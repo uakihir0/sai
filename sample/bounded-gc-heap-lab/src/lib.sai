@@ -1,0 +1,81 @@
+use acme:bounded-gc-heap-lab/collector
+use acme:bounded-gc-heap-lab/fixtures
+use acme:bounded-gc-heap-lab/model.{CollectionStatus, Heap, HeapObject, MAX_OBJECTS, MAX_ROOTS}
+
+pub fn collect_demo() -> collector.CollectionReport {
+    collector.collect(fixtures.teaching_heap(), 32)
+}
+
+test "mark traverses a reachable cycle and ignores an unreachable cycle" {
+    let report = collect_demo()
+
+    assert report.status == CollectionStatus.Complete
+    assert report.survivor_count == 4
+    assert report.compacted_objects[0].unwrap().id == 11
+    assert report.compacted_objects[1].unwrap().id == 13
+    assert report.compacted_objects[2].unwrap().id == 15
+    assert report.compacted_objects[3].unwrap().id == 16
+    assert report.compacted_objects[1].unwrap().start == 4
+    assert report.compacted_objects[2].unwrap().start == 7
+    assert report.compacted_objects[3].unwrap().start == 9
+    assert report.reclaimed_count == 4
+    assert report.reclaimed_ids[0] == Some(12)
+    assert report.reclaimed_ids[1] == Some(14)
+    assert report.reclaimed_ids[2] == Some(17)
+    assert report.reclaimed_ids[3] == Some(18)
+    assert report.reclaimed_words == 14
+}
+
+test "compaction turns scattered free extents into one reusable tail" {
+    let report = collect_demo()
+
+    assert report.free_words == 19
+    assert report.free_extent_count_before == 3
+    assert report.largest_free_extent_before == 10
+    assert report.largest_free_extent_after == 19
+    assert report.moved_words == 9
+}
+
+test "an overlapping heap layout is rejected without partial results" {
+    var heap = fixtures.teaching_heap()
+    var object = heap.objects[1].unwrap()
+    object.start = 3
+    heap.objects[1] = Some(object)
+
+    let report = collector.collect(heap, 32)
+    assert report.status == CollectionStatus.InvalidHeap
+    assert report.survivor_count == 0
+    assert report.reclaimed_count == 0
+    assert report.free_words == 0
+}
+
+test "dangling references are rejected before the mark pass" {
+    var heap = fixtures.teaching_heap()
+    var object = heap.objects[0].unwrap()
+    object.references[0] = Some(99)
+    heap.objects[0] = Some(object)
+
+    let report = collector.collect(heap, 32)
+    assert report.status == CollectionStatus.InvalidHeap
+    assert report.survivor_count == 0
+}
+
+test "zero-capacity heap is valid when it has no objects or roots" {
+    let heap = Heap(
+        objects: Array<Option<HeapObject>, MAX_OBJECTS>.filled(None),
+        object_count: 0,
+        roots: Array<Option<U32>, MAX_ROOTS>.filled(None),
+        root_count: 0,
+    )
+
+    let report = collector.collect(heap, 0)
+    assert report.status == CollectionStatus.Complete
+    assert report.survivor_count == 0
+    assert report.reclaimed_count == 0
+    assert report.reclaimed_words == 0
+    assert report.free_words == 0
+    assert report.free_extent_count_before == 0
+    assert report.largest_free_extent_before == 0
+    assert report.largest_free_extent_after == 0
+    assert report.moved_words == 0
+}

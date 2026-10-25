@@ -1,0 +1,106 @@
+pub const MAX_KEYS: USize = 6
+pub const MAX_TRANSACTION_OPS: USize = 6
+pub const MAX_JOURNAL_RECORDS: USize = 24
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum OperationKind {
+    Put
+    Delete
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type WriteOperation {
+    pub kind: OperationKind
+    pub key: U32
+    pub value: I32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TransactionBatch {
+    pub operations: Array<Option<WriteOperation>, MAX_TRANSACTION_OPS>
+    pub operation_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RecordKind {
+    Put
+    Delete
+    Commit
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type JournalRecord {
+    pub kind: RecordKind
+    pub transaction_id: U32
+    pub key: U32
+    pub value: I32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Journal {
+    pub records: Array<Option<JournalRecord>, MAX_JOURNAL_RECORDS>
+    pub record_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type StoreEntry {
+    pub key: U32
+    pub value: I32
+    pub deleted: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type StoreState {
+    pub entries: Array<Option<StoreEntry>, MAX_KEYS>
+    pub entry_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RecoveryStatus {
+    Complete
+    InvalidJournal
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RecoveryReport {
+    pub status: RecoveryStatus
+    pub state: StoreState
+    pub committed_transaction_count: USize
+    pub committed_operation_count: USize
+    pub last_committed_transaction_id: U32
+    pub ignored_incomplete_record_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum AppendStatus {
+    Committed
+    Interrupted
+    NoCapacity
+    NoStoreCapacity
+    InvalidBatch
+    InvalidJournal
+    NeedsCompaction
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AppendReport {
+    pub status: AppendStatus
+    pub journal: Journal
+    pub appended_record_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CompactionStatus {
+    Complete
+    InvalidJournal
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CompactionReport {
+    pub status: CompactionStatus
+    pub journal: Journal
+    pub before_record_count: USize
+    pub after_record_count: USize
+    pub dropped_tombstone_count: USize
+    pub discarded_incomplete_record_count: USize
+}

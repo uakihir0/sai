@@ -1,0 +1,5 @@
+package acme:bounded-wal-key-value-store @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "A fixed-capacity write-ahead journal and crash-recovery teaching model"

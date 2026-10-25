@@ -1,0 +1,41 @@
+use acme:bounded-gc-heap-lab/model.{Heap, HeapObject, MAX_OBJECTS, MAX_REFERENCES, MAX_ROOTS}
+
+fn references(first: Option<U32>, second: Option<U32>) -> Array<Option<U32>, MAX_REFERENCES> {
+    var values = Array<Option<U32>, MAX_REFERENCES>.filled(None)
+    values[0] = first
+    values[1] = second
+    values
+}
+
+fn object(
+    id: U32,
+    start: U32,
+    words: U32,
+    reference_count: USize,
+    edges: Array<Option<U32>, MAX_REFERENCES>,
+) -> HeapObject {
+    HeapObject(
+        id: id,
+        start: start,
+        words: words,
+        reference_count: reference_count,
+        references: edges,
+    )
+}
+
+pub fn teaching_heap() -> Heap {
+    var objects = Array<Option<HeapObject>, MAX_OBJECTS>.filled(None)
+    objects[0] = Some(object(11, 0, 4, 1, references(Some(13), None)))
+    objects[1] = Some(object(12, 4, 5, 1, references(Some(14), None)))
+    objects[2] = Some(object(13, 9, 3, 1, references(Some(16), None)))
+    objects[3] = Some(object(14, 12, 4, 1, references(Some(13), None)))
+    objects[4] = Some(object(15, 16, 2, 0, references(None, None)))
+    objects[5] = Some(object(16, 18, 4, 1, references(Some(13), None)))
+    objects[6] = Some(object(17, 22, 3, 1, references(Some(18), None)))
+    objects[7] = Some(object(18, 25, 2, 1, references(Some(17), None)))
+
+    var roots = Array<Option<U32>, MAX_ROOTS>.filled(None)
+    roots[0] = Some(11)
+    roots[1] = Some(15)
+    Heap(objects: objects, object_count: 8, roots: roots, root_count: 2)
+}
