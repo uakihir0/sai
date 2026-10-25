@@ -299,7 +299,7 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
             .matches("\"code\":\"NAMED_ARGUMENT_ON_FUNCTION\"")
             .count(),
         3,
-        "each positional tuple-constructor argument name is reported, but the record field is not:\n{stdout}"
+        "each named tuple-constructor argument is reported, but the record field is not:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
