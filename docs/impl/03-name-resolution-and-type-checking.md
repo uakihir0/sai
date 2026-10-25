@@ -802,9 +802,13 @@ while keeping empty tuple pattern nodes unsupported structurally. IR-935
 extends the unannotated fixed-literal projection to depth three, with
 recursive shape/arity and fixed-literal checks. IR-936 extends only the
 annotated projection to three tuple-pattern levels, retaining exact shape and
-arity; a fourth remains unsupported. The resolver uses the current package
-collection, snapshot, active source
-member closure, WIT-view closure, and test-only import filtering. Unresolved,
+arity; a fourth remains unsupported. IR-937 diagnoses a nonempty nested tuple
+literal whose arity differs from its corresponding known nonempty tuple type,
+at the full tuple span, and continues through sibling elements without
+checking inside the mismatched subtree. Empty tuple/unit nodes and
+tuple-versus-scalar pairs remain outside that shape diagnostic. The resolver
+uses the current package collection, snapshot, and active source member
+closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
 subset. This path result records path identity only; it does not record
 `type_dependent_defs` or synthesize expression types. That sentence describes
@@ -1977,12 +1981,30 @@ Named argument values still use their written positional parameter; only
 signature-backed outer call arguments are visited, and named-argument and outer
 call-arity diagnostics stay independent. `(e)` remains the expression `e`, while
 `(e,)` is a singleton tuple. A mismatched nested tuple arity produces no new
-diagnostic and its elements are not paired; that general tuple-shape error is
-left to complete expression type checking. No coercions are added below tuple
-type constructors (spec/05 §5.15.3). Nonliteral leaves, unsupported payload
+diagnostic in the IR-927 subset and its elements are not paired; IR-937 adds
+the bounded tuple-node mismatch diagnostic described below. No coercions are
+added below tuple type constructors (spec/05 §5.15.3). Nonliteral leaves,
+unsupported payload
 shapes, and all IR-926 path exclusions remain outside this slice. No
 `call_kinds`, general expression type results, or source-acceptance claim is
 added; `sai check` remains behind its incomplete-stage gate.
+
+**Implemented subset (IR-937):** At those same direct local non-generic
+tuple-variant call sites, when both the expected semantic type and actual HIR
+expression at a node are nonempty tuples, recurse only if their arities match.
+Otherwise emit one standard `TYPE_MISMATCH` spanning the complete tuple
+expression and do not inspect descendants of that mismatched subtree. Continue
+checking sibling subtrees in source order. Empty tuple type and expression
+nodes represent unit and do not participate in this arity check. Tuple-versus-
+scalar pairs and other non-tuple expression nodes (including paths and calls),
+outer arguments without a signature input, and all existing path/payload
+exclusions remain outside this added diagnostic.
+Named-argument diagnostics, outer call-arity diagnostics, and checks in
+signature-backed siblings remain independent. This reports only a known
+nonempty tuple-shape mismatch in the existing projection; it does not add
+general tuple type checking, coercions, `call_kinds`, expression type results,
+or source acceptance, and `sai check` remains behind its incomplete-stage
+gate.
 
 **Implemented subset (IR-928):** At the same direct local non-generic
 tuple-variant call sites, a single-segment plain path is checked when local
