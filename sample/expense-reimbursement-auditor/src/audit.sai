@@ -1,0 +1,76 @@
+use acme:expense-reimbursement-auditor/model.{
+    AuditTotals
+    ClaimDecision
+    DecisionStatus
+    ExpenseClaim
+    ReimbursementAudit
+    ReimbursementBatch
+}
+use acme:expense-reimbursement-auditor/review
+
+fn claim_precedes(left: ExpenseClaim, right: ExpenseClaim) -> Bool {
+    if left.expense_day != right.expense_day {
+        return left.expense_day < right.expense_day
+    }
+    if left.purchase_minute != right.purchase_minute {
+        return left.purchase_minute < right.purchase_minute
+    }
+    left.id < right.id
+}
+
+fn chronological_claims(batch: ReimbursementBatch) -> Array<Option<ExpenseClaim>, 16> {
+    var ordered = batch.claims
+    for index in 1..batch.claim_count {
+        let candidate = ordered[index].unwrap()
+        var cursor = index
+        while cursor > 0 {
+            if claim_precedes(candidate, ordered[cursor - 1].unwrap()) {
+                ordered[cursor] = ordered[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        ordered[cursor] = Some(candidate)
+    }
+    ordered
+}
+
+pub fn audit(batch: ReimbursementBatch) -> ReimbursementAudit {
+    let ordered = chronological_claims(batch)
+    var decisions: Array<Option<ClaimDecision>, 16> = Array<Option<ClaimDecision>, 16>.filled(None)
+    var totals = AuditTotals(
+        claim_count: batch.claim_count,
+        approved_count: 0,
+        adjusted_count: 0,
+        held_count: 0,
+        denied_count: 0,
+        gross_cents: 0,
+        reimbursable_cents: 0,
+    )
+
+    for index in 0..batch.claim_count {
+        let claim = ordered[index].unwrap()
+        let result = review.review(batch, claim, decisions, index)
+        decisions[index] = Some(result)
+        totals.gross_cents += claim.amount_cents
+        match result.status {
+            DecisionStatus.Approved => {
+                totals.approved_count += 1
+                totals.reimbursable_cents += result.reimbursable_cents
+            }
+            DecisionStatus.Adjusted => {
+                totals.adjusted_count += 1
+                totals.reimbursable_cents += result.reimbursable_cents
+            }
+            DecisionStatus.Held => {
+                totals.held_count += 1
+            }
+            DecisionStatus.Denied => {
+                totals.denied_count += 1
+            }
+        }
+    }
+
+    ReimbursementAudit(decisions: decisions, decision_count: batch.claim_count, totals: totals)
+}

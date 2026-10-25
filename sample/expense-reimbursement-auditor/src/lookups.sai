@@ -1,0 +1,29 @@
+use acme:expense-reimbursement-auditor/model.{BusinessTrip, Employee, ReimbursementBatch}
+
+pub fn employee_index(batch: ReimbursementBatch, employee_id: U32) -> Option<USize> {
+    for index in 0..batch.employee_count {
+        let employee = batch.employees[index].unwrap()
+        if employee.id == employee_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn trip_index(batch: ReimbursementBatch, trip_id: U32) -> Option<USize> {
+    for index in 0..batch.trip_count {
+        let trip = batch.trips[index].unwrap()
+        if trip.id == trip_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn employee(batch: ReimbursementBatch, employee_id: U32) -> Option<Employee> {
+    match employee_index(batch, employee_id) { Some(index) => batch.employees[index], None => None }
+}
+
+pub fn trip(batch: ReimbursementBatch, trip_id: U32) -> Option<BusinessTrip> {
+    match trip_index(batch, trip_id) { Some(index) => batch.trips[index], None => None }
+}
