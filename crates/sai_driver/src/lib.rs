@@ -2824,6 +2824,7 @@ pub struct TypeOwnerResolution {
     owner: OwnerId,
     kind: TopLevelOwnerKind,
     path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
+    local_record_field_types: Option<LocalRecordFieldTypesProjection>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
@@ -2867,6 +2868,103 @@ impl TypeOwnerResolution {
 
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
         &self.lowering_diagnostics
+    }
+}
+
+/// Why a direct record's field types are not available in the current
+/// snapshot-bound projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalRecordFieldTypesUnsupportedReason {
+    NotDirectLocalRecord,
+    InvalidOwnerIdentity,
+    GenericParameters,
+    WherePredicates,
+    RecoveredSyntax,
+    OwnerAnalysisFailed,
+}
+
+/// The field-type result for one exact local field definition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalRecordFieldTypeProjection {
+    def_id: DefId,
+    name: Symbol,
+    ty: Result<sai_ty::ty::Ty, sai_ty::lower_ty::UnsupportedTy>,
+}
+
+impl LocalRecordFieldTypeProjection {
+    /// Exact field identity retained from the validated current HIR owner.
+    pub const fn def_id(&self) -> DefId {
+        self.def_id
+    }
+
+    /// Source-level name of this field.
+    pub const fn name(&self) -> Symbol {
+        self.name
+    }
+
+    /// Lowered field type, or the explicit reason this field is unsupported.
+    pub fn ty(&self) -> Result<&sai_ty::ty::Ty, sai_ty::lower_ty::UnsupportedTy> {
+        self.ty.as_ref().map_err(|reason| *reason)
+    }
+}
+
+/// The bounded `type_of(field)` projection for one direct local record.
+///
+/// Successful projections retain fields in source order, including a
+/// per-field unsupported result so one unsupported field cannot hide its
+/// siblings. The owner-level rejection is used when the declaration itself
+/// cannot be trusted as a nongeneric, unrecovered local record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalRecordFieldTypesProjection {
+    Supported {
+        owner: OwnerId,
+        fields: Arc<[LocalRecordFieldTypeProjection]>,
+    },
+    Unsupported {
+        owner: OwnerId,
+        reason: LocalRecordFieldTypesUnsupportedReason,
+    },
+}
+
+impl LocalRecordFieldTypesProjection {
+    /// Exact record owner whose field identities were projected.
+    pub const fn owner(&self) -> OwnerId {
+        match self {
+            Self::Supported { owner, .. } | Self::Unsupported { owner, .. } => *owner,
+        }
+    }
+
+    /// Source-ordered field results when the record itself passed validation.
+    pub fn fields(&self) -> Option<&[LocalRecordFieldTypeProjection]> {
+        match self {
+            Self::Supported { fields, .. } => Some(fields),
+            Self::Unsupported { .. } => None,
+        }
+    }
+
+    /// Owner-level reason when this record cannot be projected.
+    pub const fn unsupported_reason(&self) -> Option<LocalRecordFieldTypesUnsupportedReason> {
+        match self {
+            Self::Supported { .. } => None,
+            Self::Unsupported { reason, .. } => Some(*reason),
+        }
+    }
+
+    /// Look up the type by the exact field `DefId`.
+    ///
+    /// `None` means the record was rejected or the definition is not one of
+    /// this record's fields. A returned `Err` is local to that field.
+    pub fn type_of_field(
+        &self,
+        field: DefId,
+    ) -> Option<Result<&sai_ty::ty::Ty, sai_ty::lower_ty::UnsupportedTy>> {
+        let Self::Supported { fields, .. } = self else {
+            return None;
+        };
+        fields
+            .iter()
+            .find(|candidate| candidate.def_id == field)
+            .map(LocalRecordFieldTypeProjection::ty)
     }
 }
 
@@ -2937,6 +3035,51 @@ impl TypeOwnerResolutions {
 
     pub fn owners(&self) -> &[TypeOwnerResolution] {
         &self.owners
+    }
+
+    /// Returns one direct local record's field-type projection after checking
+    /// collection and active-scope provenance.
+    pub fn local_record_field_types(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        owner: OwnerId,
+    ) -> Result<Option<&LocalRecordFieldTypesProjection>, OwnerControlFlowResolutionError> {
+        self.local_record_field_types_with_scopes(collection, None, None, owner)
+    }
+
+    /// Returns a field-type projection after checking every source-member and
+    /// WIT-view closure used to resolve its field paths.
+    pub fn local_record_field_types_with_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+        owner: OwnerId,
+    ) -> Result<Option<&LocalRecordFieldTypesProjection>, OwnerControlFlowResolutionError> {
+        let matches_member_scopes = match member_scopes {
+            Some(scopes) => self.matches_member_scopes(collection, scopes),
+            None => {
+                self.matches_collection(collection)
+                    && self.member_scope_closure_fingerprint.is_none()
+            }
+        };
+        let matches_wit_view_scopes = match wit_view_scopes {
+            Some(scopes) => self.matches_wit_view_scopes(collection, scopes),
+            None => {
+                self.matches_collection(collection) && self.wit_view_closure_fingerprint.is_none()
+            }
+        };
+        if !self.matches_collection(collection)
+            || !matches_member_scopes
+            || !matches_wit_view_scopes
+        {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        Ok(self
+            .owners
+            .iter()
+            .find(|result| result.owner == owner)
+            .and_then(|result| result.local_record_field_types.as_ref()))
     }
 }
 
@@ -18307,6 +18450,11 @@ impl RootDatabase {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         path_resolution: Err(error.clone()),
+                        local_record_field_types: (descriptor.kind == TopLevelOwnerKind::Struct)
+                            .then(|| LocalRecordFieldTypesProjection::Unsupported {
+                                owner: descriptor.owner,
+                                reason: LocalRecordFieldTypesUnsupportedReason::OwnerAnalysisFailed,
+                            }),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error.clone()),
                         module_path_diagnostics: Err(error),
@@ -18322,6 +18470,7 @@ impl RootDatabase {
                     OwnerTestOnlyPathResolution,
                     Vec<Diagnostic>,
                     Vec<Diagnostic>,
+                    Option<LocalRecordFieldTypesProjection>,
                 ),
                 OwnerControlFlowResolutionError,
             > = (|| {
@@ -18501,11 +18650,24 @@ impl RootDatabase {
                     &collection.target_cfg,
                     member_scopes,
                 )?;
+                let local_record_field_types = if descriptor.kind == TopLevelOwnerKind::Struct {
+                    Some(self.lower_local_record_field_types(
+                        collection,
+                        descriptor,
+                        &expected_path,
+                        &inputs,
+                        &hir_owner,
+                        &path_resolution,
+                    ))
+                } else {
+                    None
+                };
                 Ok((
                     path_resolution,
                     test_only_path_resolution,
                     diagnostics,
                     module_path_diagnostics,
+                    local_record_field_types,
                 ))
             })();
 
@@ -18515,11 +18677,13 @@ impl RootDatabase {
                     test_only_path_resolution,
                     diagnostics,
                     module_path_diagnostics,
+                    local_record_field_types,
                 )) => {
                     owners.push(TypeOwnerResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         path_resolution: Ok(path_resolution),
+                        local_record_field_types,
                         test_only_path_resolution: Ok(test_only_path_resolution),
                         test_only_diagnostics: Ok(diagnostics),
                         module_path_diagnostics: Ok(module_path_diagnostics),
@@ -18531,6 +18695,11 @@ impl RootDatabase {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         path_resolution: Err(error.clone()),
+                        local_record_field_types: (descriptor.kind == TopLevelOwnerKind::Struct)
+                            .then(|| LocalRecordFieldTypesProjection::Unsupported {
+                                owner: descriptor.owner,
+                                reason: LocalRecordFieldTypesUnsupportedReason::OwnerAnalysisFailed,
+                            }),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error.clone()),
                         module_path_diagnostics: Err(error),
@@ -18550,6 +18719,128 @@ impl RootDatabase {
             owners,
             session_token: self.session_token.clone(),
         })
+    }
+
+    fn lower_local_record_field_types(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        descriptor: TopLevelOwnerDescriptor,
+        expected_path: &DefPath,
+        inputs: &CurrentOwnerInputs,
+        hir_owner: &HirOwner<'_>,
+        path_resolution: &TypeOwnerPathResolution,
+    ) -> LocalRecordFieldTypesProjection {
+        let unsupported = |reason| LocalRecordFieldTypesProjection::Unsupported {
+            owner: descriptor.owner,
+            reason,
+        };
+        let package = collection.module_tree.package;
+        if descriptor.kind != TopLevelOwnerKind::Struct
+            || descriptor.owner.def_id.package() != package
+            || hir_owner.id != descriptor.owner
+            || path_resolution.owner() != descriptor.owner
+        {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
+        }
+
+        let Some(def_paths) = self.def_paths.get(&package) else {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
+        };
+        let Some(source_syntax) = inputs
+            .ast_ids
+            .pointer(descriptor.item_id)
+            .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
+        else {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::OwnerAnalysisFailed);
+        };
+        let Some(declaration) = ast::TypeDecl::cast(source_syntax) else {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
+        };
+        let syntax_has_error = declaration.syntax().descendants().any(|node| {
+            node.kind() == sai_syntax::SyntaxKind::ERROR
+                || node
+                    .children_with_tokens()
+                    .any(|element| element.as_token().is_some_and(|token| token.has_error()))
+        });
+        if syntax_has_error {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::RecoveredSyntax);
+        }
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
+        };
+        if item.owner_id != descriptor.owner {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
+        }
+        let ItemKind::Struct { generics, fields } = item.kind else {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::NotDirectLocalRecord);
+        };
+        if !generics.params.is_empty() {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::GenericParameters);
+        }
+        if !generics.where_preds.is_empty() {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::WherePredicates);
+        }
+
+        let owner_components = expected_path.data();
+        if expected_path.package() != package
+            || !matches!(
+                owner_components.last(),
+                Some(component)
+                    if matches!(component.data, DefPathData::TypeNs(name)
+                        if name == item.name.sym)
+                        && component.disambiguator == 0
+            )
+        {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
+        }
+
+        let mut projected_fields = Vec::with_capacity(fields.len());
+        let mut seen_field_definitions = HashSet::with_capacity(fields.len());
+        for field in fields {
+            let field_def_id = field.def_id.to_def_id();
+            let Some(field_path) = def_paths.resolve_def_id(field_def_id).ok().flatten() else {
+                return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
+            };
+            let field_components = field_path.data();
+            let has_expected_identity = field.hir_id.owner == descriptor.owner
+                && field.ty.hir_id.owner == descriptor.owner
+                && field_def_id.package == package
+                && field_path.package() == expected_path.package()
+                && field_components.len() == owner_components.len() + 1
+                && field_components[..owner_components.len()] == *owner_components
+                && matches!(
+                    field_components.last(),
+                    Some(component)
+                        if matches!(component.data, DefPathData::Field(name)
+                            if name == field.name.sym)
+                )
+                && seen_field_definitions.insert(field_def_id);
+            if !has_expected_identity {
+                return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
+            }
+
+            // A failed conversion may have consumed region indices or other
+            // context state. Start from a fresh field context so one sibling's
+            // unsupported syntax cannot affect another field's result.
+            let mut context = sai_ty::lower_ty::LowerTyContext::for_field(
+                &self.semantic_types,
+                descriptor.owner,
+                path_resolution.paths(),
+                false,
+            );
+            let ty = sai_ty::lower_ty::lower_ty(&mut context, field.ty);
+            projected_fields.push(LocalRecordFieldTypeProjection {
+                def_id: field_def_id,
+                name: field.name.sym,
+                ty,
+            });
+        }
+
+        LocalRecordFieldTypesProjection::Supported {
+            owner: descriptor.owner,
+            fields: projected_fields.into(),
+        }
     }
 
     fn type_owner_module_path_diagnostics(
@@ -37609,6 +37900,373 @@ property "shared"() {}
                 "the argument remains {expected}"
             );
         }
+    }
+
+    #[test]
+    fn local_record_field_type_projection_is_exact_and_isolated() {
+        let root = concat!(
+            "type Alias = Bool\n",
+            "type Fields {\n",
+            "  integer: I32,\n",
+            "  tuple: (Bool, U8),\n",
+            "  callback: fn(I32, (Char,)) -> Bool,\n",
+            "  array: Array<U8, 2>,\n",
+            "  borrowed: borrow Bool,\n",
+            "  callback_borrowed: fn(borrow Bool),\n",
+            "  callback_effects: fn() effects {},\n",
+            "  alias: Alias,\n",
+            "  after_unsupported: Char,\n",
+            "}\n",
+            "type Other { integer: Bool }\n",
+            "type Repeated { same: I32, same: Bool }\n",
+            "type Generic<T> { value: T }\n",
+            "type WhereOnly where I32: Copy { value: Bool }\n",
+            "type Recovered { malformed: Bool = }\n",
+            "enum Payload { Wrapped(Bool) }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty active source-member closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("current-snapshot type owner paths resolve");
+        assert!(resolved.matches_collection(&collection));
+        assert!(resolved.matches_member_scopes(&collection, &member_scopes));
+
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        let owner_for = |name: &str| {
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Struct
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .unwrap_or_else(|| panic!("direct local record {name:?} is in this collection"))
+                .owner
+        };
+        let fields_owner = owner_for("Fields");
+        let fields = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                fields_owner,
+            )
+            .expect("exact collection guards field types")
+            .expect("direct local record has a field projection");
+        let LocalRecordFieldTypesProjection::Supported {
+            owner: projected_owner,
+            fields: projected_fields,
+        } = fields
+        else {
+            panic!("nongeneric unrecovered record fields can be projected");
+        };
+        assert_eq!(*projected_owner, fields_owner);
+        assert_eq!(projected_fields.len(), 9);
+
+        let field_named = |name: &str| {
+            projected_fields
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .expect("source field is present in the projection")
+        };
+        assert_eq!(
+            projected_fields
+                .iter()
+                .map(|field| database
+                    .symbols
+                    .resolve(field.name())
+                    .expect("field name resolves"))
+                .collect::<Vec<_>>(),
+            [
+                Arc::<str>::from("integer"),
+                Arc::<str>::from("tuple"),
+                Arc::<str>::from("callback"),
+                Arc::<str>::from("array"),
+                Arc::<str>::from("borrowed"),
+                Arc::<str>::from("callback_borrowed"),
+                Arc::<str>::from("callback_effects"),
+                Arc::<str>::from("alias"),
+                Arc::<str>::from("after_unsupported"),
+            ],
+            "field results preserve source order"
+        );
+        let integer = field_named("integer");
+        assert!(matches!(
+            integer.ty().expect("primitive field lowers").kind(),
+            sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32)
+        ));
+        assert!(matches!(
+            fields.type_of_field(integer.def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32))
+        ));
+        let tuple = field_named("tuple");
+        let tuple_ty = tuple.ty().expect("tuple field lowers");
+        let sai_ty::ty::TyKind::Tuple(tuple_fields) = tuple_ty.kind() else {
+            panic!("the tuple shape is retained");
+        };
+        assert_eq!(tuple_fields.len(), 2);
+        assert!(matches!(tuple_fields[0].kind(), sai_ty::ty::TyKind::Bool));
+        assert!(matches!(
+            tuple_fields[1].kind(),
+            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+        ));
+        let callback = field_named("callback");
+        let callback_ty = callback.ty().expect("effect-free callback field lowers");
+        let sai_ty::ty::TyKind::FnPtr(callback_sig) = callback_ty.kind() else {
+            panic!("the callback field retains a function-pointer type");
+        };
+        assert_eq!(callback_sig.inputs().len(), 2);
+        assert!(matches!(
+            callback_sig.inputs()[0].kind(),
+            sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32)
+        ));
+        let sai_ty::ty::TyKind::Tuple(nested_input) = callback_sig.inputs()[1].kind() else {
+            panic!("the nested callback input retains its tuple shape");
+        };
+        assert_eq!(nested_input.len(), 1);
+        assert!(matches!(nested_input[0].kind(), sai_ty::ty::TyKind::Char));
+        assert!(matches!(
+            callback_sig.output().kind(),
+            sai_ty::ty::TyKind::Bool
+        ));
+        assert!(matches!(
+            fields.type_of_field(callback.def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::FnPtr(_))
+        ));
+
+        for (name, expected_reason) in [
+            ("array", sai_ty::lower_ty::UnsupportedTy::Array),
+            (
+                "borrowed",
+                sai_ty::lower_ty::UnsupportedTy::FieldRegionWithoutParameter,
+            ),
+            (
+                "callback_borrowed",
+                sai_ty::lower_ty::UnsupportedTy::FunctionPointerRegion,
+            ),
+            (
+                "callback_effects",
+                sai_ty::lower_ty::UnsupportedTy::FunctionPointerEffects,
+            ),
+            ("alias", sai_ty::lower_ty::UnsupportedTy::Alias),
+        ] {
+            assert_eq!(
+                field_named(name).ty(),
+                Err(expected_reason),
+                "{name} remains unsupported within its own field"
+            );
+            assert_eq!(
+                fields.type_of_field(field_named(name).def_id()),
+                Some(Err(expected_reason)),
+                "{name} retains its field-local failure through exact-DefId lookup"
+            );
+        }
+        let after_unsupported = field_named("after_unsupported");
+        assert!(matches!(
+            fields.type_of_field(after_unsupported.def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
+        ));
+
+        let other_owner = owner_for("Other");
+        let other = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                other_owner,
+            )
+            .expect("exact collection guards sibling field types")
+            .expect("the other record also has a field projection");
+        let LocalRecordFieldTypesProjection::Supported {
+            fields: other_fields,
+            ..
+        } = other
+        else {
+            panic!("the second simple record is supported");
+        };
+        let other_field = other_fields.first().expect("other record has a field");
+        assert_ne!(
+            integer.def_id(),
+            other_field.def_id(),
+            "same-spelled fields retain their exact owner-local DefIds"
+        );
+        assert!(
+            other.type_of_field(integer.def_id()).is_none(),
+            "a field from a sibling owner cannot be read through this record"
+        );
+        assert!(
+            fields.type_of_field(other_field.def_id()).is_none(),
+            "the lookup is keyed by the exact field DefId"
+        );
+
+        let repeated = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("Repeated"),
+            )
+            .expect("exact collection guards repeated-name field types")
+            .expect("repeated-name record has a field projection");
+        let repeated_fields = repeated
+            .fields()
+            .expect("direct repeated-name record passes owner validation");
+        assert_eq!(repeated_fields.len(), 2);
+        assert_eq!(repeated_fields[0].name(), repeated_fields[1].name());
+        assert_ne!(
+            repeated_fields[0].def_id(),
+            repeated_fields[1].def_id(),
+            "same-named fields retain distinct definition identities"
+        );
+        assert!(matches!(
+            repeated.type_of_field(repeated_fields[0].def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32))
+        ));
+        assert!(matches!(
+            repeated.type_of_field(repeated_fields[1].def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Bool)
+        ));
+
+        let generic = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("Generic"),
+            )
+            .expect("exact collection guards generic record rejection")
+            .expect("generic record rejection is retained");
+        assert_eq!(
+            generic.unsupported_reason(),
+            Some(LocalRecordFieldTypesUnsupportedReason::GenericParameters)
+        );
+        let where_only = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("WhereOnly"),
+            )
+            .expect("exact collection guards where-clause rejection")
+            .expect("where-clause rejection is retained");
+        assert_eq!(
+            where_only.unsupported_reason(),
+            Some(LocalRecordFieldTypesUnsupportedReason::WherePredicates)
+        );
+        let recovered = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("Recovered"),
+            )
+            .expect("exact collection guards recovered record rejection")
+            .expect("recovered record rejection is retained");
+        assert_eq!(
+            recovered.unsupported_reason(),
+            Some(LocalRecordFieldTypesUnsupportedReason::RecoveredSyntax)
+        );
+        let payload_owner = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Enum)
+            .expect("the payload enum has a descriptor")
+            .owner;
+        assert!(
+            resolved
+                .local_record_field_types_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    None,
+                    payload_owner,
+                )
+                .expect("exact collection guards enum lookup")
+                .is_none(),
+            "enum payloads do not enter the record field-type projection"
+        );
+        assert!(
+            matches!(
+                resolved.local_record_field_types(&collection, fields_owner),
+                Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+            ),
+            "a scoped resolution requires the same active closure at lookup"
+        );
+
+        let stale_snapshot = snapshot_with_version(&snapshot, 19);
+        let stale_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &stale_snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("a new source snapshot collects independently");
+        let stale_member_scopes = database
+            .collect_active_source_member_scopes(&stale_collection, &graph, &[])
+            .expect("stale snapshot closure still matches its own collection");
+        assert!(
+            matches!(
+                resolved.local_record_field_types_with_scopes(
+                    &collection,
+                    Some(&stale_member_scopes),
+                    None,
+                    fields_owner,
+                ),
+                Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+            ),
+            "a stale closure cannot be substituted for the current active closure"
+        );
+        assert!(matches!(
+            resolved.local_record_field_types_with_scopes(
+                &stale_collection,
+                Some(&stale_member_scopes),
+                None,
+                fields_owner,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+        ));
     }
 
     #[test]
@@ -84531,7 +85189,7 @@ interface facade { use middle.{payload}; }"#;
 
     #[test]
     fn type_owner_paths_resolve_active_wit_members_and_track_view_revisions() {
-        let root = b"use acme:wit-api/streams as api\ntype Client = api.Request\n";
+        let root = b"use acme:wit-api/streams as api\ntype Client = api.Request\ntype Local { value: Bool, request: api.Request }\n";
         let (mut database, module_tree, snapshot, _root_package) = phase1_fixture(root, b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let artifact = database
@@ -84648,6 +85306,54 @@ interface facade { use middle.{payload}; }"#;
         assert!(matches!(path_v1.base, Res::Def(DefKind::Struct, _)));
         assert_eq!(path_v1.resolved_segments, 2);
         assert!(resolved_v1.matches_wit_view_scopes(&collection_v1, &wit_scopes_v1));
+        let local_owner = collection_v1
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Struct)
+            .expect("the local record owner is collected")
+            .owner;
+        let local_paths = resolved_v1
+            .owners()
+            .iter()
+            .find(|owner| owner.owner() == local_owner)
+            .expect("type-owner resolution includes the local record")
+            .path_resolution()
+            .expect("local record path analysis succeeds");
+        assert!(
+            local_paths
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Struct, _))
+                    && path.resolved_segments == 2),
+            "the record field path resolves through the active WIT view"
+        );
+        let local_field_types = resolved_v1
+            .local_record_field_types_with_scopes(
+                &collection_v1,
+                None,
+                Some(&wit_scopes_v1),
+                local_owner,
+            )
+            .expect("matching active WIT-view closure guards the field projection")
+            .expect("the direct local record has a projection");
+        let local_value = local_field_types
+            .fields()
+            .expect("the record itself is eligible for projection")
+            .iter()
+            .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some("value"))
+            .expect("the local primitive field is projected");
+        assert!(matches!(
+            local_field_types.type_of_field(local_value.def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Bool)
+        ));
+        assert!(
+            matches!(
+                resolved_v1.local_record_field_types(&collection_v1, local_owner),
+                Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+            ),
+            "a WIT-scoped resolution rejects lookup without its active closure"
+        );
 
         let owner_index = collection_v1.scopes.top_level_owners[0]
             .owner
@@ -84702,6 +85408,18 @@ interface facade { use middle.{payload}; }"#;
             wit_scopes_v1.closure_fingerprint(),
             wit_scopes_changed.closure_fingerprint(),
             "view content is part of the active WIT closure identity"
+        );
+        assert!(
+            matches!(
+                resolved_v1.local_record_field_types_with_scopes(
+                    &collection_v1,
+                    None,
+                    Some(&wit_scopes_changed),
+                    local_owner,
+                ),
+                Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+            ),
+            "the original field projection rejects a changed WIT-view closure"
         );
         let collection_changed = database
             .collect_phase1_package_scopes_with_manifest_and_wit_views(
