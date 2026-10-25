@@ -1347,3 +1347,90 @@ fn check_reports_interface_repr_at_the_full_attribute_span_once() {
         "{stdout}"
     );
 }
+
+#[test]
+fn check_reports_local_enum_discriminant_diagnostics() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let dependency = package.join("dep");
+    let source_directory = package.join("src");
+    let dependency_source_directory = dependency.join("src");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::create_dir_all(&dependency_source_directory).expect("create dependency source directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:enum-check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:dep @ ^1 from path \"dep\" }\n"
+        ),
+    )
+    .expect("write package manifest");
+    fs::write(
+        dependency.join("sai.package"),
+        "package acme:dep @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi }\n",
+    )
+    .expect("write dependency manifest");
+    fs::write(
+        dependency_source_directory.join("lib.sai"),
+        "pub fn dep() {}\n",
+    )
+    .expect("write dependency source");
+    fs::write(
+        package.join("sai.lock"),
+        concat!(
+            "lock 2\n\n",
+            "root acme:enum-check @ 0.1.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n\n",
+            "package acme:dep @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write dependency lock");
+    fs::write(
+        source_directory.join("lib.sai"),
+        "@repr(U8)\nenum E { A = 256, B = 256 }\n",
+    )
+    .expect("write enum with invalid discriminants");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.contains("\"code\":\"DISCRIMINANT_OUT_OF_RANGE\""))
+            .count(),
+        2,
+        "{stdout}"
+    );
+    let duplicates = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"DUPLICATE_DISCRIMINANT\""))
+        .collect::<Vec<_>>();
+    assert_eq!(duplicates.len(), 1, "{stdout}");
+    assert!(
+        duplicates[0].contains("duplicates earlier variant `A`"),
+        "{stdout}"
+    );
+    assert!(
+        duplicates[0].contains("\"package\":\"acme:enum-check@0.1.0\""),
+        "enum diagnostics retain their package attribution: {stdout}"
+    );
+}

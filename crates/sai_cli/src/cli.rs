@@ -7060,6 +7060,7 @@ fn module_tree_workspace_check_diagnostics(
                             errors = errors.saturating_add(1);
                         }
                     }
+                    owner_diagnostics.extend(owner.lowering_diagnostics().iter().cloned());
                 }
                 for owner in function_resolutions.owners() {
                     match owner.module_path_diagnostics() {
