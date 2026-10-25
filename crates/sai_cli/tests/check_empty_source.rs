@@ -285,10 +285,14 @@ fn empty_root_package_index() -> sai_semantic::EncodedSymbolIndex {
 fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     let source = concat!(
         "enum Payload { Pair(U8, Bool), Named(value: Bool) }\n",
-        "pub fn use_it() {\n",
-        "    (Payload.Pair(1, true), ",
+        "enum NestedPayload { Nested(((I8, Char), ((), USize))) }\n",
+        "pub fn use_it(actual: Bool) {\n",
+        "    (Payload.Pair(actual, true), ",
+        "Payload.Pair(1, true), ",
         "Payload.Pair(first: true, second: 1, third: false), ",
         "Payload.Pair(256, true), ",
+        "NestedPayload.Nested(((true, 1), ((), 2))), ",
+        "NestedPayload.Nested(((256, 'x'), ((), 2))), ",
         "Payload.Named(value: true))\n",
         "}\n",
     );
@@ -309,13 +313,25 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        2,
-        "the staged projection checks only the first two named call arguments by position:\n{stdout}"
+        5,
+        "the staged projection checks parameter paths and named/nested tuple literal leaves:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
-        1,
-        "the positional U8 argument range error reaches CLI diagnostics:\n{stdout}"
+        2,
+        "direct and nested positional literal range errors reach CLI diagnostics:\n{stdout}"
+    );
+    let parameter_call = "Payload.Pair(actual, true)";
+    let parameter_start = source
+        .find(parameter_call)
+        .expect("parameter argument call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Bool`",
+        parameter_start,
+        parameter_start + "actual".len(),
     );
     let named_start = source.find("first:").expect("named argument exists");
     assert_json_diagnostic_primary_span(
@@ -355,6 +371,38 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "expected `Bool`, found an integer literal",
         named_integer_start,
         named_integer_start + "1".len(),
+    );
+    let nested_mismatch_call = "NestedPayload.Nested(((true, 1), ((), 2)))";
+    let nested_bool_start = source
+        .find(nested_mismatch_call)
+        .expect("nested tuple mismatch call exists")
+        + "NestedPayload.Nested(((".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I8`, found a Bool literal",
+        nested_bool_start,
+        nested_bool_start + "true".len(),
+    );
+    let nested_char_start = nested_bool_start + "true, ".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Char`, found an integer literal",
+        nested_char_start,
+        nested_char_start + "1".len(),
+    );
+    let nested_out_of_range_call = "NestedPayload.Nested(((256, 'x'), ((), 2)))";
+    let nested_out_of_range_start = source
+        .find(nested_out_of_range_call)
+        .expect("nested out-of-range call exists")
+        + "NestedPayload.Nested(((".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        nested_out_of_range_start,
+        nested_out_of_range_start + "256".len(),
     );
     let out_of_range_call = "Payload.Pair(256, true)";
     let out_of_range_start = source
