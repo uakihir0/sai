@@ -1,15 +1,16 @@
 //! Interned semantic types shared by declaration and body checking.
 //!
 //! This is an early semantic type kernel. It represents primitive types,
-//! tuples, references, arrays with literal lengths, owner-bound function type
-//! parameters, and nominal identities with explicit type arguments. Signature
-//! lowering currently limits arrays to the resolved built-in `Array` with a
-//! nonnegative target-fitting literal length, and generic nominal applications
-//! to validated direct local records and enums with region-free fields or
-//! payloads. Function pointers, projections, inference variables, and error
-//! types remain for later slices.
+//! tuples, references, arrays with literal lengths, function pointers,
+//! owner-bound function type parameters, and nominal identities with explicit
+//! type arguments. Signature lowering currently limits arrays to the resolved
+//! built-in `Array` with a nonnegative target-fitting literal length, function
+//! pointers to signatures without effects or borrowed/generic children, and
+//! generic nominal applications to validated direct local records and enums
+//! with region-free fields or payloads. Projections, inference variables, and
+//! error types remain for later slices.
 
-use sai_hir::{DefId, Mutability, Symbol};
+use sai_hir::{DefId, Mutability, Safety, Symbol};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -65,6 +66,8 @@ pub enum TyKind {
     Ref(Region, Ty, Mutability),
     /// A structural array with its element type and target-validated length.
     Array(Ty, u128),
+    /// A function pointer with a source-ordered signature and explicit safety.
+    FnPtr(FnPtrSig),
     /// A type parameter in the binder of one function signature.
     Param(ParamTy),
     /// A nominal definition and its explicit type arguments.
@@ -136,6 +139,40 @@ pub struct ParamTy {
 pub struct FnSigTypeParam {
     pub def_id: DefId,
     pub param: ParamTy,
+}
+
+/// A representable function pointer signature.
+///
+/// Effects are intentionally absent: HIR distinguishes an omitted effect
+/// clause from an explicitly empty one, and this semantic slice cannot retain
+/// either resolved effect sets or that source distinction.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct FnPtrSig {
+    safety: Safety,
+    inputs: Arc<[Ty]>,
+    output: Ty,
+}
+
+impl FnPtrSig {
+    pub(crate) fn new(safety: Safety, inputs: impl Into<Arc<[Ty]>>, output: Ty) -> Self {
+        Self {
+            safety,
+            inputs: inputs.into(),
+            output,
+        }
+    }
+
+    pub fn safety(&self) -> Safety {
+        self.safety
+    }
+
+    pub fn inputs(&self) -> &[Ty] {
+        &self.inputs
+    }
+
+    pub fn output(&self) -> &Ty {
+        &self.output
+    }
 }
 
 /// The lowered types of one supported partial function signature.
@@ -228,6 +265,15 @@ impl TyInterner {
             TyKind::Array(element, length) => {
                 TyKind::Array(self.intern(element.kind().clone()), length)
             }
+            TyKind::FnPtr(signature) => TyKind::FnPtr(FnPtrSig::new(
+                signature.safety,
+                signature
+                    .inputs
+                    .iter()
+                    .map(|input| self.intern(input.kind().clone()))
+                    .collect::<Vec<_>>(),
+                self.intern(signature.output.kind().clone()),
+            )),
             TyKind::Adt(def_id, args) => TyKind::Adt(
                 def_id,
                 args.iter()
@@ -334,6 +380,49 @@ mod tests {
             panic!("the array retains its exact length");
         };
         assert!(element.ptr_eq(&local_bool));
+    }
+
+    #[test]
+    fn function_pointer_interning_canonicalizes_children_and_preserves_safety() {
+        let interner = TyInterner::new();
+        let other = TyInterner::new();
+        let local_bool = interner.intern(TyKind::Bool);
+        let foreign_bool = other.intern(TyKind::Bool);
+        let local_array = interner.intern(TyKind::Array(local_bool.clone(), 3));
+        let foreign_array = other.intern(TyKind::Array(foreign_bool.clone(), 3));
+        let local_output = interner.tuple(Arc::from([local_bool.clone()]));
+        let foreign_output = other.tuple(Arc::from([foreign_bool]));
+
+        let local = interner.intern(TyKind::FnPtr(FnPtrSig::new(
+            Safety::Safe,
+            Arc::from([local_array]),
+            local_output,
+        )));
+        let foreign = interner.intern(TyKind::FnPtr(FnPtrSig::new(
+            Safety::Safe,
+            Arc::from([foreign_array]),
+            foreign_output,
+        )));
+        let unsafe_signature = interner.intern(TyKind::FnPtr(FnPtrSig::new(
+            Safety::Unsafe,
+            Arc::from([interner.intern(TyKind::Array(local_bool.clone(), 3))]),
+            interner.tuple(Arc::from([local_bool.clone()])),
+        )));
+
+        assert!(local.ptr_eq(&foreign));
+        assert!(!local.ptr_eq(&unsafe_signature));
+        let TyKind::FnPtr(signature) = foreign.kind() else {
+            panic!("the type remains a function pointer");
+        };
+        assert_eq!(signature.safety(), Safety::Safe);
+        let TyKind::Array(argument, 3) = signature.inputs()[0].kind() else {
+            panic!("the input retains its nested array");
+        };
+        assert!(argument.ptr_eq(&local_bool));
+        let TyKind::Tuple(output) = signature.output().kind() else {
+            panic!("the output retains its nested tuple");
+        };
+        assert!(output[0].ptr_eq(&local_bool));
     }
 
     #[test]

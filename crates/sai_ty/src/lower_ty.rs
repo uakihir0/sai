@@ -5,8 +5,8 @@
 //! manufacturing semantic error types or guessing at unresolved names.
 
 use crate::ty::{
-    FloatTy, FnSig, FnSigTypeParam, IntTy, ParamTy, Region, SigRegion, Ty, TyInterner, TyKind,
-    UintTy,
+    FloatTy, FnPtrSig, FnSig, FnSigTypeParam, IntTy, ParamTy, Region, SigRegion, Ty, TyInterner,
+    TyKind, UintTy,
 };
 use sai_hir::types::{
     GenericArg as HirGenericArg, GenericParam, GenericParamKind, Generics, PathRoot, Ty as HirTy,
@@ -39,7 +39,6 @@ pub enum UnsupportedTy {
     SelfType,
     Projection,
     NominalType,
-    FunctionPointer,
     Inference,
     Error,
     WrongNameKind,
@@ -48,6 +47,9 @@ pub enum UnsupportedTy {
     ErrorPath,
     RegionIndexOverflow,
     FieldRegionWithoutParameter,
+    FunctionPointerEffects,
+    FunctionPointerRegion,
+    FunctionPointerGenericParameter,
     ContextAfterFailure,
 }
 
@@ -65,6 +67,7 @@ pub enum UnsupportedFnSig {
     Effects,
     SelfParameter,
     RecoveredGenericSyntax,
+    RecoveredFunctionPointerSyntax,
     TooManyTypeParameters,
     ParameterType { index: usize, reason: UnsupportedTy },
     ReturnType(UnsupportedTy),
@@ -103,6 +106,7 @@ pub struct LowerTyContext<'a> {
     array_length_pointer_width: Option<u8>,
     region_mode: RegionMode,
     next_region_index: u32,
+    within_fn_ptr: bool,
     failed: bool,
 }
 
@@ -134,6 +138,7 @@ impl<'a> LowerTyContext<'a> {
             array_length_pointer_width: None,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
+            within_fn_ptr: false,
             failed: false,
         }
     }
@@ -163,6 +168,7 @@ impl<'a> LowerTyContext<'a> {
             array_length_pointer_width: None,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
+            within_fn_ptr: false,
             failed: false,
         }
     }
@@ -192,6 +198,7 @@ impl<'a> LowerTyContext<'a> {
             array_length_pointer_width: None,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
+            within_fn_ptr: false,
             failed: false,
         }
     }
@@ -223,6 +230,7 @@ impl<'a> LowerTyContext<'a> {
                 has_implicit_region_parameter,
             },
             next_region_index: 0,
+            within_fn_ptr: false,
             failed: false,
         }
     }
@@ -245,6 +253,7 @@ impl<'a> LowerTyContext<'a> {
             array_length_pointer_width: None,
             region_mode: RegionMode::Body,
             next_region_index: 0,
+            within_fn_ptr: false,
             failed: false,
         }
     }
@@ -311,7 +320,7 @@ impl<'a> LowerTyContext<'a> {
     }
 }
 
-/// Convert a resolved HIR type within the primitive/tuple/reference subset.
+/// Convert a resolved HIR type within the supported semantic type subset.
 ///
 /// The caller owns path resolution and diagnostics. This function performs no
 /// diagnostic emission and produces no error type; unsupported forms are
@@ -480,6 +489,9 @@ fn lower_ty_inner(context: &mut LowerTyContext<'_>, ty: &HirTy<'_>) -> Result<Ty
             if inner.hir_id.owner != context.owner {
                 return Err(UnsupportedTy::OwnerMismatch);
             }
+            if context.within_fn_ptr {
+                return Err(UnsupportedTy::FunctionPointerRegion);
+            }
             // Borrow positions precede their children in the specified
             // signature-region traversal.
             let region = context.region()?;
@@ -495,10 +507,47 @@ fn lower_ty_inner(context: &mut LowerTyContext<'_>, ty: &HirTy<'_>) -> Result<Ty
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(context.interner.tuple(elements))
         }
-        HirTyKind::FnPtr { .. } => Err(UnsupportedTy::FunctionPointer),
+        HirTyKind::FnPtr {
+            safety,
+            params,
+            ret,
+            effects,
+        } => lower_fn_ptr(context, safety, params, ret, effects),
         HirTyKind::Infer => Err(UnsupportedTy::Inference),
         HirTyKind::Err => Err(UnsupportedTy::Error),
     }
+}
+
+fn lower_fn_ptr(
+    context: &mut LowerTyContext<'_>,
+    safety: Safety,
+    params: &[HirTy<'_>],
+    ret: Option<&HirTy<'_>>,
+    effects: Option<&[sai_hir::types::EffectRef<'_>]>,
+) -> Result<Ty, UnsupportedTy> {
+    if effects.is_some() {
+        return Err(UnsupportedTy::FunctionPointerEffects);
+    }
+
+    let previous_within_fn_ptr = context.within_fn_ptr;
+    context.within_fn_ptr = true;
+    let lowered = (|| {
+        let inputs = params
+            .iter()
+            .map(|parameter| lower_ty_inner(context, parameter))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = match ret {
+            Some(return_type) => lower_ty_inner(context, return_type)?,
+            None => context.interner.tuple(Vec::new()),
+        };
+        Ok::<_, UnsupportedTy>((inputs, output))
+    })();
+    context.within_fn_ptr = previous_within_fn_ptr;
+
+    let (inputs, output) = lowered?;
+    Ok(context
+        .interner
+        .intern(TyKind::FnPtr(FnPtrSig::new(safety, inputs, output))))
 }
 
 fn lower_path_ty(
@@ -625,12 +674,18 @@ fn lower_path_ty(
             Ok(context.interner.intern(kind))
         }
         Res::Def(DefKind::Alias, _) => Err(UnsupportedTy::Alias),
-        Res::Def(DefKind::TyParam, def_id) => context
-            .generic_params
-            .get(&def_id)
-            .copied()
-            .map(|param| context.interner.intern(TyKind::Param(param)))
-            .ok_or(UnsupportedTy::GenericParameter),
+        Res::Def(DefKind::TyParam, def_id) => {
+            if context.within_fn_ptr {
+                Err(UnsupportedTy::FunctionPointerGenericParameter)
+            } else {
+                context
+                    .generic_params
+                    .get(&def_id)
+                    .copied()
+                    .map(|param| context.interner.intern(TyKind::Param(param)))
+                    .ok_or(UnsupportedTy::GenericParameter)
+            }
+        }
         Res::Def(DefKind::ConstParam, _) => Err(UnsupportedTy::ConstParameter),
         Res::Def(DefKind::AssocTy, _) => Err(UnsupportedTy::Projection),
         Res::Def(
@@ -1458,9 +1513,15 @@ mod tests {
         };
         let empty_paths = HashMap::new();
         let mut context = LowerTyContext::for_signature(&interner, owner, &empty_paths);
-        assert_eq!(
-            lower_ty(&mut context, &function),
-            Err(UnsupportedTy::FunctionPointer)
+        let lowered = lower_ty(&mut context, &function)
+            .expect("a pure function pointer with no arguments lowers");
+        let TyKind::FnPtr(signature) = lowered.kind() else {
+            panic!("the result is a function pointer");
+        };
+        assert_eq!(signature.safety(), sai_hir::Safety::Safe);
+        assert!(signature.inputs().is_empty());
+        assert!(
+            matches!(signature.output().kind(), TyKind::Tuple(elements) if elements.is_empty())
         );
 
         let inference = HirTy {
@@ -1482,6 +1543,467 @@ mod tests {
         let empty_paths = HashMap::new();
         let mut context = LowerTyContext::for_signature(&interner, owner, &empty_paths);
         assert_eq!(lower_ty(&mut context, &error), Err(UnsupportedTy::Error));
+    }
+
+    #[test]
+    fn function_pointer_types_preserve_safety_order_and_supported_children() {
+        let (owner, symbols) = owner();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let (i32_ty, mut paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            10,
+            "I32",
+            None,
+            Res::PrimTy(PrimTy::I32),
+        );
+        let (bool_ty, bool_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            20,
+            "Bool",
+            None,
+            Res::PrimTy(PrimTy::Bool),
+        );
+        let (u8_ty, u8_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            30,
+            "U8",
+            None,
+            Res::PrimTy(PrimTy::U8),
+        );
+        let (char_ty, char_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            40,
+            "Char",
+            None,
+            Res::PrimTy(PrimTy::Char),
+        );
+        paths.extend(bool_paths);
+        paths.extend(u8_paths);
+        paths.extend(char_paths);
+
+        let tuple_elements = arena.alloc_tys(&[*i32_ty, *bool_ty]);
+        let tuple = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 50),
+            kind: HirTyKind::Tuple(tuple_elements),
+            span: span(),
+        });
+        let array_args = [
+            HirGenericArg::Type(u8_ty),
+            HirGenericArg::Const(ConstArg::Int {
+                value: Some(2),
+                negated: false,
+            }),
+        ];
+        let (array, array_paths) = resolved_array_path(&arena, owner, &symbols, 60, &array_args);
+        paths.extend(array_paths);
+        let params = arena.alloc_tys(&[*tuple, *array]);
+        let function = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 70),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params,
+                ret: Some(char_ty),
+                effects: None,
+            },
+            span: span(),
+        });
+
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_array_length_pointer_width(32);
+        let lowered = lower_ty(&mut context, function).expect("the pure function pointer lowers");
+        let TyKind::FnPtr(signature) = lowered.kind() else {
+            panic!("the result retains a function pointer signature");
+        };
+        assert_eq!(signature.safety(), Safety::Safe);
+        assert_eq!(signature.inputs().len(), 2);
+        assert!(matches!(
+            signature.inputs()[0].kind(),
+            TyKind::Tuple(elements)
+                if matches!(elements[0].kind(), TyKind::Int(IntTy::I32))
+                    && matches!(elements[1].kind(), TyKind::Bool)
+        ));
+        assert!(matches!(
+            signature.inputs()[1].kind(),
+            TyKind::Array(element, 2) if matches!(element.kind(), TyKind::Uint(UintTy::U8))
+        ));
+        assert!(matches!(signature.output().kind(), TyKind::Char));
+
+        let no_params_no_return = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 80),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: &[],
+                ret: None,
+                effects: None,
+            },
+            span: span(),
+        });
+        let unit = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 81),
+            kind: HirTyKind::Tuple(&[]),
+            span: span(),
+        });
+        let explicit_unit = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 82),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: &[],
+                ret: Some(unit),
+                effects: None,
+            },
+            span: span(),
+        });
+        let unsafe_no_params = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 83),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Unsafe,
+                params: &[],
+                ret: None,
+                effects: None,
+            },
+            span: span(),
+        });
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths);
+        let omitted = lower_ty(&mut context, no_params_no_return).unwrap();
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths);
+        let explicit = lower_ty(&mut context, explicit_unit).unwrap();
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths);
+        let unsafe_pointer = lower_ty(&mut context, unsafe_no_params).unwrap();
+        assert!(omitted.ptr_eq(&explicit), "omitted output is unit");
+        assert!(
+            !omitted.ptr_eq(&unsafe_pointer),
+            "safety participates in identity"
+        );
+        assert!(matches!(
+            unsafe_pointer.kind(),
+            TyKind::FnPtr(signature) if signature.safety() == Safety::Unsafe
+        ));
+    }
+
+    #[test]
+    fn function_pointer_effects_regions_parameters_and_invalid_paths_fail_closed() {
+        let (owner, symbols) = owner();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let (boolean, bool_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            10,
+            "Bool",
+            None,
+            Res::PrimTy(PrimTy::Bool),
+        );
+        let pure_effects = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 20),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: &[],
+                ret: None,
+                effects: Some(&[]),
+            },
+            span: span(),
+        });
+        let effect_refs = arena.alloc_effect_refs(&[sai_hir::types::EffectRef {
+            hir_id: hir_id(owner, 22),
+            segments: &[],
+        }]);
+        let nonempty_effects = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 21),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: &[],
+                ret: None,
+                effects: Some(effect_refs),
+            },
+            span: span(),
+        });
+        for (hir_ty, expected) in [
+            (pure_effects, UnsupportedTy::FunctionPointerEffects),
+            (nonempty_effects, UnsupportedTy::FunctionPointerEffects),
+        ] {
+            let mut context = LowerTyContext::for_signature(&interner, owner, &bool_paths);
+            assert_eq!(lower_ty(&mut context, hir_ty), Err(expected));
+        }
+
+        let borrowed = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 30),
+            kind: HirTyKind::Borrow(Mutability::Not, boolean),
+            span: span(),
+        });
+        let borrowed_array_args = [
+            HirGenericArg::Type(borrowed),
+            HirGenericArg::Const(ConstArg::Int {
+                value: Some(1),
+                negated: false,
+            }),
+        ];
+        let (borrowed_array, mut borrowed_paths) =
+            resolved_array_path(&arena, owner, &symbols, 33, &borrowed_array_args);
+        borrowed_paths.extend(bool_paths.clone());
+        let borrowed_tuple_elements = arena.alloc_tys(&[*borrowed_array]);
+        let borrowed_tuple = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 32),
+            kind: HirTyKind::Tuple(borrowed_tuple_elements),
+            span: span(),
+        });
+        let borrowed_params = arena.alloc_tys(&[*borrowed_tuple]);
+        let borrowed_fn = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 31),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: borrowed_params,
+                ret: None,
+                effects: None,
+            },
+            span: span(),
+        });
+        let mut context = LowerTyContext::for_signature(&interner, owner, &borrowed_paths)
+            .with_array_length_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut context, borrowed_fn),
+            Err(UnsupportedTy::FunctionPointerRegion)
+        );
+        assert_eq!(
+            context.next_region_index, 0,
+            "a rejected nested function-pointer borrow does not consume an outer signature region"
+        );
+
+        let param_def = owner.def_id.to_def_id();
+        let (param, param_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            40,
+            "T",
+            None,
+            Res::Def(DefKind::TyParam, param_def),
+        );
+        let param_tuple_elements = arena.alloc_tys(&[*param]);
+        let param_tuple = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 41),
+            kind: HirTyKind::Tuple(param_tuple_elements),
+            span: span(),
+        });
+        let param_types = arena.alloc_tys(&[*param_tuple]);
+        let generic_fn = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 50),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: param_types,
+                ret: None,
+                effects: None,
+            },
+            span: span(),
+        });
+        let mut context = LowerTyContext::for_signature(&interner, owner, &param_paths);
+        assert_eq!(
+            lower_ty(&mut context, generic_fn),
+            Err(UnsupportedTy::FunctionPointerGenericParameter)
+        );
+
+        let (array_param, mut array_param_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            110,
+            "T",
+            None,
+            Res::Def(DefKind::TyParam, param_def),
+        );
+        let array_param_args = [
+            HirGenericArg::Type(array_param),
+            HirGenericArg::Const(ConstArg::Int {
+                value: Some(1),
+                negated: false,
+            }),
+        ];
+        let (param_array, param_array_paths) =
+            resolved_array_path(&arena, owner, &symbols, 120, &array_param_args);
+        array_param_paths.extend(param_array_paths);
+        let param_array_inputs = arena.alloc_tys(&[*param_array]);
+        let param_array_fn = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 130),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: param_array_inputs,
+                ret: None,
+                effects: None,
+            },
+            span: span(),
+        });
+        let mut context = LowerTyContext::for_signature(&interner, owner, &array_param_paths)
+            .with_array_length_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut context, param_array_fn),
+            Err(UnsupportedTy::FunctionPointerGenericParameter)
+        );
+
+        let parameter_name = symbols.intern("T").expect("type parameter name interns");
+        let (adt_parameter, adt_parameter_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            140,
+            "T",
+            None,
+            Res::Def(DefKind::TyParam, param_def),
+        );
+        let adt_args = arena.alloc_generic_args_list(&[HirGenericArg::Type(adt_parameter)]);
+        let adt_generic_args = arena.alloc_generic_args(GenericArgs {
+            args: adt_args,
+            span: span(),
+        });
+        let adt_def = owner.def_id.to_def_id();
+        let (adt_application, mut adt_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            150,
+            "Wrapper",
+            Some(adt_generic_args),
+            Res::Def(DefKind::Struct, adt_def),
+        );
+        adt_paths.extend(adt_parameter_paths);
+        let adt_inputs = arena.alloc_tys(&[*adt_application]);
+        let adt_fn = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 160),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: adt_inputs,
+                ret: None,
+                effects: None,
+            },
+            span: span(),
+        });
+        let unit_enums = HashSet::new();
+        let local_nominals = HashMap::from([(
+            adt_def,
+            LocalNominalDef {
+                type_params: Arc::from([(param_def, parameter_name)]),
+            },
+        )]);
+        let mut context = LowerTyContext::for_signature_with_local_nominals(
+            &interner,
+            owner,
+            &adt_paths,
+            &unit_enums,
+            &local_nominals,
+        );
+        assert_eq!(
+            lower_ty(&mut context, adt_fn),
+            Err(UnsupportedTy::FunctionPointerGenericParameter)
+        );
+
+        for (local_id, kind, expected) in [
+            (52, HirTyKind::Infer, UnsupportedTy::Inference),
+            (54, HirTyKind::Err, UnsupportedTy::Error),
+        ] {
+            let child = arena.alloc_ty(HirTy {
+                hir_id: hir_id(owner, local_id),
+                kind,
+                span: span(),
+            });
+            let children = arena.alloc_tys(&[*child]);
+            let function = arena.alloc_ty(HirTy {
+                hir_id: hir_id(owner, local_id + 1),
+                kind: HirTyKind::FnPtr {
+                    safety: Safety::Safe,
+                    params: children,
+                    ret: None,
+                    effects: None,
+                },
+                span: span(),
+            });
+            let mut context = LowerTyContext::for_signature(&interner, owner, &bool_paths);
+            assert_eq!(lower_ty(&mut context, function), Err(expected));
+        }
+
+        let (foreign_owner, _, _, _) = owner_with_generic_params(&[]);
+        let wrong_owner_child = arena.alloc_ty(HirTy {
+            hir_id: hir_id(foreign_owner, 60),
+            kind: HirTyKind::Tuple(&[]),
+            span: span(),
+        });
+        let wrong_owner_params = arena.alloc_tys(&[*wrong_owner_child]);
+        let wrong_owner_fn = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 61),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: wrong_owner_params,
+                ret: None,
+                effects: None,
+            },
+            span: span(),
+        });
+        let mut context = LowerTyContext::for_signature(&interner, owner, &bool_paths);
+        assert_eq!(
+            lower_ty(&mut context, wrong_owner_fn),
+            Err(UnsupportedTy::OwnerMismatch)
+        );
+
+        let (unresolved, _) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            70,
+            "Bool",
+            None,
+            Res::PrimTy(PrimTy::Bool),
+        );
+        let unresolved_params = arena.alloc_tys(&[*unresolved]);
+        let unresolved_fn = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 80),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: unresolved_params,
+                ret: None,
+                effects: None,
+            },
+            span: span(),
+        });
+        let no_paths = HashMap::new();
+        let mut context = LowerTyContext::for_signature(&interner, owner, &no_paths);
+        assert_eq!(
+            lower_ty(&mut context, unresolved_fn),
+            Err(UnsupportedTy::MissingPathResolution)
+        );
+
+        let (partial, partial_paths) = resolved_qualified_path(
+            &arena,
+            owner,
+            &symbols,
+            90,
+            "module",
+            "Bool",
+            1,
+            Res::PrimTy(PrimTy::Bool),
+        );
+        let partial_params = arena.alloc_tys(&[*partial]);
+        let partial_fn = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 100),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: partial_params,
+                ret: None,
+                effects: None,
+            },
+            span: span(),
+        });
+        let mut context = LowerTyContext::for_signature(&interner, owner, &partial_paths);
+        assert_eq!(
+            lower_ty(&mut context, partial_fn),
+            Err(UnsupportedTy::IncompletePathResolution)
+        );
     }
 
     #[test]
