@@ -157,10 +157,8 @@ fn remote_field_changed_after(case: SyncCase, patch: LocalPatch) -> Bool {
     false
 }
 
-pub fn validate(case: SyncCase) -> Option<SyncIssue> {
-    if (
-        case.server_change_count > MAX_SERVER_CHANGES or case.local_patch_count > MAX_LOCAL_PATCHES
-    ) {
+pub fn validate_server_journal(case: SyncCase) -> Option<SyncIssue> {
+    if case.server_change_count > MAX_SERVER_CHANGES {
         return Some(SyncIssue.CountsExceedCapacity)
     }
     if case.history_floor_revision > case.current_revision {
@@ -188,7 +186,14 @@ pub fn validate(case: SyncCase) -> Option<SyncIssue> {
     if expected_revision != case.current_revision {
         return Some(SyncIssue.HistoryDoesNotCoverCurrentRevision)
     }
+    None
+}
 
+pub fn validate(case: SyncCase) -> Option<SyncIssue> {
+    match validate_server_journal(case) { Some(issue) => return Some(issue), None => {} }
+    if case.local_patch_count > MAX_LOCAL_PATCHES {
+        return Some(SyncIssue.CountsExceedCapacity)
+    }
     for index in 0..case.local_patch_count {
         if case.local_patches[index] == None {
             return Some(SyncIssue.MissingLocalPatch)

@@ -54,7 +54,8 @@ Patches: 8 applied, 0 converged, 1 duplicate arrival, 4 conflicts, 3 held
   exact redelivery, delete-versus-update, a reused event ID, and stale edits.
 - `src/reconcile.sai` validates the retained journal and performs a
   field-level three-way merge.
-- `src/audit.sai` checks batch identity before aggregating results.
+- `src/audit.sai` preflights every case journal and work-order identity before
+  aggregating results.
 - `src/lib.sai` exposes the fixture audit and declares eleven regression tests.
 
 The manifest has no external dependencies and targets `wasm32-core`. The

@@ -107,16 +107,23 @@ test "a stale edit is held without blocking a patch based on retained history" {
 
 test "an incomplete server journal rejects the batch before reconciling any case" {
     var batch = fixtures.sample_batch()
-    batch.cases[0].unwrap().server_change_count = 2
+    var incomplete_case = batch.cases[0].unwrap()
+    incomplete_case.server_change_count = 2
+    batch.cases[0] = Some(incomplete_case)
     let result = audit.audit_all(batch)
     assert result.issue == Some(SyncIssue.HistoryDoesNotCoverCurrentRevision)
     assert result.result_count == 0
+    assert result.applied_patch_count == 0
+    assert result.needs_review_count == 0
 }
 
 test "duplicate work-order cases are rejected before any patch is applied" {
     var batch = fixtures.sample_batch()
-    batch.cases[1].unwrap().server_state.id = batch.cases[0].unwrap().server_state.id
+    var duplicate_case = batch.cases[1].unwrap()
+    duplicate_case.server_state.id = batch.cases[0].unwrap().server_state.id
+    batch.cases[1] = Some(duplicate_case)
     let result = audit.audit_all(batch)
     assert result.issue == Some(SyncIssue.DuplicateWorkOrderId)
     assert result.result_count == 0
+    assert result.applied_patch_count == 0
 }

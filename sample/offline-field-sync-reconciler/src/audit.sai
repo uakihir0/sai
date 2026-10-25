@@ -13,8 +13,13 @@ fn batch_issue(batch: SyncBatch) -> Option<SyncIssue> {
         return Some(SyncIssue.BatchCountExceedsCapacity)
     }
     for index in 0..batch.case_count {
-        if batch.cases[index] == None {
-            return Some(SyncIssue.MissingCase)
+        let case = match batch.cases[index] {
+            Some(case) => case
+            None => return Some(SyncIssue.MissingCase)
+        }
+        match reconcile.validate_server_journal(case) {
+            Some(issue) => return Some(issue)
+            None => {}
         }
     }
     for left_index in 0..batch.case_count {
