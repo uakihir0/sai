@@ -2532,6 +2532,103 @@ pub enum FunctionSignatureProjection {
     Unsupported(sai_ty::lower_ty::UnsupportedFnSig),
 }
 
+/// Resolution outcome for one direct, uppercase `E.V` expression path.
+///
+/// Every successful or diagnosed result remains tied to the exact HIR enum
+/// owner and definition. `NotEnum` is limited to a current-package type owner;
+/// dependencies, WIT items, aliases, and unsupported local enum definitions
+/// stay deferred for their owning resolver.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalEnumVariantPathOutcome {
+    Resolved {
+        enum_owner: OwnerId,
+        enum_def: DefId,
+        variant: DefId,
+    },
+    UnknownVariant {
+        enum_owner: OwnerId,
+        enum_def: DefId,
+        candidates: Vec<Symbol>,
+    },
+    NotEnum {
+        type_owner: OwnerId,
+        type_def: DefId,
+    },
+    UnsupportedEnum {
+        enum_owner: OwnerId,
+        enum_def: DefId,
+        reason: LocalEnumAdtUnsupportedReason,
+    },
+}
+
+/// One direct enum-variant suffix and the exact HIR/source identity used to
+/// resolve it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumVariantPathEntry {
+    field: HirId,
+    base_path: HirId,
+    name: Symbol,
+    field_span: sai_hir::Span,
+    name_span: sai_hir::Span,
+    outcome: LocalEnumVariantPathOutcome,
+}
+
+impl LocalEnumVariantPathEntry {
+    /// HIR identity of the field expression containing the variant suffix.
+    pub const fn field(&self) -> HirId {
+        self.field
+    }
+
+    /// HIR identity of the direct path used as the enum type head.
+    pub const fn base_path(&self) -> HirId {
+        self.base_path
+    }
+
+    /// Source-level spelling of the variant suffix.
+    pub const fn name(&self) -> Symbol {
+        self.name
+    }
+
+    /// Full field-expression span retained from HIR.
+    pub const fn field_span(&self) -> sai_hir::Span {
+        self.field_span
+    }
+
+    /// Variant-name span retained from HIR.
+    pub const fn name_span(&self) -> sai_hir::Span {
+        self.name_span
+    }
+
+    /// Exact local enum, variant, or typed failure outcome.
+    pub const fn outcome(&self) -> &LocalEnumVariantPathOutcome {
+        &self.outcome
+    }
+}
+
+/// Owned direct enum-variant paths and diagnostics for one function owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumVariantPathResolution {
+    owner: OwnerId,
+    entries: HashMap<HirId, LocalEnumVariantPathEntry>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl LocalEnumVariantPathResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    /// Results keyed by the HIR identity of each direct field expression.
+    pub fn entries(&self) -> &HashMap<HirId, LocalEnumVariantPathEntry> {
+        &self.entries
+    }
+
+    /// Source-ordered unknown-variant and non-enum diagnostics.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+}
+
 impl FunctionOwnerResolution {
     pub const fn owner(&self) -> OwnerId {
         self.owner
