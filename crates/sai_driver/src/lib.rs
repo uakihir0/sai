@@ -9580,6 +9580,78 @@ fn local_enum_variant_parameter_primitive(
     }
 }
 
+fn local_enum_variant_annotated_local_primitive(
+    value: &HirExpr<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<sai_resolve::prelude::PrimTy> {
+    let ExprKind::Path(path) = value.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return None;
+    }
+    let PathRes {
+        base: Res::Local(binding),
+        resolved_segments: 1,
+        segment_count: 1,
+    } = *locals.paths.get(&path.hir_id)?
+    else {
+        return None;
+    };
+    let binding_kind = locals.bindings.get(&binding)?.kind;
+    if !matches!(binding_kind, BindingKind::Let | BindingKind::Var) {
+        return None;
+    }
+
+    let ExprKind::Block(body_block) = body.value.kind else {
+        return None;
+    };
+    let mut annotated_type = None;
+    for statement in body_block.stmts {
+        let StmtKind::Let {
+            pat,
+            ty: Some(ty),
+            els: None,
+            ..
+        } = statement.kind
+        else {
+            continue;
+        };
+        let PatKind::Binding {
+            mode,
+            name,
+            binding: declared_binding,
+            sub: None,
+        } = pat.kind
+        else {
+            continue;
+        };
+        if declared_binding != binding {
+            continue;
+        }
+        if name.sym != path.segments[0].name.sym
+            || !matches!(
+                (binding_kind, mode),
+                (BindingKind::Let, sai_hir::patterns::BindingMode::Value)
+                    | (BindingKind::Var, sai_hir::patterns::BindingMode::Var)
+            )
+            || annotated_type.is_some()
+        {
+            return None;
+        }
+        annotated_type = Some(ty);
+    }
+
+    match resolve_function_direct_type(*annotated_type?, type_paths, symbols, inputs)? {
+        FunctionDirectType::Primitive(primitive) => Some(primitive),
+        FunctionDirectType::Str | FunctionDirectType::Unit => None,
+    }
+}
+
 fn check_local_enum_variant_parameter_argument(
     owner: OwnerId,
     expected_type: &sai_ty::ty::Ty,
@@ -9599,7 +9671,12 @@ fn check_local_enum_variant_parameter_argument(
     };
     let Some(actual) = local_enum_variant_parameter_primitive(
         value, hir_owner, body, locals, type_paths, symbols, inputs,
-    ) else {
+    )
+    .or_else(|| {
+        local_enum_variant_annotated_local_primitive(
+            value, body, locals, type_paths, symbols, inputs,
+        )
+    }) else {
         return Ok(None);
     };
     if expected == actual {
@@ -97389,9 +97466,18 @@ interface facade { use middle.{payload}; }"#;
             "fn tuple_call_param_ok(actual: U8) { Payload.Pair(actual, true) }\n",
             "fn tuple_call_mut_param_ok(var actual: U8) { Payload.Pair(actual, true) }\n",
             "fn tuple_call_raw_param_ok(r#actual: U8) { Payload.Pair(r#actual, true) }\n",
+            "fn tuple_call_annotated_let_ok() {\n    let actual: U8 = 1\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_var_ok() {\n    var actual: U8 = 1\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_mismatch() {\n    let actual: Bool = true\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_var_mismatch() {\n    var actual: Bool = true\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_shadowing(actual: Bool) {\n    let actual: U8 = 1\n    Payload.Pair(1, actual)\n}\n",
+            "fn tuple_call_annotated_nested_scope(actual: Bool) {\n    {\n        let actual: U8 = 1\n    }\n    Payload.Pair(1, actual)\n}\n",
+            "fn tuple_call_annotated_extra() {\n    let extra: Bool = true\n    Payload.Pair(1, true, extra)\n}\n",
+            "fn tuple_call_unannotated_local() {\n    let actual = 1 + 2\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_param_mismatch(actual: Bool) { Payload.Pair(actual, true) }\n",
             "fn tuple_call_unicode_param_mismatch(値: Bool) { Payload.Pair(値, true) }\n",
             "fn nested_call_param_mismatch(actual: USize) { NestedPayload.Nested(((actual, 'x'), ((), 2))) }\n",
+            "fn nested_call_annotated_mismatch() {\n    let actual: USize = 2\n    NestedPayload.Nested(((actual, 'x'), ((), 2)))\n}\n",
             "fn tuple_call_shadowed(actual: Bool) { let actual: U8 = 1; Payload.Pair(actual, true) }\n",
             "fn tuple_call_named_param_mismatch(actual: Bool) { Payload.Pair(left: actual, true) }\n",
             "fn tuple_call_param_too_many(actual: Bool) { Payload.Pair(1, true, actual) }\n",
@@ -97926,6 +98012,17 @@ interface facade { use middle.{payload}; }"#;
                 .range;
             root[span.start().to_usize()..span.end().to_usize()].to_owned()
         };
+        let assert_primary_span = |diagnostic: &sai_diagnostics::Diagnostic,
+                                   expected_start: usize,
+                                   expected_len: usize| {
+            let span = diagnostic
+                .primary()
+                .expect("diagnostic has a primary span")
+                .span
+                .range;
+            assert_eq!(span.start().to_usize(), expected_start);
+            assert_eq!(span.end().to_usize(), expected_start + expected_len);
+        };
 
         for name in [
             "tuple_call_literal_ok",
@@ -97934,16 +98031,37 @@ interface facade { use middle.{payload}; }"#;
             "tuple_call_mut_param_ok",
             "tuple_call_raw_param_ok",
             "tuple_call_shadowed",
+            "tuple_call_annotated_let_ok",
+            "tuple_call_annotated_var_ok",
+            "tuple_call_annotated_nested_scope",
+            "tuple_call_unannotated_local",
         ] {
             assert!(
                 paths_for(name).call_diagnostics().is_empty(),
-                "{name}: matching direct literals and nonliteral expressions are accepted by this bounded check"
+                "{name}: matching direct values and unsupported inferred locals are accepted by this bounded check; diagnostics: {:?}",
+                paths_for(name).call_diagnostics()
             );
         }
 
         for (name, expected_message) in [
             ("tuple_call_param_mismatch", "expected `U8`, found `Bool`"),
+            (
+                "tuple_call_annotated_mismatch",
+                "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_annotated_var_mismatch",
+                "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_annotated_shadowing",
+                "expected `Bool`, found `U8`",
+            ),
             ("nested_call_param_mismatch", "expected `I8`, found `USize`"),
+            (
+                "nested_call_annotated_mismatch",
+                "expected `I8`, found `USize`",
+            ),
             (
                 "tuple_call_unicode_param_mismatch",
                 "expected `U8`, found `Bool`",
@@ -97970,6 +98088,42 @@ interface facade { use middle.{payload}; }"#;
                 expected_path,
                 "{name}"
             );
+            if matches!(
+                name,
+                "tuple_call_annotated_mismatch" | "tuple_call_annotated_var_mismatch"
+            ) {
+                let function_start = root
+                    .find(if name == "tuple_call_annotated_mismatch" {
+                        "fn tuple_call_annotated_mismatch() {"
+                    } else {
+                        "fn tuple_call_annotated_var_mismatch() {"
+                    })
+                    .expect("annotated mismatch function exists");
+                let local_path_start = function_start
+                    + root[function_start..]
+                        .find("Payload.Pair(actual, true)")
+                        .expect("annotated local argument call exists")
+                    + "Payload.Pair(".len();
+                assert_primary_span(
+                    &paths.call_diagnostics()[0],
+                    local_path_start,
+                    "actual".len(),
+                );
+            } else if name == "tuple_call_annotated_shadowing" {
+                let function_start = root
+                    .find("fn tuple_call_annotated_shadowing(actual: Bool) {")
+                    .expect("shadowed local function exists");
+                let local_path_start = function_start
+                    + root[function_start..]
+                        .find("Payload.Pair(1, actual)")
+                        .expect("shadowed local argument call exists")
+                    + "Payload.Pair(1, ".len();
+                assert_primary_span(
+                    &paths.call_diagnostics()[0],
+                    local_path_start,
+                    "actual".len(),
+                );
+            }
         }
 
         let named_parameter_mismatch = paths_for("tuple_call_named_param_mismatch");
@@ -98001,6 +98155,13 @@ interface facade { use middle.{payload}; }"#;
         assert_eq!(
             parameter_too_many.call_diagnostics()[0].code,
             sai_diagnostics::Code::WrongArgumentCount
+        );
+        let annotated_extra = paths_for("tuple_call_annotated_extra");
+        assert_eq!(annotated_extra.call_diagnostics().len(), 1);
+        assert_eq!(
+            annotated_extra.call_diagnostics()[0].code,
+            sai_diagnostics::Code::WrongArgumentCount,
+            "an annotated local in an unmatched extra argument receives no expected-type check"
         );
 
         let tuple_call_mismatch = paths_for("tuple_call_mismatch");
