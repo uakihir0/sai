@@ -1,0 +1,186 @@
+use acme:bounded-gc-heap-lab/model.{
+    CollectionReport
+    CollectionStatus
+    Heap
+    HeapObject
+    MAX_OBJECTS
+}
+
+fn object_index(heap: Heap, id: U32) -> Option<USize> {
+    for index in 0..heap.object_count {
+        match heap.objects[index] {
+            Some(object) => {
+                if object.id == id {
+                    return Some(index)
+                }
+            }
+            None => return None
+        }
+    }
+    None
+}
+
+fn valid_heap(heap: Heap, heap_words: U32) -> Bool {
+    if (heap.object_count > MAX_OBJECTS or heap.root_count > heap.roots.len()) {
+        return false
+    }
+    if heap_words == 0 {
+        return heap.object_count == 0 and heap.root_count == 0
+    }
+
+    for index in 0..heap.object_count {
+        let object = match heap.objects[index] { Some(value) => value, None => return false }
+        if (
+            object.id == 0
+            or object.words == 0
+            or object.start > heap_words
+            or object.words > heap_words - object.start
+            or object.reference_count > object.references.len()
+        ) {
+            return false
+        }
+
+        for prior_index in 0..index {
+            let prior = heap.objects[prior_index].unwrap()
+            if (prior.id == object.id or object.start < prior.start + prior.words) {
+                return false
+            }
+        }
+
+        for reference_index in 0..object.reference_count {
+            let target_id = match object.references[reference_index] {
+                Some(value) => value
+                None => return false
+            }
+            if object_index(heap, target_id) == None {
+                return false
+            }
+        }
+    }
+
+    for root_index in 0..heap.root_count {
+        let root_id = match heap.roots[root_index] { Some(value) => value, None => return false }
+        if object_index(heap, root_id) == None {
+            return false
+        }
+    }
+
+    true
+}
+
+fn invalid_report() -> CollectionReport {
+    CollectionReport(
+        status: CollectionStatus.InvalidHeap,
+        compacted_objects: Array<Option<HeapObject>, MAX_OBJECTS>.filled(None),
+        survivor_count: 0,
+        reclaimed_ids: Array<Option<U32>, MAX_OBJECTS>.filled(None),
+        reclaimed_count: 0,
+        reclaimed_words: 0,
+        free_words: 0,
+        free_extent_count_before: 0,
+        largest_free_extent_before: 0,
+        largest_free_extent_after: 0,
+        moved_words: 0,
+    )
+}
+
+pub fn collect(heap: Heap, heap_words: U32) -> CollectionReport {
+    if not valid_heap(heap, heap_words) {
+        return invalid_report()
+    }
+
+    var marked = Array<Bool, MAX_OBJECTS>.filled(false)
+    var worklist = Array<Option<USize>, MAX_OBJECTS>.filled(None)
+    var worklist_length: USize = 0
+
+    for root_index in 0..heap.root_count {
+        let root_id = heap.roots[root_index].unwrap()
+        let index = object_index(heap, root_id).unwrap()
+        if not marked[index] {
+            marked[index] = true
+            worklist[worklist_length] = Some(index)
+            worklist_length += 1
+        }
+    }
+
+    var head: USize = 0
+    while head < worklist_length {
+        let index = worklist[head].unwrap()
+        let object = heap.objects[index].unwrap()
+        for reference_index in 0..object.reference_count {
+            let target_id = object.references[reference_index].unwrap()
+            let target_index = object_index(heap, target_id).unwrap()
+            if not marked[target_index] {
+                marked[target_index] = true
+                worklist[worklist_length] = Some(target_index)
+                worklist_length += 1
+            }
+        }
+        head += 1
+    }
+
+    var compacted = Array<Option<HeapObject>, MAX_OBJECTS>.filled(None)
+    var reclaimed_ids = Array<Option<U32>, MAX_OBJECTS>.filled(None)
+    var survivor_count: USize = 0
+    var reclaimed_count: USize = 0
+    var reclaimed_words: U32 = 0
+    var free_extent_count_before: USize = 0
+    var largest_free_extent_before: U32 = 0
+    var scan_cursor: U32 = 0
+
+    for index in 0..heap.object_count {
+        let object = heap.objects[index].unwrap()
+        if marked[index] {
+            if object.start > scan_cursor {
+                let gap = object.start - scan_cursor
+                free_extent_count_before += 1
+                if gap > largest_free_extent_before {
+                    largest_free_extent_before = gap
+                }
+            }
+            scan_cursor = object.start + object.words
+        } else {
+            reclaimed_ids[reclaimed_count] = Some(object.id)
+            reclaimed_count += 1
+            reclaimed_words += object.words
+        }
+    }
+    if heap_words > scan_cursor {
+        let tail = heap_words - scan_cursor
+        free_extent_count_before += 1
+        if tail > largest_free_extent_before {
+            largest_free_extent_before = tail
+        }
+    }
+
+    var compacted_cursor: U32 = 0
+    var moved_words: U32 = 0
+    for index in 0..heap.object_count {
+        let object = heap.objects[index].unwrap()
+        if marked[index] {
+            if object.start != compacted_cursor {
+                moved_words += object.words
+            }
+            var packed = object
+            packed.start = compacted_cursor
+            compacted[survivor_count] = Some(packed)
+            survivor_count += 1
+            compacted_cursor += packed.words
+        }
+    }
+
+    let free_words = heap_words - compacted_cursor
+    CollectionReport(
+        status: CollectionStatus.Complete,
+        compacted_objects: compacted,
+        survivor_count: survivor_count,
+        reclaimed_ids: reclaimed_ids,
+        reclaimed_count: reclaimed_count,
+        reclaimed_words: reclaimed_words,
+        free_words: free_words,
+        free_extent_count_before: free_extent_count_before,
+        largest_free_extent_before: largest_free_extent_before,
+        largest_free_extent_after: free_words,
+        moved_words: moved_words,
+    )
+}

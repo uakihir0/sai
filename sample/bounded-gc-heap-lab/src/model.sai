@@ -1,0 +1,41 @@
+pub const MAX_OBJECTS: USize = 12
+pub const MAX_ROOTS: USize = 4
+pub const MAX_REFERENCES: USize = 3
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CollectionStatus {
+    Complete
+    InvalidHeap
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type HeapObject {
+    pub id: U32
+    pub start: U32
+    pub words: U32
+    pub reference_count: USize
+    pub references: Array<Option<U32>, MAX_REFERENCES>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Heap {
+    pub objects: Array<Option<HeapObject>, MAX_OBJECTS>
+    pub object_count: USize
+    pub roots: Array<Option<U32>, MAX_ROOTS>
+    pub root_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CollectionReport {
+    pub status: CollectionStatus
+    pub compacted_objects: Array<Option<HeapObject>, MAX_OBJECTS>
+    pub survivor_count: USize
+    pub reclaimed_ids: Array<Option<U32>, MAX_OBJECTS>
+    pub reclaimed_count: USize
+    pub reclaimed_words: U32
+    pub free_words: U32
+    pub free_extent_count_before: USize
+    pub largest_free_extent_before: U32
+    pub largest_free_extent_after: U32
+    pub moved_words: U32
+}
