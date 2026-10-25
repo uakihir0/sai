@@ -80,6 +80,8 @@ source repository before a package resolver can fetch them.
 | Advanced | [`orbital-conjunction-review`](orbital-conjunction-review/README.md) | Rank fictional satellite conjunction alerts by uncertainty-adjusted miss distance and review maneuver timing, spacecraft limits, and protected propellant reserves. |
 | Advanced | [`order-fulfillment-saga`](order-fulfillment-saga/README.md) | Replay multi-step order events with operation-key idempotency, bounded retries, reverse-order compensation, and partial-failure audit states. |
 | Advanced | [`accessible-audio-release-auditor`](accessible-audio-release-auditor/README.md) | Audit a fictional audiobook release for required audio parts, chapter synchronization, timed transcript and description coverage, version consistency, and accessibility approvals. |
+| Advanced | [`privacy-request-coordinator`](privacy-request-coordinator/README.md) | Coordinate a fictional access and erasure request across stores with identity and scope gates, legal holds, retention, dependency-ordered deletions, retries, and auditable partial results. |
+| Advanced | [`smart-building-comfort-controller`](smart-building-comfort-controller/README.md) | Plan requested setpoints and ventilation under comfort bands, target hysteresis, price and carbon budgets, equipment limits, and visible unmet requests. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
