@@ -95977,7 +95977,7 @@ interface facade { use middle.{payload}; }"#;
         let complete_char = database.semantic_types.intern(sai_ty::ty::TyKind::Char);
         let complete_application = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
             complete_owner.def_id.to_def_id(),
-            Arc::from([complete_bool.clone(), complete_char]),
+            Arc::from([complete_bool.clone(), complete_char.clone()]),
         ));
         let specialized = complete_adt
             .instantiate_tuple_variant_signature(
@@ -95986,8 +95986,23 @@ interface facade { use middle.{payload}; }"#;
                 complete_variants[0].def_id(),
             )
             .expect("the exact generic application specializes its tuple constructor once");
-        assert_eq!(specialized.inputs(), &[complete_bool]);
+        assert_eq!(specialized.inputs(), &[complete_bool.clone()]);
         assert_eq!(specialized.output(), &complete_application);
+        let complete_function_item = database.semantic_types.fn_def(
+            complete_variants[0].def_id(),
+            Arc::from([complete_bool.clone(), complete_char]),
+        );
+        let specialized_from_item = complete_adt
+            .instantiate_tuple_variant_fn_def_signature(
+                &database.semantic_types,
+                &complete_function_item,
+            )
+            .expect("the validated projection specializes the exact tuple function item");
+        assert_eq!(specialized_from_item.inputs(), &[complete_bool]);
+        assert!(
+            specialized_from_item.output().ptr_eq(&complete_application),
+            "the function item supplies exact enum output identity and ordered arguments"
+        );
 
         let LocalEnumVariantPayload::Tuple(value) = variants[0].payload() else {
             panic!("Value has a tuple payload")

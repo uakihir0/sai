@@ -396,6 +396,7 @@ pub enum LocalEnumVariantTypeError {
     UnknownVariant(DefId),
     InvalidTypeParameters,
     InvalidPayloadShape(DefId),
+    NotFnDef,
     NotAdt,
     WrongEnum { expected: DefId, found: DefId },
     WrongNumberOfTypeArguments { expected: usize, found: usize },
@@ -693,6 +694,53 @@ impl LocalEnumAdtDef {
             inputs,
             enum_ty.clone(),
         ))
+    }
+
+    /// Specialize the signature of an exact tuple-variant function item.
+    ///
+    /// The variant identity and its ordered type arguments come from the
+    /// supplied `FnDef`; the matching enum application is constructed here so
+    /// callers cannot pair the function item with a different enum or
+    /// variant. Only a tuple variant belonging to this validated definition
+    /// is accepted. Payload inputs use the same one-step substitution as
+    /// [`Self::instantiate_tuple_variant_signature`].
+    pub fn instantiate_tuple_variant_fn_def_signature(
+        &self,
+        interner: &crate::ty::TyInterner,
+        function_item: &crate::ty::Ty,
+    ) -> Result<crate::ty::FnSig, LocalEnumVariantTypeError> {
+        let crate::ty::TyKind::FnDef(variant, type_args) = function_item.kind() else {
+            return Err(LocalEnumVariantTypeError::NotFnDef);
+        };
+        let expected_args = match self.value_type_of_variant(interner, *variant)? {
+            LocalEnumVariantValueType::TupleConstructor { function_item, .. } => {
+                let crate::ty::TyKind::FnDef(expected_variant, identity_args) =
+                    function_item.kind()
+                else {
+                    return Err(LocalEnumVariantTypeError::InvalidPayloadShape(*variant));
+                };
+                if expected_variant != variant {
+                    return Err(LocalEnumVariantTypeError::InvalidPayloadShape(*variant));
+                }
+                identity_args.len()
+            }
+            LocalEnumVariantValueType::Unit(_)
+            | LocalEnumVariantValueType::RecordHasNoValueType => {
+                return Err(LocalEnumVariantTypeError::NotTupleVariant(*variant));
+            }
+        };
+        if type_args.len() != expected_args {
+            return Err(LocalEnumVariantTypeError::WrongNumberOfTypeArguments {
+                expected: expected_args,
+                found: type_args.len(),
+            });
+        }
+
+        let enum_ty = interner.intern(crate::ty::TyKind::Adt(
+            self.payloads.owner(),
+            type_args.clone(),
+        ));
+        self.instantiate_tuple_variant_signature(interner, &enum_ty, *variant)
     }
 
     fn variant_template(
@@ -2519,10 +2567,72 @@ mod tests {
         );
         assert_eq!(instantiated.output(), &concrete_enum);
 
+        let bool_ty = interner.intern(crate::ty::TyKind::Bool);
+        let function_item = interner.fn_def(
+            variant_ids[1],
+            Arc::from([caller_param.clone(), bool_ty.clone()]),
+        );
+        let from_function_item = definition
+            .instantiate_tuple_variant_fn_def_signature(&interner, &function_item)
+            .unwrap();
+        assert!(from_function_item.generic_params().is_empty());
+        assert_eq!(
+            from_function_item.inputs(),
+            &[
+                caller_param.clone(),
+                interner.tuple([bool_ty.clone(), caller_param.clone()]),
+            ],
+            "the FnDef arguments remain ordered and replacements are not recursively rebound"
+        );
+        let expected_enum = interner.intern(crate::ty::TyKind::Adt(
+            ids.owner.to_def_id(),
+            Arc::from([caller_param.clone(), bool_ty.clone()]),
+        ));
+        assert!(from_function_item.output().ptr_eq(&expected_enum));
+
         let unknown_variant = ids.owner.to_def_id();
         assert_eq!(
             definition.value_type_of_variant(&interner, unknown_variant),
             Err(LocalEnumVariantTypeError::UnknownVariant(unknown_variant))
+        );
+        let unknown_function_item = interner.fn_def(
+            unknown_variant,
+            Arc::from([caller_param.clone(), bool_ty.clone()]),
+        );
+        assert_eq!(
+            definition
+                .instantiate_tuple_variant_fn_def_signature(&interner, &unknown_function_item,),
+            Err(LocalEnumVariantTypeError::UnknownVariant(unknown_variant))
+        );
+        let other_owner = ids
+            .paths
+            .intern(
+                DefPath::new(
+                    ids.owner.package(),
+                    vec![DisambiguatedDefPathData {
+                        data: DefPathData::TypeNs(ids.symbols.intern("Other").unwrap()),
+                        disambiguator: 0,
+                    }],
+                    &ids.packages,
+                    &ids.symbols,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let other_variant = ids
+            .paths
+            .intern_variants(other_owner, &[(ids.symbols.intern("Pair").unwrap(), 0)])
+            .unwrap()[0]
+            .to_def_id();
+        let same_named_other_item = interner.fn_def(
+            other_variant,
+            Arc::from([caller_param.clone(), bool_ty.clone()]),
+        );
+        assert_eq!(
+            definition
+                .instantiate_tuple_variant_fn_def_signature(&interner, &same_named_other_item,),
+            Err(LocalEnumVariantTypeError::UnknownVariant(other_variant)),
+            "a same-named variant from another enum is rejected by exact DefId"
         );
         assert_eq!(
             definition.instantiate_tuple_variant_signature(
@@ -2555,6 +2665,14 @@ mod tests {
                 found: 1,
             })
         );
+        let wrong_fn_def_arity = interner.fn_def(variant_ids[1], Arc::from([caller_param.clone()]));
+        assert_eq!(
+            definition.instantiate_tuple_variant_fn_def_signature(&interner, &wrong_fn_def_arity,),
+            Err(LocalEnumVariantTypeError::WrongNumberOfTypeArguments {
+                expected: 2,
+                found: 1,
+            })
+        );
         assert_eq!(
             definition.instantiate_tuple_variant_signature(
                 &interner,
@@ -2562,6 +2680,121 @@ mod tests {
                 variant_ids[1],
             ),
             Err(LocalEnumVariantTypeError::NotAdt)
+        );
+        assert_eq!(
+            definition.instantiate_tuple_variant_fn_def_signature(&interner, &caller_param),
+            Err(LocalEnumVariantTypeError::NotFnDef)
+        );
+        for variant in [variant_ids[0], variant_ids[2]] {
+            let function_item =
+                interner.fn_def(variant, Arc::from([caller_param.clone(), bool_ty.clone()]));
+            assert_eq!(
+                definition.instantiate_tuple_variant_fn_def_signature(&interner, &function_item,),
+                Err(LocalEnumVariantTypeError::NotTupleVariant(variant))
+            );
+        }
+    }
+
+    #[test]
+    fn non_generic_tuple_variant_function_item_signature_keeps_exact_owner() {
+        let ids = test_ids();
+        let names = [
+            ids.symbols.intern("Empty").unwrap(),
+            ids.symbols.intern("Value").unwrap(),
+            ids.symbols.intern("Named").unwrap(),
+        ];
+        let variant_paths = ids
+            .paths
+            .intern_variants(ids.owner, &names.map(|name| (name, 0)))
+            .unwrap();
+        let variant_ids = variant_paths
+            .iter()
+            .map(|variant| variant.to_def_id())
+            .collect::<Vec<_>>();
+        let field_name = ids.symbols.intern("value").unwrap();
+        let mut field_components = ids
+            .paths
+            .resolve(variant_paths[2])
+            .unwrap()
+            .unwrap()
+            .data()
+            .to_vec();
+        field_components.push(DisambiguatedDefPathData {
+            data: DefPathData::Field(field_name),
+            disambiguator: 0,
+        });
+        let field_id = ids
+            .paths
+            .intern(
+                DefPath::new(
+                    ids.owner.package(),
+                    field_components,
+                    &ids.packages,
+                    &ids.symbols,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .to_def_id();
+        let interner = crate::ty::TyInterner::new();
+        let boolean = interner.intern(crate::ty::TyKind::Bool);
+        let payloads = LocalEnumPayloadTemplateDef::try_new(
+            ids.owner.to_def_id(),
+            Arc::<[(sai_hir::DefId, crate::ty::ParamTy)]>::from([]),
+            Arc::from([
+                LocalEnumPayloadVariantTemplateDef::new(
+                    variant_ids[0],
+                    names[0],
+                    LocalEnumPayloadTemplateShape::Unit,
+                ),
+                LocalEnumPayloadVariantTemplateDef::new(
+                    variant_ids[1],
+                    names[1],
+                    LocalEnumPayloadTemplateShape::Tuple(Arc::from([
+                        LocalEnumTuplePayloadTemplate::new(variant_ids[1], 0, boolean.clone()),
+                    ])),
+                ),
+                LocalEnumPayloadVariantTemplateDef::new(
+                    variant_ids[2],
+                    names[2],
+                    LocalEnumPayloadTemplateShape::Record(Arc::from([
+                        LocalEnumRecordPayloadTemplate::new(
+                            variant_ids[2],
+                            field_id,
+                            field_name,
+                            Visibility::Pub,
+                            boolean.clone(),
+                        ),
+                    ])),
+                ),
+            ]),
+        )
+        .unwrap();
+        let definition = LocalEnumAdtDef {
+            payloads,
+            repr: None,
+            discr_ty: IntTy::I64,
+            discriminants: Arc::from([]),
+        };
+        let function_item = interner.fn_def(variant_ids[1], Arc::from([]));
+
+        let signature = definition
+            .instantiate_tuple_variant_fn_def_signature(&interner, &function_item)
+            .unwrap();
+        assert!(signature.generic_params().is_empty());
+        assert_eq!(signature.inputs(), &[boolean.clone()]);
+        assert_eq!(
+            signature.output().kind(),
+            &crate::ty::TyKind::Adt(ids.owner.to_def_id(), Arc::from([]))
+        );
+
+        let unexpected_argument = interner.fn_def(variant_ids[1], Arc::from([boolean]));
+        assert_eq!(
+            definition.instantiate_tuple_variant_fn_def_signature(&interner, &unexpected_argument,),
+            Err(LocalEnumVariantTypeError::WrongNumberOfTypeArguments {
+                expected: 0,
+                found: 1,
+            })
         );
     }
 
@@ -2621,6 +2854,12 @@ mod tests {
             .to_def_id();
         assert_eq!(
             definition.value_type_of_variant(&interner, foreign_variant),
+            Err(LocalEnumVariantTypeError::ForeignVariant(foreign_variant))
+        );
+        let foreign_function_item = interner.fn_def(foreign_variant, Arc::from([]));
+        assert_eq!(
+            definition
+                .instantiate_tuple_variant_fn_def_signature(&interner, &foreign_function_item,),
             Err(LocalEnumVariantTypeError::ForeignVariant(foreign_variant))
         );
 
