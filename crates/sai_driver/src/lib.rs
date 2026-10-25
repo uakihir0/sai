@@ -36892,7 +36892,7 @@ property "shared"() {}
         ));
         assert!(matches!(
             aliases.inputs()[2].kind(),
-            sai_ty::ty::TyKind::Array(element, 4)
+            sai_ty::ty::TyKind::Array(element, sai_ty::ty::Const::Value(4))
                 if matches!(element.kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8))
         ));
         assert!(aliases.inputs()[0].ptr_eq(aliases.output()));
@@ -37056,7 +37056,7 @@ property "shared"() {}
         assert!(matches!(pair[1].kind(), sai_ty::ty::TyKind::Bool));
         assert!(matches!(
             ordered.inputs()[1].kind(),
-            sai_ty::ty::TyKind::Array(element, 3)
+            sai_ty::ty::TyKind::Array(element, sai_ty::ty::Const::Value(3))
                 if matches!(element.kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8))
         ));
         assert!(matches!(ordered.output().kind(), sai_ty::ty::TyKind::Char));
@@ -37118,12 +37118,12 @@ property "shared"() {}
         );
         assert!(matches!(
             nested_inputs[1].kind(),
-            sai_ty::ty::TyKind::Array(element, 2)
+            sai_ty::ty::TyKind::Array(element, sai_ty::ty::Const::Value(2))
                 if element.kind() == &sai_ty::ty::TyKind::Param(nested_binder)
         ));
         assert!(matches!(
             nested_callback.output().kind(),
-            sai_ty::ty::TyKind::Array(element, 3)
+            sai_ty::ty::TyKind::Array(element, sai_ty::ty::Const::Value(3))
                 if element.kind() == &sai_ty::ty::TyKind::Param(nested_binder)
         ));
         assert_eq!(
@@ -37782,7 +37782,8 @@ property "shared"() {}
                 };
                 assert!(matches!(
                     signature.inputs()[0].kind(),
-                    sai_ty::ty::TyKind::Array(_, length) if *length == expected_length
+                    sai_ty::ty::TyKind::Array(_, sai_ty::ty::Const::Value(length))
+                        if *length == expected_length
                 ));
             };
             let unsupported_array_length = |index: usize| {
@@ -37802,7 +37803,7 @@ property "shared"() {}
             };
             assert!(matches!(
                 zero.inputs()[0].kind(),
-                sai_ty::ty::TyKind::Array(_, 0)
+                sai_ty::ty::TyKind::Array(_, sai_ty::ty::Const::Value(0))
             ));
             assert_eq!(
                 zero.inputs()[0].kind(),
@@ -37823,10 +37824,14 @@ property "shared"() {}
                 panic!("nested built-in arrays with the exact function binder are supported");
             };
             let nested_param = nested.type_params()[0].param;
-            let sai_ty::ty::TyKind::Array(outer_element, 4) = nested.inputs()[0].kind() else {
+            let sai_ty::ty::TyKind::Array(outer_element, sai_ty::ty::Const::Value(4)) =
+                nested.inputs()[0].kind()
+            else {
                 panic!("the outer array retains its length");
             };
-            let sai_ty::ty::TyKind::Array(inner_element, 2) = outer_element.kind() else {
+            let sai_ty::ty::TyKind::Array(inner_element, sai_ty::ty::Const::Value(2)) =
+                outer_element.kind()
+            else {
                 panic!("the inner array retains its length");
             };
             assert_eq!(
@@ -37839,7 +37844,9 @@ property "shared"() {}
             let FunctionSignatureProjection::Supported(borrowed) = projection(6) else {
                 panic!("a borrow inside an array element participates in signature lowering");
             };
-            let sai_ty::ty::TyKind::Array(element, 4) = borrowed.inputs()[0].kind() else {
+            let sai_ty::ty::TyKind::Array(element, sai_ty::ty::Const::Value(4)) =
+                borrowed.inputs()[0].kind()
+            else {
                 panic!("the first argument is the array");
             };
             assert!(matches!(
@@ -37916,10 +37923,162 @@ property "shared"() {}
     }
 
     #[test]
+    fn function_signature_projection_lowers_only_owner_local_usize_array_parameters() {
+        let root = concat!(
+            "const GLOBAL_N: USize = 4\n",
+            "type Packet<const M: USize> { value: U8 }\n",
+            "fn only_const<const N: USize>(value: Array<U8, N>) -> Array<U8, N> {}\n",
+            "fn type_then_const<T, const N: USize>(value: Array<T, N>) -> Array<T, N> {}\n",
+            "fn const_then_type<const N: USize, T>(value: Array<T, N>) -> Array<T, N> {}\n",
+            "fn wrong_const_type<const N: U32>(value: Array<U8, N>) -> Bool {}\n",
+            "fn type_as_length<T>(value: Array<U8, T>) -> Bool {}\n",
+            "fn non_binder_const(value: Array<U8, GLOBAL_N>) -> Bool {}\n",
+            "fn unresolved_const(value: Array<U8, Missing>) -> Bool {}\n",
+            "fn nominal_const_arg<const N: USize>(value: Packet<N>) -> Bool {}\n",
+            "fn const_expression<const N: USize>(value: Array<U8, N + 1>) -> Bool {}\n",
+            "fn callback<const N: USize>(value: fn(Array<U8, N>) -> Array<U8, N>) -> Bool {}\n",
+            "fn const_alias<const N: USize>(value: ConstBuffer<N>) -> Bool {}\n",
+            "type ConstBuffer<const N: USize> = Array<U8, N>\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot package scopes collect");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("top-level function owners resolve");
+        assert_eq!(collection.scopes.function_owners.len(), 11);
+
+        let projection = |index: usize| {
+            resolved
+                .signature_projection(&collection, collection.scopes.function_owners[index].owner)
+                .expect("the signature projection matches its collection")
+                .expect("the function owner exists")
+                .clone()
+        };
+        for (index, expected_index) in [(0, 0), (1, 1), (2, 0)] {
+            let FunctionSignatureProjection::Supported(signature) = projection(index) else {
+                panic!("the exact enclosing USize const binder lowers in arrays");
+            };
+            assert_eq!(signature.const_params().len(), 1);
+            assert_eq!(signature.const_params()[0].param.index, expected_index);
+            assert_eq!(
+                signature.generic_params().len(),
+                if index == 0 { 1 } else { 2 },
+                "all type and const binders remain in shared source order"
+            );
+            if index == 1 {
+                assert!(matches!(
+                    signature.generic_params(),
+                    [
+                        sai_ty::ty::FnSigGenericParam::Type(type_parameter),
+                        sai_ty::ty::FnSigGenericParam::Const(const_parameter),
+                    ] if type_parameter.param.index == 0
+                        && const_parameter.param.index == 1
+                ));
+                assert_eq!(signature.type_params()[0].param.index, 0);
+            } else if index == 2 {
+                assert!(matches!(
+                    signature.generic_params(),
+                    [
+                        sai_ty::ty::FnSigGenericParam::Const(const_parameter),
+                        sai_ty::ty::FnSigGenericParam::Type(type_parameter),
+                    ] if const_parameter.param.index == 0
+                        && type_parameter.param.index == 1
+                ));
+                assert_eq!(signature.type_params()[0].param.index, 1);
+            }
+
+            let sai_ty::ty::TyKind::Array(_, sai_ty::ty::Const::Param(length)) =
+                signature.inputs()[0].kind()
+            else {
+                panic!("the array length retains its const parameter");
+            };
+            assert_eq!(length.index, expected_index);
+            assert_eq!(length, &signature.const_params()[0].param);
+            let sai_ty::ty::TyKind::Array(_, sai_ty::ty::Const::Param(output_length)) =
+                signature.output().kind()
+            else {
+                panic!("the return array retains its const parameter");
+            };
+            assert_eq!(output_length, length);
+            assert!(signature.inputs()[0].ptr_eq(signature.output()));
+        }
+
+        let expected_unsupported = |reason| {
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::ParameterType { index: 0, reason },
+            )
+        };
+        assert_eq!(
+            projection(3),
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::GenericParameters
+            ),
+            "only a USize const binder is projected"
+        );
+        assert_eq!(
+            projection(4),
+            expected_unsupported(sai_ty::lower_ty::UnsupportedTy::GenericArgumentKind),
+            "a type binder is not a const length"
+        );
+        assert_eq!(
+            projection(5),
+            expected_unsupported(sai_ty::lower_ty::UnsupportedTy::ArrayLength),
+            "a module constant is not an enclosing function binder"
+        );
+        assert_eq!(
+            projection(6),
+            expected_unsupported(sai_ty::lower_ty::UnsupportedTy::ArrayLength),
+            "unresolved names do not fall back to spelling"
+        );
+        assert_eq!(
+            projection(7),
+            expected_unsupported(sai_ty::lower_ty::UnsupportedTy::GenericArguments),
+            "const arguments to nominal types remain unsupported"
+        );
+        assert_eq!(
+            projection(8),
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::RecoveredGenericSyntax
+            ),
+            "const expressions remain outside the simple argument form"
+        );
+        let FunctionSignatureProjection::Supported(callback) = projection(9) else {
+            panic!("a function pointer can reuse the enclosing const array length");
+        };
+        let sai_ty::ty::TyKind::FnPtr(callback_type) = callback.inputs()[0].kind() else {
+            panic!("the input remains a function pointer");
+        };
+        assert!(matches!(
+            callback_type.inputs()[0].kind(),
+            sai_ty::ty::TyKind::Array(
+                _,
+                sai_ty::ty::Const::Param(sai_ty::ty::ParamConst { index: 0, .. })
+            )
+        ));
+        assert_eq!(
+            callback_type.inputs()[0].kind(),
+            callback_type.output().kind()
+        );
+        assert_eq!(
+            projection(10),
+            expected_unsupported(sai_ty::lower_ty::UnsupportedTy::GenericArguments),
+            "a generic const alias stays outside the signature alias allowlist"
+        );
+    }
+
+    #[test]
     fn function_signature_projection_does_not_treat_a_shadowed_array_name_as_builtin() {
         let root = concat!(
             "type Array<T> = T\n",
-            "fn shadowed(value: Array<Bool, 4>) -> Bool {}\n",
+            "fn shadowed<const N: USize>(value: Array<Bool, N>) -> Bool {}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");

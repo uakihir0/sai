@@ -1,14 +1,16 @@
 //! Interned semantic types shared by declaration and body checking.
 //!
 //! This is an early semantic type kernel. It represents primitive types,
-//! tuples, references, arrays with literal lengths, function pointers,
-//! owner-bound function type parameters, and nominal identities with explicit
-//! type arguments. Signature lowering currently limits arrays to the resolved
-//! built-in `Array` with a nonnegative target-fitting literal length, function
-//! pointers to signatures without effects or borrowed/generic children, and
-//! generic nominal applications to validated direct local records and enums
-//! with region-free fields or payloads. Projections, inference variables, and
-//! error types remain for later slices.
+//! tuples, references, arrays with literal or enclosing `USize` const lengths,
+//! function pointers, owner-bound function type parameters, and nominal
+//! identities with explicit type arguments. Signature lowering currently
+//! limits arrays to the resolved built-in `Array` with either a nonnegative
+//! target-fitting literal length or an exact enclosing function const parameter
+//! of type `USize`. Function pointers have no effects or borrowed children and
+//! may refer to their enclosing function's validated type and const parameters.
+//! Generic nominal applications are limited to validated direct local records
+//! and enums with region-free fields or payloads. Projections, inference
+//! variables, and error types remain for later slices.
 
 use sai_hir::{DefId, Mutability, Safety, Symbol};
 use std::collections::HashMap;
@@ -64,8 +66,8 @@ pub enum TyKind {
     Never,
     Tuple(Arc<[Ty]>),
     Ref(Region, Ty, Mutability),
-    /// A structural array with its element type and target-validated length.
-    Array(Ty, u128),
+    /// A structural array with its element type and USize length.
+    Array(Ty, Const),
     /// A function pointer with a source-ordered signature and explicit safety.
     FnPtr(FnPtrSig),
     /// A type parameter in the binder of one function signature.
@@ -134,11 +136,45 @@ pub struct ParamTy {
     pub name: Symbol,
 }
 
+/// A const parameter's position and source name in its owning function binder.
+///
+/// Type and const parameters share one source-order index space.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ParamConst {
+    pub index: u32,
+    pub name: Symbol,
+}
+
+/// A USize value retained as an array length.
+///
+/// A const parameter remains distinct from a literal so later substitution
+/// can preserve the binder identity rather than treating it as a guessed
+/// value.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Const {
+    Value(u128),
+    Param(ParamConst),
+}
+
 /// One type-only binder in a function signature.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FnSigTypeParam {
     pub def_id: DefId,
     pub param: ParamTy,
+}
+
+/// One const-only binder in a function signature.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FnSigConstParam {
+    pub def_id: DefId,
+    pub param: ParamConst,
+}
+
+/// A function signature binder in source order.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FnSigGenericParam {
+    Type(FnSigTypeParam),
+    Const(FnSigConstParam),
 }
 
 /// A representable function pointer signature.
@@ -183,27 +219,62 @@ impl FnPtrSig {
 /// are implemented.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FnSig {
+    generic_params: Arc<[FnSigGenericParam]>,
     type_params: Arc<[FnSigTypeParam]>,
+    const_params: Arc<[FnSigConstParam]>,
     inputs: Arc<[Ty]>,
     output: Ty,
 }
 
 impl FnSig {
-    pub(crate) fn new(
-        type_params: impl Into<Arc<[FnSigTypeParam]>>,
+    pub(crate) fn new_with_generic_params(
+        generic_params: impl Into<Arc<[FnSigGenericParam]>>,
         inputs: impl Into<Arc<[Ty]>>,
         output: Ty,
     ) -> Self {
+        let generic_params = generic_params.into();
+        let type_params = generic_params
+            .iter()
+            .filter_map(|parameter| match parameter {
+                FnSigGenericParam::Type(parameter) => Some(*parameter),
+                FnSigGenericParam::Const(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let const_params = generic_params
+            .iter()
+            .filter_map(|parameter| match parameter {
+                FnSigGenericParam::Type(_) => None,
+                FnSigGenericParam::Const(parameter) => Some(*parameter),
+            })
+            .collect::<Vec<_>>()
+            .into();
         Self {
-            type_params: type_params.into(),
+            generic_params,
+            type_params,
+            const_params,
             inputs: inputs.into(),
             output,
         }
     }
 
+    /// The function's type and const binders in source order.
+    pub fn generic_params(&self) -> &[FnSigGenericParam] {
+        &self.generic_params
+    }
+
     /// The function's type-only binders in source order.
+    ///
+    /// Each index is still its position among all type and const binders.
     pub fn type_params(&self) -> &[FnSigTypeParam] {
         &self.type_params
+    }
+
+    /// The function's const-only binders in source order.
+    ///
+    /// Each index is still its position among all type and const binders.
+    pub fn const_params(&self) -> &[FnSigConstParam] {
+        &self.const_params
     }
 
     pub fn inputs(&self) -> &[Ty] {
@@ -358,12 +429,44 @@ mod tests {
     fn arrays_are_interned_by_element_type_and_length() {
         let interner = TyInterner::new();
         let element = interner.intern(TyKind::Bool);
-        let array = interner.intern(TyKind::Array(element.clone(), 4));
-        let same_array = interner.intern(TyKind::Array(element.clone(), 4));
-        let different_length = interner.intern(TyKind::Array(element, 5));
+        let array = interner.intern(TyKind::Array(element.clone(), Const::Value(4)));
+        let same_array = interner.intern(TyKind::Array(element.clone(), Const::Value(4)));
+        let different_length = interner.intern(TyKind::Array(element, Const::Value(5)));
 
         assert!(array.ptr_eq(&same_array));
         assert!(!array.ptr_eq(&different_length));
+    }
+
+    #[test]
+    fn array_const_parameters_are_distinct_from_literals_and_each_other() {
+        let interner = TyInterner::new();
+        let symbols = sai_intern::Interner::new();
+        let element = interner.intern(TyKind::Bool);
+        let first_parameter = ParamConst {
+            index: 0,
+            name: symbols.intern("N").unwrap(),
+        };
+        let second_parameter = ParamConst {
+            index: 1,
+            name: symbols.intern("M").unwrap(),
+        };
+        let first = interner.intern(TyKind::Array(
+            element.clone(),
+            Const::Param(first_parameter),
+        ));
+        let equivalent = interner.intern(TyKind::Array(
+            element.clone(),
+            Const::Param(first_parameter),
+        ));
+        let other_parameter = interner.intern(TyKind::Array(
+            element.clone(),
+            Const::Param(second_parameter),
+        ));
+        let literal = interner.intern(TyKind::Array(element, Const::Value(4)));
+
+        assert!(first.ptr_eq(&equivalent));
+        assert!(!first.ptr_eq(&other_parameter));
+        assert!(!first.ptr_eq(&literal));
     }
 
     #[test]
@@ -372,11 +475,11 @@ mod tests {
         let other = TyInterner::new();
         let local_bool = interner.intern(TyKind::Bool);
         let foreign_bool = other.intern(TyKind::Bool);
-        let local_array = interner.intern(TyKind::Array(local_bool.clone(), 8));
-        let foreign_array = interner.intern(TyKind::Array(foreign_bool, 8));
+        let local_array = interner.intern(TyKind::Array(local_bool.clone(), Const::Value(8)));
+        let foreign_array = interner.intern(TyKind::Array(foreign_bool, Const::Value(8)));
 
         assert!(local_array.ptr_eq(&foreign_array));
-        let TyKind::Array(element, 8) = foreign_array.kind() else {
+        let TyKind::Array(element, Const::Value(8)) = foreign_array.kind() else {
             panic!("the array retains its exact length");
         };
         assert!(element.ptr_eq(&local_bool));
@@ -388,8 +491,8 @@ mod tests {
         let other = TyInterner::new();
         let local_bool = interner.intern(TyKind::Bool);
         let foreign_bool = other.intern(TyKind::Bool);
-        let local_array = interner.intern(TyKind::Array(local_bool.clone(), 3));
-        let foreign_array = other.intern(TyKind::Array(foreign_bool.clone(), 3));
+        let local_array = interner.intern(TyKind::Array(local_bool.clone(), Const::Value(3)));
+        let foreign_array = other.intern(TyKind::Array(foreign_bool.clone(), Const::Value(3)));
         let local_output = interner.tuple(Arc::from([local_bool.clone()]));
         let foreign_output = other.tuple(Arc::from([foreign_bool]));
 
@@ -405,7 +508,7 @@ mod tests {
         )));
         let unsafe_signature = interner.intern(TyKind::FnPtr(FnPtrSig::new(
             Safety::Unsafe,
-            Arc::from([interner.intern(TyKind::Array(local_bool.clone(), 3))]),
+            Arc::from([interner.intern(TyKind::Array(local_bool.clone(), Const::Value(3)))]),
             interner.tuple(Arc::from([local_bool.clone()])),
         )));
 
@@ -415,7 +518,7 @@ mod tests {
             panic!("the type remains a function pointer");
         };
         assert_eq!(signature.safety(), Safety::Safe);
-        let TyKind::Array(argument, 3) = signature.inputs()[0].kind() else {
+        let TyKind::Array(argument, Const::Value(3)) = signature.inputs()[0].kind() else {
             panic!("the input retains its nested array");
         };
         assert!(argument.ptr_eq(&local_bool));

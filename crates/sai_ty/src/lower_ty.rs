@@ -5,8 +5,8 @@
 //! manufacturing semantic error types or guessing at unresolved names.
 
 use crate::ty::{
-    FloatTy, FnPtrSig, FnSig, FnSigTypeParam, IntTy, ParamTy, Region, SigRegion, Ty, TyInterner,
-    TyKind, UintTy,
+    Const, FloatTy, FnPtrSig, FnSig, FnSigConstParam, FnSigGenericParam, FnSigTypeParam, IntTy,
+    ParamConst, ParamTy, Region, SigRegion, Ty, TyInterner, TyKind, UintTy,
 };
 use sai_hir::types::{
     GenericArg as HirGenericArg, GenericParam, GenericParamKind, Generics, PathRoot, Ty as HirTy,
@@ -107,6 +107,7 @@ pub struct LowerTyContext<'a> {
     region_mode: RegionMode,
     next_region_index: u32,
     within_fn_ptr: bool,
+    const_params: HashMap<DefId, ParamConst>,
     failed: bool,
 }
 
@@ -139,6 +140,7 @@ impl<'a> LowerTyContext<'a> {
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             within_fn_ptr: false,
+            const_params: HashMap::new(),
             failed: false,
         }
     }
@@ -169,6 +171,7 @@ impl<'a> LowerTyContext<'a> {
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             within_fn_ptr: false,
+            const_params: HashMap::new(),
             failed: false,
         }
     }
@@ -199,6 +202,7 @@ impl<'a> LowerTyContext<'a> {
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             within_fn_ptr: false,
+            const_params: HashMap::new(),
             failed: false,
         }
     }
@@ -231,6 +235,7 @@ impl<'a> LowerTyContext<'a> {
             },
             next_region_index: 0,
             within_fn_ptr: false,
+            const_params: HashMap::new(),
             failed: false,
         }
     }
@@ -254,6 +259,7 @@ impl<'a> LowerTyContext<'a> {
             region_mode: RegionMode::Body,
             next_region_index: 0,
             within_fn_ptr: false,
+            const_params: HashMap::new(),
             failed: false,
         }
     }
@@ -342,9 +348,10 @@ pub fn lower_ty(context: &mut LowerTyContext<'_>, ty: &HirTy<'_>) -> Result<Ty, 
 /// Lower a deliberately narrow function signature while retaining its
 /// parameter and return type information.
 ///
-/// Only unbounded type-only generic parameters, safe synchronous signatures,
-/// and types supported by this module are represented by the current partial
-/// `FnSig`. Every failure invalidates the context so a partially consumed
+/// Only unbounded type parameters, `USize` const parameters, safe synchronous
+/// signatures, and types supported by this module are represented by the
+/// current partial `FnSig`. Type and const binders share source-order indices.
+/// Every failure invalidates the context so a partially consumed
 /// signature-region sequence cannot be reused. An omitted return type lowers
 /// to unit.
 pub fn lower_fn_sig(
@@ -361,8 +368,9 @@ pub fn lower_fn_sig(
         return Err(UnsupportedFnSig::WherePredicates);
     }
 
-    let mut type_params = Vec::with_capacity(generics.params.len());
+    let mut generic_params = Vec::with_capacity(generics.params.len());
     let mut generic_param_map = HashMap::with_capacity(generics.params.len());
+    let mut const_param_map = HashMap::with_capacity(generics.params.len());
     let mut generic_names = HashSet::with_capacity(generics.params.len());
     let generic_owner_path = if generics.params.is_empty() {
         None
@@ -380,18 +388,18 @@ pub fn lower_fn_sig(
         }
     };
     for (index, parameter) in generics.params.iter().enumerate() {
-        let GenericParamKind::Type { bounds } = parameter.kind else {
-            context.failed = true;
-            return Err(UnsupportedFnSig::GenericParameters);
-        };
         let parameter_has_exact_owner = generic_owner_path
             .as_ref()
             .zip(context.def_paths)
-            .is_some_and(|(owner_path, def_paths)| {
-                is_direct_function_type_parameter(def_paths, owner_path, parameter)
+            .is_some_and(|(owner_path, def_paths)| match parameter.kind {
+                GenericParamKind::Type { .. } => {
+                    is_direct_function_type_parameter(def_paths, owner_path, parameter)
+                }
+                GenericParamKind::Const { .. } => {
+                    is_direct_function_const_parameter(def_paths, owner_path, parameter)
+                }
             });
-        if !bounds.is_empty()
-            || parameter.name.sym.is_error()
+        if parameter.name.sym.is_error()
             || !generic_names.insert(parameter.name.sym)
             || !parameter_has_exact_owner
         {
@@ -402,16 +410,40 @@ pub fn lower_fn_sig(
             context.failed = true;
             UnsupportedFnSig::TooManyTypeParameters
         })?;
-        let param = ParamTy {
-            index,
-            name: parameter.name.sym,
-        };
         let def_id = parameter.def_id.to_def_id();
-        if generic_param_map.insert(def_id, param).is_some() {
-            context.failed = true;
-            return Err(UnsupportedFnSig::GenericParameters);
+        match parameter.kind {
+            GenericParamKind::Type { bounds } => {
+                if !bounds.is_empty() {
+                    context.failed = true;
+                    return Err(UnsupportedFnSig::GenericParameters);
+                }
+                let param = ParamTy {
+                    index,
+                    name: parameter.name.sym,
+                };
+                if generic_param_map.insert(def_id, param).is_some() {
+                    context.failed = true;
+                    return Err(UnsupportedFnSig::GenericParameters);
+                }
+                let binder = FnSigTypeParam { def_id, param };
+                generic_params.push(FnSigGenericParam::Type(binder));
+            }
+            GenericParamKind::Const { ty } => {
+                if !is_builtin_usize_const_type(context, ty) {
+                    context.failed = true;
+                    return Err(UnsupportedFnSig::GenericParameters);
+                }
+                let param = ParamConst {
+                    index,
+                    name: parameter.name.sym,
+                };
+                if const_param_map.insert(def_id, param).is_some() {
+                    context.failed = true;
+                    return Err(UnsupportedFnSig::GenericParameters);
+                }
+                generic_params.push(FnSigGenericParam::Const(FnSigConstParam { def_id, param }));
+            }
         }
-        type_params.push(FnSigTypeParam { def_id, param });
     }
 
     let unsupported = if signature.safety == Safety::Unsafe {
@@ -432,6 +464,7 @@ pub fn lower_fn_sig(
         return Err(reason);
     }
     context.generic_params = generic_param_map;
+    context.const_params = const_param_map;
 
     let mut inputs = Vec::with_capacity(signature.params.len());
     for (index, parameter) in signature.params.iter().enumerate() {
@@ -450,7 +483,11 @@ pub fn lower_fn_sig(
         None => context.interner.tuple(Vec::new()),
     };
 
-    Ok(FnSig::new(type_params, inputs, output))
+    Ok(FnSig::new_with_generic_params(
+        generic_params,
+        inputs,
+        output,
+    ))
 }
 
 fn is_direct_function_type_parameter(
@@ -477,6 +514,57 @@ fn is_direct_function_type_parameter(
             disambiguator: 0,
         }) if *name == parameter.name.sym
     )
+}
+
+fn is_direct_function_const_parameter(
+    def_paths: &DefPathInterner,
+    owner_path: &sai_hir::DefPath,
+    parameter: &GenericParam<'_>,
+) -> bool {
+    let Ok(Some(parameter_path)) = def_paths.resolve(parameter.def_id) else {
+        return false;
+    };
+    let owner_components = owner_path.data();
+    let parameter_components = parameter_path.data();
+    if parameter_path.package() != owner_path.package()
+        || parameter_components.len() != owner_components.len() + 1
+        || parameter_components[..owner_components.len()] != *owner_components
+    {
+        return false;
+    }
+
+    matches!(
+        parameter_components.last(),
+        Some(DisambiguatedDefPathData {
+            data: DefPathData::ConstParam(name),
+            disambiguator: 0,
+        }) if *name == parameter.name.sym
+    )
+}
+
+fn is_builtin_usize_const_type(context: &LowerTyContext<'_>, ty: &HirTy<'_>) -> bool {
+    if ty.hir_id.owner != context.owner {
+        return false;
+    }
+    let HirTyKind::Path(path) = ty.kind else {
+        return false;
+    };
+    if path.hir_id.owner != context.owner
+        || path.root != PathRoot::Plain
+        || path.segments.len() != 1
+    {
+        return false;
+    }
+    let segment = path.segments[0];
+    if segment.hir_id.owner != context.owner || segment.args.is_some() {
+        return false;
+    }
+    let Some(resolution) = context.paths.get(&path.hir_id) else {
+        return false;
+    };
+    resolution.base == Res::PrimTy(PrimTy::USize)
+        && resolution.resolved_segments == 1
+        && resolution.segment_count == 1
 }
 
 fn lower_ty_inner(context: &mut LowerTyContext<'_>, ty: &HirTy<'_>) -> Result<Ty, UnsupportedTy> {
@@ -730,24 +818,76 @@ fn lower_builtin_array(
     let HirGenericArg::Type(element) = generic_args.args[0] else {
         return Err(UnsupportedTy::GenericArgumentKind);
     };
+    let Some(pointer_width) = context.array_length_pointer_width else {
+        return Err(UnsupportedTy::Array);
+    };
     let length = match generic_args.args[1] {
         HirGenericArg::Const(sai_hir::types::ConstArg::Int {
             value: Some(length),
             negated: false,
-        }) => length,
+        }) if unsigned_value_fits_width(length, pointer_width) => Const::Value(length),
+        HirGenericArg::Const(sai_hir::types::ConstArg::Int {
+            value: Some(_),
+            negated: false,
+        }) => return Err(UnsupportedTy::ArrayLength),
         HirGenericArg::Const(_) => return Err(UnsupportedTy::ArrayLength),
-        HirGenericArg::Type(_) | HirGenericArg::Binding { .. } => {
-            return Err(UnsupportedTy::GenericArgumentKind);
-        }
+        HirGenericArg::Type(ty) => Const::Param(array_length_const_parameter(context, ty)?),
+        HirGenericArg::Binding { .. } => return Err(UnsupportedTy::GenericArgumentKind),
     };
-    let Some(pointer_width) = context.array_length_pointer_width else {
-        return Err(UnsupportedTy::Array);
-    };
-    if !unsigned_value_fits_width(length, pointer_width) {
-        return Err(UnsupportedTy::ArrayLength);
-    }
     let element = lower_ty_inner(context, element)?;
     Ok(context.interner.intern(TyKind::Array(element, length)))
+}
+
+fn array_length_const_parameter(
+    context: &LowerTyContext<'_>,
+    ty: &HirTy<'_>,
+) -> Result<ParamConst, UnsupportedTy> {
+    if ty.hir_id.owner != context.owner {
+        return Err(UnsupportedTy::OwnerMismatch);
+    }
+    let HirTyKind::Path(path) = ty.kind else {
+        return Err(UnsupportedTy::GenericArgumentKind);
+    };
+    if path.hir_id.owner != context.owner {
+        return Err(UnsupportedTy::OwnerMismatch);
+    }
+    if path.root != PathRoot::Plain || path.segments.len() != 1 {
+        return Err(UnsupportedTy::ArrayLength);
+    }
+    let segment = path.segments[0];
+    if segment.hir_id.owner != context.owner {
+        return Err(UnsupportedTy::OwnerMismatch);
+    }
+    if segment.args.is_some() {
+        return Err(UnsupportedTy::ArrayLength);
+    }
+    let resolution = context
+        .paths
+        .get(&path.hir_id)
+        .ok_or(UnsupportedTy::ArrayLength)?;
+    if resolution.resolved_segments != 1 || resolution.segment_count != 1 {
+        return Err(UnsupportedTy::ArrayLength);
+    }
+    match resolution.base {
+        Res::Def(DefKind::ConstParam, def_id) => context
+            .const_params
+            .get(&def_id)
+            .copied()
+            .ok_or(UnsupportedTy::ArrayLength),
+        Res::Def(DefKind::TyParam, _) | Res::PrimTy(_) => Err(UnsupportedTy::GenericArgumentKind),
+        Res::Def(
+            DefKind::Struct
+            | DefKind::Enum
+            | DefKind::Distinct
+            | DefKind::Refined
+            | DefKind::Resource
+            | DefKind::Alias,
+            _,
+        ) => Err(UnsupportedTy::GenericArgumentKind),
+        Res::Def(_, _) | Res::Local(_) | Res::TestOnly(_) | Res::Err => {
+            Err(UnsupportedTy::ArrayLength)
+        }
+    }
 }
 
 fn unsigned_value_fits_width(value: u128, width: u8) -> bool {
@@ -892,6 +1032,45 @@ mod tests {
             .unwrap();
         let foreign_param = paths
             .intern_generic_param(foreign_owner.def_id, type_name, false, 0)
+            .unwrap();
+        (owner, symbols, local_param, foreign_param, paths)
+    }
+
+    fn owner_with_same_package_foreign_const_param() -> (
+        sai_hir::OwnerId,
+        Interner,
+        sai_hir::LocalDefId,
+        sai_hir::LocalDefId,
+        DefPathInterner,
+    ) {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:const-generic-owner#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let owner_for = |name: &str| {
+            let item_name = symbols.intern(name).unwrap();
+            let item_path = DefPath::new(
+                package,
+                vec![DisambiguatedDefPathData {
+                    data: DefPathData::ValueNs(item_name),
+                    disambiguator: 0,
+                }],
+                &packages,
+                &symbols,
+            )
+            .unwrap();
+            sai_hir::OwnerId {
+                def_id: paths.intern(item_path).unwrap(),
+            }
+        };
+        let owner = owner_for("first");
+        let foreign_owner = owner_for("second");
+        let const_name = symbols.intern("N").unwrap();
+        let local_param = paths
+            .intern_generic_param(owner.def_id, const_name, true, 0)
+            .unwrap();
+        let foreign_param = paths
+            .intern_generic_param(foreign_owner.def_id, const_name, true, 0)
             .unwrap();
         (owner, symbols, local_param, foreign_param, paths)
     }
@@ -1361,7 +1540,7 @@ mod tests {
         let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
             .with_array_length_pointer_width(32);
         let semantic = lower_ty(&mut context, array).expect("the resolved built-in array lowers");
-        let TyKind::Array(element, 4) = semantic.kind() else {
+        let TyKind::Array(element, Const::Value(4)) = semantic.kind() else {
             panic!("the array retains its element type and literal length");
         };
         assert!(matches!(
@@ -1631,7 +1810,8 @@ mod tests {
         ));
         assert!(matches!(
             signature.inputs()[1].kind(),
-            TyKind::Array(element, 2) if matches!(element.kind(), TyKind::Uint(UintTy::U8))
+            TyKind::Array(element, Const::Value(2))
+                if matches!(element.kind(), TyKind::Uint(UintTy::U8))
         ));
         assert!(matches!(signature.output().kind(), TyKind::Char));
 
@@ -2611,6 +2791,138 @@ mod tests {
                 index: 0,
                 name: symbols.intern("B").unwrap(),
             })
+        );
+    }
+
+    #[test]
+    fn array_length_uses_only_the_exact_enclosing_usize_const_binder() {
+        let (owner, symbols, local_param, foreign_param, def_paths) =
+            owner_with_same_package_foreign_const_param();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let (usize_ty, mut paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            500,
+            "USize",
+            None,
+            Res::PrimTy(PrimTy::USize),
+        );
+        let (element_ty, element_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            510,
+            "U8",
+            None,
+            Res::PrimTy(PrimTy::U8),
+        );
+        paths.extend(element_paths);
+        let generic_param = arena.alloc_generic_param(sai_hir::types::GenericParam {
+            def_id: local_param,
+            name: Name {
+                sym: symbols.intern("N").unwrap(),
+                span: span(),
+            },
+            kind: GenericParamKind::Const { ty: usize_ty },
+        });
+        let generics = Generics {
+            params: arena.alloc_generic_params(&[*generic_param]),
+            where_preds: &[],
+        };
+        let (local_const, local_const_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            520,
+            "N",
+            None,
+            Res::Def(DefKind::ConstParam, local_param.to_def_id()),
+        );
+        paths.extend(local_const_paths);
+        let local_args = [
+            HirGenericArg::Type(element_ty),
+            HirGenericArg::Type(local_const),
+        ];
+        let (local_array, local_array_paths) =
+            resolved_array_path(&arena, owner, &symbols, 530, &local_args);
+        paths.extend(local_array_paths);
+        let local_parameter = arena.alloc_fn_param(sai_hir::body::FnParam {
+            hir_id: hir_id(owner, 540),
+            name: None,
+            is_self: false,
+            mutable: false,
+            ty: local_array,
+            span: span(),
+        });
+        let local_signature = HirFnSig {
+            safety: Safety::Safe,
+            is_async: false,
+            params: arena.alloc_fn_params(&[*local_parameter]),
+            ret: None,
+            borrows: None,
+            effects: None,
+            requires: &[],
+            ensures: &[],
+        };
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_def_path_interner(&def_paths)
+            .with_array_length_pointer_width(64);
+        let lowered = lower_fn_sig(&mut context, generics, local_signature)
+            .expect("the exact USize const binder is valid as an array length");
+        let binder = lowered.const_params()[0].param;
+        assert_eq!(binder.index, 0);
+        assert!(matches!(
+            lowered.inputs()[0].kind(),
+            TyKind::Array(_, Const::Param(parameter)) if *parameter == binder
+        ));
+
+        let (foreign_const, foreign_const_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            550,
+            "N",
+            None,
+            Res::Def(DefKind::ConstParam, foreign_param.to_def_id()),
+        );
+        let foreign_args = [
+            HirGenericArg::Type(element_ty),
+            HirGenericArg::Type(foreign_const),
+        ];
+        let (foreign_array, foreign_array_paths) =
+            resolved_array_path(&arena, owner, &symbols, 560, &foreign_args);
+        paths.extend(foreign_const_paths);
+        paths.extend(foreign_array_paths);
+        let foreign_parameter = arena.alloc_fn_param(sai_hir::body::FnParam {
+            hir_id: hir_id(owner, 570),
+            name: None,
+            is_self: false,
+            mutable: false,
+            ty: foreign_array,
+            span: span(),
+        });
+        let foreign_signature = HirFnSig {
+            safety: Safety::Safe,
+            is_async: false,
+            params: arena.alloc_fn_params(&[*foreign_parameter]),
+            ret: None,
+            borrows: None,
+            effects: None,
+            requires: &[],
+            ensures: &[],
+        };
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_def_path_interner(&def_paths)
+            .with_array_length_pointer_width(64);
+        assert_eq!(
+            lower_fn_sig(&mut context, generics, foreign_signature),
+            Err(UnsupportedFnSig::ParameterType {
+                index: 0,
+                reason: UnsupportedTy::ArrayLength,
+            }),
+            "a same-spelled const binder from another owner is not captured"
         );
     }
 
