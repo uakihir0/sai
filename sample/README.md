@@ -29,6 +29,7 @@ source repository before a package resolver can fetch them.
 | Intermediate | [`library-loan-policy`](library-loan-policy/README.md) | Enforce checkout, hold, and renewal rules with records, enums, and `Result`. |
 | Intermediate | [`marsh-survey-review`](marsh-survey-review/README.md) | Classify fixed field observations by correction, conservation review, confidence, and transect totals. |
 | Intermediate | [`corpus-search-ranker`](corpus-search-ranker/README.md) | Rank a fixed text corpus with whitespace-token matching, weighted title scores, and stable tie-breaking. |
+| Intermediate | [`life-grid-lab`](life-grid-lab/README.md) | Evolve a fixed 5×5 Conway's Game of Life board with bounded generations, finite dead boundaries, and neighbor-count rules. |
 | Intermediate | [`facility-maintenance-queue`](facility-maintenance-queue/README.md) | Schedule a fixed facilities backlog across qualified technicians, shift windows, due times, and a shared parts cupboard. |
 | Intermediate | [`neighborhood-bike-share-rebalancer`](neighborhood-bike-share-rebalancer/README.md) | Plan direct bike-share rebalancing trips by station need and donor inventory while preserving docks reserved for adaptive cycles. |
 | Advanced | [`event-planner`](event-planner/README.md) | Apply session capacity and waitlists, then detect conflicts between confirmed sessions. |

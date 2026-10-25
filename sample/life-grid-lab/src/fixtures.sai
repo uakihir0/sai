@@ -1,0 +1,36 @@
+use acme:life-grid-lab/model.{Board, CELL_COUNT}
+
+pub fn empty() -> Board {
+    Board(cells: Array<Bool, CELL_COUNT>.filled(false))
+}
+
+pub fn horizontal_blinker() -> Board {
+    var cells = Array<Bool, CELL_COUNT>.filled(false)
+    cells[11] = true
+    cells[12] = true
+    cells[13] = true
+    Board(cells: cells)
+}
+
+pub fn block() -> Board {
+    var cells = Array<Bool, CELL_COUNT>.filled(false)
+    cells[6] = true
+    cells[7] = true
+    cells[11] = true
+    cells[12] = true
+    Board(cells: cells)
+}
+
+pub fn isolated_cell() -> Board {
+    var cells = Array<Bool, CELL_COUNT>.filled(false)
+    cells[12] = true
+    Board(cells: cells)
+}
+
+pub fn opposite_edge_triad() -> Board {
+    var cells = Array<Bool, CELL_COUNT>.filled(false)
+    cells[0] = true
+    cells[4] = true
+    cells[20] = true
+    Board(cells: cells)
+}
