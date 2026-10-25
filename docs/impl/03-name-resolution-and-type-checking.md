@@ -781,9 +781,9 @@ inner path; a trailing value field in `E.V.other` is not promoted to another
 variant candidate. When the field is a call callee, `E.V()` retains only the
 inner `E.V` path result; a separate occurrence-keyed projection checks limited
 call semantics for supported local enum variant calls. IR-924 checks arity,
-IR-925 diagnoses named arguments, and IR-926 checks direct literal arguments
-at tuple-variant coercion sites. A local receiver such as `e.V` remains a
-value member path.
+IR-925 diagnoses named arguments, IR-926 checks direct literal arguments, and
+IR-927 checks aligned tuple-literal leaves at tuple-variant coercion sites. A
+local receiver such as `e.V` remains a value member path.
 The resolver uses the current package collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
@@ -1948,6 +1948,22 @@ paths remain outside this check. Pointer-sized literals use the selected
 target's pointer width. It does not populate `call_kinds`, perform general
 expression type checking, or change source acceptance; `sai check` remains
 behind its incomplete-stage gate.
+
+**Implemented subset (IR-927):** At the same direct local non-generic tuple-variant
+call sites, an argument whose expected semantic type and HIR expression are
+both tuples is traversed element by element only when their arities match.
+Traversal is iterative, preserves element order, and applies IR-926's existing
+primitive/unit literal checks at supported leaves, including nested tuples.
+Named argument values still use their written positional parameter; only
+signature-backed outer call arguments are visited, and named-argument and outer
+call-arity diagnostics stay independent. `(e)` remains the expression `e`, while
+`(e,)` is a singleton tuple. A mismatched nested tuple arity produces no new
+diagnostic and its elements are not paired; that general tuple-shape error is
+left to complete expression type checking. No coercions are added below tuple
+type constructors (spec/05 §5.15.3). Nonliteral leaves, unsupported payload
+shapes, and all IR-926 path exclusions remain outside this slice. No
+`call_kinds`, general expression type results, or source-acceptance claim is
+added; `sai check` remains behind its incomplete-stage gate.
 
 ### 3.6.4 `adt_def`
 
