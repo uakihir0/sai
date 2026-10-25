@@ -321,7 +321,8 @@ impl LocalEnumVariantDiscriminant {
 }
 
 /// A representable discriminant semantic error attached to its later source
-/// variant. The computed value remains in [`LocalEnumAdtDef`].
+/// variant. Its computed value remains in either [`LocalEnumAdtDef`] or
+/// [`LocalEnumAdtDefBuildError`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalEnumDiscriminantIssue {
     variant: DefId,
@@ -373,16 +374,17 @@ impl LocalEnumAdtDef {
     /// The driver is responsible for proving that `repr` came from the
     /// current target-filtered item's `ValidatedAttrs`. This constructor
     /// checks that the HIR owner and every source-ordered variant match the
-    /// payload template before calculating discriminants.
+    /// payload template before calculating discriminants. If a unit-only
+    /// discriminant cannot be represented, later explicit values are still
+    /// checked and their computed values and issues are retained in the build
+    /// error; implicit values stay unknown until an explicit value resumes the
+    /// sequence.
     pub fn from_hir_owner(
         payloads: LocalEnumPayloadTemplateDef,
         repr: Option<ReprAttr>,
         hir: &HirOwner<'_>,
     ) -> Result<(Self, Vec<LocalEnumDiscriminantIssue>), LocalEnumAdtDefBuildError> {
-        let invalid = |reason| LocalEnumAdtDefBuildError {
-            reason,
-            issues: Vec::new(),
-        };
+        let invalid = LocalEnumAdtDefBuildError::single_failure;
         let OwnerNode::Item(item) = hir.node else {
             return Err(invalid(LocalEnumAdtDefError::NotModuleEnum));
         };
@@ -436,47 +438,55 @@ impl LocalEnumAdtDef {
             .any(|variant| !matches!(variant.shape, VariantShape::Unit));
         let mut discriminants = Vec::with_capacity(variants.len());
         let mut issues = Vec::new();
+        let mut failures = Vec::new();
         let mut previous: Option<i128> = None;
         let mut seen = HashMap::<i128, DefId>::with_capacity(variants.len());
 
         for (index, variant) in variants.iter().enumerate() {
             let variant_id = variant.def_id.to_def_id();
             let value = if has_payload {
-                i128::try_from(index)
-                    .map_err(|_| LocalEnumAdtDefError::DiscriminantOverflow(variant_id))
-                    .map_err(|reason| LocalEnumAdtDefBuildError {
-                        reason,
-                        issues: issues.clone(),
-                    })?
+                match i128::try_from(index) {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        failures.push(LocalEnumAdtDefError::DiscriminantOverflow(variant_id));
+                        None
+                    }
+                }
             } else {
                 if variant.has_explicit_discriminant && variant.discriminant.is_none() {
-                    return Err(LocalEnumAdtDefBuildError {
-                        reason: LocalEnumAdtDefError::MissingExplicitDiscriminant(variant_id),
-                        issues: issues.clone(),
-                    });
-                }
-                if !variant.has_explicit_discriminant && variant.discriminant.is_some() {
-                    return Err(LocalEnumAdtDefBuildError {
-                        reason: LocalEnumAdtDefError::UnexpectedImplicitDiscriminant(variant_id),
-                        issues: issues.clone(),
-                    });
-                }
-                if variant.has_explicit_discriminant {
-                    variant.discriminant.expect("explicit value was validated")
+                    failures.push(LocalEnumAdtDefError::MissingExplicitDiscriminant(
+                        variant_id,
+                    ));
+                    None
+                } else if !variant.has_explicit_discriminant && variant.discriminant.is_some() {
+                    failures.push(LocalEnumAdtDefError::UnexpectedImplicitDiscriminant(
+                        variant_id,
+                    ));
+                    None
+                } else if variant.has_explicit_discriminant {
+                    variant.discriminant
                 } else {
                     match previous {
-                        Some(value) => value
-                            .checked_add(1)
-                            .ok_or(LocalEnumAdtDefError::DiscriminantOverflow(variant_id))
-                            .map_err(|reason| LocalEnumAdtDefBuildError {
-                                reason,
-                                issues: issues.clone(),
-                            })?,
-                        None => 0,
+                        Some(value) => match value.checked_add(1) {
+                            Some(value) => Some(value),
+                            None => {
+                                failures
+                                    .push(LocalEnumAdtDefError::DiscriminantOverflow(variant_id));
+                                None
+                            }
+                        },
+                        None if index == 0 => Some(0),
+                        // A preceding explicit value was unavailable or its
+                        // implicit successor overflowed. Stay unknown until a
+                        // later explicit value provides a new starting point.
+                        None => None,
                     }
                 }
             };
-            previous = Some(value);
+            previous = value;
+            let Some(value) = value else {
+                continue;
+            };
             discriminants.push(LocalEnumVariantDiscriminant::new(variant_id, value));
 
             if !discr_ty.contains(value) {
@@ -493,6 +503,16 @@ impl LocalEnumAdtDef {
                     kind: LocalEnumDiscriminantIssueKind::Duplicate { previous_variant },
                 });
             }
+        }
+
+        if !failures.is_empty() {
+            let reason = failures[0];
+            return Err(LocalEnumAdtDefBuildError {
+                reason,
+                failures,
+                discriminants,
+                issues,
+            });
         }
 
         Ok((
@@ -557,21 +577,43 @@ pub enum LocalEnumAdtDefError {
     DiscriminantOverflow(DefId),
 }
 
-/// Why an enum definition could not be built, together with semantic issues
-/// discovered before a fail-closed condition.
+/// Why an enum definition could not be built, with every representable partial
+/// discriminant and semantic issue collected across the full source order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalEnumAdtDefBuildError {
     reason: LocalEnumAdtDefError,
+    failures: Vec<LocalEnumAdtDefError>,
+    discriminants: Vec<LocalEnumVariantDiscriminant>,
     issues: Vec<LocalEnumDiscriminantIssue>,
 }
 
 impl LocalEnumAdtDefBuildError {
+    fn single_failure(reason: LocalEnumAdtDefError) -> Self {
+        Self {
+            reason,
+            failures: vec![reason],
+            discriminants: Vec::new(),
+            issues: Vec::new(),
+        }
+    }
+
     /// Structural or discriminant failure that prevented construction.
-    pub const fn reason(&self) -> LocalEnumAdtDefError {
+    pub fn reason(&self) -> LocalEnumAdtDefError {
         self.reason
     }
 
-    /// Source-ordered range/duplicate issues found before construction failed.
+    /// Every unrepresentable failure, in source order.
+    pub fn failures(&self) -> &[LocalEnumAdtDefError] {
+        &self.failures
+    }
+
+    /// Computed discriminants retained in source order despite a later
+    /// unrepresentable value.
+    pub fn discriminants(&self) -> &[LocalEnumVariantDiscriminant] {
+        &self.discriminants
+    }
+
+    /// All source-ordered range/duplicate issues found during construction.
     pub fn issues(&self) -> &[LocalEnumDiscriminantIssue] {
         &self.issues
     }
@@ -1211,7 +1253,7 @@ impl FlagsDef {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdtKind, IntTy, LocalEnumAdtDef, LocalEnumDiscriminantIssueKind,
+        AdtKind, IntTy, LocalEnumAdtDef, LocalEnumAdtDefError, LocalEnumDiscriminantIssueKind,
         LocalEnumPayloadTemplateDef, LocalEnumPayloadTemplateDefError,
         LocalEnumPayloadTemplateIdentity, LocalEnumPayloadTemplateShape,
         LocalEnumPayloadVariantTemplateDef, LocalEnumRecordPayloadTemplate,
@@ -2399,6 +2441,229 @@ mod tests {
         assert_eq!(
             error.issues()[0].kind(),
             LocalEnumDiscriminantIssueKind::OutOfRange
+        );
+    }
+
+    #[test]
+    fn local_enum_adt_retains_partial_values_and_issues_after_unavailable_values() {
+        let ids = test_ids();
+        let enum_name = ids.symbols.intern("Recovery").unwrap();
+        let missing_names = ["Lost", "Dependent", "Large", "Repeated", "After"]
+            .map(|name| ids.symbols.intern(name).unwrap());
+        let missing_ids = ids
+            .paths
+            .intern_variants(ids.owner, &missing_names.map(|name| (name, 0)))
+            .unwrap();
+        let missing_variants = [
+            unit_variant(ids.owner, missing_ids[0], missing_names[0], 1, None, true),
+            unit_variant(ids.owner, missing_ids[1], missing_names[1], 2, None, false),
+            unit_variant(
+                ids.owner,
+                missing_ids[2],
+                missing_names[2],
+                3,
+                Some(300),
+                true,
+            ),
+            unit_variant(
+                ids.owner,
+                missing_ids[3],
+                missing_names[3],
+                4,
+                Some(300),
+                true,
+            ),
+            unit_variant(ids.owner, missing_ids[4], missing_names[4], 5, None, false),
+        ];
+        let missing_payloads = unit_payload_template(ids.owner, &missing_variants);
+        let missing_item = module_enum_item(ids.owner, enum_name, &missing_variants);
+        let missing_hir = module_hir_owner(&missing_item);
+        let missing_error = LocalEnumAdtDef::from_hir_owner(
+            missing_payloads,
+            Some(ReprAttr::Integer(ReprInteger::U8)),
+            &missing_hir,
+        )
+        .expect_err("the lost explicit value keeps the enum unsupported");
+
+        assert_eq!(
+            missing_error.failures(),
+            &[LocalEnumAdtDefError::MissingExplicitDiscriminant(
+                missing_ids[0].to_def_id()
+            )]
+        );
+        assert_eq!(
+            missing_error
+                .discriminants()
+                .iter()
+                .map(|value| (value.variant(), value.value()))
+                .collect::<Vec<_>>(),
+            [
+                (missing_ids[2].to_def_id(), 300),
+                (missing_ids[3].to_def_id(), 300),
+                (missing_ids[4].to_def_id(), 301),
+            ],
+            "unknown implicit successors stay absent until an explicit value resets the sequence"
+        );
+        assert_eq!(
+            missing_error
+                .issues()
+                .iter()
+                .map(|issue| (issue.variant(), issue.value(), issue.kind()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    missing_ids[2].to_def_id(),
+                    300,
+                    LocalEnumDiscriminantIssueKind::OutOfRange,
+                ),
+                (
+                    missing_ids[3].to_def_id(),
+                    300,
+                    LocalEnumDiscriminantIssueKind::OutOfRange,
+                ),
+                (
+                    missing_ids[3].to_def_id(),
+                    300,
+                    LocalEnumDiscriminantIssueKind::Duplicate {
+                        previous_variant: missing_ids[2].to_def_id(),
+                    },
+                ),
+                (
+                    missing_ids[4].to_def_id(),
+                    301,
+                    LocalEnumDiscriminantIssueKind::OutOfRange,
+                ),
+            ]
+        );
+
+        let overflow_names = [
+            "Max",
+            "Overflow",
+            "Dependent",
+            "RepeatedMax",
+            "Large",
+            "After",
+        ]
+        .map(|name| ids.symbols.intern(name).unwrap());
+        let overflow_ids = ids
+            .paths
+            .intern_variants(ids.owner, &overflow_names.map(|name| (name, 0)))
+            .unwrap();
+        let overflow_variants = [
+            unit_variant(
+                ids.owner,
+                overflow_ids[0],
+                overflow_names[0],
+                1,
+                Some(i128::MAX),
+                true,
+            ),
+            unit_variant(
+                ids.owner,
+                overflow_ids[1],
+                overflow_names[1],
+                2,
+                None,
+                false,
+            ),
+            unit_variant(
+                ids.owner,
+                overflow_ids[2],
+                overflow_names[2],
+                3,
+                None,
+                false,
+            ),
+            unit_variant(
+                ids.owner,
+                overflow_ids[3],
+                overflow_names[3],
+                4,
+                Some(i128::MAX),
+                true,
+            ),
+            unit_variant(
+                ids.owner,
+                overflow_ids[4],
+                overflow_names[4],
+                5,
+                Some(300),
+                true,
+            ),
+            unit_variant(
+                ids.owner,
+                overflow_ids[5],
+                overflow_names[5],
+                6,
+                None,
+                false,
+            ),
+        ];
+        let overflow_payloads = unit_payload_template(ids.owner, &overflow_variants);
+        let overflow_item = module_enum_item(ids.owner, enum_name, &overflow_variants);
+        let overflow_hir = module_hir_owner(&overflow_item);
+        let overflow_error = LocalEnumAdtDef::from_hir_owner(
+            overflow_payloads,
+            Some(ReprAttr::Integer(ReprInteger::U8)),
+            &overflow_hir,
+        )
+        .expect_err("the overflow keeps the enum unsupported");
+
+        assert_eq!(
+            overflow_error.failures(),
+            &[LocalEnumAdtDefError::DiscriminantOverflow(
+                overflow_ids[1].to_def_id()
+            )]
+        );
+        assert_eq!(
+            overflow_error
+                .discriminants()
+                .iter()
+                .map(|value| (value.variant(), value.value()))
+                .collect::<Vec<_>>(),
+            [
+                (overflow_ids[0].to_def_id(), i128::MAX),
+                (overflow_ids[3].to_def_id(), i128::MAX),
+                (overflow_ids[4].to_def_id(), 300),
+                (overflow_ids[5].to_def_id(), 301),
+            ],
+            "explicit values resume the sequence after an overflow"
+        );
+        assert_eq!(
+            overflow_error
+                .issues()
+                .iter()
+                .map(|issue| (issue.variant(), issue.value(), issue.kind()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    overflow_ids[0].to_def_id(),
+                    i128::MAX,
+                    LocalEnumDiscriminantIssueKind::OutOfRange,
+                ),
+                (
+                    overflow_ids[3].to_def_id(),
+                    i128::MAX,
+                    LocalEnumDiscriminantIssueKind::OutOfRange,
+                ),
+                (
+                    overflow_ids[3].to_def_id(),
+                    i128::MAX,
+                    LocalEnumDiscriminantIssueKind::Duplicate {
+                        previous_variant: overflow_ids[0].to_def_id(),
+                    },
+                ),
+                (
+                    overflow_ids[4].to_def_id(),
+                    300,
+                    LocalEnumDiscriminantIssueKind::OutOfRange,
+                ),
+                (
+                    overflow_ids[5].to_def_id(),
+                    301,
+                    LocalEnumDiscriminantIssueKind::OutOfRange,
+                ),
+            ]
         );
     }
 }
