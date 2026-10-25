@@ -1,0 +1,5 @@
+package acme:privacy-request-coordinator @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Plan and audit a fictional data-subject access and erasure request"

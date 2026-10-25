@@ -1,0 +1,149 @@
+use acme:privacy-request-coordinator/model.{
+    DataClass
+    DataStore
+    DataSubjectRequest
+    DeletionDependency
+    DeletionReceipt
+    MAX_DEPENDENCIES
+    MAX_RECEIPTS
+    MAX_RECORDS
+    ReceiptOutcome
+    RequestKind
+    StoreRecord
+}
+
+pub fn request() -> DataSubjectRequest {
+    DataSubjectRequest(
+        request_id: 9001,
+        subject_id: 501,
+        kind: RequestKind.AccessAndErasure,
+        received_minute: 1490,
+        identity_verified: true,
+        scope_confirmed: true,
+    )
+}
+
+pub fn records() -> Array<StoreRecord, MAX_RECORDS> {
+    [
+        StoreRecord(
+            record_id: 8101,
+            operation_key: 90011,
+            subject_id: 501,
+            store: DataStore.SearchIndex,
+            data_class: DataClass.SearchDocument,
+            retained_until_minute: None,
+            legal_hold: false,
+        ),
+        StoreRecord(
+            record_id: 8102,
+            operation_key: 90012,
+            subject_id: 501,
+            store: DataStore.MarketingPlatform,
+            data_class: DataClass.MarketingPreference,
+            retained_until_minute: None,
+            legal_hold: false,
+        ),
+        StoreRecord(
+            record_id: 8103,
+            operation_key: 90013,
+            subject_id: 501,
+            store: DataStore.SessionCache,
+            data_class: DataClass.SessionToken,
+            retained_until_minute: None,
+            legal_hold: false,
+        ),
+        StoreRecord(
+            record_id: 8104,
+            operation_key: 90014,
+            subject_id: 501,
+            store: DataStore.ProfileService,
+            data_class: DataClass.Profile,
+            retained_until_minute: None,
+            legal_hold: false,
+        ),
+        StoreRecord(
+            record_id: 8105,
+            operation_key: 90015,
+            subject_id: 501,
+            store: DataStore.BillingLedger,
+            data_class: DataClass.Invoice,
+            retained_until_minute: Some(1600),
+            legal_hold: false,
+        ),
+        StoreRecord(
+            record_id: 8106,
+            operation_key: 90016,
+            subject_id: 501,
+            store: DataStore.SupportArchive,
+            data_class: DataClass.SupportConversation,
+            retained_until_minute: None,
+            legal_hold: true,
+        ),
+        StoreRecord(
+            record_id: 9991,
+            operation_key: 99991,
+            subject_id: 999,
+            store: DataStore.SearchIndex,
+            data_class: DataClass.SearchDocument,
+            retained_until_minute: None,
+            legal_hold: false,
+        ),
+    ]
+}
+
+pub fn dependencies() -> Array<DeletionDependency, MAX_DEPENDENCIES> {
+    [
+        DeletionDependency(before_record_id: 8101, after_record_id: 8104),
+        DeletionDependency(before_record_id: 8102, after_record_id: 8104),
+        DeletionDependency(before_record_id: 8103, after_record_id: 8104),
+    ]
+}
+
+pub fn receipts() -> Array<Option<DeletionReceipt>, MAX_RECEIPTS> {
+    var result = Array<Option<DeletionReceipt>, MAX_RECEIPTS>.filled(None)
+    result[0] = Some(
+        DeletionReceipt(
+            record_id: 8101,
+            operation_key: 90011,
+            attempt: 1,
+            outcome: ReceiptOutcome.Succeeded,
+        ),
+    )
+    result[1] = Some(
+        DeletionReceipt(
+            record_id: 8102,
+            operation_key: 90012,
+            attempt: 1,
+            outcome: ReceiptOutcome.RetryableFailure,
+        ),
+    )
+    result[2] = Some(
+        DeletionReceipt(
+            record_id: 8102,
+            operation_key: 90012,
+            attempt: 2,
+            outcome: ReceiptOutcome.Succeeded,
+        ),
+    )
+    result[3] = Some(
+        DeletionReceipt(
+            record_id: 8103,
+            operation_key: 90013,
+            attempt: 1,
+            outcome: ReceiptOutcome.RetryableFailure,
+        ),
+    )
+    result[4] = Some(
+        DeletionReceipt(
+            record_id: 8103,
+            operation_key: 90013,
+            attempt: 2,
+            outcome: ReceiptOutcome.RetryableFailure,
+        ),
+    )
+    result
+}
+
+pub fn receipt_count() -> USize {
+    5
+}

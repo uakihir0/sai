@@ -1,0 +1,345 @@
+use acme:privacy-request-coordinator/coordinator
+use acme:privacy-request-coordinator/fixtures
+use acme:privacy-request-coordinator/model.{
+    CoordinatorReport
+    DeletionDependency
+    DeletionReceipt
+    DeletionTask
+    ReceiptOutcome
+    RequestError
+    RequestKind
+    RequestState
+    WorkState
+}
+use acme:privacy-request-coordinator/report
+use sai:alloc/string.{String}
+
+pub fn fixture_report() -> CoordinatorReport {
+    coordinator.coordinate(
+        fixtures.request(),
+        fixtures.records(),
+        fixtures.dependencies(),
+        fixtures.receipts(),
+        fixtures.receipt_count(),
+        1500,
+    )
+}
+
+pub fn fixture_summary() -> String
+    effects { alloc }
+{
+    report.render(fixture_report())
+}
+
+fn task_for(report: CoordinatorReport, record_id: U32) -> Option<DeletionTask> {
+    for index in 0..report.task_count {
+        match report.tasks[index] {
+            Some(task) => {
+                if task.record_id == record_id {
+                    return Some(task)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+fn report_with_second_marketing_attempt(attempt: USize) -> CoordinatorReport {
+    var receipts = fixtures.receipts()
+    var changed_receipt = receipts[2].unwrap()
+    changed_receipt.attempt = attempt
+    receipts[2] = Some(changed_receipt)
+    coordinator.coordinate(
+        fixtures.request(),
+        fixtures.records(),
+        fixtures.dependencies(),
+        receipts,
+        fixtures.receipt_count(),
+        1500,
+    )
+}
+
+test "the combined request inventories all matching stores and preserves policy blocks" {
+    let result = fixture_report()
+
+    assert result.state == RequestState.NeedsReview
+    assert result.record_count == 6
+    assert result.task_count == 6
+    assert result.catalog_issue_count == 0
+    assert result.deleted_count == 2
+    assert result.legal_hold_count == 1
+    assert result.retention_blocked_count == 1
+    assert result.dependency_blocked_count == 1
+    assert result.retry_exhausted_count == 1
+    assert result.retry_recovered_count == 1
+    assert result.permanent_failure_count == 0
+    assert result.no_attempt_count == 0
+    assert task_for(result, 8106).unwrap().state == WorkState.BlockedByLegalHold
+    assert task_for(result, 8105).unwrap().state == WorkState.BlockedByRetention
+    assert task_for(result, 9991) == None
+}
+
+test "derived copies are ordered before the profile and retry keys stay stable" {
+    let result = fixture_report()
+    let search = task_for(result, 8101).unwrap()
+    let marketing = task_for(result, 8102).unwrap()
+    let session = task_for(result, 8103).unwrap()
+    let profile = task_for(result, 8104).unwrap()
+
+    assert search.plan_rank.unwrap() < profile.plan_rank.unwrap()
+    assert marketing.plan_rank.unwrap() < profile.plan_rank.unwrap()
+    assert session.plan_rank.unwrap() < profile.plan_rank.unwrap()
+    assert marketing.operation_key == 90012
+    assert marketing.attempt_count == 2
+    assert marketing.state == WorkState.Deleted
+    assert session.attempt_count == 2
+    assert session.state == WorkState.RetryExhausted
+    assert profile.state == WorkState.BlockedByDependency
+}
+
+test "access-only requests return the inventory without deletion actions" {
+    var request = fixtures.request()
+    request.kind = RequestKind.Access
+    let result = coordinator.coordinate(
+        request,
+        fixtures.records(),
+        fixtures.dependencies(),
+        fixtures.receipts(),
+        0,
+        1500,
+    )
+
+    assert result.state == RequestState.AccessPrepared
+    assert result.record_count == 6
+    assert result.task_count == 0
+    assert result.deleted_count == 0
+}
+
+test "identity validation fails closed before discovery or execution" {
+    var request = fixtures.request()
+    request.identity_verified = false
+    let result = coordinator.coordinate(
+        request,
+        fixtures.records(),
+        fixtures.dependencies(),
+        fixtures.receipts(),
+        fixtures.receipt_count(),
+        1500,
+    )
+
+    assert result.state == RequestState.InvalidRequest
+    assert result.request_error == Some(RequestError.IdentityNotVerified)
+    assert result.record_count == 0
+    assert result.task_count == 0
+    assert result.deleted_count == 0
+}
+
+test "unconfirmed scope prevents discovery and every deletion action" {
+    var request = fixtures.request()
+    request.scope_confirmed = false
+    let result = coordinator.coordinate(
+        request,
+        fixtures.records(),
+        fixtures.dependencies(),
+        fixtures.receipts(),
+        fixtures.receipt_count(),
+        1500,
+    )
+
+    assert result.state == RequestState.InvalidRequest
+    assert result.request_error == Some(RequestError.ScopeNotConfirmed)
+    assert result.record_count == 0
+    assert result.task_count == 0
+    assert result.deleted_count == 0
+}
+
+test "a duplicated catalog identifier blocks the whole request plan" {
+    var records = fixtures.records()
+    records[6] = records[0]
+    let result = coordinator.coordinate(
+        fixtures.request(),
+        records,
+        fixtures.dependencies(),
+        fixtures.receipts(),
+        fixtures.receipt_count(),
+        1500,
+    )
+
+    assert result.state == RequestState.NeedsReview
+    assert result.catalog_issue_count == 1
+    assert result.task_count == 0
+    assert result.deleted_count == 0
+}
+
+test "changed operation keys invalidate receipts without treating the action as deleted" {
+    var receipts = fixtures.receipts()
+    var changed_receipt = receipts[2].unwrap()
+    changed_receipt.operation_key = 99999
+    receipts[2] = Some(changed_receipt)
+    let result = coordinator.coordinate(
+        fixtures.request(),
+        fixtures.records(),
+        fixtures.dependencies(),
+        receipts,
+        fixtures.receipt_count(),
+        1500,
+    )
+
+    assert result.state == RequestState.NeedsReview
+    assert result.receipt_issue_count == 1
+    assert task_for(result, 8102).unwrap().state == WorkState.InvalidReceipt
+    assert task_for(result, 8102).unwrap().attempt_count == 1
+    assert result.deleted_count == 1
+}
+
+test "a successful deletion remains visible when an extra receipt requires review" {
+    var receipts = fixtures.receipts()
+    receipts[5] = Some(
+        DeletionReceipt(
+            record_id: 8101,
+            operation_key: 90011,
+            attempt: 2,
+            outcome: ReceiptOutcome.Succeeded,
+        ),
+    )
+    let result = coordinator.coordinate(
+        fixtures.request(),
+        fixtures.records(),
+        fixtures.dependencies(),
+        receipts,
+        6,
+        1500,
+    )
+
+    assert result.state == RequestState.NeedsReview
+    assert result.receipt_issue_count == 1
+    assert task_for(result, 8101).unwrap().state == WorkState.Deleted
+    assert task_for(result, 8101).unwrap().attempt_count == 1
+    assert result.deleted_count == 2
+}
+
+test "skipped and repeated attempt numbers invalidate the task without reporting its deletion" {
+    let repeated = report_with_second_marketing_attempt(1)
+    let skipped = report_with_second_marketing_attempt(3)
+
+    assert repeated.state == RequestState.NeedsReview
+    assert repeated.receipt_issue_count == 1
+    assert task_for(repeated, 8102).unwrap().state == WorkState.InvalidReceipt
+    assert task_for(repeated, 8102).unwrap().attempt_count == 1
+    assert repeated.deleted_count == 1
+
+    assert skipped.state == RequestState.NeedsReview
+    assert skipped.receipt_issue_count == 1
+    assert task_for(skipped, 8102).unwrap().state == WorkState.InvalidReceipt
+    assert task_for(skipped, 8102).unwrap().attempt_count == 1
+    assert skipped.deleted_count == 1
+}
+
+test "a cycle and its downstream task report unresolved order without naming cycle members" {
+    var dependencies = fixtures.dependencies()
+    dependencies[1] = DeletionDependency(before_record_id: 8104, after_record_id: 8101)
+    dependencies[2] = DeletionDependency(before_record_id: 8104, after_record_id: 8102)
+    let result = coordinator.coordinate(
+        fixtures.request(),
+        fixtures.records(),
+        dependencies,
+        fixtures.receipts(),
+        fixtures.receipt_count(),
+        1500,
+    )
+
+    assert result.state == RequestState.NeedsReview
+    assert result.plan_issue_count == 3
+    assert result.unused_receipt_count == fixtures.receipt_count()
+    assert result.deleted_count == 0
+    assert task_for(result, 8101).unwrap().state == WorkState.DependencyOrderUnresolved
+    assert task_for(result, 8104).unwrap().state == WorkState.DependencyOrderUnresolved
+    assert task_for(result, 8102).unwrap().state == WorkState.DependencyOrderUnresolved
+}
+
+test "a retained record keeps its hold status when it participates in a dependency cycle" {
+    var dependencies = fixtures.dependencies()
+    dependencies[0] = DeletionDependency(before_record_id: 8105, after_record_id: 8101)
+    dependencies[1] = DeletionDependency(before_record_id: 8101, after_record_id: 8105)
+    let result = coordinator.coordinate(
+        fixtures.request(),
+        fixtures.records(),
+        dependencies,
+        fixtures.receipts(),
+        fixtures.receipt_count(),
+        1500,
+    )
+
+    assert result.state == RequestState.NeedsReview
+    assert result.plan_issue_count == 0
+    assert result.retention_blocked_count == 1
+    assert task_for(result, 8105).unwrap().state == WorkState.BlockedByRetention
+    assert task_for(result, 8101).unwrap().state == WorkState.BlockedByDependency
+    assert task_for(result, 8101).unwrap().attempt_count == 0
+}
+
+test "a missing prerequisite record invalidates the plan before dependent receipts run" {
+    var dependencies = fixtures.dependencies()
+    dependencies[0] = DeletionDependency(before_record_id: 9998, after_record_id: 8104)
+    var receipts = fixtures.receipts()
+    receipts[5] = Some(
+        DeletionReceipt(
+            record_id: 8104,
+            operation_key: 90014,
+            attempt: 1,
+            outcome: ReceiptOutcome.Succeeded,
+        ),
+    )
+    let result = coordinator.coordinate(
+        fixtures.request(),
+        fixtures.records(),
+        dependencies,
+        receipts,
+        6,
+        1500,
+    )
+
+    assert result.state == RequestState.NeedsReview
+    assert result.invalid_dependency_count == 1
+    assert result.plan_issue_count == 1
+    assert result.unused_receipt_count == 6
+    assert task_for(result, 8104).unwrap().state == WorkState.InvalidDependency
+    assert task_for(result, 8104).unwrap().attempt_count == 0
+    assert result.deleted_count == 0
+}
+
+test "duplicate operation keys invalidate the affected plan items" {
+    var records = fixtures.records()
+    records[1].operation_key = records[0].operation_key
+    let result = coordinator.coordinate(
+        fixtures.request(),
+        records,
+        fixtures.dependencies(),
+        fixtures.receipts(),
+        fixtures.receipt_count(),
+        1500,
+    )
+
+    assert result.state == RequestState.NeedsReview
+    assert result.plan_issue_count == 2
+    assert result.deleted_count == 0
+    assert task_for(result, 8101).unwrap().state == WorkState.InvalidPlan
+    assert task_for(result, 8102).unwrap().state == WorkState.InvalidPlan
+}
+
+test "retention ending at the current minute no longer blocks deletion eligibility" {
+    let result = coordinator.coordinate(
+        fixtures.request(),
+        fixtures.records(),
+        fixtures.dependencies(),
+        fixtures.receipts(),
+        0,
+        1600,
+    )
+
+    assert result.retention_blocked_count == 0
+    assert task_for(result, 8105).unwrap().state == WorkState.NoAttempt
+    assert result.deleted_count == 0
+    assert result.state == RequestState.NeedsReview
+}

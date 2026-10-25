@@ -1,0 +1,20 @@
+use acme:privacy-request-coordinator/model.{DataSubjectRequest, RequestError}
+
+pub fn validate(request: DataSubjectRequest, now_minute: U32) -> Option<RequestError> {
+    if request.request_id == 0 {
+        return Some(RequestError.MissingRequestId)
+    }
+    if request.subject_id == 0 {
+        return Some(RequestError.MissingSubjectId)
+    }
+    if not request.identity_verified {
+        return Some(RequestError.IdentityNotVerified)
+    }
+    if not request.scope_confirmed {
+        return Some(RequestError.ScopeNotConfirmed)
+    }
+    if request.received_minute > now_minute {
+        return Some(RequestError.ReceivedInFuture)
+    }
+    None
+}

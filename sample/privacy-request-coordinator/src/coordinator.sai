@@ -1,0 +1,196 @@
+use acme:privacy-request-coordinator/discovery
+use acme:privacy-request-coordinator/execution
+use acme:privacy-request-coordinator/model.{
+    CoordinatorReport
+    DataSubjectRequest
+    DeletionDependency
+    DeletionPlan
+    DeletionReceipt
+    DeletionTask
+    DiscoveryReport
+    MAX_DEPENDENCIES
+    MAX_RECEIPTS
+    MAX_RECORDS
+    RequestError
+    RequestKind
+    RequestState
+    StoreRecord
+    WorkState
+}
+use acme:privacy-request-coordinator/planner
+use acme:privacy-request-coordinator/validation
+
+fn empty_plan() -> DeletionPlan {
+    DeletionPlan(
+        tasks: Array<Option<DeletionTask>, MAX_RECORDS>.filled(None),
+        task_count: 0,
+        unresolved_order_count: 0,
+        invalid_key_count: 0,
+        invalid_dependency_count: 0,
+    )
+}
+
+fn make_report(
+    request: DataSubjectRequest,
+    discovery: DiscoveryReport,
+    plan: DeletionPlan,
+    state: RequestState,
+    request_error: Option<RequestError>,
+    receipt_issue_count: USize,
+    unused_receipt_count: USize,
+) -> CoordinatorReport {
+    var report = CoordinatorReport(
+        request_id: request.request_id,
+        subject_id: request.subject_id,
+        kind: request.kind,
+        state: state,
+        request_error: request_error,
+        records: discovery.records,
+        record_count: discovery.record_count,
+        tasks: plan.tasks,
+        task_count: plan.task_count,
+        catalog_issue_count: discovery.catalog_issue_count,
+        plan_issue_count: (
+            plan.unresolved_order_count + plan.invalid_key_count + plan.invalid_dependency_count
+        ),
+        invalid_dependency_count: plan.invalid_dependency_count,
+        receipt_issue_count: receipt_issue_count,
+        unused_receipt_count: unused_receipt_count,
+        deleted_count: 0,
+        legal_hold_count: 0,
+        retention_blocked_count: 0,
+        dependency_blocked_count: 0,
+        retry_exhausted_count: 0,
+        retry_pending_count: 0,
+        retry_recovered_count: 0,
+        permanent_failure_count: 0,
+        no_attempt_count: 0,
+    )
+
+    for index in 0..plan.task_count {
+        let task = plan.tasks[index].unwrap()
+        match task.state {
+            WorkState.Deleted => {
+                report.deleted_count += 1
+                if task.attempt_count > 1 {
+                    report.retry_recovered_count += task.attempt_count - 1
+                }
+            }
+            WorkState.BlockedByLegalHold => {
+                report.legal_hold_count += 1
+            }
+            WorkState.BlockedByRetention => {
+                report.retention_blocked_count += 1
+            }
+            WorkState.BlockedByDependency => {
+                report.dependency_blocked_count += 1
+            }
+            WorkState.RetryExhausted => {
+                report.retry_exhausted_count += 1
+            }
+            WorkState.RetryPending => {
+                report.retry_pending_count += 1
+            }
+            WorkState.PermanentFailure => {
+                report.permanent_failure_count += 1
+            }
+            WorkState.NoAttempt => {
+                report.no_attempt_count += 1
+            }
+            _ => {}
+        }
+    }
+    report
+}
+
+fn status_after_execution(report: CoordinatorReport) -> RequestState {
+    if (
+        report.plan_issue_count > 0
+        or report.receipt_issue_count > 0
+        or report.unused_receipt_count > 0
+        or report.retry_exhausted_count > 0
+        or report.retry_pending_count > 0
+        or report.permanent_failure_count > 0
+        or report.no_attempt_count > 0
+    ) {
+        return RequestState.NeedsReview
+    }
+    if report.legal_hold_count > 0 or report.retention_blocked_count > 0 {
+        return RequestState.PartiallyBlocked
+    }
+    if report.dependency_blocked_count > 0 {
+        return RequestState.PartiallyBlocked
+    }
+    if report.task_count > 0 and report.deleted_count == report.task_count {
+        return RequestState.Completed
+    }
+    RequestState.NoMatchingData
+}
+
+pub fn coordinate(
+    request: DataSubjectRequest,
+    all_records: Array<StoreRecord, MAX_RECORDS>,
+    dependencies: Array<DeletionDependency, MAX_DEPENDENCIES>,
+    receipts: Array<Option<DeletionReceipt>, MAX_RECEIPTS>,
+    receipt_count: USize,
+    now_minute: U32,
+) -> CoordinatorReport {
+    let empty_discovery = DiscoveryReport(
+        records: Array<Option<StoreRecord>, MAX_RECORDS>.filled(None),
+        record_count: 0,
+        catalog_issue_count: 0,
+    )
+    let no_plan = empty_plan()
+
+    match validation.validate(request, now_minute) {
+        Some(error) => {
+            return make_report(
+                request,
+                empty_discovery,
+                no_plan,
+                RequestState.InvalidRequest,
+                Some(error),
+                0,
+                0,
+            )
+        }
+        None => {}
+    }
+
+    let found = discovery.discover(all_records, request.subject_id)
+    if found.catalog_issue_count > 0 {
+        return make_report(request, found, no_plan, RequestState.NeedsReview, None, 0, 0)
+    }
+    if request.kind == RequestKind.Access {
+        let state = if found.record_count == 0 {
+            RequestState.NoMatchingData
+        } else {
+            RequestState.AccessPrepared
+        }
+        return make_report(request, found, no_plan, state, None, 0, 0)
+    }
+
+    let plan = planner.create_plan(found, dependencies, now_minute)
+    if (
+        plan.unresolved_order_count > 0
+        or plan.invalid_key_count > 0
+        or plan.invalid_dependency_count > 0
+    ) {
+        return make_report(request, found, plan, RequestState.NeedsReview, None, 0, receipt_count)
+    }
+
+    let executed = execution.apply_receipts(plan, dependencies, receipts, receipt_count)
+    let report = make_report(
+        request,
+        found,
+        executed.plan,
+        RequestState.NeedsReview,
+        None,
+        executed.receipt_issue_count,
+        executed.unused_receipt_count,
+    )
+    let final_state = status_after_execution(report)
+    var final_report = report
+    final_report.state = final_state
+    final_report
+}

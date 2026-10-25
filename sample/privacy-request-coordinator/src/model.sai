@@ -1,0 +1,172 @@
+pub const MAX_RECORDS: USize = 7
+pub const MAX_DEPENDENCIES: USize = 3
+pub const MAX_RECEIPTS: USize = 14
+pub const MAX_ATTEMPTS: USize = 2
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RequestKind {
+    Access
+    Erasure
+    AccessAndErasure
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RequestError {
+    MissingRequestId
+    MissingSubjectId
+    IdentityNotVerified
+    ScopeNotConfirmed
+    ReceivedInFuture
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum DataStore {
+    ProfileService
+    SearchIndex
+    MarketingPlatform
+    SessionCache
+    BillingLedger
+    SupportArchive
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum DataClass {
+    Profile
+    SearchDocument
+    MarketingPreference
+    SessionToken
+    Invoice
+    SupportConversation
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum WorkState {
+    Planned
+    Deleted
+    BlockedByLegalHold
+    BlockedByRetention
+    BlockedByDependency
+    RetryPending
+    RetryExhausted
+    PermanentFailure
+    NoAttempt
+    InvalidPlan
+    InvalidReceipt
+    InvalidDependency
+    DependencyOrderUnresolved
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReceiptOutcome {
+    Succeeded
+    RetryableFailure
+    PermanentFailure
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RequestState {
+    InvalidRequest
+    NeedsReview
+    AccessPrepared
+    Completed
+    PartiallyBlocked
+    NoMatchingData
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DataSubjectRequest {
+    pub request_id: U32
+    pub subject_id: U32
+    pub kind: RequestKind
+    pub received_minute: U32
+    pub identity_verified: Bool
+    pub scope_confirmed: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type StoreRecord {
+    pub record_id: U32
+    pub operation_key: U32
+    pub subject_id: U32
+    pub store: DataStore
+    pub data_class: DataClass
+    pub retained_until_minute: Option<U32>
+    pub legal_hold: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DeletionDependency {
+    // The `before` record must be deleted successfully before `after`.
+    pub before_record_id: U32
+    pub after_record_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DeletionReceipt {
+    pub record_id: U32
+    pub operation_key: U32
+    pub attempt: USize
+    pub outcome: ReceiptOutcome
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DiscoveryReport {
+    pub records: Array<Option<StoreRecord>, MAX_RECORDS>
+    pub record_count: USize
+    pub catalog_issue_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DeletionTask {
+    pub record_id: U32
+    pub operation_key: U32
+    pub store: DataStore
+    pub data_class: DataClass
+    pub retained_until_minute: Option<U32>
+    pub state: WorkState
+    pub plan_rank: Option<USize>
+    pub attempt_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DeletionPlan {
+    pub tasks: Array<Option<DeletionTask>, MAX_RECORDS>
+    pub task_count: USize
+    pub unresolved_order_count: USize
+    pub invalid_key_count: USize
+    pub invalid_dependency_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ExecutionResult {
+    pub plan: DeletionPlan
+    pub receipt_issue_count: USize
+    pub unused_receipt_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CoordinatorReport {
+    pub request_id: U32
+    pub subject_id: U32
+    pub kind: RequestKind
+    pub state: RequestState
+    pub request_error: Option<RequestError>
+    pub records: Array<Option<StoreRecord>, MAX_RECORDS>
+    pub record_count: USize
+    pub tasks: Array<Option<DeletionTask>, MAX_RECORDS>
+    pub task_count: USize
+    pub catalog_issue_count: USize
+    pub plan_issue_count: USize
+    pub invalid_dependency_count: USize
+    pub receipt_issue_count: USize
+    pub unused_receipt_count: USize
+    pub deleted_count: USize
+    pub legal_hold_count: USize
+    pub retention_blocked_count: USize
+    pub dependency_blocked_count: USize
+    pub retry_exhausted_count: USize
+    pub retry_pending_count: USize
+    pub retry_recovered_count: USize
+    pub permanent_failure_count: USize
+    pub no_attempt_count: USize
+}
