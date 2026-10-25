@@ -1,0 +1,156 @@
+use acme:municipal-procurement-bid-review/fixtures
+use acme:municipal-procurement-bid-review/intake
+use acme:municipal-procurement-bid-review/model.{AwardReport, Bid, BidEvaluation, BidStage}
+
+fn precedes(candidate: BidEvaluation, other: BidEvaluation) -> Bool {
+    if candidate.combined_score_hundredths != other.combined_score_hundredths {
+        candidate.combined_score_hundredths > other.combined_score_hundredths
+    } else if candidate.technical_total != other.technical_total {
+        candidate.technical_total > other.technical_total
+    } else if candidate.corrected_total_thousands != other.corrected_total_thousands {
+        candidate.corrected_total_thousands < other.corrected_total_thousands
+    } else if candidate.bid.received_minute != other.bid.received_minute {
+        candidate.bid.received_minute < other.bid.received_minute
+    } else {
+        candidate.bid.id < other.bid.id
+    }
+}
+
+fn rank_of(candidate: BidEvaluation, candidates: Array<Option<BidEvaluation>, 14>) -> USize {
+    var rank: USize = 1
+    for other in candidates {
+        match other {
+            Some(item) => {
+                if item.stage == BidStage.Qualified and precedes(item, candidate) {
+                    rank += 1
+                }
+            }
+            None => {}
+        }
+    }
+    rank
+}
+
+fn has_prior_bid_id(bids: Array<Bid, 14>, index: USize) -> Bool {
+    var prior_index: USize = 0
+    var found = false
+    while prior_index < index {
+        if bids[prior_index].id == bids[index].id {
+            found = true
+        }
+        prior_index += 1
+    }
+    found
+}
+
+pub fn build_report_from(bids: Array<Bid, 14>) -> AwardReport {
+    var preliminary: Array<Option<BidEvaluation>, 14> =
+        Array<Option<BidEvaluation>, 14>.filled(None)
+    var index: USize = 0
+    while index < 14 {
+        var item = intake.assess(bids[index])
+        if has_prior_bid_id(bids, index) {
+            item.stage = BidStage.DuplicateBidIdentifier
+        }
+        preliminary[index] = Some(item)
+        index += 1
+    }
+
+    var lowest_qualified_price: U64 = 0
+    for row in preliminary {
+        match row {
+            Some(item) => {
+                if (
+                    item.stage == BidStage.Qualified
+                    and (
+                        lowest_qualified_price == 0
+                        or item.corrected_total_thousands < lowest_qualified_price
+                    )
+                ) {
+                    lowest_qualified_price = item.corrected_total_thousands
+                }
+            }
+            None => {}
+        }
+    }
+
+    var scored: Array<Option<BidEvaluation>, 14> = Array<Option<BidEvaluation>, 14>.filled(None)
+    index = 0
+    while index < 14 {
+        match preliminary[index] {
+            Some(item) => {
+                var updated = item
+                if updated.stage == BidStage.Qualified and lowest_qualified_price > 0 {
+                    updated.price_score_hundredths =
+                        (U64(4000) * lowest_qualified_price) / updated.corrected_total_thousands
+                    updated.combined_score_hundredths =
+                        (updated.technical_total * U64(100) + updated.price_score_hundredths)
+                }
+                scored[index] = Some(updated)
+            }
+            None => {}
+        }
+        index += 1
+    }
+
+    var evaluations: Array<Option<BidEvaluation>, 14> =
+        Array<Option<BidEvaluation>, 14>.filled(None)
+    index = 0
+    while index < 14 {
+        match scored[index] {
+            Some(item) => {
+                var updated = item
+                if updated.stage == BidStage.Qualified {
+                    updated.rank = rank_of(updated, scored)
+                    updated.recommended_award = updated.rank == 1
+                }
+                evaluations[index] = Some(updated)
+            }
+            None => {}
+        }
+        index += 1
+    }
+
+    var evaluation_count: USize = 0
+    var qualified_count: USize = 0
+    var excluded_count: USize = 0
+    var arithmetic_correction_count: USize = 0
+    var recommended_bid_id: Option<U32> = None
+    var recommended_amount: Option<U64> = None
+    for row in evaluations {
+        match row {
+            Some(item) => {
+                evaluation_count += 1
+                if item.stage == BidStage.Qualified {
+                    qualified_count += 1
+                } else {
+                    excluded_count += 1
+                }
+                if item.arithmetic_corrected {
+                    arithmetic_correction_count += 1
+                }
+                if item.recommended_award {
+                    recommended_bid_id = Some(item.bid.id)
+                    recommended_amount = Some(item.corrected_total_thousands)
+                }
+            }
+            None => {}
+        }
+    }
+
+    AwardReport(
+        evaluations: evaluations,
+        evaluation_count: evaluation_count,
+        qualified_count: qualified_count,
+        excluded_count: excluded_count,
+        arithmetic_correction_count: arithmetic_correction_count,
+        lowest_qualified_price_thousands: lowest_qualified_price,
+        recommendation_ready: recommended_bid_id != None,
+        recommended_bid_id: recommended_bid_id,
+        recommended_amount_thousands: recommended_amount,
+    )
+}
+
+pub fn build_report() -> AwardReport {
+    build_report_from(fixtures.bids())
+}

@@ -1,0 +1,357 @@
+use acme:municipal-procurement-bid-review/model.{
+    Bid
+    PriceLine
+    PriceSchedule
+    SubmissionDocuments
+    SupplierRecord
+    TechnicalScore
+}
+
+pub fn bids() -> Array<Bid, 14> {
+    [
+        Bid(
+            id: 7307,
+            supplier: "North Beacon Utilities",
+            received_minute: 35,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 22, work_quality: 18, accessibility: 12),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 160, quoted_extension_thousands: 640),
+                lighting: PriceLine(unit_thousands: 80, quoted_extension_thousands: 160),
+                crossings: PriceLine(unit_thousands: 40, quoted_extension_thousands: 40),
+                quoted_total_thousands: 840,
+            ),
+        ),
+        Bid(
+            id: 7304,
+            supplier: "Greenway Streets",
+            received_minute: 42,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 20, work_quality: 13, accessibility: 8),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 120, quoted_extension_thousands: 480),
+                lighting: PriceLine(unit_thousands: 80, quoted_extension_thousands: 160),
+                crossings: PriceLine(unit_thousands: 60, quoted_extension_thousands: 60),
+                quoted_total_thousands: 700,
+            ),
+        ),
+        Bid(
+            id: 7302,
+            supplier: "Harborline Civil",
+            received_minute: 20,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 22, work_quality: 18, accessibility: 12),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 160, quoted_extension_thousands: 640),
+                lighting: PriceLine(unit_thousands: 80, quoted_extension_thousands: 150),
+                crossings: PriceLine(unit_thousands: 40, quoted_extension_thousands: 40),
+                quoted_total_thousands: 830,
+            ),
+        ),
+        Bid(
+            id: 7309,
+            supplier: "Civic Works Cooperative",
+            received_minute: 21,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 24, work_quality: 19, accessibility: 13),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 170, quoted_extension_thousands: 680),
+                lighting: PriceLine(unit_thousands: 100, quoted_extension_thousands: 200),
+                crossings: PriceLine(unit_thousands: 40, quoted_extension_thousands: 40),
+                quoted_total_thousands: 920,
+            ),
+        ),
+        Bid(
+            id: 7306,
+            supplier: "Highline Paving",
+            received_minute: 210,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 25, work_quality: 20, accessibility: 15),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 300, quoted_extension_thousands: 1200),
+                lighting: PriceLine(unit_thousands: 150, quoted_extension_thousands: 300),
+                crossings: PriceLine(unit_thousands: 100, quoted_extension_thousands: 100),
+                quoted_total_thousands: 1600,
+            ),
+        ),
+        Bid(
+            id: 7303,
+            supplier: "East Ward Contracting",
+            received_minute: 301,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 25, work_quality: 19, accessibility: 15),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 130, quoted_extension_thousands: 520),
+                lighting: PriceLine(unit_thousands: 90, quoted_extension_thousands: 180),
+                crossings: PriceLine(unit_thousands: 80, quoted_extension_thousands: 80),
+                quoted_total_thousands: 780,
+            ),
+        ),
+        Bid(
+            id: 7305,
+            supplier: "MetroGrid Services",
+            received_minute: 210,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: false,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 24, work_quality: 19, accessibility: 15),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 140, quoted_extension_thousands: 560),
+                lighting: PriceLine(unit_thousands: 110, quoted_extension_thousands: 220),
+                crossings: PriceLine(unit_thousands: 40, quoted_extension_thousands: 40),
+                quoted_total_thousands: 820,
+            ),
+        ),
+        Bid(
+            id: 7311,
+            supplier: "Riverfront Infrastructure",
+            received_minute: 210,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: true,
+            ),
+            technical: TechnicalScore(delivery_plan: 23, work_quality: 19, accessibility: 15),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 130, quoted_extension_thousands: 520),
+                lighting: PriceLine(unit_thousands: 120, quoted_extension_thousands: 240),
+                crossings: PriceLine(unit_thousands: 40, quoted_extension_thousands: 40),
+                quoted_total_thousands: 800,
+            ),
+        ),
+        Bid(
+            id: 7310,
+            supplier: "Portage Contractors",
+            received_minute: 205,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: true,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 22, work_quality: 18, accessibility: 14),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 160, quoted_extension_thousands: 640),
+                lighting: PriceLine(unit_thousands: 120, quoted_extension_thousands: 240),
+                crossings: PriceLine(unit_thousands: 80, quoted_extension_thousands: 80),
+                quoted_total_thousands: 960,
+            ),
+        ),
+        Bid(
+            id: 7312,
+            supplier: "Parkway Maintenance",
+            received_minute: 205,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 26, work_quality: 20, accessibility: 15),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 150, quoted_extension_thousands: 600),
+                lighting: PriceLine(unit_thousands: 130, quoted_extension_thousands: 260),
+                crossings: PriceLine(unit_thousands: 40, quoted_extension_thousands: 40),
+                quoted_total_thousands: 900,
+            ),
+        ),
+        Bid(
+            id: 7313,
+            supplier: "Cedar City Builders",
+            received_minute: 205,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: false,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 24, work_quality: 20, accessibility: 14),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 140, quoted_extension_thousands: 560),
+                lighting: PriceLine(unit_thousands: 100, quoted_extension_thousands: 200),
+                crossings: PriceLine(unit_thousands: 100, quoted_extension_thousands: 100),
+                quoted_total_thousands: 860,
+            ),
+        ),
+        Bid(
+            id: 7314,
+            supplier: "Market Renewal LLC",
+            received_minute: 205,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: false,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 25, work_quality: 20, accessibility: 14),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 160, quoted_extension_thousands: 640),
+                lighting: PriceLine(unit_thousands: 100, quoted_extension_thousands: 200),
+                crossings: PriceLine(unit_thousands: 40, quoted_extension_thousands: 40),
+                quoted_total_thousands: 880,
+            ),
+        ),
+        Bid(
+            id: 7315,
+            supplier: "West City Engineering",
+            received_minute: 205,
+            documents: SubmissionDocuments(
+                signed_form: false,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 24, work_quality: 19, accessibility: 14),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 145, quoted_extension_thousands: 580),
+                lighting: PriceLine(unit_thousands: 110, quoted_extension_thousands: 220),
+                crossings: PriceLine(unit_thousands: 75, quoted_extension_thousands: 75),
+                quoted_total_thousands: 875,
+            ),
+        ),
+        Bid(
+            id: 7316,
+            supplier: "Zero Bid Demonstrator",
+            received_minute: 205,
+            documents: SubmissionDocuments(
+                signed_form: true,
+                addenda_acknowledged: true,
+                bid_security: true,
+            ),
+            supplier_record: SupplierRecord(
+                registration_current: true,
+                suspended: false,
+                unresolved_conflict: false,
+            ),
+            technical: TechnicalScore(delivery_plan: 25, work_quality: 20, accessibility: 15),
+            prices: PriceSchedule(
+                paving: PriceLine(unit_thousands: 0, quoted_extension_thousands: 0),
+                lighting: PriceLine(unit_thousands: 0, quoted_extension_thousands: 0),
+                crossings: PriceLine(unit_thousands: 0, quoted_extension_thousands: 0),
+                quoted_total_thousands: 0,
+            ),
+        ),
+    ]
+}
+
+pub fn bid_deadline_minute() -> U32 {
+    300
+}
+
+pub fn contract_cost_ceiling_thousands() -> U64 {
+    1500
+}
+
+pub fn technical_minimum() -> U32 {
+    42
+}
+
+pub fn delivery_plan_maximum() -> U32 {
+    25
+}
+
+pub fn work_quality_maximum() -> U32 {
+    20
+}
+
+pub fn accessibility_maximum() -> U32 {
+    15
+}
+
+pub fn paving_quantity() -> U64 {
+    4
+}
+
+pub fn lighting_quantity() -> U64 {
+    2
+}
+
+pub fn crossings_quantity() -> U64 {
+    1
+}

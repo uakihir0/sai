@@ -1,0 +1,82 @@
+use acme:municipal-procurement-bid-review/fixtures
+use acme:municipal-procurement-bid-review/model.{Bid, BidEvaluation, BidStage}
+
+pub fn corrected_total_thousands(bid: Bid) -> U64 {
+    (
+        U64(bid.prices.paving.unit_thousands) * fixtures.paving_quantity()
+        + U64(bid.prices.lighting.unit_thousands) * fixtures.lighting_quantity()
+        + U64(bid.prices.crossings.unit_thousands) * fixtures.crossings_quantity()
+    )
+}
+
+pub fn needs_arithmetic_correction(bid: Bid) -> Bool {
+    let corrected_paving = (U64(bid.prices.paving.unit_thousands) * fixtures.paving_quantity())
+    let corrected_lighting =
+        (U64(bid.prices.lighting.unit_thousands) * fixtures.lighting_quantity())
+    let corrected_crossings =
+        (U64(bid.prices.crossings.unit_thousands) * fixtures.crossings_quantity())
+    (
+        corrected_paving != U64(bid.prices.paving.quoted_extension_thousands)
+        or corrected_lighting != U64(bid.prices.lighting.quoted_extension_thousands)
+        or corrected_crossings != U64(bid.prices.crossings.quoted_extension_thousands)
+        or corrected_total_thousands(bid) != U64(bid.prices.quoted_total_thousands)
+    )
+}
+
+pub fn technical_total(bid: Bid) -> U64 {
+    (
+        U64(bid.technical.delivery_plan)
+        + U64(bid.technical.work_quality)
+        + U64(bid.technical.accessibility)
+    )
+}
+
+fn valid_technical_record(bid: Bid) -> Bool {
+    (
+        bid.technical.delivery_plan <= fixtures.delivery_plan_maximum()
+        and bid.technical.work_quality <= fixtures.work_quality_maximum()
+        and bid.technical.accessibility <= fixtures.accessibility_maximum()
+    )
+}
+
+pub fn assess(bid: Bid) -> BidEvaluation {
+    let corrected_total = corrected_total_thousands(bid)
+    let technical = technical_total(bid)
+    let stage = if bid.received_minute > fixtures.bid_deadline_minute() {
+        BidStage.LateSubmission
+    } else if not bid.documents.signed_form {
+        BidStage.MissingSignedForm
+    } else if not bid.documents.addenda_acknowledged {
+        BidStage.MissingAddendaAcknowledgment
+    } else if not bid.documents.bid_security {
+        BidStage.MissingBidSecurity
+    } else if not bid.supplier_record.registration_current {
+        BidStage.VendorNotRegistered
+    } else if bid.supplier_record.suspended {
+        BidStage.SuspendedVendor
+    } else if bid.supplier_record.unresolved_conflict {
+        BidStage.ConflictReviewRequired
+    } else if corrected_total == 0 {
+        BidStage.InvalidPriceSchedule
+    } else if not valid_technical_record(bid) {
+        BidStage.InvalidTechnicalRecord
+    } else if technical < U64(fixtures.technical_minimum()) {
+        BidStage.TechnicalScoreBelowMinimum
+    } else if corrected_total > fixtures.contract_cost_ceiling_thousands() {
+        BidStage.AboveCostCeiling
+    } else {
+        BidStage.Qualified
+    }
+
+    BidEvaluation(
+        bid: bid,
+        stage: stage,
+        technical_total: technical,
+        corrected_total_thousands: corrected_total,
+        arithmetic_corrected: needs_arithmetic_correction(bid),
+        price_score_hundredths: 0,
+        combined_score_hundredths: 0,
+        rank: 0,
+        recommended_award: false,
+    )
+}

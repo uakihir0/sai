@@ -82,6 +82,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`accessible-audio-release-auditor`](accessible-audio-release-auditor/README.md) | Audit a fictional audiobook release for required audio parts, chapter synchronization, timed transcript and description coverage, version consistency, and accessibility approvals. |
 | Advanced | [`privacy-request-coordinator`](privacy-request-coordinator/README.md) | Coordinate a fictional access and erasure request across stores with identity and scope gates, legal holds, retention, dependency-ordered deletions, retries, and auditable partial results. |
 | Advanced | [`smart-building-comfort-controller`](smart-building-comfort-controller/README.md) | Plan requested setpoints and ventilation under comfort bands, target hysteresis, price and carbon budgets, equipment limits, and visible unmet requests. |
+| Advanced | [`municipal-procurement-bid-review`](municipal-procurement-bid-review/README.md) | Review fictional public-works bids through submission and supplier gates, unit-price arithmetic correction, a technical floor, normalized best-value scoring, and a deterministic award recommendation. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
