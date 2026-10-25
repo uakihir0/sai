@@ -2675,6 +2675,64 @@ impl LocalEnumVariantPathTypeEntry {
     }
 }
 
+/// Arity result for one call whose callee is a direct supported local enum
+/// variant path. This projection does not type-check argument expressions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnumVariantCallOutcome {
+    TupleVariantArityMatches { expected: usize },
+    WrongArgumentCount { expected: usize, found: usize },
+    UnitVariantCalled { found: usize },
+}
+
+/// Arity information for one direct local enum-variant constructor call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumVariantCallEntry {
+    call: HirId,
+    callee_field: HirId,
+    enum_owner: OwnerId,
+    enum_def: DefId,
+    variant: DefId,
+    arguments: Vec<HirId>,
+    outcome: LocalEnumVariantCallOutcome,
+}
+
+impl LocalEnumVariantCallEntry {
+    /// HIR identity of the complete call expression.
+    pub const fn call(&self) -> HirId {
+        self.call
+    }
+
+    /// HIR identity of the direct enum-variant path used as the callee.
+    pub const fn callee_field(&self) -> HirId {
+        self.callee_field
+    }
+
+    /// Exact validated local enum owner.
+    pub const fn enum_owner(&self) -> OwnerId {
+        self.enum_owner
+    }
+
+    /// Exact enum definition paired with `enum_owner`.
+    pub const fn enum_def(&self) -> DefId {
+        self.enum_def
+    }
+
+    /// Exact variant definition selected by the path resolver.
+    pub const fn variant(&self) -> DefId {
+        self.variant
+    }
+
+    /// HIR identities of the call's arguments in source order.
+    pub fn arguments(&self) -> &[HirId] {
+        &self.arguments
+    }
+
+    /// Arity comparison against the projected tuple-variant signature.
+    pub const fn outcome(&self) -> LocalEnumVariantCallOutcome {
+        self.outcome
+    }
+}
+
 /// Owned direct enum-variant paths and diagnostics for one function owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalEnumVariantPathResolution {
@@ -2682,7 +2740,9 @@ pub struct LocalEnumVariantPathResolution {
     entries: HashMap<HirId, LocalEnumVariantPathEntry>,
     value_type_entries: HashMap<HirId, LocalEnumVariantPathTypeEntry>,
     type_dependent_defs: HashMap<HirId, LocalTypeDependentDef>,
+    calls: HashMap<HirId, LocalEnumVariantCallEntry>,
     diagnostics: Vec<Diagnostic>,
+    call_diagnostics: Vec<Diagnostic>,
 }
 
 impl LocalEnumVariantPathResolution {
@@ -2718,9 +2778,24 @@ impl LocalEnumVariantPathResolution {
         self.type_dependent_defs.get(&field).copied()
     }
 
+    /// Arity projections keyed by the exact call-expression HIR ID.
+    pub fn calls(&self) -> &HashMap<HirId, LocalEnumVariantCallEntry> {
+        &self.calls
+    }
+
+    /// Arity projection for the exact direct local enum-variant call.
+    pub fn call_for_expr(&self, call: HirId) -> Option<&LocalEnumVariantCallEntry> {
+        self.calls.get(&call)
+    }
+
     /// Source-ordered unknown-variant and non-enum diagnostics.
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    /// Source-ordered wrong-argument-count diagnostics for local variant calls.
+    pub fn call_diagnostics(&self) -> &[Diagnostic] {
+        &self.call_diagnostics
     }
 }
 
@@ -11500,6 +11575,7 @@ struct DirectEnumVariantPathCandidate<'hir> {
     base_path: HirPath<'hir>,
     type_head_segments: Vec<PathSegment<'hir>>,
     name: Name,
+    direct_call: Option<&'hir HirExpr<'hir>>,
 }
 
 fn direct_enum_variant_type_head<'hir>(
@@ -11554,6 +11630,7 @@ fn direct_enum_variant_path_candidates<'hir>(
             .map(|predicate| Work::Expr(predicate)),
     );
     let mut candidates = Vec::new();
+    let mut calls_by_callee = HashMap::new();
     while let Some(next) = work.pop() {
         match next {
             Work::Expr(expr) => match expr.kind {
@@ -11574,6 +11651,7 @@ fn direct_enum_variant_path_candidates<'hir>(
                             base_path,
                             type_head_segments,
                             name,
+                            direct_call: calls_by_callee.get(&expr.hir_id).copied(),
                         });
                     }
                     work.push(Work::Expr(base));
@@ -11584,6 +11662,18 @@ fn direct_enum_variant_path_candidates<'hir>(
                 | ExprKind::Try(base)
                 | ExprKind::Await(base) => work.push(Work::Expr(base)),
                 ExprKind::Call { callee, args, base } => {
+                    if base.is_none()
+                        && matches!(
+                            callee.kind,
+                            ExprKind::Field {
+                                base,
+                                args: None,
+                                ..
+                            } if direct_enum_variant_type_head(base).is_some()
+                        )
+                    {
+                        calls_by_callee.insert(callee.hir_id, expr);
+                    }
                     if let Some(base) = base {
                         work.push(Work::Expr(base));
                     }
@@ -13911,7 +14001,9 @@ fn resolve_local_enum_variant_paths(
         entries: HashMap::new(),
         value_type_entries: HashMap::new(),
         type_dependent_defs: HashMap::new(),
+        calls: HashMap::new(),
         diagnostics: Vec::new(),
+        call_diagnostics: Vec::new(),
     };
     if candidates.is_empty() {
         return Ok(result);
@@ -13965,6 +14057,7 @@ fn resolve_local_enum_variant_paths(
             base_path,
             type_head_segments,
             name,
+            direct_call,
         } = candidate;
         let (outcome, enum_variants) = match prefix.base {
             Res::Def(DefKind::Enum, enum_def)
@@ -14151,6 +14244,22 @@ fn resolve_local_enum_variant_paths(
                 snapshot,
             )?);
         }
+        if let (Some(call), Some(value_type_entry)) = (direct_call, value_type_entry.as_ref())
+            && let Some((call_entry, diagnostic)) = local_enum_variant_call_projection(
+                owner,
+                &entry,
+                call,
+                value_type_entry,
+                symbols,
+                inputs,
+                snapshot,
+            )?
+        {
+            if let Some(diagnostic) = diagnostic {
+                result.call_diagnostics.push(diagnostic);
+            }
+            result.calls.insert(call_entry.call, call_entry);
+        }
         if let Some(value_type_entry) = value_type_entry {
             result
                 .value_type_entries
@@ -14164,7 +14273,146 @@ fn resolve_local_enum_variant_paths(
         result.entries.insert(entry.field, entry);
     }
     sort_phase1_diagnostics(&mut result.diagnostics);
+    sort_phase1_diagnostics(&mut result.call_diagnostics);
     Ok(result)
+}
+
+fn local_enum_variant_call_projection(
+    owner: OwnerId,
+    path: &LocalEnumVariantPathEntry,
+    call: &HirExpr<'_>,
+    value_type: &LocalEnumVariantPathTypeEntry,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<(LocalEnumVariantCallEntry, Option<Diagnostic>)>, OwnerControlFlowResolutionError>
+{
+    let ExprKind::Call {
+        callee,
+        args,
+        base: None,
+    } = call.kind
+    else {
+        return Ok(None);
+    };
+    if callee.hir_id != path.field || value_type.field != path.field {
+        return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+    }
+    let LocalEnumVariantPathOutcome::Resolved {
+        enum_owner,
+        enum_def,
+        variant,
+    } = path.outcome()
+    else {
+        return Ok(None);
+    };
+    if value_type.enum_owner != *enum_owner
+        || value_type.enum_def != *enum_def
+        || value_type.variant != *variant
+    {
+        return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+    }
+
+    let (outcome, diagnostic) = match &value_type.value_type {
+        sai_ty::adt::LocalEnumVariantValueType::Unit(_) => (
+            LocalEnumVariantCallOutcome::UnitVariantCalled { found: args.len() },
+            Some(local_enum_variant_call_diagnostic(
+                owner,
+                call,
+                path.name,
+                "unit variant calls do not accept an argument list",
+                "unit variant cannot be called",
+                symbols,
+                inputs,
+                snapshot,
+            )?),
+        ),
+        sai_ty::adt::LocalEnumVariantValueType::TupleConstructor {
+            function_item,
+            signature,
+        } => {
+            if !matches!(
+                function_item.kind(),
+                sai_ty::ty::TyKind::FnDef(def, generic_args)
+                    if *def == *variant && generic_args.is_empty()
+            ) || signature.generic_params().len() != 0
+                || !matches!(
+                    signature.output().kind(),
+                    sai_ty::ty::TyKind::Adt(def, generic_args)
+                        if *def == *enum_def && generic_args.is_empty()
+                )
+            {
+                return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+            }
+            let expected = signature.inputs().len();
+            let found = args.len();
+            if expected == found {
+                (
+                    LocalEnumVariantCallOutcome::TupleVariantArityMatches { expected },
+                    None,
+                )
+            } else {
+                (
+                    LocalEnumVariantCallOutcome::WrongArgumentCount { expected, found },
+                    Some(local_enum_variant_call_diagnostic(
+                        owner,
+                        call,
+                        path.name,
+                        &format!("tuple variant expects {expected} arguments but found {found}"),
+                        "wrong number of variant arguments",
+                        symbols,
+                        inputs,
+                        snapshot,
+                    )?),
+                )
+            }
+        }
+        sai_ty::adt::LocalEnumVariantValueType::RecordHasNoValueType => return Ok(None),
+    };
+    let entry = LocalEnumVariantCallEntry {
+        call: call.hir_id,
+        callee_field: path.field,
+        enum_owner: *enum_owner,
+        enum_def: *enum_def,
+        variant: *variant,
+        arguments: args.iter().map(|argument| argument.expr.hir_id).collect(),
+        outcome,
+    };
+    Ok(Some((entry, diagnostic)))
+}
+
+fn local_enum_variant_call_diagnostic(
+    owner: OwnerId,
+    call: &HirExpr<'_>,
+    variant: Symbol,
+    message: &str,
+    primary_label: &str,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let variant_name = symbols
+        .resolve(variant)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    let location = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(call.span.file, call.span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let mut diagnostic = Diagnostic::new(
+        sai_diagnostics::Code::WrongArgumentCount,
+        sai_diagnostics::Severity::Error,
+        format!("{variant_name}: {message}"),
+        Some(location),
+    );
+    diagnostic.primary_label = primary_label.to_owned();
+    diagnostic.package = inputs.source_ref.package.clone();
+    diagnostic
+        .with_workspace_snapshot(snapshot)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
 }
 
 fn local_enum_variant_path_diagnostic(
@@ -96814,12 +97062,22 @@ interface facade { use middle.{payload}; }"#;
             "fn payload_tuple() { Payload.Pair }\n",
             "fn payload_record() { Payload.Named(value: true) }\n",
             "fn repeated_paths() { (Payload.Unit, Payload.Pair) }\n",
+            "fn tuple_call_ok() { Payload.Pair(Alpha.Same, Beta.Same) }\n",
+            "fn tuple_call_too_few() { Payload.Pair(1) }\n",
+            "fn tuple_call_too_many() { Payload.Pair(1, true, false) }\n",
+            "fn record_call() { Payload.Named() }\n",
+            "fn record_update_call(base: Payload) { Payload.Named(value: true, ..base) }\n",
             "fn unknown() { Alpha.Smae }\n",
             "fn qualified() { child_alias.Child.Hit }\n",
             "fn local(e: Bool) { e.Same }\n",
+            "fn local_call(e: Bool) { e.Same() }\n",
             "fn parenthesized_base() { (Alpha).Same }\n",
+            "fn parenthesized_base_call() { (Alpha).Same() }\n",
             "fn parenthesized_variant() { (Alpha.Same) }\n",
+            "fn parenthesized_variant_call() { (Alpha.Same)() }\n",
             "fn chained() { Alpha.Same.Other }\n",
+            "fn chained_call() { Alpha.Same.Other() }\n",
+            "fn explicit_generic_args_call() { Payload.Pair<U8>(1, true) }\n",
             "fn constructor_call() { Alpha.Same() }\n",
             "fn non_enum() { Widget.Foo }\n",
             "fn generic_enum() { Generic.Value }\n",
@@ -97243,6 +97501,126 @@ interface facade { use middle.{payload}; }"#;
                 if *definition == payload_tuple_type.enum_def() && arguments.is_empty()
         ));
 
+        let tuple_call_ok_paths = paths_for("tuple_call_ok");
+        assert_eq!(tuple_call_ok_paths.calls().len(), 1);
+        let tuple_call_ok = tuple_call_ok_paths.calls().values().next().unwrap();
+        assert_eq!(tuple_call_ok.enum_owner(), payload_tuple_type.enum_owner());
+        assert_eq!(tuple_call_ok.variant(), payload_tuple_type.variant());
+        assert_eq!(tuple_call_ok.enum_def(), payload_tuple_type.enum_def());
+        assert_eq!(tuple_call_ok.arguments().len(), 2);
+        assert_eq!(
+            tuple_call_ok.outcome(),
+            LocalEnumVariantCallOutcome::TupleVariantArityMatches { expected: 2 }
+        );
+        assert_ne!(tuple_call_ok.call(), tuple_call_ok.callee_field());
+        assert_eq!(
+            tuple_call_ok_paths.call_for_expr(tuple_call_ok.call()),
+            Some(tuple_call_ok),
+            "calls are retrieved by their exact full-call HIR ID"
+        );
+        let callee_path = tuple_call_ok_paths
+            .entries()
+            .values()
+            .find(|entry| {
+                tuple_call_ok_paths
+                    .value_type_for_field(entry.field())
+                    .is_some_and(|entry_type| {
+                        entry_type.enum_def() == payload_tuple_type.enum_def()
+                            && entry_type.variant() == payload_tuple_type.variant()
+                    })
+            })
+            .expect("the selected tuple variant callee remains in the same path result");
+        assert_eq!(
+            tuple_call_ok.callee_field(),
+            callee_path.field(),
+            "the call retains the exact HIR ID of its resolved direct callee field"
+        );
+        let alpha_argument = tuple_call_ok_paths
+            .entries()
+            .values()
+            .find(|entry| {
+                tuple_call_ok_paths
+                    .value_type_for_field(entry.field())
+                    .is_some_and(|entry_type| entry_type.enum_def() == alpha_enum)
+            })
+            .expect("the first enum-valued argument has its own exact path identity")
+            .field();
+        let beta_argument = tuple_call_ok_paths
+            .entries()
+            .values()
+            .find(|entry| {
+                tuple_call_ok_paths
+                    .value_type_for_field(entry.field())
+                    .is_some_and(|entry_type| entry_type.enum_def() == beta_enum)
+            })
+            .expect("the second enum-valued argument has its own exact path identity")
+            .field();
+        assert_eq!(
+            tuple_call_ok.arguments(),
+            &[alpha_argument, beta_argument],
+            "call arguments retain exact HIR identities in source order"
+        );
+        let tuple_call_too_few = paths_for("tuple_call_too_few");
+        assert_eq!(tuple_call_too_few.calls().len(), 1);
+        let tuple_call_too_few_entry = tuple_call_too_few.calls().values().next().unwrap();
+        assert_eq!(
+            tuple_call_too_few_entry.outcome(),
+            LocalEnumVariantCallOutcome::WrongArgumentCount {
+                expected: 2,
+                found: 1
+            }
+        );
+        assert_eq!(tuple_call_too_few.call_diagnostics().len(), 1);
+        assert_eq!(
+            tuple_call_too_few.call_diagnostics()[0].code,
+            sai_diagnostics::Code::WrongArgumentCount
+        );
+        assert!(
+            tuple_call_too_few.call_diagnostics()[0]
+                .message
+                .contains("tuple variant expects 2 arguments but found 1")
+        );
+        let too_few_span = tuple_call_too_few.call_diagnostics()[0]
+            .primary()
+            .expect("wrong-arity diagnostics point at the call")
+            .span
+            .range;
+        assert_eq!(
+            &root[too_few_span.start().to_usize()..too_few_span.end().to_usize()],
+            "Payload.Pair(1)",
+            "wrong-arity diagnostics cover the complete call expression"
+        );
+        let tuple_call_too_many = paths_for("tuple_call_too_many");
+        assert_eq!(
+            tuple_call_too_many
+                .calls()
+                .values()
+                .next()
+                .unwrap()
+                .outcome(),
+            LocalEnumVariantCallOutcome::WrongArgumentCount {
+                expected: 2,
+                found: 3
+            }
+        );
+        assert_eq!(tuple_call_too_many.call_diagnostics().len(), 1);
+        assert!(
+            tuple_call_too_many.call_diagnostics()[0]
+                .message
+                .contains("tuple variant expects 2 arguments but found 3"),
+            "too-many diagnostics report both expected and supplied arities"
+        );
+        let too_many_span = tuple_call_too_many.call_diagnostics()[0]
+            .primary()
+            .expect("wrong-arity diagnostics point at the call")
+            .span
+            .range;
+        assert_eq!(
+            &root[too_many_span.start().to_usize()..too_many_span.end().to_usize()],
+            "Payload.Pair(1, true, false)",
+            "too-many-arity diagnostics cover the complete call expression"
+        );
+
         let payload_record_paths = paths_for("payload_record");
         let payload_record = payload_record_paths
             .entries()
@@ -97263,6 +97641,57 @@ interface facade { use middle.{payload}; }"#;
             )),
             "the selected record variant is recorded before later call/value checking"
         );
+        let record_call = paths_for("record_call");
+        assert!(
+            record_call.calls().is_empty(),
+            "record variants are handled by named-field construction, not positional calls"
+        );
+        assert!(
+            paths_for("record_update_call").calls().is_empty(),
+            "record construction with an update base is not a positional constructor call"
+        );
+        let unit_call = paths_for("constructor_call");
+        assert_eq!(unit_call.calls().len(), 1);
+        assert_eq!(
+            unit_call.calls().values().next().unwrap().outcome(),
+            LocalEnumVariantCallOutcome::UnitVariantCalled { found: 0 }
+        );
+        assert_eq!(unit_call.call_diagnostics().len(), 1);
+        assert_eq!(
+            unit_call.call_diagnostics()[0].code,
+            sai_diagnostics::Code::WrongArgumentCount
+        );
+        assert!(
+            unit_call.call_diagnostics()[0]
+                .message
+                .contains("unit variant calls do not accept an argument list")
+        );
+        let unit_call_span = unit_call.call_diagnostics()[0]
+            .primary()
+            .expect("unit-call diagnostics point at the call")
+            .span
+            .range;
+        assert_eq!(
+            &root[unit_call_span.start().to_usize()..unit_call_span.end().to_usize()],
+            "Alpha.Same()",
+            "unit-variant diagnostics cover the complete call expression"
+        );
+        assert_eq!(
+            paths_for("parenthesized_variant_call").calls().len(),
+            1,
+            "parenthesizing the complete resolved variant path preserves its call identity"
+        );
+        for name in [
+            "local_call",
+            "parenthesized_base_call",
+            "chained_call",
+            "explicit_generic_args_call",
+        ] {
+            assert!(
+                paths_for(name).calls().is_empty(),
+                "{name} is outside the direct local enum-variant call projection"
+            );
+        }
         let repeated_paths = paths_for("repeated_paths");
         assert_eq!(repeated_paths.entries().len(), 2);
         assert_eq!(repeated_paths.value_type_entries().len(), 2);
