@@ -802,16 +802,25 @@ while keeping empty tuple pattern nodes unsupported structurally. IR-935
 extends the unannotated fixed-literal projection to depth three, with
 recursive shape/arity and fixed-literal checks. IR-936 extends only the
 annotated projection to three tuple-pattern levels, retaining exact shape and
-arity; a fourth remains unsupported. The resolver uses the current package
-collection, snapshot, active source
-member closure, WIT-view closure, and test-only import filtering. Unresolved,
+arity; a fourth remains unsupported. IR-937 diagnoses a nonempty nested tuple
+literal whose arity differs from its corresponding known nonempty tuple type,
+at the full tuple span, and continues through sibling elements without
+checking inside the mismatched subtree. Empty tuple/unit nodes and
+tuple-versus-scalar pairs remain outside that shape diagnostic. The resolver
+uses the current package collection, snapshot, and active source member
+closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
 subset. This path result records path identity only; it does not record
 `type_dependent_defs` or synthesize expression types. That sentence describes
 the original IR-921 recognition slice: IR-922/923 later add the value-type and
 type-dependent-definition projections to the per-owner result. IR-924 through
-IR-932 add limited constructor-call diagnostics without claiming general
-expression types.
+IR-939 add limited constructor-call diagnostics without claiming general
+expression types. IR-938 reports nonempty tuple literals supplied where
+supported primitive or unit payloads are expected. IR-939 reports direct
+fixed-type Bool, Byte, Char, or unit literals supplied where nonempty tuple
+payloads are expected. Empty tuple/unit and scalar-parenthesis versus
+singleton-tuple forms retain their distinct HIR meanings; numeric defaulting
+and nonliteral expressions remain outside these shape checks.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -1977,12 +1986,46 @@ Named argument values still use their written positional parameter; only
 signature-backed outer call arguments are visited, and named-argument and outer
 call-arity diagnostics stay independent. `(e)` remains the expression `e`, while
 `(e,)` is a singleton tuple. A mismatched nested tuple arity produces no new
-diagnostic and its elements are not paired; that general tuple-shape error is
-left to complete expression type checking. No coercions are added below tuple
-type constructors (spec/05 §5.15.3). Nonliteral leaves, unsupported payload
+diagnostic in the IR-927 subset and its elements are not paired; IR-937 adds
+the bounded tuple-node mismatch diagnostic described below. No coercions are
+added below tuple type constructors (spec/05 §5.15.3). Nonliteral leaves,
+unsupported payload
 shapes, and all IR-926 path exclusions remain outside this slice. No
 `call_kinds`, general expression type results, or source-acceptance claim is
 added; `sai check` remains behind its incomplete-stage gate.
+
+**Implemented subset (IR-937):** At those same direct local non-generic
+tuple-variant call sites, when both the expected semantic type and actual HIR
+expression at a node are nonempty tuples, recurse only if their arities match.
+Otherwise emit one standard `TYPE_MISMATCH` spanning the complete tuple
+expression and do not inspect descendants of that mismatched subtree. Continue
+checking sibling subtrees in source order. Empty tuple type and expression
+nodes represent unit and do not participate in this arity check. Tuple-versus-
+scalar pairs and other non-tuple expression nodes (including paths and calls),
+outer arguments without a signature input, and all existing path/payload
+exclusions remain outside this added diagnostic.
+Named-argument diagnostics, outer call-arity diagnostics, and checks in
+signature-backed siblings remain independent. This reports only a known
+nonempty tuple-shape mismatch in the existing projection; it does not add
+general tuple type checking, coercions, `call_kinds`, expression type results,
+or source acceptance, and `sai check` remains behind its incomplete-stage
+gate.
+
+**Implemented subset (IR-938):** At those same direct local non-generic
+tuple-variant call sites, an already-supported primitive or unit payload
+paired with a nonempty HIR tuple literal now emits one `TYPE_MISMATCH` over
+the complete tuple expression. Do not inspect the tuple's children, but
+continue checking eligible sibling arguments or tuple leaves in source order.
+The rule applies at outer arguments and at nested leaves reached through
+IR-927's equal-arity tuple traversal. An empty tuple expression remains unit;
+`(e)` remains scalar while `(e,)` is a tuple. Tuple-expected/scalar-actual
+pairs, tuple-typed paths and calls, aliases, `Str`, nominal or other
+unsupported payloads, and coercions remain outside this rule. Named-argument
+diagnostics, outer call-arity diagnostics, and checks in other
+signature-backed positions remain independent. This is still a narrow
+diagnostic projection rather than general expression typing: it adds no
+`call_kinds`, expression type results, or source-acceptance claim, and
+`sai check` remains behind its incomplete-stage gate.
 
 **Implemented subset (IR-928):** At the same direct local non-generic
 tuple-variant call sites, a single-segment plain path is checked when local
@@ -2420,7 +2463,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924–IR-936 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-939 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
@@ -2450,7 +2493,15 @@ names, and general expression typing, `TypeckResults::call_kinds`, and generic,
 external, dependency, or WIT variant paths remain outside the projection.
 `sai check` reports the staged diagnostics while retaining its incomplete-stage
 gate; it does not claim full check coverage or emit a success result for these
-inputs.
+inputs. IR-937 reports nonempty tuple-to-tuple arity mismatches on the
+complete expression span and suppresses checks within that subtree. IR-938
+reports nonempty tuple literals against supported primitive/unit inputs;
+IR-939 reports direct fixed-type Bool/Byte/Char/unit literals against
+nonempty tuple inputs. Empty tuple/unit and `(e)` versus `(e,)` retain their
+distinct meanings; numeric defaulting, strings, paths, calls, coercions, and
+unsupported payload types remain excluded. These diagnostics preserve
+eligible sibling checks, independent named-argument and outer-arity errors,
+and the CLI incomplete-stage gate.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
