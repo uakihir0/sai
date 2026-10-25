@@ -75,6 +75,9 @@ validate arbitrary caller-provided identifiers.
 - The priority-ordered greedy choice can use scarce inventory or water on an
   early site and hold later sites. It does not search for a globally optimal
   assignment or minimize total cost.
+- Site and species IDs are expected to be unique but are not validated. The
+  sample uses IDs for ordering, district-diversity counts, inventory selection,
+  and report lookup; a production input boundary should reject duplicates.
 
 ## Package and compiler status
 
