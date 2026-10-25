@@ -12997,6 +12997,10 @@ fn type_contains_reference(root: &sai_ty::ty::Ty) -> bool {
             sai_ty::ty::TyKind::Tuple(elements) => pending.extend(elements.iter()),
             sai_ty::ty::TyKind::Array(element, _) => pending.push(element),
             sai_ty::ty::TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
+            sai_ty::ty::TyKind::FnPtr(signature) => {
+                pending.extend(signature.inputs());
+                pending.push(signature.output());
+            }
             sai_ty::ty::TyKind::Int(_)
             | sai_ty::ty::TyKind::Uint(_)
             | sai_ty::ty::TyKind::Float(_)
@@ -36834,6 +36838,7 @@ property "shared"() {}
             "type Generic<T> = T\n",
             "type Refined = U8 where self > 0\n",
             "type Recovered<T = U32\n",
+            "type Callback = fn(I32) -> Bool\n",
             "fn aliases(count: Count, pair: Pair, bytes: Buffer) -> Count {}\n",
             "fn repeated(first: Count, second: Count) -> Count {}\n",
             "fn generic_alias(value: Generic<U8>) -> U8 {}\n",
@@ -36844,7 +36849,8 @@ property "shared"() {}
             "fn region_alias(value: Borrowed) -> U8 {}\n",
             "fn nested_region_alias(value: NestedBorrow) -> U8 {}\n",
             "fn recovered_alias(value: Recovered) -> U32 {}\n",
-
+            "fn callback_alias(value: Callback) -> Callback {}\n",
+            "fn callback_composition(value: fn(Callback) -> Callback) -> fn(Callback) -> Callback {}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -36859,7 +36865,7 @@ property "shared"() {}
         let resolved = database
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
-        assert_eq!(resolved.owners().len(), 10);
+        assert_eq!(resolved.owners().len(), 12);
 
         assert!(resolved.matches_collection(&collection));
 
@@ -36945,6 +36951,40 @@ property "shared"() {}
             );
         }
 
+        let callback_alias = resolved
+            .signature_projection(&collection, resolved.owners()[10].owner())
+            .expect("the exact collection guards the projection")
+            .expect("the function using the function-pointer alias exists");
+        let FunctionSignatureProjection::Supported(callback_alias) = callback_alias else {
+            panic!("a function-pointer alias without references passes the recursive region scan");
+        };
+        assert_eq!(callback_alias.inputs().len(), 1);
+        let sai_ty::ty::TyKind::FnPtr(callback) = callback_alias.inputs()[0].kind() else {
+            panic!("the simple alias retains its function-pointer type");
+        };
+        assert_eq!(callback.inputs().len(), 1);
+        assert!(matches!(
+            callback.inputs()[0].kind(),
+            sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32)
+        ));
+        assert!(matches!(callback.output().kind(), sai_ty::ty::TyKind::Bool));
+        assert!(callback_alias.inputs()[0].ptr_eq(callback_alias.output()));
+
+        let callback_composition = resolved
+            .signature_projection(&collection, resolved.owners()[11].owner())
+            .expect("the exact collection guards the projection")
+            .expect("the function composing an alias with a function pointer exists");
+        let FunctionSignatureProjection::Supported(callback_composition) = callback_composition
+        else {
+            panic!("a function pointer can contain the same supported local alias");
+        };
+        let sai_ty::ty::TyKind::FnPtr(composed) = callback_composition.inputs()[0].kind() else {
+            panic!("the outer function pointer retains its type");
+        };
+        assert!(composed.inputs()[0].ptr_eq(&callback_alias.inputs()[0]));
+        assert!(composed.output().ptr_eq(&callback_alias.inputs()[0]));
+        assert!(callback_composition.inputs()[0].ptr_eq(callback_composition.output()));
+
         let stale_snapshot = snapshot_with_version(&snapshot, 18);
         let stale_collection = database
             .collect_phase1_package_scopes_collection(
@@ -36958,7 +36998,6 @@ property "shared"() {}
             resolved.signature_projection(&stale_collection, resolved.owners()[0].owner()),
             Err(OwnerControlFlowResolutionError::SnapshotMismatch)
         ));
-
     }
 
     #[test]
