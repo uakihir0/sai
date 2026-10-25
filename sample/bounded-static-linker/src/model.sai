@@ -1,0 +1,90 @@
+pub const MAX_OBJECT_COUNT: USize = 3
+pub const MAX_SYMBOL_COUNT: USize = 4
+pub const MAX_RELOCATION_COUNT: USize = 2
+pub const MAX_TOTAL_RELOCATION_COUNT: USize = MAX_OBJECT_COUNT * MAX_RELOCATION_COUNT
+pub const ABS32_WIDTH: U32 = 4
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SymbolBinding {
+    Local
+    Weak
+    Strong
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Symbol {
+    pub name: Str
+    pub binding: SymbolBinding
+    pub defined: Bool
+    pub section_offset: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RelocationKind {
+    Abs32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Relocation {
+    pub kind: RelocationKind
+    pub target_name: Str
+    pub patch_offset: U32
+    pub addend: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ObjectFile {
+    pub name: Str
+    pub text_size: U32
+    pub text_alignment: U32
+    pub symbols: Array<Option<Symbol>, MAX_SYMBOL_COUNT>
+    pub symbol_count: USize
+    pub relocations: Array<Option<Relocation>, MAX_RELOCATION_COUNT>
+    pub relocation_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LinkInput {
+    pub objects: Array<Option<ObjectFile>, MAX_OBJECT_COUNT>
+    pub object_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AppliedRelocation {
+    pub patch_object_index: USize
+    pub patch_offset: U32
+    pub definition_object_index: USize
+    pub definition_symbol_index: USize
+    pub target_name: Str
+    pub value: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LinkedImage {
+    pub section_bases: Array<Option<U32>, MAX_OBJECT_COUNT>
+    pub total_size: U32
+    pub relocations: Array<Option<AppliedRelocation>, MAX_TOTAL_RELOCATION_COUNT>
+    pub relocation_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum LinkIssue {
+    InvalidObjectCount
+    MissingObject
+    InvalidSectionAlignment
+    TooManySymbols
+    MissingSymbol
+    SymbolOutsideSection
+    TooManyRelocations
+    MissingRelocation
+    DuplicateStrongDefinition
+    AddressOverflow
+    UnresolvedSymbol
+    RelocationOutsideSection
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LinkReport {
+    pub image: Option<LinkedImage>
+    pub issue: Option<LinkIssue>
+}

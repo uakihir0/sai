@@ -1,0 +1,122 @@
+use acme:virtual-memory-page-replacement-lab/fixtures
+use acme:virtual-memory-page-replacement-lab/model.{
+    AccessKind
+    CacheComparison
+    CacheScenario
+    InputIssue
+    MAX_ACCESS_COUNT
+    MAX_FRAME_COUNT
+    PageAccess
+}
+use acme:virtual-memory-page-replacement-lab/simulator
+
+pub fn sample_scenario() -> CacheScenario {
+    fixtures.workload()
+}
+
+pub fn sample_comparison() -> CacheComparison {
+    simulator.compare(sample_scenario())
+}
+
+test "the reference trace distinguishes all three replacement policies" {
+    let result = sample_comparison()
+    assert result.valid_input
+    assert result.fifo.hit_count == 4
+    assert result.fifo.fault_count == 8
+    assert result.fifo.eviction_writeback_count == 2
+    assert result.fifo.final_flush_count == 1
+    assert result.fifo.total_writeback_count == 3
+    assert result.lru.hit_count == 6
+    assert result.lru.fault_count == 6
+    assert result.lru.eviction_writeback_count == 1
+    assert result.lru.final_flush_count == 1
+    assert result.lru.total_writeback_count == 2
+    assert result.clock.hit_count == 5
+    assert result.clock.fault_count == 7
+    assert result.clock.eviction_writeback_count == 2
+    assert result.clock.final_flush_count == 1
+    assert result.clock.total_writeback_count == 3
+    assert result.fifo.final_frames[0].unwrap().page_id == 3
+    assert result.fifo.final_frames[1].unwrap().page_id == 5
+    assert result.fifo.final_frames[2].unwrap().page_id == 4
+    assert result.lru.final_frames[0].unwrap().page_id == 5
+    assert result.lru.final_frames[1].unwrap().page_id == 4
+    assert result.lru.final_frames[2].unwrap().page_id == 3
+    assert result.clock.final_frames[0].unwrap().page_id == 5
+    assert result.clock.final_frames[1].unwrap().page_id == 3
+    assert result.clock.final_frames[2].unwrap().page_id == 4
+    assert not result.fifo.final_frames[0].unwrap().dirty
+    assert not result.fifo.final_frames[1].unwrap().dirty
+    assert not result.fifo.final_frames[2].unwrap().dirty
+    assert not result.lru.final_frames[0].unwrap().dirty
+    assert not result.lru.final_frames[1].unwrap().dirty
+    assert not result.lru.final_frames[2].unwrap().dirty
+    assert not result.clock.final_frames[0].unwrap().dirty
+    assert not result.clock.final_frames[1].unwrap().dirty
+    assert not result.clock.final_frames[2].unwrap().dirty
+}
+
+test "a write hit leaves its resident page dirty until it is written back" {
+    let result = sample_comparison()
+    assert result.fifo.steps[2].unwrap().hit
+    assert result.fifo.steps[4].unwrap().evicted_page_id == Some(2)
+    assert result.fifo.steps[4].unwrap().eviction_wrote_back
+}
+
+test "LRU refreshes the hot page before choosing a victim" {
+    let result = sample_comparison()
+    assert result.lru.steps[4].unwrap().evicted_page_id == Some(1)
+    assert not result.lru.steps[4].unwrap().eviction_wrote_back
+    assert result.lru.steps[5].unwrap().hit
+}
+
+test "clock gives referenced pages a second chance and advances its hand" {
+    let result = sample_comparison()
+    assert result.clock.steps[4].unwrap().evicted_page_id == Some(2)
+    assert result.clock.steps[4].unwrap().eviction_wrote_back
+    assert result.clock.steps[9].unwrap().evicted_page_id == Some(2)
+    assert result.clock.steps[9].unwrap().eviction_wrote_back
+}
+
+test "invalid frame counts fail closed without partial traces" {
+    var scenario = sample_scenario()
+    scenario.frame_count = 0
+    let result = simulator.compare(scenario)
+    assert not result.valid_input
+    assert result.input_issue == Some(InputIssue.InvalidFrameCount)
+    assert result.fifo.step_count == 0
+    assert result.lru.step_count == 0
+    assert result.clock.step_count == 0
+}
+
+test "missing and zero page references are rejected before simulation" {
+    var missing = sample_scenario()
+    missing.accesses[3] = None
+    let missing_result = simulator.compare(missing)
+    assert missing_result.input_issue == Some(InputIssue.MissingAccess)
+
+    var zero_page = sample_scenario()
+    zero_page.accesses[0] = Some(PageAccess(page_id: 0, kind: AccessKind.Read))
+    let zero_result = simulator.compare(zero_page)
+    assert zero_result.input_issue == Some(InputIssue.ZeroPageId)
+}
+
+test "frame and access counts cannot exceed their fixed capacities" {
+    var too_many_frames = sample_scenario()
+    too_many_frames.frame_count = MAX_FRAME_COUNT + 1
+    let frame_result = simulator.compare(too_many_frames)
+    assert not frame_result.valid_input
+    assert frame_result.input_issue == Some(InputIssue.InvalidFrameCount)
+    assert frame_result.fifo.step_count == 0
+    assert frame_result.lru.step_count == 0
+    assert frame_result.clock.step_count == 0
+
+    var too_many_accesses = sample_scenario()
+    too_many_accesses.access_count = MAX_ACCESS_COUNT + 1
+    let access_result = simulator.compare(too_many_accesses)
+    assert not access_result.valid_input
+    assert access_result.input_issue == Some(InputIssue.TooManyAccesses)
+    assert access_result.fifo.step_count == 0
+    assert access_result.lru.step_count == 0
+    assert access_result.clock.step_count == 0
+}

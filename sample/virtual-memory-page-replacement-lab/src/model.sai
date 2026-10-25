@@ -1,0 +1,80 @@
+pub const MAX_ACCESS_COUNT: USize = 12
+pub const MAX_FRAME_COUNT: USize = 4
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum AccessKind {
+    Read
+    Write
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Policy {
+    Fifo
+    Lru
+    Clock
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum InputIssue {
+    InvalidFrameCount
+    TooManyAccesses
+    MissingAccess
+    ZeroPageId
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PageAccess {
+    pub page_id: U32
+    pub kind: AccessKind
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CacheScenario {
+    pub accesses: Array<Option<PageAccess>, MAX_ACCESS_COUNT>
+    pub access_count: USize
+    pub frame_count: USize
+    pub flush_dirty_pages: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type FrameState {
+    pub page_id: U32
+    pub dirty: Bool
+    pub referenced: Bool
+    pub loaded_at: USize
+    pub last_used_at: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SimulationStep {
+    pub access_order: USize
+    pub page_id: U32
+    pub kind: AccessKind
+    pub hit: Bool
+    pub frame_index: USize
+    pub evicted_page_id: Option<U32>
+    pub eviction_wrote_back: Bool
+    pub frames_after: Array<Option<U32>, MAX_FRAME_COUNT>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PolicyRun {
+    pub policy: Policy
+    pub steps: Array<Option<SimulationStep>, MAX_ACCESS_COUNT>
+    pub step_count: USize
+    pub hit_count: USize
+    pub fault_count: USize
+    pub eviction_writeback_count: USize
+    pub final_flush_count: USize
+    pub total_writeback_count: USize
+    pub final_frames: Array<Option<FrameState>, MAX_FRAME_COUNT>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CacheComparison {
+    pub valid_input: Bool
+    pub input_issue: Option<InputIssue>
+    pub fifo: PolicyRun
+    pub lru: PolicyRun
+    pub clock: PolicyRun
+}

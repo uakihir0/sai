@@ -1,0 +1,199 @@
+use acme:bounded-static-linker/model.{
+    LinkInput
+    MAX_OBJECT_COUNT
+    MAX_RELOCATION_COUNT
+    MAX_SYMBOL_COUNT
+    ObjectFile
+    Relocation
+    RelocationKind
+    Symbol
+    SymbolBinding
+}
+use sai:core/num.{U32_MAX}
+
+fn empty_object(name: Str, text_size: U32, alignment: U32) -> ObjectFile {
+    ObjectFile(
+        name: name,
+        text_size: text_size,
+        text_alignment: alignment,
+        symbols: Array<Option<Symbol>, MAX_SYMBOL_COUNT>.filled(None),
+        symbol_count: 0,
+        relocations: Array<Option<Relocation>, MAX_RELOCATION_COUNT>.filled(None),
+        relocation_count: 0,
+    )
+}
+
+fn symbol(name: Str, binding: SymbolBinding, defined: Bool, section_offset: U32) -> Symbol {
+    Symbol(name: name, binding: binding, defined: defined, section_offset: section_offset)
+}
+
+fn absolute_relocation(target_name: Str, patch_offset: U32, addend: U32) -> Relocation {
+    Relocation(
+        kind: RelocationKind.Abs32,
+        target_name: target_name,
+        patch_offset: patch_offset,
+        addend: addend,
+    )
+}
+
+fn input(
+    first: ObjectFile,
+    second: Option<ObjectFile>,
+    third: Option<ObjectFile>,
+    object_count: USize,
+) -> LinkInput {
+    LinkInput(objects: [Some(first), second, third], object_count: object_count)
+}
+
+pub fn strong_over_weak() -> LinkInput {
+    var app = empty_object("app", 12, 4)
+    app.relocations[0] = Some(absolute_relocation("normalize", 4, 0))
+    app.relocation_count = 1
+
+    var helper = empty_object("helper", 16, 4)
+    helper.symbols[0] = Some(symbol("normalize", SymbolBinding.Strong, true, 8))
+    helper.symbol_count = 1
+
+    var fallback = empty_object("fallback", 4, 4)
+    fallback.symbols[0] = Some(symbol("normalize", SymbolBinding.Weak, true, 0))
+    fallback.symbol_count = 1
+
+    input(app, Some(helper), Some(fallback), 3)
+}
+
+pub fn weak_only_duplicates() -> LinkInput {
+    var app = empty_object("app", 4, 4)
+    app.relocations[0] = Some(absolute_relocation("theme", 0, 0))
+    app.relocation_count = 1
+
+    var first = empty_object("first-weak", 8, 4)
+    first.symbols[0] = Some(symbol("theme", SymbolBinding.Weak, true, 2))
+    first.symbols[1] = Some(symbol("theme", SymbolBinding.Weak, true, 3))
+    first.symbol_count = 2
+
+    var second = empty_object("second-weak", 4, 4)
+    second.symbols[0] = Some(symbol("theme", SymbolBinding.Weak, true, 0))
+    second.symbol_count = 1
+
+    input(app, Some(first), Some(second), 3)
+}
+
+pub fn duplicate_strong_definitions() -> LinkInput {
+    var first = empty_object("first", 4, 4)
+    first.symbols[0] = Some(symbol("clash", SymbolBinding.Strong, true, 0))
+    first.symbol_count = 1
+
+    var second = empty_object("second", 4, 4)
+    second.symbols[0] = Some(symbol("clash", SymbolBinding.Strong, true, 0))
+    second.symbol_count = 1
+
+    input(first, Some(second), None, 2)
+}
+
+pub fn cross_object_local_reference() -> LinkInput {
+    var app = empty_object("app", 4, 4)
+    app.relocations[0] = Some(absolute_relocation("secret", 0, 0))
+    app.relocation_count = 1
+
+    var implementation = empty_object("implementation", 4, 4)
+    implementation.symbols[0] = Some(symbol("secret", SymbolBinding.Local, true, 0))
+    implementation.symbol_count = 1
+
+    input(app, Some(implementation), None, 2)
+}
+
+pub fn same_object_local_reference() -> LinkInput {
+    var app = empty_object("app", 4, 4)
+    app.symbols[0] = Some(symbol("secret", SymbolBinding.Local, true, 2))
+    app.symbol_count = 1
+    app.relocations[0] = Some(absolute_relocation("secret", 0, 0))
+    app.relocation_count = 1
+
+    var library = empty_object("library", 4, 4)
+    library.symbols[0] = Some(symbol("secret", SymbolBinding.Strong, true, 0))
+    library.symbol_count = 1
+
+    input(app, Some(library), None, 2)
+}
+
+pub fn relocation_at_section_end() -> LinkInput {
+    var app = empty_object("app", 12, 4)
+    app.relocations[0] = Some(absolute_relocation("entry", 8, 0))
+    app.relocation_count = 1
+
+    var helper = empty_object("helper", 4, 4)
+    helper.symbols[0] = Some(symbol("entry", SymbolBinding.Strong, true, 0))
+    helper.symbol_count = 1
+
+    input(app, Some(helper), None, 2)
+}
+
+pub fn padded_layout() -> LinkInput {
+    var app = empty_object("app", 5, 4)
+    app.relocations[0] = Some(absolute_relocation("entry", 0, 0))
+    app.relocation_count = 1
+
+    var helper = empty_object("aligned-helper", 4, 8)
+    helper.symbols[0] = Some(symbol("entry", SymbolBinding.Strong, true, 0))
+    helper.symbol_count = 1
+
+    input(app, Some(helper), None, 2)
+}
+
+pub fn relocation_past_section_end() -> LinkInput {
+    var objects = relocation_at_section_end()
+    var app = objects.objects[0].unwrap()
+    app.relocations[0] = Some(absolute_relocation("entry", 9, 0))
+    objects.objects[0] = Some(app)
+    objects
+}
+
+pub fn relocation_in_short_section() -> LinkInput {
+    var app = empty_object("app", 3, 4)
+    app.relocations[0] = Some(absolute_relocation("entry", 0, 0))
+    app.relocation_count = 1
+
+    var helper = empty_object("helper", 4, 4)
+    helper.symbols[0] = Some(symbol("entry", SymbolBinding.Strong, true, 0))
+    helper.symbol_count = 1
+
+    input(app, Some(helper), None, 2)
+}
+
+pub fn later_unresolved_relocation() -> LinkInput {
+    var app = empty_object("app", 8, 4)
+    app.relocations[0] = Some(absolute_relocation("entry", 0, 0))
+    app.relocations[1] = Some(absolute_relocation("missing", 4, 0))
+    app.relocation_count = MAX_RELOCATION_COUNT
+
+    var helper = empty_object("helper", 4, 4)
+    helper.symbols[0] = Some(symbol("entry", SymbolBinding.Strong, true, 0))
+    helper.symbol_count = 1
+
+    input(app, Some(helper), None, 2)
+}
+
+pub fn layout_overflow() -> LinkInput {
+    let first = empty_object("large", U32_MAX, 1)
+    let second = empty_object("after-large", 4, 1)
+    input(first, Some(second), None, 2)
+}
+
+pub fn addend_overflow() -> LinkInput {
+    var object = empty_object("large", U32_MAX, 1)
+    object.symbols[0] = Some(symbol("near-end", SymbolBinding.Strong, true, U32_MAX - 4))
+    object.symbol_count = 1
+    object.relocations[0] = Some(absolute_relocation("near-end", 0, 8))
+    object.relocation_count = 1
+    input(object, None, None, 1)
+}
+
+pub fn invalid_alignment() -> LinkInput {
+    let object = empty_object("bad-alignment", 4, 3)
+    input(object, None, None, 1)
+}
+
+pub fn zero_alignment() -> LinkInput {
+    let object = empty_object("zero-alignment", 4, 0)
+    input(object, None, None, 1)
+}

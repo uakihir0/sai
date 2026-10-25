@@ -1,0 +1,5 @@
+package acme:bounded-static-linker @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Resolve bounded object manifests and validate absolute relocations atomically"

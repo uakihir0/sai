@@ -1,0 +1,189 @@
+use acme:bounded-static-linker/fixtures
+use acme:bounded-static-linker/layout
+use acme:bounded-static-linker/linker
+use acme:bounded-static-linker/model.{
+    LinkIssue
+    LinkReport
+    MAX_OBJECT_COUNT
+    MAX_RELOCATION_COUNT
+    MAX_SYMBOL_COUNT
+}
+use acme:bounded-static-linker/symbols
+
+pub fn strong_precedence_fixture() -> LinkReport {
+    linker.link(fixtures.strong_over_weak())
+}
+
+pub fn weak_tie_fixture() -> LinkReport {
+    linker.link(fixtures.weak_only_duplicates())
+}
+
+test "input-order layout and strong symbols produce a checked absolute fixup" {
+    let report = strong_precedence_fixture()
+    assert report.issue == None
+    let image = report.image.unwrap()
+    assert image.section_bases[0] == Some(0)
+    assert image.section_bases[1] == Some(12)
+    assert image.section_bases[2] == Some(28)
+    assert image.total_size == 32
+    assert image.relocation_count == 1
+    let fixup = image.relocations[0].unwrap()
+    assert fixup.patch_object_index == 0
+    assert fixup.patch_offset == 4
+    assert fixup.definition_object_index == 1
+    assert fixup.definition_symbol_index == 0
+    assert fixup.target_name == "normalize"
+    assert fixup.value == 20
+}
+
+test "weak ties choose the first object and symbol-table entry" {
+    let report = weak_tie_fixture()
+    assert report.issue == None
+    let image = report.image.unwrap()
+    assert image.section_bases[1] == Some(4)
+    assert image.section_bases[2] == Some(12)
+    let fixup = image.relocations[0].unwrap()
+    assert fixup.definition_object_index == 1
+    assert fixup.definition_symbol_index == 0
+    assert fixup.value == 6
+}
+
+test "successful section layout includes alignment padding" {
+    let report = linker.link(fixtures.padded_layout())
+    assert report.issue == None
+    let image = report.image.unwrap()
+    assert image.section_bases[0] == Some(0)
+    assert image.section_bases[1] == Some(8)
+    assert image.total_size == 12
+    assert image.relocations[0].unwrap().value == 8
+}
+
+test "duplicate strong definitions reject the whole link even when unused" {
+    let report = linker.link(fixtures.duplicate_strong_definitions())
+    assert report.image == None
+    assert report.issue == Some(LinkIssue.DuplicateStrongDefinition)
+}
+
+test "a local definition cannot satisfy another object's relocation" {
+    let report = linker.link(fixtures.cross_object_local_reference())
+    assert report.image == None
+    assert report.issue == Some(LinkIssue.UnresolvedSymbol)
+}
+
+test "a same-object local definition resolves before global lookup" {
+    let report = linker.link(fixtures.same_object_local_reference())
+    assert report.issue == None
+    let image = report.image.unwrap()
+    let fixup = image.relocations[0].unwrap()
+    assert fixup.patch_object_index == 0
+    assert fixup.patch_offset == 0
+    assert fixup.definition_object_index == 0
+    assert fixup.definition_symbol_index == 0
+    assert fixup.value == 2
+}
+
+test "a four-byte fixup ending exactly at section size is valid" {
+    let report = linker.link(fixtures.relocation_at_section_end())
+    assert report.issue == None
+    let image = report.image.unwrap()
+    assert image.relocations[0].unwrap().patch_offset == 8
+    assert image.relocations[0].unwrap().value == 12
+}
+
+test "a fixup one byte past the section boundary returns no image" {
+    let report = linker.link(fixtures.relocation_past_section_end())
+    assert report.image == None
+    assert report.issue == Some(LinkIssue.RelocationOutsideSection)
+
+    let short_section = linker.link(fixtures.relocation_in_short_section())
+    assert short_section.image == None
+    assert short_section.issue == Some(LinkIssue.RelocationOutsideSection)
+}
+
+test "a later unresolved relocation does not publish earlier fixups" {
+    let report = linker.link(fixtures.later_unresolved_relocation())
+    assert report.image == None
+    assert report.issue == Some(LinkIssue.UnresolvedSymbol)
+}
+
+test "section placement and relocation addends reject address overflow" {
+    let layout_report = linker.link(fixtures.layout_overflow())
+    assert layout_report.image == None
+    assert layout_report.issue == Some(LinkIssue.AddressOverflow)
+
+    let addend_report = linker.link(fixtures.addend_overflow())
+    assert addend_report.image == None
+    assert addend_report.issue == Some(LinkIssue.AddressOverflow)
+}
+
+test "section alignment must be a nonzero power of two" {
+    let report = linker.link(fixtures.invalid_alignment())
+    assert report.image == None
+    assert report.issue == Some(LinkIssue.InvalidSectionAlignment)
+
+    let zero = linker.link(fixtures.zero_alignment())
+    assert zero.image == None
+    assert zero.issue == Some(LinkIssue.InvalidSectionAlignment)
+}
+
+test "object and symbol tables reject missing and over-capacity entries" {
+    var invalid_count = fixtures.strong_over_weak()
+    invalid_count.object_count = MAX_OBJECT_COUNT + 1
+    let invalid_count_report = linker.link(invalid_count)
+    assert invalid_count_report.image == None
+    assert invalid_count_report.issue == Some(LinkIssue.InvalidObjectCount)
+
+    var missing_object = fixtures.relocation_at_section_end()
+    missing_object.objects[1] = None
+    let missing_object_report = linker.link(missing_object)
+    assert missing_object_report.image == None
+    assert missing_object_report.issue == Some(LinkIssue.MissingObject)
+
+    var too_many_symbols = fixtures.duplicate_strong_definitions()
+    var first_object = too_many_symbols.objects[0].unwrap()
+    first_object.symbol_count = MAX_SYMBOL_COUNT + 1
+    too_many_symbols.objects[0] = Some(first_object)
+    let too_many_symbols_report = linker.link(too_many_symbols)
+    assert too_many_symbols_report.image == None
+    assert too_many_symbols_report.issue == Some(LinkIssue.TooManySymbols)
+
+    var missing_symbol = fixtures.duplicate_strong_definitions()
+    first_object = missing_symbol.objects[0].unwrap()
+    first_object.symbols[0] = None
+    missing_symbol.objects[0] = Some(first_object)
+    let missing_symbol_report = linker.link(missing_symbol)
+    assert missing_symbol_report.image == None
+    assert missing_symbol_report.issue == Some(LinkIssue.MissingSymbol)
+
+    var outside_symbol = fixtures.duplicate_strong_definitions()
+    first_object = outside_symbol.objects[0].unwrap()
+    var defined_symbol = first_object.symbols[0].unwrap()
+    defined_symbol.section_offset = first_object.text_size + 1
+    first_object.symbols[0] = Some(defined_symbol)
+    outside_symbol.objects[0] = Some(first_object)
+    let outside_symbol_report = linker.link(outside_symbol)
+    assert outside_symbol_report.image == None
+    assert outside_symbol_report.issue == Some(LinkIssue.SymbolOutsideSection)
+
+    var too_many_relocations = fixtures.relocation_at_section_end()
+    first_object = too_many_relocations.objects[0].unwrap()
+    first_object.relocation_count = MAX_RELOCATION_COUNT + 1
+    too_many_relocations.objects[0] = Some(first_object)
+    let too_many_relocations_report = linker.link(too_many_relocations)
+    assert too_many_relocations_report.image == None
+    assert too_many_relocations_report.issue == Some(LinkIssue.TooManyRelocations)
+
+    var missing_relocation = fixtures.relocation_at_section_end()
+    first_object = missing_relocation.objects[0].unwrap()
+    first_object.relocations[0] = None
+    missing_relocation.objects[0] = Some(first_object)
+    let missing_relocation_report = linker.link(missing_relocation)
+    assert missing_relocation_report.image == None
+    assert missing_relocation_report.issue == Some(LinkIssue.MissingRelocation)
+}
+
+test "public layout and symbol helpers fail safely on malformed inputs" {
+    assert layout.layout(fixtures.zero_alignment()) == Err(LinkIssue.InvalidSectionAlignment)
+    assert symbols.resolve(fixtures.invalid_alignment(), 0, "anything") == None
+    assert symbols.resolve(fixtures.strong_over_weak(), MAX_OBJECT_COUNT, "normalize") == None
+}

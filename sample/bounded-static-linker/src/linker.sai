@@ -1,0 +1,101 @@
+use acme:bounded-static-linker/layout.{layout, validate}
+use acme:bounded-static-linker/model.{
+    ABS32_WIDTH
+    AppliedRelocation
+    LinkInput
+    LinkIssue
+    LinkReport
+    LinkedImage
+    MAX_OBJECT_COUNT
+    MAX_TOTAL_RELOCATION_COUNT
+    ObjectFile
+    Symbol
+}
+use acme:bounded-static-linker/symbols.{SymbolLocation, resolve}
+use sai:core/num.{U32_MAX}
+
+fn object_at(input: LinkInput, object_index: USize) -> ObjectFile {
+    input.objects[object_index].unwrap()
+}
+
+fn symbol_at(object: ObjectFile, symbol_index: USize) -> Symbol {
+    object.symbols[symbol_index].unwrap()
+}
+
+fn failure(issue: LinkIssue) -> LinkReport {
+    LinkReport(image: None, issue: Some(issue))
+}
+
+fn definition_address(
+    input: LinkInput,
+    bases: Array<Option<U32>, MAX_OBJECT_COUNT>,
+    location: SymbolLocation,
+) -> Result<U32, LinkIssue> {
+    let object = object_at(input, location.object_index)
+    let symbol = symbol_at(object, location.symbol_index)
+    let base = bases[location.object_index].unwrap()
+    if base > U32_MAX - symbol.section_offset {
+        return Err(LinkIssue.AddressOverflow)
+    }
+    Ok(base + symbol.section_offset)
+}
+
+pub fn link(input: LinkInput) -> LinkReport {
+    match validate(input) { Some(issue) => return failure(issue), None => {} }
+
+    let section_layout = match layout(input) {
+        Ok(value) => value
+        Err(issue) => return failure(issue)
+    }
+    var applied = Array<Option<AppliedRelocation>, MAX_TOTAL_RELOCATION_COUNT>.filled(None)
+    var applied_count: USize = 0
+
+    for object_index in 0..input.object_count {
+        let object = object_at(input, object_index)
+        for relocation_index in 0..object.relocation_count {
+            let relocation = object.relocations[relocation_index].unwrap()
+            if object.text_size < ABS32_WIDTH {
+                return failure(LinkIssue.RelocationOutsideSection)
+            }
+            if relocation.patch_offset > object.text_size - ABS32_WIDTH {
+                return failure(LinkIssue.RelocationOutsideSection)
+            }
+
+            let target = match resolve(input, object_index, relocation.target_name) {
+                Some(location) => location
+                None => return failure(LinkIssue.UnresolvedSymbol)
+            }
+            let target_address = match definition_address(input, section_layout.bases, target) {
+                Ok(value) => value
+                Err(issue) => return failure(issue)
+            }
+            if target_address > U32_MAX - relocation.addend {
+                return failure(LinkIssue.AddressOverflow)
+            }
+
+            applied[applied_count] = Some(
+                AppliedRelocation(
+                    patch_object_index: object_index,
+                    patch_offset: relocation.patch_offset,
+                    definition_object_index: target.object_index,
+                    definition_symbol_index: target.symbol_index,
+                    target_name: relocation.target_name,
+                    value: target_address + relocation.addend,
+                ),
+            )
+            applied_count += 1
+        }
+    }
+
+    LinkReport(
+        image: Some(
+            LinkedImage(
+                section_bases: section_layout.bases,
+                total_size: section_layout.total_size,
+                relocations: applied,
+                relocation_count: applied_count,
+            ),
+        ),
+        issue: None,
+    )
+}
