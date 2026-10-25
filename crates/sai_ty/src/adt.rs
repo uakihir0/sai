@@ -7,8 +7,9 @@
 //! the payload-template type.
 
 use crate::iface::{FlagsDef, InterfaceItemCheck, raw_flags_marker_is_valid};
+use sai_hir::attrs::{ReprAttr, ReprInteger};
 use sai_hir::item_tree::AttrName;
-use sai_hir::items::{HirOwner, InterfaceItemKind, OwnerNode, Variant, VariantShape};
+use sai_hir::items::{HirOwner, InterfaceItemKind, ItemKind, OwnerNode, Variant, VariantShape};
 use sai_hir::{
     DefId, DefPathData, DefPathInterner, DisambiguatedDefPathData, LocalDefId, Symbol, Visibility,
 };
@@ -291,6 +292,288 @@ impl LocalEnumPayloadTemplateDef {
                     .find(|field| field.identity == identity)
                     .map(|field| &field.ty),
             })
+    }
+}
+
+/// A source-ordered enum discriminant retained even when it is invalid for
+/// the selected representation or duplicates an earlier value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalEnumVariantDiscriminant {
+    variant: DefId,
+    value: i128,
+}
+
+impl LocalEnumVariantDiscriminant {
+    /// Build a discriminant for an exact variant.
+    pub const fn new(variant: DefId, value: i128) -> Self {
+        Self { variant, value }
+    }
+
+    /// Exact variant identity.
+    pub const fn variant(self) -> DefId {
+        self.variant
+    }
+
+    /// Computed discriminant value.
+    pub const fn value(self) -> i128 {
+        self.value
+    }
+}
+
+/// A representable discriminant semantic error attached to its later source
+/// variant. The computed value remains in [`LocalEnumAdtDef`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalEnumDiscriminantIssue {
+    variant: DefId,
+    value: i128,
+    kind: LocalEnumDiscriminantIssueKind,
+}
+
+impl LocalEnumDiscriminantIssue {
+    /// Variant carrying this issue.
+    pub const fn variant(self) -> DefId {
+        self.variant
+    }
+
+    /// Computed value associated with this issue.
+    pub const fn value(self) -> i128 {
+        self.value
+    }
+
+    /// Whether the value is out of range or duplicates an earlier value.
+    pub const fn kind(self) -> LocalEnumDiscriminantIssueKind {
+        self.kind
+    }
+}
+
+/// The semantic failure found while retaining a computed discriminant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnumDiscriminantIssueKind {
+    OutOfRange,
+    Duplicate { previous_variant: DefId },
+}
+
+/// A typed, source-ordered enum definition for the current local-enum slice.
+///
+/// This composes the payload template with validated representation metadata
+/// and computed discriminants. It remains separate from the general
+/// [`AdtDef`] and does not implement the `adt_def` query contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumAdtDef {
+    payloads: LocalEnumPayloadTemplateDef,
+    repr: Option<ReprAttr>,
+    discr_ty: IntTy,
+    discriminants: Arc<[LocalEnumVariantDiscriminant]>,
+}
+
+impl LocalEnumAdtDef {
+    /// Build a local enum definition from its payload template, validated
+    /// representation, and the exact HIR owner that supplied the template.
+    ///
+    /// The driver is responsible for proving that `repr` came from the
+    /// current target-filtered item's `ValidatedAttrs`. This constructor
+    /// checks that the HIR owner and every source-ordered variant match the
+    /// payload template before calculating discriminants.
+    pub fn from_hir_owner(
+        payloads: LocalEnumPayloadTemplateDef,
+        repr: Option<ReprAttr>,
+        hir: &HirOwner<'_>,
+    ) -> Result<(Self, Vec<LocalEnumDiscriminantIssue>), LocalEnumAdtDefBuildError> {
+        let invalid = |reason| LocalEnumAdtDefBuildError {
+            reason,
+            issues: Vec::new(),
+        };
+        let OwnerNode::Item(item) = hir.node else {
+            return Err(invalid(LocalEnumAdtDefError::NotModuleEnum));
+        };
+        if hir.id != item.owner_id || item.owner_id.def_id.to_def_id() != payloads.owner() {
+            return Err(invalid(LocalEnumAdtDefError::HirOwnerMismatch));
+        }
+        let ItemKind::Enum { variants, .. } = item.kind else {
+            return Err(invalid(LocalEnumAdtDefError::NotModuleEnum));
+        };
+        if variants.len() != payloads.variants().len() {
+            return Err(invalid(LocalEnumAdtDefError::VariantOrderMismatch));
+        }
+
+        for (variant, template) in variants.iter().zip(payloads.variants()) {
+            if variant.hir_id.owner != item.owner_id
+                || variant.def_id.to_def_id() != template.def_id()
+                || variant.name.sym != template.name()
+            {
+                return Err(invalid(LocalEnumAdtDefError::VariantOrderMismatch));
+            }
+            let payload_shape_matches = match (&template.payload, variant.shape) {
+                (LocalEnumPayloadTemplateShape::Unit, VariantShape::Unit) => true,
+                (LocalEnumPayloadTemplateShape::Tuple(templates), VariantShape::Tuple(types)) => {
+                    templates.len() == types.len()
+                }
+                (
+                    LocalEnumPayloadTemplateShape::Record(templates),
+                    VariantShape::Record(fields),
+                ) => {
+                    templates.len() == fields.len()
+                        && templates.iter().zip(fields).all(|(template, field)| {
+                            template.identity()
+                                == LocalEnumPayloadTemplateIdentity::Record {
+                                    variant: variant.def_id.to_def_id(),
+                                    field: field.def_id.to_def_id(),
+                                }
+                                && template.name() == field.name.sym
+                                && template.visibility() == field.vis
+                        })
+                }
+                _ => false,
+            };
+            if !payload_shape_matches {
+                return Err(invalid(LocalEnumAdtDefError::VariantOrderMismatch));
+            }
+        }
+
+        let discr_ty = repr_int_ty(repr);
+        let has_payload = variants
+            .iter()
+            .any(|variant| !matches!(variant.shape, VariantShape::Unit));
+        let mut discriminants = Vec::with_capacity(variants.len());
+        let mut issues = Vec::new();
+        let mut previous: Option<i128> = None;
+        let mut seen = HashMap::<i128, DefId>::with_capacity(variants.len());
+
+        for (index, variant) in variants.iter().enumerate() {
+            let variant_id = variant.def_id.to_def_id();
+            let value = if has_payload {
+                i128::try_from(index)
+                    .map_err(|_| LocalEnumAdtDefError::DiscriminantOverflow(variant_id))
+                    .map_err(|reason| LocalEnumAdtDefBuildError {
+                        reason,
+                        issues: issues.clone(),
+                    })?
+            } else {
+                if variant.has_explicit_discriminant && variant.discriminant.is_none() {
+                    return Err(LocalEnumAdtDefBuildError {
+                        reason: LocalEnumAdtDefError::MissingExplicitDiscriminant(variant_id),
+                        issues: issues.clone(),
+                    });
+                }
+                if !variant.has_explicit_discriminant && variant.discriminant.is_some() {
+                    return Err(LocalEnumAdtDefBuildError {
+                        reason: LocalEnumAdtDefError::UnexpectedImplicitDiscriminant(variant_id),
+                        issues: issues.clone(),
+                    });
+                }
+                if variant.has_explicit_discriminant {
+                    variant.discriminant.expect("explicit value was validated")
+                } else {
+                    match previous {
+                        Some(value) => value
+                            .checked_add(1)
+                            .ok_or(LocalEnumAdtDefError::DiscriminantOverflow(variant_id))
+                            .map_err(|reason| LocalEnumAdtDefBuildError {
+                                reason,
+                                issues: issues.clone(),
+                            })?,
+                        None => 0,
+                    }
+                }
+            };
+            previous = Some(value);
+            discriminants.push(LocalEnumVariantDiscriminant::new(variant_id, value));
+
+            if !discr_ty.contains(value) {
+                issues.push(LocalEnumDiscriminantIssue {
+                    variant: variant_id,
+                    value,
+                    kind: LocalEnumDiscriminantIssueKind::OutOfRange,
+                });
+            }
+            if let Some(previous_variant) = seen.insert(value, variant_id) {
+                issues.push(LocalEnumDiscriminantIssue {
+                    variant: variant_id,
+                    value,
+                    kind: LocalEnumDiscriminantIssueKind::Duplicate { previous_variant },
+                });
+            }
+        }
+
+        Ok((
+            Self {
+                payloads,
+                repr,
+                discr_ty,
+                discriminants: discriminants.into(),
+            },
+            issues,
+        ))
+    }
+
+    /// Payload template from the same enum owner.
+    pub fn payloads(&self) -> &LocalEnumPayloadTemplateDef {
+        &self.payloads
+    }
+
+    /// Validated representation argument, retaining `C` versus an integer
+    /// representation even when both use the same discriminant width.
+    pub const fn repr(&self) -> Option<ReprAttr> {
+        self.repr
+    }
+
+    /// Integer type used to validate discriminant values.
+    pub const fn discr_ty(&self) -> IntTy {
+        self.discr_ty
+    }
+
+    /// Discriminants in declaration order.
+    pub fn discriminants(&self) -> &[LocalEnumVariantDiscriminant] {
+        &self.discriminants
+    }
+}
+
+fn repr_int_ty(repr: Option<ReprAttr>) -> IntTy {
+    match repr {
+        None => IntTy::I64,
+        Some(ReprAttr::C) => IntTy::I32,
+        Some(ReprAttr::Integer(integer)) => match integer {
+            ReprInteger::I8 => IntTy::I8,
+            ReprInteger::I16 => IntTy::I16,
+            ReprInteger::I32 => IntTy::I32,
+            ReprInteger::I64 => IntTy::I64,
+            ReprInteger::U8 => IntTy::U8,
+            ReprInteger::U16 => IntTy::U16,
+            ReprInteger::U32 => IntTy::U32,
+            ReprInteger::U64 => IntTy::U64,
+        },
+    }
+}
+
+/// Why a local enum's payload template could not be combined with HIR
+/// discriminants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnumAdtDefError {
+    NotModuleEnum,
+    HirOwnerMismatch,
+    VariantOrderMismatch,
+    MissingExplicitDiscriminant(DefId),
+    UnexpectedImplicitDiscriminant(DefId),
+    DiscriminantOverflow(DefId),
+}
+
+/// Why an enum definition could not be built, together with semantic issues
+/// discovered before a fail-closed condition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumAdtDefBuildError {
+    reason: LocalEnumAdtDefError,
+    issues: Vec<LocalEnumDiscriminantIssue>,
+}
+
+impl LocalEnumAdtDefBuildError {
+    /// Structural or discriminant failure that prevented construction.
+    pub const fn reason(&self) -> LocalEnumAdtDefError {
+        self.reason
+    }
+
+    /// Source-ordered range/duplicate issues found before construction failed.
+    pub fn issues(&self) -> &[LocalEnumDiscriminantIssue] {
+        &self.issues
     }
 }
 
@@ -928,16 +1211,19 @@ impl FlagsDef {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdtKind, IntTy, LocalEnumPayloadTemplateDef, LocalEnumPayloadTemplateDefError,
+        AdtKind, IntTy, LocalEnumAdtDef, LocalEnumDiscriminantIssueKind,
+        LocalEnumPayloadTemplateDef, LocalEnumPayloadTemplateDefError,
         LocalEnumPayloadTemplateIdentity, LocalEnumPayloadTemplateShape,
         LocalEnumPayloadVariantTemplateDef, LocalEnumRecordPayloadTemplate,
         LocalEnumTuplePayloadTemplate, LocalUnitEnumAdtDef, LocalUnitEnumAdtDefError, Visibility,
     };
+    use sai_hir::attrs::{ReprAttr, ReprInteger};
     use sai_hir::item_tree::{AttrName, RawAttr, RawAttrArg};
     use sai_hir::items::{
-        HirOwner, InterfaceItem, InterfaceItemKind, OwnerNode, Variant, VariantShape,
+        HirOwner, InterfaceItem, InterfaceItemKind, Item, ItemKind, OwnerNode, Variant,
+        VariantShape,
     };
-    use sai_hir::types::{Generics, Name};
+    use sai_hir::types::{Generics, Name, Ty as HirTy, TyKind as HirTyKind};
     use sai_hir::{
         DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, ItemLocalId,
         LocalDefId, OwnerId, Span, SpanCtxt,
@@ -1042,6 +1328,58 @@ mod tests {
             raw_attrs: &[],
             diagnostics: Vec::new(),
         }
+    }
+
+    fn module_enum_item<'hir>(
+        owner: LocalDefId,
+        name: sai_hir::Symbol,
+        variants: &'hir [Variant<'hir>],
+    ) -> Item<'hir> {
+        let span = span();
+        Item {
+            owner_id: OwnerId { def_id: owner },
+            name: Name { sym: name, span },
+            vis: Visibility::Pub,
+            kind: ItemKind::Enum {
+                generics: Generics {
+                    params: &[],
+                    where_preds: &[],
+                },
+                variants,
+            },
+            span,
+        }
+    }
+
+    fn module_hir_owner<'hir>(item: &'hir Item<'hir>) -> HirOwner<'hir> {
+        HirOwner {
+            id: item.owner_id,
+            node: OwnerNode::Item(item),
+            body: None,
+            raw_attrs: &[],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn unit_payload_template(
+        owner: LocalDefId,
+        variants: &[Variant<'_>],
+    ) -> LocalEnumPayloadTemplateDef {
+        LocalEnumPayloadTemplateDef::try_new(
+            owner.to_def_id(),
+            Arc::<[(sai_hir::DefId, crate::ty::ParamTy)]>::from([]),
+            variants
+                .iter()
+                .map(|variant| {
+                    LocalEnumPayloadVariantTemplateDef::new(
+                        variant.def_id.to_def_id(),
+                        variant.name.sym,
+                        LocalEnumPayloadTemplateShape::Unit,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("unit enum HIR has a valid payload template")
     }
 
     fn raw_flags_attr(source: &str, with_argument: bool) -> RawAttr {
@@ -1690,6 +2028,377 @@ mod tests {
             ),
             Err(LocalEnumPayloadTemplateDefError::EmptyPayloadVariantShape),
             "record variants require at least one field"
+        );
+    }
+
+    #[test]
+    fn local_enum_adt_maps_and_retains_validated_repr_choices() {
+        let ids = test_ids();
+        let enum_name = ids.symbols.intern("State").unwrap();
+        let ready = ids.symbols.intern("Ready").unwrap();
+        let variant_id = ids.paths.intern_variants(ids.owner, &[(ready, 0)]).unwrap()[0];
+        let variants = [unit_variant(ids.owner, variant_id, ready, 1, None, false)];
+        let payloads = unit_payload_template(ids.owner, &variants);
+        let item = module_enum_item(ids.owner, enum_name, &variants);
+        let hir = module_hir_owner(&item);
+        let cases = [
+            (None, IntTy::I64),
+            (Some(ReprAttr::C), IntTy::I32),
+            (Some(ReprAttr::Integer(ReprInteger::I8)), IntTy::I8),
+            (Some(ReprAttr::Integer(ReprInteger::I16)), IntTy::I16),
+            (Some(ReprAttr::Integer(ReprInteger::I32)), IntTy::I32),
+            (Some(ReprAttr::Integer(ReprInteger::I64)), IntTy::I64),
+            (Some(ReprAttr::Integer(ReprInteger::U8)), IntTy::U8),
+            (Some(ReprAttr::Integer(ReprInteger::U16)), IntTy::U16),
+            (Some(ReprAttr::Integer(ReprInteger::U32)), IntTy::U32),
+            (Some(ReprAttr::Integer(ReprInteger::U64)), IntTy::U64),
+        ];
+
+        for (repr, expected_discr_ty) in cases {
+            let (definition, issues) =
+                LocalEnumAdtDef::from_hir_owner(payloads.clone(), repr, &hir)
+                    .expect("the exact HIR owner builds an enum definition");
+            assert_eq!(definition.repr(), repr);
+            assert_eq!(definition.discr_ty(), expected_discr_ty);
+            assert_eq!(definition.discriminants().len(), 1);
+            assert_eq!(
+                definition.discriminants()[0].variant(),
+                variant_id.to_def_id()
+            );
+            assert_eq!(definition.discriminants()[0].value(), 0);
+            assert!(issues.is_empty());
+        }
+
+        let (c_definition, _) =
+            LocalEnumAdtDef::from_hir_owner(payloads.clone(), Some(ReprAttr::C), &hir).unwrap();
+        let (integer_definition, _) = LocalEnumAdtDef::from_hir_owner(
+            payloads,
+            Some(ReprAttr::Integer(ReprInteger::I32)),
+            &hir,
+        )
+        .unwrap();
+        assert_eq!(c_definition.discr_ty(), integer_definition.discr_ty());
+        assert_ne!(c_definition.repr(), integer_definition.repr());
+    }
+
+    #[test]
+    fn local_enum_adt_computes_unit_discriminants_in_source_order() {
+        let ids = test_ids();
+        let enum_name = ids.symbols.intern("State").unwrap();
+        let names =
+            ["First", "Next", "Reset", "AfterReset"].map(|name| ids.symbols.intern(name).unwrap());
+        let variant_ids = ids
+            .paths
+            .intern_variants(ids.owner, &names.map(|name| (name, 0)))
+            .unwrap();
+        let variants = [
+            unit_variant(ids.owner, variant_ids[0], names[0], 1, Some(5), true),
+            unit_variant(ids.owner, variant_ids[1], names[1], 2, None, false),
+            unit_variant(ids.owner, variant_ids[2], names[2], 3, Some(-2), true),
+            unit_variant(ids.owner, variant_ids[3], names[3], 4, None, false),
+        ];
+        let payloads = unit_payload_template(ids.owner, &variants);
+        let item = module_enum_item(ids.owner, enum_name, &variants);
+        let hir = module_hir_owner(&item);
+
+        let (definition, issues) = LocalEnumAdtDef::from_hir_owner(payloads, None, &hir).unwrap();
+
+        assert!(issues.is_empty());
+        assert_eq!(
+            definition
+                .discriminants()
+                .iter()
+                .map(|discriminant| discriminant.value())
+                .collect::<Vec<_>>(),
+            [5, 6, -2, -1]
+        );
+    }
+
+    #[test]
+    fn local_enum_adt_keeps_out_of_range_and_duplicate_values() {
+        let ids = test_ids();
+        let enum_name = ids.symbols.intern("State").unwrap();
+        let names =
+            ["TooLarge", "Repeated", "Negative"].map(|name| ids.symbols.intern(name).unwrap());
+        let variant_ids = ids
+            .paths
+            .intern_variants(ids.owner, &names.map(|name| (name, 0)))
+            .unwrap();
+        let variants = [
+            unit_variant(ids.owner, variant_ids[0], names[0], 1, Some(256), true),
+            unit_variant(ids.owner, variant_ids[1], names[1], 2, Some(256), true),
+            unit_variant(ids.owner, variant_ids[2], names[2], 3, Some(-1), true),
+        ];
+        let payloads = unit_payload_template(ids.owner, &variants);
+        let item = module_enum_item(ids.owner, enum_name, &variants);
+        let hir = module_hir_owner(&item);
+
+        let (definition, issues) = LocalEnumAdtDef::from_hir_owner(
+            payloads,
+            Some(ReprAttr::Integer(ReprInteger::U8)),
+            &hir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            definition
+                .discriminants()
+                .iter()
+                .map(|discriminant| (discriminant.variant(), discriminant.value()))
+                .collect::<Vec<_>>(),
+            [
+                (variant_ids[0].to_def_id(), 256),
+                (variant_ids[1].to_def_id(), 256),
+                (variant_ids[2].to_def_id(), -1),
+            ]
+        );
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| (issue.variant(), issue.value(), issue.kind()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    variant_ids[0].to_def_id(),
+                    256,
+                    LocalEnumDiscriminantIssueKind::OutOfRange,
+                ),
+                (
+                    variant_ids[1].to_def_id(),
+                    256,
+                    LocalEnumDiscriminantIssueKind::OutOfRange,
+                ),
+                (
+                    variant_ids[1].to_def_id(),
+                    256,
+                    LocalEnumDiscriminantIssueKind::Duplicate {
+                        previous_variant: variant_ids[0].to_def_id(),
+                    },
+                ),
+                (
+                    variant_ids[2].to_def_id(),
+                    -1,
+                    LocalEnumDiscriminantIssueKind::OutOfRange,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_enum_adt_rejects_reordered_variant_templates() {
+        let ids = test_ids();
+        let enum_name = ids.symbols.intern("State").unwrap();
+        let names = ["First", "Second"].map(|name| ids.symbols.intern(name).unwrap());
+        let variant_ids = ids
+            .paths
+            .intern_variants(ids.owner, &names.map(|name| (name, 0)))
+            .unwrap();
+        let variants = [
+            unit_variant(ids.owner, variant_ids[0], names[0], 1, None, false),
+            unit_variant(ids.owner, variant_ids[1], names[1], 2, None, false),
+        ];
+        let reordered_payloads = LocalEnumPayloadTemplateDef::try_new(
+            ids.owner.to_def_id(),
+            Arc::<[(sai_hir::DefId, crate::ty::ParamTy)]>::from([]),
+            Arc::from([
+                LocalEnumPayloadVariantTemplateDef::new(
+                    variant_ids[1].to_def_id(),
+                    names[1],
+                    LocalEnumPayloadTemplateShape::Unit,
+                ),
+                LocalEnumPayloadVariantTemplateDef::new(
+                    variant_ids[0].to_def_id(),
+                    names[0],
+                    LocalEnumPayloadTemplateShape::Unit,
+                ),
+            ]),
+        )
+        .unwrap();
+        let item = module_enum_item(ids.owner, enum_name, &variants);
+        let hir = module_hir_owner(&item);
+
+        let error = LocalEnumAdtDef::from_hir_owner(reordered_payloads, None, &hir)
+            .expect_err("the exact HIR variant order must match the payload template");
+
+        assert_eq!(
+            error.reason(),
+            super::LocalEnumAdtDefError::VariantOrderMismatch
+        );
+    }
+
+    #[test]
+    fn local_enum_adt_uses_ordinals_for_data_enums_and_fails_closed_on_lost_values() {
+        let ids = test_ids();
+        let enum_name = ids.symbols.intern("Mixed").unwrap();
+        let unit_name = ids.symbols.intern("Unit").unwrap();
+        let value_name = ids.symbols.intern("Value").unwrap();
+        let tail_name = ids.symbols.intern("Tail").unwrap();
+        let field_name = ids.symbols.intern("payload").unwrap();
+        let variant_ids = ids
+            .paths
+            .intern_variants(
+                ids.owner,
+                &[(unit_name, 0), (value_name, 0), (tail_name, 0)],
+            )
+            .unwrap();
+        let field_id = ids
+            .paths
+            .intern_fields_for_parents(&[(variant_ids[1], field_name, 0)])
+            .unwrap()[0];
+        let field_span = span();
+        let hir_ty = HirTy {
+            hir_id: HirId {
+                owner: OwnerId { def_id: ids.owner },
+                local_id: ItemLocalId::from_raw(10),
+            },
+            kind: HirTyKind::Err,
+            span: field_span,
+        };
+        let hir_field = sai_hir::items::FieldDef {
+            hir_id: HirId {
+                owner: OwnerId { def_id: ids.owner },
+                local_id: ItemLocalId::from_raw(9),
+            },
+            def_id: field_id,
+            vis: Visibility::Pub,
+            name: Name {
+                sym: field_name,
+                span: field_span,
+            },
+            ty: &hir_ty,
+        };
+        let hir_fields = [hir_field];
+        let variants = [
+            unit_variant(ids.owner, variant_ids[0], unit_name, 1, Some(99), true),
+            Variant {
+                hir_id: HirId {
+                    owner: OwnerId { def_id: ids.owner },
+                    local_id: ItemLocalId::from_raw(2),
+                },
+                def_id: variant_ids[1],
+                name: Name {
+                    sym: value_name,
+                    span: span(),
+                },
+                shape: VariantShape::Record(&hir_fields),
+                discriminant: None,
+                has_explicit_discriminant: true,
+                span: span(),
+                payload_span: Some(span()),
+            },
+            unit_variant(ids.owner, variant_ids[2], tail_name, 3, Some(-20), true),
+        ];
+        let semantic_types = crate::ty::TyInterner::new();
+        let payload_ty = semantic_types.intern(crate::ty::TyKind::Int(crate::ty::IntTy::I32));
+        let payloads = LocalEnumPayloadTemplateDef::try_new(
+            ids.owner.to_def_id(),
+            Arc::<[(sai_hir::DefId, crate::ty::ParamTy)]>::from([]),
+            Arc::from([
+                LocalEnumPayloadVariantTemplateDef::new(
+                    variant_ids[0].to_def_id(),
+                    unit_name,
+                    LocalEnumPayloadTemplateShape::Unit,
+                ),
+                LocalEnumPayloadVariantTemplateDef::new(
+                    variant_ids[1].to_def_id(),
+                    value_name,
+                    LocalEnumPayloadTemplateShape::Record(Arc::from([
+                        LocalEnumRecordPayloadTemplate::new(
+                            variant_ids[1].to_def_id(),
+                            field_id.to_def_id(),
+                            field_name,
+                            Visibility::Pub,
+                            payload_ty,
+                        ),
+                    ])),
+                ),
+                LocalEnumPayloadVariantTemplateDef::new(
+                    variant_ids[2].to_def_id(),
+                    tail_name,
+                    LocalEnumPayloadTemplateShape::Unit,
+                ),
+            ]),
+        )
+        .unwrap();
+        let item = module_enum_item(ids.owner, enum_name, &variants);
+        let hir = module_hir_owner(&item);
+
+        let (definition, issues) = LocalEnumAdtDef::from_hir_owner(payloads, None, &hir).unwrap();
+
+        assert!(issues.is_empty());
+        assert_eq!(
+            definition
+                .discriminants()
+                .iter()
+                .map(|discriminant| discriminant.value())
+                .collect::<Vec<_>>(),
+            [0, 1, 2],
+            "explicit literals in a data enum do not replace declaration ordinals"
+        );
+
+        let missing_name = ids.symbols.intern("Missing").unwrap();
+        let missing_id = ids
+            .paths
+            .intern_variants(ids.owner, &[(missing_name, 0)])
+            .unwrap()[0];
+        let missing = [unit_variant(
+            ids.owner,
+            missing_id,
+            missing_name,
+            1,
+            None,
+            true,
+        )];
+        let missing_payloads = unit_payload_template(ids.owner, &missing);
+        let missing_item = module_enum_item(ids.owner, enum_name, &missing);
+        let missing_hir = module_hir_owner(&missing_item);
+        let error = LocalEnumAdtDef::from_hir_owner(missing_payloads, None, &missing_hir)
+            .expect_err("a missing explicit value is not an implicit discriminant");
+        assert_eq!(
+            error.reason(),
+            super::LocalEnumAdtDefError::MissingExplicitDiscriminant(missing_id.to_def_id())
+        );
+
+        let overflow_names = ["Max", "Overflow"].map(|name| ids.symbols.intern(name).unwrap());
+        let overflow_ids = ids
+            .paths
+            .intern_variants(ids.owner, &overflow_names.map(|name| (name, 0)))
+            .unwrap();
+        let overflow = [
+            unit_variant(
+                ids.owner,
+                overflow_ids[0],
+                overflow_names[0],
+                1,
+                Some(i128::MAX),
+                true,
+            ),
+            unit_variant(
+                ids.owner,
+                overflow_ids[1],
+                overflow_names[1],
+                2,
+                None,
+                false,
+            ),
+        ];
+        let overflow_payloads = unit_payload_template(ids.owner, &overflow);
+        let overflow_item = module_enum_item(ids.owner, enum_name, &overflow);
+        let overflow_hir = module_hir_owner(&overflow_item);
+        let error = LocalEnumAdtDef::from_hir_owner(overflow_payloads, None, &overflow_hir)
+            .expect_err("implicit arithmetic must not wrap or invent an i128 value");
+        assert_eq!(
+            error.reason(),
+            super::LocalEnumAdtDefError::DiscriminantOverflow(overflow_ids[1].to_def_id())
+        );
+        assert_eq!(
+            error.issues().len(),
+            1,
+            "diagnostics for earlier computed values remain available when later arithmetic fails"
+        );
+        assert_eq!(
+            error.issues()[0].kind(),
+            LocalEnumDiscriminantIssueKind::OutOfRange
         );
     }
 }
