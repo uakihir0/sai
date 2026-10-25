@@ -1,9 +1,10 @@
 //! The first semantic ADT representation.
 //!
-//! This module currently models validated local flags declarations and
-//! local-interface enums whose variants carry no payload. It does not provide
-//! the general `adt_def(DefId)` query contract: other ADT kinds and general
-//! semantic field types are not represented yet.
+//! This module models validated local flags declarations, local-interface
+//! unit enums, and payload-only templates for direct local enums. It does not
+//! provide the general `adt_def(DefId)` query contract: discriminants,
+//! representations, and general semantic ADT fields are not represented by
+//! the payload-template type.
 
 use crate::iface::{FlagsDef, InterfaceItemCheck, raw_flags_marker_is_valid};
 use sai_hir::item_tree::AttrName;
@@ -150,6 +151,343 @@ impl FieldDef {
     pub const fn ty(&self) -> Ty {
         self.ty
     }
+}
+
+/// A payload-only template for one local enum.
+///
+/// This is intentionally separate from [`AdtDef`]. It preserves generic
+/// payload types and source shape, but does not describe enum discriminants,
+/// representation, or the complete `adt_def` query contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumPayloadTemplateDef {
+    owner: DefId,
+    type_params: Arc<[(DefId, crate::ty::ParamTy)]>,
+    variants: Arc<[LocalEnumPayloadVariantTemplateDef]>,
+}
+
+impl LocalEnumPayloadTemplateDef {
+    /// Build a payload-only template from source-ordered semantic data.
+    ///
+    /// The caller is responsible for verifying source provenance. This
+    /// constructor validates package, binder, variant, payload-identity, and
+    /// template invariants before storing the supplied data.
+    pub fn try_new(
+        owner: DefId,
+        type_params: impl Into<Arc<[(DefId, crate::ty::ParamTy)]>>,
+        variants: impl Into<Arc<[LocalEnumPayloadVariantTemplateDef]>>,
+    ) -> Result<Self, LocalEnumPayloadTemplateDefError> {
+        let type_params = type_params.into();
+        let variants = variants.into();
+        if !valid_payload_template_binders(owner, &type_params) {
+            return Err(LocalEnumPayloadTemplateDefError::InvalidTypeParameters);
+        }
+
+        let mut variant_ids = HashSet::with_capacity(variants.len());
+        for variant in variants.iter() {
+            if variant.def_id.package != owner.package
+                || variant.def_id == owner
+                || variant.name.is_error()
+                || !variant_ids.insert(variant.def_id)
+            {
+                return Err(LocalEnumPayloadTemplateDefError::InvalidVariantIdentity);
+            }
+        }
+        let mut record_field_ids = HashSet::new();
+        for variant in variants.iter() {
+            match &variant.payload {
+                LocalEnumPayloadTemplateShape::Unit => {}
+                LocalEnumPayloadTemplateShape::Tuple(payloads) => {
+                    if payloads.is_empty() {
+                        return Err(LocalEnumPayloadTemplateDefError::EmptyPayloadVariantShape);
+                    }
+                    for (index, payload) in payloads.iter().enumerate() {
+                        let expected_identity = u32::try_from(index).ok().map(|index| {
+                            LocalEnumPayloadTemplateIdentity::Tuple {
+                                variant: variant.def_id,
+                                index,
+                            }
+                        });
+                        if Some(payload.identity) != expected_identity {
+                            return Err(
+                                LocalEnumPayloadTemplateDefError::InvalidTuplePayloadIdentity,
+                            );
+                        }
+                        if !local_payload_template_matches_binders(&payload.ty, &type_params) {
+                            return Err(LocalEnumPayloadTemplateDefError::InvalidPayloadTemplate);
+                        }
+                    }
+                }
+                LocalEnumPayloadTemplateShape::Record(fields) => {
+                    if fields.is_empty() {
+                        return Err(LocalEnumPayloadTemplateDefError::EmptyPayloadVariantShape);
+                    }
+                    for field in fields.iter() {
+                        let LocalEnumPayloadTemplateIdentity::Record {
+                            variant: field_variant,
+                            field: field_def_id,
+                        } = field.identity
+                        else {
+                            return Err(
+                                LocalEnumPayloadTemplateDefError::InvalidRecordPayloadIdentity,
+                            );
+                        };
+                        if field_variant != variant.def_id
+                            || field_def_id.package != owner.package
+                            || field_def_id == owner
+                            || variant_ids.contains(&field_def_id)
+                            || field.name.is_error()
+                            || !record_field_ids.insert(field_def_id)
+                        {
+                            return Err(
+                                LocalEnumPayloadTemplateDefError::InvalidRecordPayloadIdentity,
+                            );
+                        }
+                        if !local_payload_template_matches_binders(&field.ty, &type_params) {
+                            return Err(LocalEnumPayloadTemplateDefError::InvalidPayloadTemplate);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            owner,
+            type_params,
+            variants,
+        })
+    }
+
+    /// Exact local enum identity.
+    pub const fn owner(&self) -> DefId {
+        self.owner
+    }
+
+    /// Exact source-ordered type binders used by payload templates.
+    pub fn type_params(&self) -> &[(DefId, crate::ty::ParamTy)] {
+        &self.type_params
+    }
+
+    /// Source-ordered variants and payload templates.
+    pub fn variants(&self) -> &[LocalEnumPayloadVariantTemplateDef] {
+        &self.variants
+    }
+
+    /// Look up a payload type by its exact tuple-position or record-field
+    /// identity.
+    pub fn payload_template(
+        &self,
+        identity: LocalEnumPayloadTemplateIdentity,
+    ) -> Option<&crate::ty::Ty> {
+        self.variants
+            .iter()
+            .find_map(|variant| match &variant.payload {
+                LocalEnumPayloadTemplateShape::Unit => None,
+                LocalEnumPayloadTemplateShape::Tuple(payloads) => payloads
+                    .iter()
+                    .find(|payload| payload.identity == identity)
+                    .map(|payload| &payload.ty),
+                LocalEnumPayloadTemplateShape::Record(fields) => fields
+                    .iter()
+                    .find(|field| field.identity == identity)
+                    .map(|field| &field.ty),
+            })
+    }
+}
+
+/// A variant and its source-ordered payload shape in a local enum template.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumPayloadVariantTemplateDef {
+    def_id: DefId,
+    name: Symbol,
+    payload: LocalEnumPayloadTemplateShape,
+}
+
+impl LocalEnumPayloadVariantTemplateDef {
+    /// Build a variant value for [`LocalEnumPayloadTemplateDef::try_new`].
+    pub fn new(def_id: DefId, name: Symbol, payload: LocalEnumPayloadTemplateShape) -> Self {
+        Self {
+            def_id,
+            name,
+            payload,
+        }
+    }
+
+    /// Exact variant definition.
+    pub const fn def_id(&self) -> DefId {
+        self.def_id
+    }
+
+    /// Variant name.
+    pub const fn name(&self) -> Symbol {
+        self.name
+    }
+
+    /// Unit, tuple, or record payload templates in source order.
+    pub const fn payload(&self) -> &LocalEnumPayloadTemplateShape {
+        &self.payload
+    }
+}
+
+/// The unit, tuple, or record shape of a local enum variant payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalEnumPayloadTemplateShape {
+    Unit,
+    Tuple(Arc<[LocalEnumTuplePayloadTemplate]>),
+    Record(Arc<[LocalEnumRecordPayloadTemplate]>),
+}
+
+/// Identity of a payload type template.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LocalEnumPayloadTemplateIdentity {
+    Tuple { variant: DefId, index: u32 },
+    Record { variant: DefId, field: DefId },
+}
+
+/// A tuple payload type template, identified by its variant and position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumTuplePayloadTemplate {
+    identity: LocalEnumPayloadTemplateIdentity,
+    ty: crate::ty::Ty,
+}
+
+impl LocalEnumTuplePayloadTemplate {
+    /// Build a tuple payload template for a specific source position.
+    pub fn new(variant: DefId, index: u32, ty: crate::ty::Ty) -> Self {
+        Self {
+            identity: LocalEnumPayloadTemplateIdentity::Tuple { variant, index },
+            ty,
+        }
+    }
+
+    /// Exact variant and zero-based payload position.
+    pub const fn identity(&self) -> LocalEnumPayloadTemplateIdentity {
+        self.identity
+    }
+
+    /// Semantic payload type template.
+    pub const fn ty(&self) -> &crate::ty::Ty {
+        &self.ty
+    }
+}
+
+/// A record payload type template, retaining its HIR field identity and
+/// declaration metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumRecordPayloadTemplate {
+    identity: LocalEnumPayloadTemplateIdentity,
+    name: Symbol,
+    visibility: Visibility,
+    ty: crate::ty::Ty,
+}
+
+impl LocalEnumRecordPayloadTemplate {
+    /// Build a record payload template for a specific variant field.
+    pub fn new(
+        variant: DefId,
+        field: DefId,
+        name: Symbol,
+        visibility: Visibility,
+        ty: crate::ty::Ty,
+    ) -> Self {
+        Self {
+            identity: LocalEnumPayloadTemplateIdentity::Record { variant, field },
+            name,
+            visibility,
+            ty,
+        }
+    }
+
+    /// Exact variant and HIR field definition.
+    pub const fn identity(&self) -> LocalEnumPayloadTemplateIdentity {
+        self.identity
+    }
+
+    /// Source-level field name.
+    pub const fn name(&self) -> Symbol {
+        self.name
+    }
+
+    /// Field visibility from HIR.
+    pub const fn visibility(&self) -> Visibility {
+        self.visibility
+    }
+
+    /// Semantic payload type template.
+    pub const fn ty(&self) -> &crate::ty::Ty {
+        &self.ty
+    }
+}
+
+/// Why a payload-only local enum template could not be constructed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnumPayloadTemplateDefError {
+    InvalidTypeParameters,
+    InvalidVariantIdentity,
+    EmptyPayloadVariantShape,
+    InvalidTuplePayloadIdentity,
+    InvalidRecordPayloadIdentity,
+    InvalidPayloadTemplate,
+}
+
+fn valid_payload_template_binders(
+    owner: DefId,
+    type_params: &[(DefId, crate::ty::ParamTy)],
+) -> bool {
+    let mut def_ids = HashSet::with_capacity(type_params.len());
+    let mut names = HashSet::with_capacity(type_params.len());
+    type_params
+        .iter()
+        .enumerate()
+        .all(|(index, (def_id, param))| {
+            def_id.package == owner.package
+                && u32::try_from(index).ok() == Some(param.index)
+                && !param.name.is_error()
+                && def_ids.insert(*def_id)
+                && names.insert(param.name)
+        })
+}
+
+fn local_payload_template_matches_binders(
+    template: &crate::ty::Ty,
+    type_params: &[(DefId, crate::ty::ParamTy)],
+) -> bool {
+    let mut pending = vec![template];
+    while let Some(ty) = pending.pop() {
+        match ty.kind() {
+            crate::ty::TyKind::Param(parameter) => {
+                let Some(index) = usize::try_from(parameter.index).ok() else {
+                    return false;
+                };
+                if type_params
+                    .get(index)
+                    .is_none_or(|(_, expected)| expected != parameter)
+                {
+                    return false;
+                }
+            }
+            crate::ty::TyKind::Ref(_, inner, _) => pending.push(inner),
+            crate::ty::TyKind::Tuple(elements) => pending.extend(elements.iter()),
+            crate::ty::TyKind::Array(element, length) => {
+                if matches!(length, crate::ty::Const::Param(_)) {
+                    return false;
+                }
+                pending.push(element);
+            }
+            crate::ty::TyKind::FnPtr(signature) => {
+                pending.extend(signature.inputs());
+                pending.push(signature.output());
+            }
+            crate::ty::TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
+            crate::ty::TyKind::Int(_)
+            | crate::ty::TyKind::Uint(_)
+            | crate::ty::TyKind::Float(_)
+            | crate::ty::TyKind::Bool
+            | crate::ty::TyKind::Byte
+            | crate::ty::TyKind::Char
+            | crate::ty::TyKind::Never => {}
+        }
+    }
+    true
 }
 
 /// A validated local flags definition together with its ADT representation.
@@ -589,7 +927,12 @@ impl FlagsDef {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdtKind, IntTy, LocalUnitEnumAdtDef, LocalUnitEnumAdtDefError};
+    use super::{
+        AdtKind, IntTy, LocalEnumPayloadTemplateDef, LocalEnumPayloadTemplateDefError,
+        LocalEnumPayloadTemplateIdentity, LocalEnumPayloadTemplateShape,
+        LocalEnumPayloadVariantTemplateDef, LocalEnumRecordPayloadTemplate,
+        LocalEnumTuplePayloadTemplate, LocalUnitEnumAdtDef, LocalUnitEnumAdtDefError, Visibility,
+    };
     use sai_hir::item_tree::{AttrName, RawAttr, RawAttrArg};
     use sai_hir::items::{
         HirOwner, InterfaceItem, InterfaceItemKind, OwnerNode, Variant, VariantShape,
@@ -1111,6 +1454,242 @@ mod tests {
                 &ids.symbols,
             ),
             Err(LocalUnitEnumAdtDefError::DuplicateDiscriminant)
+        );
+    }
+
+    #[test]
+    fn local_enum_payload_template_preserves_shapes_binders_and_field_metadata() {
+        let ids = test_ids();
+        let type_name = ids.symbols.intern("T").unwrap();
+        let value_name = ids.symbols.intern("Value").unwrap();
+        let named_name = ids.symbols.intern("Named").unwrap();
+        let empty_name = ids.symbols.intern("Empty").unwrap();
+        let field_name = ids.symbols.intern("item").unwrap();
+        let variant_ids = ids
+            .paths
+            .intern_variants(
+                ids.owner,
+                &[(value_name, 0), (named_name, 0), (empty_name, 0)],
+            )
+            .unwrap();
+        let owner_path = ids.paths.resolve(ids.owner).unwrap().unwrap();
+        let mut binder_components = owner_path.data().to_vec();
+        binder_components.push(DisambiguatedDefPathData {
+            data: DefPathData::TypeParam(type_name),
+            disambiguator: 0,
+        });
+        let binder = ids
+            .paths
+            .intern(
+                DefPath::new(
+                    ids.owner.package(),
+                    binder_components,
+                    &ids.packages,
+                    &ids.symbols,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let named_path = ids.paths.resolve(variant_ids[1]).unwrap().unwrap();
+        let mut field_components = named_path.data().to_vec();
+        field_components.push(DisambiguatedDefPathData {
+            data: DefPathData::Field(field_name),
+            disambiguator: 0,
+        });
+        let field = ids
+            .paths
+            .intern(
+                DefPath::new(
+                    ids.owner.package(),
+                    field_components,
+                    &ids.packages,
+                    &ids.symbols,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let interner = crate::ty::TyInterner::new();
+        let parameter = crate::ty::ParamTy {
+            index: 0,
+            name: type_name,
+        };
+        let parameter_ty = interner.intern(crate::ty::TyKind::Param(parameter));
+        let bool_ty = interner.intern(crate::ty::TyKind::Bool);
+        let tuple_ty = interner.tuple([parameter_ty.clone(), bool_ty]);
+        let value_id = variant_ids[0].to_def_id();
+        let named_id = variant_ids[1].to_def_id();
+        let empty_id = variant_ids[2].to_def_id();
+        let record_identity = LocalEnumPayloadTemplateIdentity::Record {
+            variant: named_id,
+            field: field.to_def_id(),
+        };
+        let definition = LocalEnumPayloadTemplateDef::try_new(
+            ids.owner.to_def_id(),
+            Arc::from([(binder.to_def_id(), parameter)]),
+            Arc::from([
+                LocalEnumPayloadVariantTemplateDef::new(
+                    value_id,
+                    value_name,
+                    LocalEnumPayloadTemplateShape::Tuple(Arc::from([
+                        LocalEnumTuplePayloadTemplate::new(value_id, 0, tuple_ty.clone()),
+                    ])),
+                ),
+                LocalEnumPayloadVariantTemplateDef::new(
+                    named_id,
+                    named_name,
+                    LocalEnumPayloadTemplateShape::Record(Arc::from([
+                        LocalEnumRecordPayloadTemplate::new(
+                            named_id,
+                            field.to_def_id(),
+                            field_name,
+                            Visibility::Pub,
+                            parameter_ty.clone(),
+                        ),
+                    ])),
+                ),
+                LocalEnumPayloadVariantTemplateDef::new(
+                    empty_id,
+                    empty_name,
+                    LocalEnumPayloadTemplateShape::Unit,
+                ),
+            ]),
+        )
+        .expect("validated source-ordered data builds a payload-only definition");
+
+        assert_eq!(definition.owner(), ids.owner.to_def_id());
+        assert_eq!(
+            definition.type_params(),
+            &[(binder.to_def_id(), parameter)],
+            "the exact source-ordered binder identity is retained"
+        );
+        assert_eq!(definition.variants().len(), 3);
+        let LocalEnumPayloadTemplateShape::Tuple(tuple) = definition.variants()[0].payload() else {
+            panic!("Value keeps its tuple shape")
+        };
+        assert_eq!(
+            tuple[0].identity(),
+            LocalEnumPayloadTemplateIdentity::Tuple {
+                variant: value_id,
+                index: 0,
+            }
+        );
+        assert!(tuple[0].ty().ptr_eq(&tuple_ty));
+        let LocalEnumPayloadTemplateShape::Record(record) = definition.variants()[1].payload()
+        else {
+            panic!("Named keeps its record shape")
+        };
+        assert_eq!(record[0].identity(), record_identity);
+        assert_eq!(record[0].name(), field_name);
+        assert_eq!(record[0].visibility(), Visibility::Pub);
+        assert!(
+            definition
+                .payload_template(record_identity)
+                .is_some_and(|ty| ty.ptr_eq(&parameter_ty)),
+            "record payload lookup uses the exact variant and field IDs"
+        );
+        assert!(matches!(
+            definition.variants()[2].payload(),
+            LocalEnumPayloadTemplateShape::Unit
+        ));
+    }
+
+    #[test]
+    fn local_enum_payload_template_rejects_forged_binders_and_positions() {
+        let ids = test_ids();
+        let type_name = ids.symbols.intern("T").unwrap();
+        let value_name = ids.symbols.intern("Value").unwrap();
+        let variant = ids
+            .paths
+            .intern_variants(ids.owner, &[(value_name, 0)])
+            .unwrap()[0];
+        let owner_path = ids.paths.resolve(ids.owner).unwrap().unwrap();
+        let mut binder_components = owner_path.data().to_vec();
+        binder_components.push(DisambiguatedDefPathData {
+            data: DefPathData::TypeParam(type_name),
+            disambiguator: 0,
+        });
+        let binder = ids
+            .paths
+            .intern(
+                DefPath::new(
+                    ids.owner.package(),
+                    binder_components,
+                    &ids.packages,
+                    &ids.symbols,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let interner = crate::ty::TyInterner::new();
+        let parameter = crate::ty::ParamTy {
+            index: 0,
+            name: type_name,
+        };
+        let ty = interner.intern(crate::ty::TyKind::Param(parameter));
+        let identity = |index| {
+            LocalEnumPayloadVariantTemplateDef::new(
+                variant.to_def_id(),
+                value_name,
+                LocalEnumPayloadTemplateShape::Tuple(Arc::from([
+                    LocalEnumTuplePayloadTemplate::new(variant.to_def_id(), index, ty.clone()),
+                ])),
+            )
+        };
+        assert_eq!(
+            LocalEnumPayloadTemplateDef::try_new(
+                ids.owner.to_def_id(),
+                Arc::from([(
+                    binder.to_def_id(),
+                    crate::ty::ParamTy {
+                        index: 1,
+                        name: type_name,
+                    },
+                )]),
+                Arc::from([identity(0)]),
+            ),
+            Err(LocalEnumPayloadTemplateDefError::InvalidTypeParameters),
+            "binder indices and names must match the source-order parameter records"
+        );
+        let exact_binder = crate::ty::ParamTy {
+            index: 0,
+            name: type_name,
+        };
+        assert_eq!(
+            LocalEnumPayloadTemplateDef::try_new(
+                ids.owner.to_def_id(),
+                Arc::from([(binder.to_def_id(), exact_binder)]),
+                Arc::from([identity(1)]),
+            ),
+            Err(LocalEnumPayloadTemplateDefError::InvalidTuplePayloadIdentity),
+            "tuple identities are the exact variant plus contiguous zero-based index"
+        );
+
+        assert_eq!(
+            LocalEnumPayloadTemplateDef::try_new(
+                ids.owner.to_def_id(),
+                Arc::<[(sai_hir::DefId, crate::ty::ParamTy)]>::from([]),
+                Arc::from([LocalEnumPayloadVariantTemplateDef::new(
+                    variant.to_def_id(),
+                    value_name,
+                    LocalEnumPayloadTemplateShape::Tuple(Arc::from([])),
+                )]),
+            ),
+            Err(LocalEnumPayloadTemplateDefError::EmptyPayloadVariantShape),
+            "tuple variants require at least one payload"
+        );
+        assert_eq!(
+            LocalEnumPayloadTemplateDef::try_new(
+                ids.owner.to_def_id(),
+                Arc::<[(sai_hir::DefId, crate::ty::ParamTy)]>::from([]),
+                Arc::from([LocalEnumPayloadVariantTemplateDef::new(
+                    variant.to_def_id(),
+                    value_name,
+                    LocalEnumPayloadTemplateShape::Record(Arc::from([])),
+                )]),
+            ),
+            Err(LocalEnumPayloadTemplateDefError::EmptyPayloadVariantShape),
+            "record variants require at least one field"
         );
     }
 }
