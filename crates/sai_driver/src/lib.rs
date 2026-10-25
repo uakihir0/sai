@@ -13209,7 +13209,19 @@ fn local_record_field_type_is_region_free_for_array_projection(
                     | sai_resolve::prelude::PrimTy::Byte
                     | sai_resolve::prelude::PrimTy::Char
                     | sai_resolve::prelude::PrimTy::Never,
-                ) => segment.args.is_none(),
+                ) => segment.args.is_none_or(|arguments| {
+                    // Primitive paths reject all generic syntax in ordinary
+                    // lowering. Still inspect known argument children here so
+                    // a local error cannot gate valid sibling arrays.
+                    arguments.args.iter().all(|argument| match argument {
+                        GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
+                            local_record_field_type_is_region_free_for_array_projection(
+                                ty, owner, paths,
+                            )
+                        }
+                        GenericArg::Const(_) => true,
+                    })
+                }),
                 // Do not infer safety from spelling: aliases and nominal
                 // types may hide a region-bearing field. Str and slice-like
                 // types are not primitive variants and fail closed here.
@@ -38083,7 +38095,11 @@ property "shared"() {}
             "  nested_array: Array<Array<U8, 2>, 3>,\n",
             "  after_unsupported: Char,\n",
             "}\n",
-            "type R { malformed: Array, good: Array<U8, 2> }\n",
+            "type NoArgumentArray { malformed: Array, good: Array<U8, 2> }\n",
+            "type R {\n",
+            "  with_type: U8<Bool>,\n",
+            "  good: Array<U8, 2>,\n",
+            "}\n",
             "type RegionBearing {\n",
             "  borrowed: borrow Bool,\n",
             "  array: Array<U8, 2>,\n",
@@ -38407,7 +38423,7 @@ property "shared"() {}
                 &collection,
                 Some(&member_scopes),
                 None,
-                owner_for("R"),
+                owner_for("NoArgumentArray"),
             )
             .expect("exact collection guards no-argument array fields")
             .expect("the record retains each field's lowering result");
@@ -38448,6 +38464,47 @@ property "shared"() {}
                     )
             ),
             "a malformed sibling with the exact Array constructor does not gate valid array fields"
+        );
+
+        let malformed_primitive_record = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("R"),
+            )
+            .expect("exact collection guards malformed primitive generic arguments")
+            .expect("the primitive record retains field-local failures");
+        let primitive_record_field = |name: &str| {
+            malformed_primitive_record
+                .fields()
+                .expect("the record remains field-projectable")
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .expect("the requested field exists")
+        };
+        assert_eq!(
+            malformed_primitive_record.type_of_field(primitive_record_field("with_type").def_id()),
+            Some(Err(sai_ty::lower_ty::UnsupportedTy::GenericArguments)),
+            "a malformed primitive field retains its ordinary lowering error"
+        );
+        assert!(
+            matches!(
+                malformed_primitive_record
+                    .type_of_field(primitive_record_field("good").def_id()),
+                Some(Ok(ty))
+                    if matches!(
+                        ty.kind(),
+                        sai_ty::ty::TyKind::Array(
+                            element,
+                            sai_ty::ty::Const::Value(2)
+                        ) if matches!(
+                            element.kind(),
+                            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+                        )
+                    )
+            ),
+            "known primitive arguments do not gate a valid array sibling"
         );
 
         let region_bearing = resolved
