@@ -12989,6 +12989,27 @@ fn nominal_fields_are_region_free(
     }
 }
 
+fn type_contains_reference(root: &sai_ty::ty::Ty) -> bool {
+    let mut pending = vec![root];
+    while let Some(ty) = pending.pop() {
+        match ty.kind() {
+            sai_ty::ty::TyKind::Ref(..) => return true,
+            sai_ty::ty::TyKind::Tuple(elements) => pending.extend(elements.iter()),
+            sai_ty::ty::TyKind::Array(element, _) => pending.push(element),
+            sai_ty::ty::TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
+            sai_ty::ty::TyKind::Int(_)
+            | sai_ty::ty::TyKind::Uint(_)
+            | sai_ty::ty::TyKind::Float(_)
+            | sai_ty::ty::TyKind::Bool
+            | sai_ty::ty::TyKind::Byte
+            | sai_ty::ty::TyKind::Char
+            | sai_ty::ty::TyKind::Never
+            | sai_ty::ty::TyKind::Param(_) => {}
+        }
+    }
+    false
+}
+
 fn generic_argument_syntax_has_recovery(root: &SyntaxNode) -> bool {
     root.descendants()
         .filter_map(ast::GenericArgList::cast)
@@ -14670,6 +14691,184 @@ impl RootDatabase {
         definitions
     }
 
+    fn local_type_alias_definitions(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        snapshot: &WorkspaceSnapshot,
+        module_members: &ModuleMemberIndex<'_>,
+        source_graph_packages: &HashSet<PackageId>,
+        unit_enums: &HashSet<DefId>,
+        local_nominals: &HashMap<DefId, sai_ty::lower_ty::LocalNominalDef>,
+    ) -> HashMap<DefId, sai_ty::ty::Ty> {
+        let mut aliases = HashMap::new();
+        let Some(def_paths) = self.def_paths.get(&collection.module_tree.package).cloned() else {
+            return aliases;
+        };
+        let Ok(primitive_prelude) = self.primitive_prelude.clone() else {
+            return aliases;
+        };
+        let owner_index = index_top_level_owner_descriptors(collection);
+        let descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Alias)
+            .collect::<Vec<_>>();
+        let mut file_groups = Vec::<(FileId, Vec<TopLevelOwnerDescriptor>)>::new();
+        let mut group_indices = HashMap::<FileId, usize>::new();
+        for descriptor in descriptors {
+            if let Some(index) = group_indices.get(&descriptor.file).copied() {
+                file_groups[index].1.push(descriptor);
+            } else {
+                group_indices.insert(descriptor.file, file_groups.len());
+                file_groups.push((descriptor.file, vec![descriptor]));
+            }
+        }
+
+        let syntax_subtree_has_error = |root: &SyntaxNode| {
+            root.descendants().any(|node| {
+                node.kind() == sai_syntax::SyntaxKind::ERROR
+                    || node
+                        .children_with_tokens()
+                        .any(|element| element.as_token().is_some_and(|token| token.has_error()))
+            })
+        };
+        for (file, descriptors) in file_groups {
+            let Ok(inputs) = self.current_owner_inputs(snapshot, file, &collection.target_cfg)
+            else {
+                continue;
+            };
+            let Ok(module_scope) = module_scope_for_file(collection, &collection.module_tree, file)
+            else {
+                continue;
+            };
+            for descriptor in descriptors {
+                if descriptor.owner.def_id.package() != collection.module_tree.package
+                    || inputs.retained_item_kinds.get(&descriptor.item_id)
+                        != Some(&ItemTreeKind::Alias)
+                {
+                    continue;
+                }
+                let def_id = descriptor.owner.def_id.to_def_id();
+                let Ok(Some(expected_path)) = def_paths.resolve_def_id(def_id) else {
+                    continue;
+                };
+                if expected_path.package() != collection.module_tree.package
+                    || !matches!(
+                        expected_path.data().last(),
+                        Some(component)
+                            if matches!(&component.data, DefPathData::TypeNs(_))
+                                && component.disambiguator == 0
+                    )
+                {
+                    continue;
+                }
+                let Some(syntax) = inputs
+                    .ast_ids
+                    .pointer(descriptor.item_id)
+                    .and_then(|pointer| {
+                        pointer.resolve(inputs.filtered_item_tree.file, &inputs.root)
+                    })
+                else {
+                    continue;
+                };
+                let Some(declaration) = ast::TypeDecl::cast(syntax) else {
+                    continue;
+                };
+                let Some(alias_definition) = declaration.alias_def() else {
+                    continue;
+                };
+                if alias_definition.refinement().is_some()
+                    || declaration
+                        .generic_params()
+                        .is_some_and(|params| params.params().next().is_some())
+                    || syntax_subtree_has_error(declaration.syntax())
+                {
+                    continue;
+                }
+
+                let arena = HirArena::new();
+                let context = HirLoweringContext::new(
+                    &inputs.ast_ids,
+                    snapshot,
+                    &inputs.root,
+                    &arena,
+                    &self.symbols,
+                    &def_paths,
+                );
+                let Ok(owner_descriptor) = find_top_level_owner_descriptor(
+                    &owner_index,
+                    descriptor.owner,
+                    descriptor.file,
+                    descriptor.item_id,
+                    TopLevelOwnerKind::Alias,
+                ) else {
+                    continue;
+                };
+                let Ok((hir_owner, _source_map)) = lower_top_level_owner(
+                    owner_descriptor,
+                    &expected_path,
+                    &inputs.filtered_item_tree,
+                    &inputs.retained_item_kinds,
+                    &context,
+                ) else {
+                    continue;
+                };
+                if hir_owner.id != descriptor.owner {
+                    continue;
+                }
+                let OwnerNode::Item(item) = hir_owner.node else {
+                    continue;
+                };
+                if item.owner_id != descriptor.owner {
+                    continue;
+                }
+                let ItemKind::Alias { generics, ty } = item.kind else {
+                    continue;
+                };
+                if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                    continue;
+                }
+
+                let candidates = owner_test_only_path_candidates(&hir_owner);
+                let generic_resolutions = owner_type_generic_resolutions(&hir_owner);
+                let path_resolution = resolve_type_owner_module_paths(
+                    descriptor.owner,
+                    &candidates,
+                    &generic_resolutions,
+                    &primitive_prelude,
+                    &HashSet::new(),
+                    &module_scope,
+                    Some(module_members),
+                    collection.module_tree.package,
+                    Some(source_graph_packages),
+                );
+                if path_resolution.owner() != descriptor.owner {
+                    continue;
+                }
+                let mut context =
+                    sai_ty::lower_ty::LowerTyContext::for_signature_with_local_nominals(
+                        &self.semantic_types,
+                        descriptor.owner,
+                        path_resolution.paths(),
+                        unit_enums,
+                        local_nominals,
+                    )
+                    .with_def_path_interner(&def_paths)
+                    .with_array_length_pointer_width(collection.target_cfg.pointer_width());
+                let Ok(ty) = sai_ty::lower_ty::lower_ty(&mut context, ty) else {
+                    continue;
+                };
+                if type_contains_reference(&ty) {
+                    continue;
+                }
+                aliases.insert(def_id, ty);
+            }
+        }
+        aliases
+    }
+
     /// Compatibility entry point for the combined function-owner analysis.
     ///
     /// The returned label-named result also contains local and one-segment
@@ -14897,6 +15096,14 @@ impl RootDatabase {
             })
             .collect::<HashSet<_>>();
         let local_nominal_definitions = self.local_nominal_definitions(collection, snapshot);
+        let local_type_alias_definitions = self.local_type_alias_definitions(
+            collection,
+            snapshot,
+            &module_members,
+            source_graph_packages,
+            &validated_unit_enum_definitions,
+            &local_nominal_definitions,
+        );
         let descriptors = &collection.scopes.function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
         let mut group_start = 0;
@@ -15053,6 +15260,7 @@ impl RootDatabase {
                                     &local_nominal_definitions,
                                 )
                                 .with_def_path_interner(def_paths.as_ref())
+                                .with_local_type_aliases(&local_type_alias_definitions)
                                 .with_array_length_pointer_width(
                                     collection.target_cfg.pointer_width(),
                                 );
@@ -36486,15 +36694,15 @@ property "shared"() {}
             &sai_ty::ty::TyKind::Param(generic_adt_param),
             "the nested ADT argument and output share the function-owned binder"
         );
+        let alias_projection = unsupported_signature(8);
+        let FunctionSignatureProjection::Supported(alias) = alias_projection else {
+            panic!("a direct non-generic local alias supports signature lowering");
+        };
+        assert_eq!(alias.type_params().len(), 1);
+        assert!(matches!(alias.inputs()[0].kind(), sai_ty::ty::TyKind::Bool));
         assert_eq!(
-            unsupported_signature(8),
-            FunctionSignatureProjection::Unsupported(
-                sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
-                    index: 0,
-                    reason: sai_ty::lower_ty::UnsupportedTy::Alias,
-                }
-            ),
-            "aliases remain unsupported"
+            alias.output().kind(),
+            &sai_ty::ty::TyKind::Param(alias.type_params()[0].param)
         );
         assert_eq!(
             unsupported_signature(9),
@@ -36570,6 +36778,145 @@ property "shared"() {}
             .expect("same-snapshot collection with a different target succeeds");
         assert!(matches!(
             resolved.signature_projection(&changed_collection, supported_owner),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+        ));
+    }
+
+    #[test]
+    fn function_signature_projection_lowers_only_direct_local_non_generic_aliases() {
+        let root = concat!(
+            "type Count = U32\n",
+            "type Pair = (Bool, I64)\n",
+            "type Buffer = Array<U8, 4>\n",
+            "type AliasChain = Count\n",
+            "type NestedAlias = (Count, U8)\n",
+            "type CycleLeft = CycleRight\n",
+            "type CycleRight = CycleLeft\n",
+            "type Borrowed = borrow U8\n",
+            "type NestedBorrow = (U8, Array<borrow Bool, 2>)\n",
+            "type Generic<T> = T\n",
+            "type Refined = U8 where self > 0\n",
+            "type Recovered<T = U32\n",
+            "fn aliases(count: Count, pair: Pair, bytes: Buffer) -> Count {}\n",
+            "fn repeated(first: Count, second: Count) -> Count {}\n",
+            "fn generic_alias(value: Generic<U8>) -> U8 {}\n",
+            "fn refined_alias(value: Refined) -> U8 {}\n",
+            "fn chained_alias(value: AliasChain) -> U32 {}\n",
+            "fn nested_alias(value: NestedAlias) -> (U32, U8) {}\n",
+            "fn cyclic_alias(value: CycleLeft) -> U32 {}\n",
+            "fn region_alias(value: Borrowed) -> U8 {}\n",
+            "fn nested_region_alias(value: NestedBorrow) -> U8 {}\n",
+            "fn recovered_alias(value: Recovered) -> U32 {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 10);
+        assert!(resolved.matches_collection(&collection));
+
+        let supported = resolved
+            .signature_projection(&collection, resolved.owners()[0].owner())
+            .expect("the exact collection guards the projection")
+            .expect("the direct alias function owner exists");
+        let FunctionSignatureProjection::Supported(aliases) = supported else {
+            panic!("primitive, tuple, and literal-array aliases lower");
+        };
+        assert_eq!(aliases.type_params().len(), 0);
+        assert!(matches!(
+            aliases.inputs()[0].kind(),
+            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U32)
+        ));
+        assert!(matches!(
+            aliases.inputs()[1].kind(),
+            sai_ty::ty::TyKind::Tuple(elements)
+                if matches!(elements[0].kind(), sai_ty::ty::TyKind::Bool)
+                    && matches!(
+                        elements[1].kind(),
+                        sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I64)
+                    )
+        ));
+        assert!(matches!(
+            aliases.inputs()[2].kind(),
+            sai_ty::ty::TyKind::Array(element, 4)
+                if matches!(element.kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8))
+        ));
+        assert!(aliases.inputs()[0].ptr_eq(aliases.output()));
+
+        let repeated = resolved
+            .signature_projection(&collection, resolved.owners()[1].owner())
+            .expect("the exact collection guards the projection")
+            .expect("the repeated alias function owner exists");
+        let FunctionSignatureProjection::Supported(repeated) = repeated else {
+            panic!("repeated uses of one local alias lower");
+        };
+        assert!(repeated.inputs()[0].ptr_eq(&repeated.inputs()[1]));
+        assert!(repeated.inputs()[0].ptr_eq(repeated.output()));
+
+        let unsupported = |index: usize| {
+            resolved
+                .signature_projection(&collection, resolved.owners()[index].owner())
+                .expect("the exact collection guards the projection")
+                .expect("the function owner exists")
+                .clone()
+        };
+        assert_eq!(
+            unsupported(2),
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                    index: 0,
+                    reason: sai_ty::lower_ty::UnsupportedTy::GenericArguments,
+                }
+            ),
+            "generic aliases remain unsupported"
+        );
+        assert!(
+            matches!(
+                unsupported(3),
+                FunctionSignatureProjection::Unsupported(
+                    sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                        reason: sai_ty::lower_ty::UnsupportedTy::NominalType,
+                        ..
+                    }
+                )
+            ),
+            "refined aliases remain outside the type alias allowlist"
+        );
+        for index in 4..10 {
+            assert!(
+                matches!(
+                    unsupported(index),
+                    FunctionSignatureProjection::Unsupported(
+                        sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                            reason: sai_ty::lower_ty::UnsupportedTy::Alias,
+                            ..
+                        }
+                    )
+                ),
+                "alias chains, cycles, region-bearing targets and recovered declarations fail closed"
+            );
+        }
+
+        let stale_snapshot = snapshot_with_version(&snapshot, 18);
+        let stale_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &stale_snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("a fresh snapshot with the same sources collects");
+        assert!(matches!(
+            resolved.signature_projection(&stale_collection, resolved.owners()[0].owner()),
             Err(OwnerControlFlowResolutionError::SnapshotMismatch)
         ));
     }
@@ -36834,6 +37181,11 @@ property "shared"() {}
         let root_outcome = supported_nominal(1);
         let child_packet = supported_nominal(2);
         let child_outcome = supported_nominal(3);
+        let root_alias = supported_nominal(10);
+        assert_eq!(
+            root_alias, root_packet,
+            "a direct local alias to a nominal reuses its exact semantic identity"
+        );
         assert_ne!(
             root_packet, child_packet,
             "same-named records in distinct package modules retain distinct identities"
@@ -36899,10 +37251,6 @@ property "shared"() {}
             unsupported_reason(9),
             sai_ty::lower_ty::UnsupportedTy::GenericArgumentKind,
             "a const argument cannot fill a type-only parameter"
-        );
-        assert_eq!(
-            unsupported_reason(10),
-            sai_ty::lower_ty::UnsupportedTy::Alias
         );
         for index in [11, 12] {
             assert_eq!(
