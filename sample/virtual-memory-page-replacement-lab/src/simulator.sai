@@ -1,0 +1,289 @@
+use acme:virtual-memory-page-replacement-lab/model.{
+    AccessKind
+    CacheComparison
+    CacheScenario
+    FrameState
+    InputIssue
+    MAX_ACCESS_COUNT
+    MAX_FRAME_COUNT
+    PageAccess
+    Policy
+    PolicyRun
+    SimulationStep
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+type VictimChoice {
+    frame_index: USize
+    frames: Array<Option<FrameState>, MAX_FRAME_COUNT>
+    next_clock_hand: USize
+}
+
+fn empty_frames() -> Array<Option<FrameState>, MAX_FRAME_COUNT> {
+    Array<Option<FrameState>, MAX_FRAME_COUNT>.filled(None)
+}
+
+fn empty_run(policy: Policy) -> PolicyRun {
+    PolicyRun(
+        policy: policy,
+        steps: Array<Option<SimulationStep>, MAX_ACCESS_COUNT>.filled(None),
+        step_count: 0,
+        hit_count: 0,
+        fault_count: 0,
+        eviction_writeback_count: 0,
+        final_flush_count: 0,
+        total_writeback_count: 0,
+        final_frames: empty_frames(),
+    )
+}
+
+fn validate(scenario: CacheScenario) -> Option<InputIssue> {
+    if scenario.frame_count == 0 or scenario.frame_count > MAX_FRAME_COUNT {
+        return Some(InputIssue.InvalidFrameCount)
+    }
+    if scenario.access_count > MAX_ACCESS_COUNT {
+        return Some(InputIssue.TooManyAccesses)
+    }
+    for index in 0..scenario.access_count {
+        match scenario.accesses[index] {
+            Some(access) => {
+                if access.page_id == 0 {
+                    return Some(InputIssue.ZeroPageId)
+                }
+            }
+            None => {
+                return Some(InputIssue.MissingAccess)
+            }
+        }
+    }
+    None
+}
+
+fn page_frame(
+    frames: Array<Option<FrameState>, MAX_FRAME_COUNT>,
+    frame_count: USize,
+    page_id: U32,
+) -> Option<USize> {
+    for index in 0..frame_count {
+        match frames[index] {
+            Some(frame) => {
+                if frame.page_id == page_id {
+                    return Some(index)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+fn free_frame(frames: Array<Option<FrameState>, MAX_FRAME_COUNT>, frame_count: USize) -> Option<
+    USize,
+> {
+    for index in 0..frame_count {
+        if frames[index] == None {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn choose_victim(
+    frames: Array<Option<FrameState>, MAX_FRAME_COUNT>,
+    frame_count: USize,
+    policy: Policy,
+    clock_hand: USize,
+) -> VictimChoice {
+    if policy == Policy.Fifo {
+        var victim_index: USize = 0
+        var oldest_load = frames[0].unwrap().loaded_at
+        for index in 1..frame_count {
+            let candidate = frames[index].unwrap()
+            if candidate.loaded_at < oldest_load {
+                victim_index = index
+                oldest_load = candidate.loaded_at
+            }
+        }
+        return VictimChoice(frame_index: victim_index, frames: frames, next_clock_hand: clock_hand)
+    }
+
+    if policy == Policy.Lru {
+        var victim_index: USize = 0
+        var oldest_use = frames[0].unwrap().last_used_at
+        for index in 1..frame_count {
+            let candidate = frames[index].unwrap()
+            if candidate.last_used_at < oldest_use {
+                victim_index = index
+                oldest_use = candidate.last_used_at
+            }
+        }
+        return VictimChoice(frame_index: victim_index, frames: frames, next_clock_hand: clock_hand)
+    }
+
+    var scanned = frames
+    var hand = clock_hand
+    var victim: Option<USize> = None
+    var probes: USize = 0
+    while victim == None and probes < frame_count * 2 {
+        let candidate = scanned[hand].unwrap()
+        if candidate.referenced {
+            var second_chance = candidate
+            second_chance.referenced = false
+            scanned[hand] = Some(second_chance)
+            hand = (hand + 1) % frame_count
+        } else {
+            victim = Some(hand)
+            hand = (hand + 1) % frame_count
+        }
+        probes += 1
+    }
+
+    match victim {
+        Some(index) => VictimChoice(frame_index: index, frames: scanned, next_clock_hand: hand)
+        None => VictimChoice(frame_index: 0, frames: scanned, next_clock_hand: hand)
+    }
+}
+
+fn frame_pages(frames: Array<Option<FrameState>, MAX_FRAME_COUNT>, frame_count: USize) -> Array<
+    Option<U32>,
+    MAX_FRAME_COUNT,
+> {
+    var pages = Array<Option<U32>, MAX_FRAME_COUNT>.filled(None)
+    for index in 0..frame_count {
+        match frames[index] {
+            Some(frame) => {
+                pages[index] = Some(frame.page_id)
+            }
+            None => {}
+        }
+    }
+    pages
+}
+
+fn simulate(scenario: CacheScenario, policy: Policy) -> PolicyRun {
+    var result = empty_run(policy)
+    var frames = empty_frames()
+    var clock_hand: USize = 0
+
+    for index in 0..scenario.access_count {
+        let access: PageAccess = scenario.accesses[index].unwrap()
+        let access_order = index + 1
+        match page_frame(frames, scenario.frame_count, access.page_id) {
+            Some(frame_index) => {
+                var frame = frames[frame_index].unwrap()
+                frame.dirty = frame.dirty or access.kind == AccessKind.Write
+                frame.referenced = true
+                frame.last_used_at = access_order
+                frames[frame_index] = Some(frame)
+                result.hit_count += 1
+                result.steps[index] = Some(
+                    SimulationStep(
+                        access_order: access_order,
+                        page_id: access.page_id,
+                        kind: access.kind,
+                        hit: true,
+                        frame_index: frame_index,
+                        evicted_page_id: None,
+                        eviction_wrote_back: false,
+                        frames_after: frame_pages(frames, scenario.frame_count),
+                    ),
+                )
+            }
+            None => {
+                result.fault_count += 1
+                var evicted_page_id: Option<U32> = None
+                var eviction_wrote_back = false
+                var target_frame: USize = 0
+                match free_frame(frames, scenario.frame_count) {
+                    Some(index) => {
+                        target_frame = index
+                        if policy == Policy.Clock {
+                            clock_hand = (index + 1) % scenario.frame_count
+                        }
+                    }
+                    None => {
+                        let choice = choose_victim(frames, scenario.frame_count, policy, clock_hand)
+                        frames = choice.frames
+                        target_frame = choice.frame_index
+                        clock_hand = choice.next_clock_hand
+                        let old_frame = frames[target_frame].unwrap()
+                        evicted_page_id = Some(old_frame.page_id)
+                        eviction_wrote_back = old_frame.dirty
+                        if eviction_wrote_back {
+                            result.eviction_writeback_count += 1
+                        }
+                    }
+                }
+                frames[target_frame] = Some(
+                    FrameState(
+                        page_id: access.page_id,
+                        dirty: access.kind == AccessKind.Write,
+                        referenced: true,
+                        loaded_at: access_order,
+                        last_used_at: access_order,
+                    ),
+                )
+                result.steps[index] = Some(
+                    SimulationStep(
+                        access_order: access_order,
+                        page_id: access.page_id,
+                        kind: access.kind,
+                        hit: false,
+                        frame_index: target_frame,
+                        evicted_page_id: evicted_page_id,
+                        eviction_wrote_back: eviction_wrote_back,
+                        frames_after: frame_pages(frames, scenario.frame_count),
+                    ),
+                )
+            }
+        }
+    }
+
+    if scenario.flush_dirty_pages {
+        for index in 0..scenario.frame_count {
+            match frames[index] {
+                Some(frame) => {
+                    if frame.dirty {
+                        result.final_flush_count += 1
+                        var clean_frame = frame
+                        clean_frame.dirty = false
+                        frames[index] = Some(clean_frame)
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    result.step_count = scenario.access_count
+    result.total_writeback_count = result.eviction_writeback_count + result.final_flush_count
+    result.final_frames = frames
+    result
+}
+
+fn invalid_comparison(issue: InputIssue) -> CacheComparison {
+    CacheComparison(
+        valid_input: false,
+        input_issue: Some(issue),
+        fifo: empty_run(Policy.Fifo),
+        lru: empty_run(Policy.Lru),
+        clock: empty_run(Policy.Clock),
+    )
+}
+
+pub fn compare(scenario: CacheScenario) -> CacheComparison {
+    match validate(scenario) {
+        Some(issue) => {
+            return invalid_comparison(issue)
+        }
+        None => {}
+    }
+
+    CacheComparison(
+        valid_input: true,
+        input_issue: None,
+        fifo: simulate(scenario, Policy.Fifo),
+        lru: simulate(scenario, Policy.Lru),
+        clock: simulate(scenario, Policy.Clock),
+    )
+}

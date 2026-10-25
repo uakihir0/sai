@@ -1,0 +1,5 @@
+package acme:virtual-memory-page-replacement-lab @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Compare bounded FIFO, LRU, and clock page replacement traces"

@@ -1,0 +1,28 @@
+use acme:virtual-memory-page-replacement-lab/model.{
+    AccessKind
+    CacheScenario
+    MAX_ACCESS_COUNT
+    PageAccess
+}
+
+pub fn workload() -> CacheScenario {
+    CacheScenario(
+        accesses: [
+            Some(PageAccess(page_id: 2, kind: AccessKind.Write)),
+            Some(PageAccess(page_id: 1, kind: AccessKind.Read)),
+            Some(PageAccess(page_id: 2, kind: AccessKind.Write)),
+            Some(PageAccess(page_id: 3, kind: AccessKind.Read)),
+            Some(PageAccess(page_id: 5, kind: AccessKind.Read)),
+            Some(PageAccess(page_id: 2, kind: AccessKind.Write)),
+            Some(PageAccess(page_id: 3, kind: AccessKind.Read)),
+            Some(PageAccess(page_id: 4, kind: AccessKind.Write)),
+            Some(PageAccess(page_id: 5, kind: AccessKind.Read)),
+            Some(PageAccess(page_id: 3, kind: AccessKind.Read)),
+            Some(PageAccess(page_id: 4, kind: AccessKind.Write)),
+            Some(PageAccess(page_id: 5, kind: AccessKind.Read)),
+        ],
+        access_count: MAX_ACCESS_COUNT,
+        frame_count: 3,
+        flush_dirty_pages: true,
+    )
+}
