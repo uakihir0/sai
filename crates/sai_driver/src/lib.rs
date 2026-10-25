@@ -15052,7 +15052,10 @@ impl RootDatabase {
                                     &validated_unit_enum_definitions,
                                     &local_nominal_definitions,
                                 )
-                                .with_def_path_interner(def_paths.as_ref());
+                                .with_def_path_interner(def_paths.as_ref())
+                                .with_array_length_pointer_width(
+                                    collection.target_cfg.pointer_width(),
+                                );
                             match hir_owner.node {
                                 OwnerNode::Item(item) => match item.kind {
                                     ItemKind::Fn { sig, generics, .. } => {
@@ -37145,6 +37148,235 @@ property "shared"() {}
         assert!(
             signature.inputs()[0].ptr_eq(signature.output()),
             "equivalent nested applications intern to the same structure"
+        );
+    }
+
+    #[test]
+    fn function_signature_projection_lowers_builtin_arrays_with_target_width_checks() {
+        let root = concat!(
+            "fn zero(value: Array<Bool, 0>) -> Array<Bool, 0> {}\n",
+            "fn max32(value: Array<Bool, 4294967295>) -> Bool {}\n",
+            "fn over32(value: Array<Bool, 4294967296>) -> Bool {}\n",
+            "fn max64(value: Array<Bool, 18446744073709551615>) -> Bool {}\n",
+            "fn over64(value: Array<Bool, 18446744073709551616>) -> Bool {}\n",
+            "fn nested<T>(value: Array<Array<T, 2>, 4>) -> Array<Array<T, 2>, 4> {}\n",
+            "fn borrowed(value: Array<borrow Bool, 4>, next: borrow Bool) -> borrow Bool {}\n",
+            "fn negative(value: Array<Bool, -1>) -> Bool {}\n",
+            "fn bool_length(value: Array<Bool, true>) -> Bool {}\n",
+            "fn char_length(value: Array<Bool, 'x'>) -> Bool {}\n",
+            "fn unrepresentable_length(value: Array<Bool, 340282366920938463463374607431768211456>) -> Bool {}\n",
+            "fn missing_length(value: Array<Bool>) -> Bool {}\n",
+            "fn extra_arguments(value: Array<Bool, 0, 1>) -> Bool {}\n",
+            "fn wrong_element_kind(value: Array<0, Bool>) -> Bool {}\n",
+            "fn wrong_length_kind(value: Array<Bool, Bool>) -> Bool {}\n",
+            "fn empty_arguments(value: Array<>) -> Bool {}\n",
+            "fn missing_close(value: Array<Bool, 3) -> Bool {}\n",
+        );
+        for (target, pointer_width) in [("wasm32-core", 32), ("wasm64-core", 64)] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("current-snapshot package scopes collect");
+            let resolved = database
+                .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+                .expect("top-level function owners resolve");
+            let projection = |index: usize| {
+                resolved
+                    .signature_projection(
+                        &collection,
+                        collection.scopes.function_owners[index].owner,
+                    )
+                    .expect("the signature projection matches its collection")
+                    .expect("the function owner exists")
+                    .clone()
+            };
+            let supported_array_length = |index: usize, expected_length: u128| {
+                let FunctionSignatureProjection::Supported(signature) = projection(index) else {
+                    panic!("the target-fitting built-in array signature is supported");
+                };
+                assert!(matches!(
+                    signature.inputs()[0].kind(),
+                    sai_ty::ty::TyKind::Array(_, length) if *length == expected_length
+                ));
+            };
+            let unsupported_array_length = |index: usize| {
+                assert_eq!(
+                    projection(index),
+                    FunctionSignatureProjection::Unsupported(
+                        sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                            index: 0,
+                            reason: sai_ty::lower_ty::UnsupportedTy::ArrayLength,
+                        }
+                    )
+                );
+            };
+
+            let FunctionSignatureProjection::Supported(zero) = projection(0) else {
+                panic!("zero-length built-in arrays are supported");
+            };
+            assert!(matches!(
+                zero.inputs()[0].kind(),
+                sai_ty::ty::TyKind::Array(_, 0)
+            ));
+            assert_eq!(
+                zero.inputs()[0].kind(),
+                zero.output().kind(),
+                "equal element types and lengths produce structurally equal arrays"
+            );
+            supported_array_length(1, u32::MAX.into());
+            if pointer_width == 32 {
+                unsupported_array_length(2);
+                unsupported_array_length(3);
+            } else {
+                supported_array_length(2, (u32::MAX as u128) + 1);
+                supported_array_length(3, u64::MAX.into());
+            }
+            unsupported_array_length(4);
+
+            let FunctionSignatureProjection::Supported(nested) = projection(5) else {
+                panic!("nested built-in arrays with the exact function binder are supported");
+            };
+            let nested_param = nested.type_params()[0].param;
+            let sai_ty::ty::TyKind::Array(outer_element, 4) = nested.inputs()[0].kind() else {
+                panic!("the outer array retains its length");
+            };
+            let sai_ty::ty::TyKind::Array(inner_element, 2) = outer_element.kind() else {
+                panic!("the inner array retains its length");
+            };
+            assert_eq!(
+                inner_element.kind(),
+                &sai_ty::ty::TyKind::Param(nested_param),
+                "nested array elements retain the exact function-owned type parameter"
+            );
+            assert!(nested.inputs()[0].ptr_eq(nested.output()));
+
+            let FunctionSignatureProjection::Supported(borrowed) = projection(6) else {
+                panic!("a borrow inside an array element participates in signature lowering");
+            };
+            let sai_ty::ty::TyKind::Array(element, 4) = borrowed.inputs()[0].kind() else {
+                panic!("the first argument is the array");
+            };
+            assert!(matches!(
+                element.kind(),
+                sai_ty::ty::TyKind::Ref(
+                    sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { index: 0, .. }),
+                    _,
+                    sai_hir::Mutability::Not
+                )
+            ));
+            assert!(matches!(
+                borrowed.inputs()[1].kind(),
+                sai_ty::ty::TyKind::Ref(
+                    sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { index: 1, .. }),
+                    _,
+                    sai_hir::Mutability::Not
+                )
+            ));
+            assert!(matches!(
+                borrowed.output().kind(),
+                sai_ty::ty::TyKind::Ref(
+                    sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { index: 2, .. }),
+                    _,
+                    sai_hir::Mutability::Not
+                )
+            ));
+
+            for index in [7, 8, 9, 10] {
+                assert!(
+                    matches!(
+                        projection(index),
+                        FunctionSignatureProjection::Unsupported(
+                            sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                                index: 0,
+                                reason: sai_ty::lower_ty::UnsupportedTy::ArrayLength,
+                            }
+                        )
+                    ),
+                    "non-integer, negative, and unrepresentable lengths fail closed"
+                );
+            }
+            for index in [11, 12] {
+                assert!(matches!(
+                    projection(index),
+                    FunctionSignatureProjection::Unsupported(
+                        sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                            index: 0,
+                            reason: sai_ty::lower_ty::UnsupportedTy::WrongNumberOfGenericArguments,
+                        }
+                    )
+                ));
+            }
+            for index in [13, 14] {
+                assert_eq!(
+                    projection(index),
+                    FunctionSignatureProjection::Unsupported(
+                        sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                            index: 0,
+                            reason: sai_ty::lower_ty::UnsupportedTy::GenericArgumentKind,
+                        }
+                    )
+                );
+            }
+            for index in [15, 16] {
+                assert_eq!(
+                    projection(index),
+                    FunctionSignatureProjection::Unsupported(
+                        sai_ty::lower_ty::UnsupportedFnSig::RecoveredGenericSyntax
+                    ),
+                    "empty and missing-close argument syntax fails before lowering"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn function_signature_projection_does_not_treat_a_shadowed_array_name_as_builtin() {
+        let root = concat!(
+            "type Array<T> = T\n",
+            "fn shadowed(value: Array<Bool, 4>) -> Bool {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot package scopes collect");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("the shadowed function resolves");
+        let projection = resolved
+            .signature_projection(&collection, collection.scopes.function_owners[0].owner)
+            .expect("the signature projection matches the collection")
+            .expect("the function owner exists");
+        assert_eq!(
+            projection,
+            &FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                    index: 0,
+                    reason: sai_ty::lower_ty::UnsupportedTy::GenericArguments,
+                }
+            ),
+            "the local alias does not enter the built-in array lowering path"
+        );
+        let path_resolution = resolved.owners()[0]
+            .type_path_resolution()
+            .expect("the path-resolution channel succeeds")
+            .expect("the function type path result exists");
+        assert!(
+            path_resolution
+                .paths()
+                .values()
+                .any(|path| { matches!(path.base, Res::Def(DefKind::Alias, _)) })
         );
     }
 

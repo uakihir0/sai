@@ -29,6 +29,7 @@ pub enum UnsupportedTy {
     IncompletePathResolution,
     QualifiedPath,
     Array,
+    ArrayLength,
     Alias,
     GenericArguments,
     WrongNumberOfGenericArguments,
@@ -98,6 +99,7 @@ pub struct LowerTyContext<'a> {
     local_nominals: Option<&'a HashMap<DefId, LocalNominalDef>>,
     generic_params: HashMap<DefId, ParamTy>,
     def_paths: Option<&'a DefPathInterner>,
+    array_length_pointer_width: Option<u8>,
     region_mode: RegionMode,
     next_region_index: u32,
     failed: bool,
@@ -127,6 +129,7 @@ impl<'a> LowerTyContext<'a> {
             local_nominals: None,
             generic_params: HashMap::new(),
             def_paths: None,
+            array_length_pointer_width: None,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             failed: false,
@@ -154,6 +157,7 @@ impl<'a> LowerTyContext<'a> {
             local_nominals: None,
             generic_params: HashMap::new(),
             def_paths: None,
+            array_length_pointer_width: None,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             failed: false,
@@ -181,6 +185,7 @@ impl<'a> LowerTyContext<'a> {
             local_nominals: Some(local_nominals),
             generic_params: HashMap::new(),
             def_paths: None,
+            array_length_pointer_width: None,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             failed: false,
@@ -208,6 +213,7 @@ impl<'a> LowerTyContext<'a> {
             local_nominals: None,
             generic_params: HashMap::new(),
             def_paths: None,
+            array_length_pointer_width: None,
             region_mode: RegionMode::Field {
                 has_implicit_region_parameter,
             },
@@ -230,6 +236,7 @@ impl<'a> LowerTyContext<'a> {
             local_nominals: None,
             generic_params: HashMap::new(),
             def_paths: None,
+            array_length_pointer_width: None,
             region_mode: RegionMode::Body,
             next_region_index: 0,
             failed: false,
@@ -242,6 +249,19 @@ impl<'a> LowerTyContext<'a> {
     /// parameter path can be proven to be a direct child of `owner`.
     pub fn with_def_path_interner(mut self, def_paths: &'a DefPathInterner) -> Self {
         self.def_paths = Some(def_paths);
+        self
+    }
+
+    /// Enable target-width-checked literal lengths for built-in arrays in a
+    /// signature context.
+    ///
+    /// The driver supplies this only while projecting a top-level function
+    /// signature from its target-bound collection. Body and field contexts
+    /// deliberately remain unable to lower arrays through this adapter.
+    pub fn with_array_length_pointer_width(mut self, pointer_width: u8) -> Self {
+        if matches!(self.region_mode, RegionMode::Signature) {
+            self.array_length_pointer_width = Some(pointer_width);
+        }
         self
     }
 
@@ -508,6 +528,10 @@ fn lower_path_ty(
     }
     let generic_args = path.segments.last().and_then(|segment| segment.args);
 
+    if resolution.base == Res::PrimTy(PrimTy::Array) {
+        return lower_builtin_array(context, &path, generic_args);
+    }
+
     if let Res::Def(DefKind::Struct | DefKind::Enum, def_id) = resolution.base {
         if let Some(definition) = context
             .local_nominals
@@ -593,6 +617,63 @@ fn lower_path_ty(
     }
 }
 
+fn lower_builtin_array(
+    context: &mut LowerTyContext<'_>,
+    path: &sai_hir::types::Path<'_>,
+    generic_args: Option<&sai_hir::types::GenericArgs<'_>>,
+) -> Result<Ty, UnsupportedTy> {
+    if path.root != PathRoot::Plain || path.segments.len() != 1 {
+        return Err(UnsupportedTy::QualifiedPath);
+    }
+    let Some(generic_args) = generic_args else {
+        return Err(UnsupportedTy::WrongNumberOfGenericArguments);
+    };
+    let argument_count = generic_args
+        .args
+        .iter()
+        .filter(|arg| !matches!(arg, HirGenericArg::Binding { .. }))
+        .count();
+    if argument_count != 2 {
+        return Err(UnsupportedTy::WrongNumberOfGenericArguments);
+    }
+    if generic_args
+        .args
+        .iter()
+        .any(|arg| matches!(arg, HirGenericArg::Binding { .. }))
+    {
+        return Err(UnsupportedTy::GenericArgumentKind);
+    }
+    let HirGenericArg::Type(element) = generic_args.args[0] else {
+        return Err(UnsupportedTy::GenericArgumentKind);
+    };
+    let length = match generic_args.args[1] {
+        HirGenericArg::Const(sai_hir::types::ConstArg::Int {
+            value: Some(length),
+            negated: false,
+        }) => length,
+        HirGenericArg::Const(_) => return Err(UnsupportedTy::ArrayLength),
+        HirGenericArg::Type(_) | HirGenericArg::Binding { .. } => {
+            return Err(UnsupportedTy::GenericArgumentKind);
+        }
+    };
+    let Some(pointer_width) = context.array_length_pointer_width else {
+        return Err(UnsupportedTy::Array);
+    };
+    if !unsigned_value_fits_width(length, pointer_width) {
+        return Err(UnsupportedTy::ArrayLength);
+    }
+    let element = lower_ty_inner(context, element)?;
+    Ok(context.interner.intern(TyKind::Array(element, length)))
+}
+
+fn unsigned_value_fits_width(value: u128, width: u8) -> bool {
+    match width {
+        1..=127 => value < (1u128 << u32::from(width)),
+        128 => true,
+        _ => false,
+    }
+}
+
 fn primitive_ty_kind(primitive: PrimTy) -> Result<TyKind, UnsupportedTy> {
     Ok(match primitive {
         PrimTy::I8 => TyKind::Int(IntTy::I8),
@@ -619,7 +700,7 @@ fn primitive_ty_kind(primitive: PrimTy) -> Result<TyKind, UnsupportedTy> {
 mod tests {
     use super::*;
     use sai_hir::arena::HirArena;
-    use sai_hir::types::{Name, Path, PathSegment};
+    use sai_hir::types::{ConstArg, GenericArgs, Name, Path, PathSegment};
     use sai_hir::{
         DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, ItemLocalId,
         Mutability,
@@ -785,6 +866,26 @@ mod tests {
             },
         )]);
         (ty, paths)
+    }
+
+    fn resolved_array_path<'hir>(
+        arena: &'hir HirArena<'hir>,
+        owner: sai_hir::OwnerId,
+        symbols: &Interner,
+        local_id: u32,
+        args: &[HirGenericArg<'hir>],
+    ) -> (&'hir HirTy<'hir>, HashMap<HirId, PathRes>) {
+        let args = arena.alloc_generic_args_list(args);
+        let generic_args = arena.alloc_generic_args(GenericArgs { args, span: span() });
+        resolved_path(
+            arena,
+            owner,
+            symbols,
+            local_id,
+            "Array",
+            Some(generic_args),
+            Res::PrimTy(PrimTy::Array),
+        )
     }
 
     fn resolved_qualified_path<'hir>(
@@ -1146,6 +1247,151 @@ mod tests {
     }
 
     #[test]
+    fn built_in_array_types_require_target_fit_nonnegative_integer_lengths() {
+        let (owner, symbols) = owner();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let (boolean, boolean_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            10,
+            "Bool",
+            None,
+            Res::PrimTy(PrimTy::Bool),
+        );
+        let borrowed_element = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 20),
+            kind: HirTyKind::Borrow(Mutability::Not, boolean),
+            span: span(),
+        });
+        let valid_args = [
+            HirGenericArg::Type(borrowed_element),
+            HirGenericArg::Const(ConstArg::Int {
+                value: Some(4),
+                negated: false,
+            }),
+        ];
+        let (array, mut paths) = resolved_array_path(&arena, owner, &symbols, 30, &valid_args);
+        paths.extend(boolean_paths.clone());
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_array_length_pointer_width(32);
+        let semantic = lower_ty(&mut context, array).expect("the resolved built-in array lowers");
+        let TyKind::Array(element, 4) = semantic.kind() else {
+            panic!("the array retains its element type and literal length");
+        };
+        assert!(matches!(
+            element.kind(),
+            TyKind::Ref(Region::Sig(SigRegion { index: 0, .. }), _, Mutability::Not)
+        ));
+
+        let following_borrow = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 40),
+            kind: HirTyKind::Borrow(Mutability::Mut, boolean),
+            span: span(),
+        });
+        let following = lower_ty(&mut context, following_borrow)
+            .expect("array element lowering preserves later signature region order");
+        assert!(matches!(
+            following.kind(),
+            TyKind::Ref(Region::Sig(SigRegion { index: 1, .. }), _, Mutability::Mut)
+        ));
+
+        let overflow_args = [
+            HirGenericArg::Type(boolean),
+            HirGenericArg::Const(ConstArg::Int {
+                value: Some(1u128 << 32),
+                negated: false,
+            }),
+        ];
+        let (overflow, mut paths) =
+            resolved_array_path(&arena, owner, &symbols, 50, &overflow_args);
+        paths.extend(boolean_paths.clone());
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_array_length_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut context, overflow),
+            Err(UnsupportedTy::ArrayLength),
+            "the first value outside USize fails closed"
+        );
+
+        for (local_id, argument) in [
+            (
+                60,
+                ConstArg::Int {
+                    value: Some(1),
+                    negated: true,
+                },
+            ),
+            (70, ConstArg::Bool(true)),
+            (80, ConstArg::Char('x')),
+        ] {
+            let args = [HirGenericArg::Type(boolean), HirGenericArg::Const(argument)];
+            let (invalid, mut paths) =
+                resolved_array_path(&arena, owner, &symbols, local_id, &args);
+            paths.extend(boolean_paths.clone());
+            let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+                .with_array_length_pointer_width(32);
+            assert_eq!(
+                lower_ty(&mut context, invalid),
+                Err(UnsupportedTy::ArrayLength)
+            );
+        }
+
+        let type_length_args = [HirGenericArg::Type(boolean), HirGenericArg::Type(boolean)];
+        let (wrong_kind, mut paths) =
+            resolved_array_path(&arena, owner, &symbols, 90, &type_length_args);
+        paths.extend(boolean_paths.clone());
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_array_length_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut context, wrong_kind),
+            Err(UnsupportedTy::GenericArgumentKind)
+        );
+
+        let binding_args = [
+            HirGenericArg::Type(boolean),
+            HirGenericArg::Const(ConstArg::Int {
+                value: Some(4),
+                negated: false,
+            }),
+            HirGenericArg::Binding {
+                name: Name {
+                    sym: symbols.intern("Item").expect("binding name interns"),
+                    span: span(),
+                },
+                ty: boolean,
+            },
+        ];
+        let (with_binding, mut paths) =
+            resolved_array_path(&arena, owner, &symbols, 95, &binding_args);
+        paths.extend(boolean_paths.clone());
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_array_length_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut context, with_binding),
+            Err(UnsupportedTy::GenericArgumentKind),
+            "associated bindings do not count toward array arity and remain unsupported"
+        );
+
+        let no_target_width_args = [
+            HirGenericArg::Type(boolean),
+            HirGenericArg::Const(ConstArg::Int {
+                value: Some(1),
+                negated: false,
+            }),
+        ];
+        let (without_width, mut paths) =
+            resolved_array_path(&arena, owner, &symbols, 100, &no_target_width_args);
+        paths.extend(boolean_paths);
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths);
+        assert_eq!(
+            lower_ty(&mut context, without_width),
+            Err(UnsupportedTy::Array)
+        );
+    }
+
+    #[test]
     fn unsupported_hir_and_path_forms_fail_closed() {
         let (owner, symbols) = owner();
         let interner = TyInterner::new();
@@ -1160,7 +1406,10 @@ mod tests {
             Res::PrimTy(PrimTy::Array),
         );
         let mut context = LowerTyContext::for_signature(&interner, owner, &paths);
-        assert_eq!(lower_ty(&mut context, array), Err(UnsupportedTy::Array));
+        assert_eq!(
+            lower_ty(&mut context, array),
+            Err(UnsupportedTy::WrongNumberOfGenericArguments)
+        );
         assert_eq!(
             lower_ty(&mut context, array),
             Err(UnsupportedTy::ContextAfterFailure)
