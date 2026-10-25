@@ -9652,6 +9652,155 @@ fn local_enum_variant_annotated_local_primitive(
     }
 }
 
+fn local_enum_variant_annotated_tuple_local_primitive(
+    value: &HirExpr<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<sai_resolve::prelude::PrimTy> {
+    let ExprKind::Path(path) = value.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return None;
+    }
+    let PathRes {
+        base: Res::Local(binding),
+        resolved_segments: 1,
+        segment_count: 1,
+    } = *locals.paths.get(&path.hir_id)?
+    else {
+        return None;
+    };
+    if !matches!(
+        locals.bindings.get(&binding)?.kind,
+        BindingKind::Pattern { .. }
+    ) {
+        return None;
+    }
+
+    let ExprKind::Block(body_block) = body.value.kind else {
+        return None;
+    };
+    let mut annotated_primitive = None;
+    for statement in body_block.stmts {
+        let StmtKind::Let {
+            pat,
+            ty: Some(ty),
+            els: None,
+            ..
+        } = statement.kind
+        else {
+            continue;
+        };
+        if !matches!(pat.kind, PatKind::Tuple(_)) {
+            continue;
+        }
+
+        let mut target_primitive = None;
+        if local_enum_variant_annotated_tuple_pattern_matches(
+            pat,
+            *ty,
+            1,
+            binding,
+            path.segments[0].name.sym,
+            locals,
+            type_paths,
+            symbols,
+            inputs,
+            &mut target_primitive,
+        )
+        .is_none()
+        {
+            continue;
+        }
+        let Some(target_primitive) = target_primitive else {
+            continue;
+        };
+        if annotated_primitive.replace(target_primitive).is_some() {
+            return None;
+        }
+    }
+    annotated_primitive
+}
+
+fn local_enum_variant_annotated_tuple_pattern_matches(
+    pattern: &HirPat<'_>,
+    ty: Ty<'_>,
+    tuple_depth: usize,
+    target_binding: sai_hir::BindingId,
+    target_name: Symbol,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    target_primitive: &mut Option<sai_resolve::prelude::PrimTy>,
+) -> Option<()> {
+    use sai_hir::patterns::BindingMode;
+
+    match (pattern.kind, ty.kind) {
+        (PatKind::Tuple(patterns), TyKind::Tuple(types)) => {
+            if tuple_depth > 2 || patterns.is_empty() || patterns.len() != types.len() {
+                return None;
+            }
+            for (pattern, ty) in patterns.iter().zip(types) {
+                local_enum_variant_annotated_tuple_pattern_matches(
+                    pattern,
+                    *ty,
+                    tuple_depth + 1,
+                    target_binding,
+                    target_name,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_primitive,
+                )?;
+            }
+            Some(())
+        }
+        (PatKind::Wild, _) => matches!(
+            resolve_function_direct_type(ty, type_paths, symbols, inputs),
+            Some(FunctionDirectType::Primitive(_))
+        )
+        .then_some(()),
+        (
+            PatKind::Binding {
+                mode,
+                name,
+                binding,
+                sub: None,
+            },
+            _,
+        ) => {
+            let Some(FunctionDirectType::Primitive(primitive)) =
+                resolve_function_direct_type(ty, type_paths, symbols, inputs)
+            else {
+                return None;
+            };
+            let local_binding = locals.bindings.get(&binding)?;
+            let supported_mode = matches!(
+                (local_binding.kind, mode),
+                (BindingKind::Pattern { var: false }, BindingMode::Value)
+                    | (BindingKind::Pattern { var: true }, BindingMode::Var)
+            );
+            if !supported_mode || local_binding.name != Some(name.sym) {
+                return None;
+            }
+            if binding == target_binding {
+                if name.sym != target_name || target_primitive.is_some() {
+                    return None;
+                }
+                *target_primitive = Some(primitive);
+            }
+            Some(())
+        }
+        _ => None,
+    }
+}
+
 fn local_enum_variant_unannotated_fixed_local_type(
     value: &HirExpr<'_>,
     body: &sai_hir::body::Body<'_>,
@@ -9874,6 +10023,11 @@ fn check_local_enum_variant_parameter_argument(
     )
     .or_else(|| {
         local_enum_variant_annotated_local_primitive(
+            value, body, locals, type_paths, symbols, inputs,
+        )
+    })
+    .or_else(|| {
+        local_enum_variant_annotated_tuple_local_primitive(
             value, body, locals, type_paths, symbols, inputs,
         )
     }) else {
@@ -97701,10 +97855,11 @@ interface facade { use middle.{payload}; }"#;
             "enum Beta { Same, Later }\n",
             "enum Duplicate { Same, Same }\n",
             "enum Payload { Unit, Pair(U8, Bool), Fixed(Bool, Byte, Char, ()), Named(value: Bool), UnitPayload(()), Signed(ISize), Wide(USize) }\n",
-            "enum NestedPayload { Nested(((I8, Char), ((), USize))), Single((I8,)) }\n",
+            "enum NestedPayload { Nested(((I8, Char), ((), USize))), Fixed(((I8, Byte), (Char, Bool))), Single((I8,)) }\n",
             "enum Generic<T> { Value(T) }\n",
             "enum Broken { Huge = 170141183460469231731687303715884105728 }\n",
             "type Widget { value: Bool }\n",
+            "type BoolAlias = Bool\n",
             "fn alpha() { Alpha.Same }\n",
             "fn beta() { Beta.Same }\n",
             "fn duplicate() { Duplicate.Same }\n",
@@ -97763,6 +97918,24 @@ interface facade { use middle.{payload}; }"#;
             "fn tuple_call_inferred_nested_tuple_bound_numeric_leaf() {\n    let (actual, (nested, other)) = (true, (false, 1))\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_tuple_pattern_too_deep() {\n    let (((actual, _), _), other) = (((true, false), true), false)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_tuple_nested_scope() {\n    {\n        let (actual, other) = (true, false)\n        Payload.Pair(actual, true)\n    }\n}\n",
+            "fn tuple_call_annotated_tuple_destructure_ok(actual: Bool) {\n    let (actual, _): (U8, Bool) = (true && false, 1 + 2)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_destructure_var_ok() {\n    let (_, var actual): (U8, Bool) = (1 + 2, true && false)\n    Payload.Pair(1, actual)\n}\n",
+            "fn tuple_call_annotated_tuple_destructure_bool_mismatch() {\n    let (actual, _): (Bool, Bool) = (false, true)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_destructure_var_mismatch() {\n    let (_, var actual): (U8, Byte) = (1, b'x')\n    Payload.Pair(1, actual)\n}\n",
+            "fn tuple_call_annotated_tuple_initializer_shape_ignored() {\n    let (actual, _): (Bool, Bool) = true\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_wildcard_alias_leaf() {\n    let (actual, _): (Bool, BoolAlias) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_nested_unit_leaf() {\n    let (actual, ()): (Bool, ()) = (true, ())\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_nested_tuple_destructure_ok() {\n    let ((actual, _), (tail, _)): ((I8, Byte), (Char, Bool)) = ((true, 1 + 2), ('x', false))\n    NestedPayload.Fixed(((actual, b'x'), ('x', true)))\n}\n",
+            "fn tuple_call_annotated_nested_tuple_destructure_mismatch() {\n    let ((actual, _), (tail, _)): ((Bool, Byte), (Char, Bool)) = ((true, b'x'), ('x', false))\n    NestedPayload.Fixed(((actual, b'x'), ('x', true)))\n}\n",
+            "fn tuple_call_annotated_tuple_shape_mismatch() {\n    let (actual, (nested, _)): (Bool, Bool) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_arity_mismatch() {\n    let (actual, _): (Bool,) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_pattern_too_deep() {\n    let (((actual, _), _), other): (((Bool, Bool), Bool), Bool) = (((true, false), false), true)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_nested_scope() {\n    {\n        let (actual, _): (Bool, Bool) = (true, false)\n        Payload.Pair(actual, true)\n    }\n}\n",
+            "fn tuple_call_annotated_tuple_else() {\n    let (actual, _): (Bool, Bool) = (true, false) else { return }\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_alias_leaf() {\n    let (actual, _): (BoolAlias, Bool) = (false, true)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_str_leaf() {\n    let (actual, _): (Str, Bool) = (\"text\", true)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_unit_leaf() {\n    let (actual, _): ((), Bool) = ((), true)\n    Payload.UnitPayload(actual)\n}\n",
+            "fn tuple_call_annotated_tuple_nominal_leaf() {\n    let (actual, _): (Widget, Bool) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_param_mismatch(actual: Bool) { Payload.Pair(actual, true) }\n",
             "fn tuple_call_unicode_param_mismatch(値: Bool) { Payload.Pair(値, true) }\n",
             "fn nested_call_param_mismatch(actual: USize) { NestedPayload.Nested(((actual, 'x'), ((), 2))) }\n",
@@ -98332,7 +98505,6 @@ interface facade { use middle.{payload}; }"#;
             "tuple_call_unannotated_computed_bool",
             "tuple_call_inferred_tuple_destructure_ok",
             "tuple_call_inferred_tuple_arity_mismatch",
-            "tuple_call_inferred_tuple_destructure_annotated",
             "tuple_call_inferred_tuple_numeric_leaf",
             "tuple_call_inferred_tuple_computed_leaf",
             "tuple_call_inferred_tuple_wildcard_numeric_leaf",
@@ -98346,6 +98518,20 @@ interface facade { use middle.{payload}; }"#;
             "tuple_call_inferred_nested_tuple_bound_numeric_leaf",
             "tuple_call_inferred_tuple_pattern_too_deep",
             "tuple_call_inferred_tuple_nested_scope",
+            "tuple_call_annotated_tuple_destructure_ok",
+            "tuple_call_annotated_tuple_destructure_var_ok",
+            "tuple_call_annotated_nested_tuple_destructure_ok",
+            "tuple_call_annotated_tuple_wildcard_alias_leaf",
+            "tuple_call_annotated_tuple_nested_unit_leaf",
+            "tuple_call_annotated_tuple_shape_mismatch",
+            "tuple_call_annotated_tuple_arity_mismatch",
+            "tuple_call_annotated_tuple_pattern_too_deep",
+            "tuple_call_annotated_tuple_nested_scope",
+            "tuple_call_annotated_tuple_else",
+            "tuple_call_annotated_tuple_alias_leaf",
+            "tuple_call_annotated_tuple_str_leaf",
+            "tuple_call_annotated_tuple_unit_leaf",
+            "tuple_call_annotated_tuple_nominal_leaf",
         ] {
             assert!(
                 paths_for(name).call_diagnostics().is_empty(),
@@ -98391,6 +98577,26 @@ interface facade { use middle.{payload}; }"#;
             (
                 "tuple_call_inferred_tuple_destructure_bool_mismatch",
                 "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_inferred_tuple_destructure_annotated",
+                "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_annotated_tuple_destructure_bool_mismatch",
+                "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_annotated_tuple_initializer_shape_ignored",
+                "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_annotated_tuple_destructure_var_mismatch",
+                "expected `Bool`, found `Byte`",
+            ),
+            (
+                "tuple_call_annotated_nested_tuple_destructure_mismatch",
+                "expected `I8`, found `Bool`",
             ),
             (
                 "tuple_call_inferred_tuple_nested_pattern",
@@ -98505,6 +98711,11 @@ interface facade { use middle.{payload}; }"#;
                     | "tuple_call_inferred_tuple_destructure_shadowing"
                     | "tuple_call_inferred_nested_tuple_destructure_bool_mismatch"
                     | "tuple_call_inferred_nested_tuple_destructure_var_mismatch"
+                    | "tuple_call_inferred_tuple_destructure_annotated"
+                    | "tuple_call_annotated_tuple_destructure_bool_mismatch"
+                    | "tuple_call_annotated_tuple_initializer_shape_ignored"
+                    | "tuple_call_annotated_tuple_destructure_var_mismatch"
+                    | "tuple_call_annotated_nested_tuple_destructure_mismatch"
             ) {
                 let function_start = root
                     .find(&format!("fn {name}"))
@@ -98516,6 +98727,13 @@ interface facade { use middle.{payload}; }"#;
                     | "tuple_call_inferred_nested_tuple_destructure_shadowing" => {
                         ("Payload.Pair(1, actual)", "Payload.Pair(1, ".len())
                     }
+                    "tuple_call_annotated_tuple_destructure_var_mismatch" => {
+                        ("Payload.Pair(1, actual)", "Payload.Pair(1, ".len())
+                    }
+                    "tuple_call_annotated_nested_tuple_destructure_mismatch" => (
+                        "NestedPayload.Fixed(((actual, b'x'), ('x', true)))",
+                        "NestedPayload.Fixed(((".len(),
+                    ),
                     "tuple_call_inferred_char_mismatch" => (
                         "NestedPayload.Nested(((actual, 'x'), ((), 2)))",
                         "NestedPayload.Nested(((".len(),

@@ -284,9 +284,11 @@ fn empty_root_package_index() -> sai_semantic::EncodedSymbolIndex {
 #[test]
 fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     let source = concat!(
-        "enum Payload { Pair(U8, Bool), Named(value: Bool) }\n",
+        "enum Payload { Pair(U8, Bool), Named(value: Bool), UnitPayload(()) }\n",
         "enum FixedPayload { Values(Bool, Byte, Char, ()) }\n",
-        "enum NestedPayload { Nested(((I8, Char), ((), USize))), Fixed(((I8, Byte), (Char, ()))) }\n",
+        "enum NestedPayload { Nested(((I8, Char), ((), USize))), Fixed(((I8, Byte), (Char, ()))), AnnotatedFixed(((I8, Byte), (Char, Bool))) }\n",
+        "type BoolAlias = Bool\n",
+        "type Widget { value: Bool }\n",
         "pub fn use_it(actual: Bool) {\n",
         "    let annotated: Bool = true\n",
         "    var matching: Bool = false\n",
@@ -305,6 +307,23 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "    let (tuple_nested_rejected, (tuple_nested_inner, _)) = (true, (false, 1))\n",
         "    let ((tuple_shape_nested, _), tuple_shape_tail) = (true, false)\n",
         "    let (tuple_shape_leaf, tuple_shape_leaf_tail) = ((true, false), true)\n",
+        "    let (tuple_annotation_good, _): (U8, Bool) = (true && false, 1 + 2)\n",
+        "    let (_, var tuple_annotation_var_good): (U8, Bool) = (1 + 2, true && false)\n",
+        "    let (tuple_annotation_bad, _): (Bool, Bool) = (false, true)\n",
+        "    let (_, var tuple_annotation_var_bad): (U8, Byte) = (1, b'x')\n",
+        "    let (tuple_annotation_initializer_shape_bad, _): (Bool, Bool) = true\n",
+        "    let (tuple_annotation_wildcard_alias_bad, _): (Bool, BoolAlias) = (true, false)\n",
+        "    let (tuple_annotation_nested_unit_bad, ()): (Bool, ()) = (true, ())\n",
+        "    let ((tuple_annotation_nested_good, _), (nested_tail, _)): ((I8, Byte), (Char, Bool)) = ((true && false, 1), ('x', false))\n",
+        "    let ((tuple_annotation_nested_bad, _), (nested_bad_tail, _)): ((Bool, Byte), (Char, Bool)) = ((true, b'x'), ('x', false))\n",
+        "    let (tuple_annotation_shape_bad, (shape_nested, _)): (Bool, Bool) = (true, false)\n",
+        "    let (tuple_annotation_arity_bad, _): (Bool,) = (true, false)\n",
+        "    let (((tuple_annotation_deep_bad, _), _), deep_tail): (((Bool, Bool), Bool), Bool) = (((true, false), false), true)\n",
+        "    let (tuple_annotation_alias_bad, _): (BoolAlias, Bool) = (true, false)\n",
+        "    let (tuple_annotation_str_bad, _): (Str, Bool) = (\"text\", true)\n",
+        "    let (tuple_annotation_unit_bad, _): ((), Bool) = ((), true)\n",
+        "    let (tuple_annotation_nominal_bad, _): (Widget, Bool) = (true, false)\n",
+        "    let (tuple_annotation_else, _): (Bool, Bool) = (true, false) else { return }\n",
         "    (Payload.Pair(actual, true), ",
         "Payload.Pair(annotated, true), ",
         "Payload.Pair(1, matching), ",
@@ -317,6 +336,23 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "Payload.Pair(tuple_bad_arity, true), ",
         "Payload.Pair(tuple_annotated, true), ",
         "Payload.Pair(tuple_nested, true), ",
+        "Payload.Pair(tuple_annotation_good, true), ",
+        "Payload.Pair(1, tuple_annotation_var_good), ",
+        "Payload.Pair(tuple_annotation_bad, true), ",
+        "Payload.Pair(1, tuple_annotation_var_bad), ",
+        "Payload.Pair(tuple_annotation_initializer_shape_bad, true), ",
+        "Payload.Pair(tuple_annotation_wildcard_alias_bad, true), ",
+        "Payload.Pair(tuple_annotation_nested_unit_bad, true), ",
+        "NestedPayload.AnnotatedFixed(((tuple_annotation_nested_good, b'x'), ('x', true))), ",
+        "NestedPayload.AnnotatedFixed(((tuple_annotation_nested_bad, b'x'), ('x', true))), ",
+        "Payload.Pair(tuple_annotation_shape_bad, true), ",
+        "Payload.Pair(tuple_annotation_arity_bad, true), ",
+        "Payload.Pair(tuple_annotation_deep_bad, true), ",
+        "Payload.Pair(tuple_annotation_alias_bad, true), ",
+        "Payload.Pair(tuple_annotation_str_bad, true), ",
+        "Payload.UnitPayload(tuple_annotation_unit_bad), ",
+        "Payload.Pair(tuple_annotation_nominal_bad, true), ",
+        "Payload.Pair(tuple_annotation_else, true), ",
         "NestedPayload.Fixed(((tuple_nested_bool, tuple_nested_byte), (tuple_nested_char, tuple_nested_unit))), ",
         "NestedPayload.Fixed(((tuple_nested_rejected, b'x'), ('x', ()))), ",
         "NestedPayload.Fixed(((tuple_shape_nested, b'x'), ('x', ()))), ",
@@ -351,7 +387,7 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        10,
+        15,
         "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus named/nested tuple literal leaves:\n{stdout}"
     );
     assert_eq!(
@@ -406,6 +442,67 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "expected `U8`, found `Bool`",
         tuple_destructured_start,
         tuple_destructured_start + "tuple_bool".len(),
+    );
+    let annotated_tuple_call = "Payload.Pair(tuple_annotated, true)";
+    let annotated_tuple_start = source
+        .find(annotated_tuple_call)
+        .expect("annotated tuple-destructured local argument call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Bool`",
+        annotated_tuple_start,
+        annotated_tuple_start + "tuple_annotated".len(),
+    );
+    let annotated_tuple_bad_call = "Payload.Pair(tuple_annotation_bad, true)";
+    let annotated_tuple_bad_start = source
+        .find(annotated_tuple_bad_call)
+        .expect("annotated tuple leaf mismatch call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Bool`",
+        annotated_tuple_bad_start,
+        annotated_tuple_bad_start + "tuple_annotation_bad".len(),
+    );
+    let initializer_shape_call = "Payload.Pair(tuple_annotation_initializer_shape_bad, true)";
+    let initializer_shape_start = source
+        .find(initializer_shape_call)
+        .expect("initializer-shape-independent local mismatch call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Bool`",
+        initializer_shape_start,
+        initializer_shape_start + "tuple_annotation_initializer_shape_bad".len(),
+    );
+    let annotated_tuple_var_bad_call = "Payload.Pair(1, tuple_annotation_var_bad)";
+    let annotated_tuple_var_bad_start = source
+        .find(annotated_tuple_var_bad_call)
+        .expect("annotated mutable tuple leaf mismatch call exists")
+        + "Payload.Pair(1, ".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `Byte`",
+        annotated_tuple_var_bad_start,
+        annotated_tuple_var_bad_start + "tuple_annotation_var_bad".len(),
+    );
+    let annotated_nested_call =
+        "NestedPayload.AnnotatedFixed(((tuple_annotation_nested_bad, b'x'), ('x', true)))";
+    let annotated_nested_start = source
+        .find(annotated_nested_call)
+        .expect("nested annotated tuple leaf mismatch call exists")
+        + "NestedPayload.AnnotatedFixed(((".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I8`, found `Bool`",
+        annotated_nested_start,
+        annotated_nested_start + "tuple_annotation_nested_bad".len(),
     );
     let nested_tuple_call = "NestedPayload.Fixed(((tuple_nested_bool, tuple_nested_byte), (tuple_nested_char, tuple_nested_unit)))";
     let nested_tuple_start = source

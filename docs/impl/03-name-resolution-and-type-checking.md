@@ -794,6 +794,10 @@ direct `Bool`, `Byte`, `Char`, or unit literals; the selected element is
 matched to the argument by its exact `BindingId`. IR-932 extends this to one
 nested tuple level, requiring the same tuple shape and arity recursively and
 fixed literals for every leaf, including wildcard-matched leaves.
+IR-933 accepts explicitly annotated tuple patterns through that same maximum
+pattern depth when the annotation has matching tuple structure and direct
+primitive type paths at every leaf. The annotation supplies each binding type;
+the initializer is not inspected or inferred.
 The resolver uses the current package collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
@@ -2046,11 +2050,37 @@ constructor input emits `TYPE_MISMATCH` on the exact argument path span.
 
 Requiring every tuple value, including values matched by `_`, to be a fixed
 literal is a conservative boundary: an unsupported sibling initializer does
-not indirectly make another binding eligible. Tuple arity mismatch, annotated
-tuple bindings, integer and floating-point leaves, computed leaves (including
-those matched by `_`), nested or complex patterns, nested-scope declarations,
-and extra call arguments remain unexamined. This does not add tuple-shape
-diagnostics, inference, coercions, or general pattern typing.
+not indirectly make another binding eligible. At the IR-931 boundary, tuple
+arity mismatch, annotated tuple bindings (extended separately by IR-933),
+integer and floating-point leaves, computed leaves (including those matched
+by `_`), nested or complex patterns, nested-scope declarations, and extra
+call arguments remain unexamined. This does not add tuple-shape diagnostics,
+inference, coercions, or general pattern typing.
+
+**Implemented subset (IR-932):** The unannotated tuple-pattern projection also
+accepts one nested tuple-pattern level. Pattern and initializer shapes must
+match recursively, and every leaf initializer, including wildcard-matched
+values, must be a direct fixed-type Bool, Byte, Char, or unit literal. This
+does not diagnose shape errors or infer tuple types.
+
+**Implemented subset (IR-933):** At those same local enum-call sites, a path
+may resolve to a binding in a directly declared outer-block `let` tuple
+pattern with an explicit tuple annotation. The pattern and annotation must
+have identical tuple shape and arity through at most one nested tuple level.
+Leaves must be simple bindings or `_`; each annotation leaf must resolve
+through `resolve_function_direct_type` to a direct primitive type path. The
+empty tuple/unit node is rejected even when written as an empty tuple pattern,
+so it cannot pass as a structural branch. The
+annotation provides the selected binding's type without examining or
+inferring from the initializer. Selection uses the exact `BindingId`, and
+every binding's `Pattern { var }` kind, HIR name, and binding mode must agree.
+Only the selected leaf is compared with the constructor argument type, with a
+mismatch reported at the argument path span. Declarations with `else`, a
+tuple-shape or arity mismatch, deeper or complex patterns, aliases, `Str`,
+unit, nominal or other non-primitive annotation leaves, nested scopes, and
+non-path expressions remain outside the projection. This does not add
+shape diagnostics, general type queries, inference, coercions, or full
+expression results.
 
 ### 3.6.4 `adt_def`
 
@@ -2378,7 +2408,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924–IR-931 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-933 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
@@ -2397,7 +2427,10 @@ initializers only when they are fixed-type Bool, Byte, Char, or unit literals.
 Both local checks use resolved binding identity. IR-931 also checks same-arity,
 one-level tuple destructuring when every initializer leaf is a direct
 fixed-type Bool, Byte, Char, or unit literal. These are limited argument
-checks: named arguments are not bound by their names, and general expression
+initializers. IR-933 checks matching explicitly annotated tuple patterns
+through one nested tuple level using direct primitive annotation leaves, while
+ignoring their initializers. These are limited argument checks: named
+arguments are not bound by their names, and general expression
 typing, `TypeckResults::call_kinds`, and generic, external, dependency, or WIT
 variant paths remain outside the projection. `sai check`
 reports the staged diagnostics while retaining its incomplete-stage gate; it
