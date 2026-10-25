@@ -86,14 +86,14 @@ impl Drop for StagedLocalEnumVariantValueTypeGuard {
 }
 
 #[derive(Clone)]
-struct LocalEnumVariantValueTypeQueryOutput {
+pub(super) struct LocalEnumVariantValueTypeQueryOutput {
     identity: Arc<LocalEnumVariantValueTypeQueryIdentity>,
     projection: Option<LocalEnumVariantValueTypeProjection>,
 }
 
 impl LocalEnumVariantValueTypeQueryOutput {
     #[cfg(test)]
-    pub(super) const fn input_fingerprint(&self) -> Fingerprint {
+    pub(super) fn input_fingerprint(&self) -> Fingerprint {
         self.identity.source_fingerprint
     }
 }
@@ -218,6 +218,7 @@ impl RootDatabase {
         variant: DefId,
     ) -> Result<Option<LocalEnumVariantValueTypeProjection>, LocalEnumVariantValueTypeQueryError>
     {
+        validate_query_snapshot(resolutions, snapshot)?;
         let projection = resolutions.local_enum_variant_value_type_with_scopes(
             &self.semantic_types,
             collection,
@@ -336,6 +337,7 @@ impl RootDatabase {
         variant: DefId,
     ) -> Result<Arc<LocalEnumVariantValueTypeQueryOutput>, LocalEnumVariantValueTypeQueryError>
     {
+        validate_query_snapshot(resolutions, snapshot)?;
         let projection = resolutions.local_enum_variant_value_type_with_scopes(
             &self.semantic_types,
             collection,
@@ -363,6 +365,16 @@ impl RootDatabase {
             projection,
         )?)
     }
+}
+
+fn validate_query_snapshot(
+    resolutions: &TypeOwnerResolutions,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<(), LocalEnumVariantValueTypeQueryError> {
+    if !resolutions.matches_snapshot(snapshot) {
+        return Err(OwnerControlFlowResolutionError::SnapshotMismatch.into());
+    }
+    Ok(())
 }
 
 fn hash_phase1_build_context(context: Phase1BuildContext, hasher: &mut StableHasher) {
