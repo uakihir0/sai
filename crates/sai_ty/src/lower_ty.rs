@@ -674,18 +674,16 @@ fn lower_path_ty(
             Ok(context.interner.intern(kind))
         }
         Res::Def(DefKind::Alias, _) => Err(UnsupportedTy::Alias),
-        Res::Def(DefKind::TyParam, def_id) => {
-            if context.within_fn_ptr {
-                Err(UnsupportedTy::FunctionPointerGenericParameter)
+        Res::Def(DefKind::TyParam, def_id) => context
+            .generic_params
+            .get(&def_id)
+            .copied()
+            .map(|param| context.interner.intern(TyKind::Param(param)))
+            .ok_or(if context.within_fn_ptr {
+                UnsupportedTy::FunctionPointerGenericParameter
             } else {
-                context
-                    .generic_params
-                    .get(&def_id)
-                    .copied()
-                    .map(|param| context.interner.intern(TyKind::Param(param)))
-                    .ok_or(UnsupportedTy::GenericParameter)
-            }
-        }
+                UnsupportedTy::GenericParameter
+            }),
         Res::Def(DefKind::ConstParam, _) => Err(UnsupportedTy::ConstParameter),
         Res::Def(DefKind::AssocTy, _) => Err(UnsupportedTy::Projection),
         Res::Def(
@@ -2613,6 +2611,126 @@ mod tests {
                 index: 0,
                 name: symbols.intern("B").unwrap(),
             })
+        );
+    }
+
+    #[test]
+    fn function_pointer_reuses_only_the_enclosing_function_type_parameter() {
+        let (owner, symbols, local_param, foreign_param, def_paths) =
+            owner_with_same_package_foreign_param();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let generic_param = arena.alloc_generic_param(sai_hir::types::GenericParam {
+            def_id: local_param,
+            name: Name {
+                sym: symbols.intern("T").unwrap(),
+                span: span(),
+            },
+            kind: GenericParamKind::Type { bounds: &[] },
+        });
+        let generics = Generics {
+            params: arena.alloc_generic_params(&[*generic_param]),
+            where_preds: &[],
+        };
+        let (local_ty, mut local_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            420,
+            "T",
+            None,
+            Res::Def(DefKind::TyParam, local_param.to_def_id()),
+        );
+        let callback_params = arena.alloc_tys(&[*local_ty]);
+        let callback = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 440),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: callback_params,
+                ret: Some(local_ty),
+                effects: None,
+            },
+            span: span(),
+        });
+        let callback_param = arena.alloc_fn_param(sai_hir::body::FnParam {
+            hir_id: hir_id(owner, 450),
+            name: None,
+            is_self: false,
+            mutable: false,
+            ty: callback,
+            span: span(),
+        });
+        let signature = HirFnSig {
+            safety: Safety::Safe,
+            is_async: false,
+            params: arena.alloc_fn_params(&[*callback_param]),
+            ret: Some(local_ty),
+            borrows: None,
+            effects: None,
+            requires: &[],
+            ensures: &[],
+        };
+        let mut context = LowerTyContext::for_signature(&interner, owner, &local_paths)
+            .with_def_path_interner(&def_paths);
+        let lowered = lower_fn_sig(&mut context, generics, signature)
+            .expect("a callback can reuse its enclosing function's binder");
+        let binder = lowered.type_params()[0].param;
+        assert_eq!(binder.index, 0);
+        let TyKind::FnPtr(callback) = lowered.inputs()[0].kind() else {
+            panic!("the first outer argument remains a function pointer");
+        };
+        assert_eq!(callback.inputs()[0].kind(), &TyKind::Param(binder));
+        assert_eq!(callback.output().kind(), &TyKind::Param(binder));
+        assert_eq!(lowered.output().kind(), &TyKind::Param(binder));
+
+        let (foreign_ty, foreign_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            460,
+            "T",
+            None,
+            Res::Def(DefKind::TyParam, foreign_param.to_def_id()),
+        );
+        local_paths.extend(foreign_paths);
+        let foreign_callback_params = arena.alloc_tys(&[*foreign_ty]);
+        let foreign_callback = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 480),
+            kind: HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params: foreign_callback_params,
+                ret: Some(foreign_ty),
+                effects: None,
+            },
+            span: span(),
+        });
+        let foreign_callback_param = arena.alloc_fn_param(sai_hir::body::FnParam {
+            hir_id: hir_id(owner, 490),
+            name: None,
+            is_self: false,
+            mutable: false,
+            ty: foreign_callback,
+            span: span(),
+        });
+        let foreign_signature = HirFnSig {
+            safety: Safety::Safe,
+            is_async: false,
+            params: arena.alloc_fn_params(&[*foreign_callback_param]),
+            ret: Some(local_ty),
+            borrows: None,
+            effects: None,
+            requires: &[],
+            ensures: &[],
+        };
+        let mut context = LowerTyContext::for_signature(&interner, owner, &local_paths)
+            .with_def_path_interner(&def_paths);
+        assert_eq!(
+            lower_fn_sig(&mut context, generics, foreign_signature),
+            Err(UnsupportedFnSig::ParameterType {
+                index: 0,
+                reason: UnsupportedTy::FunctionPointerGenericParameter,
+            }),
+            "a same-spelled parameter from another owner is not captured by the enclosing binder"
         );
     }
 
