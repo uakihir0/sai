@@ -58,8 +58,9 @@ The sample policy allows meals up to $75 per employee per expense day, lodging
 up to $180 per night, airfare up to $800 per claim, and ground transport up to
 $180 per claim. Lodging and airfare always require itemized evidence. Other
 categories require some receipt evidence for claims of $25 or more. Alcohol is
-excluded. A receipt reference can support only one non-denied claim in the
-batch; a later claim reusing it is held and linked to the earlier claim.
+excluded. If a claim reaches the duplicate-reference check, an earlier
+non-denied claim with the same nonzero receipt reference causes it to be held
+and linked. Earlier held claims still count; earlier denied claims do not.
 
 Only the first issue found is stored for a claim. The review order is employee
 existence and active status, trip existence and ownership, trip dates, business
