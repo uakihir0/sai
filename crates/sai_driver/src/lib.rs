@@ -9972,7 +9972,7 @@ fn local_enum_variant_fixed_tuple_pattern_matches<'hir>(
             true
         }
         PatKind::Tuple(patterns) => {
-            if tuple_depth > 2 {
+            if tuple_depth > 3 {
                 return false;
             }
             let ExprKind::Tuple(values) = initializer.kind else {
@@ -97896,6 +97896,7 @@ interface facade { use middle.{payload}; }"#;
             "enum Duplicate { Same, Same }\n",
             "enum Payload { Unit, Pair(U8, Bool), Fixed(Bool, Byte, Char, ()), Named(value: Bool), UnitPayload(()), Signed(ISize), Wide(USize) }\n",
             "enum NestedPayload { Nested(((I8, Char), ((), USize))), Fixed(((I8, Byte), (Char, Bool))), Single((I8,)) }\n",
+            "enum DeepPayload { DeepBool((((Bool, Char), Bool), Bool)), DeepByte((((Byte, Char), Bool), Bool)) }\n",
             "enum Generic<T> { Value(T) }\n",
             "enum Broken { Huge = 170141183460469231731687303715884105728 }\n",
             "type Widget { value: Bool }\n",
@@ -97948,6 +97949,8 @@ interface facade { use middle.{payload}; }"#;
             "fn tuple_call_inferred_tuple_wildcard_numeric_leaf() {\n    let (actual, _) = (true, 1)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_tuple_wildcard_computed_leaf() {\n    let (actual, _) = (true, true && false)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_nested_tuple_destructure_ok() {\n    let ((actual_bool, var actual_byte), (actual_char, var actual_unit)) = ((true, b'x'), ('x', ()))\n    FixedPayload.Values(actual_bool, actual_byte, actual_char, actual_unit)\n}\n",
+            "fn tuple_call_inferred_deep_tuple_destructure_ok() {\n    let (((actual, _), _), _) = (((true, 'x'), false), true)\n    DeepPayload.DeepBool((((actual, 'x'), false), true))\n}\n",
+            "fn tuple_call_inferred_deep_tuple_destructure_bool_mismatch() {\n    let (((actual, _), _), _) = (((true, 'x'), false), true)\n    DeepPayload.DeepByte((((actual, 'x'), false), true))\n}\n",
             "fn tuple_call_inferred_nested_tuple_destructure_bool_mismatch() {\n    let (other, (actual, _)) = (true, (false, false))\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_nested_tuple_destructure_var_mismatch() {\n    let ((other, var actual), tail) = ((true, b'x'), 'x')\n    Payload.Pair(1, actual)\n}\n",
             "fn tuple_call_inferred_nested_tuple_destructure_shadowing(actual: Bool) {\n    let (other, (actual, _)) = (true, (b'x', false))\n    Payload.Pair(1, actual)\n}\n",
@@ -97957,7 +97960,7 @@ interface facade { use middle.{payload}; }"#;
             "fn tuple_call_inferred_nested_tuple_wildcard_numeric_leaf() {\n    let (actual, (nested, _)) = (true, (false, 1))\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_nested_tuple_wildcard_computed_leaf() {\n    let (actual, (nested, _)) = (true, (false, true && false))\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_nested_tuple_bound_numeric_leaf() {\n    let (actual, (nested, other)) = (true, (false, 1))\n    Payload.Pair(actual, true)\n}\n",
-            "fn tuple_call_inferred_tuple_pattern_too_deep() {\n    let (((actual, _), _), other) = (((true, false), true), false)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_depth_four_rejected() {\n    let ((((actual, _), _), _), _) = ((((true, false), true), false), true)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_tuple_nested_scope() {\n    {\n        let (actual, other) = (true, false)\n        Payload.Pair(actual, true)\n    }\n}\n",
             "fn tuple_call_annotated_tuple_destructure_ok(actual: Bool) {\n    let (actual, _): (U8, Bool) = (true && false, 1 + 2)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_annotated_tuple_destructure_var_ok() {\n    let (_, var actual): (U8, Bool) = (1 + 2, true && false)\n    Payload.Pair(1, actual)\n}\n",
@@ -98564,13 +98567,14 @@ interface facade { use middle.{payload}; }"#;
             "tuple_call_inferred_tuple_wildcard_numeric_leaf",
             "tuple_call_inferred_tuple_wildcard_computed_leaf",
             "tuple_call_inferred_nested_tuple_destructure_ok",
+            "tuple_call_inferred_deep_tuple_destructure_ok",
             "tuple_call_inferred_nested_tuple_arity_mismatch",
             "tuple_call_inferred_nested_tuple_pattern_vs_leaf",
             "tuple_call_inferred_nested_tuple_leaf_vs_pattern",
             "tuple_call_inferred_nested_tuple_wildcard_numeric_leaf",
             "tuple_call_inferred_nested_tuple_wildcard_computed_leaf",
             "tuple_call_inferred_nested_tuple_bound_numeric_leaf",
-            "tuple_call_inferred_tuple_pattern_too_deep",
+            "tuple_call_inferred_tuple_depth_four_rejected",
             "tuple_call_inferred_tuple_nested_scope",
             "tuple_call_annotated_tuple_destructure_ok",
             "tuple_call_annotated_tuple_destructure_var_ok",
@@ -98687,6 +98691,10 @@ interface facade { use middle.{payload}; }"#;
                 "expected `Bool`, found `Byte`",
             ),
             (
+                "tuple_call_inferred_deep_tuple_destructure_bool_mismatch",
+                "expected `Byte`, found `Bool`",
+            ),
+            (
                 "tuple_call_inferred_nested_tuple_destructure_shadowing",
                 "expected `Bool`, found `Byte`",
             ),
@@ -98787,6 +98795,7 @@ interface facade { use middle.{payload}; }"#;
                     | "tuple_call_inferred_tuple_destructure_shadowing"
                     | "tuple_call_inferred_nested_tuple_destructure_bool_mismatch"
                     | "tuple_call_inferred_nested_tuple_destructure_var_mismatch"
+                    | "tuple_call_inferred_deep_tuple_destructure_bool_mismatch"
                     | "tuple_call_inferred_tuple_destructure_annotated"
                     | "tuple_call_annotated_tuple_destructure_bool_mismatch"
                     | "tuple_call_annotated_tuple_initializer_shape_ignored"
@@ -98806,6 +98815,10 @@ interface facade { use middle.{payload}; }"#;
                     | "tuple_call_inferred_nested_tuple_destructure_shadowing" => {
                         ("Payload.Pair(1, actual)", "Payload.Pair(1, ".len())
                     }
+                    "tuple_call_inferred_deep_tuple_destructure_bool_mismatch" => (
+                        "DeepPayload.DeepByte((((actual, 'x'), false), true))",
+                        "DeepPayload.DeepByte((((".len(),
+                    ),
                     "tuple_call_annotated_tuple_destructure_var_mismatch" => {
                         ("Payload.Pair(1, actual)", "Payload.Pair(1, ".len())
                     }
