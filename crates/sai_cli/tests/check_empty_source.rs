@@ -407,7 +407,7 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "NestedPayload.Fixed(((tuple_shape_leaf, b'x'), ('x', ()))), ",
         "NestedPayload.Nested(((true,), ((), true))), ",
         "NestedPayload.Nested(((true, 1, false), ((), true))), ",
-        "NestedPayload.Nested(((), ((true,), 2))), ",
+        "NestedPayload.Nested(((), ((), 2))), ",
         "NestedPayload.Nested((true, ((), 2))), ",
         "NestedPayload.Nested(((1, (false,)), ((), 2))), ",
         "NestedPayload.Nested((actual, ((), 2))), ",
@@ -444,8 +444,8 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        25,
-        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus depth-three annotated leaves, named/nested tuple literal leaves, and bounded nested tuple-arity mismatches:\n{stdout}"
+        26,
+        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus depth-three annotated leaves, named/nested tuple literal leaves, bounded nested tuple-arity mismatches, and tuple-versus-scalar mismatches:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
@@ -764,6 +764,182 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "integer literal is out of range for `U8`",
         out_of_range_start,
         out_of_range_start + "256".len(),
+    );
+}
+
+#[test]
+fn check_reports_supported_scalar_expected_tuple_expression_mismatches() {
+    let source = concat!(
+        "enum Payload { Pair(U8, Bool), UnitPayload(()) }\n",
+        "enum NestedPayload { Nested(((I8, Char), ((), USize))), Fixed(((I8, Byte), (Char, Bool))) }\n",
+        "type BoolAlias = Bool\n",
+        "type Widget { value: Bool }\n",
+        "enum ExcludedPayload { Alias(BoolAlias), Text(Str), Nominal(Widget) }\n",
+        "fn tuple_factory() -> (U8,) { (1,) }\n",
+        "pub fn use_it(actual: (U8,)) {\n",
+        "    (Payload.Pair((true, false), true), ",
+        "Payload.UnitPayload((true, false)), ",
+        "NestedPayload.Fixed(((1, (false,)), (1, (1,)))), ",
+        "NestedPayload.Nested(((1, 'x'), ((true,), 2))), ",
+        "Payload.Pair((), true), ",
+        "Payload.Pair((1), true), ",
+        "Payload.Pair((true,), true), ",
+        "Payload.Pair(actual, true), ",
+        "Payload.Pair(tuple_factory(), true), ",
+        "NestedPayload.Nested((true, ((), 2))), ",
+        "ExcludedPayload.Alias((true, false)), ",
+        "ExcludedPayload.Text((true, false)), ",
+        "ExcludedPayload.Nominal((true, false)), ",
+        "Payload.Pair(first: (true, false), second: true, third: false))\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(&output, "scalar tuple-expression mismatches");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        9,
+        "outer and nested primitive/unit expectations diagnose tuple literals once, while paths, calls, aliases, Str, nominal payloads, and tuple-expected scalar expressions stay excluded:\n{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"NAMED_ARGUMENT_ON_FUNCTION\"")
+            .count(),
+        3,
+        "all named-argument diagnostics remain independent"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
+        1,
+        "the outer arity diagnostic remains independent"
+    );
+
+    let outer_primitive_call = "Payload.Pair((true, false), true)";
+    let outer_primitive_start = source
+        .find(outer_primitive_call)
+        .expect("outer primitive tuple call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found tuple of arity 2",
+        outer_primitive_start,
+        outer_primitive_start + "(true, false)".len(),
+    );
+    let outer_unit_call = "Payload.UnitPayload((true, false))";
+    let outer_unit_start = source
+        .find(outer_unit_call)
+        .expect("outer unit tuple call exists")
+        + "Payload.UnitPayload(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `()`, found tuple of arity 2",
+        outer_unit_start,
+        outer_unit_start + "(true, false)".len(),
+    );
+
+    let nested_fixed_call = "NestedPayload.Fixed(((1, (false,)), (1, (1,))))";
+    let nested_fixed_start = source
+        .find(nested_fixed_call)
+        .expect("nested scalar tuple-leaf call exists");
+    let nested_byte_start = nested_fixed_start
+        + nested_fixed_call
+            .find("NestedPayload.Fixed(((1, ")
+            .expect("first nested tuple prefix exists")
+        + "NestedPayload.Fixed(((1, ".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Byte`, found tuple of arity 1",
+        nested_byte_start,
+        nested_byte_start + "(false,)".len(),
+    );
+    let nested_char_start = nested_fixed_start
+        + nested_fixed_call
+            .find("), (1, (1,)")
+            .expect("eligible Char sibling exists")
+        + "), (".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Char`, found an integer literal",
+        nested_char_start,
+        nested_char_start + "1".len(),
+    );
+    let nested_bool_start = nested_fixed_start
+        + nested_fixed_call
+            .find("(1,)")
+            .expect("nested Bool tuple leaf exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found tuple of arity 1",
+        nested_bool_start,
+        nested_bool_start + "(1,)".len(),
+    );
+
+    let nested_unit_call = "NestedPayload.Nested(((1, 'x'), ((true,), 2)))";
+    let nested_unit_start = source
+        .find(nested_unit_call)
+        .expect("nested unit tuple-leaf call exists")
+        + nested_unit_call
+            .find("(true,)")
+            .expect("nested tuple at a unit leaf exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `()`, found tuple of arity 1",
+        nested_unit_start,
+        nested_unit_start + "(true,)".len(),
+    );
+
+    let empty_unit_call = "Payload.Pair((), true)";
+    let empty_unit_start = source
+        .find(empty_unit_call)
+        .expect("empty tuple unit argument exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found unit",
+        empty_unit_start,
+        empty_unit_start + "()".len(),
+    );
+    let singleton_call = "Payload.Pair((true,), true)";
+    let singleton_start = source
+        .find(singleton_call)
+        .expect("singleton tuple argument exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found tuple of arity 1",
+        singleton_start,
+        singleton_start + "(true,)".len(),
+    );
+
+    let named_arity_call = "Payload.Pair(first: (true, false), second: true, third: false)";
+    let named_tuple_start = source
+        .find(named_arity_call)
+        .expect("named tuple argument with excess outer argument exists")
+        + "Payload.Pair(first: ".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found tuple of arity 2",
+        named_tuple_start,
+        named_tuple_start + "(true, false)".len(),
+    );
+    let named_arity_start = source
+        .find(named_arity_call)
+        .expect("named tuple call with excess outer argument exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "WRONG_ARGUMENT_COUNT",
+        "Pair: tuple variant expects 2 arguments but found 3",
+        named_arity_start,
+        named_arity_start + named_arity_call.len(),
     );
 }
 
