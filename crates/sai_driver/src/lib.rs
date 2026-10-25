@@ -2825,6 +2825,7 @@ pub struct TypeOwnerResolution {
     kind: TopLevelOwnerKind,
     path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
     local_record_field_types: Option<LocalRecordFieldTypesProjection>,
+    local_enum_payload_types: Option<LocalEnumPayloadTypesProjection>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
@@ -3089,6 +3090,132 @@ impl LocalRecordFieldTypesProjection {
     }
 }
 
+/// Why a local enum's payload types are not available in the current
+/// snapshot-bound projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnumPayloadTypesUnsupportedReason {
+    NotDirectLocalEnum,
+    InvalidOwnerIdentity,
+    GenericParameters,
+    WherePredicates,
+    RecoveredSyntax,
+    OwnerAnalysisFailed,
+}
+
+/// The source-ordered payload identity for one enum payload type.
+///
+/// Record payloads use their exact HIR field definition. Tuple payloads have
+/// no HIR field definition, so their identity is the exact variant definition
+/// and zero-based position rather than a fabricated `DefId`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnumPayloadTypeIdentity {
+    Tuple {
+        variant: DefId,
+        index: u32,
+    },
+    Record {
+        variant: DefId,
+        field: DefId,
+        name: Symbol,
+    },
+}
+
+/// The lowered type result for one exact enum payload position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumPayloadTypeProjection {
+    identity: LocalEnumPayloadTypeIdentity,
+    ty: Result<sai_ty::ty::Ty, sai_ty::lower_ty::UnsupportedTy>,
+}
+
+impl LocalEnumPayloadTypeProjection {
+    /// Exact tuple position or record field identity.
+    pub const fn identity(&self) -> LocalEnumPayloadTypeIdentity {
+        self.identity
+    }
+
+    /// Lowered payload type, or the explicit reason this payload is
+    /// unsupported.
+    pub fn ty(&self) -> Result<&sai_ty::ty::Ty, sai_ty::lower_ty::UnsupportedTy> {
+        self.ty.as_ref().map_err(|reason| *reason)
+    }
+}
+
+/// Payload shape and exact identity for one enum variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumVariantPayloadProjection {
+    def_id: DefId,
+    name: Symbol,
+    payload: LocalEnumVariantPayload,
+}
+
+impl LocalEnumVariantPayloadProjection {
+    /// Exact variant definition retained from the validated current HIR owner.
+    pub const fn def_id(&self) -> DefId {
+        self.def_id
+    }
+
+    /// Source-level variant name.
+    pub const fn name(&self) -> Symbol {
+        self.name
+    }
+
+    /// Unit, tuple, or record payload in source order.
+    pub const fn payload(&self) -> &LocalEnumVariantPayload {
+        &self.payload
+    }
+}
+
+/// Source-ordered payload types for one variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalEnumVariantPayload {
+    Unit,
+    Tuple(Arc<[LocalEnumPayloadTypeProjection]>),
+    Record(Arc<[LocalEnumPayloadTypeProjection]>),
+}
+
+/// The bounded payload-type projection for one direct local enum.
+///
+/// Successful projections retain variants and their payloads in source order.
+/// Each payload has an independent lowering result, so an unsupported type
+/// does not hide supported siblings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalEnumPayloadTypesProjection {
+    Supported {
+        owner: OwnerId,
+        variants: Arc<[LocalEnumVariantPayloadProjection]>,
+    },
+    Unsupported {
+        owner: OwnerId,
+        reason: LocalEnumPayloadTypesUnsupportedReason,
+    },
+}
+
+impl LocalEnumPayloadTypesProjection {
+    /// Exact enum owner whose payloads were projected.
+    pub const fn owner(&self) -> OwnerId {
+        match self {
+            Self::Supported { owner, .. } | Self::Unsupported { owner, .. } => *owner,
+        }
+    }
+
+    /// Source-ordered variant and payload results when the enum passed
+    /// validation.
+    pub fn variants(&self) -> Option<&[LocalEnumVariantPayloadProjection]> {
+        match self {
+            Self::Supported { variants, .. } => Some(variants),
+            Self::Unsupported { .. } => None,
+        }
+    }
+
+    /// Owner-level reason when this enum cannot be projected.
+    pub const fn unsupported_reason(&self) -> Option<LocalEnumPayloadTypesUnsupportedReason> {
+        match self {
+            Self::Supported { .. } => None,
+            Self::Unsupported { reason, .. } => Some(*reason),
+        }
+    }
+}
+
 fn validate_record_projection_type_params(
     type_params: &[(DefId, sai_ty::ty::ParamTy)],
 ) -> Result<(), ()> {
@@ -3261,6 +3388,51 @@ impl TypeOwnerResolutions {
             .iter()
             .find(|result| result.owner == owner)
             .and_then(|result| result.local_record_field_types.as_ref()))
+    }
+
+    /// Returns one direct local enum's payload-type projection after checking
+    /// collection and active-scope provenance.
+    pub fn local_enum_payload_types(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        owner: OwnerId,
+    ) -> Result<Option<&LocalEnumPayloadTypesProjection>, OwnerControlFlowResolutionError> {
+        self.local_enum_payload_types_with_scopes(collection, None, None, owner)
+    }
+
+    /// Returns an enum-payload projection after checking every source-member
+    /// and WIT-view closure used to resolve its payload paths.
+    pub fn local_enum_payload_types_with_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+        owner: OwnerId,
+    ) -> Result<Option<&LocalEnumPayloadTypesProjection>, OwnerControlFlowResolutionError> {
+        let matches_member_scopes = match member_scopes {
+            Some(scopes) => self.matches_member_scopes(collection, scopes),
+            None => {
+                self.matches_collection(collection)
+                    && self.member_scope_closure_fingerprint.is_none()
+            }
+        };
+        let matches_wit_view_scopes = match wit_view_scopes {
+            Some(scopes) => self.matches_wit_view_scopes(collection, scopes),
+            None => {
+                self.matches_collection(collection) && self.wit_view_closure_fingerprint.is_none()
+            }
+        };
+        if !self.matches_collection(collection)
+            || !matches_member_scopes
+            || !matches_wit_view_scopes
+        {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        Ok(self
+            .owners
+            .iter()
+            .find(|result| result.owner == owner)
+            .and_then(|result| result.local_enum_payload_types.as_ref()))
     }
 }
 
@@ -18981,6 +19153,11 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 reason: LocalRecordFieldTypesUnsupportedReason::OwnerAnalysisFailed,
                             }),
+                        local_enum_payload_types: (descriptor.kind == TopLevelOwnerKind::Enum)
+                            .then(|| LocalEnumPayloadTypesProjection::Unsupported {
+                                owner: descriptor.owner,
+                                reason: LocalEnumPayloadTypesUnsupportedReason::OwnerAnalysisFailed,
+                            }),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error.clone()),
                         module_path_diagnostics: Err(error),
@@ -18997,6 +19174,7 @@ impl RootDatabase {
                     Vec<Diagnostic>,
                     Vec<Diagnostic>,
                     Option<LocalRecordFieldTypesProjection>,
+                    Option<LocalEnumPayloadTypesProjection>,
                 ),
                 OwnerControlFlowResolutionError,
             > = (|| {
@@ -19190,12 +19368,27 @@ impl RootDatabase {
                 } else {
                     None
                 };
+                let local_enum_payload_types = if descriptor.kind == TopLevelOwnerKind::Enum {
+                    Some(self.lower_local_enum_payload_types(
+                        collection,
+                        &local_nominal_definitions,
+                        &local_type_alias_definitions,
+                        descriptor,
+                        &expected_path,
+                        &inputs,
+                        &hir_owner,
+                        &path_resolution,
+                    ))
+                } else {
+                    None
+                };
                 Ok((
                     path_resolution,
                     test_only_path_resolution,
                     diagnostics,
                     module_path_diagnostics,
                     local_record_field_types,
+                    local_enum_payload_types,
                 ))
             })();
 
@@ -19206,12 +19399,14 @@ impl RootDatabase {
                     diagnostics,
                     module_path_diagnostics,
                     local_record_field_types,
+                    local_enum_payload_types,
                 )) => {
                     owners.push(TypeOwnerResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         path_resolution: Ok(path_resolution),
                         local_record_field_types,
+                        local_enum_payload_types,
                         test_only_path_resolution: Ok(test_only_path_resolution),
                         test_only_diagnostics: Ok(diagnostics),
                         module_path_diagnostics: Ok(module_path_diagnostics),
@@ -19227,6 +19422,11 @@ impl RootDatabase {
                             .then(|| LocalRecordFieldTypesProjection::Unsupported {
                                 owner: descriptor.owner,
                                 reason: LocalRecordFieldTypesUnsupportedReason::OwnerAnalysisFailed,
+                            }),
+                        local_enum_payload_types: (descriptor.kind == TopLevelOwnerKind::Enum)
+                            .then(|| LocalEnumPayloadTypesProjection::Unsupported {
+                                owner: descriptor.owner,
+                                reason: LocalEnumPayloadTypesUnsupportedReason::OwnerAnalysisFailed,
                             }),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error.clone()),
@@ -19447,6 +19647,287 @@ impl RootDatabase {
             type_params: validated_type_params,
             fields: projected_fields,
             provenance,
+        }
+    }
+
+    fn lower_local_enum_payload_types(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        local_nominals: &HashMap<DefId, sai_ty::lower_ty::LocalNominalDef>,
+        local_aliases: &HashMap<DefId, sai_ty::lower_ty::LocalTypeAlias>,
+        descriptor: TopLevelOwnerDescriptor,
+        expected_path: &DefPath,
+        inputs: &CurrentOwnerInputs,
+        hir_owner: &HirOwner<'_>,
+        path_resolution: &TypeOwnerPathResolution,
+    ) -> LocalEnumPayloadTypesProjection {
+        let unsupported = |reason| LocalEnumPayloadTypesProjection::Unsupported {
+            owner: descriptor.owner,
+            reason,
+        };
+        let package = collection.module_tree.package;
+        if descriptor.kind != TopLevelOwnerKind::Enum
+            || descriptor.owner.def_id.package() != package
+            || hir_owner.id != descriptor.owner
+            || path_resolution.owner() != descriptor.owner
+        {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+        }
+
+        let Some(def_paths) = self.def_paths.get(&package) else {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+        };
+        let Some(source_syntax) = inputs
+            .ast_ids
+            .pointer(descriptor.item_id)
+            .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
+        else {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::OwnerAnalysisFailed);
+        };
+        let Some(declaration) = ast::EnumDecl::cast(source_syntax) else {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+        };
+        let syntax_has_error = declaration.syntax().descendants().any(|node| {
+            node.kind() == sai_syntax::SyntaxKind::ERROR
+                || node
+                    .children_with_tokens()
+                    .any(|element| element.as_token().is_some_and(|token| token.has_error()))
+        });
+        if syntax_has_error {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::RecoveredSyntax);
+        }
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+        };
+        if item.owner_id != descriptor.owner {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+        }
+        let ItemKind::Enum { generics, variants } = item.kind else {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::NotDirectLocalEnum);
+        };
+        if !generics.where_preds.is_empty() || declaration.where_clause().is_some() {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::WherePredicates);
+        }
+
+        let source_parameter_count = declaration
+            .generic_params()
+            .map_or(0, |parameters| parameters.params().count());
+        if source_parameter_count != generics.params.len() {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+        }
+        if !generics.params.is_empty() {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::GenericParameters);
+        }
+
+        let owner_components = expected_path.data();
+        if expected_path.package() != package
+            || !matches!(
+                owner_components.last(),
+                Some(component)
+                    if matches!(component.data, DefPathData::TypeNs(name)
+                        if name == item.name.sym)
+                        && component.disambiguator == 0
+            )
+        {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+        }
+
+        let Some(source_variants) = declaration
+            .variants()
+            .map(|list| list.variants().collect::<Vec<_>>())
+        else {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::RecoveredSyntax);
+        };
+        if source_variants.len() != variants.len() {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+        }
+
+        let field_local_aliases = local_aliases
+            .iter()
+            .filter(|(_, alias)| !alias.type_params.is_empty())
+            .map(|(def_id, alias)| (*def_id, alias.clone()))
+            .collect::<HashMap<_, _>>();
+        let type_parameters = HashSet::new();
+        let has_implicit_region_parameter = variants.iter().any(|variant| match variant.shape {
+            VariantShape::Unit => false,
+            VariantShape::Tuple(types) => types
+                .iter()
+                .any(|ty| local_record_field_type_has_explicit_borrow(ty, descriptor.owner)),
+            VariantShape::Record(fields) => fields.iter().any(|field| {
+                local_record_field_type_has_explicit_borrow(field.ty, descriptor.owner)
+            }),
+        });
+        // Array support is declaration-wide: an unrecognized or potentially
+        // region-bearing payload closes the gate for every variant.
+        let literal_arrays_are_region_free = variants.iter().all(|variant| match variant.shape {
+            VariantShape::Unit => true,
+            VariantShape::Tuple(types) => types.iter().all(|ty| {
+                local_record_field_type_is_region_free_for_array_projection(
+                    ty,
+                    descriptor.owner,
+                    path_resolution.paths(),
+                    local_nominals,
+                    &type_parameters,
+                    Some(&field_local_aliases),
+                )
+            }),
+            VariantShape::Record(fields) => fields.iter().all(|field| {
+                local_record_field_type_is_region_free_for_array_projection(
+                    field.ty,
+                    descriptor.owner,
+                    path_resolution.paths(),
+                    local_nominals,
+                    &type_parameters,
+                    Some(&field_local_aliases),
+                )
+            }),
+        });
+
+        let mut projected_variants = Vec::with_capacity(variants.len());
+        let mut seen_variant_definitions = HashSet::with_capacity(variants.len());
+        let mut seen_field_definitions = HashSet::new();
+        for (variant, source_variant) in variants.iter().zip(source_variants) {
+            let variant_def_id = variant.def_id.to_def_id();
+            let Some(variant_path) = def_paths.resolve_def_id(variant_def_id).ok().flatten() else {
+                return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+            };
+            let variant_components = variant_path.data();
+            let variant_has_expected_identity = variant.hir_id.owner == descriptor.owner
+                && variant_def_id.package == package
+                && variant_path.package() == expected_path.package()
+                && variant_components.len() == owner_components.len() + 1
+                && variant_components[..owner_components.len()] == *owner_components
+                && matches!(
+                    variant_components.last(),
+                    Some(component)
+                        if matches!(component.data, DefPathData::Variant(name)
+                            if name == variant.name.sym)
+                )
+                && seen_variant_definitions.insert(variant_def_id);
+            if !variant_has_expected_identity {
+                return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+            }
+            let source_shape_matches = match variant.shape {
+                VariantShape::Unit => {
+                    source_variant.tuple_shape().is_none()
+                        && source_variant.record_shape().is_none()
+                }
+                VariantShape::Tuple(types) => source_variant
+                    .tuple_shape()
+                    .is_some_and(|shape| shape.types().count() == types.len()),
+                VariantShape::Record(fields) => source_variant
+                    .record_shape()
+                    .is_some_and(|shape| shape.fields().count() == fields.len()),
+            };
+            if !source_shape_matches {
+                return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+            }
+
+            let payload = match variant.shape {
+                VariantShape::Unit => LocalEnumVariantPayload::Unit,
+                VariantShape::Tuple(types) => {
+                    let mut projected_types = Vec::with_capacity(types.len());
+                    for (index, ty) in types.iter().enumerate() {
+                        let Ok(index) = u32::try_from(index) else {
+                            return unsupported(
+                                LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity,
+                            );
+                        };
+                        if ty.hir_id.owner != descriptor.owner {
+                            return unsupported(
+                                LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity,
+                            );
+                        }
+                        let mut context = sai_ty::lower_ty::LowerTyContext::for_field(
+                            &self.semantic_types,
+                            descriptor.owner,
+                            path_resolution.paths(),
+                            has_implicit_region_parameter,
+                        )
+                        .with_field_local_nominals(local_nominals)
+                        .with_field_local_type_aliases(&field_local_aliases);
+                        if literal_arrays_are_region_free {
+                            context = context.with_field_array_literal_pointer_width(
+                                collection.target_cfg.pointer_width(),
+                            );
+                        }
+                        projected_types.push(LocalEnumPayloadTypeProjection {
+                            identity: LocalEnumPayloadTypeIdentity::Tuple {
+                                variant: variant_def_id,
+                                index,
+                            },
+                            ty: sai_ty::lower_ty::lower_ty(&mut context, ty),
+                        });
+                    }
+                    LocalEnumVariantPayload::Tuple(projected_types.into())
+                }
+                VariantShape::Record(fields) => {
+                    let mut projected_types = Vec::with_capacity(fields.len());
+                    for field in fields {
+                        let field_def_id = field.def_id.to_def_id();
+                        let Some(field_path) =
+                            def_paths.resolve_def_id(field_def_id).ok().flatten()
+                        else {
+                            return unsupported(
+                                LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity,
+                            );
+                        };
+                        let field_components = field_path.data();
+                        let field_has_expected_identity = field.hir_id.owner == descriptor.owner
+                            && field.ty.hir_id.owner == descriptor.owner
+                            && field_def_id.package == package
+                            && field_path.package() == expected_path.package()
+                            && field_components.len() == variant_components.len() + 1
+                            && field_components[..variant_components.len()] == *variant_components
+                            && matches!(
+                                field_components.last(),
+                                Some(component)
+                                    if matches!(component.data, DefPathData::Field(name)
+                                        if name == field.name.sym)
+                            )
+                            && seen_field_definitions.insert(field_def_id);
+                        if !field_has_expected_identity {
+                            return unsupported(
+                                LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity,
+                            );
+                        }
+
+                        let mut context = sai_ty::lower_ty::LowerTyContext::for_field(
+                            &self.semantic_types,
+                            descriptor.owner,
+                            path_resolution.paths(),
+                            has_implicit_region_parameter,
+                        )
+                        .with_field_local_nominals(local_nominals)
+                        .with_field_local_type_aliases(&field_local_aliases);
+                        if literal_arrays_are_region_free {
+                            context = context.with_field_array_literal_pointer_width(
+                                collection.target_cfg.pointer_width(),
+                            );
+                        }
+                        projected_types.push(LocalEnumPayloadTypeProjection {
+                            identity: LocalEnumPayloadTypeIdentity::Record {
+                                variant: variant_def_id,
+                                field: field_def_id,
+                                name: field.name.sym,
+                            },
+                            ty: sai_ty::lower_ty::lower_ty(&mut context, field.ty),
+                        });
+                    }
+                    LocalEnumVariantPayload::Record(projected_types.into())
+                }
+            };
+            projected_variants.push(LocalEnumVariantPayloadProjection {
+                def_id: variant_def_id,
+                name: variant.name.sym,
+                payload,
+            });
+        }
+
+        LocalEnumPayloadTypesProjection::Supported {
+            owner: descriptor.owner,
+            variants: projected_variants.into(),
         }
     }
 
@@ -93702,6 +94183,467 @@ interface facade { use middle.{payload}; }"#;
             .wasi_view(foreign_unit)
             .expect("foreign identity canonicalizes to the cached local view");
         assert!(Arc::ptr_eq(&local_view, &foreign_view));
+    }
+
+    #[test]
+    fn local_enum_payload_projection_preserves_exact_variant_and_field_identity() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "enum Payloads {\n",
+            "  Empty,\n",
+            "  Wrapped(child_alias.Identity<U8>),\n",
+            "  Pair(Bool, Array<U8, 2>),\n",
+            "  Named(first: I32, second: Array<U8, 3>),\n",
+            "  AnotherNamed(first: U16),\n",
+            "}\n",
+        );
+        let child = "pub type Identity<T> = (T, Bool)\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty active source-member closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("enum payload paths resolve with current member scopes");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        let owner = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::Enum
+                    && def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            path.data().last().is_some_and(|component| {
+                                matches!(
+                                    component.data,
+                                    DefPathData::TypeNs(name)
+                                        if database.symbols.resolve(name).ok().as_deref()
+                                            == Some("Payloads")
+                                )
+                            })
+                        })
+            })
+            .expect("the direct local enum owner is collected")
+            .owner;
+        let projection = resolved
+            .local_enum_payload_types_with_scopes(&collection, Some(&member_scopes), None, owner)
+            .expect("collection and member-scope provenance matches")
+            .expect("the direct local enum has a payload projection");
+        let variants = projection.variants().unwrap_or_else(|| {
+            panic!(
+                "enum projection rejected: {:?}",
+                projection.unsupported_reason()
+            )
+        });
+        assert_eq!(
+            variants
+                .iter()
+                .map(|variant| database
+                    .symbols
+                    .resolve(variant.name())
+                    .unwrap()
+                    .to_string())
+                .collect::<Vec<_>>(),
+            ["Empty", "Wrapped", "Pair", "Named", "AnotherNamed"],
+            "variants stay in source order, including unit variants"
+        );
+        assert!(matches!(
+            variants[0].payload(),
+            LocalEnumVariantPayload::Unit
+        ));
+
+        let LocalEnumVariantPayload::Tuple(wrapped) = variants[1].payload() else {
+            panic!("Wrapped keeps its tuple payload shape")
+        };
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(
+            wrapped[0].identity(),
+            LocalEnumPayloadTypeIdentity::Tuple {
+                variant: variants[1].def_id(),
+                index: 0,
+            },
+            "tuple identity is the exact variant and source position"
+        );
+        assert!(matches!(
+            wrapped[0].ty().expect("the local generic alias expands").kind(),
+            sai_ty::ty::TyKind::Tuple(elements)
+                if matches!(elements[0].kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8))
+                    && matches!(elements[1].kind(), sai_ty::ty::TyKind::Bool)
+        ));
+
+        let LocalEnumVariantPayload::Tuple(pair) = variants[2].payload() else {
+            panic!("Pair keeps its tuple payload shape")
+        };
+        assert_eq!(
+            pair.iter()
+                .map(LocalEnumPayloadTypeProjection::identity)
+                .collect::<Vec<_>>(),
+            [
+                LocalEnumPayloadTypeIdentity::Tuple {
+                    variant: variants[2].def_id(),
+                    index: 0,
+                },
+                LocalEnumPayloadTypeIdentity::Tuple {
+                    variant: variants[2].def_id(),
+                    index: 1,
+                },
+            ]
+        );
+        assert!(matches!(
+            pair[1]
+                .ty()
+                .expect("the literal array fits the target")
+                .kind(),
+            sai_ty::ty::TyKind::Array(_, sai_ty::ty::Const::Value(2))
+        ));
+
+        let LocalEnumVariantPayload::Record(named) = variants[3].payload() else {
+            panic!("Named keeps its record payload shape")
+        };
+        let LocalEnumVariantPayload::Record(another_named) = variants[4].payload() else {
+            panic!("AnotherNamed keeps its record payload shape")
+        };
+        let LocalEnumPayloadTypeIdentity::Record {
+            variant: named_variant,
+            field: named_field,
+            name: named_field_name,
+        } = named[0].identity()
+        else {
+            panic!("record payload identity contains its HIR field DefId")
+        };
+        let LocalEnumPayloadTypeIdentity::Record {
+            variant: another_variant,
+            field: another_field,
+            name: another_field_name,
+        } = another_named[0].identity()
+        else {
+            panic!("record payload identity contains its HIR field DefId")
+        };
+        assert_eq!(named_variant, variants[3].def_id());
+        assert_eq!(another_variant, variants[4].def_id());
+        assert_eq!(named_field_name, another_field_name);
+        assert_ne!(
+            named_field, another_field,
+            "same-named fields in different variants retain distinct definitions"
+        );
+        for (variant, field) in [
+            (named_variant, named_field),
+            (another_variant, another_field),
+        ] {
+            let variant_path = database
+                .resolve_def_path(variant)
+                .expect("the variant path resolves")
+                .expect("the variant path exists");
+            let field_path = database
+                .resolve_def_path(field)
+                .expect("the field path resolves")
+                .expect("the field path exists");
+            assert_eq!(
+                &field_path.data()[..variant_path.data().len()],
+                variant_path.data(),
+                "record field identity is a child of its exact variant"
+            );
+            assert!(matches!(
+                field_path.data().last(),
+                Some(sai_hir::DisambiguatedDefPathData {
+                    data: DefPathData::Field(name),
+                    ..
+                }) if *name == named_field_name
+            ));
+        }
+        assert!(matches!(
+            named[1]
+                .ty()
+                .expect("the second record field's array is supported")
+                .kind(),
+            sai_ty::ty::TyKind::Array(_, sai_ty::ty::Const::Value(3))
+        ));
+    }
+
+    #[test]
+    fn local_enum_payload_projection_uses_declaration_wide_regions_and_isolates_errors() {
+        let root = concat!(
+            "enum Borrowed {\n",
+            "  BorrowedValue(borrow Bool),\n",
+            "  ArrayValue(Array<U8, 2>),\n",
+            "  LaterValue(Char),\n",
+            "}\n",
+            "enum Unknown {\n",
+            "  MissingValue(Missing),\n",
+            "  ArrayValue(Array<U8, 3>),\n",
+            "  LaterValue(U16),\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty active source-member closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("all enum payload paths have an owner result");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        let projection_for = |name: &str| {
+            let owner = collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Enum
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .expect("the direct local enum owner is collected")
+                .owner;
+            let projection = resolved
+                .local_enum_payload_types_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    None,
+                    owner,
+                )
+                .expect("collection and member-scope provenance matches")
+                .expect("the local enum has a payload projection");
+            (owner, projection)
+        };
+
+        let (borrowed_owner, borrowed) = projection_for("Borrowed");
+        let borrowed_variants = borrowed.variants().expect("Borrowed is a valid enum");
+        let LocalEnumVariantPayload::Tuple(reference) = borrowed_variants[0].payload() else {
+            panic!("BorrowedValue has one tuple payload")
+        };
+        assert!(matches!(
+            reference[0].ty().expect("the borrow lowers").kind(),
+            sai_ty::ty::TyKind::Ref(
+                sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { item, index: 0 }),
+                inner,
+                sai_hir::Mutability::Not,
+            ) if *item == borrowed_owner.def_id.to_def_id()
+                && matches!(inner.kind(), sai_ty::ty::TyKind::Bool)
+        ));
+        let LocalEnumVariantPayload::Tuple(array) = borrowed_variants[1].payload() else {
+            panic!("ArrayValue has one tuple payload")
+        };
+        assert_eq!(
+            array[0].ty(),
+            Err(sai_ty::lower_ty::UnsupportedTy::Array),
+            "a borrow in one variant closes literal-array lowering for every payload"
+        );
+        let LocalEnumVariantPayload::Tuple(later) = borrowed_variants[2].payload() else {
+            panic!("LaterValue has one tuple payload")
+        };
+        assert!(matches!(
+            later[0]
+                .ty()
+                .expect("an unrelated later payload still lowers")
+                .kind(),
+            sai_ty::ty::TyKind::Char
+        ));
+
+        let (_, unknown) = projection_for("Unknown");
+        let unknown_variants = unknown.variants().expect("Unknown is a valid enum");
+        let LocalEnumVariantPayload::Tuple(missing) = unknown_variants[0].payload() else {
+            panic!("MissingValue has one tuple payload")
+        };
+        assert!(
+            missing[0].ty().is_err(),
+            "the unresolved payload stays local"
+        );
+        let LocalEnumVariantPayload::Tuple(unknown_array) = unknown_variants[1].payload() else {
+            panic!("ArrayValue has one tuple payload")
+        };
+        assert_eq!(
+            unknown_array[0].ty(),
+            Err(sai_ty::lower_ty::UnsupportedTy::Array),
+            "an unknown payload also closes the declaration-wide array gate"
+        );
+        let LocalEnumVariantPayload::Tuple(unknown_later) = unknown_variants[2].payload() else {
+            panic!("LaterValue has one tuple payload")
+        };
+        assert!(matches!(
+            unknown_later[0]
+                .ty()
+                .expect("an unrelated later payload still lowers")
+                .kind(),
+            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U16)
+        ));
+    }
+
+    #[test]
+    fn local_enum_payload_projection_rejects_unsupported_owners_and_checks_scopes() {
+        let root = concat!(
+            "enum Generic<T> { Value(T) }\n",
+            "enum WhereOnly where I32: Copy { Value(Bool) }\n",
+            "enum Recovered { Broken { malformed: Bool = }, Safe(U8) }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty active source-member closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("all enum owners retain a result");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        let projection_for = |name: &str| {
+            let owner = collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Enum
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .expect("the direct local enum owner is collected")
+                .owner;
+            (
+                owner,
+                resolved.local_enum_payload_types_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    None,
+                    owner,
+                ),
+            )
+        };
+        let (generic_owner, generic_result) = projection_for("Generic");
+        assert!(matches!(
+            resolved.local_enum_payload_types(&collection, generic_owner),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+        ));
+        let generic = generic_result
+            .expect("the active closure matches")
+            .expect("the generic enum retains a fail-closed result");
+        assert_eq!(
+            generic.unsupported_reason(),
+            Some(LocalEnumPayloadTypesUnsupportedReason::GenericParameters)
+        );
+
+        let (_, where_result) = projection_for("WhereOnly");
+        let where_only = where_result
+            .expect("the active closure matches")
+            .expect("the where-constrained enum retains a fail-closed result");
+        assert_eq!(
+            where_only.unsupported_reason(),
+            Some(LocalEnumPayloadTypesUnsupportedReason::WherePredicates)
+        );
+
+        let (_, recovered_result) = projection_for("Recovered");
+        let recovered = recovered_result
+            .expect("the active closure matches")
+            .expect("the recovered enum retains a fail-closed result");
+        assert!(
+            matches!(
+                recovered,
+                LocalEnumPayloadTypesProjection::Unsupported {
+                    reason: LocalEnumPayloadTypesUnsupportedReason::RecoveredSyntax
+                        | LocalEnumPayloadTypesUnsupportedReason::OwnerAnalysisFailed
+                        | LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity,
+                    ..
+                }
+            ),
+            "parser-recovered syntax never yields a partial enum payload projection"
+        );
     }
 
     fn view_definition_ids(view: &WitView) -> Vec<DefId> {
