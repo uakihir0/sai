@@ -20690,6 +20690,7 @@ impl RootDatabase {
                         ),
                         LocalEnumAdtDefError::NotModuleEnum
                         | LocalEnumAdtDefError::HirOwnerMismatch
+                        | LocalEnumAdtDefError::GenericParameterMismatch
                         | LocalEnumAdtDefError::VariantOrderMismatch
                         | LocalEnumAdtDefError::UnexpectedImplicitDiscriminant(_) => continue,
                     };
@@ -27593,7 +27594,7 @@ mod tests {
     use sai_package::validation::PackageValidationContext;
     use sai_package::version::Version;
     use sai_package::version_req::VersionReq;
-    use sai_ty::adt::LocalEnumPayloadTemplateIdentity;
+    use sai_ty::adt::{LocalEnumPayloadTemplateIdentity, LocalEnumVariantValueType};
     use sai_vfs::{
         PackageFileEntry, PackageRelativePath, SnapshotFile, SourceFile, WitFilesSnapshot,
         WorkspaceSnapshot,
@@ -95890,6 +95891,82 @@ interface facade { use middle.{payload}; }"#;
             complete_definition.variants()[2].payload(),
             LocalEnumPayloadTemplateShape::Unit
         ));
+        let complete_adt_projection = resolved
+            .local_enum_adt_with_scopes(&collection, Some(&member_scopes), None, complete_owner)
+            .expect("the current enum owner and scope provenance matches")
+            .expect("the complete generic enum has typed ADT metadata");
+        let complete_adt = complete_adt_projection
+            .definition()
+            .expect("the exact HIR owner produces a supported enum definition");
+        assert_eq!(
+            complete_adt.payloads(),
+            &complete_definition,
+            "the constructor model composes the same verified owner template"
+        );
+        let LocalEnumVariantValueType::Unit(unit_ty) = complete_adt
+            .value_type_of_variant(&database.semantic_types, complete_variants[2].def_id())
+            .expect("the exact source unit variant resolves")
+        else {
+            panic!("Empty has the enum's identity application as its value type")
+        };
+        let complete_identity_args = complete_type_params
+            .iter()
+            .map(|(_, param)| {
+                database
+                    .semantic_types
+                    .intern(sai_ty::ty::TyKind::Param(*param))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unit_ty.kind(),
+            &sai_ty::ty::TyKind::Adt(
+                complete_owner.def_id.to_def_id(),
+                complete_identity_args.into(),
+            )
+        );
+        let LocalEnumVariantValueType::TupleConstructor(tuple_template) = complete_adt
+            .value_type_of_variant(&database.semantic_types, complete_variants[0].def_id())
+            .expect("the exact source tuple variant resolves")
+        else {
+            panic!("Value has a function signature template")
+        };
+        assert_eq!(
+            tuple_template
+                .generic_params()
+                .iter()
+                .map(|parameter| match parameter {
+                    sai_ty::ty::FnSigGenericParam::Type(parameter) => {
+                        (parameter.def_id, parameter.param)
+                    }
+                    sai_ty::ty::FnSigGenericParam::Const(_) => {
+                        panic!("local enum payload binders are type-only")
+                    }
+                })
+                .collect::<Vec<_>>(),
+            complete_type_params.to_vec(),
+            "the signature keeps the exact HIR binder DefIds and source order"
+        );
+        assert!(matches!(
+            complete_adt
+                .value_type_of_variant(&database.semantic_types, complete_variants[1].def_id(),)
+                .expect("the exact source record variant resolves"),
+            LocalEnumVariantValueType::RecordHasNoValueType
+        ));
+        let complete_bool = database.semantic_types.intern(sai_ty::ty::TyKind::Bool);
+        let complete_char = database.semantic_types.intern(sai_ty::ty::TyKind::Char);
+        let complete_application = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            complete_owner.def_id.to_def_id(),
+            Arc::from([complete_bool.clone(), complete_char]),
+        ));
+        let specialized = complete_adt
+            .instantiate_tuple_variant_signature(
+                &database.semantic_types,
+                &complete_application,
+                complete_variants[0].def_id(),
+            )
+            .expect("the exact generic application specializes its tuple constructor once");
+        assert_eq!(specialized.inputs(), &[complete_bool]);
+        assert_eq!(specialized.output(), &complete_application);
 
         let LocalEnumVariantPayload::Tuple(value) = variants[0].payload() else {
             panic!("Value has a tuple payload")

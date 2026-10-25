@@ -71,7 +71,7 @@ pub enum TyKind {
     Array(Ty, Const),
     /// A function pointer with a source-ordered signature and explicit safety.
     FnPtr(FnPtrSig),
-    /// A type parameter in the binder of one function signature.
+    /// A type parameter in a validated type binder.
     Param(ParamTy),
     /// A nominal definition and its explicit type arguments.
     ///
@@ -126,11 +126,11 @@ pub struct SigRegion {
     pub index: u32,
 }
 
-/// A type parameter's position and source name in its owning function binder.
+/// A type parameter's position and source name in its owning type binder.
 ///
-/// The enclosing [`FnSig`] retains the corresponding local `DefId` for each
-/// entry in source order. This keeps the type node compact while preserving
-/// owner-local binder identity at the signature boundary.
+/// A function signature or enum payload template retains the corresponding
+/// binder `DefId` separately. This keeps the type node compact while
+/// preserving owner-local binder identity at the enclosing definition.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ParamTy {
     pub index: u32,
