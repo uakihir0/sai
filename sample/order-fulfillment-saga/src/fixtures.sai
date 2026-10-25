@@ -1,0 +1,99 @@
+use acme:order-fulfillment-saga/model.{
+    MAX_SAGAS
+    MAX_SAGA_EVENTS
+    SagaBatch
+    SagaCase
+    SagaEvent
+    SagaStep
+    StepResult
+}
+
+fn event(
+    event_id: U32,
+    operation_key: U32,
+    step: SagaStep,
+    attempt: USize,
+    result: StepResult,
+) -> SagaEvent {
+    SagaEvent(
+        event_id: event_id,
+        operation_key: operation_key,
+        step: step,
+        attempt: attempt,
+        result: result,
+    )
+}
+
+fn case(
+    order_id: U32,
+    events: Array<Option<SagaEvent>, MAX_SAGA_EVENTS>,
+    event_count: USize,
+) -> SagaCase {
+    SagaCase(order_id: order_id, events: events, event_count: event_count)
+}
+
+pub fn batch() -> SagaBatch {
+    var cases = Array<Option<SagaCase>, MAX_SAGAS>.filled(None)
+
+    var completed_events = Array<Option<SagaEvent>, MAX_SAGA_EVENTS>.filled(None)
+    completed_events[0] =
+        Some(event(1001, 70011, SagaStep.ReserveInventory, 1, StepResult.Succeeded))
+    completed_events[1] =
+        Some(event(1001, 70011, SagaStep.ReserveInventory, 1, StepResult.Succeeded))
+    completed_events[2] =
+        Some(event(1002, 70012, SagaStep.CapturePayment, 1, StepResult.RetryableFailure))
+    completed_events[3] = Some(event(1003, 70012, SagaStep.CapturePayment, 2, StepResult.Succeeded))
+    completed_events[4] = Some(event(1004, 70013, SagaStep.CreateShipment, 1, StepResult.Succeeded))
+    cases[0] = Some(case(7001, completed_events, 5))
+
+    var compensated_events = Array<Option<SagaEvent>, MAX_SAGA_EVENTS>.filled(None)
+    compensated_events[0] =
+        Some(event(2001, 70021, SagaStep.ReserveInventory, 1, StepResult.Succeeded))
+    compensated_events[1] =
+        Some(event(2002, 70022, SagaStep.CapturePayment, 1, StepResult.Succeeded))
+    compensated_events[2] =
+        Some(event(2003, 70023, SagaStep.CreateShipment, 1, StepResult.RetryableFailure))
+    compensated_events[3] =
+        Some(event(2004, 70023, SagaStep.CreateShipment, 2, StepResult.RetryableFailure))
+    compensated_events[4] =
+        Some(event(2005, 70024, SagaStep.RefundPayment, 1, StepResult.Succeeded))
+    compensated_events[5] =
+        Some(event(2006, 70025, SagaStep.ReleaseInventory, 1, StepResult.Succeeded))
+    cases[1] = Some(case(7002, compensated_events, 6))
+
+    var partial_compensation_events = Array<Option<SagaEvent>, MAX_SAGA_EVENTS>.filled(None)
+    partial_compensation_events[0] =
+        Some(event(3001, 70031, SagaStep.ReserveInventory, 1, StepResult.Succeeded))
+    partial_compensation_events[1] =
+        Some(event(3002, 70032, SagaStep.CapturePayment, 1, StepResult.Succeeded))
+    partial_compensation_events[2] =
+        Some(event(3003, 70033, SagaStep.CreateShipment, 1, StepResult.PermanentFailure))
+    partial_compensation_events[3] =
+        Some(event(3004, 70034, SagaStep.RefundPayment, 1, StepResult.RetryableFailure))
+    partial_compensation_events[4] =
+        Some(event(3005, 70034, SagaStep.RefundPayment, 2, StepResult.PermanentFailure))
+    cases[2] = Some(case(7003, partial_compensation_events, 5))
+
+    var payment_rejection_events = Array<Option<SagaEvent>, MAX_SAGA_EVENTS>.filled(None)
+    payment_rejection_events[0] =
+        Some(event(4001, 70041, SagaStep.ReserveInventory, 1, StepResult.Succeeded))
+    payment_rejection_events[1] =
+        Some(event(4002, 70042, SagaStep.CapturePayment, 1, StepResult.PermanentFailure))
+    payment_rejection_events[2] =
+        Some(event(4003, 70043, SagaStep.ReleaseInventory, 1, StepResult.Succeeded))
+    cases[3] = Some(case(7004, payment_rejection_events, 3))
+
+    var inventory_rejection_events = Array<Option<SagaEvent>, MAX_SAGA_EVENTS>.filled(None)
+    inventory_rejection_events[0] =
+        Some(event(5001, 70051, SagaStep.ReserveInventory, 1, StepResult.PermanentFailure))
+    cases[4] = Some(case(7005, inventory_rejection_events, 1))
+
+    var conflicting_duplicate_events = Array<Option<SagaEvent>, MAX_SAGA_EVENTS>.filled(None)
+    conflicting_duplicate_events[0] =
+        Some(event(6001, 70061, SagaStep.ReserveInventory, 1, StepResult.Succeeded))
+    conflicting_duplicate_events[1] =
+        Some(event(6001, 70062, SagaStep.CapturePayment, 1, StepResult.Succeeded))
+    cases[5] = Some(case(7006, conflicting_duplicate_events, 2))
+
+    SagaBatch(cases: cases, length: 6)
+}

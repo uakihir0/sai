@@ -1,0 +1,178 @@
+use acme:order-fulfillment-saga/audit
+use acme:order-fulfillment-saga/fixtures
+use acme:order-fulfillment-saga/model as model.{
+    FailureReason
+    ReviewReason
+    SagaReport
+    SagaStatus
+    SagaStep
+    StepResult
+}
+use acme:order-fulfillment-saga/replay
+
+pub fn audit_fixture() -> SagaReport {
+    audit.audit(fixtures.batch())
+}
+
+test "exact duplicate delivery is logged but does not repeat its inventory action" {
+    let report = audit_fixture()
+    let completed = report.sagas[0].unwrap()
+
+    assert report.valid
+    assert report.case_count == 6
+    assert report.completed_count == 1
+    assert report.compensated_count == 2
+    assert report.rejected_count == 1
+    assert report.needs_review_count == 2
+    assert report.event_count == 22
+    assert report.action_attempt_count == 20
+    assert report.duplicate_event_count == 1
+    assert report.retryable_failure_count == 4
+    assert report.rejected_event_count == 1
+    assert completed.status == SagaStatus.Completed
+    assert completed.event_count == 5
+    assert completed.action_attempt_count == 4
+    assert completed.duplicate_event_count == 1
+    assert completed.reserve_attempts == 1
+    assert completed.capture_attempts == 2
+    assert completed.retryable_failure_count == 1
+    assert completed.events[2].unwrap().operation_key == completed.events[3].unwrap().operation_key
+}
+
+test "exhausted shipment retries refund payment before releasing inventory" {
+    let report = audit_fixture()
+    let compensated = report.sagas[1].unwrap()
+
+    assert compensated.status == SagaStatus.Compensated
+    assert compensated.primary_failure == Some(FailureReason.RetryBudgetExhausted)
+    assert compensated.dispatch_attempts == 2
+    assert compensated.refund_attempts == 1
+    assert compensated.release_attempts == 1
+    assert compensated.refund_completed
+    assert compensated.inventory_released
+    assert not compensated.payment_captured
+    assert not compensated.inventory_reserved
+    assert compensated.events[4].unwrap().step == SagaStep.RefundPayment
+    assert compensated.events[5].unwrap().step == SagaStep.ReleaseInventory
+}
+
+test "failed refund preserves the captured payment and reserved stock for review" {
+    let partial = audit_fixture().sagas[2].unwrap()
+
+    assert partial.status == SagaStatus.NeedsReview
+    assert partial.primary_failure == Some(FailureReason.ShipmentRejected)
+    assert partial.compensation_failure == Some(FailureReason.PaymentRefundRejected)
+    assert partial.payment_captured
+    assert partial.inventory_reserved
+    assert not partial.refund_completed
+    assert not partial.inventory_released
+    assert partial.refund_attempts == 2
+}
+
+test "payment rejection releases inventory without attempting a refund" {
+    let report = audit_fixture()
+    let compensated = report.sagas[3].unwrap()
+
+    assert compensated.status == SagaStatus.Compensated
+    assert compensated.primary_failure == Some(FailureReason.PaymentRejected)
+    assert compensated.refund_attempts == 0
+    assert compensated.release_attempts == 1
+    assert not compensated.payment_captured
+    assert compensated.inventory_released
+}
+
+test "inventory rejection stops before payment or compensation" {
+    let rejected = audit_fixture().sagas[4].unwrap()
+
+    assert rejected.status == SagaStatus.Rejected
+    assert rejected.primary_failure == Some(FailureReason.InventoryRejected)
+    assert rejected.capture_attempts == 0
+    assert rejected.release_attempts == 0
+}
+
+test "an event ID reused for a different operation is held for review" {
+    let report = audit_fixture()
+    let held = report.sagas[5].unwrap()
+
+    assert held.status == SagaStatus.NeedsReview
+    assert held.review_reason == Some(ReviewReason.DuplicateEventIdConflict)
+    assert held.event_count == 2
+    assert held.action_attempt_count == 1
+    assert held.rejected_event_count == 1
+}
+
+test "a repeated order ID invalidates the batch without replaying the second case" {
+    var scenarios = fixtures.batch()
+    var duplicate = scenarios.cases[1].unwrap()
+    duplicate.order_id = 7001
+    scenarios.cases[1] = Some(duplicate)
+
+    let report = audit.audit(scenarios)
+    let held = report.sagas[1].unwrap()
+
+    assert not report.valid
+    assert held.status == SagaStatus.NeedsReview
+    assert held.review_reason == Some(ReviewReason.DuplicateOrderId)
+    assert held.event_count == 6
+    assert held.action_attempt_count == 0
+    assert held.rejected_event_count == 6
+    assert not held.inventory_reserved
+    assert report.event_count == 22
+    assert report.action_attempt_count == 14
+}
+
+test "a fresh event after successful completion is preserved and flagged" {
+    var scenario = fixtures.batch().cases[0].unwrap()
+    scenario.events[5] =
+        Some(model_event(1099, 70014, SagaStep.ReleaseInventory, 1, StepResult.Succeeded))
+    scenario.event_count = 6
+
+    let held = replay.replay(scenario)
+    assert held.status == SagaStatus.NeedsReview
+    assert held.review_reason == Some(ReviewReason.EventAfterTerminal)
+    assert held.event_count == 6
+    assert held.rejected_event_count == 1
+}
+
+test "a first event cannot skip the initial attempt number" {
+    var scenario = fixtures.batch().cases[0].unwrap()
+    scenario.events[0] =
+        Some(model_event(1001, 70011, SagaStep.ReserveInventory, 2, StepResult.Succeeded))
+    scenario.event_count = 1
+
+    let held = replay.replay(scenario)
+    assert held.status == SagaStatus.NeedsReview
+    assert held.review_reason == Some(ReviewReason.WrongAttemptNumber)
+    assert held.reserve_attempts == 0
+    assert held.action_attempt_count == 0
+    assert held.rejected_event_count == 1
+}
+
+fn model_event(
+    event_id: U32,
+    operation_key: U32,
+    step: SagaStep,
+    attempt: USize,
+    result: StepResult,
+) -> model.SagaEvent {
+    model.SagaEvent(
+        event_id: event_id,
+        operation_key: operation_key,
+        step: step,
+        attempt: attempt,
+        result: result,
+    )
+}
+
+test "a retry cannot change the idempotency key of an operation" {
+    var scenario = fixtures.batch().cases[0].unwrap()
+    scenario.events[3] =
+        Some(model_event(1003, 99999, SagaStep.CapturePayment, 2, StepResult.Succeeded))
+    scenario.event_count = 4
+    let held = replay.replay(scenario)
+
+    assert held.status == SagaStatus.NeedsReview
+    assert held.review_reason == Some(ReviewReason.ChangedOperationKey)
+    assert held.capture_attempts == 1
+    assert held.rejected_event_count == 1
+}

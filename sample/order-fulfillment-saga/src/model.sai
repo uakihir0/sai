@@ -1,0 +1,127 @@
+pub const MAX_SAGA_EVENTS: USize = 8
+pub const MAX_SAGAS: USize = 6
+pub const MAX_STAGE_ATTEMPTS: USize = 2
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SagaStep {
+    ReserveInventory
+    CapturePayment
+    CreateShipment
+    RefundPayment
+    ReleaseInventory
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum StepResult {
+    Succeeded
+    RetryableFailure
+    PermanentFailure
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SagaStatus {
+    AwaitingInventory
+    AwaitingPayment
+    AwaitingShipment
+    RefundingPayment
+    ReleasingInventory
+    Completed
+    Rejected
+    Compensated
+    NeedsReview
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum FailureReason {
+    InventoryRejected
+    PaymentRejected
+    ShipmentRejected
+    RetryBudgetExhausted
+    PaymentRefundRejected
+    InventoryReleaseRejected
+    CompensationRetryExhausted
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReviewReason {
+    DuplicateOrderId
+    DuplicateEventIdConflict
+    UnexpectedStep
+    WrongAttemptNumber
+    ChangedOperationKey
+    MissingOperationKey
+    EventAfterTerminal
+    EventAfterReview
+    EventLogCapacityExceeded
+    ScriptCountExceedsCapacity
+    MissingEventSlot
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SagaEvent {
+    pub event_id: U32
+    pub operation_key: U32
+    pub step: SagaStep
+    pub attempt: USize
+    pub result: StepResult
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SagaCase {
+    pub order_id: U32
+    pub events: Array<Option<SagaEvent>, MAX_SAGA_EVENTS>
+    pub event_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SagaBatch {
+    pub cases: Array<Option<SagaCase>, MAX_SAGAS>
+    pub length: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SagaResult {
+    pub order_id: U32
+    pub status: SagaStatus
+    pub events: Array<Option<SagaEvent>, MAX_SAGA_EVENTS>
+    // Includes every accepted arrival, including exact duplicates and conflicts.
+    pub event_count: USize
+    pub reserve_attempts: USize
+    pub capture_attempts: USize
+    pub dispatch_attempts: USize
+    pub refund_attempts: USize
+    pub release_attempts: USize
+    pub action_attempt_count: USize
+    pub duplicate_event_count: USize
+    pub retryable_failure_count: USize
+    pub rejected_event_count: USize
+    pub reserve_operation_key: U32
+    pub capture_operation_key: U32
+    pub dispatch_operation_key: U32
+    pub refund_operation_key: U32
+    pub release_operation_key: U32
+    pub inventory_reserved: Bool
+    pub payment_captured: Bool
+    pub shipment_dispatched: Bool
+    pub refund_completed: Bool
+    pub inventory_released: Bool
+    pub primary_failure: Option<FailureReason>
+    pub compensation_failure: Option<FailureReason>
+    pub review_reason: Option<ReviewReason>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SagaReport {
+    pub sagas: Array<Option<SagaResult>, MAX_SAGAS>
+    pub case_count: USize
+    pub completed_count: USize
+    pub compensated_count: USize
+    pub rejected_count: USize
+    pub needs_review_count: USize
+    pub event_count: USize
+    pub action_attempt_count: USize
+    pub duplicate_event_count: USize
+    pub retryable_failure_count: USize
+    pub rejected_event_count: USize
+    pub valid: Bool
+}
