@@ -814,8 +814,13 @@ subset. This path result records path identity only; it does not record
 `type_dependent_defs` or synthesize expression types. That sentence describes
 the original IR-921 recognition slice: IR-922/923 later add the value-type and
 type-dependent-definition projections to the per-owner result. IR-924 through
-IR-932 add limited constructor-call diagnostics without claiming general
-expression types.
+IR-939 add limited constructor-call diagnostics without claiming general
+expression types. IR-938 reports nonempty tuple literals supplied where
+supported primitive or unit payloads are expected. IR-939 reports direct
+fixed-type Bool, Byte, Char, or unit literals supplied where nonempty tuple
+payloads are expected. Empty tuple/unit and scalar-parenthesis versus
+singleton-tuple forms retain their distinct HIR meanings; numeric defaulting
+and nonliteral expressions remain outside these shape checks.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -2458,7 +2463,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924–IR-936 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-939 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
@@ -2488,7 +2493,15 @@ names, and general expression typing, `TypeckResults::call_kinds`, and generic,
 external, dependency, or WIT variant paths remain outside the projection.
 `sai check` reports the staged diagnostics while retaining its incomplete-stage
 gate; it does not claim full check coverage or emit a success result for these
-inputs.
+inputs. IR-937 reports nonempty tuple-to-tuple arity mismatches on the
+complete expression span and suppresses checks within that subtree. IR-938
+reports nonempty tuple literals against supported primitive/unit inputs;
+IR-939 reports direct fixed-type Bool/Byte/Char/unit literals against
+nonempty tuple inputs. Empty tuple/unit and `(e)` versus `(e,)` retain their
+distinct meanings; numeric defaulting, strings, paths, calls, coercions, and
+unsupported payload types remain excluded. These diagnostics preserve
+eligible sibling checks, independent named-argument and outer-arity errors,
+and the CLI incomplete-stage gate.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
