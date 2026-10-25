@@ -1,0 +1,478 @@
+use acme:bounded-wal-key-value-store/model.{
+    AppendReport
+    AppendStatus
+    CompactionReport
+    CompactionStatus
+    Journal
+    JournalRecord
+    MAX_JOURNAL_RECORDS
+    MAX_KEYS
+    MAX_TRANSACTION_OPS
+    OperationKind
+    RecordKind
+    RecoveryReport
+    RecoveryStatus
+    StoreEntry
+    StoreState
+    TransactionBatch
+    WriteOperation
+}
+
+pub fn empty_journal() -> Journal {
+    Journal(
+        records: Array<Option<JournalRecord>, MAX_JOURNAL_RECORDS>.filled(None),
+        record_count: 0,
+    )
+}
+
+pub fn empty_batch() -> TransactionBatch {
+    TransactionBatch(
+        operations: Array<Option<WriteOperation>, MAX_TRANSACTION_OPS>.filled(None),
+        operation_count: 0,
+    )
+}
+
+pub fn empty_store() -> StoreState {
+    StoreState(entries: Array<Option<StoreEntry>, MAX_KEYS>.filled(None), entry_count: 0)
+}
+
+fn entry_index(state: StoreState, key: U32) -> Option<USize> {
+    if state.entry_count > MAX_KEYS {
+        return None
+    }
+    for index in 0..state.entry_count {
+        match state.entries[index] {
+            Some(entry) => {
+                if entry.key == key {
+                    return Some(index)
+                }
+            }
+            None => return None
+        }
+    }
+    None
+}
+
+pub fn get(state: StoreState, key: U32) -> Option<I32> {
+    match entry_index(state, key) {
+        Some(index) => {
+            let entry = match state.entries[index] { Some(value) => value, None => return None }
+            if entry.deleted {
+                None
+            } else {
+                Some(entry.value)
+            }
+        }
+        None => None
+    }
+}
+
+pub fn is_tombstoned(state: StoreState, key: U32) -> Bool {
+    match entry_index(state, key) {
+        Some(index) => {
+            let entry = match state.entries[index] { Some(value) => value, None => return false }
+            entry.deleted
+        }
+        None => false
+    }
+}
+
+pub fn live_key_count(state: StoreState) -> USize {
+    if state.entry_count > MAX_KEYS {
+        return 0
+    }
+    var count: USize = 0
+    for index in 0..state.entry_count {
+        match state.entries[index] {
+            Some(entry) => {
+                if not entry.deleted {
+                    count += 1
+                }
+            }
+            None => return 0
+        }
+    }
+    count
+}
+
+pub fn store_invariants_hold(state: StoreState) -> Bool {
+    if state.entry_count > MAX_KEYS {
+        return false
+    }
+    for index in 0..state.entry_count {
+        let entry = match state.entries[index] { Some(value) => value, None => return false }
+        if entry.key == 0 {
+            return false
+        }
+        for prior_index in 0..index {
+            let prior = state.entries[prior_index].unwrap()
+            if prior.key == entry.key {
+                return false
+            }
+        }
+    }
+    for index in state.entry_count..MAX_KEYS {
+        if state.entries[index] != None {
+            return false
+        }
+    }
+    true
+}
+
+fn apply_operation(state: StoreState, operation: WriteOperation) -> Option<StoreState> {
+    if operation.key == 0 or not store_invariants_hold(state) {
+        return None
+    }
+    var next = state
+    match entry_index(state, operation.key) {
+        Some(index) => {
+            var entry = state.entries[index].unwrap()
+            match operation.kind {
+                OperationKind.Put => {
+                    entry.value = operation.value
+                    entry.deleted = false
+                }
+                OperationKind.Delete => {
+                    entry.value = 0
+                    entry.deleted = true
+                }
+            }
+            next.entries[index] = Some(entry)
+            Some(next)
+        }
+        None => {
+            match operation.kind {
+                OperationKind.Delete => Some(next)
+                OperationKind.Put => {
+                    if state.entry_count >= MAX_KEYS {
+                        return None
+                    }
+                    next.entries[state.entry_count] =
+                        Some(StoreEntry(key: operation.key, value: operation.value, deleted: false))
+                    next.entry_count += 1
+                    Some(next)
+                }
+            }
+        }
+    }
+}
+
+fn invalid_recovery() -> RecoveryReport {
+    RecoveryReport(
+        status: RecoveryStatus.InvalidJournal,
+        state: empty_store(),
+        committed_transaction_count: 0,
+        committed_operation_count: 0,
+        last_committed_transaction_id: 0,
+        ignored_incomplete_record_count: 0,
+    )
+}
+
+pub fn recover(journal: Journal) -> RecoveryReport {
+    if journal.record_count > MAX_JOURNAL_RECORDS {
+        return invalid_recovery()
+    }
+    for index in journal.record_count..MAX_JOURNAL_RECORDS {
+        if journal.records[index] != None {
+            return invalid_recovery()
+        }
+    }
+
+    var state = empty_store()
+    var pending = Array<Option<WriteOperation>, MAX_TRANSACTION_OPS>.filled(None)
+    var pending_count: USize = 0
+    var pending_transaction_id: Option<U32> = None
+    var committed_transaction_count: USize = 0
+    var committed_operation_count: USize = 0
+    var last_committed_transaction_id: U32 = 0
+
+    for index in 0..journal.record_count {
+        let record = match journal.records[index] {
+            Some(value) => value
+            None => return invalid_recovery()
+        }
+        if record.transaction_id == 0 {
+            return invalid_recovery()
+        }
+
+        match record.kind {
+            RecordKind.Put => {
+                if record.key == 0 {
+                    return invalid_recovery()
+                }
+                match pending_transaction_id {
+                    Some(transaction_id) => {
+                        if transaction_id != record.transaction_id {
+                            return invalid_recovery()
+                        }
+                    }
+                    None => {
+                        if record.transaction_id <= last_committed_transaction_id {
+                            return invalid_recovery()
+                        }
+                        pending_transaction_id = Some(record.transaction_id)
+                    }
+                }
+                if pending_count >= MAX_TRANSACTION_OPS {
+                    return invalid_recovery()
+                }
+                pending[pending_count] = Some(
+                    WriteOperation(kind: OperationKind.Put, key: record.key, value: record.value),
+                )
+                pending_count += 1
+            }
+            RecordKind.Delete => {
+                if record.key == 0 or record.value != 0 {
+                    return invalid_recovery()
+                }
+                match pending_transaction_id {
+                    Some(transaction_id) => {
+                        if transaction_id != record.transaction_id {
+                            return invalid_recovery()
+                        }
+                    }
+                    None => {
+                        if record.transaction_id <= last_committed_transaction_id {
+                            return invalid_recovery()
+                        }
+                        pending_transaction_id = Some(record.transaction_id)
+                    }
+                }
+                if pending_count >= MAX_TRANSACTION_OPS {
+                    return invalid_recovery()
+                }
+                pending[pending_count] =
+                    Some(WriteOperation(kind: OperationKind.Delete, key: record.key, value: 0))
+                pending_count += 1
+            }
+            RecordKind.Commit => {
+                if (
+                    pending_count == 0
+                    or pending_transaction_id != Some(record.transaction_id)
+                    or record.key != 0
+                    or record.value != 0
+                ) {
+                    return invalid_recovery()
+                }
+
+                var candidate = state
+                for operation_index in 0..pending_count {
+                    let operation = match pending[operation_index] {
+                        Some(value) => value
+                        None => return invalid_recovery()
+                    }
+                    candidate = match apply_operation(candidate, operation) {
+                        Some(value) => value
+                        None => return invalid_recovery()
+                    }
+                }
+                if not store_invariants_hold(candidate) {
+                    return invalid_recovery()
+                }
+
+                state = candidate
+                committed_transaction_count += 1
+                committed_operation_count += pending_count
+                last_committed_transaction_id = record.transaction_id
+                pending_count = 0
+                pending_transaction_id = None
+                pending = Array<Option<WriteOperation>, MAX_TRANSACTION_OPS>.filled(None)
+            }
+        }
+    }
+
+    RecoveryReport(
+        status: RecoveryStatus.Complete,
+        state: state,
+        committed_transaction_count: committed_transaction_count,
+        committed_operation_count: committed_operation_count,
+        last_committed_transaction_id: last_committed_transaction_id,
+        ignored_incomplete_record_count: pending_count,
+    )
+}
+
+pub fn journal_invariants_hold(journal: Journal) -> Bool {
+    recover(journal).status == RecoveryStatus.Complete
+}
+
+fn append_failure(status: AppendStatus, journal: Journal) -> AppendReport {
+    AppendReport(status: status, journal: journal, appended_record_count: 0)
+}
+
+pub fn append_transaction(
+    journal: Journal,
+    transaction_id: U32,
+    batch: TransactionBatch,
+    records_to_write: USize,
+) -> AppendReport {
+    let recovered = recover(journal)
+    if recovered.status != RecoveryStatus.Complete {
+        return append_failure(AppendStatus.InvalidJournal, journal)
+    }
+    if recovered.ignored_incomplete_record_count > 0 {
+        return append_failure(AppendStatus.NeedsCompaction, journal)
+    }
+    if (
+        batch.operation_count == 0
+        or batch.operation_count > MAX_TRANSACTION_OPS
+        or transaction_id == 0
+        or transaction_id <= recovered.last_committed_transaction_id
+    ) {
+        return append_failure(AppendStatus.InvalidBatch, journal)
+    }
+    for index in 0..batch.operation_count {
+        let operation = match batch.operations[index] {
+            Some(value) => value
+            None => return append_failure(AppendStatus.InvalidBatch, journal)
+        }
+        if operation.key == 0 {
+            return append_failure(AppendStatus.InvalidBatch, journal)
+        }
+    }
+    for index in batch.operation_count..MAX_TRANSACTION_OPS {
+        if batch.operations[index] != None {
+            return append_failure(AppendStatus.InvalidBatch, journal)
+        }
+    }
+
+    var candidate = recovered.state
+    for index in 0..batch.operation_count {
+        let operation = batch.operations[index].unwrap()
+        candidate = match apply_operation(candidate, operation) {
+            Some(value) => value
+            None => return append_failure(AppendStatus.NoStoreCapacity, journal)
+        }
+    }
+
+    let required_record_count = batch.operation_count + 1
+    if required_record_count > MAX_JOURNAL_RECORDS - journal.record_count {
+        return append_failure(AppendStatus.NoCapacity, journal)
+    }
+
+    let write_count = if records_to_write < required_record_count {
+        records_to_write
+    } else {
+        required_record_count
+    }
+    var next = journal
+    var appended_record_count: USize = 0
+    for index in 0..batch.operation_count {
+        if appended_record_count >= write_count {
+            break
+        }
+        let operation = batch.operations[index].unwrap()
+        let kind = match operation.kind {
+            OperationKind.Put => RecordKind.Put
+            OperationKind.Delete => RecordKind.Delete
+        }
+        next.records[next.record_count] = Some(
+            JournalRecord(
+                kind: kind,
+                transaction_id: transaction_id,
+                key: operation.key,
+                value: if operation.kind == OperationKind.Put {
+                    operation.value
+                } else {
+                    0
+                },
+            ),
+        )
+        next.record_count += 1
+        appended_record_count += 1
+    }
+
+    if write_count == required_record_count {
+        next.records[next.record_count] = Some(
+            JournalRecord(
+                kind: RecordKind.Commit,
+                transaction_id: transaction_id,
+                key: 0,
+                value: 0,
+            ),
+        )
+        next.record_count += 1
+        appended_record_count += 1
+        AppendReport(
+            status: AppendStatus.Committed,
+            journal: next,
+            appended_record_count: appended_record_count,
+        )
+    } else {
+        AppendReport(
+            status: AppendStatus.Interrupted,
+            journal: next,
+            appended_record_count: appended_record_count,
+        )
+    }
+}
+
+fn invalid_compaction(journal: Journal) -> CompactionReport {
+    CompactionReport(
+        status: CompactionStatus.InvalidJournal,
+        journal: journal,
+        before_record_count: journal.record_count,
+        after_record_count: journal.record_count,
+        dropped_tombstone_count: 0,
+        discarded_incomplete_record_count: 0,
+    )
+}
+
+pub fn compact_journal(journal: Journal) -> CompactionReport {
+    let recovered = recover(journal)
+    if recovered.status != RecoveryStatus.Complete {
+        return invalid_compaction(journal)
+    }
+
+    let state = recovered.state
+    let live_count = live_key_count(state)
+    var emitted = Array<Bool, MAX_KEYS>.filled(false)
+    var batch = empty_batch()
+
+    for output_index in 0..live_count {
+        var selected: Option<USize> = None
+        for index in 0..state.entry_count {
+            let entry = state.entries[index].unwrap()
+            if not entry.deleted and not emitted[index] {
+                match selected {
+                    Some(selected_index) => {
+                        let selected_entry = state.entries[selected_index].unwrap()
+                        if entry.key < selected_entry.key {
+                            selected = Some(index)
+                        }
+                    }
+                    None => {
+                        selected = Some(index)
+                    }
+                }
+            }
+        }
+
+        let selected_index = match selected {
+            Some(value) => value
+            None => return invalid_compaction(journal)
+        }
+        let entry = state.entries[selected_index].unwrap()
+        batch.operations[output_index] =
+            Some(WriteOperation(kind: OperationKind.Put, key: entry.key, value: entry.value))
+        batch.operation_count += 1
+        emitted[selected_index] = true
+    }
+
+    let compacted_journal = if batch.operation_count == 0 {
+        empty_journal()
+    } else {
+        let append = append_transaction(empty_journal(), 1, batch, MAX_JOURNAL_RECORDS)
+        if append.status != AppendStatus.Committed {
+            return invalid_compaction(journal)
+        }
+        append.journal
+    }
+    CompactionReport(
+        status: CompactionStatus.Complete,
+        journal: compacted_journal,
+        before_record_count: journal.record_count,
+        after_record_count: compacted_journal.record_count,
+        dropped_tombstone_count: state.entry_count - live_count,
+        discarded_incomplete_record_count: recovered.ignored_incomplete_record_count,
+    )
+}

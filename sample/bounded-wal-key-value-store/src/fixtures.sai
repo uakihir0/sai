@@ -1,0 +1,89 @@
+use acme:bounded-wal-key-value-store/engine
+use acme:bounded-wal-key-value-store/model.{
+    Journal
+    MAX_TRANSACTION_OPS
+    OperationKind
+    TransactionBatch
+    WriteOperation
+}
+
+fn batch_three(
+    first: WriteOperation,
+    second: WriteOperation,
+    third: WriteOperation,
+) -> TransactionBatch {
+    var batch = engine.empty_batch()
+    batch.operations[0] = Some(first)
+    batch.operations[1] = Some(second)
+    batch.operations[2] = Some(third)
+    batch.operation_count = 3
+    batch
+}
+
+fn batch_two(first: WriteOperation, second: WriteOperation) -> TransactionBatch {
+    var batch = engine.empty_batch()
+    batch.operations[0] = Some(first)
+    batch.operations[1] = Some(second)
+    batch.operation_count = 2
+    batch
+}
+
+fn batch_one(operation: WriteOperation) -> TransactionBatch {
+    var batch = engine.empty_batch()
+    batch.operations[0] = Some(operation)
+    batch.operation_count = 1
+    batch
+}
+
+fn put(key: U32, value: I32) -> WriteOperation {
+    WriteOperation(kind: OperationKind.Put, key: key, value: value)
+}
+
+fn delete(key: U32) -> WriteOperation {
+    WriteOperation(kind: OperationKind.Delete, key: key, value: 0)
+}
+
+pub fn interrupted_history() -> Journal {
+    var journal = engine.empty_journal()
+    journal = engine.append_transaction(
+        journal,
+        1,
+        batch_three(put(30, 300), put(10, 100), put(20, 200)),
+        4,
+    ).journal
+    journal = engine.append_transaction(journal, 2, batch_two(put(10, 111), delete(20)), 3).journal
+    journal = engine.append_transaction(journal, 3, batch_one(put(40, 400)), 2).journal
+    engine.append_transaction(journal, 4, batch_two(put(50, 500), delete(30)), 2).journal
+}
+
+pub fn small_put_batch() -> TransactionBatch {
+    batch_one(put(60, 600))
+}
+
+pub fn tombstone_only_history() -> Journal {
+    let with_key =
+        engine.append_transaction(engine.empty_journal(), 1, batch_one(put(7, 70)), 2).journal
+    engine.append_transaction(with_key, 2, batch_one(delete(7)), 2).journal
+}
+
+pub fn existing_put_batch() -> TransactionBatch {
+    batch_one(put(1, 42))
+}
+
+pub fn two_existing_put_batch() -> TransactionBatch {
+    batch_two(put(1, 42), put(2, 84))
+}
+
+pub fn full_sized_batch() -> TransactionBatch {
+    TransactionBatch(
+        operations: [
+            Some(put(1, 0)),
+            Some(put(2, 1)),
+            Some(put(3, 2)),
+            Some(put(4, 3)),
+            Some(put(5, 4)),
+            Some(put(6, 5)),
+        ],
+        operation_count: MAX_TRANSACTION_OPS,
+    )
+}

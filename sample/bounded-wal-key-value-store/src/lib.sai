@@ -1,0 +1,165 @@
+use acme:bounded-wal-key-value-store/engine
+use acme:bounded-wal-key-value-store/fixtures
+use acme:bounded-wal-key-value-store/model.{
+    AppendStatus
+    CompactionStatus
+    MAX_JOURNAL_RECORDS
+    MAX_TRANSACTION_OPS
+    OperationKind
+    RecordKind
+    RecoveryStatus
+    WriteOperation
+}
+
+pub fn recover_demo() -> engine.RecoveryReport {
+    engine.recover(fixtures.interrupted_history())
+}
+
+pub fn compact_demo() -> engine.CompactionReport {
+    engine.compact_journal(fixtures.interrupted_history())
+}
+
+test "recovery applies only committed operations and preserves the prior value" {
+    let report = recover_demo()
+
+    assert report.status == RecoveryStatus.Complete
+    assert report.committed_transaction_count == 3
+    assert report.committed_operation_count == 6
+    assert report.last_committed_transaction_id == 3
+    assert report.ignored_incomplete_record_count == 2
+    assert engine.get(report.state, 10) == Some(111)
+    assert engine.get(report.state, 20) == None
+    assert engine.is_tombstoned(report.state, 20)
+    assert engine.get(report.state, 30) == Some(300)
+    assert engine.get(report.state, 40) == Some(400)
+    assert engine.get(report.state, 50) == None
+    assert not engine.is_tombstoned(report.state, 50)
+    assert report.state.entry_count == 4
+    assert engine.live_key_count(report.state) == 3
+    assert engine.store_invariants_hold(report.state)
+    assert engine.journal_invariants_hold(fixtures.interrupted_history())
+}
+
+test "compaction drops tombstones and the incomplete suffix in key order" {
+    let report = compact_demo()
+    let recovered = engine.recover(report.journal)
+
+    assert report.status == CompactionStatus.Complete
+    assert report.before_record_count == 11
+    assert report.after_record_count == 4
+    assert report.dropped_tombstone_count == 1
+    assert report.discarded_incomplete_record_count == 2
+    assert report.journal.records[0].unwrap().kind == RecordKind.Put
+    assert report.journal.records[0].unwrap().key == 10
+    assert report.journal.records[1].unwrap().key == 30
+    assert report.journal.records[2].unwrap().key == 40
+    assert report.journal.records[3].unwrap().kind == RecordKind.Commit
+    assert recovered.status == RecoveryStatus.Complete
+    assert recovered.ignored_incomplete_record_count == 0
+    assert recovered.state.entry_count == 3
+    assert engine.get(recovered.state, 10) == Some(111)
+    assert engine.get(recovered.state, 20) == None
+    assert engine.get(recovered.state, 30) == Some(300)
+    assert engine.get(recovered.state, 40) == Some(400)
+    assert engine.store_invariants_hold(recovered.state)
+}
+
+test "compaction produces the same canonical journal for the same input" {
+    let first = engine.compact_journal(fixtures.interrupted_history())
+    let second = engine.compact_journal(fixtures.interrupted_history())
+
+    assert first.status == CompactionStatus.Complete
+    assert first.journal == second.journal
+}
+
+test "compaction returns an empty journal when no live keys remain" {
+    let report = engine.compact_journal(fixtures.tombstone_only_history())
+
+    assert report.status == CompactionStatus.Complete
+    assert report.before_record_count == 4
+    assert report.after_record_count == 0
+    assert report.dropped_tombstone_count == 1
+    assert report.discarded_incomplete_record_count == 0
+    assert report.journal == engine.empty_journal()
+}
+
+test "an append cannot be placed behind an incomplete transaction" {
+    let journal = fixtures.interrupted_history()
+    let result = engine.append_transaction(journal, 5, fixtures.small_put_batch(), 2)
+
+    assert result.status == AppendStatus.NeedsCompaction
+    assert result.journal == journal
+    assert result.appended_record_count == 0
+}
+
+test "compaction allows a later transaction in the new journal generation" {
+    let compacted = engine.compact_journal(fixtures.interrupted_history())
+    let append = engine.append_transaction(compacted.journal, 2, fixtures.small_put_batch(), 2)
+    let recovered = engine.recover(append.journal)
+
+    assert append.status == AppendStatus.Committed
+    assert recovered.status == RecoveryStatus.Complete
+    assert recovered.committed_transaction_count == 2
+    assert recovered.last_committed_transaction_id == 2
+    assert engine.get(recovered.state, 60) == Some(600)
+}
+
+test "a transaction that cannot fit is rejected without a partial append" {
+    let batch = fixtures.full_sized_batch()
+    let base = engine.empty_journal()
+    var journal = engine.append_transaction(base, 1, batch, MAX_TRANSACTION_OPS + 1).journal
+    journal = engine.append_transaction(journal, 2, batch, MAX_TRANSACTION_OPS + 1).journal
+    journal = engine.append_transaction(journal, 3, batch, MAX_TRANSACTION_OPS + 1).journal
+
+    let final_fit = engine.append_transaction(journal, 4, fixtures.two_existing_put_batch(), 3)
+    assert final_fit.status == AppendStatus.Committed
+    journal = final_fit.journal
+    let before = journal
+    let rejected = engine.append_transaction(
+        journal,
+        5,
+        fixtures.existing_put_batch(),
+        MAX_TRANSACTION_OPS + 1,
+    )
+    assert before.record_count == MAX_JOURNAL_RECORDS
+    assert rejected.status == AppendStatus.NoCapacity
+    assert rejected.journal == before
+    assert rejected.appended_record_count == 0
+}
+
+test "a committed batch that exceeds table capacity is rejected before logging" {
+    let filled = engine.append_transaction(
+        engine.empty_journal(),
+        1,
+        fixtures.full_sized_batch(),
+        MAX_TRANSACTION_OPS + 1,
+    )
+    let result = engine.append_transaction(filled.journal, 2, fixtures.small_put_batch(), 2)
+
+    assert filled.status == AppendStatus.Committed
+    assert result.status == AppendStatus.NoStoreCapacity
+    assert result.journal == filled.journal
+}
+
+test "invalid zero keys are rejected before any transaction records are appended" {
+    var batch = engine.empty_batch()
+    batch.operations[0] = Some(WriteOperation(kind: OperationKind.Put, key: 0, value: 9))
+    batch.operation_count = 1
+
+    let result = engine.append_transaction(engine.empty_journal(), 1, batch, 2)
+    assert result.status == AppendStatus.InvalidBatch
+    assert result.journal.record_count == 0
+}
+
+test "malformed journals fail validation without returning partial state" {
+    var journal = fixtures.interrupted_history()
+    var first_record = journal.records[0].unwrap()
+    first_record.transaction_id = 0
+    journal.records[0] = Some(first_record)
+    let report = engine.recover(journal)
+
+    assert not engine.journal_invariants_hold(journal)
+    assert report.status == RecoveryStatus.InvalidJournal
+    assert report.state.entry_count == 0
+    assert engine.live_key_count(report.state) == 0
+}
