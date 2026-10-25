@@ -784,7 +784,14 @@ call semantics for supported local enum variant calls. IR-924 checks arity,
 IR-925 diagnoses named arguments, IR-926 checks direct literal arguments,
 IR-927 checks aligned tuple-literal leaves at tuple-variant coercion sites, and
 IR-928 checks direct primitive function-parameter paths by resolved binding
-identity. A local receiver such as `e.V` remains a value member path.
+identity. IR-929 also checks explicitly annotated primitive `let` and `var`
+locals declared directly in the same function body's outer block. IR-930
+extends those local paths to unannotated direct `let` and `var` initializers
+whose fixed type is `Bool`, `Byte`, `Char`, or unit. A local receiver such as
+`e.V` remains a value member path. IR-931 also supports simple one-level
+tuple patterns with same-arity tuple initializers whose elements are all
+direct `Bool`, `Byte`, `Char`, or unit literals; the selected element is
+matched to the argument by its exact `BindingId`.
 The resolver uses the current package collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
@@ -792,7 +799,7 @@ subset. This path result records path identity only; it does not record
 `type_dependent_defs` or synthesize expression types. That sentence describes
 the original IR-921 recognition slice: IR-922/923 later add the value-type and
 type-dependent-definition projections to the per-owner result. IR-924 through
-IR-926 add limited constructor-call diagnostics without claiming general
+IR-931 add limited constructor-call diagnostics without claiming general
 expression types.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
@@ -1984,6 +1991,65 @@ coercions, numeric widening, local type inference, general expression type
 results, `call_kinds`, or source acceptance; `sai check` remains behind its
 incomplete-stage gate.
 
+**Implemented subset (IR-929):** At those same call sites, a single-segment
+plain path may also be checked when it resolves to an explicitly annotated
+primitive local binding declared by a simple `let` or `var` statement directly
+in the function body's outer block. The declaration's annotation is resolved
+through the existing direct primitive-type path projection; its initializer is
+not inspected. The declaration is selected by the exact resolved `BindingId`,
+and its HIR binding kind, name, and binding mode must agree. Equal primitive
+types pass; a different primitive type emits `TYPE_MISMATCH` at the argument
+path span. This works at outer arguments and at leaves reached by IR-927's
+equal-arity tuple walk, while outer arguments remain bounded by signature
+zipping. Unannotated locals, inferred or computed types, type aliases,
+unsupported annotations, nested-scope declarations, destructuring or
+subpatterns, non-primitive annotations, and expressions other than a direct
+plain path remain outside this slice. Named values keep their written
+positional parameter, and extra arguments receive only the existing arity
+diagnostic. No coercions, initializer checking, general local inference,
+general expression type results, `call_kinds`, or source-acceptance claims are
+added; `sai check` remains behind its incomplete-stage gate.
+
+**Implemented subset (IR-930):** At those same call sites, a single-segment
+plain path may also be checked when it resolves to an unannotated local
+declared by a simple `let` or `var` statement directly in the function body's
+outer block. The initializer must be exactly a `Bool`, `Byte`, or `Char`
+literal, or the empty tuple literal `()`; these expressions have fixed types
+under spec/05 §5.3.2 and spec/06 §6.3.3. The declaration is selected by its
+exact resolved `BindingId`, and its HIR binding kind, name, and binding mode
+must agree. Equal primitive or unit types pass; a different supported
+primitive or unit type emits `TYPE_MISMATCH` at the argument path span. This
+works at outer arguments and at leaves reached by IR-927's equal-arity tuple
+walk, while outer arguments remain bounded by signature zipping. Integer and
+floating-point initializers, including direct literals subject to numeric
+defaulting, computed initializers, explicit annotations, nested-scope
+declarations, destructuring or subpatterns, aliases, unsupported types, and
+let-else declarations and expressions other than a direct plain path remain
+outside this slice. Named
+values keep their written positional parameter, and extra arguments receive
+only the existing arity diagnostic. This does not add general local inference,
+coercions, expression type results, `call_kinds`, or source-acceptance claims;
+`sai check` remains behind its incomplete-stage gate.
+
+**Implemented subset (IR-931):** At those same call sites, a single-segment
+plain path may resolve to a binding in a simple, one-level tuple pattern
+declared directly in the function body's outer block. The `let` must have no
+type annotation or `else` block; its pattern and initializer must both be
+tuples of the same arity, and every initializer element must be a direct
+`Bool`, `Byte`, `Char`, or unit literal. Pattern components may be simple
+`let` bindings, `var` bindings, or `_`. The exact resolved `BindingId` selects
+the corresponding initializer element, and the binding's name, pattern kind,
+and mode must agree. A selected literal with a different primitive or unit
+constructor input emits `TYPE_MISMATCH` on the exact argument path span.
+
+Requiring every tuple value, including values matched by `_`, to be a fixed
+literal is a conservative boundary: an unsupported sibling initializer does
+not indirectly make another binding eligible. Tuple arity mismatch, annotated
+tuple bindings, integer and floating-point leaves, computed leaves (including
+those matched by `_`), nested or complex patterns, nested-scope declarations,
+and extra call arguments remain unexamined. This does not add tuple-shape
+diagnostics, inference, coercions, or general pattern typing.
+
 ### 3.6.4 `adt_def`
 
 `adt_def(def) -> Arc<AdtDef>` describes a nominal type:
@@ -2310,7 +2376,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924–IR-928 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-931 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
@@ -2323,10 +2389,15 @@ argument positionally. Record variants remain on the named-field construction
 path and receive no positional call entry or named-function-argument
 diagnostic. IR-926/927 check direct primitive and unit literals plus aligned
 tuple-literal leaves against the constructor signature; IR-928 checks direct
-primitive parameter paths by resolved binding identity. These are limited
-argument checks: named arguments are not bound by their names, and general
-expression typing, `TypeckResults::call_kinds`, and generic, external,
-dependency, or WIT variant paths remain outside the projection. `sai check`
+primitive parameter paths, IR-929 checks explicitly annotated direct
+primitive `let`/`var` local paths, and IR-930 checks unannotated direct local
+initializers only when they are fixed-type Bool, Byte, Char, or unit literals.
+Both local checks use resolved binding identity. IR-931 also checks same-arity,
+one-level tuple destructuring when every initializer leaf is a direct
+fixed-type Bool, Byte, Char, or unit literal. These are limited argument
+checks: named arguments are not bound by their names, and general expression
+typing, `TypeckResults::call_kinds`, and generic, external, dependency, or WIT
+variant paths remain outside the projection. `sai check`
 reports the staged diagnostics while retaining its incomplete-stage gate; it
 does not claim full check coverage or emit a success result for these inputs.
 

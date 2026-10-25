@@ -285,15 +285,45 @@ fn empty_root_package_index() -> sai_semantic::EncodedSymbolIndex {
 fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     let source = concat!(
         "enum Payload { Pair(U8, Bool), Named(value: Bool) }\n",
+        "enum FixedPayload { Values(Bool, Byte, Char, ()) }\n",
         "enum NestedPayload { Nested(((I8, Char), ((), USize))) }\n",
         "pub fn use_it(actual: Bool) {\n",
+        "    let annotated: Bool = true\n",
+        "    var matching: Bool = false\n",
+        "    var extra: Bool = false\n",
+        "    let inferred_bool = true\n",
+        "    var inferred_byte = b'x'\n",
+        "    let inferred_char = 'x'\n",
+        "    var inferred_unit = ()\n",
+        "    let (tuple_bool, var tuple_byte, tuple_char, var tuple_unit) = (true, b'x', 'x', ())\n",
+        "    let (tuple_wildcard_numeric, _) = (true, 1)\n",
+        "    let (tuple_wildcard_computed, _) = (true, true && false)\n",
+        "    let (tuple_bad_arity, other_bad_arity) = (true,)\n",
+        "    let (tuple_annotated, other_annotated): (Bool, Bool) = (true, false)\n",
+        "    let ((tuple_nested, _), other_nested) = ((true, false), true)\n",
         "    (Payload.Pair(actual, true), ",
+        "Payload.Pair(annotated, true), ",
+        "Payload.Pair(1, matching), ",
+        "Payload.Pair(inferred_bool, true), ",
+        "FixedPayload.Values(inferred_bool, inferred_byte, inferred_char, inferred_unit), ",
+        "Payload.Pair(tuple_bool, true), ",
+        "FixedPayload.Values(tuple_bool, tuple_byte, tuple_char, tuple_unit), ",
+        "Payload.Pair(tuple_wildcard_numeric, true), ",
+        "Payload.Pair(tuple_wildcard_computed, true), ",
+        "Payload.Pair(tuple_bad_arity, true), ",
+        "Payload.Pair(tuple_annotated, true), ",
+        "Payload.Pair(tuple_nested, true), ",
         "Payload.Pair(1, true), ",
         "Payload.Pair(first: true, second: 1, third: false), ",
+        "Payload.Pair(1, true, extra), ",
         "Payload.Pair(256, true), ",
         "NestedPayload.Nested(((true, 1), ((), 2))), ",
         "NestedPayload.Nested(((256, 'x'), ((), 2))), ",
         "Payload.Named(value: true))\n",
+        "    {\n",
+        "        let (nested_scope, _) = (true, false)\n",
+        "        Payload.Pair(nested_scope, true)\n",
+        "    }\n",
         "}\n",
     );
     let output = run_check(source, "", &[], &[]);
@@ -308,13 +338,13 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
-        1,
+        2,
         "the call arity error is surfaced alongside named-argument errors:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        5,
-        "the staged projection checks parameter paths and named/nested tuple literal leaves:\n{stdout}"
+        8,
+        "the staged projection checks parameter, annotated, fixed-literal inferred, and tuple-destructured local paths plus named/nested tuple literal leaves:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
@@ -332,6 +362,42 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "expected `U8`, found `Bool`",
         parameter_start,
         parameter_start + "actual".len(),
+    );
+    let annotated_call = "Payload.Pair(annotated, true)";
+    let annotated_start = source
+        .find(annotated_call)
+        .expect("annotated local argument call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Bool`",
+        annotated_start,
+        annotated_start + "annotated".len(),
+    );
+    let inferred_call = "Payload.Pair(inferred_bool, true)";
+    let inferred_start = source
+        .find(inferred_call)
+        .expect("inferred local mismatch call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Bool`",
+        inferred_start,
+        inferred_start + "inferred_bool".len(),
+    );
+    let tuple_destructured_call = "Payload.Pair(tuple_bool, true)";
+    let tuple_destructured_start = source
+        .find(tuple_destructured_call)
+        .expect("tuple-destructured local mismatch call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Bool`",
+        tuple_destructured_start,
+        tuple_destructured_start + "tuple_bool".len(),
     );
     let named_start = source.find("first:").expect("named argument exists");
     assert_json_diagnostic_primary_span(
