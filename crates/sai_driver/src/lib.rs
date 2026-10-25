@@ -13112,6 +13112,139 @@ fn nominal_field_type_is_region_free(
     }
 }
 
+/// Prove that a direct record field cannot introduce an implicit region
+/// before enabling the field-only literal-array lowerer.
+///
+/// This is deliberately stricter than ordinary region inference: only
+/// resolved scalar primitives, tuples, function pointers, and exactly
+/// resolved built-in arrays are understood. Function pointers are excluded
+/// from implicit-region inference; their own lowering still rejects
+/// unsupported borrows and effects. Aliases, nominal types, borrows, and
+/// incomplete or unknown paths fail closed.
+fn local_record_field_type_is_region_free_for_array_projection(
+    ty: &Ty<'_>,
+    owner: OwnerId,
+    paths: &HashMap<HirId, PathRes>,
+) -> bool {
+    if ty.hir_id.owner != owner {
+        return false;
+    }
+    match ty.kind {
+        TyKind::Borrow(..) | TyKind::Infer | TyKind::Err => false,
+        TyKind::Tuple(elements) => elements.iter().all(|element| {
+            local_record_field_type_is_region_free_for_array_projection(element, owner, paths)
+        }),
+        // The declaration implicit-region rule explicitly excludes function
+        // pointers. Their children still go through ordinary field lowering,
+        // which rejects unsupported function-pointer borrows and effects.
+        TyKind::FnPtr { .. } => true,
+        TyKind::Path(path) => {
+            if path.hir_id.owner != owner
+                || path.root != PathRoot::Plain
+                || path.segments.len() != 1
+                || path
+                    .segments
+                    .iter()
+                    .any(|segment| segment.hir_id.owner != owner)
+            {
+                return false;
+            }
+            let Ok(segment_count) = u32::try_from(path.segments.len()) else {
+                return false;
+            };
+            let Some(resolution) = paths.get(&path.hir_id) else {
+                return false;
+            };
+            if resolution.resolved_segments != segment_count
+                || resolution.segment_count != segment_count
+            {
+                return false;
+            }
+
+            let segment = path.segments[0];
+            match resolution.base {
+                Res::PrimTy(sai_resolve::prelude::PrimTy::Array) => {
+                    let Some(arguments) = segment.args else {
+                        return false;
+                    };
+                    arguments
+                        .args
+                        .iter()
+                        .enumerate()
+                        .all(|(index, argument)| match argument {
+                            GenericArg::Type(ty)
+                                if index == 1
+                                    && local_record_array_length_is_exact_const_path(
+                                        ty, owner, paths,
+                                    ) =>
+                            {
+                                true
+                            }
+                            GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
+                                local_record_field_type_is_region_free_for_array_projection(
+                                    ty, owner, paths,
+                                )
+                            }
+                            // Const syntax cannot carry a borrow or region.
+                            GenericArg::Const(_) => true,
+                        })
+                }
+                Res::PrimTy(
+                    sai_resolve::prelude::PrimTy::I8
+                    | sai_resolve::prelude::PrimTy::I16
+                    | sai_resolve::prelude::PrimTy::I32
+                    | sai_resolve::prelude::PrimTy::I64
+                    | sai_resolve::prelude::PrimTy::ISize
+                    | sai_resolve::prelude::PrimTy::U8
+                    | sai_resolve::prelude::PrimTy::U16
+                    | sai_resolve::prelude::PrimTy::U32
+                    | sai_resolve::prelude::PrimTy::U64
+                    | sai_resolve::prelude::PrimTy::USize
+                    | sai_resolve::prelude::PrimTy::F32
+                    | sai_resolve::prelude::PrimTy::F64
+                    | sai_resolve::prelude::PrimTy::Bool
+                    | sai_resolve::prelude::PrimTy::Byte
+                    | sai_resolve::prelude::PrimTy::Char
+                    | sai_resolve::prelude::PrimTy::Never,
+                ) => segment.args.is_none(),
+                // Do not infer safety from spelling: aliases and nominal
+                // types may hide a region-bearing field. Str and slice-like
+                // types are not primitive variants and fail closed here.
+                _ => false,
+            }
+        }
+    }
+}
+
+fn local_record_array_length_is_exact_const_path(
+    ty: &Ty<'_>,
+    owner: OwnerId,
+    paths: &HashMap<HirId, PathRes>,
+) -> bool {
+    if ty.hir_id.owner != owner {
+        return false;
+    }
+    let TyKind::Path(path) = ty.kind else {
+        return false;
+    };
+    if path.hir_id.owner != owner
+        || path.root != PathRoot::Plain
+        || path.segments.len() != 1
+        || path.segments[0].hir_id.owner != owner
+        || path.segments[0].args.is_some()
+    {
+        return false;
+    }
+    let Ok(segment_count) = u32::try_from(path.segments.len()) else {
+        return false;
+    };
+    paths.get(&path.hir_id).is_some_and(|resolution| {
+        resolution.resolved_segments == segment_count
+            && resolution.segment_count == segment_count
+            && matches!(resolution.base, Res::Def(DefKind::Const, _))
+    })
+}
+
 fn nominal_fields_are_region_free(
     item_kind: ItemKind<'_>,
     type_parameters: &HashSet<Symbol>,
@@ -18795,6 +18928,19 @@ impl RootDatabase {
             return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
         }
 
+        // The record-level implicit-region classifier is intentionally
+        // conservative for this adapter: an unsupported or unknown shape is
+        // treated as region-bearing. Keep field lowering itself in the
+        // no-region mode so borrow fields remain unsupported; this decision
+        // only gates literal arrays for the declaration.
+        let has_implicit_region_parameter = fields.iter().any(|field| {
+            !local_record_field_type_is_region_free_for_array_projection(
+                field.ty,
+                descriptor.owner,
+                path_resolution.paths(),
+            )
+        });
+
         let mut projected_fields = Vec::with_capacity(fields.len());
         let mut seen_field_definitions = HashSet::with_capacity(fields.len());
         for field in fields {
@@ -18823,13 +18969,18 @@ impl RootDatabase {
             // A failed conversion may have consumed region indices or other
             // context state. Start from a fresh field context so one sibling's
             // unsupported syntax cannot affect another field's result.
-            let mut context = sai_ty::lower_ty::LowerTyContext::for_field(
+            let context = sai_ty::lower_ty::LowerTyContext::for_field(
                 &self.semantic_types,
                 descriptor.owner,
                 path_resolution.paths(),
                 false,
-            )
-            .with_field_array_literal_pointer_width(collection.target_cfg.pointer_width());
+            );
+            let mut context = if has_implicit_region_parameter {
+                context
+            } else {
+                context
+                    .with_field_array_literal_pointer_width(collection.target_cfg.pointer_width())
+            };
             let ty = sai_ty::lower_ty::lower_ty(&mut context, field.ty);
             projected_fields.push(LocalRecordFieldTypeProjection {
                 def_id: field_def_id,
@@ -37920,6 +38071,24 @@ property "shared"() {}
             "  alias: Alias,\n",
             "  after_unsupported: Char,\n",
             "}\n",
+            "type ArrayFields {\n",
+            "  callback: fn(I32) -> Bool,\n",
+            "  callback_borrowed: fn(borrow Bool),\n",
+            "  callback_effects: fn() effects {},\n",
+            "  array: Array<U8, 2>,\n",
+            "  overflow_array: Array<U8, 4294967296>,\n",
+            "  nested_array: Array<Array<U8, 2>, 3>,\n",
+            "  after_unsupported: Char,\n",
+            "}\n",
+            "type RegionBearing {\n",
+            "  borrowed: borrow Bool,\n",
+            "  array: Array<U8, 2>,\n",
+            "  after_unsupported: Char,\n",
+            "}\n",
+            "type AliasBearing { alias: Alias, array: Array<U8, 2>, later: Char }\n",
+            "type NominalBearing { nested: Other, array: Array<U8, 2>, later: Char }\n",
+            "type UnknownBearing { missing: Missing, array: Array<U8, 2>, later: Char }\n",
+            "type ViewBearing { text: Str, slice: Slice<U8>, array: Array<U8, 2>, later: Char }\n",
             "type Other { integer: Bool }\n",
             "type Repeated { same: I32, same: Bool }\n",
             "type Generic<T> { value: T }\n",
@@ -38082,29 +38251,20 @@ property "shared"() {}
 
         let array = field_named("array");
         assert!(matches!(
-            array.ty().expect("target-fit literal array field lowers").kind(),
-            sai_ty::ty::TyKind::Array(element, sai_ty::ty::Const::Value(2))
-                if matches!(element.kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8))
+            array.ty(),
+            Err(sai_ty::lower_ty::UnsupportedTy::Array)
         ));
         let nested_array = field_named("nested_array");
-        assert!(matches!(
-            nested_array.ty().expect("nested literal array field lowers").kind(),
-            sai_ty::ty::TyKind::Array(outer_element, sai_ty::ty::Const::Value(3))
-                if matches!(
-                    outer_element.kind(),
-                    sai_ty::ty::TyKind::Array(inner_element, sai_ty::ty::Const::Value(2))
-                        if matches!(
-                            inner_element.kind(),
-                            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
-                        )
-                )
-        ));
+        assert_eq!(
+            nested_array.ty(),
+            Err(sai_ty::lower_ty::UnsupportedTy::Array),
+            "an implicit-region declaration disables literal arrays recursively"
+        );
 
         for (name, expected_reason) in [
-            (
-                "overflow_array",
-                sai_ty::lower_ty::UnsupportedTy::ArrayLength,
-            ),
+            ("overflow_array", sai_ty::lower_ty::UnsupportedTy::Array),
+            ("array", sai_ty::lower_ty::UnsupportedTy::Array),
+            ("nested_array", sai_ty::lower_ty::UnsupportedTy::Array),
             (
                 "borrowed",
                 sai_ty::lower_ty::UnsupportedTy::FieldRegionWithoutParameter,
@@ -38135,6 +38295,181 @@ property "shared"() {}
             fields.type_of_field(after_unsupported.def_id()),
             Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
         ));
+
+        let array_fields = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("ArrayFields"),
+            )
+            .expect("exact collection guards region-free array fields")
+            .expect("the region-free array record has a field projection");
+        let callback_field = array_fields
+            .fields()
+            .expect("the region-free array record is supported")
+            .iter()
+            .find(|field| {
+                database.symbols.resolve(field.name()).ok().as_deref() == Some("callback")
+            })
+            .expect("the function-pointer field exists");
+        assert!(
+            matches!(
+                array_fields.type_of_field(callback_field.def_id()),
+                Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::FnPtr(_))
+            ),
+            "an effect-free, region-free function pointer does not block field arrays"
+        );
+        let array_field = array_fields
+            .fields()
+            .expect("the region-free array record is supported")
+            .iter()
+            .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some("array"))
+            .expect("the array field exists");
+        assert!(
+            matches!(
+                array_fields.type_of_field(array_field.def_id()),
+                Some(Ok(ty))
+                    if matches!(
+                        ty.kind(),
+                        sai_ty::ty::TyKind::Array(
+                            element,
+                            sai_ty::ty::Const::Value(2)
+                        ) if matches!(
+                            element.kind(),
+                            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+                        )
+                    )
+            ),
+            "the public exact-DefId lookup exposes an accepted literal array field"
+        );
+        let array_fields_by_name = |name: &str| {
+            array_fields
+                .fields()
+                .expect("region-free record remains supported")
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .expect("the requested array-record field exists")
+        };
+        for (name, expected_reason) in [
+            (
+                "callback_borrowed",
+                sai_ty::lower_ty::UnsupportedTy::FunctionPointerRegion,
+            ),
+            (
+                "callback_effects",
+                sai_ty::lower_ty::UnsupportedTy::FunctionPointerEffects,
+            ),
+        ] {
+            assert_eq!(
+                array_fields.type_of_field(array_fields_by_name(name).def_id()),
+                Some(Err(expected_reason)),
+                "function-pointer {name} remains unsupported while sibling arrays are enabled"
+            );
+        }
+        assert_eq!(
+            array_fields.type_of_field(array_fields_by_name("overflow_array").def_id()),
+            Some(Err(sai_ty::lower_ty::UnsupportedTy::ArrayLength)),
+            "an unsupported array length stays local to its field"
+        );
+        assert!(matches!(
+            array_fields
+                .type_of_field(array_fields_by_name("nested_array").def_id()),
+            Some(Ok(ty))
+                if matches!(
+                    ty.kind(),
+                    sai_ty::ty::TyKind::Array(
+                        outer,
+                        sai_ty::ty::Const::Value(3)
+                    ) if matches!(
+                        outer.kind(),
+                        sai_ty::ty::TyKind::Array(
+                            inner,
+                            sai_ty::ty::Const::Value(2)
+                        ) if matches!(
+                            inner.kind(),
+                            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+                        )
+                    )
+                )
+        ));
+        assert!(matches!(
+            array_fields.type_of_field(array_fields_by_name("after_unsupported").def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
+        ));
+
+        let region_bearing = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("RegionBearing"),
+            )
+            .expect("exact collection guards borrow-bearing fields")
+            .expect("the borrow-bearing record remains field-projectable");
+        let region_field_by_name = |name: &str| {
+            region_bearing
+                .fields()
+                .expect("the borrow-bearing record is structurally supported")
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .expect("the requested region-bearing field exists")
+        };
+        assert_eq!(
+            region_bearing.type_of_field(region_field_by_name("array").def_id()),
+            Some(Err(sai_ty::lower_ty::UnsupportedTy::Array)),
+            "borrow-bearing declarations cannot enable the literal-array builder"
+        );
+        assert_eq!(
+            region_bearing.type_of_field(region_field_by_name("borrowed").def_id()),
+            Some(Err(
+                sai_ty::lower_ty::UnsupportedTy::FieldRegionWithoutParameter
+            )),
+            "the region proof does not turn borrow fields into supported references"
+        );
+        assert!(matches!(
+            region_bearing.type_of_field(region_field_by_name("after_unsupported").def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
+        ));
+
+        for name in [
+            "AliasBearing",
+            "NominalBearing",
+            "UnknownBearing",
+            "ViewBearing",
+        ] {
+            let projection = resolved
+                .local_record_field_types_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    None,
+                    owner_for(name),
+                )
+                .expect("exact collection guards conservative array gating")
+                .expect("the declaration retains independent field results");
+            let field_by_name = |field_name: &str| {
+                projection
+                    .fields()
+                    .expect("the declaration remains field-projectable")
+                    .iter()
+                    .find(|field| {
+                        database.symbols.resolve(field.name()).ok().as_deref() == Some(field_name)
+                    })
+                    .expect("the requested field exists")
+            };
+            assert_eq!(
+                projection.type_of_field(field_by_name("array").def_id()),
+                Some(Err(sai_ty::lower_ty::UnsupportedTy::Array)),
+                "{name} must fail closed before enabling any array fields"
+            );
+            assert!(
+                matches!(
+                    projection.type_of_field(field_by_name("later").def_id()),
+                    Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
+                ),
+                "the supported sibling remains available in {name}"
+            );
+        }
 
         let other_owner = owner_for("Other");
         let other = resolved
