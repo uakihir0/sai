@@ -779,14 +779,17 @@ Generic and otherwise unsupported local enums retain typed unsupported
 outcomes. The AST shape check rejects `(E).V`, while `(E.V)` still denotes the
 inner path; a trailing value field in `E.V.other` is not promoted to another
 variant candidate. When the field is a call callee, `E.V()` retains only the
-inner `E.V` path result; this slice does not type or check the call. A local
-receiver such as `e.V` remains a value member path.
+inner `E.V` path result; the separate IR-924 projection later checks limited
+arity for supported local enum variant calls. A local receiver such as `e.V`
+remains a value member path.
 The resolver uses the current package collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
-subset. This records path identity only; it does not record
-`type_dependent_defs`, synthesize expression types, or change constructor-call
-checking.
+subset. This path result records path identity only; it does not record
+`type_dependent_defs` or synthesize expression types. That sentence describes
+the original IR-921 recognition slice: IR-922/923 later add the value-type and
+type-dependent-definition projections to the per-owner result, and IR-924 adds
+limited constructor-call arity without claiming general expression types.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -1840,8 +1843,8 @@ The source-map AST check distinguishes `E.V` and `(E.V)` from `(E).V`, rejects
 generic field arguments and non-path/value receivers, and leaves a trailing
 value field such as `E.V.other` outside the variant result. Current collection,
 snapshot, source-member, WIT-view and test-only-import checks remain in force.
-This does not record expression types or type-dependent definitions, or add
-tuple constructor-call behavior.
+This does not record expression types or type-dependent definitions. IR-924
+adds a separately bounded local constructor-call arity projection.
 
 **IR-921 compatibility decisions and review record:** A direct enum-variant
 path is recognized from the source AST as well as HIR because HIR erases
@@ -1855,8 +1858,9 @@ Generic/unsupported enums keep typed unsupported outcomes, while unresolved,
 dependency/WIT and type-alias heads remain deferred because this slice cannot
 prove their local owner/variant identity. The richer result retains the exact
 enum owner and variant `DefId` for the follow-up type-recording slice; it does not
-claim `type_of`, `type_dependent_defs`, call checking or broader source
-acceptance. **Review required:** verify the source-map parenthesis/full-span
+claim `type_of`, `type_dependent_defs`, general call checking or broader source
+acceptance. IR-924 adds the limited local variant-call arity projection.
+**Review required:** verify the source-map parenthesis/full-span
 checks, exact prefix consumption and enum-owner pairing, enum-local candidate
 and diagnostic behavior, test-only/module/source/WIT provenance, and the
 deferred boundaries above. Focused verification is recorded in
@@ -1911,6 +1915,15 @@ This narrow map is not the complete `TypeckResults::type_dependent_defs`: it
 does not select methods, implicit members, flags constants, external heads, or
 other type-relative definitions, and it adds no error entries or expression
 types.
+
+**Implemented subset (IR-924):** Direct local non-generic enum variant calls
+now have a separate occurrence-keyed arity projection. Tuple calls retain
+their source-ordered argument HIR IDs and compare argument count with the
+selected variant's validated constructor signature. Unit calls receive
+`WRONG_ARGUMENT_COUNT` even for an empty `()`, as required by spec/06
+§6.18.2. Record variants remain selected as type-dependent paths but are not
+treated as positional calls. This does not check argument types, populate
+`call_kinds`, or extend the supported path set.
 
 ### 3.6.4 `adt_def`
 
@@ -2237,6 +2250,18 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 **Records and variants.** `Call { callee, args, base }` whose callee resolves (§3.7.7, §3.9.5) to a record type, a record variant, `Self` of record type, or an implicit member naming a record variant is a record construction (spec/06 §6.18.1). Generic arguments come from the path or are fresh, with the expected type unified in a snapshot (§3.7.5). For each argument in source order: `name: e` names a field; a nameless argument that is a single-segment value path `x` is punning; any other nameless argument is `RECORD_FIELD_NEEDS_NAME`. Then `DUPLICATE_FIELD`, `UNKNOWN_FIELD` and `PRIVATE_FIELD` are reported per argument, each initializer is checked at a coercion site against the substituted field type, the base is checked against the record type by unification, and `MISSING_FIELD` lists every field (declaration order) not covered when there is no base; `REDUNDANT_UPDATE_BASE` is reported on the base when every field is explicit. `TypeckResults::record_ctors[e]` records the variant, the field index of every argument and whether the base supplies the rest. A `base` in any other call is `FUNCTIONAL_UPDATE_OUTSIDE_RECORD`. A construction whose callee is an `IS_HANDLE` resource (an imported resource, or an unbound resource of a local interface) is `OPAQUE_RESOURCE_CONSTRUCTION` instead of the field checks ([16](16-interfaces-and-wit.md) §16.7.5).
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
+
+**IR-924 local enum-call arity slice.** For a direct callee path to a supported,
+local, non-generic enum variant, the owner result records a call entry under
+the call expression's `HirId`, retaining the exact callee field, enum owner,
+enum and variant `DefId`s, and source-ordered argument `HirId`s. Tuple variant
+arity is compared with the already validated constructor signature; a mismatch
+emits `WRONG_ARGUMENT_COUNT` on the complete call. Calling a unit variant
+emits `WRONG_ARGUMENT_COUNT`, including `E.V()`. Record variants remain on the
+named-field construction path and receive no positional call entry. This
+projection does not type-check argument expressions, handle named function
+arguments, populate `TypeckResults::call_kinds`, or accept generic, external,
+dependency, or WIT variant paths.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
