@@ -61,9 +61,10 @@ pub enum TyKind {
     Ref(Region, Ty, Mutability),
     /// A nongeneric nominal definition.
     ///
-    /// This slice currently constructs this form only for validated local
-    /// interface unit enums. Generic arguments will be represented when the
-    /// generic substitution model is implemented.
+    /// This slice constructs this form only for validated local interface
+    /// unit enums and direct local records/enums whose HIR has no generic
+    /// parameters or where predicates. Generic arguments will be represented
+    /// when the generic substitution model is implemented.
     Adt(DefId),
 }
 

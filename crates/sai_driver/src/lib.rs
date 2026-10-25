@@ -14392,6 +14392,134 @@ impl RootDatabase {
         })
     }
 
+    fn local_nongeneric_nominal_definitions(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        snapshot: &WorkspaceSnapshot,
+    ) -> HashSet<DefId> {
+        let mut file_groups = Vec::<(FileId, Vec<TopLevelOwnerDescriptor>)>::new();
+        let mut group_indices = HashMap::<FileId, usize>::new();
+        for descriptor in collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| {
+                matches!(
+                    descriptor.kind,
+                    TopLevelOwnerKind::Struct | TopLevelOwnerKind::Enum
+                )
+            })
+        {
+            if let Some(index) = group_indices.get(&descriptor.file).copied() {
+                file_groups[index].1.push(descriptor);
+            } else {
+                group_indices.insert(descriptor.file, file_groups.len());
+                file_groups.push((descriptor.file, vec![descriptor]));
+            }
+        }
+
+        let Some(def_paths) = self.def_paths.get(&collection.module_tree.package).cloned() else {
+            return HashSet::new();
+        };
+        let syntax_subtree_has_error = |root: &SyntaxNode| {
+            root.descendants().any(|node| {
+                node.kind() == sai_syntax::SyntaxKind::ERROR
+                    || node
+                        .children_with_tokens()
+                        .any(|element| element.as_token().is_some_and(|token| token.has_error()))
+            })
+        };
+        let mut definitions = HashSet::new();
+        for (file, descriptors) in file_groups {
+            let Ok(inputs) = self.current_owner_inputs(snapshot, file, &collection.target_cfg)
+            else {
+                continue;
+            };
+            for descriptor in descriptors {
+                if descriptor.owner.def_id.package() != collection.module_tree.package {
+                    continue;
+                }
+                let def_id = descriptor.owner.def_id.to_def_id();
+                let Ok(Some(expected_path)) = def_paths.resolve_def_id(def_id) else {
+                    continue;
+                };
+                let arena = HirArena::new();
+                let context = HirLoweringContext::new(
+                    &inputs.ast_ids,
+                    snapshot,
+                    &inputs.root,
+                    &arena,
+                    &self.symbols,
+                    &def_paths,
+                );
+                let Ok((hir_owner, _source_map)) = lower_top_level_owner(
+                    descriptor,
+                    &expected_path,
+                    &inputs.filtered_item_tree,
+                    &inputs.retained_item_kinds,
+                    &context,
+                ) else {
+                    continue;
+                };
+                if hir_owner.id != descriptor.owner {
+                    continue;
+                }
+                let OwnerNode::Item(item) = hir_owner.node else {
+                    continue;
+                };
+                if item.owner_id != descriptor.owner {
+                    continue;
+                }
+                let generics = match (descriptor.kind, item.kind) {
+                    (TopLevelOwnerKind::Struct, ItemKind::Struct { generics, .. })
+                    | (TopLevelOwnerKind::Enum, ItemKind::Enum { generics, .. }) => generics,
+                    _ => continue,
+                };
+                if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                    continue;
+                }
+
+                let Some(syntax) = inputs
+                    .ast_ids
+                    .pointer(descriptor.item_id)
+                    .and_then(|pointer| {
+                        pointer.resolve(inputs.filtered_item_tree.file, &inputs.root)
+                    })
+                else {
+                    continue;
+                };
+                let (declaration_syntax, generic_params) = match descriptor.kind {
+                    TopLevelOwnerKind::Struct => {
+                        let Some(declaration) = ast::TypeDecl::cast(syntax) else {
+                            continue;
+                        };
+                        (declaration.syntax().clone(), declaration.generic_params())
+                    }
+                    TopLevelOwnerKind::Enum => {
+                        let Some(declaration) = ast::EnumDecl::cast(syntax) else {
+                            continue;
+                        };
+                        (declaration.syntax().clone(), declaration.generic_params())
+                    }
+                    _ => continue,
+                };
+                if generic_params
+                    .as_ref()
+                    .is_some_and(|params| syntax_subtree_has_error(params.syntax()))
+                    || declaration_syntax
+                        .descendants()
+                        .filter_map(ast::WhereClause::cast)
+                        .any(|clause| syntax_subtree_has_error(clause.syntax()))
+                {
+                    continue;
+                }
+                definitions.insert(def_id);
+            }
+        }
+        definitions
+    }
+
     /// Compatibility entry point for the combined function-owner analysis.
     ///
     /// The returned label-named result also contains local and one-segment
@@ -14618,6 +14746,8 @@ impl RootDatabase {
                 | LocalInterfaceEnumAdtProjection::Unsupported { .. } => None,
             })
             .collect::<HashSet<_>>();
+        let local_nongeneric_nominal_definitions =
+            self.local_nongeneric_nominal_definitions(collection, snapshot);
         let descriptors = &collection.scopes.function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
         let mut group_start = 0;
@@ -14765,13 +14895,13 @@ impl RootDatabase {
                     );
                     signature_projection = Some(match type_path_resolution.as_ref() {
                         Some(Ok(Some(path_resolution))) => {
-                            let mut context =
-                                sai_ty::lower_ty::LowerTyContext::for_signature_with_unit_enums(
-                                    &self.semantic_types,
-                                    descriptor.owner,
-                                    path_resolution.paths(),
-                                    &validated_unit_enum_definitions,
-                                );
+                            let mut context = sai_ty::lower_ty::LowerTyContext::for_signature_with_local_nongeneric_nominals(
+                                &self.semantic_types,
+                                descriptor.owner,
+                                path_resolution.paths(),
+                                &validated_unit_enum_definitions,
+                                &local_nongeneric_nominal_definitions,
+                            );
                             match hir_owner.node {
                                 OwnerNode::Item(item) => match item.kind {
                                     ItemKind::Fn { sig, generics, .. } => {
@@ -36034,7 +36164,6 @@ property "shared"() {}
         for (index, expected_reason) in [
             (2, sai_ty::lower_ty::UnsupportedTy::NominalType),
             (3, sai_ty::lower_ty::UnsupportedTy::GenericArguments),
-            (4, sai_ty::lower_ty::UnsupportedTy::NominalType),
         ] {
             assert_eq!(
                 resolved
@@ -36046,9 +36175,233 @@ property "shared"() {}
                         reason: expected_reason,
                     },
                 )),
-                "payload, generic, and module-level enum types remain unsupported"
+                "interface payload enums and explicit generic enum arguments remain unsupported"
             );
         }
+        let module_enum = resolved
+            .signature_projection(&collection, resolved.owners()[4].owner())
+            .expect("the exact collection guards the projection")
+            .expect("the top-level function owner exists");
+        let FunctionSignatureProjection::Supported(module_enum) = module_enum else {
+            panic!("a direct top-level nongeneric unit enum supports signatures");
+        };
+        assert!(
+            matches!(module_enum.inputs()[0].kind(), sai_ty::ty::TyKind::Adt(_)),
+            "the direct top-level enum is represented by its nominal identity"
+        );
+        assert!(module_enum.output().ptr_eq(&module_enum.inputs()[0]));
+    }
+
+    #[test]
+    fn function_signature_projection_lowers_only_direct_local_nongeneric_nominals() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "type Packet { value: U32 }\n",
+            "enum Outcome { Failed, Succeeded(U32) }\n",
+            "type GenericRecord<T> { value: T }\n",
+            "enum GenericEnum<T> { Empty, Value(T) }\n",
+            "type RecoveredRecord<123> { value: Bool }\n",
+            "type Alias = Packet\n",
+            "interface api {\n",
+            "  type Member { value: Bool }\n",
+            "}\n",
+            "@target(\"wasm64-core\")\n",
+            "type Filtered { value: Bool }\n",
+            "fn root_packet(value: Packet) -> Packet {}\n",
+            "fn root_outcome(value: Outcome) -> Outcome {}\n",
+            "fn child_packet(value: child_alias.Packet) -> child_alias.Packet {}\n",
+            "fn child_outcome(value: child_alias.Outcome) -> child_alias.Outcome {}\n",
+            "fn generic_record_omitted(value: GenericRecord) -> GenericRecord {}\n",
+            "fn generic_record_explicit(value: GenericRecord<U32>) -> GenericRecord<U32> {}\n",
+            "fn generic_enum_omitted(value: GenericEnum) -> GenericEnum {}\n",
+            "fn generic_enum_explicit(value: GenericEnum<U32>) -> GenericEnum<U32> {}\n",
+            "fn alias(value: Alias) -> Alias {}\n",
+            "fn unresolved(value: Missing) -> Missing {}\n",
+            "fn filtered(value: Filtered) -> Filtered {}\n",
+            "fn interface_member(value: api.Member) -> api.Member {}\n",
+            "fn recovered_generic(value: RecoveredRecord) -> RecoveredRecord {}\n",
+        );
+        let child = concat!(
+            "pub type Packet { value: Bool }\n",
+            "pub enum Outcome { Failed, Succeeded(Bool) }\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.owners().len(), 13);
+
+        let recovered_descriptor = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .find(|descriptor| {
+                if descriptor.kind != TopLevelOwnerKind::Struct {
+                    return false;
+                }
+                let Ok(inputs) = database.current_owner_inputs(
+                    &snapshot,
+                    descriptor.file,
+                    &collection.target_cfg,
+                ) else {
+                    return false;
+                };
+                inputs
+                    .ast_ids
+                    .pointer(descriptor.item_id)
+                    .and_then(|pointer| {
+                        pointer.resolve(inputs.filtered_item_tree.file, &inputs.root)
+                    })
+                    .and_then(ast::TypeDecl::cast)
+                    .and_then(|declaration| declaration.name())
+                    .and_then(|name| name.syntax().first_token())
+                    .is_some_and(|token| token.text() == "RecoveredRecord")
+            })
+            .expect("parser recovery retains the direct Struct descriptor");
+        let recovered_inputs = database
+            .current_owner_inputs(&snapshot, recovered_descriptor.file, &collection.target_cfg)
+            .expect("recovered owner inputs are available");
+        let recovered_def_id = recovered_descriptor.owner.def_id.to_def_id();
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("the package DefPath interner is available"),
+        );
+        let recovered_path = def_paths
+            .resolve_def_id(recovered_def_id)
+            .expect("recovered DefPath resolves")
+            .expect("recovered DefPath exists");
+        let recovered_arena = HirArena::new();
+        let recovered_context = HirLoweringContext::new(
+            &recovered_inputs.ast_ids,
+            &snapshot,
+            &recovered_inputs.root,
+            &recovered_arena,
+            &database.symbols,
+            &def_paths,
+        );
+        let (recovered_owner, _) = lower_top_level_owner(
+            recovered_descriptor,
+            &recovered_path,
+            &recovered_inputs.filtered_item_tree,
+            &recovered_inputs.retained_item_kinds,
+            &recovered_context,
+        )
+        .expect("the recovered generic-list ERROR does not prevent HIR lowering");
+        let OwnerNode::Item(recovered_item) = recovered_owner.node else {
+            panic!("a recovered direct Struct lowers to an item owner");
+        };
+        let ItemKind::Struct {
+            generics: recovered_generics,
+            ..
+        } = recovered_item.kind
+        else {
+            panic!("the recovered owner retains its Struct HIR kind");
+        };
+        assert!(recovered_generics.params.is_empty());
+        assert!(recovered_generics.where_preds.is_empty());
+        assert!(
+            !database
+                .local_nongeneric_nominal_definitions(&collection, &snapshot)
+                .contains(&recovered_def_id),
+            "an empty recovered HIR generic list must not enter the nominal allowlist"
+        );
+
+        let supported_nominal = |index: usize| {
+            let projection = resolved
+                .signature_projection(&collection, resolved.owners()[index].owner())
+                .expect("the exact collection guards the signature")
+                .expect("the top-level function owner exists");
+            let FunctionSignatureProjection::Supported(signature) = projection else {
+                panic!("a direct local nongeneric nominal signature is supported");
+            };
+            let sai_ty::ty::TyKind::Adt(input_def) = signature.inputs()[0].kind() else {
+                panic!("the input retains nominal DefId identity");
+            };
+            let sai_ty::ty::TyKind::Adt(output_def) = signature.output().kind() else {
+                panic!("the output retains nominal DefId identity");
+            };
+            assert_eq!(input_def, output_def);
+            *input_def
+        };
+        let root_packet = supported_nominal(0);
+        let root_outcome = supported_nominal(1);
+        let child_packet = supported_nominal(2);
+        let child_outcome = supported_nominal(3);
+        assert_ne!(
+            root_packet, child_packet,
+            "same-named records in distinct package modules retain distinct identities"
+        );
+        assert_ne!(
+            root_outcome, child_outcome,
+            "same-named enums in distinct package modules retain distinct identities"
+        );
+
+        let unsupported_reason = |index: usize| {
+            let projection = resolved
+                .signature_projection(&collection, resolved.owners()[index].owner())
+                .expect("the exact collection guards the signature")
+                .expect("the top-level function owner exists");
+            match projection {
+                FunctionSignatureProjection::Unsupported(
+                    sai_ty::lower_ty::UnsupportedFnSig::ParameterType { reason, .. },
+                ) => *reason,
+                FunctionSignatureProjection::Supported(_) => {
+                    panic!("this source type is outside the nominal signature slice")
+                }
+                FunctionSignatureProjection::Unsupported(reason) => {
+                    panic!("expected a parameter type rejection, got {reason:?}")
+                }
+            }
+        };
+        for index in [4, 6] {
+            assert_eq!(
+                unsupported_reason(index),
+                sai_ty::lower_ty::UnsupportedTy::NominalType,
+                "a generic definition without use-site arguments stays unsupported"
+            );
+        }
+        for index in [5, 7] {
+            assert_eq!(
+                unsupported_reason(index),
+                sai_ty::lower_ty::UnsupportedTy::GenericArguments,
+                "explicit generic arguments stay unsupported"
+            );
+        }
+        assert_eq!(
+            unsupported_reason(8),
+            sai_ty::lower_ty::UnsupportedTy::Alias
+        );
+        for index in [9, 10] {
+            assert_eq!(
+                unsupported_reason(index),
+                sai_ty::lower_ty::UnsupportedTy::MissingPathResolution,
+                "unresolved and target-filtered definitions have no accepted path"
+            );
+        }
+        assert_eq!(
+            unsupported_reason(11),
+            sai_ty::lower_ty::UnsupportedTy::NominalType,
+            "a local interface-member record is outside the direct top-level allowlist"
+        );
+        assert_eq!(
+            unsupported_reason(12),
+            sai_ty::lower_ty::UnsupportedTy::NominalType,
+            "a recovered generic parameter list cannot masquerade as HIR arity zero"
+        );
     }
 
     #[test]
