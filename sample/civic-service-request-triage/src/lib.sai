@@ -1,0 +1,105 @@
+use acme:civic-service-request-triage/data
+use acme:civic-service-request-triage/model.{Decision, ServiceKind, TriageReport, Urgency}
+use acme:civic-service-request-triage/triage
+
+pub fn sample_report() -> TriageReport {
+    triage.triage()
+}
+
+test "the intake summary separates routed work from reports needing review" {
+    let report = sample_report()
+    assert report.request_count == 11
+    assert report.routed_count == 7
+    assert report.duplicate_count == 2
+    assert report.outside_municipality_count == 1
+    assert report.classification_review_count == 1
+    assert report.invalid_record_count == 0
+    assert report.critical_count == 2
+}
+
+test "the earliest same-day report remains canonical and counts linked reports" {
+    let report = sample_report()
+    let ramp = report.items[0].unwrap()
+    assert ramp.request_id == 8401
+    assert ramp.decision == Decision.Routed
+    assert ramp.incident_report_count == 2
+
+    let duplicate = report.items[2].unwrap()
+    assert duplicate.request_id == 8403
+    assert duplicate.decision == Decision.Duplicate
+    assert duplicate.duplicate_of == Some(8401)
+}
+
+test "a repeated location on another day becomes a separate incident" {
+    let report = sample_report()
+    let next_day = report.items[8].unwrap()
+    assert next_day.request_id == 8409
+    assert next_day.decision == Decision.Routed
+    assert next_day.incident_report_count == 1
+}
+
+test "screened hazards and blocked accessible routes receive bounded targets" {
+    let report = sample_report()
+    let signal = report.items[1].unwrap()
+    assert signal.urgency == Some(Urgency.Critical)
+    assert signal.response_due_minute == Some(490)
+    assert signal.incident_report_count == 2
+
+    let ramp = report.items[0].unwrap()
+    assert ramp.urgency == Some(Urgency.High)
+    assert ramp.response_due_minute == Some(690)
+}
+
+test "non-city assets and unclassified reports are never dispatched" {
+    let report = sample_report()
+    let outside = report.items[4].unwrap()
+    assert outside.decision == Decision.OutsideMunicipality
+    assert outside.department == None
+    assert outside.response_due_minute == None
+
+    let unclassified = report.items[9].unwrap()
+    assert unclassified.service == ServiceKind.Unclassified
+    assert unclassified.decision == Decision.ClassificationReview
+    assert unclassified.department == None
+}
+
+test "duplicate request identifiers invalidate every ambiguous intake row" {
+    var requests = data.requests()
+    requests[10].id = requests[0].id
+    let report = triage.triage_requests(requests)
+    assert report.invalid_record_count == 2
+    assert report.routed_count == 6
+}
+
+test "invalid references and out-of-window timestamps do not produce deadlines" {
+    var requests = data.requests()
+    requests[0].location_code = 0
+    requests[1].opened_minute = 10080
+    let report = triage.triage_requests(requests)
+    assert report.invalid_record_count == 2
+    assert report.routed_count == 7
+    assert report.items[0].unwrap().response_due_minute == None
+    assert report.items[1].unwrap().response_due_minute == None
+}
+
+test "the supplied intake day must agree with its absolute timestamp" {
+    var requests = data.requests()
+    requests[3].service_day = 2
+    let report = triage.triage_requests(requests)
+    assert report.invalid_record_count == 1
+    assert report.items[3].unwrap().decision == Decision.InvalidRecord
+    assert report.items[3].unwrap().response_due_minute == None
+}
+
+test "a later input can become canonical when its report time is earlier" {
+    var requests = data.requests()
+    requests[2].opened_minute = 430
+    let report = triage.triage_requests(requests)
+    let linked = report.items[0].unwrap()
+    let canonical = report.items[2].unwrap()
+    assert linked.decision == Decision.Duplicate
+    assert linked.duplicate_of == Some(8403)
+    assert canonical.decision == Decision.Routed
+    assert canonical.incident_report_count == 2
+    assert canonical.response_due_minute == Some(670)
+}

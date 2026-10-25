@@ -1,0 +1,76 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ServiceKind {
+    SidewalkAccess
+    TrafficSignal
+    MissedCollection
+    WaterLeak
+    ParkHazard
+    Unclassified
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Urgency {
+    Critical
+    High
+    Standard
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Department {
+    AccessAndMobility
+    TrafficOperations
+    Sanitation
+    WaterUtility
+    Parks
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Decision {
+    InvalidRecord
+    ClassificationReview
+    OutsideMunicipality
+    Duplicate
+    Routed
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ServiceRequest {
+    pub id: U32
+    // A fictional, stable municipal asset-location code; no resident data is stored.
+    pub location_code: U32
+    pub location_name: Str
+    pub service_day: U32
+    // Absolute minutes from the beginning of the seven-day intake fixture.
+    pub opened_minute: U32
+    pub service: ServiceKind
+    pub municipal_asset: Bool
+    // Intake staff have already screened these two impact signals.
+    pub immediate_hazard: Bool
+    pub accessible_route_blocked: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TriageItem {
+    pub request_id: U32
+    pub location_name: Str
+    pub service: ServiceKind
+    pub decision: Decision
+    pub department: Option<Department>
+    pub urgency: Option<Urgency>
+    pub response_due_minute: Option<U32>
+    pub duplicate_of: Option<U32>
+    // Populated on the canonical routed request, counting the original report.
+    pub incident_report_count: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TriageReport {
+    pub items: Array<Option<TriageItem>, 11>
+    pub request_count: USize
+    pub routed_count: USize
+    pub duplicate_count: USize
+    pub outside_municipality_count: USize
+    pub classification_review_count: USize
+    pub invalid_record_count: USize
+    pub critical_count: USize
+}

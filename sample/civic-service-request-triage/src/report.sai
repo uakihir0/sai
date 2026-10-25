@@ -1,0 +1,102 @@
+use acme:civic-service-request-triage/model.{
+    Department
+    ServiceKind
+    TriageItem
+    TriageReport
+    Urgency
+}
+use acme:civic-service-request-triage/triage
+use sai:alloc/string.{String}
+use sai:core/fmt.{Writer}
+
+fn service_name(service: ServiceKind) -> Str {
+    match service {
+        .SidewalkAccess => "sidewalk access"
+        .TrafficSignal => "traffic signal"
+        .MissedCollection => "missed collection"
+        .WaterLeak => "water leak"
+        .ParkHazard => "park hazard"
+        .Unclassified => "unclassified service"
+    }
+}
+
+fn department_name(department: Department) -> Str {
+    match department {
+        .AccessAndMobility => "Access & Mobility"
+        .TrafficOperations => "Traffic Operations"
+        .Sanitation => "Sanitation"
+        .WaterUtility => "Water Utility"
+        .Parks => "Parks"
+    }
+}
+
+fn urgency_name(urgency: Urgency) -> Str {
+    match urgency { .Critical => "CRITICAL", .High => "HIGH", .Standard => "STANDARD" }
+}
+
+fn write_item(out: borrow mut String, item: TriageItem) {
+    match item.decision {
+        .InvalidRecord => {
+            out.write_str(
+                f"#{item.request_id} {item.location_name} — invalid intake record; held for correction\n".as_str(),
+            )
+        }
+        .ClassificationReview => {
+            out.write_str(
+                f"#{item.request_id} {item.location_name} — service classification review; no dispatch\n".as_str(),
+            )
+        }
+        .OutsideMunicipality => {
+            out.write_str(
+                f"#{item.request_id} {item.location_name} — outside municipal responsibility; jurisdiction referral required\n".as_str(),
+            )
+        }
+        .Duplicate => {
+            match item.duplicate_of {
+                Some(canonical_id) => {
+                    out.write_str(
+                        f"#{item.request_id} {item.location_name} — duplicate report linked to #{canonical_id}\n".as_str(),
+                    )
+                }
+                None => {
+                    out.write_str(
+                        f"#{item.request_id} {item.location_name} — duplicate link unavailable; held for review\n".as_str(),
+                    )
+                }
+            }
+        }
+        .Routed => {
+            match (item.department, item.urgency, item.response_due_minute) {
+                (Some(department), Some(urgency), Some(due_minute)) => {
+                    out.write_str(
+                        f"#{item.request_id} {service_name(item.service)} — {item.location_name}; routed to {department_name(department)}; {urgency_name(urgency)}; target minute {due_minute}; {item.incident_report_count} report(s)\n".as_str(),
+                    )
+                }
+                _ => {
+                    out.write_str(
+                        f"#{item.request_id} — routed record is incomplete; held for review\n".as_str(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+pub fn render_report() -> String
+    effects { alloc }
+{
+    let report: TriageReport = triage.triage()
+    var out = String.new()
+    out.write_str("Civic service request triage\n")
+    out.write_str(
+        "Duplicate key: service + municipal asset location + intake day; earliest report is retained\n",
+    )
+    out.write_str("Response targets: critical 30 min; high 240 min; standard 2,880 min\n\n")
+    for index in 0..report.request_count {
+        match report.items[index] { Some(item) => write_item(borrow mut out, item), None => {} }
+    }
+    out.write_str(
+        f"\nSummary: {report.routed_count} routed; {report.duplicate_count} duplicate reports linked; {report.outside_municipality_count} jurisdiction holds; {report.classification_review_count} classification reviews; {report.invalid_record_count} invalid records; {report.critical_count} critical cases\n".as_str(),
+    )
+    out
+}
