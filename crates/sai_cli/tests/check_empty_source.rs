@@ -435,8 +435,8 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        19,
-        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus named/nested tuple literal leaves:\n{stdout}"
+        20,
+        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus depth-three annotated leaves and named/nested tuple literal leaves:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
