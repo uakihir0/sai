@@ -2376,7 +2376,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924–IR-930 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-931 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
@@ -2392,10 +2392,12 @@ tuple-literal leaves against the constructor signature; IR-928 checks direct
 primitive parameter paths, IR-929 checks explicitly annotated direct
 primitive `let`/`var` local paths, and IR-930 checks unannotated direct local
 initializers only when they are fixed-type Bool, Byte, Char, or unit literals.
-Both local checks use resolved binding identity. These are
-limited argument checks: named arguments are not bound by their names, and
-general expression typing, `TypeckResults::call_kinds`, and generic, external,
-dependency, or WIT variant paths remain outside the projection. `sai check`
+Both local checks use resolved binding identity. IR-931 also checks same-arity,
+one-level tuple destructuring when every initializer leaf is a direct
+fixed-type Bool, Byte, Char, or unit literal. These are limited argument
+checks: named arguments are not bound by their names, and general expression
+typing, `TypeckResults::call_kinds`, and generic, external, dependency, or WIT
+variant paths remain outside the projection. `sai check`
 reports the staged diagnostics while retaining its incomplete-stage gate; it
 does not claim full check coverage or emit a success result for these inputs.
 
