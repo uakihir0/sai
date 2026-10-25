@@ -1,0 +1,310 @@
+use acme:reproducible-pipeline-planner/graph
+use acme:reproducible-pipeline-planner/lookup
+use acme:reproducible-pipeline-planner/model.{
+    ConfigIssue
+    Dependency
+    ExecutionResult
+    GraphIssue
+    InputValidation
+    MAX_DEPENDENCIES
+    MAX_TASKS
+    ScheduleReport
+    SchedulerConfig
+    SchedulerIssue
+    Task
+    TaskRun
+    TaskSnapshot
+    TaskState
+    TaskStates
+}
+
+fn empty_report(
+    graph_issue: Option<GraphIssue>,
+    config_issue: Option<ConfigIssue>,
+    scheduler_issue: Option<SchedulerIssue>,
+) -> ScheduleReport {
+    ScheduleReport(
+        runs: Array<Option<TaskRun>, MAX_TASKS>.filled(None),
+        run_count: 0,
+        batch_count: 0,
+        tasks: Array<Option<TaskSnapshot>, MAX_TASKS>.filled(None),
+        task_count: 0,
+        graph_issue: graph_issue,
+        config_issue: config_issue,
+        scheduler_issue: scheduler_issue,
+    )
+}
+
+fn validate_config(tasks: Array<Task, MAX_TASKS>, config: SchedulerConfig) -> Option<ConfigIssue> {
+    if config.worker_slots == 0 {
+        return Some(ConfigIssue.ZeroWorkerSlots)
+    }
+    if config.resource_budget == 0 {
+        return Some(ConfigIssue.ZeroResourceBudget)
+    }
+    for task in tasks {
+        if task.resource_cost == 0 {
+            return Some(ConfigIssue.ZeroTaskResourceCost)
+        }
+        if task.resource_cost > config.resource_budget {
+            return Some(ConfigIssue.TaskExceedsResourceBudget)
+        }
+    }
+    None
+}
+
+fn first_terminal_prerequisite(
+    tasks: Array<Task, MAX_TASKS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    task_id: U32,
+    states: Array<TaskState, MAX_TASKS>,
+) -> Option<U32> {
+    var selected: Option<U32> = None
+    for dependency in dependencies {
+        if dependency.task_id == task_id {
+            match lookup.task_index(tasks, dependency.prerequisite_id) {
+                Some(index) => {
+                    let state = states[index]
+                    if (
+                        state == TaskState.Failed
+                        or state == TaskState.Invalid
+                        or state == TaskState.Blocked
+                    ) {
+                        match selected {
+                            Some(selected_id) => {
+                                if dependency.prerequisite_id < selected_id {
+                                    selected = Some(dependency.prerequisite_id)
+                                }
+                            }
+                            None => {
+                                selected = Some(dependency.prerequisite_id)
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    selected
+}
+
+fn propagate_blocked(
+    tasks: Array<Task, MAX_TASKS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    var progress: TaskStates,
+) -> TaskStates {
+    var changed = true
+    while changed {
+        changed = false
+        for index in 0..tasks.len() {
+            if progress.states[index] == TaskState.Pending {
+                match first_terminal_prerequisite(
+                    tasks,
+                    dependencies,
+                    tasks[index].id,
+                    progress.states,
+                ) {
+                    Some(prerequisite_id) => {
+                        progress.states[index] = TaskState.Blocked
+                        progress.blocked_by[index] = Some(prerequisite_id)
+                        changed = true
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    progress
+}
+
+fn all_prerequisites_succeeded(
+    tasks: Array<Task, MAX_TASKS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    task_id: U32,
+    states: Array<TaskState, MAX_TASKS>,
+) -> Bool {
+    for dependency in dependencies {
+        if dependency.task_id == task_id {
+            match lookup.task_index(tasks, dependency.prerequisite_id) {
+                Some(index) => {
+                    if states[index] != TaskState.Succeeded {
+                        return false
+                    }
+                }
+                None => {
+                    return false
+                }
+            }
+        }
+    }
+    true
+}
+
+fn best_ready_task(
+    tasks: Array<Task, MAX_TASKS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    states: Array<TaskState, MAX_TASKS>,
+    remaining_resources: U32,
+) -> Option<USize> {
+    var selected: Option<USize> = None
+    for index in 0..tasks.len() {
+        if (
+            states[index] == TaskState.Pending
+            and tasks[index].resource_cost <= remaining_resources
+            and all_prerequisites_succeeded(tasks, dependencies, tasks[index].id, states)
+        ) {
+            match selected {
+                Some(selected_index) => {
+                    if (
+                        tasks[index].priority > tasks[selected_index].priority
+                        or (
+                            tasks[index].priority == tasks[selected_index].priority
+                            and tasks[index].id < tasks[selected_index].id
+                        )
+                    ) {
+                        selected = Some(index)
+                    }
+                }
+                None => {
+                    selected = Some(index)
+                }
+            }
+        }
+    }
+    selected
+}
+
+fn every_task_is_terminal(states: Array<TaskState, MAX_TASKS>) -> Bool {
+    for state in states {
+        if state == TaskState.Pending or state == TaskState.Running {
+            return false
+        }
+    }
+    true
+}
+
+fn snapshots(tasks: Array<Task, MAX_TASKS>, states: TaskStates) -> Array<
+    Option<TaskSnapshot>,
+    MAX_TASKS,
+> {
+    var result = Array<Option<TaskSnapshot>, MAX_TASKS>.filled(None)
+    for index in 0..tasks.len() {
+        result[index] = Some(
+            TaskSnapshot(
+                task_id: tasks[index].id,
+                state: states.states[index],
+                blocked_by: states.blocked_by[index],
+            ),
+        )
+    }
+    result
+}
+
+pub fn run(
+    tasks: Array<Task, MAX_TASKS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    config: SchedulerConfig,
+) -> ScheduleReport {
+    let config_issue = validate_config(tasks, config)
+    if config_issue.is_some() {
+        return empty_report(None, config_issue, None)
+    }
+
+    let graph_issue = graph.validate(tasks, dependencies)
+    if graph_issue.is_some() {
+        return empty_report(graph_issue, None, None)
+    }
+
+    var progress = TaskStates(
+        states: Array<TaskState, MAX_TASKS>.filled(TaskState.Pending),
+        blocked_by: Array<Option<U32>, MAX_TASKS>.filled(None),
+    )
+    for index in 0..tasks.len() {
+        if tasks[index].validation == InputValidation.Invalid {
+            progress.states[index] = TaskState.Invalid
+        }
+    }
+
+    var runs = Array<Option<TaskRun>, MAX_TASKS>.filled(None)
+    var run_count: USize = 0
+    var batch_count: USize = 0
+    var scheduler_issue: Option<SchedulerIssue> = None
+    var finished = false
+
+    while not finished {
+        progress = propagate_blocked(tasks, dependencies, progress)
+        if every_task_is_terminal(progress.states) {
+            finished = true
+        } else {
+            let batch_start = run_count
+            var selected_count: USize = 0
+            var remaining_resources = config.resource_budget
+
+            while selected_count < config.worker_slots {
+                match best_ready_task(tasks, dependencies, progress.states, remaining_resources) {
+                    Some(index) => {
+                        let task = tasks[index]
+                        progress.states[index] = TaskState.Running
+                        runs[run_count] = Some(
+                            TaskRun(
+                                sequence: run_count + 1,
+                                batch: batch_count + 1,
+                                worker_slot: selected_count + 1,
+                                task_id: task.id,
+                                execution: task.execution,
+                            ),
+                        )
+                        run_count += 1
+                        selected_count += 1
+                        remaining_resources -= task.resource_cost
+                    }
+                    None => {
+                        break
+                    }
+                }
+            }
+
+            if selected_count == 0 {
+                scheduler_issue = Some(SchedulerIssue.NoProgress)
+                finished = true
+            } else {
+                batch_count += 1
+                for run_index in batch_start..run_count {
+                    match runs[run_index] {
+                        Some(run) => {
+                            match lookup.task_index(tasks, run.task_id) {
+                                Some(index) => {
+                                    progress.states[index] = match run.execution {
+                                        ExecutionResult.Succeeds => TaskState.Succeeded
+                                        ExecutionResult.Fails => TaskState.Failed
+                                    }
+                                }
+                                None => {
+                                    scheduler_issue = Some(SchedulerIssue.NoProgress)
+                                }
+                            }
+                        }
+                        None => {
+                            scheduler_issue = Some(SchedulerIssue.NoProgress)
+                        }
+                    }
+                }
+                if scheduler_issue.is_some() {
+                    finished = true
+                }
+            }
+        }
+    }
+
+    ScheduleReport(
+        runs: runs,
+        run_count: run_count,
+        batch_count: batch_count,
+        tasks: snapshots(tasks, progress),
+        task_count: tasks.len(),
+        graph_issue: None,
+        config_issue: None,
+        scheduler_issue: scheduler_issue,
+    )
+}

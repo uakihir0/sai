@@ -1,0 +1,10 @@
+use acme:reproducible-pipeline-planner/model.{MAX_TASKS, Task}
+
+pub fn task_index(tasks: Array<Task, MAX_TASKS>, task_id: U32) -> Option<USize> {
+    for index in 0..tasks.len() {
+        if tasks[index].id == task_id {
+            return Some(index)
+        }
+    }
+    None
+}

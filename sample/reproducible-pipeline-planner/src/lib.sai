@@ -1,0 +1,72 @@
+use acme:reproducible-pipeline-planner/fixtures
+use acme:reproducible-pipeline-planner/model.{
+    ConfigIssue
+    GraphIssue
+    ScheduleReport
+    SchedulerConfig
+    TaskState
+}
+use acme:reproducible-pipeline-planner/planner
+
+pub fn fixture_report() -> ScheduleReport {
+    planner.run(fixtures.tasks(), fixtures.dependencies(), fixtures.config())
+}
+
+test "fixture ranks only ready tasks that fit the remaining batch budget" {
+    let report = fixture_report()
+
+    assert report.graph_issue == None
+    assert report.config_issue == None
+    assert report.scheduler_issue == None
+    assert report.run_count == 7
+    assert report.batch_count == 4
+    assert report.runs[0].unwrap().task_id == 10
+    assert report.runs[1].unwrap().task_id == 20
+    assert report.runs[2].unwrap().task_id == 30
+    assert report.runs[1].unwrap().batch == 2
+    assert report.runs[2].unwrap().batch == 2
+    assert report.runs[3].unwrap().task_id == 110
+    assert report.runs[3].unwrap().batch == 2
+    assert report.runs[3].unwrap().worker_slot == 3
+    assert report.runs[4].unwrap().task_id == 40
+    assert report.runs[5].unwrap().task_id == 60
+    assert report.runs[4].unwrap().batch == 3
+    assert report.runs[5].unwrap().batch == 3
+    assert report.runs[5].unwrap().worker_slot == 2
+    assert report.runs[6].unwrap().task_id == 100
+    assert report.runs[6].unwrap().batch == 4
+    assert report.runs[6].unwrap().worker_slot == 1
+}
+
+test "failed and invalid prerequisites propagate to their dependents" {
+    let report = fixture_report()
+
+    assert report.tasks[3].unwrap().state == TaskState.Failed
+    assert report.tasks[4].unwrap().state == TaskState.Blocked
+    assert report.tasks[4].unwrap().blocked_by == Some(40)
+    assert report.tasks[6].unwrap().state == TaskState.Invalid
+    assert report.tasks[7].unwrap().state == TaskState.Blocked
+    assert report.tasks[7].unwrap().blocked_by == Some(70)
+    assert report.tasks[8].unwrap().state == TaskState.Blocked
+    assert report.tasks[8].unwrap().blocked_by == Some(80)
+    assert report.tasks[9].unwrap().state == TaskState.Succeeded
+}
+
+test "dependency cycles reject the graph before any work is scheduled" {
+    var dependencies = fixtures.dependencies()
+    dependencies[1].task_id = 10
+    dependencies[1].prerequisite_id = 20
+    let report = planner.run(fixtures.tasks(), dependencies, fixtures.config())
+    assert report.graph_issue == Some(GraphIssue.DependencyCycle)
+    assert report.run_count == 0
+    assert report.tasks[0] == None
+}
+
+test "a task larger than the total resource budget rejects the configuration" {
+    let config = SchedulerConfig(worker_slots: 3, resource_budget: 2)
+    let report = planner.run(fixtures.tasks(), fixtures.dependencies(), config)
+
+    assert report.config_issue == Some(ConfigIssue.TaskExceedsResourceBudget)
+    assert report.run_count == 0
+    assert report.tasks[0] == None
+}

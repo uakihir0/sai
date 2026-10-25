@@ -1,0 +1,102 @@
+pub const MAX_TASKS: USize = 11
+pub const MAX_DEPENDENCIES: USize = 12
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum InputValidation {
+    Valid
+    Invalid
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ExecutionResult {
+    Succeeds
+    Fails
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum TaskState {
+    Pending
+    Running
+    Succeeded
+    Failed
+    Invalid
+    Blocked
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum GraphIssue {
+    DuplicateTaskId
+    UnknownDependencyEndpoint
+    SelfDependency
+    DuplicateDependency
+    DependencyCycle
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ConfigIssue {
+    ZeroWorkerSlots
+    ZeroResourceBudget
+    ZeroTaskResourceCost
+    TaskExceedsResourceBudget
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SchedulerIssue {
+    NoProgress
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Task {
+    pub id: U32
+    pub name: Str
+    pub priority: U32
+    pub resource_cost: U32
+    pub validation: InputValidation
+    pub execution: ExecutionResult
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Dependency {
+    pub task_id: U32
+    pub prerequisite_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SchedulerConfig {
+    pub worker_slots: USize
+    pub resource_budget: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TaskRun {
+    pub sequence: USize
+    pub batch: USize
+    pub worker_slot: USize
+    pub task_id: U32
+    pub execution: ExecutionResult
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TaskSnapshot {
+    pub task_id: U32
+    pub state: TaskState
+    pub blocked_by: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ScheduleReport {
+    pub runs: Array<Option<TaskRun>, MAX_TASKS>
+    pub run_count: USize
+    pub batch_count: USize
+    pub tasks: Array<Option<TaskSnapshot>, MAX_TASKS>
+    pub task_count: USize
+    pub graph_issue: Option<GraphIssue>
+    pub config_issue: Option<ConfigIssue>
+    pub scheduler_issue: Option<SchedulerIssue>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TaskStates {
+    pub states: Array<TaskState, MAX_TASKS>
+    pub blocked_by: Array<Option<U32>, MAX_TASKS>
+}

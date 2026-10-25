@@ -1,0 +1,123 @@
+use acme:reproducible-pipeline-planner/model.{
+    Dependency
+    ExecutionResult
+    InputValidation
+    MAX_DEPENDENCIES
+    MAX_TASKS
+    SchedulerConfig
+    Task
+}
+
+pub fn tasks() -> Array<Task, MAX_TASKS> {
+    [
+        Task(
+            id: 10,
+            name: "Fetch source",
+            priority: 50,
+            resource_cost: 1,
+            validation: InputValidation.Valid,
+            execution: ExecutionResult.Succeeds,
+        ),
+        Task(
+            id: 20,
+            name: "Verify source signatures",
+            priority: 95,
+            resource_cost: 2,
+            validation: InputValidation.Valid,
+            execution: ExecutionResult.Succeeds,
+        ),
+        Task(
+            id: 30,
+            name: "Lint source",
+            priority: 80,
+            resource_cost: 1,
+            validation: InputValidation.Valid,
+            execution: ExecutionResult.Succeeds,
+        ),
+        Task(
+            id: 40,
+            name: "Run unit tests",
+            priority: 100,
+            resource_cost: 3,
+            validation: InputValidation.Valid,
+            execution: ExecutionResult.Fails,
+        ),
+        Task(
+            id: 50,
+            name: "Package release",
+            priority: 70,
+            resource_cost: 2,
+            validation: InputValidation.Valid,
+            execution: ExecutionResult.Succeeds,
+        ),
+        Task(
+            id: 60,
+            name: "Check documentation links",
+            priority: 60,
+            resource_cost: 1,
+            validation: InputValidation.Valid,
+            execution: ExecutionResult.Succeeds,
+        ),
+        Task(
+            id: 70,
+            name: "Scan dependencies",
+            priority: 85,
+            resource_cost: 1,
+            validation: InputValidation.Invalid,
+            execution: ExecutionResult.Succeeds,
+        ),
+        Task(
+            id: 80,
+            name: "Sign release",
+            priority: 75,
+            resource_cost: 1,
+            validation: InputValidation.Valid,
+            execution: ExecutionResult.Succeeds,
+        ),
+        Task(
+            id: 90,
+            name: "Publish release",
+            priority: 90,
+            resource_cost: 2,
+            validation: InputValidation.Valid,
+            execution: ExecutionResult.Succeeds,
+        ),
+        Task(
+            id: 100,
+            name: "Run integration tests",
+            priority: 75,
+            resource_cost: 2,
+            validation: InputValidation.Valid,
+            execution: ExecutionResult.Succeeds,
+        ),
+        Task(
+            id: 110,
+            name: "Record build provenance",
+            priority: 65,
+            resource_cost: 1,
+            validation: InputValidation.Valid,
+            execution: ExecutionResult.Succeeds,
+        ),
+    ]
+}
+
+pub fn dependencies() -> Array<Dependency, MAX_DEPENDENCIES> {
+    [
+        Dependency(task_id: 20, prerequisite_id: 10),
+        Dependency(task_id: 30, prerequisite_id: 10),
+        Dependency(task_id: 40, prerequisite_id: 20),
+        Dependency(task_id: 40, prerequisite_id: 30),
+        Dependency(task_id: 50, prerequisite_id: 40),
+        Dependency(task_id: 60, prerequisite_id: 30),
+        Dependency(task_id: 80, prerequisite_id: 70),
+        Dependency(task_id: 90, prerequisite_id: 50),
+        Dependency(task_id: 90, prerequisite_id: 80),
+        Dependency(task_id: 100, prerequisite_id: 20),
+        Dependency(task_id: 100, prerequisite_id: 30),
+        Dependency(task_id: 110, prerequisite_id: 10),
+    ]
+}
+
+pub fn config() -> SchedulerConfig {
+    SchedulerConfig(worker_slots: 3, resource_budget: 4)
+}
