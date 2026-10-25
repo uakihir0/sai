@@ -1,0 +1,88 @@
+use acme:order-fulfillment-saga/model.{
+    MAX_SAGAS
+    ReviewReason
+    SagaBatch
+    SagaReport
+    SagaResult
+    SagaStatus
+}
+use acme:order-fulfillment-saga/replay
+
+fn empty_report() -> SagaReport {
+    SagaReport(
+        sagas: Array<Option<SagaResult>, MAX_SAGAS>.filled(None),
+        case_count: 0,
+        completed_count: 0,
+        compensated_count: 0,
+        rejected_count: 0,
+        needs_review_count: 0,
+        event_count: 0,
+        action_attempt_count: 0,
+        duplicate_event_count: 0,
+        retryable_failure_count: 0,
+        rejected_event_count: 0,
+        valid: true,
+    )
+}
+
+fn has_prior_order_id(batch: SagaBatch, before_index: USize, order_id: U32) -> Bool {
+    for index in 0..before_index {
+        match batch.cases[index] {
+            Some(previous) => {
+                if previous.order_id == order_id {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+pub fn audit(batch: SagaBatch) -> SagaReport {
+    var report = empty_report()
+    if batch.length > batch.cases.len() {
+        report.valid = false
+        return report
+    }
+
+    for index in 0..batch.length {
+        match batch.cases[index] {
+            Some(case) => {
+                let duplicate_order = has_prior_order_id(batch, index, case.order_id)
+                let result = if duplicate_order {
+                    report.valid = false
+                    replay.reject_case(case, ReviewReason.DuplicateOrderId)
+                } else {
+                    replay.replay(case)
+                }
+                report.sagas[index] = Some(result)
+                report.case_count += 1
+                report.event_count += result.event_count
+                report.action_attempt_count += result.action_attempt_count
+                report.duplicate_event_count += result.duplicate_event_count
+                report.retryable_failure_count += result.retryable_failure_count
+                report.rejected_event_count += result.rejected_event_count
+                match result.status {
+                    SagaStatus.Completed => {
+                        report.completed_count += 1
+                    }
+                    SagaStatus.Compensated => {
+                        report.compensated_count += 1
+                    }
+                    SagaStatus.Rejected => {
+                        report.rejected_count += 1
+                    }
+                    SagaStatus.NeedsReview => {
+                        report.needs_review_count += 1
+                    }
+                    _ => {}
+                }
+            }
+            None => {
+                report.valid = false
+            }
+        }
+    }
+    report
+}

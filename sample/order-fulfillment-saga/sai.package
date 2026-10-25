@@ -1,0 +1,5 @@
+package acme:order-fulfillment-saga @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Replay and audit a fixed multi-step order fulfillment saga"

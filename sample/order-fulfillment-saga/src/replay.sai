@@ -1,0 +1,334 @@
+use acme:order-fulfillment-saga/model.{
+    FailureReason
+    MAX_SAGA_EVENTS
+    MAX_STAGE_ATTEMPTS
+    ReviewReason
+    SagaCase
+    SagaEvent
+    SagaResult
+    SagaStatus
+    SagaStep
+    StepResult
+}
+
+fn empty_result(order_id: U32) -> SagaResult {
+    SagaResult(
+        order_id: order_id,
+        status: SagaStatus.AwaitingInventory,
+        events: Array<Option<SagaEvent>, MAX_SAGA_EVENTS>.filled(None),
+        event_count: 0,
+        reserve_attempts: 0,
+        capture_attempts: 0,
+        dispatch_attempts: 0,
+        refund_attempts: 0,
+        release_attempts: 0,
+        action_attempt_count: 0,
+        duplicate_event_count: 0,
+        retryable_failure_count: 0,
+        rejected_event_count: 0,
+        reserve_operation_key: 0,
+        capture_operation_key: 0,
+        dispatch_operation_key: 0,
+        refund_operation_key: 0,
+        release_operation_key: 0,
+        inventory_reserved: false,
+        payment_captured: false,
+        shipment_dispatched: false,
+        refund_completed: false,
+        inventory_released: false,
+        primary_failure: None,
+        compensation_failure: None,
+        review_reason: None,
+    )
+}
+
+fn note_review(state: borrow mut SagaResult, reason: ReviewReason) {
+    state.status = SagaStatus.NeedsReview
+    if state.review_reason == None {
+        state.review_reason = Some(reason)
+    }
+}
+
+fn prior_event(state: SagaResult, event_id: U32) -> Option<SagaEvent> {
+    for index in 0..state.event_count {
+        match state.events[index] {
+            Some(event) => {
+                if event.event_id == event_id {
+                    return Some(event)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+fn expected_step(status: SagaStatus) -> Option<SagaStep> {
+    match status {
+        SagaStatus.AwaitingInventory => Some(SagaStep.ReserveInventory)
+        SagaStatus.AwaitingPayment => Some(SagaStep.CapturePayment)
+        SagaStatus.AwaitingShipment => Some(SagaStep.CreateShipment)
+        SagaStatus.RefundingPayment => Some(SagaStep.RefundPayment)
+        SagaStatus.ReleasingInventory => Some(SagaStep.ReleaseInventory)
+        _ => None
+    }
+}
+
+fn attempts_for(state: SagaResult, step: SagaStep) -> USize {
+    match step {
+        SagaStep.ReserveInventory => state.reserve_attempts
+        SagaStep.CapturePayment => state.capture_attempts
+        SagaStep.CreateShipment => state.dispatch_attempts
+        SagaStep.RefundPayment => state.refund_attempts
+        SagaStep.ReleaseInventory => state.release_attempts
+    }
+}
+
+fn operation_key_for(state: SagaResult, step: SagaStep) -> U32 {
+    match step {
+        SagaStep.ReserveInventory => state.reserve_operation_key
+        SagaStep.CapturePayment => state.capture_operation_key
+        SagaStep.CreateShipment => state.dispatch_operation_key
+        SagaStep.RefundPayment => state.refund_operation_key
+        SagaStep.ReleaseInventory => state.release_operation_key
+    }
+}
+
+fn set_attempt_and_key(state: borrow mut SagaResult, event: SagaEvent) {
+    match event.step {
+        SagaStep.ReserveInventory => {
+            state.reserve_attempts = event.attempt
+            state.reserve_operation_key = event.operation_key
+        }
+        SagaStep.CapturePayment => {
+            state.capture_attempts = event.attempt
+            state.capture_operation_key = event.operation_key
+        }
+        SagaStep.CreateShipment => {
+            state.dispatch_attempts = event.attempt
+            state.dispatch_operation_key = event.operation_key
+        }
+        SagaStep.RefundPayment => {
+            state.refund_attempts = event.attempt
+            state.refund_operation_key = event.operation_key
+        }
+        SagaStep.ReleaseInventory => {
+            state.release_attempts = event.attempt
+            state.release_operation_key = event.operation_key
+        }
+    }
+}
+
+fn begin_compensation(state: borrow mut SagaResult, failure: FailureReason) {
+    state.primary_failure = Some(failure)
+    if state.payment_captured {
+        state.status = SagaStatus.RefundingPayment
+    } else if state.inventory_reserved {
+        state.status = SagaStatus.ReleasingInventory
+    } else {
+        state.status = SagaStatus.Rejected
+    }
+}
+
+fn apply_success(state: borrow mut SagaResult, step: SagaStep) {
+    match step {
+        SagaStep.ReserveInventory => {
+            state.inventory_reserved = true
+            state.status = SagaStatus.AwaitingPayment
+        }
+        SagaStep.CapturePayment => {
+            state.payment_captured = true
+            state.status = SagaStatus.AwaitingShipment
+        }
+        SagaStep.CreateShipment => {
+            state.shipment_dispatched = true
+            state.status = SagaStatus.Completed
+        }
+        SagaStep.RefundPayment => {
+            state.refund_completed = true
+            state.payment_captured = false
+            state.status = SagaStatus.ReleasingInventory
+        }
+        SagaStep.ReleaseInventory => {
+            state.inventory_released = true
+            state.inventory_reserved = false
+            state.status = SagaStatus.Compensated
+        }
+    }
+}
+
+fn record_compensation_failure(state: borrow mut SagaResult, failure: FailureReason) {
+    state.compensation_failure = Some(failure)
+    state.status = SagaStatus.NeedsReview
+}
+
+fn apply_failure(state: borrow mut SagaResult, event: SagaEvent) {
+    let retryable = event.result == StepResult.RetryableFailure
+    if retryable {
+        state.retryable_failure_count += 1
+        if event.attempt < MAX_STAGE_ATTEMPTS {
+            return
+        }
+    }
+
+    match event.step {
+        SagaStep.ReserveInventory => {
+            begin_compensation(
+                state,
+                if retryable {
+                    FailureReason.RetryBudgetExhausted
+                } else {
+                    FailureReason.InventoryRejected
+                },
+            )
+        }
+        SagaStep.CapturePayment => {
+            begin_compensation(
+                state,
+                if retryable {
+                    FailureReason.RetryBudgetExhausted
+                } else {
+                    FailureReason.PaymentRejected
+                },
+            )
+        }
+        SagaStep.CreateShipment => {
+            begin_compensation(
+                state,
+                if retryable {
+                    FailureReason.RetryBudgetExhausted
+                } else {
+                    FailureReason.ShipmentRejected
+                },
+            )
+        }
+        SagaStep.RefundPayment => {
+            record_compensation_failure(
+                state,
+                if retryable {
+                    FailureReason.CompensationRetryExhausted
+                } else {
+                    FailureReason.PaymentRefundRejected
+                },
+            )
+        }
+        SagaStep.ReleaseInventory => {
+            record_compensation_failure(
+                state,
+                if retryable {
+                    FailureReason.CompensationRetryExhausted
+                } else {
+                    FailureReason.InventoryReleaseRejected
+                },
+            )
+        }
+    }
+}
+
+fn log_event(state: borrow mut SagaResult, event: SagaEvent) -> Bool {
+    if state.event_count >= MAX_SAGA_EVENTS {
+        note_review(state, ReviewReason.EventLogCapacityExceeded)
+        state.rejected_event_count += 1
+        return false
+    }
+    state.events[state.event_count] = Some(event)
+    state.event_count += 1
+    true
+}
+
+fn apply_event(state: borrow mut SagaResult, event: SagaEvent) {
+    match prior_event(*state, event.event_id) {
+        Some(previous) => {
+            if log_event(state, event) {
+                if previous == event {
+                    state.duplicate_event_count += 1
+                } else {
+                    note_review(state, ReviewReason.DuplicateEventIdConflict)
+                    state.rejected_event_count += 1
+                }
+            }
+            return
+        }
+        None => {}
+    }
+
+    if not log_event(state, event) {
+        return
+    }
+
+    match expected_step(state.status) {
+        Some(expected) => {
+            if event.step != expected {
+                note_review(state, ReviewReason.UnexpectedStep)
+                state.rejected_event_count += 1
+                return
+            }
+
+            let previous_attempts = attempts_for(*state, event.step)
+            let previous_key = operation_key_for(*state, event.step)
+            if event.operation_key == 0 {
+                note_review(state, ReviewReason.MissingOperationKey)
+                state.rejected_event_count += 1
+                return
+            }
+            if event.attempt != previous_attempts + 1 {
+                note_review(state, ReviewReason.WrongAttemptNumber)
+                state.rejected_event_count += 1
+                return
+            }
+            if previous_key != 0 and previous_key != event.operation_key {
+                note_review(state, ReviewReason.ChangedOperationKey)
+                state.rejected_event_count += 1
+                return
+            }
+
+            set_attempt_and_key(state, event)
+            state.action_attempt_count += 1
+            if event.result == StepResult.Succeeded {
+                apply_success(state, event.step)
+            } else {
+                apply_failure(state, event)
+            }
+        }
+        None => {
+            if state.status == SagaStatus.NeedsReview {
+                note_review(state, ReviewReason.EventAfterReview)
+            } else {
+                note_review(state, ReviewReason.EventAfterTerminal)
+            }
+            state.rejected_event_count += 1
+        }
+    }
+}
+
+pub fn replay(case: SagaCase) -> SagaResult {
+    var state = empty_result(case.order_id)
+    if case.event_count > case.events.len() {
+        note_review(state, ReviewReason.ScriptCountExceedsCapacity)
+        return state
+    }
+
+    for index in 0..case.event_count {
+        match case.events[index] {
+            Some(event) => apply_event(borrow mut state, event)
+            None => {
+                note_review(borrow mut state, ReviewReason.MissingEventSlot)
+                break
+            }
+        }
+    }
+    state
+}
+
+pub fn reject_case(case: SagaCase, reason: ReviewReason) -> SagaResult {
+    var state = empty_result(case.order_id)
+    note_review(borrow mut state, reason)
+    if case.event_count > case.events.len() {
+        return state
+    }
+
+    state.events = case.events
+    state.event_count = case.event_count
+    state.rejected_event_count = case.event_count
+    state
+}
