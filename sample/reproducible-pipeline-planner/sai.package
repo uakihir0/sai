@@ -1,0 +1,5 @@
+package acme:reproducible-pipeline-planner @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Schedule a bounded build pipeline with dependency and resource gates"

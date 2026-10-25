@@ -1,0 +1,155 @@
+use acme:mentorship-matching/data
+use acme:mentorship-matching/matching
+use acme:mentorship-matching/model.{InputError, MatchReport, ProposalResult}
+
+pub fn fixture_report() -> MatchReport {
+    matching.build_report(
+        data.mentees(),
+        data.mentees().len(),
+        data.mentors(),
+        data.mentors().len(),
+    )
+}
+
+test "deferred acceptance holds four mentees and exhausts Eli's acceptable list" {
+    let report = fixture_report()
+    assert report.input_error == None
+    assert report.pair_count == 4
+    assert report.unmatched_count == 1
+    assert report.unmatched_mentee_ids[0] == Some(105)
+    assert report.proposal_count == 10
+    assert report.replacement_count == 2
+    assert report.ineligible_count == 1
+    assert report.rejection_count == 3
+
+    let aki = report.pairs[0].unwrap()
+    assert aki.mentee_id == 101
+    assert aki.mentor_id == 202
+    assert aki.mentee_preference_rank == 2
+    assert aki.mentor_preference_rank == 2
+
+    let bea = report.pairs[1].unwrap()
+    assert bea.mentee_id == 102
+    assert bea.mentor_id == 203
+    assert bea.mentee_preference_rank == 2
+    assert bea.mentor_preference_rank == 1
+
+    let chen = report.pairs[2].unwrap()
+    assert chen.mentee_id == 103
+    assert chen.mentor_id == 201
+    assert chen.mentee_preference_rank == 1
+    assert chen.mentor_preference_rank == 1
+
+    let daya = report.pairs[3].unwrap()
+    assert daya.mentee_id == 104
+    assert daya.mentor_id == 202
+    assert daya.mentee_preference_rank == 2
+    assert daya.mentor_preference_rank == 1
+}
+
+test "matched pairs remain compact when an earlier mentee has no choices" {
+    var mentees = data.mentees()
+    mentees[0].preference_count = 0
+    mentees[1].preference_count = 1
+
+    var mentors = data.mentors()
+    mentors[0].preference_count = 1
+    mentors[0].preferences[0] = 101
+    mentors[1].preference_count = 2
+    mentors[1].preferences[0] = 102
+    mentors[1].preferences[1] = 101
+
+    let report = matching.build_report(mentees, 2, mentors, 2)
+    assert report.input_error == None
+    assert report.pair_count == 1
+    assert report.unmatched_count == 1
+    assert report.unmatched_mentee_ids[0] == Some(101)
+    assert report.pairs[0].unwrap().mentee_id == 102
+    assert report.pairs[0].unwrap().mentor_id == 202
+}
+
+test "replaced and rejected proposers continue at the next preference" {
+    let report = fixture_report()
+    assert report.proposals[2].unwrap().result == ProposalResult.Replaced(101)
+    assert report.proposals[3].unwrap().mentee_id == 101
+    assert report.proposals[3].unwrap().mentor_id == 202
+    assert report.proposals[3].unwrap().result == ProposalResult.Held
+    assert report.proposals[4].unwrap().mentee_id == 104
+    assert report.proposals[4].unwrap().result == ProposalResult.SkippedIneligible
+    assert report.proposals[5].unwrap().mentee_id == 104
+    assert report.proposals[5].unwrap().mentor_id == 202
+    assert report.proposals[5].unwrap().result == ProposalResult.Replaced(102)
+    assert report.proposals[6].unwrap().mentee_id == 102
+    assert report.proposals[6].unwrap().mentor_id == 203
+    assert report.proposals[6].unwrap().result == ProposalResult.Held
+    assert report.proposals[7].unwrap().result == ProposalResult.Rejected
+    assert report.proposals[8].unwrap().result == ProposalResult.Rejected
+    assert report.proposals[9].unwrap().result == ProposalResult.Rejected
+}
+
+test "duplicate mentee IDs stop before the first proposal" {
+    var mentees = data.mentees()
+    mentees[1].id = mentees[0].id
+    let report = matching.build_report(mentees, mentees.len(), data.mentors(), data.mentors().len())
+    assert report.input_error == Some(InputError.DuplicateMenteeId)
+    assert report.proposal_count == 0
+    assert report.pair_count == 0
+}
+
+test "duplicate mentor IDs stop before the first proposal" {
+    var mentors = data.mentors()
+    mentors[2].id = mentors[1].id
+    let report = matching.build_report(data.mentees(), data.mentees().len(), mentors, mentors.len())
+    assert report.input_error == Some(InputError.DuplicateMentorId)
+    assert report.proposal_count == 0
+}
+
+test "an unknown mentee preference reference stops before matching" {
+    var mentees = data.mentees()
+    mentees[0].preferences[0] = 999
+    let mentors = data.mentors()
+    let bad_mentee_reference = matching.build_report(mentees, mentees.len(), mentors, mentors.len())
+    assert bad_mentee_reference.input_error == Some(InputError.MenteePreferenceUnknownMentor)
+    assert bad_mentee_reference.proposal_count == 0
+}
+
+test "an unknown mentor preference reference stops before matching" {
+    var mentors = data.mentors()
+    mentors[0].preferences[0] = 999
+    let mentees = data.mentees()
+    let bad_mentor_reference = matching.build_report(mentees, mentees.len(), mentors, mentors.len())
+    assert bad_mentor_reference.input_error == Some(InputError.MentorPreferenceUnknownMentee)
+    assert bad_mentor_reference.proposal_count == 0
+}
+
+test "duplicate preferences and excessive capacities are rejected before matching" {
+    var mentees = data.mentees()
+    mentees[0].preferences[1] = mentees[0].preferences[0]
+    let repeated_choice =
+        matching.build_report(mentees, mentees.len(), data.mentors(), data.mentors().len())
+    assert repeated_choice.input_error == Some(InputError.DuplicateMenteePreference)
+    assert repeated_choice.proposal_count == 0
+
+    var mentors = data.mentors()
+    mentors[0].capacity = 6
+    let excessive_capacity =
+        matching.build_report(data.mentees(), data.mentees().len(), mentors, mentors.len())
+    assert excessive_capacity.input_error == Some(InputError.MentorCapacityExceedsLimit)
+    assert excessive_capacity.proposal_count == 0
+}
+
+test "the hand-checked fixture uses distinct mentees and never exceeds mentor capacities" {
+    let report = fixture_report()
+    let mentees = data.mentees()
+    let mentors = data.mentors()
+    for mentor_index in 0..mentors.len() {
+        var held_count: USize = 0
+        for pair_index in 0..report.pair_count {
+            if report.pairs[pair_index].unwrap().mentor_id == mentors[mentor_index].id {
+                held_count += 1
+            }
+        }
+        assert held_count <= mentors[mentor_index].capacity
+    }
+    assert mentees[0].id != mentees[1].id
+}
