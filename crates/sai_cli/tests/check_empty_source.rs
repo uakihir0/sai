@@ -1191,7 +1191,7 @@ fn check_reports_tuple_expected_primitive_parameter_path_mismatches() {
         "type Widget { value: Bool }\n",
         "fn bool_factory() -> Bool { true }\n",
         "fn use_it(actual: Bool, nested: USize, var byte: Byte, alias: BoolAlias, text: Str, unit: (), tuple: (I8,), owner: Widget, extra: Bool) {\n",
-        "    let local = true\n",
+        "    let local = true && false\n",
         "    (\n",
         "        Payload.Single(actual), ",
         "        Payload.Nested((nested, ((), 2))), ",
@@ -1357,9 +1357,9 @@ fn check_reports_tuple_expected_annotated_primitive_local_mismatches() {
         "    let extra_local: Bool = true\n",
         "    Payload.Single((1,), extra_local)\n",
         "}\n",
-        "fn unannotated_exclusion() {\n",
-        "    let unannotated = true\n",
-        "    Payload.Single(unannotated)\n",
+        "fn computed_exclusion() {\n",
+        "    let computed = true && false\n",
+        "    Payload.Single(computed)\n",
         "}\n",
         "fn nested_scope_exclusion() {\n",
         "    {\n",
@@ -1516,6 +1516,198 @@ fn check_reports_tuple_expected_annotated_primitive_local_mismatches() {
         &stdout,
         "WRONG_ARGUMENT_COUNT",
         "Single: tuple variant expects 1 arguments but found 2",
+        named_start,
+        named_start + named_call.len(),
+    );
+}
+
+#[test]
+fn check_reports_tuple_expected_inferred_fixed_primitive_local_mismatches() {
+    let source = concat!(
+        "enum Payload { Shape((I8, (Bool,), USize, (USize,))) }\n",
+        "fn bool_factory() -> Bool { true }\n",
+        "fn let_outer() {\n",
+        "    let let_local = true\n",
+        "    Payload.Shape(let_local)\n",
+        "}\n",
+        "fn var_outer() {\n",
+        "    var var_local = b'x'\n",
+        "    Payload.Shape(var_local)\n",
+        "}\n",
+        "fn nested_char() {\n",
+        "    let nested_char = 'x'\n",
+        "    Payload.Shape((1, nested_char, 2, (3,)))\n",
+        "}\n",
+        "fn nested_unit() {\n",
+        "    let nested_unit = ()\n",
+        "    Payload.Shape((1, (true,), 2, nested_unit))\n",
+        "}\n",
+        "fn shadowed(parameter: Bool) {\n",
+        "    let parameter = b'x'\n",
+        "    Payload.Shape(parameter)\n",
+        "}\n",
+        "fn sibling_order() {\n",
+        "    var sibling_local = true\n",
+        "    Payload.Shape((1, sibling_local, true, (3,)))\n",
+        "}\n",
+        "fn named_extra(extra: Bool) {\n",
+        "    let named_local = true\n",
+        "    Payload.Shape(value: named_local, extra: extra)\n",
+        "}\n",
+        "fn extra_argument() {\n",
+        "    let extra_local = true\n",
+        "    Payload.Shape((1, (true,), 2, (3,)), extra_local)\n",
+        "}\n",
+        "fn integer_exclusion() {\n",
+        "    let integer_local = 1\n",
+        "    Payload.Shape(integer_local)\n",
+        "}\n",
+        "fn float_exclusion() {\n",
+        "    let float_local = 1.5\n",
+        "    Payload.Shape(float_local)\n",
+        "}\n",
+        "fn annotated_str_exclusion() {\n",
+        "    let annotated_local: Str = \"text\"\n",
+        "    Payload.Shape(annotated_local)\n",
+        "}\n",
+        "fn computed_exclusion() {\n",
+        "    let computed_local = true && false\n",
+        "    Payload.Shape(computed_local)\n",
+        "}\n",
+        "fn call_exclusion() {\n",
+        "    let call_local = bool_factory()\n",
+        "    Payload.Shape(call_local)\n",
+        "}\n",
+        "fn nested_scope_exclusion() {\n",
+        "    {\n",
+        "        let nested_local = true\n",
+        "        Payload.Shape(nested_local)\n",
+        "    }\n",
+        "}\n",
+        "fn else_exclusion() {\n",
+        "    let else_local = true else { return }\n",
+        "    Payload.Shape(else_local)\n",
+        "}\n",
+        "fn tuple_pattern_exclusion() {\n",
+        "    let (pattern_local, _) = (true, false)\n",
+        "    Payload.Shape(pattern_local)\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "tuple-expected inferred fixed primitive locals",
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        8,
+        "only direct fixed-type locals at nonempty tuple positions and the eligible sibling literal mismatch are reported:\n{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"NAMED_ARGUMENT_ON_FUNCTION\"")
+            .count(),
+        2,
+        "named-argument diagnostics remain independent"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
+        2,
+        "named and positional extra arguments retain their independent arity diagnostics"
+    );
+
+    for (call, path, expected_message) in [
+        (
+            "Payload.Shape(let_local)",
+            "let_local",
+            "expected tuple of arity 4, found `Bool`",
+        ),
+        (
+            "Payload.Shape(var_local)",
+            "var_local",
+            "expected tuple of arity 4, found `Byte`",
+        ),
+        (
+            "Payload.Shape((1, nested_char, 2, (3,)))",
+            "nested_char",
+            "expected tuple of arity 1, found `Char`",
+        ),
+        (
+            "Payload.Shape((1, (true,), 2, nested_unit))",
+            "nested_unit",
+            "expected tuple of arity 1, found `()`",
+        ),
+        (
+            "Payload.Shape(parameter)",
+            "parameter",
+            "expected tuple of arity 4, found `Byte`",
+        ),
+        (
+            "Payload.Shape(value: named_local, extra: extra)",
+            "named_local",
+            "expected tuple of arity 4, found `Bool`",
+        ),
+    ] {
+        let call_start = source
+            .find(call)
+            .expect("inferred local mismatch call exists");
+        let path_start = call_start
+            + call
+                .find(path)
+                .expect("inferred local mismatch path occurs in the call");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            expected_message,
+            path_start,
+            path_start + path.len(),
+        );
+    }
+
+    let sibling_call = "Payload.Shape((1, sibling_local, true, (3,)))";
+    let sibling_start = source
+        .find(sibling_call)
+        .expect("inferred sibling call exists");
+    let sibling_path_start = sibling_start
+        + sibling_call
+            .find("sibling_local")
+            .expect("inferred local sibling path exists");
+    let sibling_literal_start = sibling_start
+        + sibling_call
+            .find("true")
+            .expect("eligible Bool literal sibling exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected tuple of arity 1, found `Bool`",
+        sibling_path_start,
+        sibling_path_start + "sibling_local".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `USize`, found a Bool literal",
+        sibling_literal_start,
+        sibling_literal_start + "true".len(),
+    );
+    let sibling_path_record = stdout
+        .find(&format!("\"start\":{{\"byte\":{sibling_path_start},"))
+        .expect("inferred local mismatch record exists");
+    let sibling_literal_record = stdout
+        .find(&format!("\"start\":{{\"byte\":{sibling_literal_start},"))
+        .expect("following sibling literal mismatch record exists");
+    assert!(
+        sibling_path_record < sibling_literal_record,
+        "inferred local and eligible sibling diagnostics retain source order"
+    );
+
+    let named_call = "Payload.Shape(value: named_local, extra: extra)";
+    let named_start = source.find(named_call).expect("named extra call exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "WRONG_ARGUMENT_COUNT",
+        "Shape: tuple variant expects 1 arguments but found 2",
         named_start,
         named_start + named_call.len(),
     );
