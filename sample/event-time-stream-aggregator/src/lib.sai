@@ -1,0 +1,153 @@
+use acme:event-time-stream-aggregator/data
+use acme:event-time-stream-aggregator/model.{FindingCode, StreamReport, WindowAggregate}
+use acme:event-time-stream-aggregator/policy
+use acme:event-time-stream-aggregator/stream
+
+pub fn fixture_report() -> StreamReport {
+    stream.aggregate_stream(data.sensors(), data.events())
+}
+
+fn closed_at(report: StreamReport, index: USize) -> WindowAggregate {
+    report.windows.closed_windows[index].unwrap()
+}
+
+fn open_for(report: StreamReport, sensor_id: U32, window_start: U32) -> Option<WindowAggregate> {
+    for slot in report.windows.open_windows {
+        match slot {
+            Some(aggregate) => {
+                if aggregate.sensor_id == sensor_id and aggregate.window_start == window_start {
+                    return Some(aggregate)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+test "event-time windows close at the watermark and preserve stable ordering" {
+    let report = fixture_report()
+    assert report.events_seen == 20
+    assert report.accepted_count == 15
+    assert report.finding_count == 5
+    assert report.windows.closed_count == 9
+    assert report.open_count == 2
+    assert report.final_watermark_minute == 20
+    assert report.max_event_minute == 22
+
+    assert closed_at(report, 0).window_start == 0
+    assert closed_at(report, 0).sensor_id == 10
+    assert closed_at(report, 0).reading_count == 2
+    assert closed_at(report, 0).total == 24
+    assert closed_at(report, 0).minimum == 10
+    assert closed_at(report, 0).maximum == 14
+    assert closed_at(report, 1).window_start == 0
+    assert closed_at(report, 1).sensor_id == 20
+    assert closed_at(report, 1).total == 4
+    assert closed_at(report, 2).window_start == 0
+    assert closed_at(report, 2).sensor_id == 30
+    assert closed_at(report, 2).total == 7
+
+    assert closed_at(report, 3).window_start == 5
+    assert closed_at(report, 3).sensor_id == 10
+    assert closed_at(report, 3).total == 31
+    assert closed_at(report, 4).sensor_id == 20
+    assert closed_at(report, 4).total == 8
+    assert closed_at(report, 5).sensor_id == 30
+    assert closed_at(report, 5).total == 11
+
+    assert closed_at(report, 6).window_start == 10
+    assert closed_at(report, 6).sensor_id == 10
+    assert closed_at(report, 6).total == 9
+    assert closed_at(report, 7).sensor_id == 20
+    assert closed_at(report, 7).reading_count == 2
+    assert closed_at(report, 7).total == 30
+    assert closed_at(report, 8).window_start == 15
+    assert closed_at(report, 8).sensor_id == 10
+    assert closed_at(report, 8).reading_count == 2
+    assert closed_at(report, 8).total == 28
+
+    let market_open = open_for(report, 30, 20).unwrap()
+    assert market_open.reading_count == 1
+    assert market_open.total == 6
+    let river_open = open_for(report, 20, 20).unwrap()
+    assert river_open.reading_count == 1
+    assert river_open.total == 22
+}
+
+test "the arrival-order findings retain rejected source rows and their watermark" {
+    let report = fixture_report()
+    assert report.findings[0].unwrap().event.event_id == 1005
+    assert report.findings[0].unwrap().code == FindingCode.LateEvent
+    assert report.findings[0].unwrap().watermark_at_arrival == 9
+    assert report.findings[1].unwrap().event.event_id == 1007
+    assert report.findings[1].unwrap().code == FindingCode.MissingMeasurement
+    assert report.findings[2].unwrap().event.event_id == 2005
+    assert report.findings[2].unwrap().code == FindingCode.DuplicateEventId
+    assert report.findings[3].unwrap().event.event_id == 1010
+    assert report.findings[3].unwrap().code == FindingCode.LateEvent
+    assert report.findings[3].unwrap().watermark_at_arrival == 20
+    assert report.findings[4].unwrap().event.event_id == 4001
+    assert report.findings[4].unwrap().code == FindingCode.UnknownSensor
+}
+
+test "an event exactly at the current watermark is admitted before closure" {
+    let report = fixture_report()
+    // Event 1006 at minute 9 equals the watermark and contributes to [5, 10).
+    assert closed_at(report, 3).reading_count == 2
+    assert closed_at(report, 3).total == 31
+}
+
+test "duplicate future timestamps cannot advance the watermark" {
+    var events = data.events()
+    events[15].event_minute = 9999
+    let report = stream.aggregate_stream(data.sensors(), events)
+    assert report.max_event_minute == 22
+    assert report.final_watermark_minute == 20
+    assert report.open_count == 2
+}
+
+test "a missing future measurement does not advance the watermark" {
+    var events = data.events()
+    events[12].event_minute = 9999
+    let report = stream.aggregate_stream(data.sensors(), events)
+    assert report.max_event_minute == 22
+    assert report.final_watermark_minute == 20
+    assert report.accepted_count == 15
+    assert report.findings[1].unwrap().code == FindingCode.MissingMeasurement
+}
+
+test "out-of-range event times are rejected before window arithmetic" {
+    var events = data.events()
+    events[19].sensor_id = 10
+    events[19].event_minute = 10001
+    let report = stream.aggregate_stream(data.sensors(), events)
+    assert report.max_event_minute == 22
+    assert report.final_watermark_minute == 20
+    assert report.findings[4].unwrap().code == FindingCode.EventMinuteOutOfRange
+}
+
+test "out-of-range measurements cannot overflow a window total" {
+    var events = data.events()
+    events[19].sensor_id = 10
+    events[19].event_minute = 40
+    events[19].value = Some(1000001)
+    let report = stream.aggregate_stream(data.sensors(), events)
+    assert report.max_event_minute == 22
+    assert report.final_watermark_minute == 20
+    assert report.findings[4].unwrap().code == FindingCode.MeasurementOutOfRange
+}
+
+test "the watermark clamps to zero before the lateness allowance is reached" {
+    assert policy.watermark_for(0) == 0
+    assert policy.watermark_for(1) == 0
+    assert policy.watermark_for(2) == 0
+    assert policy.watermark_for(3) == 1
+}
+
+test "window start is inclusive and its end is exclusive" {
+    assert policy.window_start(0) == 0
+    assert policy.window_start(4) == 0
+    assert policy.window_start(5) == 5
+    assert policy.window_start(9) == 5
+}

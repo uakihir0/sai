@@ -1,0 +1,65 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Sensor {
+    pub sensor_id: U32
+    pub display_name: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReadingEvent {
+    pub event_id: U32
+    pub sensor_id: U32
+    // Minutes after 00:00 on one fictional service day.
+    pub event_minute: U32
+    // None represents a source row with a missing measurement.
+    pub value: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type WindowAggregate {
+    pub sensor_id: U32
+    // Five-minute tumbling windows are [window_start, window_start + 5).
+    pub window_start: U32
+    pub reading_count: USize
+    pub total: U32
+    pub minimum: U32
+    pub maximum: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type WindowState {
+    // Open slots reuse free positions deterministically. Closed results are
+    // sorted by window start, then sensor ID.
+    pub open_windows: Array<Option<WindowAggregate>, 20>
+    pub closed_windows: Array<Option<WindowAggregate>, 20>
+    pub closed_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum FindingCode {
+    DuplicateEventId
+    UnknownSensor
+    MissingMeasurement
+    EventMinuteOutOfRange
+    MeasurementOutOfRange
+    LateEvent
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type StreamFinding {
+    // Keep the original row so invalid or late data remains inspectable.
+    pub event: ReadingEvent
+    pub code: FindingCode
+    pub watermark_at_arrival: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type StreamReport {
+    pub windows: WindowState
+    pub findings: Array<Option<StreamFinding>, 20>
+    pub finding_count: USize
+    pub events_seen: USize
+    pub accepted_count: USize
+    pub open_count: USize
+    pub max_event_minute: U32
+    pub final_watermark_minute: U32
+}

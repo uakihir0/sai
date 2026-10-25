@@ -1,0 +1,109 @@
+use acme:event-time-stream-aggregator/aggregate
+use acme:event-time-stream-aggregator/model.{
+    FindingCode
+    ReadingEvent
+    Sensor
+    StreamFinding
+    StreamReport
+    WindowAggregate
+    WindowState
+}
+use acme:event-time-stream-aggregator/policy
+
+fn empty_report(events_seen: USize) -> StreamReport {
+    StreamReport(
+        windows: WindowState(
+            open_windows: Array<Option<WindowAggregate>, 20>.filled(None),
+            closed_windows: Array<Option<WindowAggregate>, 20>.filled(None),
+            closed_count: 0,
+        ),
+        findings: Array<Option<StreamFinding>, 20>.filled(None),
+        finding_count: 0,
+        events_seen: events_seen,
+        accepted_count: 0,
+        open_count: 0,
+        max_event_minute: 0,
+        final_watermark_minute: 0,
+    )
+}
+
+fn count_open_windows(windows: Array<Option<WindowAggregate>, 20>) -> USize {
+    var count: USize = 0
+    for window in windows {
+        match window {
+            Some(_) => {
+                count += 1
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+fn reject(
+    report: StreamReport,
+    event: ReadingEvent,
+    code: FindingCode,
+    watermark_minute: U32,
+) -> StreamReport {
+    var updated = report
+    updated.findings[updated.finding_count] =
+        Some(StreamFinding(event: event, code: code, watermark_at_arrival: watermark_minute))
+    updated.finding_count += 1
+    updated
+}
+
+pub fn aggregate_stream(
+    sensors: Array<Sensor, 3>,
+    events: Array<ReadingEvent, 20>,
+) -> StreamReport {
+    var report = empty_report(events.len())
+
+    for index in 0..events.len() {
+        let event = events[index]
+        let current_watermark = report.final_watermark_minute
+
+        if policy.has_prior_event_id(events, index) {
+            report = reject(report, event, FindingCode.DuplicateEventId, current_watermark)
+        } else if not policy.sensor_is_known(sensors, event.sensor_id) {
+            report = reject(report, event, FindingCode.UnknownSensor, current_watermark)
+        } else if event.event_minute > policy.MAX_EVENT_MINUTE {
+            report = reject(report, event, FindingCode.EventMinuteOutOfRange, current_watermark)
+        } else {
+            match event.value {
+                None => {
+                    report =
+                        reject(report, event, FindingCode.MissingMeasurement, current_watermark)
+                }
+                Some(value) => {
+                    if value > policy.MAX_MEASUREMENT {
+                        report = reject(
+                            report,
+                            event,
+                            FindingCode.MeasurementOutOfRange,
+                            current_watermark,
+                        )
+                    } else if event.event_minute < current_watermark {
+                        report = reject(report, event, FindingCode.LateEvent, current_watermark)
+                    } else {
+                        report.windows = aggregate.add_reading(report.windows, event, value)
+                        report.accepted_count += 1
+
+                        if event.event_minute > report.max_event_minute {
+                            report.max_event_minute = event.event_minute
+                        }
+                        report.final_watermark_minute =
+                            policy.watermark_for(report.max_event_minute)
+                        report.windows = aggregate.close_ready_windows(
+                            report.windows,
+                            report.final_watermark_minute,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    report.open_count = count_open_windows(report.windows.open_windows)
+    report
+}

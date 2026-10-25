@@ -1,0 +1,5 @@
+package acme:event-time-stream-aggregator @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Aggregate bounded sensor streams with event-time windows"

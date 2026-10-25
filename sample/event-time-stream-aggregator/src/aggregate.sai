@@ -1,0 +1,111 @@
+use acme:event-time-stream-aggregator/model.{ReadingEvent, WindowAggregate, WindowState}
+use acme:event-time-stream-aggregator/policy
+
+fn comes_after(left: WindowAggregate, right: WindowAggregate) -> Bool {
+    (
+        left.window_start > right.window_start
+        or (left.window_start == right.window_start and left.sensor_id > right.sensor_id)
+    )
+}
+
+fn insert_closed(state: WindowState, aggregate: WindowAggregate) -> WindowState {
+    var updated = state
+    var insertion_index = updated.closed_count
+
+    while insertion_index > 0 {
+        let previous_index = insertion_index - 1
+        match updated.closed_windows[previous_index] {
+            Some(previous) => {
+                if comes_after(previous, aggregate) {
+                    updated.closed_windows[insertion_index] = Some(previous)
+                    insertion_index -= 1
+                } else {
+                    break
+                }
+            }
+            None => break
+        }
+    }
+
+    updated.closed_windows[insertion_index] = Some(aggregate)
+    updated.closed_count += 1
+    updated
+}
+
+pub fn add_reading(state: WindowState, event: ReadingEvent, value: U32) -> WindowState {
+    let start = policy.window_start(event.event_minute)
+    var updated = state
+    var matched = false
+
+    for slot in 0..updated.open_windows.len() {
+        match updated.open_windows[slot] {
+            Some(current) => {
+                if current.sensor_id == event.sensor_id and current.window_start == start {
+                    updated.open_windows[slot] = Some(
+                        WindowAggregate(
+                            sensor_id: current.sensor_id,
+                            window_start: current.window_start,
+                            reading_count: current.reading_count + 1,
+                            total: current.total + value,
+                            minimum: if value < current.minimum {
+                                value
+                            } else {
+                                current.minimum
+                            },
+                            maximum: if value > current.maximum {
+                                value
+                            } else {
+                                current.maximum
+                            },
+                        ),
+                    )
+                    matched = true
+                    break
+                }
+            }
+            None => {}
+        }
+    }
+
+    if not matched {
+        for slot in 0..updated.open_windows.len() {
+            match updated.open_windows[slot] {
+                None => {
+                    updated.open_windows[slot] = Some(
+                        WindowAggregate(
+                            sensor_id: event.sensor_id,
+                            window_start: start,
+                            reading_count: 1,
+                            total: value,
+                            minimum: value,
+                            maximum: value,
+                        ),
+                    )
+                    break
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    updated
+}
+
+pub fn close_ready_windows(state: WindowState, watermark_minute: U32) -> WindowState {
+    var updated = state
+
+    for slot in 0..updated.open_windows.len() {
+        match updated.open_windows[slot] {
+            Some(aggregate) => {
+                let window_end = aggregate.window_start + policy.WINDOW_WIDTH_MINUTES
+                if window_end <= watermark_minute {
+                    updated.open_windows[slot] = None
+                    updated = insert_closed(updated, aggregate)
+                }
+            }
+            None => {}
+        }
+    }
+
+    updated
+}
