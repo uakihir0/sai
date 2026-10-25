@@ -1,11 +1,11 @@
 //! Interned semantic types shared by declaration and body checking.
 //!
 //! This is an early semantic type kernel. It represents primitive types,
-//! tuples, references, and nongeneric nominal identities; generic arguments,
-//! function pointers, projections, inference variables, and error types are
-//! added by later slices.
+//! tuples, references, owner-bound function type parameters, and nongeneric
+//! nominal identities; generic arguments, function pointers, projections,
+//! inference variables, and error types are added by later slices.
 
-use sai_hir::{DefId, Mutability};
+use sai_hir::{DefId, Mutability, Symbol};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -59,6 +59,8 @@ pub enum TyKind {
     Never,
     Tuple(Arc<[Ty]>),
     Ref(Region, Ty, Mutability),
+    /// A type parameter in the binder of one function signature.
+    Param(ParamTy),
     /// A nongeneric nominal definition.
     ///
     /// This slice constructs this form only for validated local interface
@@ -111,7 +113,25 @@ pub struct SigRegion {
     pub index: u32,
 }
 
-/// The lowered types of one supported non-generic function signature.
+/// A type parameter's position and source name in its owning function binder.
+///
+/// The enclosing [`FnSig`] retains the corresponding local `DefId` for each
+/// entry in source order. This keeps the type node compact while preserving
+/// owner-local binder identity at the signature boundary.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ParamTy {
+    pub index: u32,
+    pub name: Symbol,
+}
+
+/// One type-only binder in a function signature.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FnSigTypeParam {
+    pub def_id: DefId,
+    pub param: ParamTy,
+}
+
+/// The lowered types of one supported partial function signature.
 ///
 /// This is intentionally not the complete `fn_sig` model from the
 /// implementation plan: safety, async output, ABI, effects, and borrow
@@ -119,16 +139,27 @@ pub struct SigRegion {
 /// are implemented.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FnSig {
+    type_params: Arc<[FnSigTypeParam]>,
     inputs: Arc<[Ty]>,
     output: Ty,
 }
 
 impl FnSig {
-    pub(crate) fn new(inputs: impl Into<Arc<[Ty]>>, output: Ty) -> Self {
+    pub(crate) fn new(
+        type_params: impl Into<Arc<[FnSigTypeParam]>>,
+        inputs: impl Into<Arc<[Ty]>>,
+        output: Ty,
+    ) -> Self {
         Self {
+            type_params: type_params.into(),
             inputs: inputs.into(),
             output,
         }
+    }
+
+    /// The function's type-only binders in source order.
+    pub fn type_params(&self) -> &[FnSigTypeParam] {
+        &self.type_params
     }
 
     pub fn inputs(&self) -> &[Ty] {

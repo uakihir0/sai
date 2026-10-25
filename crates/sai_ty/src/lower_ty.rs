@@ -1,11 +1,20 @@
-//! Conservative conversion of a small set of resolved HIR types.
+//! Conservative conversion of a small set of resolved HIR types and function
+//! signatures.
 //!
 //! This module deliberately returns an unsupported result instead of
 //! manufacturing semantic error types or guessing at unresolved names.
 
-use crate::ty::{FloatTy, FnSig, IntTy, Region, SigRegion, Ty, TyInterner, TyKind, UintTy};
-use sai_hir::types::{Generics, PathRoot, Ty as HirTy, TyKind as HirTyKind};
-use sai_hir::{DefId, HirId, OwnerId, Safety, body::FnSig as HirFnSig};
+use crate::ty::{
+    FloatTy, FnSig, FnSigTypeParam, IntTy, ParamTy, Region, SigRegion, Ty, TyInterner, TyKind,
+    UintTy,
+};
+use sai_hir::types::{
+    GenericParam, GenericParamKind, Generics, PathRoot, Ty as HirTy, TyKind as HirTyKind,
+};
+use sai_hir::{
+    DefId, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, OwnerId, Safety,
+    body::FnSig as HirFnSig,
+};
 use sai_resolve::package_scopes::{DefKind, PathRes, Res};
 use sai_resolve::prelude::PrimTy;
 use std::collections::{HashMap, HashSet};
@@ -37,7 +46,7 @@ pub enum UnsupportedTy {
     ContextAfterFailure,
 }
 
-/// Why a function signature is outside the current non-generic subset.
+/// Why a function signature is outside the current partial projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedFnSig {
     ContextAfterFailure,
@@ -50,6 +59,8 @@ pub enum UnsupportedFnSig {
     BorrowClause,
     Effects,
     SelfParameter,
+    RecoveredGenericSyntax,
+    TooManyTypeParameters,
     ParameterType { index: usize, reason: UnsupportedTy },
     ReturnType(UnsupportedTy),
 }
@@ -67,6 +78,8 @@ pub struct LowerTyContext<'a> {
     paths: &'a HashMap<HirId, PathRes>,
     unit_enums: Option<&'a HashSet<DefId>>,
     local_nongeneric_nominals: Option<&'a HashSet<DefId>>,
+    generic_params: HashMap<DefId, ParamTy>,
+    def_paths: Option<&'a DefPathInterner>,
     region_mode: RegionMode,
     next_region_index: u32,
     failed: bool,
@@ -94,6 +107,8 @@ impl<'a> LowerTyContext<'a> {
             paths,
             unit_enums: None,
             local_nongeneric_nominals: None,
+            generic_params: HashMap::new(),
+            def_paths: None,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             failed: false,
@@ -119,6 +134,8 @@ impl<'a> LowerTyContext<'a> {
             paths,
             unit_enums: Some(unit_enums),
             local_nongeneric_nominals: None,
+            generic_params: HashMap::new(),
+            def_paths: None,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             failed: false,
@@ -145,6 +162,8 @@ impl<'a> LowerTyContext<'a> {
             paths,
             unit_enums: Some(unit_enums),
             local_nongeneric_nominals: Some(local_nongeneric_nominals),
+            generic_params: HashMap::new(),
+            def_paths: None,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             failed: false,
@@ -170,6 +189,8 @@ impl<'a> LowerTyContext<'a> {
             paths,
             unit_enums: None,
             local_nongeneric_nominals: None,
+            generic_params: HashMap::new(),
+            def_paths: None,
             region_mode: RegionMode::Field {
                 has_implicit_region_parameter,
             },
@@ -190,10 +211,21 @@ impl<'a> LowerTyContext<'a> {
             paths,
             unit_enums: None,
             local_nongeneric_nominals: None,
+            generic_params: HashMap::new(),
+            def_paths: None,
             region_mode: RegionMode::Body,
             next_region_index: 0,
             failed: false,
         }
+    }
+
+    /// Attach the DefPath interner used to construct this context's owner.
+    ///
+    /// Generic function binders require this provenance so each local
+    /// parameter path can be proven to be a direct child of `owner`.
+    pub fn with_def_path_interner(mut self, def_paths: &'a DefPathInterner) -> Self {
+        self.def_paths = Some(def_paths);
+        self
     }
 
     fn region(&mut self) -> Result<Region, UnsupportedTy> {
@@ -226,7 +258,8 @@ impl<'a> LowerTyContext<'a> {
 ///
 /// The caller owns path resolution and diagnostics. This function performs no
 /// diagnostic emission and produces no error type; unsupported forms are
-/// returned explicitly.
+/// returned explicitly. A type parameter is accepted only while lowering a
+/// function signature with its exact owner-local binder active.
 pub fn lower_ty(context: &mut LowerTyContext<'_>, ty: &HirTy<'_>) -> Result<Ty, UnsupportedTy> {
     if context.failed {
         return Err(UnsupportedTy::ContextAfterFailure);
@@ -243,10 +276,11 @@ pub fn lower_ty(context: &mut LowerTyContext<'_>, ty: &HirTy<'_>) -> Result<Ty, 
 /// Lower a deliberately narrow function signature while retaining its
 /// parameter and return type information.
 ///
-/// Only non-generic, safe, synchronous signatures without effect or borrow
-/// clauses are represented by the current `FnSig`. Every failure invalidates
-/// the context so a partially consumed signature-region sequence cannot be
-/// reused. An omitted return type lowers to unit.
+/// Only unbounded type-only generic parameters, safe synchronous signatures,
+/// and types supported by this module are represented by the current partial
+/// `FnSig`. Every failure invalidates the context so a partially consumed
+/// signature-region sequence cannot be reused. An omitted return type lowers
+/// to unit.
 pub fn lower_fn_sig(
     context: &mut LowerTyContext<'_>,
     generics: Generics<'_>,
@@ -256,11 +290,65 @@ pub fn lower_fn_sig(
         return Err(UnsupportedFnSig::ContextAfterFailure);
     }
 
-    let unsupported = if !generics.params.is_empty() {
-        Some(UnsupportedFnSig::GenericParameters)
-    } else if !generics.where_preds.is_empty() {
-        Some(UnsupportedFnSig::WherePredicates)
-    } else if signature.safety == Safety::Unsafe {
+    if !generics.where_preds.is_empty() {
+        context.failed = true;
+        return Err(UnsupportedFnSig::WherePredicates);
+    }
+
+    let mut type_params = Vec::with_capacity(generics.params.len());
+    let mut generic_param_map = HashMap::with_capacity(generics.params.len());
+    let mut generic_names = HashSet::with_capacity(generics.params.len());
+    let generic_owner_path = if generics.params.is_empty() {
+        None
+    } else {
+        let Some(def_paths) = context.def_paths else {
+            context.failed = true;
+            return Err(UnsupportedFnSig::GenericParameters);
+        };
+        match def_paths.resolve(context.owner.def_id) {
+            Ok(Some(path)) => Some(path),
+            Ok(None) | Err(_) => {
+                context.failed = true;
+                return Err(UnsupportedFnSig::GenericParameters);
+            }
+        }
+    };
+    for (index, parameter) in generics.params.iter().enumerate() {
+        let GenericParamKind::Type { bounds } = parameter.kind else {
+            context.failed = true;
+            return Err(UnsupportedFnSig::GenericParameters);
+        };
+        let parameter_has_exact_owner = generic_owner_path
+            .as_ref()
+            .zip(context.def_paths)
+            .is_some_and(|(owner_path, def_paths)| {
+                is_direct_function_type_parameter(def_paths, owner_path, parameter)
+            });
+        if !bounds.is_empty()
+            || parameter.name.sym.is_error()
+            || !generic_names.insert(parameter.name.sym)
+            || !parameter_has_exact_owner
+        {
+            context.failed = true;
+            return Err(UnsupportedFnSig::GenericParameters);
+        }
+        let index = u32::try_from(index).map_err(|_| {
+            context.failed = true;
+            UnsupportedFnSig::TooManyTypeParameters
+        })?;
+        let param = ParamTy {
+            index,
+            name: parameter.name.sym,
+        };
+        let def_id = parameter.def_id.to_def_id();
+        if generic_param_map.insert(def_id, param).is_some() {
+            context.failed = true;
+            return Err(UnsupportedFnSig::GenericParameters);
+        }
+        type_params.push(FnSigTypeParam { def_id, param });
+    }
+
+    let unsupported = if signature.safety == Safety::Unsafe {
         Some(UnsupportedFnSig::Unsafe)
     } else if signature.is_async {
         Some(UnsupportedFnSig::Async)
@@ -277,6 +365,7 @@ pub fn lower_fn_sig(
         context.failed = true;
         return Err(reason);
     }
+    context.generic_params = generic_param_map;
 
     let mut inputs = Vec::with_capacity(signature.params.len());
     for (index, parameter) in signature.params.iter().enumerate() {
@@ -295,7 +384,33 @@ pub fn lower_fn_sig(
         None => context.interner.tuple(Vec::new()),
     };
 
-    Ok(FnSig::new(inputs, output))
+    Ok(FnSig::new(type_params, inputs, output))
+}
+
+fn is_direct_function_type_parameter(
+    def_paths: &DefPathInterner,
+    owner_path: &sai_hir::DefPath,
+    parameter: &GenericParam<'_>,
+) -> bool {
+    let Ok(Some(parameter_path)) = def_paths.resolve(parameter.def_id) else {
+        return false;
+    };
+    let owner_components = owner_path.data();
+    let parameter_components = parameter_path.data();
+    if parameter_path.package() != owner_path.package()
+        || parameter_components.len() != owner_components.len() + 1
+        || parameter_components[..owner_components.len()] != *owner_components
+    {
+        return false;
+    }
+
+    matches!(
+        parameter_components.last(),
+        Some(DisambiguatedDefPathData {
+            data: DefPathData::TypeParam(name),
+            disambiguator: 0,
+        }) if *name == parameter.name.sym
+    )
 }
 
 fn lower_ty_inner(context: &mut LowerTyContext<'_>, ty: &HirTy<'_>) -> Result<Ty, UnsupportedTy> {
@@ -398,7 +513,12 @@ fn lower_path_ty(
             Ok(context.interner.intern(kind))
         }
         Res::Def(DefKind::Alias, _) => Err(UnsupportedTy::Alias),
-        Res::Def(DefKind::TyParam, _) => Err(UnsupportedTy::GenericParameter),
+        Res::Def(DefKind::TyParam, def_id) => context
+            .generic_params
+            .get(&def_id)
+            .copied()
+            .map(|param| context.interner.intern(TyKind::Param(param)))
+            .ok_or(UnsupportedTy::GenericParameter),
         Res::Def(DefKind::ConstParam, _) => Err(UnsupportedTy::ConstParameter),
         Res::Def(DefKind::AssocTy, _) => Err(UnsupportedTy::Projection),
         Res::Def(
@@ -472,6 +592,86 @@ mod tests {
             def_id: paths.intern(path).expect("definition interns"),
         };
         (owner, symbols)
+    }
+
+    fn owner_with_generic_params(
+        names: &[&str],
+    ) -> (
+        sai_hir::OwnerId,
+        Interner,
+        Vec<sai_hir::LocalDefId>,
+        DefPathInterner,
+    ) {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:generic-types#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let item_name = symbols.intern("item").unwrap();
+        let item_path = DefPath::new(
+            package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::ValueNs(item_name),
+                disambiguator: 0,
+            }],
+            &packages,
+            &symbols,
+        )
+        .unwrap();
+        let owner = sai_hir::OwnerId {
+            def_id: paths.intern(item_path).unwrap(),
+        };
+        let parameter_symbols = names
+            .iter()
+            .map(|name| symbols.intern(name).unwrap())
+            .collect::<Vec<_>>();
+        let parameters = parameter_symbols
+            .iter()
+            .copied()
+            .map(|name| (name, false, 0))
+            .collect::<Vec<_>>();
+        let def_ids = paths
+            .intern_generic_params(owner.def_id, &parameters)
+            .unwrap();
+        (owner, symbols, def_ids, paths)
+    }
+
+    fn owner_with_same_package_foreign_param() -> (
+        sai_hir::OwnerId,
+        Interner,
+        sai_hir::LocalDefId,
+        sai_hir::LocalDefId,
+        DefPathInterner,
+    ) {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:generic-owner#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let owner_for = |name: &str| {
+            let item_name = symbols.intern(name).unwrap();
+            let item_path = DefPath::new(
+                package,
+                vec![DisambiguatedDefPathData {
+                    data: DefPathData::ValueNs(item_name),
+                    disambiguator: 0,
+                }],
+                &packages,
+                &symbols,
+            )
+            .unwrap();
+            sai_hir::OwnerId {
+                def_id: paths.intern(item_path).unwrap(),
+            }
+        };
+        let owner = owner_for("first");
+        let foreign_owner = owner_for("second");
+        let type_name = symbols.intern("T").unwrap();
+        let local_param = paths
+            .intern_generic_param(owner.def_id, type_name, false, 0)
+            .unwrap();
+        let foreign_param = paths
+            .intern_generic_param(foreign_owner.def_id, type_name, false, 0)
+            .unwrap();
+        (owner, symbols, local_param, foreign_param, paths)
     }
 
     fn hir_id(owner: sai_hir::OwnerId, local_id: u32) -> HirId {
@@ -1307,6 +1507,239 @@ mod tests {
     }
 
     #[test]
+    fn function_type_parameters_lower_in_owner_local_source_order() {
+        let (owner, symbols, param_def_ids, def_paths) = owner_with_generic_params(&["B", "A"]);
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let generic_nodes = param_def_ids
+            .iter()
+            .zip(["B", "A"])
+            .map(|(def_id, name)| {
+                arena.alloc_generic_param(sai_hir::types::GenericParam {
+                    def_id: *def_id,
+                    name: Name {
+                        sym: symbols.intern(name).unwrap(),
+                        span: span(),
+                    },
+                    kind: GenericParamKind::Type { bounds: &[] },
+                })
+            })
+            .collect::<Vec<_>>();
+        let generics = Generics {
+            params: arena
+                .alloc_generic_params(&generic_nodes.iter().map(|node| **node).collect::<Vec<_>>()),
+            where_preds: &[],
+        };
+        let (input, paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            350,
+            "A",
+            None,
+            Res::Def(DefKind::TyParam, param_def_ids[1].to_def_id()),
+        );
+        let (output, output_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            360,
+            "B",
+            None,
+            Res::Def(DefKind::TyParam, param_def_ids[0].to_def_id()),
+        );
+        let mut paths = paths;
+        paths.extend(output_paths);
+        let parameter = arena.alloc_fn_param(sai_hir::body::FnParam {
+            hir_id: hir_id(owner, 370),
+            name: None,
+            is_self: false,
+            mutable: false,
+            ty: input,
+            span: span(),
+        });
+        let signature = HirFnSig {
+            safety: Safety::Safe,
+            is_async: false,
+            params: arena.alloc_fn_params(&[*parameter]),
+            ret: Some(output),
+            borrows: None,
+            effects: None,
+            requires: &[],
+            ensures: &[],
+        };
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_def_path_interner(&def_paths);
+
+        let lowered = lower_fn_sig(&mut context, generics, signature).unwrap();
+        assert_eq!(
+            lowered
+                .type_params()
+                .iter()
+                .map(|parameter| parameter.param.index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(
+            lowered
+                .type_params()
+                .iter()
+                .map(|parameter| parameter.param.name)
+                .collect::<Vec<_>>(),
+            [symbols.intern("B").unwrap(), symbols.intern("A").unwrap()]
+        );
+        assert_eq!(
+            lowered
+                .type_params()
+                .iter()
+                .map(|parameter| parameter.def_id)
+                .collect::<Vec<_>>(),
+            [param_def_ids[0].to_def_id(), param_def_ids[1].to_def_id()]
+        );
+        assert_eq!(
+            lowered.inputs()[0].kind(),
+            &TyKind::Param(ParamTy {
+                index: 1,
+                name: symbols.intern("A").unwrap(),
+            })
+        );
+        assert_eq!(
+            lowered.output().kind(),
+            &TyKind::Param(ParamTy {
+                index: 0,
+                name: symbols.intern("B").unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn foreign_owner_type_parameter_resolution_is_not_captured_by_name() {
+        let (owner, symbols, local_param, foreign_param, def_paths) =
+            owner_with_same_package_foreign_param();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let generic_param = arena.alloc_generic_param(sai_hir::types::GenericParam {
+            def_id: local_param,
+            name: Name {
+                sym: symbols.intern("T").unwrap(),
+                span: span(),
+            },
+            kind: GenericParamKind::Type { bounds: &[] },
+        });
+        let generics = Generics {
+            params: arena.alloc_generic_params(&[*generic_param]),
+            where_preds: &[],
+        };
+        let (input, paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            380,
+            "T",
+            None,
+            Res::Def(DefKind::TyParam, foreign_param.to_def_id()),
+        );
+        assert_eq!(
+            local_param.package(),
+            foreign_param.package(),
+            "both binders belong to the same package"
+        );
+        assert_ne!(
+            local_param.to_def_id(),
+            foreign_param.to_def_id(),
+            "the local and foreign function binders have distinct DefIds"
+        );
+        let parameter = arena.alloc_fn_param(sai_hir::body::FnParam {
+            hir_id: hir_id(owner, 390),
+            name: None,
+            is_self: false,
+            mutable: false,
+            ty: input,
+            span: span(),
+        });
+        let signature = HirFnSig {
+            safety: Safety::Safe,
+            is_async: false,
+            params: arena.alloc_fn_params(&[*parameter]),
+            ret: None,
+            borrows: None,
+            effects: None,
+            requires: &[],
+            ensures: &[],
+        };
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_def_path_interner(&def_paths);
+
+        assert_eq!(
+            lower_fn_sig(&mut context, generics, signature),
+            Err(UnsupportedFnSig::ParameterType {
+                index: 0,
+                reason: UnsupportedTy::GenericParameter,
+            })
+        );
+        assert_eq!(
+            lower_ty(&mut context, input),
+            Err(UnsupportedTy::ContextAfterFailure),
+            "a failed foreign parameter conversion poisons its owner context"
+        );
+    }
+
+    #[test]
+    fn foreign_owner_binders_are_rejected_even_with_matching_resolution() {
+        let (owner, symbols, _local_param, foreign_param, def_paths) =
+            owner_with_same_package_foreign_param();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let generic_param = arena.alloc_generic_param(sai_hir::types::GenericParam {
+            def_id: foreign_param,
+            name: Name {
+                sym: symbols.intern("T").unwrap(),
+                span: span(),
+            },
+            kind: GenericParamKind::Type { bounds: &[] },
+        });
+        let generics = Generics {
+            params: arena.alloc_generic_params(&[*generic_param]),
+            where_preds: &[],
+        };
+        let (input, paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            400,
+            "T",
+            None,
+            Res::Def(DefKind::TyParam, foreign_param.to_def_id()),
+        );
+        let parameter = arena.alloc_fn_param(sai_hir::body::FnParam {
+            hir_id: hir_id(owner, 410),
+            name: None,
+            is_self: false,
+            mutable: false,
+            ty: input,
+            span: span(),
+        });
+        let signature = HirFnSig {
+            safety: Safety::Safe,
+            is_async: false,
+            params: arena.alloc_fn_params(&[*parameter]),
+            ret: None,
+            borrows: None,
+            effects: None,
+            requires: &[],
+            ensures: &[],
+        };
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_def_path_interner(&def_paths);
+
+        assert_eq!(
+            lower_fn_sig(&mut context, generics, signature),
+            Err(UnsupportedFnSig::GenericParameters),
+            "a matching resolution is not enough when its binder belongs to another function"
+        );
+    }
+
+    #[test]
     fn unsupported_function_signature_metadata_fails_closed() {
         let (owner, symbols) = owner();
         let interner = TyInterner::new();
@@ -1335,7 +1768,7 @@ mod tests {
                 sym: symbols.intern("T").unwrap(),
                 span: span(),
             },
-            kind: sai_hir::types::GenericParamKind::Type { bounds: &[] },
+            kind: sai_hir::types::GenericParamKind::Const { ty: input },
         });
         let generic_params = arena.alloc_generic_params(&[*generic_param]);
         let cases = [
