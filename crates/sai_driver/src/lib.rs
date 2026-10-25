@@ -2936,7 +2936,7 @@ pub enum LocalRecordFieldTypeInstantiationError {
 pub struct LocalRecordFieldTypesValidation {
     owner: OwnerId,
     type_params: Arc<[(DefId, sai_ty::ty::ParamTy)]>,
-    field_def_ids: Arc<[DefId]>,
+    field_results: Arc<[LocalRecordFieldTypeProjection]>,
 }
 
 /// The bounded `type_of(field)` projection for one direct local record.
@@ -3039,11 +3039,7 @@ impl LocalRecordFieldTypesProjection {
         };
         if provenance.owner != *owner
             || provenance.type_params.as_ref() != type_params.as_ref()
-            || provenance
-                .field_def_ids
-                .iter()
-                .copied()
-                .ne(fields.iter().map(LocalRecordFieldTypeProjection::def_id))
+            || provenance.field_results.as_ref() != fields.as_ref()
         {
             return Err(LocalRecordFieldTypeInstantiationError::InvalidProjectionProvenance);
         }
@@ -19374,11 +19370,7 @@ impl RootDatabase {
         let provenance = LocalRecordFieldTypesValidation {
             owner: descriptor.owner,
             type_params: Arc::clone(&validated_type_params),
-            field_def_ids: projected_fields
-                .iter()
-                .map(LocalRecordFieldTypeProjection::def_id)
-                .collect::<Vec<_>>()
-                .into(),
+            field_results: Arc::clone(&projected_fields),
         };
         LocalRecordFieldTypesProjection::Supported {
             owner: descriptor.owner,
@@ -39900,6 +39892,35 @@ property "shared"() {}
             ),
             Err(LocalRecordFieldTypeInstantiationError::InvalidProjectionProvenance),
             "public enum pattern matching cannot transplant validated fields to another owner"
+        );
+        let forged_field_result_projection = match generic.clone() {
+            LocalRecordFieldTypesProjection::Supported {
+                owner,
+                type_params,
+                fields,
+                provenance,
+            } => {
+                let mut changed_fields = fields.to_vec();
+                changed_fields[0].ty = Ok(bool_ty.clone());
+                LocalRecordFieldTypesProjection::Supported {
+                    owner,
+                    type_params,
+                    fields: changed_fields.into(),
+                    provenance,
+                }
+            }
+            LocalRecordFieldTypesProjection::Unsupported { .. } => {
+                panic!("the generic projection is supported")
+            }
+        };
+        assert_eq!(
+            forged_field_result_projection.instantiate_field_type(
+                &database.semantic_types,
+                &generic_bool,
+                generic_value
+            ),
+            Err(LocalRecordFieldTypeInstantiationError::InvalidProjectionProvenance),
+            "opaque provenance authenticates complete field results, not just their identities"
         );
 
         assert_eq!(
