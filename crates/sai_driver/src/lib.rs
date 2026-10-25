@@ -37007,8 +37007,10 @@ property "shared"() {}
             "fn callback_unsafe(value: unsafe fn()) {}\n",
             "fn callback_omitted_return(value: fn()) {}\n",
             "fn callback_explicit_unit(value: fn() -> ()) {}\n",
-            "fn callback_generic<T>(value: fn((T,))) {}\n",
+            "fn apply<T>(callback: fn(T) -> T, value: T) -> T {}\n",
+            "fn callback_nested<T>(callback: fn((T, Array<T, 2>)) -> Array<T, 3>) -> T {}\n",
             "fn callback_borrowed(value: fn((borrow I32,))) {}\n",
+            "fn callback_borrowed_generic<T>(value: fn((Array<borrow T, 2>,))) {}\n",
             "fn callback_empty_effects(value: fn() effects {}) {}\n",
             "fn callback_effects(value: fn() effects { io }) {}\n",
             "fn callback_unresolved(value: fn(Missing)) {}\n",
@@ -37027,7 +37029,7 @@ property "shared"() {}
         let resolved = database
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
-        assert_eq!(resolved.owners().len(), 10);
+        assert_eq!(resolved.owners().len(), 12);
 
         let projection = |index: usize| {
             resolved
@@ -37075,15 +37077,66 @@ property "shared"() {}
         };
         assert!(omitted.inputs()[0].ptr_eq(&explicit.inputs()[0]));
 
+        let FunctionSignatureProjection::Supported(apply) = projection(4) else {
+            panic!("an enclosing type binder is shared with a function pointer");
+        };
+        let apply_binder = apply.type_params()[0].param;
+        assert_eq!(apply_binder.index, 0);
+        let sai_ty::ty::TyKind::FnPtr(apply_callback) = apply.inputs()[0].kind() else {
+            panic!("the first apply argument remains a callback type");
+        };
+        assert_eq!(
+            apply_callback.inputs()[0].kind(),
+            &sai_ty::ty::TyKind::Param(apply_binder)
+        );
+        assert_eq!(
+            apply_callback.output().kind(),
+            &sai_ty::ty::TyKind::Param(apply_binder)
+        );
+        assert_eq!(
+            apply.inputs()[1].kind(),
+            &sai_ty::ty::TyKind::Param(apply_binder)
+        );
+        assert_eq!(
+            apply.output().kind(),
+            &sai_ty::ty::TyKind::Param(apply_binder)
+        );
+
+        let FunctionSignatureProjection::Supported(nested) = projection(5) else {
+            panic!("the enclosing binder can occur below tuple and array children");
+        };
+        let nested_binder = nested.type_params()[0].param;
+        let sai_ty::ty::TyKind::FnPtr(nested_callback) = nested.inputs()[0].kind() else {
+            panic!("the nested function argument remains a callback type");
+        };
+        let sai_ty::ty::TyKind::Tuple(nested_inputs) = nested_callback.inputs()[0].kind() else {
+            panic!("the callback keeps its tuple input");
+        };
+        assert_eq!(
+            nested_inputs[0].kind(),
+            &sai_ty::ty::TyKind::Param(nested_binder)
+        );
+        assert!(matches!(
+            nested_inputs[1].kind(),
+            sai_ty::ty::TyKind::Array(element, 2)
+                if element.kind() == &sai_ty::ty::TyKind::Param(nested_binder)
+        ));
+        assert!(matches!(
+            nested_callback.output().kind(),
+            sai_ty::ty::TyKind::Array(element, 3)
+                if element.kind() == &sai_ty::ty::TyKind::Param(nested_binder)
+        ));
+        assert_eq!(
+            nested.output().kind(),
+            &sai_ty::ty::TyKind::Param(nested_binder)
+        );
+
         for (index, reason) in [
-            (
-                4,
-                sai_ty::lower_ty::UnsupportedTy::FunctionPointerGenericParameter,
-            ),
-            (5, sai_ty::lower_ty::UnsupportedTy::FunctionPointerRegion),
-            (6, sai_ty::lower_ty::UnsupportedTy::FunctionPointerEffects),
-            (7, sai_ty::lower_ty::UnsupportedTy::FunctionPointerEffects),
-            (8, sai_ty::lower_ty::UnsupportedTy::MissingPathResolution),
+            (6, sai_ty::lower_ty::UnsupportedTy::FunctionPointerRegion),
+            (7, sai_ty::lower_ty::UnsupportedTy::FunctionPointerRegion),
+            (8, sai_ty::lower_ty::UnsupportedTy::FunctionPointerEffects),
+            (9, sai_ty::lower_ty::UnsupportedTy::FunctionPointerEffects),
+            (10, sai_ty::lower_ty::UnsupportedTy::MissingPathResolution),
         ] {
             assert_eq!(
                 projection(index),
@@ -37093,7 +37146,7 @@ property "shared"() {}
             );
         }
         assert_eq!(
-            projection(9),
+            projection(11),
             FunctionSignatureProjection::Unsupported(
                 sai_ty::lower_ty::UnsupportedFnSig::RecoveredFunctionPointerSyntax
             )
