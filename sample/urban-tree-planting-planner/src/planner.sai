@@ -71,8 +71,8 @@ fn choose_species(
     decision_count: USize,
     remaining_water_liters: U32,
     district_limit: USize,
-) -> (Option<TreeSpecies>, Option<HoldReason>) {
-    var best: Option<TreeSpecies> = None
+) -> (Option<USize>, Option<HoldReason>) {
+    var best: Option<USize> = None
     var saw_site_fit = false
     var saw_stock = false
     var saw_diversity_slot = false
@@ -101,19 +101,20 @@ fn choose_species(
         saw_water = true
 
         match best {
-            Some(current) => {
+            Some(current_index) => {
+                let current = species[current_index]
                 if choice_precedes(candidate, current, site, decisions, decision_count) {
-                    best = Some(candidate)
+                    best = Some(index)
                 }
             }
             None => {
-                best = Some(candidate)
+                best = Some(index)
             }
         }
     }
 
     match best {
-        Some(candidate) => (Some(candidate), None)
+        Some(species_index) => (Some(species_index), None)
         None => {
             let reason = if not saw_site_fit {
                 HoldReason.NoSuitableSpecies
@@ -176,12 +177,9 @@ pub fn plan(
             district_limit,
         )
         match selected {
-            Some(tree) => {
-                for species_index in 0..species.len() {
-                    if species[species_index].id == tree.id {
-                        remaining_stock[species_index] -= 1
-                    }
-                }
+            Some(species_index) => {
+                let tree = species[species_index]
+                remaining_stock[species_index] -= 1
                 water_reserved_liters += tree.establishment_water_liters
                 planted_count += 1
                 decisions[index] = Some(
@@ -221,4 +219,134 @@ pub fn plan(
         water_reserved_liters: water_reserved_liters,
         water_budget_liters: water_budget_liters,
     )
+}
+
+test "duplicate species IDs consume only the selected stock entry" {
+    let site = PlantingSite(
+        id: 1,
+        name: "Training Site",
+        district_id: 1,
+        priority: 1,
+        drainage: Drainage.Moist,
+        usable_root_volume_ft3: 30,
+        overhead_clearance_ft: 12,
+        sidewalk_width_ft: 3,
+    )
+    let sites = [site, site, site, site, site, site, site, site, site, site]
+    let species = [
+        TreeSpecies(
+            id: 7,
+            name: "Unstocked Serviceberry",
+            drainage: Drainage.Moist,
+            minimum_root_volume_ft3: 20,
+            minimum_overhead_clearance_ft: 10,
+            minimum_sidewalk_width_ft: 2,
+            establishment_water_liters: 28,
+            nursery_stock: 0,
+        ),
+        TreeSpecies(
+            id: 7,
+            name: "Available Serviceberry",
+            drainage: Drainage.Moist,
+            minimum_root_volume_ft3: 20,
+            minimum_overhead_clearance_ft: 10,
+            minimum_sidewalk_width_ft: 2,
+            establishment_water_liters: 28,
+            nursery_stock: 1,
+        ),
+        TreeSpecies(
+            id: 8,
+            name: "Poor-Drainage Oak",
+            drainage: Drainage.PoorlyDrained,
+            minimum_root_volume_ft3: 20,
+            minimum_overhead_clearance_ft: 10,
+            minimum_sidewalk_width_ft: 2,
+            establishment_water_liters: 40,
+            nursery_stock: 1,
+        ),
+        TreeSpecies(
+            id: 9,
+            name: "Well-Drained Ironwood",
+            drainage: Drainage.WellDrained,
+            minimum_root_volume_ft3: 20,
+            minimum_overhead_clearance_ft: 10,
+            minimum_sidewalk_width_ft: 2,
+            establishment_water_liters: 40,
+            nursery_stock: 1,
+        ),
+    ]
+    let result = plan(sites, species, 10, 300)
+    assert result.planted_count == 1
+    assert result.held_count == 9
+    assert result.decisions[0].unwrap().species_id == Some(7)
+    assert result.decisions[1].unwrap().hold_reason == Some(HoldReason.NurseryStockUnavailable)
+}
+
+test "hold reasons report the furthest eligibility gate reached" {
+    let site = PlantingSite(
+        id: 1,
+        name: "Training Site",
+        district_id: 1,
+        priority: 1,
+        drainage: Drainage.Moist,
+        usable_root_volume_ft3: 30,
+        overhead_clearance_ft: 12,
+        sidewalk_width_ft: 3,
+    )
+    let unstocked = TreeSpecies(
+        id: 1,
+        name: "Unstocked Serviceberry",
+        drainage: Drainage.Moist,
+        minimum_root_volume_ft3: 20,
+        minimum_overhead_clearance_ft: 10,
+        minimum_sidewalk_width_ft: 2,
+        establishment_water_liters: 28,
+        nursery_stock: 0,
+    )
+    let district_limited = TreeSpecies(
+        id: 2,
+        name: "District-Limited Serviceberry",
+        drainage: Drainage.Moist,
+        minimum_root_volume_ft3: 20,
+        minimum_overhead_clearance_ft: 10,
+        minimum_sidewalk_width_ft: 2,
+        establishment_water_liters: 28,
+        nursery_stock: 1,
+    )
+    let unfit = [
+        TreeSpecies(
+            id: 3,
+            name: "Poor-Drainage Oak",
+            drainage: Drainage.PoorlyDrained,
+            minimum_root_volume_ft3: 20,
+            minimum_overhead_clearance_ft: 10,
+            minimum_sidewalk_width_ft: 2,
+            establishment_water_liters: 40,
+            nursery_stock: 1,
+        ),
+        TreeSpecies(
+            id: 4,
+            name: "Well-Drained Ironwood",
+            drainage: Drainage.WellDrained,
+            minimum_root_volume_ft3: 20,
+            minimum_overhead_clearance_ft: 10,
+            minimum_sidewalk_width_ft: 2,
+            establishment_water_liters: 40,
+            nursery_stock: 1,
+        ),
+    ]
+    let species = [unstocked, district_limited, unfit[0], unfit[1]]
+    let previous = PlantingDecision(
+        site_id: 0,
+        site_name: "Earlier Site",
+        district_id: site.district_id,
+        priority: 0,
+        species_id: Some(district_limited.id),
+        hold_reason: None,
+        establishment_water_liters: district_limited.establishment_water_liters,
+    )
+    let decisions = [Some(previous), None, None, None, None, None, None, None, None, None]
+    let (selected, hold_reason) = choose_species(site, species, [0, 1, 1, 1], decisions, 1, 300, 1)
+    assert selected == None
+    assert hold_reason == Some(HoldReason.DistrictDiversityLimit)
 }
