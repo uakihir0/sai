@@ -1,11 +1,13 @@
 //! Interned semantic types shared by declaration and body checking.
 //!
 //! This is an early semantic type kernel. It represents primitive types,
-//! tuples, references, owner-bound function type parameters, and nominal
-//! identities with explicit type arguments. Signature lowering currently
-//! limits generic nominal applications to validated direct local records and
-//! enums with region-free fields or payloads. Function pointers, projections,
-//! inference variables, and error types remain for later slices.
+//! tuples, references, arrays with literal lengths, owner-bound function type
+//! parameters, and nominal identities with explicit type arguments. Signature
+//! lowering currently limits arrays to the resolved built-in `Array` with a
+//! nonnegative target-fitting literal length, and generic nominal applications
+//! to validated direct local records and enums with region-free fields or
+//! payloads. Function pointers, projections, inference variables, and error
+//! types remain for later slices.
 
 use sai_hir::{DefId, Mutability, Symbol};
 use std::collections::HashMap;
@@ -61,6 +63,8 @@ pub enum TyKind {
     Never,
     Tuple(Arc<[Ty]>),
     Ref(Region, Ty, Mutability),
+    /// A structural array with its element type and target-validated length.
+    Array(Ty, u128),
     /// A type parameter in the binder of one function signature.
     Param(ParamTy),
     /// A nominal definition and its explicit type arguments.
@@ -221,6 +225,9 @@ impl TyInterner {
             TyKind::Ref(region, inner, mutability) => {
                 TyKind::Ref(region, self.intern(inner.kind().clone()), mutability)
             }
+            TyKind::Array(element, length) => {
+                TyKind::Array(self.intern(element.kind().clone()), length)
+            }
             TyKind::Adt(def_id, args) => TyKind::Adt(
                 def_id,
                 args.iter()
@@ -299,6 +306,34 @@ mod tests {
                 Mutability::Mut
             )
         );
+    }
+
+    #[test]
+    fn arrays_are_interned_by_element_type_and_length() {
+        let interner = TyInterner::new();
+        let element = interner.intern(TyKind::Bool);
+        let array = interner.intern(TyKind::Array(element.clone(), 4));
+        let same_array = interner.intern(TyKind::Array(element.clone(), 4));
+        let different_length = interner.intern(TyKind::Array(element, 5));
+
+        assert!(array.ptr_eq(&same_array));
+        assert!(!array.ptr_eq(&different_length));
+    }
+
+    #[test]
+    fn array_interning_canonicalizes_element_types_from_another_interner() {
+        let interner = TyInterner::new();
+        let other = TyInterner::new();
+        let local_bool = interner.intern(TyKind::Bool);
+        let foreign_bool = other.intern(TyKind::Bool);
+        let local_array = interner.intern(TyKind::Array(local_bool.clone(), 8));
+        let foreign_array = interner.intern(TyKind::Array(foreign_bool, 8));
+
+        assert!(local_array.ptr_eq(&foreign_array));
+        let TyKind::Array(element, 8) = foreign_array.kind() else {
+            panic!("the array retains its exact length");
+        };
+        assert!(element.ptr_eq(&local_bool));
     }
 
     #[test]
