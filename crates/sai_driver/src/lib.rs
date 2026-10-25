@@ -9652,6 +9652,84 @@ fn local_enum_variant_annotated_local_primitive(
     }
 }
 
+fn local_enum_variant_unannotated_fixed_local_type(
+    value: &HirExpr<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+) -> Option<ConstLiteralType> {
+    let ExprKind::Path(path) = value.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return None;
+    }
+    let PathRes {
+        base: Res::Local(binding),
+        resolved_segments: 1,
+        segment_count: 1,
+    } = *locals.paths.get(&path.hir_id)?
+    else {
+        return None;
+    };
+    let binding_kind = locals.bindings.get(&binding)?.kind;
+    if !matches!(binding_kind, BindingKind::Let | BindingKind::Var) {
+        return None;
+    }
+
+    let ExprKind::Block(body_block) = body.value.kind else {
+        return None;
+    };
+    let mut initializer = None;
+    for statement in body_block.stmts {
+        let StmtKind::Let {
+            pat,
+            ty: None,
+            init,
+            els: None,
+        } = statement.kind
+        else {
+            continue;
+        };
+        let PatKind::Binding {
+            mode,
+            name,
+            binding: declared_binding,
+            sub: None,
+        } = pat.kind
+        else {
+            continue;
+        };
+        if declared_binding != binding {
+            continue;
+        }
+        if name.sym != path.segments[0].name.sym
+            || !matches!(
+                (binding_kind, mode),
+                (BindingKind::Let, sai_hir::patterns::BindingMode::Value)
+                    | (BindingKind::Var, sai_hir::patterns::BindingMode::Var)
+            )
+            || initializer.is_some()
+        {
+            return None;
+        }
+        initializer = Some(init);
+    }
+
+    match initializer?.kind {
+        ExprKind::Lit(Lit::Bool(_)) => Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::Bool,
+        )),
+        ExprKind::Lit(Lit::Byte(_)) => Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::Byte,
+        )),
+        ExprKind::Lit(Lit::Char(_)) => Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::Char,
+        )),
+        ExprKind::Tuple(elements) if elements.is_empty() => Some(ConstLiteralType::Unit),
+        _ => None,
+    }
+}
+
 fn check_local_enum_variant_parameter_argument(
     owner: OwnerId,
     expected_type: &sai_ty::ty::Ty,
@@ -9695,6 +9773,47 @@ fn check_local_enum_variant_parameter_argument(
         ),
         "type mismatch",
     )?))
+}
+
+fn check_local_enum_variant_unannotated_local_argument(
+    owner: OwnerId,
+    expected_type: &sai_ty::ty::Ty,
+    value: &HirExpr<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Diagnostic>, OwnerControlFlowResolutionError> {
+    let Some(expected) = local_enum_variant_literal_type(expected_type) else {
+        return Ok(None);
+    };
+    let Some(actual) = local_enum_variant_unannotated_fixed_local_type(value, body, locals) else {
+        return Ok(None);
+    };
+    if expected == actual {
+        return Ok(None);
+    }
+    Ok(Some(const_literal_diagnostic(
+        owner,
+        inputs,
+        snapshot,
+        value.span,
+        sai_diagnostics::Code::TypeMismatch,
+        format!(
+            "expected `{}`, found `{}`",
+            local_enum_variant_type_name(expected),
+            local_enum_variant_type_name(actual)
+        ),
+        "type mismatch",
+    )?))
+}
+
+fn local_enum_variant_type_name(literal_type: ConstLiteralType) -> &'static str {
+    match literal_type {
+        ConstLiteralType::Primitive(primitive) => const_primitive_name(primitive),
+        ConstLiteralType::Str => "Str",
+        ConstLiteralType::Unit => "()",
+    }
 }
 
 fn check_local_enum_variant_literal_argument(
@@ -9752,6 +9871,17 @@ fn check_local_enum_variant_literal_argument(
             locals,
             type_paths,
             symbols,
+            inputs,
+            snapshot,
+        )? {
+            diagnostics.push(diagnostic);
+        }
+        if let Some(diagnostic) = check_local_enum_variant_unannotated_local_argument(
+            owner,
+            expected_type,
+            value,
+            body,
+            locals,
             inputs,
             snapshot,
         )? {
@@ -97448,7 +97578,7 @@ interface facade { use middle.{payload}; }"#;
             "enum Alpha { Same, Ready }\n",
             "enum Beta { Same, Later }\n",
             "enum Duplicate { Same, Same }\n",
-            "enum Payload { Unit, Pair(U8, Bool), Named(value: Bool), UnitPayload(()), Signed(ISize), Wide(USize) }\n",
+            "enum Payload { Unit, Pair(U8, Bool), Fixed(Bool, Byte, Char, ()), Named(value: Bool), UnitPayload(()), Signed(ISize), Wide(USize) }\n",
             "enum NestedPayload { Nested(((I8, Char), ((), USize))), Single((I8,)) }\n",
             "enum Generic<T> { Value(T) }\n",
             "enum Broken { Huge = 170141183460469231731687303715884105728 }\n",
@@ -97474,6 +97604,19 @@ interface facade { use middle.{payload}; }"#;
             "fn tuple_call_annotated_nested_scope(actual: Bool) {\n    {\n        let actual: U8 = 1\n    }\n    Payload.Pair(1, actual)\n}\n",
             "fn tuple_call_annotated_extra() {\n    let extra: Bool = true\n    Payload.Pair(1, true, extra)\n}\n",
             "fn tuple_call_unannotated_local() {\n    let actual = 1 + 2\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_fixed_locals_ok() {\n    let actual_bool = true\n    var actual_byte = b'x'\n    let actual_char = 'x'\n    var actual_unit = ()\n    Payload.Fixed(actual_bool, actual_byte, actual_char, actual_unit)\n}\n",
+            "fn tuple_call_inferred_bool_mismatch() {\n    let actual = true\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_var_byte_mismatch() {\n    var actual = b'x'\n    Payload.Pair(1, actual)\n}\n",
+            "fn tuple_call_inferred_char_mismatch() {\n    let actual = 'x'\n    NestedPayload.Nested(((actual, 'x'), ((), 2)))\n}\n",
+            "fn tuple_call_inferred_unit_mismatch() {\n    let actual = true\n    NestedPayload.Nested(((1, 'x'), (actual, 2)))\n}\n",
+            "fn tuple_call_inferred_shadowing(actual: Bool) {\n    let actual = b'x'\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_nested_scope(actual: U8) {\n    {\n        let actual = true\n    }\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_nested_scope_only() {\n    {\n        let actual = true\n        Payload.Pair(actual, true)\n    }\n}\n",
+            "fn tuple_call_inferred_extra() {\n    let extra = true\n    Payload.Pair(1, true, extra)\n}\n",
+            "fn tuple_call_unannotated_integer_literal() {\n    let actual = 1\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_unannotated_float_literal() {\n    let actual = 1.5\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_unannotated_computed_bool() {\n    let actual = true && false\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_destructuring() {\n    let (actual, _) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_param_mismatch(actual: Bool) { Payload.Pair(actual, true) }\n",
             "fn tuple_call_unicode_param_mismatch(値: Bool) { Payload.Pair(値, true) }\n",
             "fn nested_call_param_mismatch(actual: USize) { NestedPayload.Nested(((actual, 'x'), ((), 2))) }\n",
@@ -98035,6 +98178,13 @@ interface facade { use middle.{payload}; }"#;
             "tuple_call_annotated_var_ok",
             "tuple_call_annotated_nested_scope",
             "tuple_call_unannotated_local",
+            "tuple_call_inferred_fixed_locals_ok",
+            "tuple_call_inferred_nested_scope",
+            "tuple_call_inferred_nested_scope_only",
+            "tuple_call_unannotated_integer_literal",
+            "tuple_call_unannotated_float_literal",
+            "tuple_call_unannotated_computed_bool",
+            "tuple_call_inferred_destructuring",
         ] {
             assert!(
                 paths_for(name).call_diagnostics().is_empty(),
@@ -98052,6 +98202,26 @@ interface facade { use middle.{payload}; }"#;
             (
                 "tuple_call_annotated_var_mismatch",
                 "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_inferred_bool_mismatch",
+                "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_inferred_var_byte_mismatch",
+                "expected `Bool`, found `Byte`",
+            ),
+            (
+                "tuple_call_inferred_char_mismatch",
+                "expected `I8`, found `Char`",
+            ),
+            (
+                "tuple_call_inferred_unit_mismatch",
+                "expected `()`, found `Bool`",
+            ),
+            (
+                "tuple_call_inferred_shadowing",
+                "expected `U8`, found `Byte`",
             ),
             (
                 "tuple_call_annotated_shadowing",
@@ -98123,6 +98293,44 @@ interface facade { use middle.{payload}; }"#;
                     local_path_start,
                     "actual".len(),
                 );
+            } else if matches!(
+                name,
+                "tuple_call_inferred_bool_mismatch"
+                    | "tuple_call_inferred_var_byte_mismatch"
+                    | "tuple_call_inferred_char_mismatch"
+                    | "tuple_call_inferred_unit_mismatch"
+                    | "tuple_call_inferred_shadowing"
+            ) {
+                let function_start = root
+                    .find(&format!("fn {name}"))
+                    .expect("inferred local mismatch function exists");
+                let (call, argument_prefix_len) = match name {
+                    "tuple_call_inferred_var_byte_mismatch" => {
+                        ("Payload.Pair(1, actual)", "Payload.Pair(1, ".len())
+                    }
+                    "tuple_call_inferred_char_mismatch" => (
+                        "NestedPayload.Nested(((actual, 'x'), ((), 2)))",
+                        "NestedPayload.Nested(((".len(),
+                    ),
+                    "tuple_call_inferred_unit_mismatch" => (
+                        "NestedPayload.Nested(((1, 'x'), (actual, 2)))",
+                        "NestedPayload.Nested(((1, 'x'), (".len(),
+                    ),
+                    "tuple_call_inferred_shadowing" => {
+                        ("Payload.Pair(actual, true)", "Payload.Pair(".len())
+                    }
+                    _ => ("Payload.Pair(actual, true)", "Payload.Pair(".len()),
+                };
+                let local_path_start = function_start
+                    + root[function_start..]
+                        .find(call)
+                        .expect("inferred local argument call exists")
+                    + argument_prefix_len;
+                assert_primary_span(
+                    &paths.call_diagnostics()[0],
+                    local_path_start,
+                    "actual".len(),
+                );
             }
         }
 
@@ -98162,6 +98370,13 @@ interface facade { use middle.{payload}; }"#;
             annotated_extra.call_diagnostics()[0].code,
             sai_diagnostics::Code::WrongArgumentCount,
             "an annotated local in an unmatched extra argument receives no expected-type check"
+        );
+        let inferred_extra = paths_for("tuple_call_inferred_extra");
+        assert_eq!(inferred_extra.call_diagnostics().len(), 1);
+        assert_eq!(
+            inferred_extra.call_diagnostics()[0].code,
+            sai_diagnostics::Code::WrongArgumentCount,
+            "an inferred local in an unmatched extra argument receives no expected-type check"
         );
 
         let tuple_call_mismatch = paths_for("tuple_call_mismatch");

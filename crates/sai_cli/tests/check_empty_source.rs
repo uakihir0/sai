@@ -285,14 +285,21 @@ fn empty_root_package_index() -> sai_semantic::EncodedSymbolIndex {
 fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     let source = concat!(
         "enum Payload { Pair(U8, Bool), Named(value: Bool) }\n",
+        "enum FixedPayload { Values(Bool, Byte, Char, ()) }\n",
         "enum NestedPayload { Nested(((I8, Char), ((), USize))) }\n",
         "pub fn use_it(actual: Bool) {\n",
         "    let annotated: Bool = true\n",
         "    var matching: Bool = false\n",
         "    var extra: Bool = false\n",
+        "    let inferred_bool = true\n",
+        "    var inferred_byte = b'x'\n",
+        "    let inferred_char = 'x'\n",
+        "    var inferred_unit = ()\n",
         "    (Payload.Pair(actual, true), ",
         "Payload.Pair(annotated, true), ",
         "Payload.Pair(1, matching), ",
+        "Payload.Pair(inferred_bool, true), ",
+        "FixedPayload.Values(inferred_bool, inferred_byte, inferred_char, inferred_unit), ",
         "Payload.Pair(1, true), ",
         "Payload.Pair(first: true, second: 1, third: false), ",
         "Payload.Pair(1, true, extra), ",
@@ -319,8 +326,8 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        6,
-        "the staged projection checks parameter and explicitly annotated local paths plus named/nested tuple literal leaves:\n{stdout}"
+        7,
+        "the staged projection checks parameter, annotated and fixed-literal inferred local paths plus named/nested tuple literal leaves:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
@@ -350,6 +357,18 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "expected `U8`, found `Bool`",
         annotated_start,
         annotated_start + "annotated".len(),
+    );
+    let inferred_call = "Payload.Pair(inferred_bool, true)";
+    let inferred_start = source
+        .find(inferred_call)
+        .expect("inferred local mismatch call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Bool`",
+        inferred_start,
+        inferred_start + "inferred_bool".len(),
     );
     let named_start = source.find("first:").expect("named argument exists");
     assert_json_diagnostic_primary_span(
