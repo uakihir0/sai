@@ -98106,6 +98106,7 @@ interface facade { use middle.{payload}; }"#;
             "fn nested_call_tuple_arity_unit_literal() { NestedPayload.Nested(((), ((), 2))) }\n",
             "fn nested_call_tuple_arity_sibling_order() { NestedPayload.Nested((true, ((), true))) }\n",
             "fn nested_call_tuple_arity_numeric_exclusion() { NestedPayload.Nested((1, ((), 2))) }\n",
+            "fn nested_call_tuple_arity_float_exclusion() { NestedPayload.Nested((1.0, ((), 2))) }\n",
             "fn nested_call_tuple_arity_string_exclusion() { NestedPayload.Nested((\"text\", ((), 2))) }\n",
             "fn nested_call_tuple_arity_actual_tuple_scalar() { NestedPayload.Nested(((1, (false,)), ((), 2))) }\n",
             "fn nested_call_tuple_arity_nonliteral(actual: (I8,)) { NestedPayload.Nested((actual, ((), 2))) }\n",
@@ -99254,6 +99255,7 @@ interface facade { use middle.{payload}; }"#;
         for name in [
             "nested_call_tuple_arity_unit_exclusions",
             "nested_call_tuple_arity_numeric_exclusion",
+            "nested_call_tuple_arity_float_exclusion",
             "nested_call_tuple_arity_string_exclusion",
             "nested_call_tuple_arity_nonliteral",
             "nested_call_tuple_arity_tuple_call_exclusion",

@@ -988,6 +988,7 @@ fn check_reports_tuple_expected_fixed_literal_mismatches() {
         "NestedPayload.Nested(((true,), ((), 2))), ",
         "NestedPayload.Nested((true, ((), true))), ",
         "NestedPayload.Nested((1, ((), 2))), ",
+        "NestedPayload.Nested((1.0, ((), 2))), ",
         "NestedPayload.Nested((\"text\", ((), 2))), ",
         "NestedPayload.Nested((actual, ((), 2))), ",
         "NestedPayload.Nested((tuple_factory(), ((), 2))), ",
@@ -1014,6 +1015,18 @@ fn check_reports_tuple_expected_fixed_literal_mismatches() {
         stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
         1,
         "outer call arity remains independently diagnosed"
+    );
+    let float_call = "NestedPayload.Nested((1.0, ((), 2)))";
+    let float_start = source
+        .find(float_call)
+        .expect("tuple-expected float exclusion call exists")
+        + float_call.find("1.0").expect("float literal exists");
+    assert!(
+        !stdout.lines().any(|record| {
+            record.contains("\"code\":\"TYPE_MISMATCH\"")
+                && record.contains(&format!("\"start\":{{\"byte\":{float_start},"))
+        }),
+        "defaulted floating-point literals remain outside tuple mismatch diagnostics:\n{stdout}"
     );
 
     let assert_literal_mismatch =
