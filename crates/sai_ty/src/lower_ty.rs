@@ -104,6 +104,7 @@ pub struct LowerTyContext<'a> {
     generic_params: HashMap<DefId, ParamTy>,
     def_paths: Option<&'a DefPathInterner>,
     array_length_pointer_width: Option<u8>,
+    array_literal_lengths_only: bool,
     region_mode: RegionMode,
     next_region_index: u32,
     within_fn_ptr: bool,
@@ -137,6 +138,7 @@ impl<'a> LowerTyContext<'a> {
             generic_params: HashMap::new(),
             def_paths: None,
             array_length_pointer_width: None,
+            array_literal_lengths_only: false,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             within_fn_ptr: false,
@@ -168,6 +170,7 @@ impl<'a> LowerTyContext<'a> {
             generic_params: HashMap::new(),
             def_paths: None,
             array_length_pointer_width: None,
+            array_literal_lengths_only: false,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             within_fn_ptr: false,
@@ -199,6 +202,7 @@ impl<'a> LowerTyContext<'a> {
             generic_params: HashMap::new(),
             def_paths: None,
             array_length_pointer_width: None,
+            array_literal_lengths_only: false,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             within_fn_ptr: false,
@@ -230,6 +234,7 @@ impl<'a> LowerTyContext<'a> {
             generic_params: HashMap::new(),
             def_paths: None,
             array_length_pointer_width: None,
+            array_literal_lengths_only: false,
             region_mode: RegionMode::Field {
                 has_implicit_region_parameter,
             },
@@ -256,6 +261,7 @@ impl<'a> LowerTyContext<'a> {
             generic_params: HashMap::new(),
             def_paths: None,
             array_length_pointer_width: None,
+            array_literal_lengths_only: false,
             region_mode: RegionMode::Body,
             next_region_index: 0,
             within_fn_ptr: false,
@@ -282,6 +288,27 @@ impl<'a> LowerTyContext<'a> {
     pub fn with_array_length_pointer_width(mut self, pointer_width: u8) -> Self {
         if matches!(self.region_mode, RegionMode::Signature) {
             self.array_length_pointer_width = Some(pointer_width);
+        }
+        self
+    }
+
+    /// Enable only target-width-checked integer literal array lengths for a
+    /// declaration-field context without an implicit region parameter.
+    ///
+    /// Unlike signature lowering, field projection does not admit symbolic
+    /// const parameters or any other type-shaped length argument. This
+    /// builder is deliberately inert for signature, body, and region-bearing
+    /// field contexts so this field-specific support cannot widen those
+    /// lowering paths.
+    pub fn with_field_array_literal_pointer_width(mut self, pointer_width: u8) -> Self {
+        if matches!(
+            self.region_mode,
+            RegionMode::Field {
+                has_implicit_region_parameter: false,
+            }
+        ) {
+            self.array_length_pointer_width = Some(pointer_width);
+            self.array_literal_lengths_only = true;
         }
         self
     }
@@ -831,6 +858,9 @@ fn lower_builtin_array(
             negated: false,
         }) => return Err(UnsupportedTy::ArrayLength),
         HirGenericArg::Const(_) => return Err(UnsupportedTy::ArrayLength),
+        HirGenericArg::Type(_) if context.array_literal_lengths_only => {
+            return Err(UnsupportedTy::ArrayLength);
+        }
         HirGenericArg::Type(ty) => Const::Param(array_length_const_parameter(context, ty)?),
         HirGenericArg::Binding { .. } => return Err(UnsupportedTy::GenericArgumentKind),
     };
@@ -1506,6 +1536,213 @@ mod tests {
         assert_eq!(
             lower_ty(&mut context, second_borrow),
             Err(UnsupportedTy::FieldRegionWithoutParameter)
+        );
+    }
+
+    #[test]
+    fn field_array_context_accepts_only_target_fit_literal_lengths() {
+        let (owner, symbols) = owner();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let (byte, byte_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            10,
+            "U8",
+            None,
+            Res::PrimTy(PrimTy::U8),
+        );
+
+        for (pointer_width, largest, first_overflow) in [
+            (32, (1u128 << 32) - 1, 1u128 << 32),
+            (64, (1u128 << 64) - 1, 1u128 << 64),
+        ] {
+            for length in [0, largest] {
+                let args = [
+                    HirGenericArg::Type(byte),
+                    HirGenericArg::Const(ConstArg::Int {
+                        value: Some(length),
+                        negated: false,
+                    }),
+                ];
+                let (array, mut paths) = resolved_array_path(
+                    &arena,
+                    owner,
+                    &symbols,
+                    100 + u32::from(pointer_width),
+                    &args,
+                );
+                paths.extend(byte_paths.clone());
+                let mut context = LowerTyContext::for_field(&interner, owner, &paths, false)
+                    .with_field_array_literal_pointer_width(pointer_width);
+                assert!(matches!(
+                    lower_ty(&mut context, array).map(|ty| ty.kind().clone()),
+                    Ok(TyKind::Array(_, Const::Value(actual))) if actual == length
+                ));
+            }
+
+            let overflow_args = [
+                HirGenericArg::Type(byte),
+                HirGenericArg::Const(ConstArg::Int {
+                    value: Some(first_overflow),
+                    negated: false,
+                }),
+            ];
+            let (overflow, mut paths) = resolved_array_path(
+                &arena,
+                owner,
+                &symbols,
+                200 + u32::from(pointer_width),
+                &overflow_args,
+            );
+            paths.extend(byte_paths.clone());
+            let mut context = LowerTyContext::for_field(&interner, owner, &paths, false)
+                .with_field_array_literal_pointer_width(pointer_width);
+            assert_eq!(
+                lower_ty(&mut context, overflow),
+                Err(UnsupportedTy::ArrayLength),
+                "the first non-representable USize value fails closed at {pointer_width} bits"
+            );
+        }
+
+        let (inner, mut inner_paths) = resolved_array_path(
+            &arena,
+            owner,
+            &symbols,
+            300,
+            &[
+                HirGenericArg::Type(byte),
+                HirGenericArg::Const(ConstArg::Int {
+                    value: Some(2),
+                    negated: false,
+                }),
+            ],
+        );
+        let (outer, mut outer_paths) = resolved_array_path(
+            &arena,
+            owner,
+            &symbols,
+            320,
+            &[
+                HirGenericArg::Type(inner),
+                HirGenericArg::Const(ConstArg::Int {
+                    value: Some(3),
+                    negated: false,
+                }),
+            ],
+        );
+        inner_paths.extend(byte_paths.clone());
+        outer_paths.extend(inner_paths);
+        let mut context = LowerTyContext::for_field(&interner, owner, &outer_paths, false)
+            .with_field_array_literal_pointer_width(32);
+        let lowered = lower_ty(&mut context, outer).expect("nested literal arrays lower");
+        let TyKind::Array(inner, Const::Value(3)) = lowered.kind() else {
+            panic!("the outer literal array shape is retained");
+        };
+        assert!(matches!(inner.kind(), TyKind::Array(_, Const::Value(2))));
+        let mut region_bearing_context =
+            LowerTyContext::for_field(&interner, owner, &outer_paths, true)
+                .with_field_array_literal_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut region_bearing_context, outer),
+            Err(UnsupportedTy::Array),
+            "region-bearing field contexts remain outside this literal-array adapter"
+        );
+
+        let invalid_lengths = [
+            ConstArg::Int {
+                value: Some(1),
+                negated: true,
+            },
+            ConstArg::Int {
+                value: None,
+                negated: false,
+            },
+            ConstArg::Bool(true),
+            ConstArg::Char('x'),
+        ];
+        for (index, length) in invalid_lengths.into_iter().enumerate() {
+            let args = [HirGenericArg::Type(byte), HirGenericArg::Const(length)];
+            let (array, mut paths) =
+                resolved_array_path(&arena, owner, &symbols, 400 + index as u32 * 10, &args);
+            paths.extend(byte_paths.clone());
+            let mut context = LowerTyContext::for_field(&interner, owner, &paths, false)
+                .with_field_array_literal_pointer_width(32);
+            assert_eq!(
+                lower_ty(&mut context, array),
+                Err(UnsupportedTy::ArrayLength)
+            );
+        }
+
+        let type_length_args = [HirGenericArg::Type(byte), HirGenericArg::Type(byte)];
+        let (type_length, mut paths) =
+            resolved_array_path(&arena, owner, &symbols, 460, &type_length_args);
+        paths.extend(byte_paths.clone());
+        let mut context = LowerTyContext::for_field(&interner, owner, &paths, false)
+            .with_field_array_literal_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut context, type_length),
+            Err(UnsupportedTy::ArrayLength),
+            "type-shaped lengths and symbolic const substitution remain unsupported"
+        );
+
+        let mut signature_context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_field_array_literal_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut signature_context, type_length),
+            Err(UnsupportedTy::Array),
+            "the field-only builder cannot enable signature array lowering"
+        );
+        let mut body_context = LowerTyContext::for_body(&interner, owner, &paths)
+            .with_field_array_literal_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut body_context, type_length),
+            Err(UnsupportedTy::Array),
+            "the field-only builder cannot enable body array lowering"
+        );
+
+        let wrong_element_kind_args = [
+            HirGenericArg::Const(ConstArg::Int {
+                value: Some(1),
+                negated: false,
+            }),
+            HirGenericArg::Type(byte),
+        ];
+        let (wrong_element_kind, paths) =
+            resolved_array_path(&arena, owner, &symbols, 480, &wrong_element_kind_args);
+        let mut paths = paths;
+        paths.extend(byte_paths.clone());
+        let mut context = LowerTyContext::for_field(&interner, owner, &paths, false)
+            .with_field_array_literal_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut context, wrong_element_kind),
+            Err(UnsupportedTy::GenericArgumentKind)
+        );
+
+        let binding_args = [
+            HirGenericArg::Type(byte),
+            HirGenericArg::Const(ConstArg::Int {
+                value: Some(1),
+                negated: false,
+            }),
+            HirGenericArg::Binding {
+                name: sai_hir::types::Name {
+                    sym: symbols.intern("Item").unwrap(),
+                    span: span(),
+                },
+                ty: byte,
+            },
+        ];
+        let (with_binding, mut paths) =
+            resolved_array_path(&arena, owner, &symbols, 500, &binding_args);
+        paths.extend(byte_paths);
+        let mut context = LowerTyContext::for_field(&interner, owner, &paths, false)
+            .with_field_array_literal_pointer_width(32);
+        assert_eq!(
+            lower_ty(&mut context, with_binding),
+            Err(UnsupportedTy::GenericArgumentKind),
+            "associated bindings remain unsupported"
         );
     }
 

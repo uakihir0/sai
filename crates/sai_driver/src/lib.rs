@@ -18828,7 +18828,8 @@ impl RootDatabase {
                 descriptor.owner,
                 path_resolution.paths(),
                 false,
-            );
+            )
+            .with_field_array_literal_pointer_width(collection.target_cfg.pointer_width());
             let ty = sai_ty::lower_ty::lower_ty(&mut context, field.ty);
             projected_fields.push(LocalRecordFieldTypeProjection {
                 def_id: field_def_id,
@@ -37911,6 +37912,8 @@ property "shared"() {}
             "  tuple: (Bool, U8),\n",
             "  callback: fn(I32, (Char,)) -> Bool,\n",
             "  array: Array<U8, 2>,\n",
+            "  overflow_array: Array<U8, 4294967296>,\n",
+            "  nested_array: Array<Array<U8, 2>, 3>,\n",
             "  borrowed: borrow Bool,\n",
             "  callback_borrowed: fn(borrow Bool),\n",
             "  callback_effects: fn() effects {},\n",
@@ -38002,7 +38005,7 @@ property "shared"() {}
             panic!("nongeneric unrecovered record fields can be projected");
         };
         assert_eq!(*projected_owner, fields_owner);
-        assert_eq!(projected_fields.len(), 9);
+        assert_eq!(projected_fields.len(), 11);
 
         let field_named = |name: &str| {
             projected_fields
@@ -38023,6 +38026,8 @@ property "shared"() {}
                 Arc::<str>::from("tuple"),
                 Arc::<str>::from("callback"),
                 Arc::<str>::from("array"),
+                Arc::<str>::from("overflow_array"),
+                Arc::<str>::from("nested_array"),
                 Arc::<str>::from("borrowed"),
                 Arc::<str>::from("callback_borrowed"),
                 Arc::<str>::from("callback_effects"),
@@ -38075,8 +38080,31 @@ property "shared"() {}
             Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::FnPtr(_))
         ));
 
+        let array = field_named("array");
+        assert!(matches!(
+            array.ty().expect("target-fit literal array field lowers").kind(),
+            sai_ty::ty::TyKind::Array(element, sai_ty::ty::Const::Value(2))
+                if matches!(element.kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8))
+        ));
+        let nested_array = field_named("nested_array");
+        assert!(matches!(
+            nested_array.ty().expect("nested literal array field lowers").kind(),
+            sai_ty::ty::TyKind::Array(outer_element, sai_ty::ty::Const::Value(3))
+                if matches!(
+                    outer_element.kind(),
+                    sai_ty::ty::TyKind::Array(inner_element, sai_ty::ty::Const::Value(2))
+                        if matches!(
+                            inner_element.kind(),
+                            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+                        )
+                )
+        ));
+
         for (name, expected_reason) in [
-            ("array", sai_ty::lower_ty::UnsupportedTy::Array),
+            (
+                "overflow_array",
+                sai_ty::lower_ty::UnsupportedTy::ArrayLength,
+            ),
             (
                 "borrowed",
                 sai_ty::lower_ty::UnsupportedTy::FieldRegionWithoutParameter,
@@ -38267,6 +38295,248 @@ property "shared"() {}
             ),
             Err(OwnerControlFlowResolutionError::SnapshotMismatch)
         ));
+    }
+
+    #[test]
+    fn local_record_field_literal_arrays_use_the_collection_target_width() {
+        let root = concat!(
+            "const LENGTH: USize = 7\n",
+            "type Bounds {\n",
+            "  zero: Array<U8, 0>,\n",
+            "  max32: Array<U8, 4294967295>,\n",
+            "  over32: Array<U8, 4294967296>,\n",
+            "  max64: Array<U8, 18446744073709551615>,\n",
+            "  over64: Array<U8, 18446744073709551616>,\n",
+            "  nested: Array<Array<U8, 4294967295>, 0>,\n",
+            "  symbolic: Array<U8, LENGTH>,\n",
+            "  negative: Array<U8, -1>,\n",
+            "  boolean: Array<U8, true>,\n",
+            "  character: Array<U8, 'x'>,\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        for (target, supports_over32, supports_max64) in
+            [("wasm32-core", false, false), ("x86_64-linux", true, true)]
+        {
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("target-bound Phase 1 collection succeeds");
+            let member_scopes = database
+                .collect_active_source_member_scopes(&collection, &graph, &[])
+                .expect("empty active source-member closure validates");
+            let resolved = database
+                .resolve_type_owner_paths_with_member_scopes(
+                    &collection,
+                    &module_tree,
+                    &snapshot,
+                    &member_scopes,
+                )
+                .expect("target-bound type owner paths resolve");
+            let def_paths = Arc::clone(
+                database
+                    .def_paths
+                    .get(&module_tree.package)
+                    .expect("local DefPath interner exists"),
+            );
+            let bounds_owner = collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Struct
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some("Bounds")
+                                    )
+                                })
+                            })
+                })
+                .expect("the direct local record descriptor exists")
+                .owner;
+            let projection = resolved
+                .local_record_field_types_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    None,
+                    bounds_owner,
+                )
+                .expect("exact target collection guards field types")
+                .expect("the local bounds record has a projection");
+            let LocalRecordFieldTypesProjection::Supported { fields, .. } = projection else {
+                panic!("an unrecovered direct local record is projected");
+            };
+            let field = |name: &str| {
+                fields
+                    .iter()
+                    .find(|field| {
+                        database.symbols.resolve(field.name()).ok().as_deref() == Some(name)
+                    })
+                    .unwrap_or_else(|| panic!("field {name:?} exists"))
+            };
+            let array_length = |name: &str| {
+                let semantic = field(name)
+                    .ty()
+                    .unwrap_or_else(|reason| panic!("field {name:?} lowers: {reason:?}"));
+                let sai_ty::ty::TyKind::Array(_, sai_ty::ty::Const::Value(length)) =
+                    semantic.kind()
+                else {
+                    panic!("field {name:?} retains its literal array type");
+                };
+                *length
+            };
+            assert_eq!(array_length("zero"), 0);
+            assert_eq!(array_length("max32"), (1u128 << 32) - 1);
+            assert_eq!(
+                field("over32").ty().is_ok(),
+                supports_over32,
+                "2^32 follows the pointer width of {target}"
+            );
+            assert_eq!(
+                field("max64").ty().is_ok(),
+                supports_max64,
+                "the 64-bit maximum follows the pointer width of {target}"
+            );
+            assert_eq!(
+                field("over64").ty(),
+                Err(sai_ty::lower_ty::UnsupportedTy::ArrayLength),
+                "2^64 is outside USize for {target}"
+            );
+            let nested = field("nested").ty().expect("nested literal arrays lower");
+            assert!(matches!(
+                nested.kind(),
+                sai_ty::ty::TyKind::Array(
+                    inner,
+                    sai_ty::ty::Const::Value(0)
+                ) if matches!(
+                    inner.kind(),
+                    sai_ty::ty::TyKind::Array(
+                        _,
+                        sai_ty::ty::Const::Value(4_294_967_295)
+                    )
+                )
+            ));
+            for name in ["symbolic", "negative", "boolean", "character"] {
+                assert_eq!(
+                    field(name).ty(),
+                    Err(sai_ty::lower_ty::UnsupportedTy::ArrayLength),
+                    "{name} remains outside literal-only field array lowering on {target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_record_field_projection_does_not_treat_shadowed_array_as_builtin() {
+        let root = concat!(
+            "type Array<T> = T\n",
+            "type Fields { value: Array<U8, 2>, later: Char }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty active source-member closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("the shadowed record type paths resolve");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        let owner = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::Struct
+                    && def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            path.data().last().is_some_and(|component| {
+                                matches!(
+                                    component.data,
+                                    DefPathData::TypeNs(symbol)
+                                        if database.symbols.resolve(symbol).ok().as_deref()
+                                            == Some("Fields")
+                                )
+                            })
+                        })
+            })
+            .expect("the direct local record descriptor exists")
+            .owner;
+        let projection = resolved
+            .local_record_field_types_with_scopes(&collection, Some(&member_scopes), None, owner)
+            .expect("the exact target collection guards the projection")
+            .expect("the local record has a field projection");
+        let LocalRecordFieldTypesProjection::Supported { fields, .. } = projection else {
+            panic!("the direct local record is supported");
+        };
+        assert_eq!(
+            fields[0].ty(),
+            Err(sai_ty::lower_ty::UnsupportedTy::GenericArguments),
+            "the local alias named Array does not enter built-in array lowering"
+        );
+        assert!(
+            matches!(
+                fields[1].ty(),
+                Ok(ty) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
+            ),
+            "a supported sibling follows the unsupported shadowed array"
+        );
+        let owner_result = resolved
+            .owners()
+            .iter()
+            .find(|owner_result| owner_result.owner() == owner)
+            .expect("the exact local record owner result exists");
+        let path_resolution = owner_result
+            .path_resolution()
+            .expect("type-owner path resolution succeeds");
+        assert!(
+            path_resolution
+                .paths()
+                .values()
+                .any(|path| { matches!(path.base, Res::Def(DefKind::Alias, _)) }),
+            "Array resolves to the local alias rather than the built-in constructor"
+        );
     }
 
     #[test]
