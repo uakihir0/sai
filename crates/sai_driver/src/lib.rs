@@ -2513,6 +2513,8 @@ pub struct FunctionOwnerResolution {
     signature_projection: Result<FunctionSignatureProjection, FunctionOwnerResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, FunctionOwnerResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, FunctionOwnerResolutionError>,
+    local_enum_variant_paths:
+        Result<Option<LocalEnumVariantPathResolution>, FunctionOwnerResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, FunctionOwnerResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, FunctionOwnerResolutionError>,
@@ -2537,7 +2539,9 @@ pub enum FunctionSignatureProjection {
 /// Every successful or diagnosed result remains tied to the exact HIR enum
 /// owner and definition. `NotEnum` is limited to a current-package type owner;
 /// dependencies, WIT items, aliases, and unsupported local enum definitions
-/// stay deferred for their owning resolver.
+/// stay deferred for their owning resolver. A qualified local enum type head,
+/// such as `module_alias.Child.Variant`, is also eligible when the full prefix
+/// resolves to that exact local enum.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalEnumVariantPathOutcome {
     Resolved {
@@ -2557,8 +2561,15 @@ pub enum LocalEnumVariantPathOutcome {
     UnsupportedEnum {
         enum_owner: OwnerId,
         enum_def: DefId,
-        reason: LocalEnumAdtUnsupportedReason,
+        reason: LocalEnumVariantPathUnsupportedReason,
     },
+}
+
+/// Why a local type head is not eligible for the direct enum-variant slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnumVariantPathUnsupportedReason {
+    GenericEnum,
+    Enum(LocalEnumAdtUnsupportedReason),
 }
 
 /// One direct enum-variant suffix and the exact HIR/source identity used to
@@ -2566,6 +2577,7 @@ pub enum LocalEnumVariantPathOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalEnumVariantPathEntry {
     field: HirId,
+    base_expression: HirId,
     base_path: HirId,
     name: Symbol,
     field_span: sai_hir::Span,
@@ -2579,7 +2591,18 @@ impl LocalEnumVariantPathEntry {
         self.field
     }
 
-    /// HIR identity of the direct path used as the enum type head.
+    /// HIR identity of the expression used as the enum type head.
+    ///
+    /// For a direct path this is the same node as `base_path`. A qualified
+    /// type head retains the final `Field` prefix node here.
+    pub const fn base_expression(&self) -> HirId {
+        self.base_expression
+    }
+
+    /// HIR identity of the root path in the enum type head.
+    ///
+    /// This remains the root path when qualified type heads contain nested
+    /// `Field` expressions.
     pub const fn base_path(&self) -> HirId {
         self.base_path
     }
@@ -2671,6 +2694,16 @@ impl FunctionOwnerResolution {
         &self,
     ) -> Result<Option<&TypeOwnerPathResolution>, &FunctionOwnerResolutionError> {
         self.type_path_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    /// Direct local enum-variant suffixes resolved while the owner's HIR and
+    /// source map were live.
+    pub fn local_enum_variant_paths(
+        &self,
+    ) -> Result<Option<&LocalEnumVariantPathResolution>, &FunctionOwnerResolutionError> {
+        self.local_enum_variant_paths
             .as_ref()
             .map(|resolution| resolution.as_ref())
     }
@@ -6615,6 +6648,45 @@ impl FunctionOwnerResolutions {
             .map(Some)
             .map_err(Clone::clone)
     }
+
+    /// Returns one function's direct enum-variant paths after checking the
+    /// package collection and every active-scope closure used to resolve its
+    /// enum type heads.
+    pub fn local_enum_variant_paths_with_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+        owner: OwnerId,
+    ) -> Result<Option<&LocalEnumVariantPathResolution>, FunctionOwnerResolutionError> {
+        let matches_member_scopes = match member_scopes {
+            Some(scopes) => self.matches_member_scopes(collection, scopes),
+            None => {
+                self.matches_collection(collection)
+                    && self.member_scope_closure_fingerprint.is_none()
+            }
+        };
+        let matches_wit_view_scopes = match wit_view_scopes {
+            Some(scopes) => self.matches_wit_view_scopes(collection, scopes),
+            None => {
+                self.matches_collection(collection) && self.wit_view_closure_fingerprint.is_none()
+            }
+        };
+        if !self.matches_collection(collection)
+            || !matches_member_scopes
+            || !matches_wit_view_scopes
+        {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        let Some(owner) = self.owners.iter().find(|result| result.owner == owner) else {
+            return Ok(None);
+        };
+        owner
+            .local_enum_variant_paths
+            .as_ref()
+            .map(|paths| paths.as_ref())
+            .map_err(Clone::clone)
+    }
 }
 
 /// Compatibility name for the original label result collection.
@@ -9874,7 +9946,7 @@ fn local_interface_type_member_owners(
 fn append_interface_use_references(
     references: &mut Vec<InterfaceUseReference>,
     interface: sai_hir::LocalDefId,
-    candidates: &[OwnerPathHead<'_>],
+    candidates: &[OwnerPathHead<'_, '_>],
     resolution: &TypeOwnerPathResolution,
     interface_type_members: &HashMap<DefId, sai_hir::LocalDefId>,
     inputs: &CurrentOwnerInputs,
@@ -10773,13 +10845,13 @@ enum OwnerPathKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OwnerPathHead<'hir> {
+struct OwnerPathHead<'paths, 'hir> {
     hir_id: HirId,
     name: Symbol,
     span: sai_hir::Span,
     segment_count: u32,
     kind: OwnerPathKind,
-    segments: &'hir [sai_hir::types::PathSegment<'hir>],
+    segments: &'paths [sai_hir::types::PathSegment<'hir>],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10789,13 +10861,13 @@ struct RefinedGenericSyntaxPathHead {
     kind: OwnerPathKind,
 }
 
-fn owner_test_only_path_candidates<'hir>(owner: &HirOwner<'hir>) -> Vec<OwnerPathHead<'hir>> {
+fn owner_test_only_path_candidates<'hir>(owner: &HirOwner<'hir>) -> Vec<OwnerPathHead<'hir, 'hir>> {
     owner_test_only_path_candidates_with_body(owner, true)
 }
 
 fn world_item_signature_type_path_candidates<'hir>(
     owner: &HirOwner<'hir>,
-) -> Option<Vec<OwnerPathHead<'hir>>> {
+) -> Option<Vec<OwnerPathHead<'hir, 'hir>>> {
     let is_function = match owner.node {
         OwnerNode::WorldItem(item) => {
             matches!(
@@ -10816,7 +10888,7 @@ fn world_item_signature_type_path_candidates<'hir>(
 fn owner_test_only_path_candidates_with_body<'hir>(
     owner: &HirOwner<'hir>,
     include_body: bool,
-) -> Vec<OwnerPathHead<'hir>> {
+) -> Vec<OwnerPathHead<'hir, 'hir>> {
     enum Work<'hir> {
         Expr(&'hir HirExpr<'hir>),
         Block(&'hir HirBlock<'hir>),
@@ -11341,6 +11413,192 @@ fn owner_test_only_path_candidates_with_body<'hir>(
     }
     paths.sort_by_key(|path| path.span.range.start());
     paths
+}
+
+#[derive(Clone)]
+struct DirectEnumVariantPathCandidate<'hir> {
+    field: &'hir HirExpr<'hir>,
+    base_expression: &'hir HirExpr<'hir>,
+    base_path: HirPath<'hir>,
+    type_head_segments: Vec<PathSegment<'hir>>,
+    name: Name,
+}
+
+fn direct_enum_variant_type_head<'hir>(
+    mut base: &'hir HirExpr<'hir>,
+) -> Option<(HirPath<'hir>, Vec<PathSegment<'hir>>)> {
+    let mut field_segments = Vec::new();
+    loop {
+        match base.kind {
+            ExprKind::Field {
+                base: inner,
+                name,
+                args: None,
+            } => {
+                field_segments.push(PathSegment {
+                    hir_id: base.hir_id,
+                    name,
+                    args: None,
+                });
+                base = inner;
+            }
+            ExprKind::Path(path) => {
+                let mut segments = path.segments.to_vec();
+                field_segments.reverse();
+                segments.extend(field_segments);
+                return Some((path, segments));
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn direct_enum_variant_path_candidates<'hir>(
+    body: &'hir sai_hir::body::Body<'hir>,
+) -> Vec<DirectEnumVariantPathCandidate<'hir>> {
+    enum Work<'hir> {
+        Expr(&'hir HirExpr<'hir>),
+        Block(&'hir HirBlock<'hir>),
+        Stmt(&'hir Stmt<'hir>),
+    }
+
+    let mut work = vec![Work::Expr(body.value)];
+    work.extend(
+        body.contracts
+            .iter()
+            .rev()
+            .map(|contract| Work::Expr(&contract.expr)),
+    );
+    work.extend(
+        body.invariant_preds
+            .iter()
+            .rev()
+            .map(|predicate| Work::Expr(predicate)),
+    );
+    let mut candidates = Vec::new();
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Expr(expr) => match expr.kind {
+                ExprKind::Lit(_)
+                | ExprKind::Path(_)
+                | ExprKind::ImplicitMember(_)
+                | ExprKind::ContractResult
+                | ExprKind::Continue { .. }
+                | ExprKind::Err => {}
+                ExprKind::Field { base, name, args } => {
+                    if args.is_none()
+                        && let Some((base_path, type_head_segments)) =
+                            direct_enum_variant_type_head(base)
+                    {
+                        candidates.push(DirectEnumVariantPathCandidate {
+                            field: expr,
+                            base_expression: base,
+                            base_path,
+                            type_head_segments,
+                            name,
+                        });
+                    }
+                    work.push(Work::Expr(base));
+                }
+                ExprKind::TupleField { base, .. }
+                | ExprKind::Unary(_, base)
+                | ExprKind::Borrow(_, base)
+                | ExprKind::Try(base)
+                | ExprKind::Await(base) => work.push(Work::Expr(base)),
+                ExprKind::Call { callee, args, base } => {
+                    if let Some(base) = base {
+                        work.push(Work::Expr(base));
+                    }
+                    work.extend(args.iter().rev().map(|arg| Work::Expr(&arg.expr)));
+                    work.push(Work::Expr(callee));
+                }
+                ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
+                    work.push(Work::Expr(right));
+                    work.push(Work::Expr(left));
+                }
+                ExprKind::Range { start, end, .. } => {
+                    if let Some(end) = end {
+                        work.push(Work::Expr(end));
+                    }
+                    if let Some(start) = start {
+                        work.push(Work::Expr(start));
+                    }
+                }
+                ExprKind::Tuple(items) | ExprKind::Array(items) => {
+                    work.extend(items.iter().rev().map(Work::Expr));
+                }
+                ExprKind::Block(block)
+                | ExprKind::AsyncBlock { block, .. }
+                | ExprKind::Loop { body: block, .. }
+                | ExprKind::Region { block, .. } => work.push(Work::Block(block)),
+                ExprKind::If { cond, then, els } => {
+                    if let Some(els) = els {
+                        work.push(Work::Expr(els));
+                    }
+                    work.push(Work::Block(then));
+                    work.push(Work::Expr(cond));
+                }
+                ExprKind::Match {
+                    scrutinee, arms, ..
+                } => {
+                    for arm in arms.iter().rev() {
+                        work.push(Work::Expr(&arm.body));
+                        if let Some(guard) = arm.guard {
+                            work.push(Work::Expr(guard));
+                        }
+                    }
+                    work.push(Work::Expr(scrutinee));
+                }
+                ExprKind::Break { value, .. } | ExprKind::Return(value) => {
+                    if let Some(value) = value {
+                        work.push(Work::Expr(value));
+                    }
+                }
+                ExprKind::Closure(closure) => work.push(Work::Block(closure.body)),
+                ExprKind::FormatString(pieces) => {
+                    for piece in pieces.iter().rev() {
+                        if let FmtPiece::Arg { expr, .. } = piece {
+                            work.push(Work::Expr(expr));
+                        }
+                    }
+                }
+                ExprKind::ContractOld { args, base } => {
+                    if let Some(base) = base {
+                        work.push(Work::Expr(base));
+                    }
+                    work.extend(args.iter().rev().map(|arg| Work::Expr(&arg.expr)));
+                }
+                ExprKind::AsCast { operand, .. } => work.push(Work::Expr(operand)),
+            },
+            Work::Block(block) => {
+                if let Some(tail) = block.tail {
+                    work.push(Work::Expr(tail));
+                }
+                work.extend(block.stmts.iter().rev().map(Work::Stmt));
+            }
+            Work::Stmt(stmt) => match stmt.kind {
+                StmtKind::Let { init, els, .. } => {
+                    if let Some(els) = els {
+                        work.push(Work::Block(els));
+                    }
+                    work.push(Work::Expr(init));
+                }
+                StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                    work.push(Work::Expr(rhs));
+                    work.push(Work::Expr(lhs));
+                }
+                StmtKind::Assert { cond, msg, .. } => {
+                    if let Some(msg) = msg {
+                        work.push(Work::Expr(msg));
+                    }
+                    work.push(Work::Expr(cond));
+                }
+                StmtKind::Expr(expr) => work.push(Work::Expr(expr)),
+            },
+        }
+    }
+    candidates.sort_by_key(|candidate| candidate.field.span.range.start());
+    candidates
 }
 
 fn refined_generic_syntax_path_candidates(
@@ -12014,7 +12272,7 @@ fn collect_test_only_reference_diagnostics(
 
 fn collect_test_only_module_head_diagnostics(
     owner: OwnerId,
-    candidates: &[OwnerPathHead<'_>],
+    candidates: &[OwnerPathHead<'_, '_>],
     generic_parameters: &HashSet<Symbol>,
     module_scope: &Phase1ModuleScopes,
     path_resolution: &mut OwnerTestOnlyPathResolution,
@@ -12073,7 +12331,7 @@ fn collect_test_only_module_head_diagnostics(
 
 fn rejected_test_only_type_path_ids(
     owner: OwnerId,
-    candidates: &[OwnerPathHead<'_>],
+    candidates: &[OwnerPathHead<'_, '_>],
     generic_parameters: &HashSet<Symbol>,
     module_scope: &Phase1ModuleScopes,
 ) -> Result<HashSet<HirId>, OwnerControlFlowResolutionError> {
@@ -12107,7 +12365,7 @@ fn rejected_test_only_type_path_ids(
 
 fn resolve_partial_type_owner_paths(
     owner: OwnerId,
-    candidates: &[OwnerPathHead<'_>],
+    candidates: &[OwnerPathHead<'_, '_>],
     generic_resolutions: &HashMap<Symbol, Res>,
     primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
     module_scope: &Phase1ModuleScopes,
@@ -13227,7 +13485,7 @@ fn interface_impl_target_diagnostics(
 
 fn resolve_type_owner_module_paths(
     owner: OwnerId,
-    candidates: &[OwnerPathHead<'_>],
+    candidates: &[OwnerPathHead<'_, '_>],
     generic_resolutions: &HashMap<Symbol, Res>,
     primitive_prelude: &Prelude,
     rejected_test_only_paths: &HashSet<HirId>,
@@ -13382,6 +13640,454 @@ fn module_path_error_segment_index(error: ModulePathError) -> usize {
         | ModulePathError::InaccessibleMember { segment_index, .. }
         | ModulePathError::MissingTargetScope { segment_index, .. } => segment_index,
     }
+}
+
+fn direct_enum_variant_ast_type_head(mut base: ast::Expr) -> bool {
+    loop {
+        match base {
+            ast::Expr::Path(_) => return true,
+            ast::Expr::Field(field) if field.generic_args().is_none() => {
+                let Some(inner) = field.base() else {
+                    return false;
+                };
+                base = inner;
+            }
+            _ => return false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_local_enum_variant_paths(
+    owner: OwnerId,
+    hir_owner: &HirOwner<'_>,
+    body: &sai_hir::body::Body<'_>,
+    source_map: &HirSourceMap,
+    locals: &LocalResolution,
+    module_paths: &ModuleResolution,
+    type_owners: &TypeOwnerResolutions,
+    generic_resolutions: &HashMap<Symbol, Res>,
+    symbols: &Interner,
+    module_scope: &Phase1ModuleScopes,
+    members: Option<&ModuleMemberIndex<'_>>,
+    source_graph_packages: &HashSet<PackageId>,
+    collection: &Phase1PackageScopesCollection,
+    member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<LocalEnumVariantPathResolution, OwnerControlFlowResolutionError> {
+    let matches_member_scopes = match member_scopes {
+        Some(scopes) => type_owners.matches_member_scopes(collection, scopes),
+        None => {
+            type_owners.matches_collection(collection)
+                && type_owners.member_scope_closure_fingerprint.is_none()
+        }
+    };
+    let matches_wit_view_scopes = match wit_view_scopes {
+        Some(scopes) => type_owners.matches_wit_view_scopes(collection, scopes),
+        None => {
+            type_owners.matches_collection(collection)
+                && type_owners.wit_view_closure_fingerprint.is_none()
+        }
+    };
+    if owner != hir_owner.id
+        || owner != body.owner
+        || owner != source_map.owner()
+        || owner != locals.owner
+        || owner != module_paths.owner
+        || !locals.matches_body_source(body, source_map, snapshot)
+        || !type_owners.matches_collection(collection)
+        || !matches_member_scopes
+        || !matches_wit_view_scopes
+    {
+        return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+    }
+
+    let mut candidates = Vec::new();
+    for candidate in direct_enum_variant_path_candidates(body) {
+        let field = candidate.field;
+        let base_path = candidate.base_path;
+        let name = candidate.name;
+        if base_path.root != PathRoot::Plain
+            || base_path.segments.is_empty()
+            || candidate
+                .type_head_segments
+                .iter()
+                .any(|segment| segment.args.is_some())
+            || locals
+                .paths
+                .get(&base_path.hir_id)
+                .is_some_and(|resolution| matches!(resolution.base, Res::Local(_)))
+            || symbols.resolve(name.sym).ok().is_none_or(|spelling| {
+                sai_syntax::identifier_case_kind(&spelling) != sai_syntax::SyntaxKind::UIDENT
+            })
+        {
+            continue;
+        }
+        let Some(pointer) = source_map.syntax_for_node(field.hir_id) else {
+            continue;
+        };
+        let Some(syntax) = pointer.resolve(inputs.filtered_item_tree.file, &inputs.root) else {
+            continue;
+        };
+        let Some(field_syntax) = ast::FieldExpr::cast(syntax) else {
+            continue;
+        };
+        if field_syntax.generic_args().is_some()
+            || !field_syntax
+                .base()
+                .is_some_and(direct_enum_variant_ast_type_head)
+            || field_syntax.syntax().text_range() != field.span.range
+            || field_syntax
+                .name()
+                .is_none_or(|syntax_name| syntax_name.syntax().text_range() != name.span.range)
+        {
+            continue;
+        }
+        if candidate.type_head_segments.is_empty() {
+            continue;
+        }
+        candidates.push(candidate);
+    }
+
+    let mut result = LocalEnumVariantPathResolution {
+        owner,
+        entries: HashMap::new(),
+        diagnostics: Vec::new(),
+    };
+    if candidates.is_empty() {
+        return Ok(result);
+    }
+    let primitive_prelude = primitive_prelude
+        .as_ref()
+        .map_err(|error| OwnerControlFlowResolutionError::PrimitivePrelude(error.clone()))?;
+    let heads = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let segment_count = u32::try_from(candidate.type_head_segments.len()).ok()?;
+            let first = candidate.type_head_segments.first()?;
+            Some(OwnerPathHead {
+                hir_id: candidate.base_expression.hir_id,
+                name: first.name.sym,
+                span: first.name.span,
+                segment_count,
+                kind: OwnerPathKind::Type,
+                segments: &candidate.type_head_segments,
+            })
+        })
+        .collect::<Vec<_>>();
+    let generic_parameters = generic_resolutions.keys().copied().collect();
+    let rejected_test_only_paths =
+        rejected_test_only_type_path_ids(owner, &heads, &generic_parameters, module_scope)?;
+    let path_resolution = resolve_type_owner_module_paths(
+        owner,
+        &heads,
+        generic_resolutions,
+        primitive_prelude,
+        &rejected_test_only_paths,
+        module_scope,
+        members,
+        owner.def_id.package(),
+        Some(source_graph_packages),
+    );
+
+    for candidate in candidates {
+        let Some(prefix) = path_resolution.paths.get(&candidate.base_expression.hir_id) else {
+            continue;
+        };
+        let Ok(segment_count) = u32::try_from(candidate.type_head_segments.len()) else {
+            continue;
+        };
+        if prefix.segment_count != segment_count || prefix.resolved_segments != segment_count {
+            continue;
+        }
+        let DirectEnumVariantPathCandidate {
+            field,
+            base_expression,
+            base_path,
+            type_head_segments,
+            name,
+        } = candidate;
+        let (outcome, enum_variants) = match prefix.base {
+            Res::Def(DefKind::Enum, enum_def)
+                if enum_def.package == collection.module_tree.package =>
+            {
+                let Some(type_owner) = type_owners
+                    .owners()
+                    .iter()
+                    .find(|type_owner| type_owner.owner.def_id.to_def_id() == enum_def)
+                else {
+                    continue;
+                };
+                if type_owner.kind != TopLevelOwnerKind::Enum
+                    || type_owner.owner.def_id.package() != collection.module_tree.package
+                {
+                    continue;
+                }
+                let Some(projection) = type_owner.local_enum_adt() else {
+                    let entry = LocalEnumVariantPathEntry {
+                        field: field.hir_id,
+                        base_expression: base_expression.hir_id,
+                        base_path: base_path.hir_id,
+                        name: name.sym,
+                        field_span: field.span,
+                        name_span: name.span,
+                        outcome: LocalEnumVariantPathOutcome::UnsupportedEnum {
+                            enum_owner: type_owner.owner,
+                            enum_def,
+                            reason: LocalEnumVariantPathUnsupportedReason::Enum(
+                                LocalEnumAdtUnsupportedReason::OwnerAnalysisFailed,
+                            ),
+                        },
+                    };
+                    result.entries.insert(entry.field, entry);
+                    continue;
+                };
+                match projection {
+                    LocalEnumAdtProjection::Supported {
+                        owner: projected_owner,
+                        definition,
+                        ..
+                    } if *projected_owner == type_owner.owner
+                        && definition.payloads().owner() == enum_def =>
+                    {
+                        let variant_defs = definition.payloads().variants();
+                        let variant_names = variant_defs
+                            .iter()
+                            .map(|variant| variant.name())
+                            .collect::<Vec<_>>();
+                        if !definition.payloads().type_params().is_empty() {
+                            (
+                                LocalEnumVariantPathOutcome::UnsupportedEnum {
+                                    enum_owner: type_owner.owner,
+                                    enum_def,
+                                    reason: LocalEnumVariantPathUnsupportedReason::GenericEnum,
+                                },
+                                Some(variant_names),
+                            )
+                        } else if let Some(variant) = variant_defs
+                            .iter()
+                            .find(|variant| variant.name() == name.sym)
+                        {
+                            (
+                                LocalEnumVariantPathOutcome::Resolved {
+                                    enum_owner: type_owner.owner,
+                                    enum_def,
+                                    variant: variant.def_id(),
+                                },
+                                Some(variant_names),
+                            )
+                        } else {
+                            (
+                                LocalEnumVariantPathOutcome::UnknownVariant {
+                                    enum_owner: type_owner.owner,
+                                    enum_def,
+                                    candidates: variant_names.clone(),
+                                },
+                                Some(variant_names),
+                            )
+                        }
+                    }
+                    LocalEnumAdtProjection::Supported { .. } => (
+                        LocalEnumVariantPathOutcome::UnsupportedEnum {
+                            enum_owner: type_owner.owner,
+                            enum_def,
+                            reason: LocalEnumVariantPathUnsupportedReason::Enum(
+                                LocalEnumAdtUnsupportedReason::InvalidOwnerIdentity,
+                            ),
+                        },
+                        None,
+                    ),
+                    LocalEnumAdtProjection::Unsupported {
+                        owner: projected_owner,
+                        reason,
+                        ..
+                    } if *projected_owner == type_owner.owner => (
+                        LocalEnumVariantPathOutcome::UnsupportedEnum {
+                            enum_owner: type_owner.owner,
+                            enum_def,
+                            reason: LocalEnumVariantPathUnsupportedReason::Enum(*reason),
+                        },
+                        None,
+                    ),
+                    LocalEnumAdtProjection::Unsupported { .. } => continue,
+                }
+            }
+            Res::Def(kind, type_def)
+                if type_def.package == collection.module_tree.package
+                    && matches!(
+                        kind,
+                        DefKind::Struct | DefKind::Distinct | DefKind::Refined | DefKind::Resource
+                    ) =>
+            {
+                let Some(type_owner) = type_owners
+                    .owners()
+                    .iter()
+                    .find(|type_owner| type_owner.owner.def_id.to_def_id() == type_def)
+                else {
+                    continue;
+                };
+                (
+                    LocalEnumVariantPathOutcome::NotEnum {
+                        type_owner: type_owner.owner,
+                        type_def,
+                    },
+                    None,
+                )
+            }
+            _ => continue,
+        };
+
+        let entry = LocalEnumVariantPathEntry {
+            field: field.hir_id,
+            base_expression: base_expression.hir_id,
+            base_path: base_path.hir_id,
+            name: name.sym,
+            field_span: field.span,
+            name_span: name.span,
+            outcome,
+        };
+        if matches!(
+            &entry.outcome,
+            LocalEnumVariantPathOutcome::UnknownVariant { .. }
+                | LocalEnumVariantPathOutcome::NotEnum { .. }
+        ) {
+            result.diagnostics.push(local_enum_variant_path_diagnostic(
+                owner,
+                &entry,
+                &type_head_segments,
+                enum_variants.as_deref(),
+                symbols,
+                inputs,
+                snapshot,
+            )?);
+        }
+        result.entries.insert(entry.field, entry);
+    }
+    sort_phase1_diagnostics(&mut result.diagnostics);
+    Ok(result)
+}
+
+fn local_enum_variant_path_diagnostic(
+    owner: OwnerId,
+    entry: &LocalEnumVariantPathEntry,
+    type_head_segments: &[PathSegment<'_>],
+    enum_variants: Option<&[Symbol]>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let written_name = inputs
+        .source
+        .text()
+        .get(entry.name_span.range.start().to_usize()..entry.name_span.range.end().to_usize())
+        .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+            owner,
+        ))?;
+    let base_name = type_head_segments
+        .iter()
+        .map(|segment| {
+            symbols
+                .resolve(segment.name.sym)
+                .map(|name| name.to_string())
+                .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join(".");
+    let (message, primary_label) = match &entry.outcome {
+        LocalEnumVariantPathOutcome::UnknownVariant { .. } => (
+            format!("enum `{base_name}` has no variant `{written_name}`"),
+            "unknown enum variant",
+        ),
+        LocalEnumVariantPathOutcome::NotEnum { .. } => (
+            format!("type `{base_name}` is not an enum"),
+            "expected an enum type",
+        ),
+        _ => {
+            return Err(OwnerControlFlowResolutionError::InvalidSourceLocation(
+                owner,
+            ));
+        }
+    };
+    let location = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(entry.name_span.file, entry.name_span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let node = name_node_id_for_span(&inputs.root, entry.name_span).ok_or(
+        OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+    )?;
+    let mut diagnostic = Diagnostic::new(
+        sai_diagnostics::Code::UnknownVariant,
+        sai_diagnostics::Severity::Error,
+        message,
+        Some(location),
+    );
+    diagnostic.primary_label = primary_label.to_owned();
+    diagnostic.node = Some(node);
+    diagnostic.package = inputs.source_ref.package.clone();
+    diagnostic.data.insert(
+        "type_name".to_owned(),
+        sai_diagnostics::Value::String(base_name),
+    );
+    diagnostic.data.insert(
+        "variant".to_owned(),
+        sai_diagnostics::Value::String(written_name.to_owned()),
+    );
+    let mut suggestions = enum_variants
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .filter_map(|(declaration_order, symbol)| {
+            let candidate = symbols.resolve(*symbol).ok()?.to_string();
+            let distance = edit_distance_at_most_two(written_name, &candidate)?;
+            Some((distance, declaration_order, candidate))
+        })
+        .collect::<Vec<_>>();
+    suggestions.sort_by_key(|(distance, declaration_order, _)| (*distance, *declaration_order));
+    suggestions.truncate(5);
+    let suggestion_names = suggestions
+        .into_iter()
+        .map(|(_, _, name)| name)
+        .collect::<Vec<_>>();
+    diagnostic.data.insert(
+        "candidates".to_owned(),
+        sai_diagnostics::Value::Array(
+            suggestion_names
+                .iter()
+                .cloned()
+                .map(sai_diagnostics::Value::String)
+                .collect(),
+        ),
+    );
+    if !suggestion_names.is_empty() {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: format!(
+                    "did you mean one of these variants?\n{}",
+                    suggestion_names.join("\n")
+                ),
+                location: None,
+            })
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    } else if matches!(&entry.outcome, LocalEnumVariantPathOutcome::NotEnum { .. }) {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: "only an enum type can be followed by a variant name".to_owned(),
+                location: None,
+            })
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    }
+    diagnostic
+        .with_workspace_snapshot(snapshot)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
 }
 
 fn wit_unit_package_identity(stable_key: &str) -> Option<String> {
@@ -16675,6 +17381,14 @@ impl RootDatabase {
             .map(|scopes| &scopes.source_graph_packages)
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let local_type_owners = self.resolve_type_owner_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(&module_members),
+            member_scopes,
+            wit_view_scopes,
+        )?;
         let validated_unit_enum_definitions = collection
             .local_interface_enum_projections
             .iter()
@@ -16717,6 +17431,7 @@ impl RootDatabase {
                                 signature_projection: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
+                                local_enum_variant_paths: Err(error.clone()),
                                 module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
@@ -16742,6 +17457,7 @@ impl RootDatabase {
                 let mut signature_projection = None;
                 let mut module_resolution = None;
                 let mut type_path_resolution = None;
+                let mut local_enum_variant_paths = None;
                 let mut module_path_diagnostics = None;
                 let mut test_only_path_resolution = None;
                 let mut test_only_diagnostics = None;
@@ -17036,6 +17752,33 @@ impl RootDatabase {
                                         (Err(error), _) => Err(error.clone()),
                                         (_, Err(error)) => Err(error.clone()),
                                     };
+                                    local_enum_variant_paths =
+                                        Some(match (&module_scope, &module_paths) {
+                                            (Ok(module_scope), Ok(module_paths)) => {
+                                                resolve_local_enum_variant_paths(
+                                                    descriptor.owner,
+                                                    &hir_owner,
+                                                    body,
+                                                    &source_map,
+                                                    &locals,
+                                                    module_paths,
+                                                    &local_type_owners,
+                                                    &generic_resolutions,
+                                                    &self.symbols,
+                                                    module_scope,
+                                                    Some(&module_members),
+                                                    source_graph_packages,
+                                                    collection,
+                                                    member_scopes,
+                                                    wit_view_scopes,
+                                                    &self.primitive_prelude,
+                                                    &inputs,
+                                                    snapshot,
+                                                )
+                                                .map(Some)
+                                            }
+                                            (Err(error), _) | (_, Err(error)) => Err(error.clone()),
+                                        });
                                     module_resolution = Some(module_paths.map(Some));
                                     let test_only_paths =
                                         match (signature_diagnostics, test_only_paths) {
@@ -17054,6 +17797,7 @@ impl RootDatabase {
                                         world_field_resolution = Some(Err(error.clone()));
                                     }
                                     module_resolution = Some(Err(error.clone()));
+                                    local_enum_variant_paths = Some(Err(error.clone()));
                                     test_only_diagnostics = Some(signature_diagnostics);
                                     local_resolution = Some(Err(error));
                                 }
@@ -17063,6 +17807,7 @@ impl RootDatabase {
                         None => {
                             local_resolution = Some(Ok(None));
                             module_resolution = Some(Ok(None));
+                            local_enum_variant_paths = Some(Ok(None));
                             world_field_resolution = Some(Ok(None));
                             test_only_diagnostics = Some(signature_diagnostics);
                             Ok(LabelResolution::default())
@@ -17087,6 +17832,8 @@ impl RootDatabase {
                     module_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let type_path_resolution =
                     type_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let local_enum_variant_paths =
+                    local_enum_variant_paths.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let module_path_diagnostics =
                     module_path_diagnostics.unwrap_or_else(|| match &type_path_resolution {
                         Err(error) => Err(error.clone()),
@@ -17111,6 +17858,7 @@ impl RootDatabase {
                     signature_projection,
                     module_resolution,
                     type_path_resolution,
+                    local_enum_variant_paths,
                     module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
@@ -59135,7 +59883,7 @@ property "shared"() {}
         let api_types = api
             .type_path_resolution()
             .expect("trait header type lookup succeeds");
-        let candidate_named = |candidate: &OwnerPathHead<'_>, name: &str| {
+        let candidate_named = |candidate: &OwnerPathHead<'_, '_>, name: &str| {
             database
                 .resolve_symbol(candidate.name)
                 .is_ok_and(|resolved| resolved.as_ref() == name)
@@ -95848,6 +96596,285 @@ interface facade { use middle.{payload}; }"#;
                 "{name} should report that the value exceeds supported discriminant range"
             );
         }
+    }
+
+    #[test]
+    fn function_owner_resolves_direct_local_enum_variant_paths_with_provenance() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "enum Alpha { Same, Ready }\n",
+            "enum Beta { Same, Later }\n",
+            "enum Generic<T> { Value(T) }\n",
+            "enum Broken { Huge = 170141183460469231731687303715884105728 }\n",
+            "type Widget { value: Bool }\n",
+            "fn alpha() { Alpha.Same }\n",
+            "fn beta() { Beta.Same }\n",
+            "fn unknown() { Alpha.Smae }\n",
+            "fn qualified() { child_alias.Child.Hit }\n",
+            "fn local(e: Bool) { e.Same }\n",
+            "fn parenthesized_base() { (Alpha).Same }\n",
+            "fn parenthesized_variant() { (Alpha.Same) }\n",
+            "fn chained() { Alpha.Same.Other }\n",
+            "fn constructor_call() { Alpha.Same() }\n",
+            "fn non_enum() { Widget.Foo }\n",
+            "fn generic_enum() { Generic.Value }\n",
+            "fn unsupported_enum() { Broken.Huge }\n",
+        );
+        let child = "pub enum Child { Hit }\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        let (collection, member_scopes, wit_view_scopes, _) = collect_local_enum_query_inputs(
+            &mut database,
+            &module_tree,
+            &snapshot,
+            &target,
+            Phase1BuildContext::default(),
+            &graph,
+        );
+        let resolved = database
+            .resolve_function_owner_analyses_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("function paths resolve with the active source and WIT scopes");
+        let def_paths = database
+            .def_paths
+            .get(&collection.module_tree.package)
+            .expect("local definition paths exist");
+        let function_owner_named = |name: &str| {
+            collection
+                .scopes
+                .function_owners
+                .iter()
+                .find(|descriptor| {
+                    def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| path.data().last().cloned())
+                        .is_some_and(|component| {
+                            matches!(
+                                component.data,
+                                DefPathData::ValueNs(symbol)
+                                    if database.symbols.resolve(symbol).ok().as_deref()
+                                        == Some(name)
+                            )
+                        })
+                })
+                .unwrap_or_else(|| panic!("function `{name}` has a collected owner"))
+                .owner
+        };
+        let paths_for = |name: &str| {
+            resolved
+                .local_enum_variant_paths_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    function_owner_named(name),
+                )
+                .expect("function-result collection and scope provenance match")
+                .expect("function has a body projection")
+        };
+        let entry_for = |name: &str| {
+            let paths = paths_for(name);
+            assert_eq!(
+                paths.entries().len(),
+                1,
+                "{name}: {:?}",
+                paths.entries().values().collect::<Vec<_>>()
+            );
+            paths.entries().values().next().expect("one variant path")
+        };
+        let variant_for = |name: &str| match entry_for(name).outcome() {
+            LocalEnumVariantPathOutcome::Resolved {
+                enum_owner,
+                enum_def,
+                variant,
+            } => (*enum_owner, *enum_def, *variant),
+            outcome => panic!("{name} did not resolve a variant: {outcome:?}"),
+        };
+
+        let (alpha_owner, alpha_enum, alpha_variant) = variant_for("alpha");
+        let (beta_owner, beta_enum, beta_variant) = variant_for("beta");
+        assert_eq!(alpha_enum, alpha_owner.def_id.to_def_id());
+        assert_eq!(beta_enum, beta_owner.def_id.to_def_id());
+        assert_ne!(alpha_enum, beta_enum);
+        assert_ne!(
+            alpha_variant, beta_variant,
+            "same-named variants retain their enum-specific DefIds"
+        );
+        let alpha_entry = entry_for("alpha");
+        assert_eq!(alpha_entry.field().owner, function_owner_named("alpha"));
+        assert_eq!(
+            alpha_entry.base_expression().owner,
+            function_owner_named("alpha")
+        );
+        assert_eq!(alpha_entry.base_path().owner, function_owner_named("alpha"));
+        assert!(alpha_entry.name_span().range.start() < alpha_entry.name_span().range.end());
+
+        let unknown_paths = paths_for("unknown");
+        let unknown = unknown_paths
+            .entries()
+            .values()
+            .next()
+            .expect("unknown suffix");
+        let LocalEnumVariantPathOutcome::UnknownVariant {
+            enum_owner,
+            enum_def,
+            candidates,
+        } = unknown.outcome()
+        else {
+            panic!("unknown suffix has a typed per-enum failure");
+        };
+        assert_eq!(*enum_owner, alpha_owner);
+        assert_eq!(*enum_def, alpha_enum);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|symbol| database.symbols.resolve(*symbol).unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["Same", "Ready"]
+        );
+        assert_eq!(
+            unknown_paths.diagnostics()[0].code,
+            sai_diagnostics::Code::UnknownVariant
+        );
+        assert!(
+            matches!(
+                unknown_paths.diagnostics()[0].data.get("candidates"),
+                Some(sai_diagnostics::Value::Array(candidates))
+                    if candidates.iter().any(|candidate| {
+                        matches!(candidate, sai_diagnostics::Value::String(name) if name == "Same")
+                    })
+            ),
+            "the unknown-variant diagnostic suggests only names from Alpha"
+        );
+
+        let qualified_paths = paths_for("qualified");
+        let qualified = qualified_paths
+            .entries()
+            .values()
+            .next()
+            .expect("one qualified variant path");
+        assert_ne!(
+            qualified.base_expression(),
+            qualified.base_path(),
+            "a qualified enum head retains its Field prefix and root Path identities"
+        );
+        assert!(matches!(
+            qualified.outcome(),
+            LocalEnumVariantPathOutcome::Resolved {
+                enum_owner,
+                enum_def,
+                ..
+            } if enum_owner.def_id.to_def_id() == *enum_def
+                && enum_owner.def_id.package() == collection.module_tree.package
+        ));
+        assert!(
+            paths_for("local").entries().is_empty(),
+            "a local variable receiver is not reinterpreted as an enum type"
+        );
+        assert!(
+            paths_for("parenthesized_base").entries().is_empty(),
+            "parentheses around the enum head prevent direct E.V resolution"
+        );
+        assert_eq!(
+            paths_for("parenthesized_variant").entries().len(),
+            1,
+            "parentheses around the complete E.V expression preserve the direct field node"
+        );
+        assert_eq!(
+            paths_for("chained").entries().len(),
+            1,
+            "only the direct inner E.V node resolves in E.V.other"
+        );
+        let chained_entry = paths_for("chained")
+            .entries()
+            .values()
+            .next()
+            .expect("the direct inner variant path remains");
+        let chained_range = chained_entry.field_span().range;
+        assert_eq!(
+            &root[chained_range.start().to_usize()..chained_range.end().to_usize()],
+            "Alpha.Same",
+            "the outer Alpha.Same.Other field is not mistaken for a variant"
+        );
+        let call_entry = paths_for("constructor_call")
+            .entries()
+            .values()
+            .next()
+            .expect("the callee field remains a variant path");
+        let call_range = call_entry.field_span().range;
+        assert_eq!(
+            &root[call_range.start().to_usize()..call_range.end().to_usize()],
+            "Alpha.Same",
+            "the call wrapper is not absorbed into the variant field"
+        );
+        assert_eq!(
+            paths_for("constructor_call").entries().len(),
+            1,
+            "the direct callee field resolves without adding call typing"
+        );
+
+        let non_enum = paths_for("non_enum");
+        assert!(matches!(
+            non_enum.entries().values().next().unwrap().outcome(),
+            LocalEnumVariantPathOutcome::NotEnum { type_def, .. }
+                if type_def.package == collection.module_tree.package
+        ));
+        assert_eq!(
+            non_enum.diagnostics()[0].code,
+            sai_diagnostics::Code::UnknownVariant
+        );
+        assert!(non_enum.diagnostics()[0].message.contains("is not an enum"));
+
+        assert!(matches!(
+            entry_for("generic_enum").outcome(),
+            LocalEnumVariantPathOutcome::UnsupportedEnum {
+                reason: LocalEnumVariantPathUnsupportedReason::GenericEnum,
+                ..
+            }
+        ));
+        assert!(matches!(
+            entry_for("unsupported_enum").outcome(),
+            LocalEnumVariantPathOutcome::UnsupportedEnum {
+                reason: LocalEnumVariantPathUnsupportedReason::Enum(
+                    LocalEnumAdtUnsupportedReason::Definition(_)
+                ),
+                ..
+            }
+        ));
+        assert!(
+            paths_for("unsupported_enum").diagnostics().is_empty(),
+            "an unsupported enum is left to the owning semantic phase"
+        );
+
+        assert!(matches!(
+            resolved.local_enum_variant_paths_with_scopes(
+                &collection,
+                None,
+                None,
+                function_owner_named("alpha"),
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+        ));
+        assert!(
+            resolved
+                .local_enum_variant_paths_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    beta_owner,
+                )
+                .expect("the collection and closures match")
+                .is_none(),
+            "the accessor does not alias an enum type owner to a function owner"
+        );
     }
 
     #[test]

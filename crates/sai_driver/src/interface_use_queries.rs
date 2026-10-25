@@ -4864,7 +4864,7 @@ fn collect_owner_references(
 fn append_world_interface_use_references(
     references: &mut Vec<(sai_vfs::TextSize, InterfaceUse)>,
     interface: DefId,
-    candidates: &[super::OwnerPathHead<'_>],
+    candidates: &[super::OwnerPathHead<'_, '_>],
     resolution: &TypeOwnerPathResolution,
     interface_type_members: &HashMap<DefId, DefId>,
     local_boundary_aliases: &LocalBoundaryAliases<'_>,
@@ -4916,16 +4916,16 @@ fn append_world_interface_use_references(
 
 fn interface_use_path_candidates<'hir>(
     owner: &HirOwner<'hir>,
-    candidates: &[super::OwnerPathHead<'hir>],
-) -> Vec<super::OwnerPathHead<'hir>> {
+    candidates: &[super::OwnerPathHead<'hir, 'hir>],
+) -> Vec<super::OwnerPathHead<'hir, 'hir>> {
     let roots = interface_use_type_roots(owner);
     type_path_candidates_in_roots(candidates, &roots)
 }
 
 fn type_path_candidates_in_roots<'hir>(
-    candidates: &[super::OwnerPathHead<'hir>],
+    candidates: &[super::OwnerPathHead<'hir, 'hir>],
     roots: &[&'hir Ty<'hir>],
-) -> Vec<super::OwnerPathHead<'hir>> {
+) -> Vec<super::OwnerPathHead<'hir, 'hir>> {
     let mut path_ids = HashSet::<HirId>::new();
     for root in roots {
         collect_type_path_ids(root, &mut path_ids);
@@ -5592,7 +5592,7 @@ fn collect_generated_use_aliases(
     mapped_definitions: &HashSet<DefId>,
     hidden_references: &[sai_ty::boundary::BoundaryTypeReference],
     root: &Ty<'_>,
-    owner_path_candidates: &[super::OwnerPathHead<'_>],
+    owner_path_candidates: &[super::OwnerPathHead<'_, '_>],
     resolution: &TypeOwnerPathResolution,
     alias_names: &HashMap<DefId, BoundaryUseAliasName>,
     generated_type_references: &HashMap<DefId, WitTypeRef>,
