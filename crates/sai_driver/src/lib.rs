@@ -9,6 +9,7 @@ pub mod index_operation_journal_validation;
 mod interface_impl_resource_wit;
 mod interface_resource_alias;
 mod interface_use_queries;
+mod local_enum_variant_value_queries;
 mod module_function_inventory;
 pub mod package_graph;
 mod package_wit_name_queries;
@@ -31,6 +32,7 @@ use interface_resource_alias::{
 use interface_use_queries::InterfaceUsesQueries;
 pub use interface_use_queries::InterfaceUsesQueryError;
 pub use interface_use_queries::WorldInterfaceUseGraph;
+pub use local_enum_variant_value_queries::LocalEnumVariantValueTypeQueryError;
 pub use module_function_inventory::Phase1PackageSymbolInventory;
 use module_function_inventory::collect_module_function_inventory;
 pub use sai_wit::WitPackageDiagnosticTemplate;
@@ -211,6 +213,8 @@ pub struct RootDatabase {
     package_wit_names: PackageWitNamesQueries,
     interface_uses: InterfaceUsesQueries,
     type_owner_paths: TypeOwnerPathQueries,
+    local_enum_variant_value_types:
+        local_enum_variant_value_queries::LocalEnumVariantValueTypeQueries,
     declared_requirements: DeclaredRequirementsQueries,
     wit_contracts: WitContractQueries,
     generated_wit_texts: GeneratedWitTextQueries,
@@ -14549,6 +14553,8 @@ impl RootDatabase {
             primitive_prelude.clone(),
         )?;
         let type_owner_paths = TypeOwnerPathQueries::new()?;
+        let local_enum_variant_value_types =
+            local_enum_variant_value_queries::LocalEnumVariantValueTypeQueries::new()?;
         let declared_requirements = DeclaredRequirementsQueries::new()?;
         let wit_contracts = WitContractQueries::new(declared_requirements.input.clone())?;
         let generated_wit_texts = GeneratedWitTextQueries::new()?;
@@ -14600,6 +14606,7 @@ impl RootDatabase {
             package_wit_names,
             interface_uses,
             type_owner_paths,
+            local_enum_variant_value_types,
             declared_requirements,
             wit_contracts,
             generated_wit_texts,
@@ -27774,6 +27781,144 @@ mod tests {
             Some(1),
         ));
         WorkspaceSnapshot::new(files).expect("workspace snapshot with unrelated file is valid")
+    }
+
+    fn collect_local_enum_query_inputs(
+        database: &mut RootDatabase,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        target: &TargetCfg,
+        build_context: Phase1BuildContext,
+        graph: &PackageGraph,
+    ) -> (
+        Phase1PackageScopesCollection,
+        Phase1ActiveSourceMemberScopes,
+        Phase1ActiveWitViewScopes,
+        TypeOwnerResolutions,
+    ) {
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("the active package graph is recorded");
+        let wit_view_scopes = database
+            .collect_active_wit_view_scopes(module_tree, snapshot, target, graph)
+            .expect("the active WIT-view closure validates");
+        let manifest = Arc::<[u8]>::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]);
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                module_tree,
+                snapshot,
+                target,
+                build_context,
+                manifest,
+                PackageRole::Root,
+                &wit_view_scopes,
+            )
+            .expect("the package scope collection succeeds");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, graph, &[])
+            .expect("the active source-member closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes_and_wit_views(
+                &collection,
+                module_tree,
+                snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("type owner paths resolve against both closures");
+        (collection, member_scopes, wit_view_scopes, resolved)
+    }
+
+    fn package_snapshot_from_database(
+        database: &mut RootDatabase,
+        module_tree: &ModuleTree,
+    ) -> WorkspaceSnapshot {
+        WorkspaceSnapshot::new(
+            module_tree
+                .modules
+                .iter()
+                .map(|module| {
+                    let key = database
+                        .file_key(module.file)
+                        .expect("module has a stable file key")
+                        .clone();
+                    let contents = match database
+                        .file_contents(key.clone())
+                        .expect("module source input can be read")
+                    {
+                        Some(FileContents::Bytes(contents)) => contents,
+                        other => panic!("module source bytes are missing: {other:?}"),
+                    };
+                    SnapshotFile::new(
+                        Arc::new(
+                            SourceFile::decode(module.file, &contents)
+                                .expect("module source decodes"),
+                        ),
+                        key.path().to_owned(),
+                        Some("acme:phase1@1.0.0".to_owned()),
+                        Some(17),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("current module files form a workspace snapshot")
+    }
+
+    fn local_enum_owner_named(
+        database: &RootDatabase,
+        collection: &Phase1PackageScopesCollection,
+        name: &str,
+    ) -> OwnerId {
+        let def_paths = database
+            .def_paths
+            .get(&collection.module_tree.package)
+            .expect("local definition paths exist");
+        collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::Enum
+                    && def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| path.data().last().cloned())
+                        .is_some_and(|component| {
+                            matches!(
+                                component.data,
+                                DefPathData::TypeNs(symbol)
+                                    if database.symbols.resolve(symbol).ok().as_deref()
+                                        == Some(name)
+                            )
+                        })
+            })
+            .expect("the requested local enum owner is collected")
+            .owner
+    }
+
+    fn local_enum_variants(
+        resolved: &TypeOwnerResolutions,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+        owner: OwnerId,
+    ) -> Vec<DefId> {
+        resolved
+            .local_enum_payload_types_with_scopes(
+                collection,
+                Some(member_scopes),
+                Some(wit_view_scopes),
+                owner,
+            )
+            .expect("the current package and closure provenance matches")
+            .expect("the requested enum payload projection exists")
+            .variants()
+            .expect("the enum payload projection is supported")
+            .iter()
+            .map(LocalEnumVariantPayloadProjection::def_id)
+            .collect()
     }
 
     fn phase1_fixture(
@@ -95944,6 +96089,717 @@ interface facade { use middle.{payload}; }"#;
                 specialized_arguments.into(),
             ),
             "the result is the exact enum application in supplied argument order"
+        );
+    }
+
+    #[test]
+    fn tracked_local_enum_variant_value_query_preserves_variant_identity_and_shape() {
+        let root = concat!(
+            "enum First<T> { Unit, Same(T), Record(value: T) }\n",
+            "enum Second { Same(Bool) }\n",
+            "enum TooLarge { Huge = 170141183460469231731687303715884105728 }\n",
+            "@repr(U8)\n",
+            "enum Issues { Large = 300, First = 0, Duplicate = 0 }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let graph = phase1_root_only_graph();
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let (collection, member_scopes, wit_view_scopes, resolved) =
+            collect_local_enum_query_inputs(
+                &mut database,
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                &graph,
+            );
+
+        let first_owner = local_enum_owner_named(&database, &collection, "First");
+        let first_variants = local_enum_variants(
+            &resolved,
+            &collection,
+            &member_scopes,
+            &wit_view_scopes,
+            first_owner,
+        );
+        let unit = database
+            .query_local_enum_variant_value_type(
+                &resolved,
+                &collection,
+                &snapshot,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                first_owner,
+                first_variants[0],
+            )
+            .expect("the validated unit variant is queryable")
+            .expect("the enum owner has a unit value projection");
+        assert!(matches!(
+            unit,
+            LocalEnumVariantValueTypeProjection::Supported {
+                owner,
+                variant,
+                value_type: LocalEnumVariantValueType::Unit(ty),
+            } if owner == first_owner
+                && variant == first_variants[0]
+                && ty.kind() == &sai_ty::ty::TyKind::Adt(
+                    first_owner.def_id.to_def_id(),
+                    Arc::from([database.semantic_types.intern(
+                        sai_ty::ty::TyKind::Param(sai_ty::ty::ParamTy {
+                            index: 0,
+                            name: database.symbols.intern("T").unwrap(),
+                        })
+                    )]),
+                )
+        ));
+
+        let first_tuple = database
+            .query_local_enum_variant_value_type(
+                &resolved,
+                &collection,
+                &snapshot,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                first_owner,
+                first_variants[1],
+            )
+            .expect("the validated tuple variant is queryable")
+            .expect("the enum owner has a tuple value projection");
+        assert!(matches!(
+            &first_tuple,
+            LocalEnumVariantValueTypeProjection::Supported {
+                owner,
+                variant,
+                value_type: LocalEnumVariantValueType::TupleConstructor {
+                    function_item,
+                    signature,
+                },
+            } if *owner == first_owner
+                && *variant == first_variants[1]
+                && function_item.kind()
+                    == &sai_ty::ty::TyKind::FnDef(
+                        first_variants[1],
+                        Arc::from([database.semantic_types.intern(
+                            sai_ty::ty::TyKind::Param(sai_ty::ty::ParamTy {
+                                index: 0,
+                                name: database.symbols.intern("T").unwrap(),
+                            })
+                        )]),
+                    )
+                && signature.inputs().len() == 1
+        ));
+        let cached_first = database
+            .local_enum_variant_value_type_query_output_for_tests(
+                &resolved,
+                &collection,
+                &snapshot,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                first_owner,
+                first_variants[1],
+            )
+            .expect("the tuple query memo is available");
+        let cached_second = database
+            .local_enum_variant_value_type_query_output_for_tests(
+                &resolved,
+                &collection,
+                &snapshot,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                first_owner,
+                first_variants[1],
+            )
+            .expect("the unchanged tuple query memo is reusable");
+        assert!(
+            Arc::ptr_eq(&cached_first, &cached_second),
+            "repeating the exact identity and inputs reuses the query memo"
+        );
+
+        let record = database
+            .query_local_enum_variant_value_type(
+                &resolved,
+                &collection,
+                &snapshot,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                first_owner,
+                first_variants[2],
+            )
+            .expect("the validated record variant is queryable")
+            .expect("the enum owner has a record value projection");
+        assert!(matches!(
+            record,
+            LocalEnumVariantValueTypeProjection::Supported {
+                owner,
+                variant,
+                value_type: LocalEnumVariantValueType::RecordHasNoValueType,
+            } if owner == first_owner && variant == first_variants[2]
+        ));
+
+        let second_owner = local_enum_owner_named(&database, &collection, "Second");
+        let second_variant = local_enum_variants(
+            &resolved,
+            &collection,
+            &member_scopes,
+            &wit_view_scopes,
+            second_owner,
+        )[0];
+        let second_tuple = database
+            .query_local_enum_variant_value_type(
+                &resolved,
+                &collection,
+                &snapshot,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                second_owner,
+                second_variant,
+            )
+            .expect("the second enum's same-named variant is queryable")
+            .expect("the second enum owner has a value projection");
+        assert!(matches!(
+            second_tuple,
+            LocalEnumVariantValueTypeProjection::Supported {
+                owner,
+                variant,
+                value_type: LocalEnumVariantValueType::TupleConstructor {
+                    function_item,
+                    ..
+                },
+            } if owner == second_owner
+                && variant == second_variant
+                && function_item.kind()
+                    == &sai_ty::ty::TyKind::FnDef(second_variant, Arc::from([]))
+        ));
+        assert_ne!(
+            first_variants[1], second_variant,
+            "same spelling under different enum paths must preserve exact identity"
+        );
+        assert!(matches!(
+            database
+                .query_local_enum_variant_value_type(
+                    &resolved,
+                    &collection,
+                    &snapshot,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    first_owner,
+                    second_variant,
+                )
+                .expect("a foreign owner variant is returned as a typed invalid projection"),
+            Some(LocalEnumVariantValueTypeProjection::InvalidVariant {
+                owner,
+                variant,
+                reason: sai_ty::adt::LocalEnumVariantTypeError::UnknownVariant(found),
+            }) if owner == first_owner && variant == second_variant && found == second_variant
+        ));
+
+        let foreign_package = database
+            .intern_package("acme:foreign#1")
+            .expect("foreign package identity interns");
+        let foreign_name = database
+            .symbols
+            .intern("Foreign")
+            .expect("foreign enum name interns");
+        let foreign_variant_name = database
+            .symbols
+            .intern("Same")
+            .expect("foreign variant name interns");
+        let foreign_paths = Arc::new(
+            DefPathInterner::new(foreign_package, &database.packages, &database.symbols)
+                .expect("foreign definition paths initialize"),
+        );
+        let foreign_enum = foreign_paths
+            .intern(
+                DefPath::new(
+                    foreign_package,
+                    vec![sai_hir::DisambiguatedDefPathData {
+                        data: DefPathData::TypeNs(foreign_name),
+                        disambiguator: 0,
+                    }],
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("foreign enum path is valid"),
+            )
+            .expect("foreign enum path interns");
+        let foreign_variant = foreign_paths
+            .intern_variants(foreign_enum, &[(foreign_variant_name, 0)])
+            .expect("foreign variant path interns")[0]
+            .to_def_id();
+        database.def_paths.insert(foreign_package, foreign_paths);
+        assert!(matches!(
+            database
+                .query_local_enum_variant_value_type(
+                    &resolved,
+                    &collection,
+                    &snapshot,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    first_owner,
+                    foreign_variant,
+                )
+                .expect("a known foreign identity is queryable as invalid"),
+            Some(LocalEnumVariantValueTypeProjection::InvalidVariant {
+                owner,
+                variant,
+                reason: sai_ty::adt::LocalEnumVariantTypeError::ForeignVariant(found),
+            }) if owner == first_owner && variant == foreign_variant && found == foreign_variant
+        ));
+        let uninterned_variant =
+            DefId::from_foreign(collection.module_tree.package, Default::default());
+        assert_eq!(
+            database.query_local_enum_variant_value_type(
+                &resolved,
+                &collection,
+                &snapshot,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                first_owner,
+                uninterned_variant,
+            ),
+            Err(LocalEnumVariantValueTypeQueryError::DefinitionPathInterner(
+                sai_hir::DefPathInternerError::ForeignDefinitionId
+            )),
+            "unknown IDs without a canonical path fail closed instead of entering the query key"
+        );
+
+        let too_large_owner = local_enum_owner_named(&database, &collection, "TooLarge");
+        let too_large_variant = local_enum_variants(
+            &resolved,
+            &collection,
+            &member_scopes,
+            &wit_view_scopes,
+            too_large_owner,
+        )[0];
+        assert!(matches!(
+            database
+                .query_local_enum_variant_value_type(
+                    &resolved,
+                    &collection,
+                    &snapshot,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    too_large_owner,
+                    too_large_variant,
+                )
+                .expect("unsupported enum definitions remain queryable as values"),
+            Some(LocalEnumVariantValueTypeProjection::UnsupportedEnum {
+                owner,
+                variant,
+                reason: LocalEnumAdtUnsupportedReason::Definition(
+                    sai_ty::adt::LocalEnumAdtDefError::MissingExplicitDiscriminant(failed)
+                ),
+            }) if owner == too_large_owner
+                && variant == too_large_variant
+                && failed == too_large_variant
+        ));
+
+        let issues_owner = local_enum_owner_named(&database, &collection, "Issues");
+        let issues_variant = local_enum_variants(
+            &resolved,
+            &collection,
+            &member_scopes,
+            &wit_view_scopes,
+            issues_owner,
+        )[0];
+        assert!(matches!(
+            resolved
+                .local_enum_adt_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    issues_owner,
+                )
+                .expect("the representable enum projection is current"),
+            Some(LocalEnumAdtProjection::Supported { issues, .. })
+                if issues
+                    .iter()
+                    .any(|issue| issue.kind() == LocalEnumDiscriminantIssueKind::OutOfRange)
+                    && issues.iter().any(|issue| matches!(
+                        issue.kind(),
+                        LocalEnumDiscriminantIssueKind::Duplicate { .. }
+                    ))
+        ));
+        assert!(matches!(
+            database
+                .query_local_enum_variant_value_type(
+                    &resolved,
+                    &collection,
+                    &snapshot,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    issues_owner,
+                    issues_variant,
+                )
+                .expect("representable discriminant issues do not block value queries"),
+            Some(LocalEnumVariantValueTypeProjection::Supported {
+                value_type: LocalEnumVariantValueType::Unit(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn tracked_local_enum_variant_value_query_hashes_sources_not_session_ids() {
+        let root = "enum First<T> { Same(T) }\n";
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(root.as_bytes(), b"");
+        let graph = phase1_root_only_graph();
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let (collection, member_scopes, wit_view_scopes, resolved) =
+            collect_local_enum_query_inputs(
+                &mut database,
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                &graph,
+            );
+        let owner = local_enum_owner_named(&database, &collection, "First");
+        let variant = local_enum_variants(
+            &resolved,
+            &collection,
+            &member_scopes,
+            &wit_view_scopes,
+            owner,
+        )[0];
+        let initial = database
+            .local_enum_variant_value_type_query_output_for_tests(
+                &resolved,
+                &collection,
+                &snapshot,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                owner,
+                variant,
+            )
+            .expect("the initial tracked query succeeds");
+
+        let (mut equivalent_database, equivalent_tree, equivalent_snapshot, _) =
+            phase1_fixture(root.as_bytes(), b"");
+        let (equivalent_collection, equivalent_members, equivalent_wit, equivalent_resolved) =
+            collect_local_enum_query_inputs(
+                &mut equivalent_database,
+                &equivalent_tree,
+                &equivalent_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                &graph,
+            );
+        let equivalent_owner =
+            local_enum_owner_named(&equivalent_database, &equivalent_collection, "First");
+        let equivalent_variant = local_enum_variants(
+            &equivalent_resolved,
+            &equivalent_collection,
+            &equivalent_members,
+            &equivalent_wit,
+            equivalent_owner,
+        )[0];
+        let equivalent = equivalent_database
+            .local_enum_variant_value_type_query_output_for_tests(
+                &equivalent_resolved,
+                &equivalent_collection,
+                &equivalent_snapshot,
+                Some(&equivalent_members),
+                Some(&equivalent_wit),
+                equivalent_owner,
+                equivalent_variant,
+            )
+            .expect("the equivalent independent session query succeeds");
+        assert_eq!(
+            initial.input_fingerprint(),
+            equivalent.input_fingerprint(),
+            "snapshot IDs, DefIds, Ty handles, and query addresses do not enter the digest"
+        );
+
+        let source_key =
+            FileKey::new("acme:phase1#1", "src/lib.sai").expect("the root file key is valid");
+        database
+            .set_file_contents(
+                source_key,
+                Arc::from(&b"enum First<T> { Same(Bool) }\n"[..]),
+                Durability::Low,
+            )
+            .expect("the changed enum source is tracked");
+        let changed_snapshot = package_snapshot_from_database(&mut database, &module_tree);
+        let changed_tree = database
+            .module_tree(
+                package,
+                PackageSourceDirectory::new("src").expect("source directory is valid"),
+                None,
+            )
+            .expect("the updated package module tree is available");
+        let (changed_collection, changed_members, changed_wit, changed_resolved) =
+            collect_local_enum_query_inputs(
+                &mut database,
+                &changed_tree,
+                &changed_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                &graph,
+            );
+        let changed_owner = local_enum_owner_named(&database, &changed_collection, "First");
+        let changed_variant = local_enum_variants(
+            &changed_resolved,
+            &changed_collection,
+            &changed_members,
+            &changed_wit,
+            changed_owner,
+        )[0];
+        let changed_source = database
+            .local_enum_variant_value_type_query_output_for_tests(
+                &changed_resolved,
+                &changed_collection,
+                &changed_snapshot,
+                Some(&changed_members),
+                Some(&changed_wit),
+                changed_owner,
+                changed_variant,
+            )
+            .expect("the changed source query succeeds");
+        assert_ne!(
+            initial.input_fingerprint(),
+            changed_source.input_fingerprint(),
+            "payload source changes invalidate the tracked value projection"
+        );
+
+        let other_context = Phase1BuildContext {
+            is_root_core_module_build: true,
+            ..Phase1BuildContext::default()
+        };
+        let (context_collection, context_members, context_wit, context_resolved) =
+            collect_local_enum_query_inputs(
+                &mut database,
+                &changed_tree,
+                &changed_snapshot,
+                &target,
+                other_context,
+                &graph,
+            );
+        let context_owner = local_enum_owner_named(&database, &context_collection, "First");
+        let context_variant = local_enum_variants(
+            &context_resolved,
+            &context_collection,
+            &context_members,
+            &context_wit,
+            context_owner,
+        )[0];
+        let changed_context = database
+            .local_enum_variant_value_type_query_output_for_tests(
+                &context_resolved,
+                &context_collection,
+                &changed_snapshot,
+                Some(&context_members),
+                Some(&context_wit),
+                context_owner,
+                context_variant,
+            )
+            .expect("the changed build context query succeeds");
+        assert_ne!(
+            changed_source.input_fingerprint(),
+            changed_context.input_fingerprint(),
+            "build context participates in the query identity"
+        );
+
+        let other_target = target_cfg_for_check("wasm64-core").expect("target config is valid");
+        let (target_collection, target_members, target_wit, target_resolved) =
+            collect_local_enum_query_inputs(
+                &mut database,
+                &changed_tree,
+                &changed_snapshot,
+                &other_target,
+                Phase1BuildContext::default(),
+                &graph,
+            );
+        let target_owner = local_enum_owner_named(&database, &target_collection, "First");
+        let target_variant = local_enum_variants(
+            &target_resolved,
+            &target_collection,
+            &target_members,
+            &target_wit,
+            target_owner,
+        )[0];
+        let changed_target = database
+            .local_enum_variant_value_type_query_output_for_tests(
+                &target_resolved,
+                &target_collection,
+                &changed_snapshot,
+                Some(&target_members),
+                Some(&target_wit),
+                target_owner,
+                target_variant,
+            )
+            .expect("the changed target query succeeds");
+        assert_ne!(
+            changed_source.input_fingerprint(),
+            changed_target.input_fingerprint(),
+            "target identity participates in the query digest"
+        );
+
+        let other_graph = phase1_root_only_graph_with_toolchain("1.8.3");
+        let (graph_collection, graph_members, graph_wit, graph_resolved) =
+            collect_local_enum_query_inputs(
+                &mut database,
+                &changed_tree,
+                &changed_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                &other_graph,
+            );
+        assert_ne!(
+            changed_members.closure_fingerprint(),
+            graph_members.closure_fingerprint(),
+            "the validated source-member closure changes with the active graph"
+        );
+        assert_ne!(
+            changed_wit.closure_fingerprint(),
+            graph_wit.closure_fingerprint(),
+            "the validated WIT-view closure changes with the active graph"
+        );
+        let graph_owner = local_enum_owner_named(&database, &graph_collection, "First");
+        let graph_variant = local_enum_variants(
+            &graph_resolved,
+            &graph_collection,
+            &graph_members,
+            &graph_wit,
+            graph_owner,
+        )[0];
+        let changed_graph = database
+            .local_enum_variant_value_type_query_output_for_tests(
+                &graph_resolved,
+                &graph_collection,
+                &changed_snapshot,
+                Some(&graph_members),
+                Some(&graph_wit),
+                graph_owner,
+                graph_variant,
+            )
+            .expect("the changed closure query succeeds");
+        assert_ne!(
+            changed_target.input_fingerprint(),
+            changed_graph.input_fingerprint(),
+            "active source and WIT closures participate in the query digest"
+        );
+    }
+
+    #[test]
+    fn tracked_local_enum_variant_value_query_rejects_mismatched_snapshot() {
+        let root = "enum Sample { Value(Bool) }\n";
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(root.as_bytes(), b"");
+        let graph = phase1_root_only_graph();
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let (collection, member_scopes, wit_view_scopes, resolutions) =
+            collect_local_enum_query_inputs(
+                &mut database,
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                &graph,
+            );
+        let owner = local_enum_owner_named(&database, &collection, "Sample");
+        let variant = local_enum_variants(
+            &resolutions,
+            &collection,
+            &member_scopes,
+            &wit_view_scopes,
+            owner,
+        )[0];
+        let stale_projection = resolutions
+            .local_enum_variant_value_type_with_scopes(
+                &database.semantic_types,
+                &collection,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                owner,
+                variant,
+            )
+            .expect("the original projection is current")
+            .expect("the enum has a value projection");
+
+        let file_key = database
+            .file_key(module_tree.modules[0].file)
+            .expect("the enum source has a stable key")
+            .clone();
+        database
+            .set_file_contents(
+                file_key,
+                Arc::from(&b"enum Sample { Value(Char) }\n"[..]),
+                Durability::Low,
+            )
+            .expect("the replacement enum source is tracked");
+        let changed_snapshot = package_snapshot_from_database(&mut database, &module_tree);
+
+        assert_eq!(
+            database.query_local_enum_variant_value_type(
+                &resolutions,
+                &collection,
+                &changed_snapshot,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                owner,
+                variant,
+            ),
+            Err(LocalEnumVariantValueTypeQueryError::Resolution(
+                OwnerControlFlowResolutionError::SnapshotMismatch
+            )),
+            "stale resolutions cannot be cached under the replacement source fingerprint"
+        );
+
+        let changed_tree = database
+            .module_tree(
+                package,
+                PackageSourceDirectory::new("src").expect("source directory is valid"),
+                None,
+            )
+            .expect("the changed source has an updated module tree");
+        let (changed_collection, changed_members, changed_wit, changed_resolutions) =
+            collect_local_enum_query_inputs(
+                &mut database,
+                &changed_tree,
+                &changed_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                &graph,
+            );
+        let changed_owner = local_enum_owner_named(&database, &changed_collection, "Sample");
+        let changed_variant = local_enum_variants(
+            &changed_resolutions,
+            &changed_collection,
+            &changed_members,
+            &changed_wit,
+            changed_owner,
+        )[0];
+        let expected = changed_resolutions
+            .local_enum_variant_value_type_with_scopes(
+                &database.semantic_types,
+                &changed_collection,
+                Some(&changed_members),
+                Some(&changed_wit),
+                changed_owner,
+                changed_variant,
+            )
+            .expect("the refreshed projection matches the new snapshot")
+            .expect("the enum retains a value projection");
+        assert_ne!(
+            stale_projection, expected,
+            "the changed payload type changes the resolved projection"
+        );
+
+        assert_eq!(
+            database
+                .query_local_enum_variant_value_type(
+                    &changed_resolutions,
+                    &changed_collection,
+                    &changed_snapshot,
+                    Some(&changed_members),
+                    Some(&changed_wit),
+                    changed_owner,
+                    changed_variant,
+                )
+                .expect("fresh resolutions are queryable")
+                .expect("the enum has a value projection"),
+            expected,
+            "rejecting the stale request leaves the fresh query unpoisoned"
         );
     }
 
