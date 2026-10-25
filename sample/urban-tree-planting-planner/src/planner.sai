@@ -1,0 +1,224 @@
+use acme:urban-tree-planting-planner/model.{
+    Drainage
+    HoldReason
+    PlantingDecision
+    PlantingPlan
+    PlantingSite
+    TreeSpecies
+}
+
+fn site_precedes(left: PlantingSite, right: PlantingSite) -> Bool {
+    if left.priority != right.priority {
+        return left.priority < right.priority
+    }
+    left.id < right.id
+}
+
+fn fits_site(species: TreeSpecies, site: PlantingSite) -> Bool {
+    (
+        species.drainage == site.drainage
+        and site.usable_root_volume_ft3 >= species.minimum_root_volume_ft3
+        and site.overhead_clearance_ft >= species.minimum_overhead_clearance_ft
+        and site.sidewalk_width_ft >= species.minimum_sidewalk_width_ft
+    )
+}
+
+fn species_count_in_district(
+    decisions: Array<Option<PlantingDecision>, 10>,
+    decision_count: USize,
+    district_id: U32,
+    species_id: U32,
+) -> USize {
+    var count: USize = 0
+    for index in 0..decision_count {
+        match decisions[index] {
+            Some(decision) => {
+                if decision.district_id == district_id and decision.species_id == Some(species_id) {
+                    count += 1
+                }
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+fn choice_precedes(
+    candidate: TreeSpecies,
+    current: TreeSpecies,
+    site: PlantingSite,
+    decisions: Array<Option<PlantingDecision>, 10>,
+    decision_count: USize,
+) -> Bool {
+    let candidate_count =
+        species_count_in_district(decisions, decision_count, site.district_id, candidate.id)
+    let current_count =
+        species_count_in_district(decisions, decision_count, site.district_id, current.id)
+    if candidate_count != current_count {
+        return candidate_count < current_count
+    }
+    if candidate.establishment_water_liters != current.establishment_water_liters {
+        return candidate.establishment_water_liters < current.establishment_water_liters
+    }
+    candidate.id < current.id
+}
+
+fn choose_species(
+    site: PlantingSite,
+    species: Array<TreeSpecies, 4>,
+    remaining_stock: Array<USize, 4>,
+    decisions: Array<Option<PlantingDecision>, 10>,
+    decision_count: USize,
+    remaining_water_liters: U32,
+    district_limit: USize,
+) -> (Option<TreeSpecies>, Option<HoldReason>) {
+    var best: Option<TreeSpecies> = None
+    var saw_site_fit = false
+    var saw_stock = false
+    var saw_diversity_slot = false
+    var saw_water = false
+
+    for index in 0..species.len() {
+        let candidate = species[index]
+        if not fits_site(candidate, site) {
+            continue
+        }
+        saw_site_fit = true
+        if remaining_stock[index] == 0 {
+            continue
+        }
+        saw_stock = true
+
+        let district_count =
+            species_count_in_district(decisions, decision_count, site.district_id, candidate.id)
+        if district_count >= district_limit {
+            continue
+        }
+        saw_diversity_slot = true
+        if candidate.establishment_water_liters > remaining_water_liters {
+            continue
+        }
+        saw_water = true
+
+        match best {
+            Some(current) => {
+                if choice_precedes(candidate, current, site, decisions, decision_count) {
+                    best = Some(candidate)
+                }
+            }
+            None => {
+                best = Some(candidate)
+            }
+        }
+    }
+
+    match best {
+        Some(candidate) => (Some(candidate), None)
+        None => {
+            let reason = if not saw_site_fit {
+                HoldReason.NoSuitableSpecies
+            } else if not saw_stock {
+                HoldReason.NurseryStockUnavailable
+            } else if not saw_diversity_slot {
+                HoldReason.DistrictDiversityLimit
+            } else if not saw_water {
+                HoldReason.SharedWaterBudgetExceeded
+            } else {
+                HoldReason.NoSuitableSpecies
+            }
+            (None, Some(reason))
+        }
+    }
+}
+
+pub fn plan(
+    sites: Array<PlantingSite, 10>,
+    species: Array<TreeSpecies, 4>,
+    district_limit: USize,
+    water_budget_liters: U32,
+) -> PlantingPlan {
+    var ordered = sites
+    for index in 1..ordered.len() {
+        let candidate = ordered[index]
+        var cursor = index
+        while cursor > 0 {
+            if site_precedes(candidate, ordered[cursor - 1]) {
+                ordered[cursor] = ordered[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        ordered[cursor] = candidate
+    }
+
+    var decisions: Array<Option<PlantingDecision>, 10> =
+        [None, None, None, None, None, None, None, None, None, None]
+    var remaining_stock = Array<USize, 4>.filled(0)
+    for index in 0..species.len() {
+        remaining_stock[index] = species[index].nursery_stock
+    }
+
+    var water_reserved_liters: U32 = 0
+    var planted_count: USize = 0
+    var held_count: USize = 0
+
+    for index in 0..ordered.len() {
+        let site = ordered[index]
+        let remaining_water_liters = water_budget_liters - water_reserved_liters
+        let (selected, hold_reason) = choose_species(
+            site,
+            species,
+            remaining_stock,
+            decisions,
+            index,
+            remaining_water_liters,
+            district_limit,
+        )
+        match selected {
+            Some(tree) => {
+                for species_index in 0..species.len() {
+                    if species[species_index].id == tree.id {
+                        remaining_stock[species_index] -= 1
+                    }
+                }
+                water_reserved_liters += tree.establishment_water_liters
+                planted_count += 1
+                decisions[index] = Some(
+                    PlantingDecision(
+                        site_id: site.id,
+                        site_name: site.name,
+                        district_id: site.district_id,
+                        priority: site.priority,
+                        species_id: Some(tree.id),
+                        hold_reason: None,
+                        establishment_water_liters: tree.establishment_water_liters,
+                    ),
+                )
+            }
+            None => {
+                held_count += 1
+                decisions[index] = Some(
+                    PlantingDecision(
+                        site_id: site.id,
+                        site_name: site.name,
+                        district_id: site.district_id,
+                        priority: site.priority,
+                        species_id: None,
+                        hold_reason: hold_reason,
+                        establishment_water_liters: 0,
+                    ),
+                )
+            }
+        }
+    }
+
+    PlantingPlan(
+        decisions: decisions,
+        decision_count: ordered.len(),
+        planted_count: planted_count,
+        held_count: held_count,
+        water_reserved_liters: water_reserved_liters,
+        water_budget_liters: water_budget_liters,
+    )
+}

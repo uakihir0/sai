@@ -1,0 +1,159 @@
+use acme:urban-tree-planting-planner/model.{Drainage, PlantingSite, TreeSpecies}
+
+pub fn sites() -> Array<PlantingSite, 10> {
+    [
+        PlantingSite(
+            id: 3106,
+            name: "Maple Row",
+            district_id: 1,
+            priority: 2,
+            drainage: Drainage.Moist,
+            usable_root_volume_ft3: 50,
+            overhead_clearance_ft: 26,
+            sidewalk_width_ft: 5,
+        ),
+        PlantingSite(
+            id: 3102,
+            name: "Civic Steps",
+            district_id: 1,
+            priority: 1,
+            drainage: Drainage.Moist,
+            usable_root_volume_ft3: 28,
+            overhead_clearance_ft: 12,
+            sidewalk_width_ft: 3,
+        ),
+        PlantingSite(
+            id: 3108,
+            name: "North Park",
+            district_id: 2,
+            priority: 3,
+            drainage: Drainage.WellDrained,
+            usable_root_volume_ft3: 40,
+            overhead_clearance_ft: 18,
+            sidewalk_width_ft: 4,
+        ),
+        PlantingSite(
+            id: 3101,
+            name: "Canal Walk",
+            district_id: 1,
+            priority: 1,
+            drainage: Drainage.PoorlyDrained,
+            usable_root_volume_ft3: 60,
+            overhead_clearance_ft: 24,
+            sidewalk_width_ft: 5,
+        ),
+        PlantingSite(
+            id: 3110,
+            name: "North Annex",
+            district_id: 2,
+            priority: 3,
+            drainage: Drainage.Moist,
+            usable_root_volume_ft3: 22,
+            overhead_clearance_ft: 10,
+            sidewalk_width_ft: 2,
+        ),
+        PlantingSite(
+            id: 3104,
+            name: "Library Court",
+            district_id: 1,
+            priority: 2,
+            drainage: Drainage.WellDrained,
+            usable_root_volume_ft3: 36,
+            overhead_clearance_ft: 16,
+            sidewalk_width_ft: 4,
+        ),
+        PlantingSite(
+            id: 3109,
+            name: "East Market",
+            district_id: 2,
+            priority: 3,
+            drainage: Drainage.Moist,
+            usable_root_volume_ft3: 24,
+            overhead_clearance_ft: 11,
+            sidewalk_width_ft: 2,
+        ),
+        PlantingSite(
+            id: 3103,
+            name: "Depot Island",
+            district_id: 2,
+            priority: 1,
+            drainage: Drainage.PoorlyDrained,
+            usable_root_volume_ft3: 42,
+            overhead_clearance_ft: 17,
+            sidewalk_width_ft: 4,
+        ),
+        PlantingSite(
+            id: 3107,
+            name: "South Wharf",
+            district_id: 1,
+            priority: 2,
+            drainage: Drainage.PoorlyDrained,
+            usable_root_volume_ft3: 55,
+            overhead_clearance_ft: 22,
+            sidewalk_width_ft: 5,
+        ),
+        PlantingSite(
+            id: 3105,
+            name: "Canal Pocket",
+            district_id: 1,
+            priority: 2,
+            drainage: Drainage.PoorlyDrained,
+            usable_root_volume_ft3: 54,
+            overhead_clearance_ft: 20,
+            sidewalk_width_ft: 4,
+        ),
+    ]
+}
+
+pub fn species() -> Array<TreeSpecies, 4> {
+    [
+        TreeSpecies(
+            id: 101,
+            name: "Serviceberry",
+            drainage: Drainage.Moist,
+            minimum_root_volume_ft3: 18,
+            minimum_overhead_clearance_ft: 9,
+            minimum_sidewalk_width_ft: 2,
+            establishment_water_liters: 28,
+            nursery_stock: 2,
+        ),
+        TreeSpecies(
+            id: 102,
+            name: "Ironwood",
+            drainage: Drainage.WellDrained,
+            minimum_root_volume_ft3: 32,
+            minimum_overhead_clearance_ft: 15,
+            minimum_sidewalk_width_ft: 3,
+            establishment_water_liters: 52,
+            nursery_stock: 2,
+        ),
+        TreeSpecies(
+            id: 103,
+            name: "Swamp white oak",
+            drainage: Drainage.PoorlyDrained,
+            minimum_root_volume_ft3: 48,
+            minimum_overhead_clearance_ft: 18,
+            minimum_sidewalk_width_ft: 4,
+            establishment_water_liters: 72,
+            nursery_stock: 3,
+        ),
+        TreeSpecies(
+            id: 104,
+            name: "Kentucky coffeetree",
+            drainage: Drainage.Moist,
+            minimum_root_volume_ft3: 40,
+            minimum_overhead_clearance_ft: 22,
+            minimum_sidewalk_width_ft: 4,
+            establishment_water_liters: 44,
+            nursery_stock: 3,
+        ),
+    ]
+}
+
+pub fn district_species_limit() -> USize {
+    2
+}
+
+pub fn city_water_budget_liters() -> U32 {
+    300
+}
