@@ -3601,6 +3601,59 @@ pub enum LocalEnumAdtUnsupportedReason {
     Definition(LocalEnumAdtDefError),
 }
 
+/// The type of one exact variant value exposed through a validated enum owner.
+///
+/// This projection preserves the enum owner and requested variant identity.
+/// An unsupported enum-level definition remains unsupported here; callers
+/// cannot bypass an unrepresentable discriminant by reading its payload
+/// template directly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalEnumVariantValueTypeProjection {
+    Supported {
+        owner: OwnerId,
+        variant: DefId,
+        value_type: sai_ty::adt::LocalEnumVariantValueType,
+    },
+    UnsupportedEnum {
+        owner: OwnerId,
+        variant: DefId,
+        reason: LocalEnumAdtUnsupportedReason,
+    },
+    InvalidVariant {
+        owner: OwnerId,
+        variant: DefId,
+        reason: sai_ty::adt::LocalEnumVariantTypeError,
+    },
+}
+
+impl LocalEnumVariantValueTypeProjection {
+    /// Exact enum owner used to validate this request.
+    pub const fn owner(&self) -> OwnerId {
+        match self {
+            Self::Supported { owner, .. }
+            | Self::UnsupportedEnum { owner, .. }
+            | Self::InvalidVariant { owner, .. } => *owner,
+        }
+    }
+
+    /// Exact requested variant identity.
+    pub const fn variant(&self) -> DefId {
+        match self {
+            Self::Supported { variant, .. }
+            | Self::UnsupportedEnum { variant, .. }
+            | Self::InvalidVariant { variant, .. } => *variant,
+        }
+    }
+
+    /// Derived unit, tuple-constructor, or record-no-value result.
+    pub fn value_type(&self) -> Option<&sai_ty::adt::LocalEnumVariantValueType> {
+        match self {
+            Self::Supported { value_type, .. } => Some(value_type),
+            Self::UnsupportedEnum { .. } | Self::InvalidVariant { .. } => None,
+        }
+    }
+}
+
 fn validate_local_projection_type_params(
     type_params: &[(DefId, sai_ty::ty::ParamTy)],
 ) -> Result<(), ()> {
@@ -3864,6 +3917,73 @@ impl TypeOwnerResolutions {
             .iter()
             .find(|result| result.owner == owner)
             .and_then(|result| result.local_enum_adt.as_ref()))
+    }
+
+    /// Returns one exact local enum variant's value type through the
+    /// collection- and scope-validated enum definition.
+    ///
+    /// Unit variants yield the enum identity application, tuple variants
+    /// yield their exact `FnDef` and signature template, and record variants
+    /// explicitly have no value-constructor type. An absent owner returns
+    /// `None`; an unsupported enum definition or invalid variant identity is
+    /// preserved as a projection result.
+    pub fn local_enum_variant_value_type(
+        &self,
+        interner: &sai_ty::ty::TyInterner,
+        collection: &Phase1PackageScopesCollection,
+        owner: OwnerId,
+        variant: DefId,
+    ) -> Result<Option<LocalEnumVariantValueTypeProjection>, OwnerControlFlowResolutionError> {
+        self.local_enum_variant_value_type_with_scopes(
+            interner, collection, None, None, owner, variant,
+        )
+    }
+
+    /// Returns a variant value type after validating the exact current
+    /// collection and every source-member/WIT-view closure used by enum
+    /// payload resolution.
+    pub fn local_enum_variant_value_type_with_scopes(
+        &self,
+        interner: &sai_ty::ty::TyInterner,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+        owner: OwnerId,
+        variant: DefId,
+    ) -> Result<Option<LocalEnumVariantValueTypeProjection>, OwnerControlFlowResolutionError> {
+        let Some(enum_projection) =
+            self.local_enum_adt_with_scopes(collection, member_scopes, wit_view_scopes, owner)?
+        else {
+            return Ok(None);
+        };
+        let value_type_projection = match enum_projection {
+            LocalEnumAdtProjection::Supported {
+                owner: projected_owner,
+                definition,
+                ..
+            } => match definition.value_type_of_variant(interner, variant) {
+                Ok(value_type) => LocalEnumVariantValueTypeProjection::Supported {
+                    owner: *projected_owner,
+                    variant,
+                    value_type,
+                },
+                Err(reason) => LocalEnumVariantValueTypeProjection::InvalidVariant {
+                    owner: *projected_owner,
+                    variant,
+                    reason,
+                },
+            },
+            LocalEnumAdtProjection::Unsupported {
+                owner: projected_owner,
+                reason,
+                ..
+            } => LocalEnumVariantValueTypeProjection::UnsupportedEnum {
+                owner: *projected_owner,
+                variant,
+                reason: *reason,
+            },
+        };
+        Ok(Some(value_type_projection))
     }
 }
 
@@ -95486,6 +95606,497 @@ interface facade { use middle.{payload}; }"#;
                 "{name} should report that the value exceeds supported discriminant range"
             );
         }
+    }
+
+    #[test]
+    fn local_enum_variant_value_type_projection_is_exact_and_fails_closed() {
+        let root = concat!(
+            "enum Generic<T, U> { Pair(T, U), Named(value: U), Empty }\n",
+            "enum Other<T> { Pair(T) }\n",
+            "enum TooLarge { Huge = 170141183460469231731687303715884105728 }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_view_scopes = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target_cfg, &graph)
+            .expect("active WIT-view closure validates");
+        let manifest = Arc::<[u8]>::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]);
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                Arc::clone(&manifest),
+                PackageRole::Root,
+                &wit_view_scopes,
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty active source-member closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("enum owners resolve against the validated closures");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        let owner_for = |name: &str| {
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Enum
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .expect("the direct local enum owner is collected")
+                .owner
+        };
+        let variants_for = |owner| {
+            resolved
+                .local_enum_payload_types_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    owner,
+                )
+                .expect("the current collection and active closures match")
+                .expect("the local enum payload projection exists")
+                .variants()
+                .expect("supported payloads retain their variants")
+                .iter()
+                .map(LocalEnumVariantPayloadProjection::def_id)
+                .collect::<Vec<_>>()
+        };
+
+        let generic_owner = owner_for("Generic");
+        let generic_variants = variants_for(generic_owner);
+        let generic_type_params = resolved
+            .local_enum_payload_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                generic_owner,
+            )
+            .unwrap()
+            .unwrap()
+            .type_params()
+            .unwrap()
+            .to_vec();
+        let identity_args = generic_type_params
+            .iter()
+            .map(|(_, parameter)| {
+                database
+                    .semantic_types
+                    .intern(sai_ty::ty::TyKind::Param(*parameter))
+            })
+            .collect::<Vec<_>>();
+        let unit_projection = resolved
+            .local_enum_variant_value_type_with_scopes(
+                &database.semantic_types,
+                &collection,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                generic_owner,
+                generic_variants[2],
+            )
+            .expect("owner and scope provenance matches")
+            .expect("Generic has an enum value projection");
+        assert_eq!(unit_projection.owner(), generic_owner);
+        assert_eq!(unit_projection.variant(), generic_variants[2]);
+        assert!(matches!(
+            unit_projection,
+            LocalEnumVariantValueTypeProjection::Supported {
+                value_type: LocalEnumVariantValueType::Unit(ref ty),
+                ..
+            } if ty.kind() == &sai_ty::ty::TyKind::Adt(
+                generic_owner.def_id.to_def_id(),
+                identity_args.clone().into(),
+            )
+        ));
+
+        let tuple_projection = resolved
+            .local_enum_variant_value_type_with_scopes(
+                &database.semantic_types,
+                &collection,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                generic_owner,
+                generic_variants[0],
+            )
+            .expect("owner and scope provenance matches")
+            .expect("Generic has a tuple constructor projection");
+        let LocalEnumVariantValueTypeProjection::Supported {
+            owner: tuple_owner,
+            variant: tuple_variant,
+            value_type:
+                LocalEnumVariantValueType::TupleConstructor {
+                    function_item,
+                    signature,
+                },
+        } = &tuple_projection
+        else {
+            panic!("Pair must project to its exact tuple function item")
+        };
+        assert_eq!(*tuple_owner, generic_owner);
+        assert_eq!(*tuple_variant, generic_variants[0]);
+        assert_eq!(
+            function_item.kind(),
+            &sai_ty::ty::TyKind::FnDef(generic_variants[0], identity_args.clone().into())
+        );
+        assert_eq!(
+            signature.inputs(),
+            &identity_args[..],
+            "tuple arguments remain in their source order"
+        );
+        assert_eq!(
+            signature.output().kind(),
+            &sai_ty::ty::TyKind::Adt(
+                generic_owner.def_id.to_def_id(),
+                identity_args.clone().into(),
+            )
+        );
+
+        let record_projection = resolved
+            .local_enum_variant_value_type_with_scopes(
+                &database.semantic_types,
+                &collection,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                generic_owner,
+                generic_variants[1],
+            )
+            .expect("owner and scope provenance matches")
+            .expect("Generic has a record variant projection");
+        assert!(matches!(
+            record_projection,
+            LocalEnumVariantValueTypeProjection::Supported {
+                owner,
+                variant,
+                value_type: LocalEnumVariantValueType::RecordHasNoValueType,
+            } if owner == generic_owner && variant == generic_variants[1]
+        ));
+
+        let other_variants = variants_for(owner_for("Other"));
+        let wrong_owner_variant = other_variants[0];
+        assert!(
+            matches!(
+                resolved
+                    .local_enum_variant_value_type_with_scopes(
+                        &database.semantic_types,
+                        &collection,
+                        Some(&member_scopes),
+                        Some(&wit_view_scopes),
+                        generic_owner,
+                        wrong_owner_variant,
+                    )
+                    .unwrap(),
+                Some(LocalEnumVariantValueTypeProjection::InvalidVariant {
+                    reason: sai_ty::adt::LocalEnumVariantTypeError::UnknownVariant(variant),
+                    ..
+                }) if variant == wrong_owner_variant
+            ),
+            "a same-package variant from another enum cannot match by name"
+        );
+        let unknown_same_package =
+            DefId::from_foreign(collection.module_tree.package, Default::default());
+        assert!(
+            matches!(
+                resolved
+                    .local_enum_variant_value_type_with_scopes(
+                        &database.semantic_types,
+                        &collection,
+                        Some(&member_scopes),
+                        Some(&wit_view_scopes),
+                        generic_owner,
+                        unknown_same_package,
+                    )
+                    .unwrap(),
+                Some(LocalEnumVariantValueTypeProjection::InvalidVariant {
+                    reason: sai_ty::adt::LocalEnumVariantTypeError::UnknownVariant(variant),
+                    ..
+                }) if variant == unknown_same_package
+            ),
+            "an unknown same-package variant identity remains rejected"
+        );
+        let foreign_package = database
+            .intern_package("acme:foreign#1")
+            .expect("foreign test package identity interns");
+        let foreign_variant = DefId::from_foreign(foreign_package, Default::default());
+        assert!(matches!(
+            resolved
+                .local_enum_variant_value_type_with_scopes(
+                    &database.semantic_types,
+                    &collection,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    generic_owner,
+                    foreign_variant,
+                )
+                .unwrap(),
+            Some(LocalEnumVariantValueTypeProjection::InvalidVariant {
+                reason: sai_ty::adt::LocalEnumVariantTypeError::ForeignVariant(variant),
+                ..
+            }) if variant == foreign_variant
+        ));
+
+        let too_large_owner = owner_for("TooLarge");
+        let too_large_variant = variants_for(too_large_owner)[0];
+        assert!(
+            matches!(
+                resolved
+                    .local_enum_variant_value_type_with_scopes(
+                        &database.semantic_types,
+                        &collection,
+                        Some(&member_scopes),
+                        Some(&wit_view_scopes),
+                        too_large_owner,
+                        too_large_variant,
+                    )
+                    .unwrap(),
+                Some(LocalEnumVariantValueTypeProjection::UnsupportedEnum {
+                    owner,
+                    variant,
+                    reason: LocalEnumAdtUnsupportedReason::Definition(
+                        sai_ty::adt::LocalEnumAdtDefError::MissingExplicitDiscriminant(failed_variant)
+                    ),
+                }) if owner == too_large_owner
+                    && variant == too_large_variant
+                    && failed_variant == too_large_variant
+            ),
+            "an unrepresentable enum definition cannot be bypassed through payload data"
+        );
+
+        let specialized_arguments = [
+            database.semantic_types.intern(sai_ty::ty::TyKind::Bool),
+            database.semantic_types.intern(sai_ty::ty::TyKind::Char),
+        ];
+        let specialized_function_item = database
+            .semantic_types
+            .substitute(
+                match tuple_projection.value_type().unwrap() {
+                    LocalEnumVariantValueType::TupleConstructor { function_item, .. } => {
+                        function_item
+                    }
+                    LocalEnumVariantValueType::Unit(_)
+                    | LocalEnumVariantValueType::RecordHasNoValueType => {
+                        panic!("the selected variant is a tuple constructor")
+                    }
+                },
+                &specialized_arguments
+                    .iter()
+                    .cloned()
+                    .map(sai_ty::ty::GenericArg::Type)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("substituting the projected FnDef preserves its exact variant");
+        let enum_projection = resolved
+            .local_enum_adt_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                generic_owner,
+            )
+            .unwrap()
+            .unwrap();
+        let definition = enum_projection
+            .definition()
+            .expect("Generic has a representable semantic definition");
+        let specialized_signature = definition
+            .instantiate_tuple_variant_fn_def_signature(
+                &database.semantic_types,
+                &specialized_function_item,
+            )
+            .expect("IR-918 specializes the projected tuple function item");
+        assert_eq!(specialized_signature.inputs(), &specialized_arguments);
+        assert_eq!(
+            specialized_signature.output().kind(),
+            &sai_ty::ty::TyKind::Adt(
+                generic_owner.def_id.to_def_id(),
+                specialized_arguments.into(),
+            ),
+            "the result is the exact enum application in supplied argument order"
+        );
+    }
+
+    #[test]
+    fn local_enum_variant_value_type_projection_checks_collection_and_scope_provenance() {
+        let root = "enum Generic<T> { Value(T) }\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_view_scopes = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target_cfg, &graph)
+            .expect("active WIT-view closure validates");
+        let manifest = Arc::<[u8]>::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]);
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                Arc::clone(&manifest),
+                PackageRole::Root,
+                &wit_view_scopes,
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty active source-member closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("the enum owner resolves against both active closures");
+        let owner = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Enum)
+            .expect("the direct local enum owner is collected")
+            .owner;
+        let variant = resolved
+            .local_enum_payload_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                owner,
+            )
+            .expect("the current collection and closures match")
+            .expect("the enum payload projection exists")
+            .variants()
+            .expect("the enum payload projection is supported")[0]
+            .def_id();
+
+        assert_eq!(
+            resolved.local_enum_variant_value_type(
+                &database.semantic_types,
+                &collection,
+                owner,
+                variant,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch),
+            "omitting closures used to produce the result must fail closed"
+        );
+
+        let changed_snapshot = snapshot_with_unrelated_file(&snapshot);
+        let changed_snapshot_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &changed_snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("a changed snapshot produces its own collection");
+        assert_eq!(
+            resolved.local_enum_variant_value_type(
+                &database.semantic_types,
+                &changed_snapshot_collection,
+                owner,
+                variant,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch),
+            "a collection from another snapshot cannot reuse the owner result"
+        );
+
+        let other_target = target_cfg_for_check("wasm64-core").expect("target config is valid");
+        let other_target_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &other_target,
+                Phase1BuildContext::default(),
+            )
+            .expect("a different target produces its own collection");
+        assert_eq!(
+            resolved.local_enum_variant_value_type(
+                &database.semantic_types,
+                &other_target_collection,
+                owner,
+                variant,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch),
+            "a collection from another target cannot reuse the owner result"
+        );
+
+        let other_graph = phase1_root_only_graph_with_toolchain("1.8.3");
+        database
+            .set_package_graph(Some(other_graph.clone()))
+            .expect("a changed active graph is recorded");
+        let other_graph_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("the changed graph produces its own collection");
+        let other_member_scopes = database
+            .collect_active_source_member_scopes(&other_graph_collection, &other_graph, &[])
+            .expect("the changed source-member closure validates");
+        let other_wit_view_scopes = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target_cfg, &other_graph)
+            .expect("the changed WIT-view closure validates");
+        assert_eq!(
+            resolved.local_enum_variant_value_type_with_scopes(
+                &database.semantic_types,
+                &collection,
+                Some(&other_member_scopes),
+                None,
+                owner,
+                variant,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch),
+            "a different active source-member closure cannot reuse the projection"
+        );
+        assert_eq!(
+            resolved.local_enum_variant_value_type_with_scopes(
+                &database.semantic_types,
+                &collection,
+                Some(&member_scopes),
+                Some(&other_wit_view_scopes),
+                owner,
+                variant,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch),
+            "a different active WIT-view closure cannot reuse the projection"
+        );
     }
 
     #[test]
