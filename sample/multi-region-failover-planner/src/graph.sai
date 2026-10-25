@@ -1,0 +1,191 @@
+use acme:multi-region-failover-planner/model.{
+    Dependency
+    MAX_DEPENDENCIES
+    MAX_REGIONS
+    MAX_REPLICAS
+    MAX_SERVICES
+    MAX_TARGETS
+    PlanIssue
+    RecoveryTarget
+    Region
+    Replica
+    Service
+}
+
+pub fn service_index(services: Array<Service, MAX_SERVICES>, service_id: U32) -> Option<USize> {
+    var found: Option<USize> = None
+    for index in 0..services.len() {
+        if services[index].id == service_id {
+            found = Some(index)
+            break
+        }
+    }
+    found
+}
+
+pub fn region_index(regions: Array<Region, MAX_REGIONS>, region_id: U32) -> Option<USize> {
+    var found: Option<USize> = None
+    for index in 0..regions.len() {
+        if regions[index].id == region_id {
+            found = Some(index)
+            break
+        }
+    }
+    found
+}
+
+pub fn replica_index(
+    replicas: Array<Replica, MAX_REPLICAS>,
+    service_id: U32,
+    region_id: U32,
+) -> Option<USize> {
+    var found: Option<USize> = None
+    for index in 0..replicas.len() {
+        if replicas[index].service_id == service_id and replicas[index].region_id == region_id {
+            found = Some(index)
+            break
+        }
+    }
+    found
+}
+
+fn dependency_is_ordered(
+    services: Array<Service, MAX_SERVICES>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    ordered: Array<Bool, MAX_SERVICES>,
+    service_id: U32,
+) -> Bool {
+    for dependency in dependencies {
+        if dependency.service_id == service_id {
+            let prerequisite_index = match service_index(services, dependency.prerequisite_id) {
+                Some(index) => index
+                None => return false
+            }
+            if not ordered[prerequisite_index] {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn validate_dependencies(
+    services: Array<Service, MAX_SERVICES>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+) -> Option<PlanIssue> {
+    for dependency_index in 0..dependencies.len() {
+        let dependency = dependencies[dependency_index]
+        if (
+            service_index(services, dependency.service_id) == None
+            or service_index(services, dependency.prerequisite_id) == None
+        ) {
+            return Some(PlanIssue.UnknownDependencyEndpoint)
+        }
+        if dependency.service_id == dependency.prerequisite_id {
+            return Some(PlanIssue.SelfDependency)
+        }
+        for previous_index in 0..dependency_index {
+            let previous = dependencies[previous_index]
+            if (
+                previous.service_id == dependency.service_id
+                and previous.prerequisite_id == dependency.prerequisite_id
+            ) {
+                return Some(PlanIssue.DuplicateDependency)
+            }
+        }
+    }
+
+    var ordered = Array<Bool, MAX_SERVICES>.filled(false)
+    var ordered_count: USize = 0
+    while ordered_count < services.len() {
+        var selected: Option<USize> = None
+        for index in 0..services.len() {
+            if (
+                not ordered[index]
+                and dependency_is_ordered(services, dependencies, ordered, services[index].id)
+            ) {
+                selected = Some(index)
+                break
+            }
+        }
+        match selected {
+            Some(index) => {
+                ordered[index] = true
+                ordered_count += 1
+            }
+            None => {
+                return Some(PlanIssue.DependencyCycle)
+            }
+        }
+    }
+    None
+}
+
+pub fn validate(
+    services: Array<Service, MAX_SERVICES>,
+    regions: Array<Region, MAX_REGIONS>,
+    targets: Array<RecoveryTarget, MAX_TARGETS>,
+    replicas: Array<Replica, MAX_REPLICAS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+) -> Option<PlanIssue> {
+    for service_index in 0..services.len() {
+        let service = services[service_index]
+        for previous_index in 0..service_index {
+            if services[previous_index].id == service.id {
+                return Some(PlanIssue.DuplicateServiceId)
+            }
+        }
+        if region_index(regions, service.primary_region_id) == None {
+            return Some(PlanIssue.UnknownPrimaryRegion)
+        }
+    }
+
+    for region_index_value in 0..regions.len() {
+        for previous_index in 0..region_index_value {
+            if regions[previous_index].id == regions[region_index_value].id {
+                return Some(PlanIssue.DuplicateRegionId)
+            }
+        }
+    }
+
+    for target_index in 0..targets.len() {
+        let target = targets[target_index]
+        let service_index_value = match service_index(services, target.service_id) {
+            Some(index) => index
+            None => return Some(PlanIssue.UnknownTargetService)
+        }
+        if region_index(regions, target.region_id) == None {
+            return Some(PlanIssue.UnknownTargetRegion)
+        }
+        if services[service_index_value].primary_region_id == target.region_id {
+            return Some(PlanIssue.PrimaryRegionIsTarget)
+        }
+        for previous_index in 0..target_index {
+            let previous = targets[previous_index]
+            if previous.service_id == target.service_id and previous.region_id == target.region_id {
+                return Some(PlanIssue.DuplicateTarget)
+            }
+        }
+    }
+
+    for replica_index_value in 0..replicas.len() {
+        let replica = replicas[replica_index_value]
+        if service_index(services, replica.service_id) == None {
+            return Some(PlanIssue.UnknownReplicaService)
+        }
+        if region_index(regions, replica.region_id) == None {
+            return Some(PlanIssue.UnknownReplicaRegion)
+        }
+        for previous_index in 0..replica_index_value {
+            let previous = replicas[previous_index]
+            if (
+                previous.service_id == replica.service_id
+                and previous.region_id == replica.region_id
+            ) {
+                return Some(PlanIssue.DuplicateReplica)
+            }
+        }
+    }
+
+    validate_dependencies(services, dependencies)
+}

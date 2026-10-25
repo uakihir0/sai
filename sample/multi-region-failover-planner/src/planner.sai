@@ -1,0 +1,550 @@
+use acme:multi-region-failover-planner/graph
+use acme:multi-region-failover-planner/model.{
+    Decision
+    DecisionState
+    Dependency
+    HoldReason
+    MAX_DEPENDENCIES
+    MAX_REGIONS
+    MAX_REPLICAS
+    MAX_SERVICES
+    MAX_TARGETS
+    Placement
+    PlanIssue
+    PlanReport
+    RecoveryTarget
+    Region
+    Replica
+    Service
+}
+use sai:core/num.{U32_MAX}
+
+fn empty_report(issue: Option<PlanIssue>) -> PlanReport {
+    PlanReport(
+        decisions: Array<Option<Decision>, MAX_SERVICES>.filled(None),
+        decision_count: 0,
+        wave_count: 0,
+        reserved_units_by_region: Array<U32, MAX_REGIONS>.filled(0),
+        issue: issue,
+    )
+}
+
+fn dependencies_recovered_before_wave(
+    services: Array<Service, MAX_SERVICES>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    decisions: Array<Option<Decision>, MAX_SERVICES>,
+    service_id: U32,
+    wave: USize,
+) -> Bool {
+    for dependency in dependencies {
+        if dependency.service_id == service_id {
+            let prerequisite_index = match graph.service_index(
+                services,
+                dependency.prerequisite_id,
+            ) { Some(index) => index, None => return false }
+            match decisions[prerequisite_index] {
+                Some(decision) => {
+                    if decision.state != DecisionState.Recovered or decision.wave >= wave {
+                        return false
+                    }
+                }
+                None => {
+                    return false
+                }
+            }
+        }
+    }
+    true
+}
+
+fn dependency_recovery_minute(
+    services: Array<Service, MAX_SERVICES>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    decisions: Array<Option<Decision>, MAX_SERVICES>,
+    service_id: U32,
+    incident_minute: U32,
+) -> U32 {
+    var latest_minute = incident_minute
+    for dependency in dependencies {
+        if dependency.service_id == service_id {
+            match graph.service_index(services, dependency.prerequisite_id) {
+                Some(index) => {
+                    match decisions[index] {
+                        Some(decision) => {
+                            match decision.recovered_minute {
+                                Some(minute) => {
+                                    if minute > latest_minute {
+                                        latest_minute = minute
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    latest_minute
+}
+
+fn target_recovery_minute(
+    service: Service,
+    target: RecoveryTarget,
+    dependency_minute: U32,
+) -> Option<U32> {
+    if dependency_minute > U32_MAX - service.startup_minutes {
+        return None
+    }
+    let startup_complete = dependency_minute + service.startup_minutes
+    if startup_complete > U32_MAX - target.activation_minutes {
+        return None
+    }
+    Some(startup_complete + target.activation_minutes)
+}
+
+fn select_placement(
+    services: Array<Service, MAX_SERVICES>,
+    regions: Array<Region, MAX_REGIONS>,
+    targets: Array<RecoveryTarget, MAX_TARGETS>,
+    replicas: Array<Replica, MAX_REPLICAS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    decisions: Array<Option<Decision>, MAX_SERVICES>,
+    reserved: Array<U32, MAX_REGIONS>,
+    service_index: USize,
+    wave: USize,
+    incident_minute: U32,
+) -> Option<Placement> {
+    let service = services[service_index]
+    let dependency_minute =
+        dependency_recovery_minute(services, dependencies, decisions, service.id, incident_minute)
+    var selected: Option<Placement> = None
+
+    for target in targets {
+        if target.service_id == service.id {
+            let replica_index = match graph.replica_index(replicas, service.id, target.region_id) {
+                Some(index) => index
+                None => continue
+            }
+            let replica = replicas[replica_index]
+            if not replica.available or replica.replicated_minute > incident_minute {
+                continue
+            }
+            if incident_minute - replica.replicated_minute > service.rpo_minutes {
+                continue
+            }
+
+            if dependency_minute > U32_MAX - service.startup_minutes {
+                continue
+            }
+            let startup_complete = dependency_minute + service.startup_minutes
+            if startup_complete > U32_MAX - target.activation_minutes {
+                continue
+            }
+            let recovered_minute = startup_complete + target.activation_minutes
+            if recovered_minute - incident_minute > service.rto_minutes {
+                continue
+            }
+
+            let region_index = match graph.region_index(regions, target.region_id) {
+                Some(index) => index
+                None => continue
+            }
+            let region = regions[region_index]
+            if (
+                reserved[region_index] > region.failover_capacity_units
+                or service.capacity_units > region.failover_capacity_units - reserved[region_index]
+            ) {
+                continue
+            }
+
+            let candidate = Placement(
+                service_index: service_index,
+                region_index: region_index,
+                preference: target.preference,
+                recovered_minute: recovered_minute,
+            )
+            let is_better = match selected {
+                Some(current) => (
+                    candidate.preference < current.preference
+                    or (
+                        candidate.preference == current.preference
+                        and regions[candidate.region_index].id < regions[current.region_index].id
+                    )
+                )
+                None => true
+            }
+            if is_better {
+                selected = Some(candidate)
+            }
+        }
+    }
+    selected
+}
+
+fn hold_reason_for_unplaced_service(
+    service: Service,
+    targets: Array<RecoveryTarget, MAX_TARGETS>,
+    replicas: Array<Replica, MAX_REPLICAS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    decisions: Array<Option<Decision>, MAX_SERVICES>,
+    services: Array<Service, MAX_SERVICES>,
+    incident_minute: U32,
+) -> HoldReason {
+    var has_target = false
+    var has_replica = false
+    var has_available_replica = false
+    var has_fresh_replica = false
+    var has_stale_replica = false
+    var has_future_replica = false
+    var has_rto_eligible_target = false
+    var has_rto_exceeded_target = false
+    var has_time_overflow = false
+    var dependency_minute =
+        dependency_recovery_minute(services, dependencies, decisions, service.id, incident_minute)
+
+    for target in targets {
+        if target.service_id != service.id {
+            continue
+        }
+        has_target = true
+        let replica_index = match graph.replica_index(replicas, service.id, target.region_id) {
+            Some(index) => index
+            None => continue
+        }
+        let replica = replicas[replica_index]
+        has_replica = true
+        if not replica.available {
+            continue
+        }
+        has_available_replica = true
+        if replica.replicated_minute > incident_minute {
+            has_future_replica = true
+            continue
+        }
+        if incident_minute - replica.replicated_minute > service.rpo_minutes {
+            has_stale_replica = true
+            continue
+        }
+        has_fresh_replica = true
+
+        match target_recovery_minute(service, target, dependency_minute) {
+            Some(recovered_minute) => {
+                if recovered_minute - incident_minute > service.rto_minutes {
+                    has_rto_exceeded_target = true
+                } else {
+                    has_rto_eligible_target = true
+                }
+            }
+            None => {
+                has_time_overflow = true
+            }
+        }
+    }
+
+    if not has_target {
+        return HoldReason.NoRecoveryTarget
+    }
+    if not has_replica {
+        return HoldReason.NoReplica
+    }
+    if not has_available_replica {
+        return HoldReason.ReplicaUnavailable
+    }
+    if not has_fresh_replica {
+        if has_future_replica and not has_stale_replica {
+            return HoldReason.ReplicaFromFuture
+        }
+        return HoldReason.ReplicaStale
+    }
+    if not has_rto_eligible_target {
+        if has_time_overflow {
+            return HoldReason.RecoveryTimeOverflow
+        }
+        return HoldReason.RecoveryTimeExceeded
+    }
+    HoldReason.RegionCapacityExceeded
+}
+
+fn best_ready_placement(
+    services: Array<Service, MAX_SERVICES>,
+    regions: Array<Region, MAX_REGIONS>,
+    targets: Array<RecoveryTarget, MAX_TARGETS>,
+    replicas: Array<Replica, MAX_REPLICAS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    decisions: Array<Option<Decision>, MAX_SERVICES>,
+    reserved: Array<U32, MAX_REGIONS>,
+    wave: USize,
+    incident_minute: U32,
+) -> Option<Placement> {
+    var selected: Option<Placement> = None
+    for index in 0..services.len() {
+        let decision = match decisions[index] { Some(value) => value, None => continue }
+        if (
+            decision.state == DecisionState.Pending
+            and dependencies_recovered_before_wave(
+                services,
+                dependencies,
+                decisions,
+                services[index].id,
+                wave,
+            )
+        ) {
+            match select_placement(
+                services,
+                regions,
+                targets,
+                replicas,
+                dependencies,
+                decisions,
+                reserved,
+                index,
+                wave,
+                incident_minute,
+            ) {
+                Some(candidate) => {
+                    let is_better = match selected {
+                        Some(current) => (
+                            services[candidate.service_index].priority
+                                > services[current.service_index].priority
+                            or (
+                                services[candidate.service_index].priority
+                                    == services[current.service_index].priority
+                                and services[candidate.service_index].id
+                                    < services[current.service_index].id
+                            )
+                        )
+                        None => true
+                    }
+                    if is_better {
+                        selected = Some(candidate)
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    selected
+}
+
+fn hold_ready_services(
+    services: Array<Service, MAX_SERVICES>,
+    regions: Array<Region, MAX_REGIONS>,
+    targets: Array<RecoveryTarget, MAX_TARGETS>,
+    replicas: Array<Replica, MAX_REPLICAS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    var decisions: Array<Option<Decision>, MAX_SERVICES>,
+    reserved: Array<U32, MAX_REGIONS>,
+    wave: USize,
+    incident_minute: U32,
+) -> Array<Option<Decision>, MAX_SERVICES> {
+    for index in 0..services.len() {
+        match decisions[index] {
+            Some(decision) => {
+                if (
+                    decision.state == DecisionState.Pending
+                    and dependencies_recovered_before_wave(
+                        services,
+                        dependencies,
+                        decisions,
+                        services[index].id,
+                        wave,
+                    )
+                ) {
+                    let reason = hold_reason_for_unplaced_service(
+                        services[index],
+                        targets,
+                        replicas,
+                        dependencies,
+                        decisions,
+                        services,
+                        incident_minute,
+                    )
+                    decisions[index] = Some(
+                        Decision(
+                            service_id: services[index].id,
+                            state: DecisionState.Held,
+                            region_id: None,
+                            wave: 0,
+                            recovered_minute: None,
+                            hold_reason: Some(reason),
+                        ),
+                    )
+                }
+            }
+            None => {}
+        }
+    }
+    decisions
+}
+
+fn propagate_dependency_holds(
+    services: Array<Service, MAX_SERVICES>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    var decisions: Array<Option<Decision>, MAX_SERVICES>,
+) -> Array<Option<Decision>, MAX_SERVICES> {
+    var changed = true
+    while changed {
+        changed = false
+        for index in 0..services.len() {
+            match decisions[index] {
+                Some(decision) => {
+                    if decision.state == DecisionState.Pending {
+                        var blocked = false
+                        for dependency in dependencies {
+                            if dependency.service_id == decision.service_id {
+                                match graph.service_index(services, dependency.prerequisite_id) {
+                                    Some(prerequisite_index) => {
+                                        match decisions[prerequisite_index] {
+                                            Some(prerequisite) => {
+                                                if prerequisite.state == DecisionState.Held {
+                                                    blocked = true
+                                                }
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
+                        if blocked {
+                            decisions[index] = Some(
+                                Decision(
+                                    service_id: decision.service_id,
+                                    state: DecisionState.Held,
+                                    region_id: None,
+                                    wave: 0,
+                                    recovered_minute: None,
+                                    hold_reason: Some(HoldReason.DependenciesUnavailable),
+                                ),
+                            )
+                            changed = true
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    decisions
+}
+
+fn hold_remaining_pending(
+    services: Array<Service, MAX_SERVICES>,
+    var decisions: Array<Option<Decision>, MAX_SERVICES>,
+) -> Array<Option<Decision>, MAX_SERVICES> {
+    for index in 0..services.len() {
+        match decisions[index] {
+            Some(decision) => {
+                if decision.state == DecisionState.Pending {
+                    decisions[index] = Some(
+                        Decision(
+                            service_id: services[index].id,
+                            state: DecisionState.Held,
+                            region_id: None,
+                            wave: 0,
+                            recovered_minute: None,
+                            hold_reason: Some(HoldReason.DependenciesUnavailable),
+                        ),
+                    )
+                }
+            }
+            None => {}
+        }
+    }
+    decisions
+}
+
+pub fn plan(
+    services: Array<Service, MAX_SERVICES>,
+    regions: Array<Region, MAX_REGIONS>,
+    targets: Array<RecoveryTarget, MAX_TARGETS>,
+    replicas: Array<Replica, MAX_REPLICAS>,
+    dependencies: Array<Dependency, MAX_DEPENDENCIES>,
+    incident_minute: U32,
+) -> PlanReport {
+    let issue = graph.validate(services, regions, targets, replicas, dependencies)
+    if issue.is_some() {
+        return empty_report(issue)
+    }
+
+    var report = empty_report(None)
+    report.decision_count = services.len()
+    for index in 0..services.len() {
+        report.decisions[index] = Some(
+            Decision(
+                service_id: services[index].id,
+                state: DecisionState.Pending,
+                region_id: None,
+                wave: 0,
+                recovered_minute: None,
+                hold_reason: None,
+            ),
+        )
+    }
+
+    var planning = true
+    while planning and report.wave_count < services.len() {
+        let wave = report.wave_count + 1
+        var wave_has_recovery = false
+        var selecting = true
+        while selecting {
+            match best_ready_placement(
+                services,
+                regions,
+                targets,
+                replicas,
+                dependencies,
+                report.decisions,
+                report.reserved_units_by_region,
+                wave,
+                incident_minute,
+            ) {
+                Some(placement) => {
+                    let service = services[placement.service_index]
+                    let region = regions[placement.region_index]
+                    report.decisions[placement.service_index] = Some(
+                        Decision(
+                            service_id: service.id,
+                            state: DecisionState.Recovered,
+                            region_id: Some(region.id),
+                            wave: wave,
+                            recovered_minute: Some(placement.recovered_minute),
+                            hold_reason: None,
+                        ),
+                    )
+                    report.reserved_units_by_region[placement.region_index] +=
+                        service.capacity_units
+                    wave_has_recovery = true
+                }
+                None => {
+                    selecting = false
+                }
+            }
+        }
+
+        report.decisions = hold_ready_services(
+            services,
+            regions,
+            targets,
+            replicas,
+            dependencies,
+            report.decisions,
+            report.reserved_units_by_region,
+            wave,
+            incident_minute,
+        )
+        report.decisions = propagate_dependency_holds(services, dependencies, report.decisions)
+
+        if wave_has_recovery {
+            report.wave_count = wave
+        } else {
+            report.decisions = hold_remaining_pending(services, report.decisions)
+            planning = false
+        }
+    }
+    report
+}

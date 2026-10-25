@@ -1,0 +1,184 @@
+use acme:multi-region-failover-planner/data
+use acme:multi-region-failover-planner/model.{DecisionState, HoldReason, PlanIssue, PlanReport}
+use acme:multi-region-failover-planner/planner
+use sai:core/num.{U32_MAX}
+
+pub fn fixture_report() -> PlanReport {
+    planner.plan(
+        data.services(),
+        data.regions(),
+        data.targets(),
+        data.replicas(),
+        data.dependencies(),
+        data.INCIDENT_MINUTE,
+    )
+}
+
+test "fixture plans dependency waves and reports every held service" {
+    let report = fixture_report()
+
+    assert report.issue == None
+    assert report.decision_count == 9
+    assert report.wave_count == 2
+    assert report.decisions[0].unwrap().state == DecisionState.Recovered
+    assert report.decisions[0].unwrap().region_id == Some(2)
+    assert report.decisions[0].unwrap().wave == 1
+    assert report.decisions[0].unwrap().recovered_minute == Some(1008)
+    assert report.decisions[1].unwrap().region_id == Some(1)
+    assert report.decisions[1].unwrap().wave == 1
+    assert report.decisions[1].unwrap().recovered_minute == Some(1008)
+    assert report.decisions[2].unwrap().region_id == Some(2)
+    assert report.decisions[2].unwrap().wave == 2
+    assert report.decisions[2].unwrap().recovered_minute == Some(1013)
+    assert report.decisions[3].unwrap().hold_reason == Some(HoldReason.RegionCapacityExceeded)
+    assert report.decisions[4].unwrap().hold_reason == Some(HoldReason.ReplicaStale)
+    assert report.decisions[5].unwrap().hold_reason == Some(HoldReason.DependenciesUnavailable)
+    assert report.decisions[6].unwrap().hold_reason == Some(HoldReason.RecoveryTimeExceeded)
+    assert report.decisions[7].unwrap().hold_reason == Some(HoldReason.NoReplica)
+    assert report.decisions[8].unwrap().hold_reason == Some(HoldReason.RegionCapacityExceeded)
+    assert report.reserved_units_by_region[0] == 5
+    assert report.reserved_units_by_region[1] == 6
+    assert report.reserved_units_by_region[2] == 0
+}
+
+test "stale preferred copy falls back to a fresh inclusive RPO target" {
+    var replicas = data.replicas()
+    replicas[0].replicated_minute = 990
+    let report = planner.plan(
+        data.services(),
+        data.regions(),
+        data.targets(),
+        replicas,
+        data.dependencies(),
+        data.INCIDENT_MINUTE,
+    )
+
+    assert report.issue == None
+    assert report.decisions[0].unwrap().region_id == Some(1)
+    assert report.decisions[1].unwrap().region_id == Some(3)
+}
+
+test "recovery time includes the selected region activation delay" {
+    var services = data.services()
+    services[0].rto_minutes = 7
+    let report = planner.plan(
+        services,
+        data.regions(),
+        data.targets(),
+        data.replicas(),
+        data.dependencies(),
+        data.INCIDENT_MINUTE,
+    )
+
+    assert report.issue == None
+    assert report.decisions[0].unwrap().region_id == Some(1)
+    assert report.decisions[0].unwrap().recovered_minute == Some(1006)
+}
+
+test "future replica timestamps are held instead of wrapping the RPO age" {
+    var replicas = data.replicas()
+    replicas[0].replicated_minute = 1001
+    replicas[1].replicated_minute = 1001
+    let report = planner.plan(
+        data.services(),
+        data.regions(),
+        data.targets(),
+        replicas,
+        data.dependencies(),
+        data.INCIDENT_MINUTE,
+    )
+
+    assert report.issue == None
+    assert report.decisions[0].unwrap().state == DecisionState.Held
+    assert report.decisions[0].unwrap().hold_reason == Some(HoldReason.ReplicaFromFuture)
+}
+
+test "overflowing recovery times are held without reserving capacity" {
+    var replicas = data.replicas()
+    replicas[0].replicated_minute = U32_MAX - 4
+    replicas[1].replicated_minute = U32_MAX - 4
+    let report = planner.plan(
+        data.services(),
+        data.regions(),
+        data.targets(),
+        replicas,
+        data.dependencies(),
+        U32_MAX - 4,
+    )
+
+    assert report.issue == None
+    assert report.decisions[0].unwrap().state == DecisionState.Held
+    assert report.decisions[0].unwrap().hold_reason == Some(HoldReason.RecoveryTimeOverflow)
+    assert report.reserved_units_by_region[0] == 0
+    assert report.reserved_units_by_region[1] == 0
+}
+
+test "greedy target preference can hold work despite a feasible reassignment" {
+    var regions = data.regions()
+    regions[0].failover_capacity_units = 5
+    regions[1].failover_capacity_units = 4
+
+    var targets = data.targets()
+    targets[0].region_id = 1
+    targets[1].region_id = 2
+
+    var replicas = data.replicas()
+    replicas[3].replicated_minute = 990
+    let report = planner.plan(
+        data.services(),
+        regions,
+        targets,
+        replicas,
+        data.dependencies(),
+        data.INCIDENT_MINUTE,
+    )
+
+    assert report.issue == None
+    assert report.decisions[0].unwrap().region_id == Some(1)
+    assert report.decisions[1].unwrap().state == DecisionState.Held
+    assert report.decisions[1].unwrap().hold_reason == Some(HoldReason.RegionCapacityExceeded)
+
+    var alternate_regions = data.regions()
+    alternate_regions[0].failover_capacity_units = 5
+    alternate_regions[1].failover_capacity_units = 4
+
+    var alternate_targets = data.targets()
+    alternate_targets[0].region_id = 1
+    alternate_targets[0].preference = 2
+    alternate_targets[1].region_id = 2
+    alternate_targets[1].preference = 1
+
+    var alternate_replicas = data.replicas()
+    alternate_replicas[3].replicated_minute = 990
+    let alternate_report = planner.plan(
+        data.services(),
+        alternate_regions,
+        alternate_targets,
+        alternate_replicas,
+        data.dependencies(),
+        data.INCIDENT_MINUTE,
+    )
+
+    assert alternate_report.issue == None
+    assert alternate_report.decisions[0].unwrap().region_id == Some(2)
+    assert alternate_report.decisions[1].unwrap().state == DecisionState.Recovered
+    assert alternate_report.decisions[1].unwrap().region_id == Some(1)
+}
+
+test "dependency cycles reject the catalog before scheduling" {
+    var dependencies = data.dependencies()
+    dependencies[0].service_id = 10
+    dependencies[0].prerequisite_id = 30
+    let report = planner.plan(
+        data.services(),
+        data.regions(),
+        data.targets(),
+        data.replicas(),
+        dependencies,
+        data.INCIDENT_MINUTE,
+    )
+
+    assert report.issue == Some(PlanIssue.DependencyCycle)
+    assert report.decision_count == 0
+    assert report.decisions[0] == None
+}
