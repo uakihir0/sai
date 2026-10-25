@@ -1,0 +1,5 @@
+package acme:two-phase-commit-lab @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "A bounded two-phase commit crash and recovery teaching model"

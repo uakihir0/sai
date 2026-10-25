@@ -1,0 +1,370 @@
+use acme:two-phase-commit-lab/model.{
+    CrashPoint
+    Decision
+    MAX_PARTICIPANTS
+    ParticipantInput
+    ParticipantResult
+    ParticipantState
+    RunStatus
+    Scenario
+    Vote
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Report {
+    status: RunStatus
+    decision: Decision
+    participants: Array<Option<ParticipantResult>, MAX_PARTICIPANTS>
+    participant_count: USize
+    yes_vote_count: USize
+    no_vote_count: USize
+    committed_count: USize
+    aborted_count: USize
+    in_doubt_count: USize
+    decision_pending_count: USize
+}
+
+pub fn status(report: Report) -> RunStatus {
+    report.status
+}
+
+pub fn decision(report: Report) -> Decision {
+    report.decision
+}
+
+pub fn participant_count(report: Report) -> USize {
+    report.participant_count
+}
+
+pub fn participant(report: Report, index: USize) -> Option<ParticipantResult> {
+    if index >= report.participant_count {
+        return None
+    }
+    report.participants[index]
+}
+
+pub fn yes_vote_count(report: Report) -> USize {
+    report.yes_vote_count
+}
+
+pub fn no_vote_count(report: Report) -> USize {
+    report.no_vote_count
+}
+
+pub fn committed_count(report: Report) -> USize {
+    report.committed_count
+}
+
+pub fn aborted_count(report: Report) -> USize {
+    report.aborted_count
+}
+
+pub fn in_doubt_count(report: Report) -> USize {
+    report.in_doubt_count
+}
+
+pub fn decision_pending_count(report: Report) -> USize {
+    report.decision_pending_count
+}
+
+pub fn empty_scenario() -> Scenario {
+    Scenario(
+        participants: Array<Option<ParticipantInput>, MAX_PARTICIPANTS>.filled(None),
+        participant_count: 0,
+        crash_point: CrashPoint.None,
+    )
+}
+
+fn empty_report(status: RunStatus) -> Report {
+    Report(
+        status: status,
+        decision: Decision.Unrecorded,
+        participants: Array<Option<ParticipantResult>, MAX_PARTICIPANTS>.filled(None),
+        participant_count: 0,
+        yes_vote_count: 0,
+        no_vote_count: 0,
+        committed_count: 0,
+        aborted_count: 0,
+        in_doubt_count: 0,
+        decision_pending_count: 0,
+    )
+}
+
+fn input_is_valid(scenario: Scenario) -> Bool {
+    if scenario.participant_count == 0 or scenario.participant_count > MAX_PARTICIPANTS {
+        return false
+    }
+    for index in 0..scenario.participant_count {
+        let participant = match scenario.participants[index] {
+            Some(value) => value
+            None => return false
+        }
+        if participant.id == 0 {
+            return false
+        }
+        for prior_index in 0..index {
+            let prior = scenario.participants[prior_index].unwrap()
+            if prior.id == participant.id {
+                return false
+            }
+        }
+    }
+    for index in scenario.participant_count..MAX_PARTICIPANTS {
+        if scenario.participants[index] != None {
+            return false
+        }
+    }
+    true
+}
+
+fn expected_status(report: Report) -> RunStatus {
+    if report.decision == Decision.Unrecorded {
+        RunStatus.InDoubt
+    } else if report.decision_pending_count > 0 {
+        RunStatus.DistributionPending
+    } else {
+        RunStatus.Complete
+    }
+}
+
+fn refresh_counts(report: Report) -> Report {
+    var updated = report
+    updated.yes_vote_count = 0
+    updated.no_vote_count = 0
+    updated.committed_count = 0
+    updated.aborted_count = 0
+    updated.in_doubt_count = 0
+    updated.decision_pending_count = 0
+    for index in 0..updated.participant_count {
+        let participant = updated.participants[index].unwrap()
+        match participant.vote {
+            Vote.Yes => {
+                updated.yes_vote_count += 1
+            }
+            Vote.No => {
+                updated.no_vote_count += 1
+            }
+        }
+        match participant.state {
+            ParticipantState.Aborted => {
+                updated.aborted_count += 1
+            }
+            ParticipantState.InDoubt => {
+                updated.in_doubt_count += 1
+            }
+            ParticipantState.DecisionPending => {
+                updated.decision_pending_count += 1
+            }
+            ParticipantState.Committed => {
+                updated.committed_count += 1
+            }
+        }
+    }
+    updated.status = expected_status(updated)
+    updated
+}
+
+fn report_is_valid(report: Report) -> Bool {
+    if (
+        report.status == RunStatus.InvalidInput
+        or report.participant_count == 0
+        or report.participant_count > MAX_PARTICIPANTS
+    ) {
+        return false
+    }
+
+    var yes_vote_count: USize = 0
+    var no_vote_count: USize = 0
+    var committed_count: USize = 0
+    var aborted_count: USize = 0
+    var in_doubt_count: USize = 0
+    var decision_pending_count: USize = 0
+
+    for index in 0..report.participant_count {
+        let participant = match report.participants[index] {
+            Some(value) => value
+            None => return false
+        }
+        if participant.id == 0 {
+            return false
+        }
+        for prior_index in 0..index {
+            let prior = report.participants[prior_index].unwrap()
+            if prior.id == participant.id {
+                return false
+            }
+        }
+        match participant.vote {
+            Vote.Yes => {
+                yes_vote_count += 1
+            }
+            Vote.No => {
+                no_vote_count += 1
+            }
+        }
+        match participant.state {
+            ParticipantState.Aborted => {
+                aborted_count += 1
+                if participant.vote == Vote.Yes and report.decision != Decision.Abort {
+                    return false
+                }
+            }
+            ParticipantState.InDoubt => {
+                in_doubt_count += 1
+                if report.decision != Decision.Unrecorded or participant.vote != Vote.Yes {
+                    return false
+                }
+            }
+            ParticipantState.DecisionPending => {
+                decision_pending_count += 1
+                if report.decision == Decision.Unrecorded {
+                    return false
+                }
+            }
+            ParticipantState.Committed => {
+                committed_count += 1
+                if report.decision != Decision.Commit or participant.vote != Vote.Yes {
+                    return false
+                }
+            }
+        }
+        if report.decision == Decision.Unrecorded {
+            if (participant.vote == Vote.Yes and participant.state != ParticipantState.InDoubt) {
+                return false
+            }
+            if participant.vote == Vote.No and participant.state != ParticipantState.Aborted {
+                return false
+            }
+        } else if report.decision == Decision.Commit {
+            if participant.vote != Vote.Yes {
+                return false
+            }
+            if (
+                participant.state != ParticipantState.Committed
+                and participant.state != ParticipantState.DecisionPending
+            ) {
+                return false
+            }
+        } else {
+            if (
+                participant.state != ParticipantState.Aborted
+                and participant.state != ParticipantState.DecisionPending
+            ) {
+                return false
+            }
+            if participant.vote == Vote.No and participant.state != ParticipantState.Aborted {
+                return false
+            }
+        }
+    }
+
+    for index in report.participant_count..MAX_PARTICIPANTS {
+        if report.participants[index] != None {
+            return false
+        }
+    }
+    if report.decision == Decision.Abort and no_vote_count == 0 {
+        return false
+    }
+    (
+        report.status == expected_status(report)
+        and report.yes_vote_count == yes_vote_count
+        and report.no_vote_count == no_vote_count
+        and report.committed_count == committed_count
+        and report.aborted_count == aborted_count
+        and report.in_doubt_count == in_doubt_count
+        and report.decision_pending_count == decision_pending_count
+    )
+}
+
+fn state_after_recorded_decision(
+    decision: Decision,
+    participant: ParticipantInput,
+) -> ParticipantState {
+    if participant.vote == Vote.No {
+        return ParticipantState.Aborted
+    }
+    if not participant.decision_channel_open {
+        return ParticipantState.DecisionPending
+    }
+    if decision == Decision.Commit {
+        ParticipantState.Committed
+    } else {
+        ParticipantState.Aborted
+    }
+}
+
+pub fn run(scenario: Scenario) -> Report {
+    if not input_is_valid(scenario) {
+        return empty_report(RunStatus.InvalidInput)
+    }
+
+    var report = empty_report(RunStatus.InDoubt)
+    report.participant_count = scenario.participant_count
+    var no_vote_count: USize = 0
+    for index in 0..scenario.participant_count {
+        if scenario.participants[index].unwrap().vote == Vote.No {
+            no_vote_count += 1
+        }
+    }
+
+    if scenario.crash_point == CrashPoint.BeforeDecisionLog {
+        for index in 0..scenario.participant_count {
+            let participant = scenario.participants[index].unwrap()
+            let state = if participant.vote == Vote.No {
+                ParticipantState.Aborted
+            } else {
+                ParticipantState.InDoubt
+            }
+            report.participants[index] =
+                Some(ParticipantResult(id: participant.id, vote: participant.vote, state: state))
+        }
+        return refresh_counts(report)
+    }
+
+    report.decision = if no_vote_count > 0 {
+        Decision.Abort
+    } else {
+        Decision.Commit
+    }
+    for index in 0..scenario.participant_count {
+        let participant = scenario.participants[index].unwrap()
+        let state = if scenario.crash_point == CrashPoint.AfterDecisionLog {
+            if participant.vote == Vote.No {
+                ParticipantState.Aborted
+            } else {
+                ParticipantState.DecisionPending
+            }
+        } else {
+            state_after_recorded_decision(report.decision, participant)
+        }
+        report.participants[index] =
+            Some(ParticipantResult(id: participant.id, vote: participant.vote, state: state))
+    }
+    refresh_counts(report)
+}
+
+pub fn resume(report: Report, decision_channels_open: Array<Bool, MAX_PARTICIPANTS>) -> Report {
+    if not report_is_valid(report) {
+        return empty_report(RunStatus.InvalidInput)
+    }
+    if report.decision == Decision.Unrecorded {
+        return report
+    }
+
+    var resumed = report
+    for index in 0..resumed.participant_count {
+        var participant = resumed.participants[index].unwrap()
+        if (
+            participant.state == ParticipantState.DecisionPending and decision_channels_open[index]
+        ) {
+            participant.state = if resumed.decision == Decision.Commit {
+                ParticipantState.Committed
+            } else {
+                ParticipantState.Aborted
+            }
+            resumed.participants[index] = Some(participant)
+        }
+    }
+    refresh_counts(resumed)
+}
