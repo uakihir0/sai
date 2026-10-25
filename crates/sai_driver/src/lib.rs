@@ -133,7 +133,11 @@ use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError}
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
 use sai_syntax::ast::{self, AstNode, AstToken};
 use sai_syntax::{Parse, ParseQueryError, SyntaxElement, SyntaxNode, SyntaxQueries};
-use sai_ty::adt::{LocalFlagsAdtDef, LocalInterfaceEnumAdtProjection};
+use sai_ty::adt::{
+    LocalEnumPayloadTemplateDef, LocalEnumPayloadTemplateDefError, LocalEnumPayloadTemplateShape,
+    LocalEnumPayloadVariantTemplateDef, LocalEnumRecordPayloadTemplate,
+    LocalEnumTuplePayloadTemplate, LocalFlagsAdtDef, LocalInterfaceEnumAdtProjection,
+};
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
     PackageFilesSnapshot, PackageKey, PackageKeyError, PackageRelativePath, PackageSourceDirectory,
@@ -3125,6 +3129,7 @@ pub enum LocalEnumPayloadTypeIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalEnumPayloadTypeProjection {
     identity: LocalEnumPayloadTypeIdentity,
+    visibility: Option<sai_hir::Visibility>,
     ty: Result<sai_ty::ty::Ty, sai_ty::lower_ty::UnsupportedTy>,
 }
 
@@ -3132,6 +3137,12 @@ impl LocalEnumPayloadTypeProjection {
     /// Exact tuple position or record field identity.
     pub const fn identity(&self) -> LocalEnumPayloadTypeIdentity {
         self.identity
+    }
+
+    /// HIR visibility for a record payload field, or `None` for tuple
+    /// positions that do not have a field declaration.
+    pub const fn visibility(&self) -> Option<sai_hir::Visibility> {
+        self.visibility
     }
 
     /// Lowered payload type, or the explicit reason this payload is
@@ -3188,6 +3199,22 @@ pub enum LocalEnumPayloadTypeInstantiationError {
     InvalidBinderMetadata,
     UnsupportedTemplate,
     Substitution(sai_ty::ty::SubstitutionError),
+}
+
+/// Why the verified payload projection could not become a typed payload-only
+/// enum template.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnumPayloadTemplateProjectionError {
+    UnsupportedProjection(LocalEnumPayloadTypesUnsupportedReason),
+    InvalidProjectionProvenance,
+    InvalidBinderMetadata,
+    InvalidPayloadIdentity(LocalEnumPayloadTypeIdentity),
+    UnsupportedPayload {
+        identity: LocalEnumPayloadTypeIdentity,
+        reason: sai_ty::lower_ty::UnsupportedTy,
+    },
+    UnsupportedTemplate(LocalEnumPayloadTypeIdentity),
+    InvalidTemplateDefinition(LocalEnumPayloadTemplateDefError),
 }
 
 /// Opaque validation record attached to driver-created enum projections.
@@ -3252,6 +3279,152 @@ impl LocalEnumPayloadTypesProjection {
             Self::Supported { .. } => None,
             Self::Unsupported { reason, .. } => Some(*reason),
         }
+    }
+
+    /// Convert a fully supported, provenance-verified payload projection
+    /// into the payload-only semantic ADT template model.
+    ///
+    /// This does not build a full `AdtDef`: discriminants and `@repr` are not
+    /// part of the IR-913 payload projection and remain the responsibility of
+    /// a later full-ADT adapter.
+    pub fn to_payload_template_def(
+        &self,
+    ) -> Result<LocalEnumPayloadTemplateDef, LocalEnumPayloadTemplateProjectionError> {
+        let (owner, type_params, variants, provenance) = match self {
+            Self::Supported {
+                owner,
+                type_params,
+                variants,
+                provenance,
+            } => (owner, type_params, variants, provenance),
+            Self::Unsupported { reason, .. } => {
+                return Err(
+                    LocalEnumPayloadTemplateProjectionError::UnsupportedProjection(*reason),
+                );
+            }
+        };
+        if provenance.owner != *owner
+            || provenance.type_params.as_ref() != type_params.as_ref()
+            || provenance.variants.as_ref() != variants.as_ref()
+        {
+            return Err(LocalEnumPayloadTemplateProjectionError::InvalidProjectionProvenance);
+        }
+        validate_local_projection_type_params(type_params)
+            .map_err(|()| LocalEnumPayloadTemplateProjectionError::InvalidBinderMetadata)?;
+
+        let mut template_variants = Vec::with_capacity(variants.len());
+        for variant in variants.iter() {
+            let payload = match variant.payload() {
+                LocalEnumVariantPayload::Unit => LocalEnumPayloadTemplateShape::Unit,
+                LocalEnumVariantPayload::Tuple(payloads) => {
+                    let mut templates = Vec::with_capacity(payloads.len());
+                    for (index, payload) in payloads.iter().enumerate() {
+                        let index = u32::try_from(index).map_err(|_| {
+                            LocalEnumPayloadTemplateProjectionError::InvalidPayloadIdentity(
+                                payload.identity(),
+                            )
+                        })?;
+                        let expected_identity = LocalEnumPayloadTypeIdentity::Tuple {
+                            variant: variant.def_id(),
+                            index,
+                        };
+                        if payload.identity() != expected_identity || payload.visibility().is_some()
+                        {
+                            return Err(
+                                LocalEnumPayloadTemplateProjectionError::InvalidPayloadIdentity(
+                                    payload.identity(),
+                                ),
+                            );
+                        }
+                        let ty = payload.ty().map_err(|reason| {
+                            LocalEnumPayloadTemplateProjectionError::UnsupportedPayload {
+                                identity: payload.identity(),
+                                reason,
+                            }
+                        })?;
+                        if !type_params.is_empty()
+                            && !local_type_template_matches_binders(ty, type_params)
+                        {
+                            return Err(
+                                LocalEnumPayloadTemplateProjectionError::UnsupportedTemplate(
+                                    payload.identity(),
+                                ),
+                            );
+                        }
+                        templates.push(LocalEnumTuplePayloadTemplate::new(
+                            variant.def_id(),
+                            index,
+                            ty.clone(),
+                        ));
+                    }
+                    LocalEnumPayloadTemplateShape::Tuple(templates.into())
+                }
+                LocalEnumVariantPayload::Record(fields) => {
+                    let mut templates = Vec::with_capacity(fields.len());
+                    for field in fields.iter() {
+                        let LocalEnumPayloadTypeIdentity::Record {
+                            variant: identity_variant,
+                            field: field_id,
+                            name,
+                        } = field.identity()
+                        else {
+                            return Err(
+                                LocalEnumPayloadTemplateProjectionError::InvalidPayloadIdentity(
+                                    field.identity(),
+                                ),
+                            );
+                        };
+                        if identity_variant != variant.def_id() {
+                            return Err(
+                                LocalEnumPayloadTemplateProjectionError::InvalidPayloadIdentity(
+                                    field.identity(),
+                                ),
+                            );
+                        }
+                        let visibility = field.visibility().ok_or(
+                            LocalEnumPayloadTemplateProjectionError::InvalidPayloadIdentity(
+                                field.identity(),
+                            ),
+                        )?;
+                        let ty = field.ty().map_err(|reason| {
+                            LocalEnumPayloadTemplateProjectionError::UnsupportedPayload {
+                                identity: field.identity(),
+                                reason,
+                            }
+                        })?;
+                        if !type_params.is_empty()
+                            && !local_type_template_matches_binders(ty, type_params)
+                        {
+                            return Err(
+                                LocalEnumPayloadTemplateProjectionError::UnsupportedTemplate(
+                                    field.identity(),
+                                ),
+                            );
+                        }
+                        templates.push(LocalEnumRecordPayloadTemplate::new(
+                            variant.def_id(),
+                            field_id,
+                            name,
+                            visibility,
+                            ty.clone(),
+                        ));
+                    }
+                    LocalEnumPayloadTemplateShape::Record(templates.into())
+                }
+            };
+            template_variants.push(LocalEnumPayloadVariantTemplateDef::new(
+                variant.def_id(),
+                variant.name(),
+                payload,
+            ));
+        }
+
+        LocalEnumPayloadTemplateDef::try_new(
+            owner.def_id.to_def_id(),
+            Arc::clone(type_params),
+            template_variants,
+        )
+        .map_err(LocalEnumPayloadTemplateProjectionError::InvalidTemplateDefinition)
     }
 
     /// Instantiate one generic payload template from an exact local-enum
@@ -20014,6 +20187,7 @@ impl RootDatabase {
                                 variant: variant_def_id,
                                 index,
                             },
+                            visibility: None,
                             ty: sai_ty::lower_ty::lower_ty(&mut context, ty),
                         });
                     }
@@ -20076,6 +20250,7 @@ impl RootDatabase {
                                 field: field_def_id,
                                 name: field.name.sym,
                             },
+                            visibility: Some(field.vis),
                             ty: sai_ty::lower_ty::lower_ty(&mut context, field.ty),
                         });
                     }
@@ -26974,6 +27149,7 @@ mod tests {
     use sai_package::validation::PackageValidationContext;
     use sai_package::version::Version;
     use sai_package::version_req::VersionReq;
+    use sai_ty::adt::LocalEnumPayloadTemplateIdentity;
     use sai_vfs::{
         PackageFileEntry, PackageRelativePath, SnapshotFile, SourceFile, WitFilesSnapshot,
         WorkspaceSnapshot,
@@ -94449,15 +94625,31 @@ interface facade { use middle.{payload}; }"#;
             ["Empty", "Wrapped", "Pair", "Named", "AnotherNamed"],
             "variants stay in source order, including unit variants"
         );
+        let payload_template = projection
+            .to_payload_template_def()
+            .expect("every successfully lowered payload has a typed template");
+        assert_eq!(payload_template.owner(), owner.def_id.to_def_id());
+        assert_eq!(payload_template.type_params(), &[]);
+        assert_eq!(payload_template.variants().len(), variants.len());
         assert!(matches!(
             variants[0].payload(),
             LocalEnumVariantPayload::Unit
+        ));
+        assert!(matches!(
+            payload_template.variants()[0].payload(),
+            LocalEnumPayloadTemplateShape::Unit
         ));
 
         let LocalEnumVariantPayload::Tuple(wrapped) = variants[1].payload() else {
             panic!("Wrapped keeps its tuple payload shape")
         };
+        let LocalEnumPayloadTemplateShape::Tuple(wrapped_template) =
+            payload_template.variants()[1].payload()
+        else {
+            panic!("the typed template retains Wrapped's tuple shape")
+        };
         assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped_template.len(), 1);
         assert_eq!(
             wrapped[0].identity(),
             LocalEnumPayloadTypeIdentity::Tuple {
@@ -94466,6 +94658,14 @@ interface facade { use middle.{payload}; }"#;
             },
             "tuple identity is the exact variant and source position"
         );
+        assert_eq!(
+            wrapped_template[0].identity(),
+            LocalEnumPayloadTemplateIdentity::Tuple {
+                variant: variants[1].def_id(),
+                index: 0,
+            }
+        );
+        assert!(wrapped_template[0].ty().ptr_eq(wrapped[0].ty().unwrap()));
         assert!(matches!(
             wrapped[0].ty().expect("the local generic alias expands").kind(),
             sai_ty::ty::TyKind::Tuple(elements)
@@ -94502,9 +94702,16 @@ interface facade { use middle.{payload}; }"#;
         let LocalEnumVariantPayload::Record(named) = variants[3].payload() else {
             panic!("Named keeps its record payload shape")
         };
+        let LocalEnumPayloadTemplateShape::Record(named_template) =
+            payload_template.variants()[3].payload()
+        else {
+            panic!("the typed template retains Named's record shape")
+        };
         let LocalEnumVariantPayload::Record(another_named) = variants[4].payload() else {
             panic!("AnotherNamed keeps its record payload shape")
         };
+        assert_eq!(named[0].visibility(), Some(sai_hir::Visibility::Private));
+        assert_eq!(named_template.len(), named.len());
         let LocalEnumPayloadTypeIdentity::Record {
             variant: named_variant,
             field: named_field,
@@ -94523,6 +94730,18 @@ interface facade { use middle.{payload}; }"#;
         };
         assert_eq!(named_variant, variants[3].def_id());
         assert_eq!(another_variant, variants[4].def_id());
+        assert_eq!(named_template[0].name(), named_field_name);
+        assert_eq!(
+            named_template[0].identity(),
+            LocalEnumPayloadTemplateIdentity::Record {
+                variant: named_variant,
+                field: named_field,
+            }
+        );
+        assert_eq!(
+            named_template[0].visibility(),
+            named[0].visibility().unwrap()
+        );
         assert_eq!(named_field_name, another_field_name);
         assert_ne!(
             named_field, another_field,
@@ -94575,6 +94794,7 @@ interface facade { use middle.{payload}; }"#;
             "}\n",
             "enum Other<T> { Value(T) }\n",
             "enum Plain { Value(Bool) }\n",
+            "enum Complete<T, U> { Value(T), Named(value: U), Empty }\n",
         );
         let child = "pub type Identity<T> = (T, Bool)\n";
         let (mut database, module_tree, snapshot, _) =
@@ -94691,6 +94911,93 @@ interface facade { use middle.{payload}; }"#;
                 }) if *name == parameter.name
             ));
         }
+
+        let complete_owner = owner_for("Complete");
+        let complete_projection = resolved
+            .local_enum_payload_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                complete_owner,
+            )
+            .expect("collection and member-scope provenance matches")
+            .expect("the complete generic enum has a payload projection");
+        let complete_definition = complete_projection
+            .to_payload_template_def()
+            .expect("supported generic enum payloads adapt losslessly");
+        assert_eq!(
+            complete_definition.owner(),
+            complete_owner.def_id.to_def_id()
+        );
+        let complete_type_params = complete_projection
+            .type_params()
+            .expect("the generic source binders remain available");
+        assert_eq!(complete_definition.type_params(), complete_type_params);
+        let complete_variants = complete_projection.variants().unwrap();
+        assert_eq!(
+            complete_definition
+                .variants()
+                .iter()
+                .map(|variant| variant.def_id())
+                .collect::<Vec<_>>(),
+            complete_variants
+                .iter()
+                .map(LocalEnumVariantPayloadProjection::def_id)
+                .collect::<Vec<_>>(),
+            "the adapter retains exact source-ordered variant IDs"
+        );
+        let LocalEnumPayloadTemplateShape::Tuple(complete_tuple) =
+            complete_definition.variants()[0].payload()
+        else {
+            panic!("Complete::Value remains a tuple variant")
+        };
+        let complete_tuple_identity = LocalEnumPayloadTemplateIdentity::Tuple {
+            variant: complete_variants[0].def_id(),
+            index: 0,
+        };
+        assert_eq!(complete_tuple[0].identity(), complete_tuple_identity);
+        assert!(matches!(
+            complete_tuple[0].ty().kind(),
+            sai_ty::ty::TyKind::Param(parameter) if parameter == &complete_type_params[0].1
+        ));
+        let LocalEnumPayloadTemplateShape::Record(complete_record) =
+            complete_definition.variants()[1].payload()
+        else {
+            panic!("Complete::Named remains a record variant")
+        };
+        let LocalEnumVariantPayload::Record(complete_record_projection) =
+            complete_variants[1].payload()
+        else {
+            panic!("the verified source projection retains the record field")
+        };
+        let LocalEnumPayloadTypeIdentity::Record {
+            variant: complete_record_variant,
+            field: complete_record_field,
+            name: complete_record_name,
+        } = complete_record_projection[0].identity()
+        else {
+            panic!("record payload carries its source field identity")
+        };
+        assert_eq!(
+            complete_record[0].identity(),
+            LocalEnumPayloadTemplateIdentity::Record {
+                variant: complete_record_variant,
+                field: complete_record_field,
+            }
+        );
+        assert_eq!(complete_record[0].name(), complete_record_name);
+        assert_eq!(
+            complete_record[0].visibility(),
+            complete_record_projection[0].visibility().unwrap()
+        );
+        assert!(matches!(
+            complete_record[0].ty().kind(),
+            sai_ty::ty::TyKind::Param(parameter) if parameter == &complete_type_params[1].1
+        ));
+        assert!(matches!(
+            complete_definition.variants()[2].payload(),
+            LocalEnumPayloadTemplateShape::Unit
+        ));
 
         let LocalEnumVariantPayload::Tuple(value) = variants[0].payload() else {
             panic!("Value has a tuple payload")
@@ -94831,6 +95138,13 @@ interface facade { use middle.{payload}; }"#;
                 _
             ))
         ));
+        assert!(matches!(
+            projection.to_payload_template_def(),
+            Err(LocalEnumPayloadTemplateProjectionError::UnsupportedPayload {
+                identity,
+                ..
+            }) if identity == unknown[0].identity()
+        ));
 
         let other_owner = owner_for("Other");
         let wrong_enum = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
@@ -94945,6 +95259,10 @@ interface facade { use middle.{payload}; }"#;
             ),
             Err(LocalEnumPayloadTypeInstantiationError::InvalidProjectionProvenance)
         );
+        assert_eq!(
+            forged_owner.to_payload_template_def(),
+            Err(LocalEnumPayloadTemplateProjectionError::InvalidProjectionProvenance)
+        );
         let forged_binders = match projection.clone() {
             LocalEnumPayloadTypesProjection::Supported {
                 owner,
@@ -95008,6 +95326,11 @@ interface facade { use middle.{payload}; }"#;
             ),
             Err(LocalEnumPayloadTypeInstantiationError::InvalidProjectionProvenance),
             "opaque provenance authenticates the payload types and identities"
+        );
+        assert_eq!(
+            forged_payload.to_payload_template_def(),
+            Err(LocalEnumPayloadTemplateProjectionError::InvalidProjectionProvenance),
+            "the typed ADT adapter authenticates the complete projection provenance"
         );
     }
 
@@ -95237,6 +95560,14 @@ interface facade { use middle.{payload}; }"#;
         assert_eq!(
             generic.unsupported_reason(),
             Some(LocalEnumPayloadTypesUnsupportedReason::GenericParameters)
+        );
+        assert_eq!(
+            generic.to_payload_template_def(),
+            Err(
+                LocalEnumPayloadTemplateProjectionError::UnsupportedProjection(
+                    LocalEnumPayloadTypesUnsupportedReason::GenericParameters
+                )
+            )
         );
 
         let (_, const_result) = projection_for("ConstGeneric");
