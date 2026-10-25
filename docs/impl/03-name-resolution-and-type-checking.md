@@ -791,7 +791,9 @@ whose fixed type is `Bool`, `Byte`, `Char`, or unit. A local receiver such as
 `e.V` remains a value member path. IR-931 also supports simple one-level
 tuple patterns with same-arity tuple initializers whose elements are all
 direct `Bool`, `Byte`, `Char`, or unit literals; the selected element is
-matched to the argument by its exact `BindingId`.
+matched to the argument by its exact `BindingId`. IR-932 extends this to one
+nested tuple level, requiring the same tuple shape and arity recursively and
+fixed literals for every leaf, including wildcard-matched leaves.
 The resolver uses the current package collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
@@ -799,7 +801,7 @@ subset. This path result records path identity only; it does not record
 `type_dependent_defs` or synthesize expression types. That sentence describes
 the original IR-921 recognition slice: IR-922/923 later add the value-type and
 type-dependent-definition projections to the per-owner result. IR-924 through
-IR-931 add limited constructor-call diagnostics without claiming general
+IR-932 add limited constructor-call diagnostics without claiming general
 expression types.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
