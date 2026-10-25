@@ -1,0 +1,58 @@
+pub const MAX_PARTICIPANTS: USize = 4
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Vote {
+    Yes
+    No
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CrashPoint {
+    None
+    BeforeDecisionLog
+    AfterDecisionLog
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Decision {
+    Unrecorded
+    Commit
+    Abort
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ParticipantState {
+    Aborted
+    InDoubt
+    DecisionPending
+    Committed
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RunStatus {
+    Complete
+    DistributionPending
+    InDoubt
+    InvalidInput
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ParticipantInput {
+    pub id: U32
+    pub vote: Vote
+    pub decision_channel_open: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Scenario {
+    pub participants: Array<Option<ParticipantInput>, MAX_PARTICIPANTS>
+    pub participant_count: USize
+    pub crash_point: CrashPoint
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ParticipantResult {
+    pub id: U32
+    pub vote: Vote
+    pub state: ParticipantState
+}

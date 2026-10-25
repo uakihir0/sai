@@ -1,0 +1,58 @@
+use acme:two-phase-commit-lab/coordinator
+use acme:two-phase-commit-lab/model.{CrashPoint, MAX_PARTICIPANTS, ParticipantInput, Scenario, Vote}
+
+pub fn all_yes_scenario() -> Scenario {
+    var scenario = coordinator.empty_scenario()
+    scenario.participants[0] =
+        Some(ParticipantInput(id: 11, vote: Vote.Yes, decision_channel_open: true))
+    scenario.participants[1] =
+        Some(ParticipantInput(id: 22, vote: Vote.Yes, decision_channel_open: true))
+    scenario.participants[2] =
+        Some(ParticipantInput(id: 33, vote: Vote.Yes, decision_channel_open: true))
+    scenario.participant_count = 3
+    scenario
+}
+
+pub fn successful_commit() -> Scenario {
+    all_yes_scenario()
+}
+
+pub fn rejected_prepare_vote() -> Scenario {
+    var scenario = all_yes_scenario()
+    scenario.participants[1] =
+        Some(ParticipantInput(id: 22, vote: Vote.No, decision_channel_open: true))
+    scenario
+}
+
+pub fn crash_before_decision_log() -> Scenario {
+    var scenario = all_yes_scenario()
+    scenario.crash_point = CrashPoint.BeforeDecisionLog
+    scenario
+}
+
+pub fn crash_after_commit_log() -> Scenario {
+    var scenario = all_yes_scenario()
+    scenario.crash_point = CrashPoint.AfterDecisionLog
+    scenario
+}
+
+pub fn partial_replay_channels() -> Array<Bool, MAX_PARTICIPANTS> {
+    [true, false, true, false]
+}
+
+pub fn final_replay_channels() -> Array<Bool, MAX_PARTICIPANTS> {
+    [false, true, false, false]
+}
+
+pub fn duplicate_identity_scenario() -> Scenario {
+    var scenario = all_yes_scenario()
+    scenario.participants[2] =
+        Some(ParticipantInput(id: 22, vote: Vote.Yes, decision_channel_open: true))
+    scenario
+}
+
+pub fn hole_in_participant_prefix_scenario() -> Scenario {
+    var scenario = all_yes_scenario()
+    scenario.participants[1] = None
+    scenario
+}

@@ -1,0 +1,92 @@
+use acme:two-phase-commit-lab/coordinator
+use acme:two-phase-commit-lab/fixtures
+use acme:two-phase-commit-lab/model.{Decision, ParticipantState, RunStatus}
+
+pub fn commit_report() -> coordinator.Report {
+    coordinator.run(fixtures.successful_commit())
+}
+
+pub fn abort_report() -> coordinator.Report {
+    coordinator.run(fixtures.rejected_prepare_vote())
+}
+
+pub fn recovered_commit_report() -> coordinator.Report {
+    let after_crash = coordinator.run(fixtures.crash_after_commit_log())
+    let partially_delivered = coordinator.resume(after_crash, fixtures.partial_replay_channels())
+    coordinator.resume(partially_delivered, fixtures.final_replay_channels())
+}
+
+test "all positive prepare votes produce one recorded commit" {
+    let report = commit_report()
+
+    assert coordinator.status(report) == RunStatus.Complete
+    assert coordinator.decision(report) == Decision.Commit
+    assert coordinator.yes_vote_count(report) == 3
+    assert coordinator.no_vote_count(report) == 0
+    assert coordinator.committed_count(report) == 3
+    assert coordinator.aborted_count(report) == 0
+    assert coordinator.in_doubt_count(report) == 0
+    assert coordinator.decision_pending_count(report) == 0
+}
+
+test "one negative vote aborts every prepared participant" {
+    let report = abort_report()
+
+    assert coordinator.status(report) == RunStatus.Complete
+    assert coordinator.decision(report) == Decision.Abort
+    assert coordinator.yes_vote_count(report) == 2
+    assert coordinator.no_vote_count(report) == 1
+    assert coordinator.committed_count(report) == 0
+    assert coordinator.aborted_count(report) == 3
+    assert coordinator.decision_pending_count(report) == 0
+    assert coordinator.participant(report, 0).unwrap().state == ParticipantState.Aborted
+    assert coordinator.participant(report, 1).unwrap().state == ParticipantState.Aborted
+    assert coordinator.participant(report, 2).unwrap().state == ParticipantState.Aborted
+}
+
+test "a crash before the decision log leaves positive voters in doubt" {
+    let report = coordinator.run(fixtures.crash_before_decision_log())
+    let resumed = coordinator.resume(report, fixtures.final_replay_channels())
+
+    assert coordinator.status(report) == RunStatus.InDoubt
+    assert coordinator.decision(report) == Decision.Unrecorded
+    assert coordinator.in_doubt_count(report) == 3
+    assert coordinator.committed_count(report) == 0
+    assert resumed == report
+}
+
+test "recovery replays only the durable decision to reachable participants" {
+    let after_crash = coordinator.run(fixtures.crash_after_commit_log())
+    let partial = coordinator.resume(after_crash, fixtures.partial_replay_channels())
+    let complete = coordinator.resume(partial, fixtures.final_replay_channels())
+
+    assert coordinator.decision(after_crash) == Decision.Commit
+    assert coordinator.status(after_crash) == RunStatus.DistributionPending
+    assert coordinator.decision_pending_count(after_crash) == 3
+    assert coordinator.status(partial) == RunStatus.DistributionPending
+    assert coordinator.committed_count(partial) == 2
+    assert coordinator.decision_pending_count(partial) == 1
+    assert coordinator.participant(partial, 1).unwrap().state == ParticipantState.DecisionPending
+    assert complete == recovered_commit_report()
+    assert coordinator.status(complete) == RunStatus.Complete
+    assert coordinator.decision(complete) == Decision.Commit
+    assert coordinator.committed_count(complete) == 3
+    assert coordinator.decision_pending_count(complete) == 0
+}
+
+test "duplicate participant identities are rejected before a decision" {
+    let report = coordinator.run(fixtures.duplicate_identity_scenario())
+
+    assert coordinator.status(report) == RunStatus.InvalidInput
+    assert coordinator.decision(report) == Decision.Unrecorded
+    assert coordinator.participant_count(report) == 0
+}
+
+test "missing participant slots inside the declared prefix are rejected" {
+    let report = coordinator.run(fixtures.hole_in_participant_prefix_scenario())
+
+    assert coordinator.status(report) == RunStatus.InvalidInput
+    assert coordinator.participant_count(report) == 0
+    assert coordinator.committed_count(report) == 0
+    assert coordinator.aborted_count(report) == 0
+}
