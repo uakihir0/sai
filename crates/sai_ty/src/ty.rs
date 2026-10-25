@@ -1,9 +1,11 @@
 //! Interned semantic types shared by declaration and body checking.
 //!
 //! This is an early semantic type kernel. It represents primitive types,
-//! tuples, references, owner-bound function type parameters, and nongeneric
-//! nominal identities; generic arguments, function pointers, projections,
-//! inference variables, and error types are added by later slices.
+//! tuples, references, owner-bound function type parameters, and nominal
+//! identities with explicit type arguments. Signature lowering currently
+//! limits generic nominal applications to validated direct local records and
+//! enums with region-free fields or payloads. Function pointers, projections,
+//! inference variables, and error types remain for later slices.
 
 use sai_hir::{DefId, Mutability, Symbol};
 use std::collections::HashMap;
@@ -61,13 +63,14 @@ pub enum TyKind {
     Ref(Region, Ty, Mutability),
     /// A type parameter in the binder of one function signature.
     Param(ParamTy),
-    /// A nongeneric nominal definition.
+    /// A nominal definition and its explicit type arguments.
     ///
-    /// This slice constructs this form only for validated local interface
-    /// unit enums and direct local records/enums whose HIR has no generic
-    /// parameters or where predicates. Generic arguments will be represented
-    /// when the generic substitution model is implemented.
-    Adt(DefId),
+    /// This slice supports type arguments only for validated direct local
+    /// records and enums with unbounded type-only parameters whose fields or
+    /// payloads are proven not to require an implicit region parameter.
+    /// Interface unit enums and nongeneric local definitions use an empty
+    /// argument list.
+    Adt(DefId, Arc<[Ty]>),
 }
 
 /// Signed integer type.
@@ -218,6 +221,13 @@ impl TyInterner {
             TyKind::Ref(region, inner, mutability) => {
                 TyKind::Ref(region, self.intern(inner.kind().clone()), mutability)
             }
+            TyKind::Adt(def_id, args) => TyKind::Adt(
+                def_id,
+                args.iter()
+                    .map(|arg| self.intern(arg.kind().clone()))
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
             kind => kind,
         }
     }
@@ -323,6 +333,28 @@ mod tests {
     }
 
     #[test]
+    fn generic_adt_interning_canonicalizes_arguments_from_another_interner() {
+        let packages = sai_intern::PackageInterner::new();
+        let package = packages.intern("acme:types#1.0").expect("package interns");
+        let definition = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(1));
+        let interner = TyInterner::new();
+        let other = TyInterner::new();
+        let local_bool = interner.intern(TyKind::Bool);
+        let foreign_bool = other.intern(TyKind::Bool);
+
+        let local_application =
+            interner.intern(TyKind::Adt(definition, Arc::from([local_bool.clone()])));
+        let foreign_application =
+            interner.intern(TyKind::Adt(definition, Arc::from([foreign_bool])));
+
+        assert!(local_application.ptr_eq(&foreign_application));
+        let TyKind::Adt(_, args) = foreign_application.kind() else {
+            panic!("the nominal application remains an ADT");
+        };
+        assert!(args[0].ptr_eq(&local_bool));
+    }
+
+    #[test]
     fn distinct_adt_definitions_keep_distinct_semantic_identity() {
         let packages = sai_intern::PackageInterner::new();
         let package = packages.intern("acme:types#1.0").expect("package interns");
@@ -330,12 +362,41 @@ mod tests {
         let first = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(1));
         let second = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(2));
 
-        let first_ty = interner.intern(TyKind::Adt(first));
-        let same_first_ty = interner.intern(TyKind::Adt(first));
-        let second_ty = interner.intern(TyKind::Adt(second));
+        let first_ty = interner.intern(TyKind::Adt(first, Arc::from([])));
+        let same_first_ty = interner.intern(TyKind::Adt(first, Arc::from([])));
+        let second_ty = interner.intern(TyKind::Adt(second, Arc::from([])));
 
         assert!(first_ty.ptr_eq(&same_first_ty));
         assert!(!first_ty.ptr_eq(&second_ty));
         assert_ne!(first_ty.kind(), second_ty.kind());
+    }
+
+    #[test]
+    fn generic_adt_applications_are_interned_by_definition_and_ordered_arguments() {
+        let packages = sai_intern::PackageInterner::new();
+        let package = packages.intern("acme:types#1.0").expect("package interns");
+        let interner = TyInterner::new();
+        let definition = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(1));
+        let other_definition = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(2));
+        let u32_ty = interner.intern(TyKind::Uint(UintTy::U32));
+        let bool_ty = interner.intern(TyKind::Bool);
+
+        let packet_u32 = interner.intern(TyKind::Adt(definition, Arc::from([u32_ty.clone()])));
+        let same_packet_u32 = interner.intern(TyKind::Adt(definition, Arc::from([u32_ty.clone()])));
+        let packet_bool = interner.intern(TyKind::Adt(definition, Arc::from([bool_ty.clone()])));
+        let pair_u32_bool = interner.intern(TyKind::Adt(
+            definition,
+            Arc::from([u32_ty.clone(), bool_ty.clone()]),
+        ));
+        let pair_bool_u32 = interner.intern(TyKind::Adt(definition, Arc::from([bool_ty, u32_ty])));
+        let other_packet_u32 = interner.intern(TyKind::Adt(
+            other_definition,
+            Arc::from([interner.intern(TyKind::Uint(UintTy::U32))]),
+        ));
+
+        assert!(packet_u32.ptr_eq(&same_packet_u32));
+        assert!(!packet_u32.ptr_eq(&packet_bool));
+        assert!(!pair_u32_bool.ptr_eq(&pair_bool_u32));
+        assert!(!packet_u32.ptr_eq(&other_packet_u32));
     }
 }
