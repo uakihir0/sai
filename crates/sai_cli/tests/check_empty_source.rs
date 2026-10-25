@@ -444,8 +444,8 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        29,
-        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus depth-three annotated leaves, named/nested tuple literal leaves, bounded nested tuple-shape mismatches, and tuple-versus-scalar mismatches:\n{stdout}"
+        30,
+        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus depth-three annotated leaves, named/nested tuple literal leaves, bounded nested tuple-shape mismatches, tuple-versus-scalar mismatches, and primitive parameter paths against tuples:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
@@ -475,6 +475,18 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "expected tuple of arity 2, found a Bool literal",
         tuple_expected_start,
         tuple_expected_start + "true".len(),
+    );
+    let tuple_parameter_call = "NestedPayload.Nested((actual, ((), 2)))";
+    let tuple_parameter_start = source
+        .find(tuple_parameter_call)
+        .expect("nested tuple parameter mismatch call exists")
+        + "NestedPayload.Nested((".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected tuple of arity 2, found `Bool`",
+        tuple_parameter_start,
+        tuple_parameter_start + "actual".len(),
     );
     let annotated_call = "Payload.Pair(annotated, true)";
     let annotated_start = source
@@ -1166,6 +1178,145 @@ fn check_reports_tuple_expected_fixed_literal_mismatches() {
         &stdout,
         "WRONG_ARGUMENT_COUNT",
         "Nested: tuple variant expects 1 arguments but found 2",
+        named_start,
+        named_start + named_call.len(),
+    );
+}
+
+#[test]
+fn check_reports_tuple_expected_primitive_parameter_path_mismatches() {
+    let source = concat!(
+        "enum Payload { Single((I8,)), Nested(((I8, Char), ((), USize))) }\n",
+        "type BoolAlias = Bool\n",
+        "type Widget { value: Bool }\n",
+        "fn bool_factory() -> Bool { true }\n",
+        "fn use_it(actual: Bool, nested: USize, var byte: Byte, alias: BoolAlias, text: Str, unit: (), tuple: (I8,), owner: Widget, extra: Bool) {\n",
+        "    let local: Bool = true\n",
+        "    (\n",
+        "        Payload.Single(actual), ",
+        "        Payload.Nested((nested, ((), 2))), ",
+        "        Payload.Nested((byte, ((), true))), ",
+        "        Payload.Single(value: actual, extra: extra), ",
+        "        Payload.Single(alias), ",
+        "        Payload.Single(text), ",
+        "        Payload.Single(unit), ",
+        "        Payload.Single(tuple), ",
+        "        Payload.Single(owner), ",
+        "        Payload.Single(local), ",
+        "        Payload.Single(bool_factory())\n",
+        "    )\n",
+        "}\n",
+        "fn shadowed(actual: Bool) {\n",
+        "    let actual: I8 = 1\n",
+        "    Payload.Single(actual)\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "tuple-expected primitive parameter paths",
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        5,
+        "only direct primitive parameter paths at expected tuple positions and the eligible Bool sibling mismatch:\n{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"NAMED_ARGUMENT_ON_FUNCTION\"")
+            .count(),
+        2,
+        "named-argument diagnostics remain independent"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
+        1,
+        "the unmatched extra named argument retains only the outer arity diagnostic"
+    );
+
+    let assert_path_mismatch =
+        |call: &str, argument: &str, expected_message: &str, occurrence: usize| {
+            let call_start = source.find(call).expect("parameter mismatch call exists");
+            let relative_start = call
+                .match_indices(argument)
+                .nth(occurrence)
+                .map(|(start, _)| start)
+                .expect("parameter path occurs in its call");
+            let start = call_start + relative_start;
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                expected_message,
+                start,
+                start + argument.len(),
+            );
+        };
+    assert_path_mismatch(
+        "Payload.Single(actual)",
+        "actual",
+        "expected tuple of arity 1, found `Bool`",
+        0,
+    );
+    assert_path_mismatch(
+        "Payload.Nested((nested, ((), 2)))",
+        "nested",
+        "expected tuple of arity 2, found `USize`",
+        0,
+    );
+    assert_path_mismatch(
+        "Payload.Nested((byte, ((), true)))",
+        "byte",
+        "expected tuple of arity 2, found `Byte`",
+        0,
+    );
+    assert_path_mismatch(
+        "Payload.Single(value: actual, extra: extra)",
+        "actual",
+        "expected tuple of arity 1, found `Bool`",
+        0,
+    );
+
+    let sibling_call = "Payload.Nested((byte, ((), true)))";
+    let sibling_start = source
+        .find(sibling_call)
+        .expect("path mismatch sibling call exists");
+    let sibling_literal_start = sibling_start
+        + sibling_call
+            .rfind("true")
+            .expect("Bool sibling literal exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `USize`, found a Bool literal",
+        sibling_literal_start,
+        sibling_literal_start + "true".len(),
+    );
+    let byte_path_record = stdout
+        .find(&format!(
+            "\"start\":{{\"byte\":{},",
+            sibling_start
+                + sibling_call
+                    .find("byte")
+                    .expect("Byte parameter path exists")
+        ))
+        .expect("parameter path mismatch record exists");
+    let sibling_literal_record = stdout
+        .find(&format!("\"start\":{{\"byte\":{sibling_literal_start},"))
+        .expect("sibling literal mismatch record exists");
+    assert!(
+        byte_path_record < sibling_literal_record,
+        "the typed path and eligible sibling diagnostics retain source order"
+    );
+
+    let named_call = "Payload.Single(value: actual, extra: extra)";
+    let named_start = source
+        .find(named_call)
+        .expect("named call with an unmatched extra parameter exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "WRONG_ARGUMENT_COUNT",
+        "Single: tuple variant expects 1 arguments but found 2",
         named_start,
         named_start + named_call.len(),
     );

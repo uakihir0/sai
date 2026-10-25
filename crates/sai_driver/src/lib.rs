@@ -10137,6 +10137,16 @@ fn expected_tuple_literal_mismatch(
     format!("expected tuple of arity {expected_arity}, found {actual_literal_description}")
 }
 
+fn expected_tuple_primitive_mismatch(
+    expected_arity: usize,
+    actual_primitive: sai_resolve::prelude::PrimTy,
+) -> String {
+    format!(
+        "expected tuple of arity {expected_arity}, found `{}`",
+        const_primitive_name(actual_primitive)
+    )
+}
+
 fn local_enum_variant_type_name(literal_type: ConstLiteralType) -> &'static str {
     match literal_type {
         ConstLiteralType::Primitive(primitive) => const_primitive_name(primitive),
@@ -10173,6 +10183,24 @@ fn check_local_enum_variant_literal_argument(
                 value.span,
                 sai_diagnostics::Code::TypeMismatch,
                 expected_tuple_literal_mismatch(expected_elements.len(), actual_description),
+                "type mismatch",
+            )?);
+            continue;
+        }
+
+        if let sai_ty::ty::TyKind::Tuple(expected_elements) = expected_type.kind()
+            && !expected_elements.is_empty()
+            && let Some(actual_primitive) = local_enum_variant_parameter_primitive(
+                value, hir_owner, body, locals, type_paths, symbols, inputs,
+            )
+        {
+            diagnostics.push(const_literal_diagnostic(
+                owner,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                expected_tuple_primitive_mismatch(expected_elements.len(), actual_primitive),
                 "type mismatch",
             )?);
             continue;
@@ -98080,6 +98108,20 @@ interface facade { use middle.{payload}; }"#;
             "fn tuple_call_param_mismatch(actual: Bool) { Payload.Pair(actual, true) }\n",
             "fn tuple_call_unicode_param_mismatch(値: Bool) { Payload.Pair(値, true) }\n",
             "fn nested_call_param_mismatch(actual: USize) { NestedPayload.Nested(((actual, 'x'), ((), 2))) }\n",
+            "fn nested_call_tuple_param_outer_mismatch(actual: Bool) { NestedPayload.Single(actual) }\n",
+            "fn nested_call_tuple_param_nested_mismatch(actual: USize) { NestedPayload.Nested((actual, ((), 2))) }\n",
+            "fn nested_call_tuple_var_param_nested_mismatch(var actual: Byte) { NestedPayload.Nested((actual, ((), 2))) }\n",
+            "fn nested_call_tuple_param_sibling_order(actual: Bool) { NestedPayload.Nested((actual, ((), true))) }\n",
+            "fn nested_call_tuple_param_named_outer_too_many(actual: Bool, extra: Bool) { NestedPayload.Single(value: actual, extra: extra) }\n",
+            "fn nested_call_tuple_param_alias_exclusion(actual: BoolAlias) { NestedPayload.Single(actual) }\n",
+            "fn nested_call_tuple_param_str_exclusion(actual: Str) { NestedPayload.Single(actual) }\n",
+            "fn nested_call_tuple_param_unit_exclusion(actual: ()) { NestedPayload.Single(actual) }\n",
+            "fn nested_call_tuple_param_nominal_exclusion(actual: Widget) { NestedPayload.Single(actual) }\n",
+            "fn nested_call_tuple_param_tuple_path_exclusion(actual: (I8,)) { NestedPayload.Single(actual) }\n",
+            "fn nested_call_tuple_param_local_exclusion() {\n    let actual: Bool = true\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_param_shadow_exclusion(actual: Bool) {\n    let actual: I8 = 1\n    NestedPayload.Single(actual)\n}\n",
+            "fn bool_factory() -> Bool { true }\n",
+            "fn nested_call_tuple_param_call_exclusion() { NestedPayload.Single(bool_factory()) }\n",
             "fn nested_call_annotated_mismatch() {\n    let actual: USize = 2\n    NestedPayload.Nested(((actual, 'x'), ((), 2)))\n}\n",
             "fn tuple_call_shadowed(actual: Bool) { let actual: U8 = 1; Payload.Pair(actual, true) }\n",
             "fn tuple_call_named_param_mismatch(actual: Bool) { Payload.Pair(left: actual, true) }\n",
@@ -98669,6 +98711,14 @@ interface facade { use middle.{payload}; }"#;
             "tuple_call_annotated_var_ok",
             "tuple_call_annotated_nested_scope",
             "tuple_call_unannotated_local",
+            "nested_call_tuple_param_alias_exclusion",
+            "nested_call_tuple_param_str_exclusion",
+            "nested_call_tuple_param_unit_exclusion",
+            "nested_call_tuple_param_nominal_exclusion",
+            "nested_call_tuple_param_tuple_path_exclusion",
+            "nested_call_tuple_param_local_exclusion",
+            "nested_call_tuple_param_shadow_exclusion",
+            "nested_call_tuple_param_call_exclusion",
             "tuple_call_inferred_fixed_locals_ok",
             "tuple_call_inferred_nested_scope",
             "tuple_call_inferred_nested_scope_only",
@@ -98842,6 +98892,18 @@ interface facade { use middle.{payload}; }"#;
                 "expected `I8`, found `USize`",
             ),
             (
+                "nested_call_tuple_param_outer_mismatch",
+                "expected tuple of arity 1, found `Bool`",
+            ),
+            (
+                "nested_call_tuple_param_nested_mismatch",
+                "expected tuple of arity 2, found `USize`",
+            ),
+            (
+                "nested_call_tuple_var_param_nested_mismatch",
+                "expected tuple of arity 2, found `Byte`",
+            ),
+            (
                 "tuple_call_unicode_param_mismatch",
                 "expected `U8`, found `Bool`",
             ),
@@ -98990,6 +99052,131 @@ interface facade { use middle.{payload}; }"#;
                 );
             }
         }
+
+        for (name, call, argument_prefix_len) in [
+            (
+                "nested_call_tuple_param_outer_mismatch",
+                "NestedPayload.Single(actual)",
+                "NestedPayload.Single(".len(),
+            ),
+            (
+                "nested_call_tuple_param_nested_mismatch",
+                "NestedPayload.Nested((actual, ((), 2)))",
+                "NestedPayload.Nested((".len(),
+            ),
+            (
+                "nested_call_tuple_var_param_nested_mismatch",
+                "NestedPayload.Nested((actual, ((), 2)))",
+                "NestedPayload.Nested((".len(),
+            ),
+        ] {
+            let paths = paths_for(name);
+            let function_start = root
+                .find(&format!("fn {name}"))
+                .expect("tuple-expected parameter function exists");
+            let argument_start = function_start
+                + root[function_start..]
+                    .find(call)
+                    .expect("tuple-expected parameter call exists")
+                + argument_prefix_len;
+            assert_primary_span(&paths.call_diagnostics()[0], argument_start, "actual".len());
+        }
+
+        let parameter_sibling_order = paths_for("nested_call_tuple_param_sibling_order");
+        let parameter_sibling_diagnostics = parameter_sibling_order
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parameter_sibling_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected tuple of arity 2, found `Bool`",
+                "expected `USize`, found a Bool literal",
+            ],
+            "a parameter-path mismatch stops locally and eligible tuple siblings remain source ordered"
+        );
+        assert_eq!(
+            parameter_sibling_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic_primary_text(diagnostic))
+                .collect::<Vec<_>>(),
+            ["actual", "true"]
+        );
+        let parameter_sibling_function_start = root
+            .find("fn nested_call_tuple_param_sibling_order(actual: Bool)")
+            .expect("parameter sibling function exists");
+        let parameter_sibling_call_start = parameter_sibling_function_start
+            + root[parameter_sibling_function_start..]
+                .find("NestedPayload.Nested((actual, ((), true)))")
+                .expect("parameter sibling call exists");
+        assert_primary_span(
+            parameter_sibling_diagnostics[0],
+            parameter_sibling_call_start + "NestedPayload.Nested((".len(),
+            "actual".len(),
+        );
+        assert_primary_span(
+            parameter_sibling_diagnostics[1],
+            parameter_sibling_call_start + "NestedPayload.Nested((actual, ((), ".len(),
+            "true".len(),
+        );
+
+        let parameter_named_outer_too_many =
+            paths_for("nested_call_tuple_param_named_outer_too_many");
+        let named_parameter_type_mismatch = parameter_named_outer_too_many
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named_parameter_type_mismatch.len(),
+            1,
+            "only the signature-backed named value receives the tuple mismatch"
+        );
+        assert_eq!(
+            named_parameter_type_mismatch[0].message,
+            "expected tuple of arity 1, found `Bool`"
+        );
+        let named_parameter_call = "NestedPayload.Single(value: actual, extra: extra)";
+        let named_parameter_function_start = root
+            .find("fn nested_call_tuple_param_named_outer_too_many")
+            .expect("named parameter function exists");
+        let named_parameter_call_start = named_parameter_function_start
+            + root[named_parameter_function_start..]
+                .find(named_parameter_call)
+                .expect("named parameter call exists");
+        assert_eq!(
+            diagnostic_primary_text(named_parameter_type_mismatch[0]),
+            "actual"
+        );
+        assert_primary_span(
+            named_parameter_type_mismatch[0],
+            named_parameter_call_start + "NestedPayload.Single(value: ".len(),
+            "actual".len(),
+        );
+        assert_eq!(
+            parameter_named_outer_too_many
+                .call_diagnostics()
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::NamedArgumentOnFunction
+                })
+                .count(),
+            2,
+            "named-argument diagnostics remain independent"
+        );
+        assert_eq!(
+            parameter_named_outer_too_many
+                .call_diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WrongArgumentCount)
+                .count(),
+            1,
+            "outer arity diagnostics remain independent"
+        );
 
         let named_parameter_mismatch = paths_for("tuple_call_named_param_mismatch");
         assert_eq!(named_parameter_mismatch.call_diagnostics().len(), 2);
