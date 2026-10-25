@@ -784,7 +784,9 @@ call semantics for supported local enum variant calls. IR-924 checks arity,
 IR-925 diagnoses named arguments, IR-926 checks direct literal arguments,
 IR-927 checks aligned tuple-literal leaves at tuple-variant coercion sites, and
 IR-928 checks direct primitive function-parameter paths by resolved binding
-identity. A local receiver such as `e.V` remains a value member path.
+identity. IR-929 also checks explicitly annotated primitive `let` and `var`
+locals declared directly in the same function body's outer block. A local
+receiver such as `e.V` remains a value member path.
 The resolver uses the current package collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
@@ -1984,6 +1986,25 @@ coercions, numeric widening, local type inference, general expression type
 results, `call_kinds`, or source acceptance; `sai check` remains behind its
 incomplete-stage gate.
 
+**Implemented subset (IR-929):** At those same call sites, a single-segment
+plain path may also be checked when it resolves to an explicitly annotated
+primitive local binding declared by a simple `let` or `var` statement directly
+in the function body's outer block. The declaration's annotation is resolved
+through the existing direct primitive-type path projection; its initializer is
+not inspected. The declaration is selected by the exact resolved `BindingId`,
+and its HIR binding kind, name, and binding mode must agree. Equal primitive
+types pass; a different primitive type emits `TYPE_MISMATCH` at the argument
+path span. This works at outer arguments and at leaves reached by IR-927's
+equal-arity tuple walk, while outer arguments remain bounded by signature
+zipping. Unannotated locals, inferred or computed types, type aliases,
+unsupported annotations, nested-scope declarations, destructuring or
+subpatterns, non-primitive annotations, and expressions other than a direct
+plain path remain outside this slice. Named values keep their written
+positional parameter, and extra arguments receive only the existing arity
+diagnostic. No coercions, initializer checking, general local inference,
+general expression type results, `call_kinds`, or source-acceptance claims are
+added; `sai check` remains behind its incomplete-stage gate.
+
 ### 3.6.4 `adt_def`
 
 `adt_def(def) -> Arc<AdtDef>` describes a nominal type:
@@ -2310,7 +2331,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924–IR-928 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-929 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
@@ -2323,9 +2344,10 @@ argument positionally. Record variants remain on the named-field construction
 path and receive no positional call entry or named-function-argument
 diagnostic. IR-926/927 check direct primitive and unit literals plus aligned
 tuple-literal leaves against the constructor signature; IR-928 checks direct
-primitive parameter paths by resolved binding identity. These are limited
-argument checks: named arguments are not bound by their names, and general
-expression typing, `TypeckResults::call_kinds`, and generic, external,
+primitive parameter paths and IR-929 checks explicitly annotated direct
+primitive `let`/`var` local paths by resolved binding identity. These are
+limited argument checks: named arguments are not bound by their names, and
+general expression typing, `TypeckResults::call_kinds`, and generic, external,
 dependency, or WIT variant paths remain outside the projection. `sai check`
 reports the staged diagnostics while retaining its incomplete-stage gate; it
 does not claim full check coverage or emit a success result for these inputs.
