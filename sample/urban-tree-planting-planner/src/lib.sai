@@ -51,7 +51,7 @@ test "water and nursery shortages hold later sites without reserving resources" 
 }
 
 test "the rendered report names trees and explains held sites" {
-    let result = report.sample_report()
+    let result = sample_report()
     assert result.as_str().contains("plant Swamp white oak")
     assert result.as_str().contains("district species limit reached")
     assert result.as_str().contains("296/300 L reserved")
