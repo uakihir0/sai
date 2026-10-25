@@ -1,0 +1,224 @@
+use acme:mentorship-matching/model.{
+    InputError
+    MAX_MENTEES
+    MAX_PROPOSALS
+    MatchPair
+    MatchReport
+    Mentee
+    Mentor
+    Proposal
+    ProposalResult
+}
+use acme:mentorship-matching/policy
+use acme:mentorship-matching/validate
+
+fn empty_report(error: Option<InputError>) -> MatchReport {
+    MatchReport(
+        input_error: error,
+        pairs: Array<Option<MatchPair>, MAX_MENTEES>.filled(None),
+        pair_count: 0,
+        unmatched_mentee_ids: Array<Option<U32>, MAX_MENTEES>.filled(None),
+        unmatched_count: 0,
+        proposals: Array<Option<Proposal>, MAX_PROPOSALS>.filled(None),
+        proposal_count: 0,
+        replacement_count: 0,
+        ineligible_count: 0,
+        rejection_count: 0,
+    )
+}
+
+fn held_count(
+    mentee_to_mentor: Array<Option<U32>, MAX_MENTEES>,
+    mentor_id: U32,
+    mentee_count: USize,
+) -> USize {
+    var count: USize = 0
+    for index in 0..mentee_count {
+        if mentee_to_mentor[index] == Some(mentor_id) {
+            count += 1
+        }
+    }
+    count
+}
+
+fn worst_held_index(
+    mentor: Mentor,
+    mentees: Array<Mentee, MAX_MENTEES>,
+    mentee_to_mentor: Array<Option<U32>, MAX_MENTEES>,
+    mentee_count: USize,
+) -> Option<USize> {
+    var found = false
+    var worst_index: USize = 0
+    var worst_rank: USize = 0
+    for index in 0..mentee_count {
+        if mentee_to_mentor[index] == Some(mentor.id) {
+            match policy.mentor_rank(mentor, mentees[index].id) {
+                Some(rank) => {
+                    if not found or rank > worst_rank {
+                        found = true
+                        worst_index = index
+                        worst_rank = rank
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    if found {
+        Some(worst_index)
+    } else {
+        None
+    }
+}
+
+pub fn build_report(
+    mentees: Array<Mentee, MAX_MENTEES>,
+    mentee_count: USize,
+    mentors: Array<Mentor, 3>,
+    mentor_count: USize,
+) -> MatchReport {
+    let validation_error = validate.validate(mentees, mentee_count, mentors, mentor_count)
+    match validation_error {
+        Some(error) => {
+            return empty_report(Some(error))
+        }
+        None => {}
+    }
+
+    var mentee_to_mentor = Array<Option<U32>, MAX_MENTEES>.filled(None)
+    var next_preference = Array<USize, MAX_MENTEES>.filled(0)
+    var report = empty_report(None)
+    var finished = false
+
+    while not finished and report.proposal_count < MAX_PROPOSALS {
+        var found_proposer = false
+        var proposer_index: USize = 0
+        for index in 0..mentee_count {
+            if (
+                not found_proposer
+                and mentee_to_mentor[index] == None
+                and next_preference[index] < mentees[index].preference_count
+            ) {
+                found_proposer = true
+                proposer_index = index
+            }
+        }
+
+        if not found_proposer {
+            finished = true
+        } else {
+            let mentee = mentees[proposer_index]
+            let mentor_id = mentee.preferences[next_preference[proposer_index]]
+            next_preference[proposer_index] += 1
+            report.proposal_count += 1
+
+            var proposal_result = ProposalResult.RejectedUnranked
+            match policy.mentor_index(mentors, mentor_count, mentor_id) {
+                Some(mentor_index) => {
+                    let mentor = mentors[mentor_index]
+                    if not policy.eligible(mentee, mentor) {
+                        proposal_result = ProposalResult.SkippedIneligible
+                        report.ineligible_count += 1
+                    } else {
+                        match policy.mentor_rank(mentor, mentee.id) {
+                            None => {
+                                proposal_result = ProposalResult.RejectedUnranked
+                                report.rejection_count += 1
+                            }
+                            Some(proposer_rank) => {
+                                if (
+                                    held_count(mentee_to_mentor, mentor.id, mentee_count)
+                                    < mentor.capacity
+                                ) {
+                                    mentee_to_mentor[proposer_index] = Some(mentor.id)
+                                    proposal_result = ProposalResult.Held
+                                } else {
+                                    match worst_held_index(
+                                        mentor,
+                                        mentees,
+                                        mentee_to_mentor,
+                                        mentee_count,
+                                    ) {
+                                        Some(worst_index) => {
+                                            let incumbent_id = mentees[worst_index].id
+                                            match policy.mentor_rank(mentor, incumbent_id) {
+                                                Some(incumbent_rank) => {
+                                                    if proposer_rank < incumbent_rank {
+                                                        mentee_to_mentor[worst_index] = None
+                                                        mentee_to_mentor[proposer_index] =
+                                                            Some(mentor.id)
+                                                        proposal_result =
+                                                            ProposalResult.Replaced(incumbent_id)
+                                                        report.replacement_count += 1
+                                                    } else {
+                                                        proposal_result = ProposalResult.Rejected
+                                                        report.rejection_count += 1
+                                                    }
+                                                }
+                                                None => {
+                                                    proposal_result =
+                                                        ProposalResult.RejectedUnranked
+                                                    report.rejection_count += 1
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            proposal_result = ProposalResult.Rejected
+                                            report.rejection_count += 1
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    proposal_result = ProposalResult.RejectedUnranked
+                    report.rejection_count += 1
+                }
+            }
+
+            report.proposals[report.proposal_count - 1] = Some(
+                Proposal(
+                    round: report.proposal_count,
+                    mentee_id: mentee.id,
+                    mentor_id: mentor_id,
+                    result: proposal_result,
+                ),
+            )
+        }
+    }
+
+    var pair_index: USize = 0
+    for index in 0..mentee_count {
+        let mentee = mentees[index]
+        match mentee_to_mentor[index] {
+            Some(mentor_id) => {
+                match policy.mentor_index(mentors, mentor_count, mentor_id) {
+                    Some(mentor_index) => {
+                        let mentor = mentors[mentor_index]
+                        let mentee_rank = policy.mentee_rank(mentee, mentor_id).unwrap() + 1
+                        let mentor_rank = policy.mentor_rank(mentor, mentee.id).unwrap() + 1
+                        report.pairs[pair_index] = Some(
+                            MatchPair(
+                                mentee_id: mentee.id,
+                                mentor_id: mentor_id,
+                                mentee_preference_rank: mentee_rank,
+                                mentor_preference_rank: mentor_rank,
+                            ),
+                        )
+                        pair_index += 1
+                        report.pair_count += 1
+                    }
+                    None => {}
+                }
+            }
+            None => {
+                report.unmatched_mentee_ids[report.unmatched_count] = Some(mentee.id)
+                report.unmatched_count += 1
+            }
+        }
+    }
+
+    report
+}

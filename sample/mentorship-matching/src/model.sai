@@ -1,0 +1,85 @@
+pub const MAX_MENTEES: USize = 5
+pub const MAX_MENTORS: USize = 3
+pub const MAX_PROPOSALS: USize = 15
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Topic {
+    Robotics
+    Climate
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Mentee {
+    pub id: U32
+    pub name: Str
+    pub topic: Topic
+    pub preference_count: USize
+    pub preferences: Array<U32, MAX_MENTORS>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Mentor {
+    pub id: U32
+    pub name: Str
+    pub capacity: USize
+    pub supports_robotics: Bool
+    pub supports_climate: Bool
+    pub preference_count: USize
+    pub preferences: Array<U32, MAX_MENTEES>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum InputError {
+    MenteeCountExceedsLimit
+    MentorCountExceedsLimit
+    ZeroMenteeId
+    DuplicateMenteeId
+    ZeroMentorId
+    DuplicateMentorId
+    MenteePreferenceCountExceedsLimit
+    MenteePreferenceUnknownMentor
+    DuplicateMenteePreference
+    MentorCapacityExceedsLimit
+    MentorPreferenceCountExceedsLimit
+    MentorPreferenceUnknownMentee
+    DuplicateMentorPreference
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ProposalResult {
+    SkippedIneligible
+    RejectedUnranked
+    Held
+    Rejected
+    Replaced(U32)
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Proposal {
+    pub round: USize
+    pub mentee_id: U32
+    pub mentor_id: U32
+    pub result: ProposalResult
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MatchPair {
+    pub mentee_id: U32
+    pub mentor_id: U32
+    pub mentee_preference_rank: USize
+    pub mentor_preference_rank: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MatchReport {
+    pub input_error: Option<InputError>
+    pub pairs: Array<Option<MatchPair>, MAX_MENTEES>
+    pub pair_count: USize
+    pub unmatched_mentee_ids: Array<Option<U32>, MAX_MENTEES>
+    pub unmatched_count: USize
+    pub proposals: Array<Option<Proposal>, MAX_PROPOSALS>
+    pub proposal_count: USize
+    pub replacement_count: USize
+    pub ineligible_count: USize
+    pub rejection_count: USize
+}

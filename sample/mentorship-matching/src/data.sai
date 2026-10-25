@@ -1,0 +1,73 @@
+use acme:mentorship-matching/model.{Mentee, Mentor, Topic}
+
+pub fn mentees() -> Array<Mentee, 5> {
+    [
+        Mentee(
+            id: 101,
+            name: "Aki Tanaka",
+            topic: Topic.Robotics,
+            preference_count: 3,
+            preferences: [201, 202, 203],
+        ),
+        Mentee(
+            id: 102,
+            name: "Bea Sato",
+            topic: Topic.Climate,
+            preference_count: 3,
+            preferences: [202, 203, 201],
+        ),
+        Mentee(
+            id: 103,
+            name: "Chen Ito",
+            topic: Topic.Robotics,
+            preference_count: 3,
+            preferences: [201, 202, 203],
+        ),
+        Mentee(
+            id: 104,
+            name: "Daya Mori",
+            topic: Topic.Climate,
+            preference_count: 3,
+            preferences: [201, 202, 203],
+        ),
+        Mentee(
+            id: 105,
+            name: "Eli Kato",
+            topic: Topic.Robotics,
+            preference_count: 3,
+            preferences: [201, 202, 203],
+        ),
+    ]
+}
+
+pub fn mentors() -> Array<Mentor, 3> {
+    [
+        Mentor(
+            id: 201,
+            name: "Mira Chen",
+            capacity: 1,
+            supports_robotics: true,
+            supports_climate: false,
+            preference_count: 3,
+            preferences: [103, 101, 105, 0, 0],
+        ),
+        Mentor(
+            id: 202,
+            name: "Niko Park",
+            capacity: 2,
+            supports_robotics: true,
+            supports_climate: true,
+            preference_count: 5,
+            preferences: [104, 101, 102, 103, 105],
+        ),
+        Mentor(
+            id: 203,
+            name: "Oren Ali",
+            capacity: 1,
+            supports_robotics: true,
+            supports_climate: true,
+            preference_count: 5,
+            preferences: [102, 104, 103, 101, 105],
+        ),
+    ]
+}

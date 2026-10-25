@@ -84,6 +84,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`smart-building-comfort-controller`](smart-building-comfort-controller/README.md) | Plan requested setpoints and ventilation under comfort bands, target hysteresis, price and carbon budgets, equipment limits, and visible unmet requests. |
 | Advanced | [`municipal-procurement-bid-review`](municipal-procurement-bid-review/README.md) | Review fictional public-works bids through submission and supplier gates, unit-price arithmetic correction, a technical floor, normalized best-value scoring, and a deterministic award recommendation. |
 | Advanced | [`reproducible-pipeline-planner`](reproducible-pipeline-planner/README.md) | Validate workflow dependencies and schedule ready tasks in deterministic batches under worker and shared-resource limits, propagating invalid or failed prerequisites. |
+| Advanced | [`mentorship-matching`](mentorship-matching/README.md) | Match fictional mentees to mentors with bounded deferred acceptance, topic eligibility, capacities, strict preferences, and an auditable proposal trail. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or

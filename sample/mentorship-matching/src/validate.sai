@@ -1,0 +1,81 @@
+use acme:mentorship-matching/model.{InputError, Mentee, Mentor}
+use acme:mentorship-matching/policy
+
+pub fn validate(
+    mentees: Array<Mentee, 5>,
+    mentee_count: USize,
+    mentors: Array<Mentor, 3>,
+    mentor_count: USize,
+) -> Option<InputError> {
+    if mentee_count > mentees.len() {
+        return Some(InputError.MenteeCountExceedsLimit)
+    }
+    if mentor_count > mentors.len() {
+        return Some(InputError.MentorCountExceedsLimit)
+    }
+
+    for index in 0..mentee_count {
+        let mentee = mentees[index]
+        if mentee.id == 0 {
+            return Some(InputError.ZeroMenteeId)
+        }
+        if mentee.preference_count > mentors.len() {
+            return Some(InputError.MenteePreferenceCountExceedsLimit)
+        }
+        for other_index in (index + 1)..mentee_count {
+            if mentee.id == mentees[other_index].id {
+                return Some(InputError.DuplicateMenteeId)
+            }
+        }
+    }
+
+    for index in 0..mentor_count {
+        let mentor = mentors[index]
+        if mentor.id == 0 {
+            return Some(InputError.ZeroMentorId)
+        }
+        if mentor.capacity > mentees.len() {
+            return Some(InputError.MentorCapacityExceedsLimit)
+        }
+        if mentor.preference_count > mentees.len() {
+            return Some(InputError.MentorPreferenceCountExceedsLimit)
+        }
+        for other_index in (index + 1)..mentor_count {
+            if mentor.id == mentors[other_index].id {
+                return Some(InputError.DuplicateMentorId)
+            }
+        }
+    }
+
+    for mentee_index in 0..mentee_count {
+        let mentee = mentees[mentee_index]
+        for preference_index in 0..mentee.preference_count {
+            let preferred_mentor_id = mentee.preferences[preference_index]
+            if policy.mentor_index(mentors, mentor_count, preferred_mentor_id) == None {
+                return Some(InputError.MenteePreferenceUnknownMentor)
+            }
+            for earlier_index in 0..preference_index {
+                if mentee.preferences[earlier_index] == preferred_mentor_id {
+                    return Some(InputError.DuplicateMenteePreference)
+                }
+            }
+        }
+    }
+
+    for mentor_index in 0..mentor_count {
+        let mentor = mentors[mentor_index]
+        for preference_index in 0..mentor.preference_count {
+            let preferred_mentee_id = mentor.preferences[preference_index]
+            if policy.mentee_index(mentees, mentee_count, preferred_mentee_id) == None {
+                return Some(InputError.MentorPreferenceUnknownMentee)
+            }
+            for earlier_index in 0..preference_index {
+                if mentor.preferences[earlier_index] == preferred_mentee_id {
+                    return Some(InputError.DuplicateMentorPreference)
+                }
+            }
+        }
+    }
+
+    None
+}

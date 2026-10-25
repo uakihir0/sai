@@ -1,0 +1,48 @@
+use acme:mentorship-matching/model.{Mentee, Mentor, Topic}
+
+pub fn mentee_index(mentees: Array<Mentee, 5>, mentee_count: USize, mentee_id: U32) -> Option<
+    USize,
+> {
+    for index in 0..mentee_count {
+        if mentees[index].id == mentee_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn mentor_index(mentors: Array<Mentor, 3>, mentor_count: USize, mentor_id: U32) -> Option<
+    USize,
+> {
+    for index in 0..mentor_count {
+        if mentors[index].id == mentor_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn eligible(mentee: Mentee, mentor: Mentor) -> Bool {
+    match mentee.topic {
+        Topic.Robotics => mentor.supports_robotics
+        Topic.Climate => mentor.supports_climate
+    }
+}
+
+pub fn mentee_rank(mentee: Mentee, mentor_id: U32) -> Option<USize> {
+    for index in 0..mentee.preference_count {
+        if mentee.preferences[index] == mentor_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn mentor_rank(mentor: Mentor, mentee_id: U32) -> Option<USize> {
+    for index in 0..mentor.preference_count {
+        if mentor.preferences[index] == mentee_id {
+            return Some(index)
+        }
+    }
+    None
+}
