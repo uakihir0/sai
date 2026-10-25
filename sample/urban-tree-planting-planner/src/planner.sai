@@ -221,9 +221,9 @@ pub fn plan(
     )
 }
 
-test "duplicate species IDs consume only the selected stock entry" {
-    let site = PlantingSite(
-        id: 1,
+fn inventory_test_site(site_id: U32) -> PlantingSite {
+    PlantingSite(
+        id: site_id,
         name: "Training Site",
         district_id: 1,
         priority: 1,
@@ -232,7 +232,21 @@ test "duplicate species IDs consume only the selected stock entry" {
         overhead_clearance_ft: 12,
         sidewalk_width_ft: 3,
     )
-    let sites = [site, site, site, site, site, site, site, site, site, site]
+}
+
+test "duplicate species IDs consume only the selected stock entry" {
+    let sites = [
+        inventory_test_site(1),
+        inventory_test_site(2),
+        inventory_test_site(3),
+        inventory_test_site(4),
+        inventory_test_site(5),
+        inventory_test_site(6),
+        inventory_test_site(7),
+        inventory_test_site(8),
+        inventory_test_site(9),
+        inventory_test_site(10),
+    ]
     let species = [
         TreeSpecies(
             id: 7,
