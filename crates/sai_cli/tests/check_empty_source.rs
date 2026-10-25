@@ -286,7 +286,7 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     let source = concat!(
         "enum Payload { Pair(U8, Bool), Named(value: Bool) }\n",
         "enum FixedPayload { Values(Bool, Byte, Char, ()) }\n",
-        "enum NestedPayload { Nested(((I8, Char), ((), USize))) }\n",
+        "enum NestedPayload { Nested(((I8, Char), ((), USize))), Fixed(((I8, Byte), (Char, ()))) }\n",
         "pub fn use_it(actual: Bool) {\n",
         "    let annotated: Bool = true\n",
         "    var matching: Bool = false\n",
@@ -301,6 +301,10 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "    let (tuple_bad_arity, other_bad_arity) = (true,)\n",
         "    let (tuple_annotated, other_annotated): (Bool, Bool) = (true, false)\n",
         "    let ((tuple_nested, _), other_nested) = ((true, false), true)\n",
+        "    let ((tuple_nested_bool, tuple_nested_byte), (tuple_nested_char, tuple_nested_unit)) = ((true, b'x'), ('x', ()))\n",
+        "    let (tuple_nested_rejected, (tuple_nested_inner, _)) = (true, (false, 1))\n",
+        "    let ((tuple_shape_nested, _), tuple_shape_tail) = (true, false)\n",
+        "    let (tuple_shape_leaf, tuple_shape_leaf_tail) = ((true, false), true)\n",
         "    (Payload.Pair(actual, true), ",
         "Payload.Pair(annotated, true), ",
         "Payload.Pair(1, matching), ",
@@ -313,6 +317,10 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "Payload.Pair(tuple_bad_arity, true), ",
         "Payload.Pair(tuple_annotated, true), ",
         "Payload.Pair(tuple_nested, true), ",
+        "NestedPayload.Fixed(((tuple_nested_bool, tuple_nested_byte), (tuple_nested_char, tuple_nested_unit))), ",
+        "NestedPayload.Fixed(((tuple_nested_rejected, b'x'), ('x', ()))), ",
+        "NestedPayload.Fixed(((tuple_shape_nested, b'x'), ('x', ()))), ",
+        "NestedPayload.Fixed(((tuple_shape_leaf, b'x'), ('x', ()))), ",
         "Payload.Pair(1, true), ",
         "Payload.Pair(first: true, second: 1, third: false), ",
         "Payload.Pair(1, true, extra), ",
@@ -343,8 +351,8 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        8,
-        "the staged projection checks parameter, annotated, fixed-literal inferred, and tuple-destructured local paths plus named/nested tuple literal leaves:\n{stdout}"
+        10,
+        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus named/nested tuple literal leaves:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
@@ -398,6 +406,18 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "expected `U8`, found `Bool`",
         tuple_destructured_start,
         tuple_destructured_start + "tuple_bool".len(),
+    );
+    let nested_tuple_call = "NestedPayload.Fixed(((tuple_nested_bool, tuple_nested_byte), (tuple_nested_char, tuple_nested_unit)))";
+    let nested_tuple_start = source
+        .find(nested_tuple_call)
+        .expect("nested tuple-destructured local argument call exists")
+        + "NestedPayload.Fixed(((".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I8`, found `Bool`",
+        nested_tuple_start,
+        nested_tuple_start + "tuple_nested_bool".len(),
     );
     let named_start = source.find("first:").expect("named argument exists");
     assert_json_diagnostic_primary_span(
