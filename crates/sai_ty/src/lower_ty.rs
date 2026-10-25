@@ -763,6 +763,7 @@ fn semantic_type_contains_reference(root: &Ty) -> bool {
                 pending.extend(signature.inputs());
                 pending.push(signature.output());
             }
+            TyKind::FnDef(_, arguments) => pending.extend(arguments.iter()),
             TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
             TyKind::Int(_)
             | TyKind::Uint(_)
@@ -788,6 +789,7 @@ fn semantic_type_contains_array(root: &Ty) -> bool {
                 pending.extend(signature.inputs());
                 pending.push(signature.output());
             }
+            TyKind::FnDef(_, arguments) => pending.extend(arguments.iter()),
             TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
             TyKind::Int(_)
             | TyKind::Uint(_)
@@ -816,6 +818,7 @@ fn semantic_type_parameter_usage(root: &Ty, count: usize) -> Option<Vec<bool>> {
                 pending.extend(signature.inputs());
                 pending.push(signature.output());
             }
+            TyKind::FnDef(_, arguments) => pending.extend(arguments.iter()),
             TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
             TyKind::Int(_)
             | TyKind::Uint(_)

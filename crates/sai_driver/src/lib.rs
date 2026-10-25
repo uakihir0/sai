@@ -3648,6 +3648,7 @@ fn local_type_template_matches_binders(
                 pending.extend(signature.inputs());
                 pending.push(signature.output());
             }
+            sai_ty::ty::TyKind::FnDef(_, arguments) => pending.extend(arguments.iter()),
             sai_ty::ty::TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
             sai_ty::ty::TyKind::Int(_)
             | sai_ty::ty::TyKind::Uint(_)
@@ -95924,12 +95925,32 @@ interface facade { use middle.{payload}; }"#;
                 complete_identity_args.into(),
             )
         );
-        let LocalEnumVariantValueType::TupleConstructor(tuple_template) = complete_adt
+        let LocalEnumVariantValueType::TupleConstructor {
+            function_item,
+            signature: tuple_template,
+        } = complete_adt
             .value_type_of_variant(&database.semantic_types, complete_variants[0].def_id())
             .expect("the exact source tuple variant resolves")
         else {
-            panic!("Value has a function signature template")
+            panic!("Value has a function-item value type and signature template")
         };
+        assert_eq!(
+            function_item.kind(),
+            &sai_ty::ty::TyKind::FnDef(
+                complete_variants[0].def_id(),
+                Arc::from(
+                    complete_type_params
+                        .iter()
+                        .map(|(_, param)| {
+                            database
+                                .semantic_types
+                                .intern(sai_ty::ty::TyKind::Param(*param))
+                        })
+                        .collect::<Vec<_>>()
+                ),
+            ),
+            "the tuple constructor retains the exact HIR variant and ordered identity arguments"
+        );
         assert_eq!(
             tuple_template
                 .generic_params()
