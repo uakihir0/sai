@@ -1,0 +1,91 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Crop {
+    Tomatoes
+    LeafyGreens
+    Zucchini
+    Beans
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum NeedPriority {
+    Immediate
+    Standard
+    Flexible
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum OutcomeStatus {
+    Fulfilled
+    PartiallyPlanned
+    NoBedReadyByDeadline
+    EarlierNeedUsedProduce
+    DailyCapacityReserved
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SupplyBed {
+    pub bed_id: U32
+    pub crop: Crop
+    pub available_kg: U32
+    pub remaining_kg: U32
+    pub ready_day: U32
+    pub last_pick_day: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PantryNeed {
+    pub request_id: U32
+    pub recipient: Str
+    pub crop: Crop
+    pub requested_kg: U32
+    pub priority: NeedPriority
+    pub due_day: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DailyCapacity {
+    pub day: U32
+    pub harvest_kg: U32
+    pub wash_pack_kg: U32
+    pub cold_chain_kg: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type HarvestAllocation {
+    pub request_id: U32
+    pub recipient: Str
+    pub crop: Crop
+    pub day: U32
+    pub kilograms: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type NeedOutcome {
+    pub request_id: U32
+    pub recipient: Str
+    pub crop: Crop
+    pub requested_kg: U32
+    pub planned_kg: U32
+    pub unfilled_kg: U32
+    pub status: OutcomeStatus
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type HarvestPlan {
+    pub allocations: Array<Option<HarvestAllocation>, 18>
+    pub allocation_count: USize
+    // Outcomes retain fixture order so callers can correlate by request ID.
+    pub outcomes: Array<Option<NeedOutcome>, 6>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type HarvestSummary {
+    pub planned_kg: U32
+    pub unfilled_kg: U32
+    pub fulfilled_requests: USize
+    pub partial_requests: USize
+    pub unplanned_requests: USize
+    pub allocation_count: USize
+    // Slots correspond to modeled days 1, 2, and 3.
+    pub daily_picked_kg: Array<U32, 3>
+}

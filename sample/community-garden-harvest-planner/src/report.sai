@@ -1,0 +1,79 @@
+use acme:community-garden-harvest-planner/model.{
+    HarvestPlan
+    HarvestSummary
+    NeedOutcome
+    OutcomeStatus
+}
+
+pub fn summarize(plan: HarvestPlan) -> HarvestSummary {
+    var planned_kg: U32 = 0
+    var unfilled_kg: U32 = 0
+    var fulfilled_requests: USize = 0
+    var partial_requests: USize = 0
+    var unplanned_requests: USize = 0
+    var daily_picked_kg: Array<U32, 3> = Array<U32, 3>.filled(0)
+
+    var allocation_index: USize = 0
+    while allocation_index < plan.allocation_count {
+        match plan.allocations[allocation_index] {
+            Some(allocation) => {
+                planned_kg += allocation.kilograms
+                if allocation.day == 1 {
+                    daily_picked_kg[0] += allocation.kilograms
+                } else if allocation.day == 2 {
+                    daily_picked_kg[1] += allocation.kilograms
+                } else if allocation.day == 3 {
+                    daily_picked_kg[2] += allocation.kilograms
+                }
+            }
+            None => {}
+        }
+        allocation_index += 1
+    }
+
+    for outcome in plan.outcomes {
+        match outcome {
+            Some(item) => {
+                unfilled_kg += item.unfilled_kg
+                match item.status {
+                    OutcomeStatus.Fulfilled => {
+                        fulfilled_requests += 1
+                    }
+                    OutcomeStatus.PartiallyPlanned => {
+                        partial_requests += 1
+                    }
+                    OutcomeStatus.NoBedReadyByDeadline => {
+                        unplanned_requests += 1
+                    }
+                    OutcomeStatus.EarlierNeedUsedProduce => {
+                        unplanned_requests += 1
+                    }
+                    OutcomeStatus.DailyCapacityReserved => {
+                        unplanned_requests += 1
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    HarvestSummary(
+        planned_kg: planned_kg,
+        unfilled_kg: unfilled_kg,
+        fulfilled_requests: fulfilled_requests,
+        partial_requests: partial_requests,
+        unplanned_requests: unplanned_requests,
+        allocation_count: plan.allocation_count,
+        daily_picked_kg: daily_picked_kg,
+    )
+}
+
+pub fn outcome_name(outcome: NeedOutcome) -> Str {
+    match outcome.status {
+        OutcomeStatus.Fulfilled => "fulfilled"
+        OutcomeStatus.PartiallyPlanned => "partially planned"
+        OutcomeStatus.NoBedReadyByDeadline => "no bed ready by deadline"
+        OutcomeStatus.EarlierNeedUsedProduce => "available produce went to earlier needs"
+        OutcomeStatus.DailyCapacityReserved => "daily handling capacity already reserved"
+    }
+}

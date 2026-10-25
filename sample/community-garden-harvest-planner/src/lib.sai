@@ -1,0 +1,16 @@
+use acme:community-garden-harvest-planner/data
+use acme:community-garden-harvest-planner/model.{HarvestPlan, HarvestSummary}
+use acme:community-garden-harvest-planner/planner
+use acme:community-garden-harvest-planner/report
+
+pub fn example_plan() -> HarvestPlan {
+    planner.build(data.supply_beds(), data.pantry_needs(), data.daily_capacities())
+}
+
+pub fn example_summary() -> HarvestSummary {
+    report.summarize(example_plan())
+}
+
+pub fn summarize(plan: HarvestPlan) -> HarvestSummary {
+    report.summarize(plan)
+}
