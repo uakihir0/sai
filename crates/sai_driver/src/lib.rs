@@ -37915,8 +37915,10 @@ property "shared"() {}
             "  callback_borrowed: fn(borrow Bool),\n",
             "  callback_effects: fn() effects {},\n",
             "  alias: Alias,\n",
+            "  after_unsupported: Char,\n",
             "}\n",
             "type Other { integer: Bool }\n",
+            "type Repeated { same: I32, same: Bool }\n",
             "type Generic<T> { value: T }\n",
             "type WhereOnly where I32: Copy { value: Bool }\n",
             "type Recovered { malformed: Bool = }\n",
@@ -37924,6 +37926,10 @@ property "shared"() {}
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
         let collection = database
             .collect_phase1_package_scopes_collection(
                 &module_tree,
@@ -37932,10 +37938,19 @@ property "shared"() {}
                 Phase1BuildContext::default(),
             )
             .expect("current-snapshot Phase 1 collection succeeds");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty active source-member closure validates");
         let resolved = database
-            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .resolve_type_owner_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
             .expect("current-snapshot type owner paths resolve");
         assert!(resolved.matches_collection(&collection));
+        assert!(resolved.matches_member_scopes(&collection, &member_scopes));
 
         let def_paths = Arc::clone(
             database
@@ -37971,7 +37986,12 @@ property "shared"() {}
         };
         let fields_owner = owner_for("Fields");
         let fields = resolved
-            .local_record_field_types(&collection, fields_owner)
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                fields_owner,
+            )
             .expect("exact collection guards field types")
             .expect("direct local record has a field projection");
         let LocalRecordFieldTypesProjection::Supported {
@@ -37982,7 +38002,7 @@ property "shared"() {}
             panic!("nongeneric unrecovered record fields can be projected");
         };
         assert_eq!(*projected_owner, fields_owner);
-        assert_eq!(projected_fields.len(), 8);
+        assert_eq!(projected_fields.len(), 9);
 
         let field_named = |name: &str| {
             projected_fields
@@ -37990,10 +38010,35 @@ property "shared"() {}
                 .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
                 .expect("source field is present in the projection")
         };
+        assert_eq!(
+            projected_fields
+                .iter()
+                .map(|field| database
+                    .symbols
+                    .resolve(field.name())
+                    .expect("field name resolves"))
+                .collect::<Vec<_>>(),
+            [
+                Arc::<str>::from("integer"),
+                Arc::<str>::from("tuple"),
+                Arc::<str>::from("callback"),
+                Arc::<str>::from("array"),
+                Arc::<str>::from("borrowed"),
+                Arc::<str>::from("callback_borrowed"),
+                Arc::<str>::from("callback_effects"),
+                Arc::<str>::from("alias"),
+                Arc::<str>::from("after_unsupported"),
+            ],
+            "field results preserve source order"
+        );
         let integer = field_named("integer");
         assert!(matches!(
             integer.ty().expect("primitive field lowers").kind(),
             sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32)
+        ));
+        assert!(matches!(
+            fields.type_of_field(integer.def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32))
         ));
         let tuple = field_named("tuple");
         let tuple_ty = tuple.ty().expect("tuple field lowers");
@@ -38016,9 +38061,18 @@ property "shared"() {}
             callback_sig.inputs()[0].kind(),
             sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32)
         ));
+        let sai_ty::ty::TyKind::Tuple(nested_input) = callback_sig.inputs()[1].kind() else {
+            panic!("the nested callback input retains its tuple shape");
+        };
+        assert_eq!(nested_input.len(), 1);
+        assert!(matches!(nested_input[0].kind(), sai_ty::ty::TyKind::Char));
         assert!(matches!(
             callback_sig.output().kind(),
             sai_ty::ty::TyKind::Bool
+        ));
+        assert!(matches!(
+            fields.type_of_field(callback.def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::FnPtr(_))
         ));
 
         for (name, expected_reason) in [
@@ -38042,11 +38096,26 @@ property "shared"() {}
                 Err(expected_reason),
                 "{name} remains unsupported within its own field"
             );
+            assert_eq!(
+                fields.type_of_field(field_named(name).def_id()),
+                Some(Err(expected_reason)),
+                "{name} retains its field-local failure through exact-DefId lookup"
+            );
         }
+        let after_unsupported = field_named("after_unsupported");
+        assert!(matches!(
+            fields.type_of_field(after_unsupported.def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
+        ));
 
         let other_owner = owner_for("Other");
         let other = resolved
-            .local_record_field_types(&collection, other_owner)
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                other_owner,
+            )
             .expect("exact collection guards sibling field types")
             .expect("the other record also has a field projection");
         let LocalRecordFieldTypesProjection::Supported {
@@ -38071,8 +38140,41 @@ property "shared"() {}
             "the lookup is keyed by the exact field DefId"
         );
 
+        let repeated = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("Repeated"),
+            )
+            .expect("exact collection guards repeated-name field types")
+            .expect("repeated-name record has a field projection");
+        let repeated_fields = repeated
+            .fields()
+            .expect("direct repeated-name record passes owner validation");
+        assert_eq!(repeated_fields.len(), 2);
+        assert_eq!(repeated_fields[0].name(), repeated_fields[1].name());
+        assert_ne!(
+            repeated_fields[0].def_id(),
+            repeated_fields[1].def_id(),
+            "same-named fields retain distinct definition identities"
+        );
+        assert!(matches!(
+            repeated.type_of_field(repeated_fields[0].def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32))
+        ));
+        assert!(matches!(
+            repeated.type_of_field(repeated_fields[1].def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Bool)
+        ));
+
         let generic = resolved
-            .local_record_field_types(&collection, owner_for("Generic"))
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("Generic"),
+            )
             .expect("exact collection guards generic record rejection")
             .expect("generic record rejection is retained");
         assert_eq!(
@@ -38080,7 +38182,12 @@ property "shared"() {}
             Some(LocalRecordFieldTypesUnsupportedReason::GenericParameters)
         );
         let where_only = resolved
-            .local_record_field_types(&collection, owner_for("WhereOnly"))
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("WhereOnly"),
+            )
             .expect("exact collection guards where-clause rejection")
             .expect("where-clause rejection is retained");
         assert_eq!(
@@ -38088,7 +38195,12 @@ property "shared"() {}
             Some(LocalRecordFieldTypesUnsupportedReason::WherePredicates)
         );
         let recovered = resolved
-            .local_record_field_types(&collection, owner_for("Recovered"))
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("Recovered"),
+            )
             .expect("exact collection guards recovered record rejection")
             .expect("recovered record rejection is retained");
         assert_eq!(
@@ -38104,10 +38216,22 @@ property "shared"() {}
             .owner;
         assert!(
             resolved
-                .local_record_field_types(&collection, payload_owner)
+                .local_record_field_types_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    None,
+                    payload_owner,
+                )
                 .expect("exact collection guards enum lookup")
                 .is_none(),
             "enum payloads do not enter the record field-type projection"
+        );
+        assert!(
+            matches!(
+                resolved.local_record_field_types(&collection, fields_owner),
+                Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+            ),
+            "a scoped resolution requires the same active closure at lookup"
         );
 
         let stale_snapshot = snapshot_with_version(&snapshot, 19);
@@ -38119,8 +38243,28 @@ property "shared"() {}
                 Phase1BuildContext::default(),
             )
             .expect("a new source snapshot collects independently");
+        let stale_member_scopes = database
+            .collect_active_source_member_scopes(&stale_collection, &graph, &[])
+            .expect("stale snapshot closure still matches its own collection");
+        assert!(
+            matches!(
+                resolved.local_record_field_types_with_scopes(
+                    &collection,
+                    Some(&stale_member_scopes),
+                    None,
+                    fields_owner,
+                ),
+                Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+            ),
+            "a stale closure cannot be substituted for the current active closure"
+        );
         assert!(matches!(
-            resolved.local_record_field_types(&stale_collection, fields_owner),
+            resolved.local_record_field_types_with_scopes(
+                &stale_collection,
+                Some(&stale_member_scopes),
+                None,
+                fields_owner,
+            ),
             Err(OwnerControlFlowResolutionError::SnapshotMismatch)
         ));
     }
