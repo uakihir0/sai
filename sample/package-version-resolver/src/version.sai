@@ -1,0 +1,23 @@
+use acme:package-version-resolver/model.{Version, VersionRange}
+
+pub fn less(left: Version, right: Version) -> Bool {
+    if left.major != right.major {
+        left.major < right.major
+    } else if left.minor != right.minor {
+        left.minor < right.minor
+    } else {
+        left.patch < right.patch
+    }
+}
+
+pub fn range_is_nonempty(range: VersionRange) -> Bool {
+    less(range.minimum_inclusive, range.maximum_exclusive)
+}
+
+pub fn range_contains(range: VersionRange, candidate: Version) -> Bool {
+    (
+        range_is_nonempty(range)
+        and not less(candidate, range.minimum_inclusive)
+        and less(candidate, range.maximum_exclusive)
+    )
+}
