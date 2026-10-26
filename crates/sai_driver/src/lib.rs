@@ -9262,13 +9262,24 @@ fn is_supported_direct_call_bitwise_operands_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
 ) -> bool {
-    [left, right].into_iter().all(|operand| {
-        let ExprKind::Path(path) = operand.kind else {
-            return false;
-        };
-        resolved_plain_local_path_binding(path, locals, inputs)
-            .is_some_and(|binding| preceding_bindings.contains(&binding))
-    })
+    let ExprKind::Path(path) = left.kind else {
+        return false;
+    };
+    if !resolved_plain_local_path_binding(path, locals, inputs)
+        .is_some_and(|binding| preceding_bindings.contains(&binding))
+    {
+        return false;
+    }
+
+    if matches!(right.kind, ExprKind::Lit(Lit::Int { .. })) {
+        return true;
+    }
+
+    let ExprKind::Path(path) = right.kind else {
+        return false;
+    };
+    resolved_plain_local_path_binding(path, locals, inputs)
+        .is_some_and(|binding| preceding_bindings.contains(&binding))
 }
 
 fn is_supported_direct_call_leaf_argument_shape(
@@ -49124,6 +49135,53 @@ property "shared"() {}
             "pub fn bitwise_integer_literal_unsupported(left: I32) -> I32 { apply_i32(left & 1) }\n",
             "pub fn bitwise_literal_left_unsupported(right: I32) -> I32 { apply_i32(1 | right) }\n",
             "pub fn bitwise_literal_pair_unsupported() -> I32 { apply_i32(1 ^ 2) }\n",
+            "pub fn bitwise_integer_literal_parameter_mismatch(left: I32) -> I32 {\n",
+            "    let result = apply_bool(left & 1)\n",
+            "    let alias = result\n",
+            "    let valid = apply_i32(left & 2)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn bitwise_byte_integer_literal_mismatch(left: Byte) -> Byte {\n",
+            "    let result = apply_byte(left & 1)\n",
+            "    let alias = result\n",
+            "    let valid = apply_byte(left)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn bitwise_bool_integer_literal_unsupported(left: Bool) -> Bool { apply_bool(left & 1) }\n",
+            "pub fn bitwise_f32_integer_literal_unsupported(left: F32) -> F32 { float_fn(left | 1) }\n",
+            "pub fn bitwise_f64_integer_literal_unsupported(left: F64) -> F64 { apply_double(left ^ 1) }\n",
+            "pub fn bitwise_char_integer_literal_trait_unsupported(left: Char) -> Char { identity_char(left ^ 1) }\n",
+            "pub fn bitwise_char_integer_literal_out_of_range(left: Char) -> Char { identity_char(left & 9223372036854775808) }\n",
+            "pub fn bitwise_char_integer_literal_below_range(left: Char) -> Char { identity_char(left ^ -9223372036854775809) }\n",
+            "pub fn bitwise_literal_rhs_bool_unsupported(left: I32) -> I32 { apply_i32(left & true) }\n",
+            "pub fn bitwise_literal_rhs_byte_unsupported(left: I32) -> I32 { apply_i32(left & b'a') }\n",
+            "pub fn bitwise_literal_rhs_char_unsupported(left: I32) -> I32 { apply_i32(left & 'x') }\n",
+            "pub fn bitwise_literal_rhs_float_unsupported(left: I32) -> I32 { apply_i32(left & 1.0) }\n",
+            "pub fn bitwise_unresolved_integer_literal_path_unsupported(left: I32) -> I32 {\n",
+            "    let rhs = 1\n",
+            "    apply_i32(left & rhs)\n",
+            "}\n",
+            "pub fn bitwise_unresolved_integer_literal_left_unsupported() -> I32 {\n",
+            "    let left = 1\n",
+            "    apply_i32(left & 1)\n",
+            "}\n",
+            "pub fn bitwise_integer_literal_alias_left(left: I32) -> I32 {\n",
+            "    let copy = left\n",
+            "    apply_i32(copy & 1)\n",
+            "}\n",
+            "pub fn bitwise_integer_literal_forward_left_unsupported(right: I32) -> I32 {\n",
+            "    let result = apply_i32(left & 1)\n",
+            "    let left = right\n",
+            "    result\n",
+            "}\n",
+            "pub fn bitwise_integer_literal_computed_left_unsupported(left: I32) -> I32 { apply_i32((left + 1) & 1) }\n",
+            "pub fn bitwise_integer_literal_nested_operator_unsupported(left: I32, right: I32) -> I32 { apply_i32((left & right) | 1) }\n",
+            "pub fn bitwise_integer_literal_call_operand_unsupported(left: I32) -> I32 { apply_i32(add_one(left) & 1) }\n",
+            "pub fn bitwise_integer_literal_not_operand_unsupported(left: I32) -> I32 { apply_i32((~left) & 1) }\n",
+            "pub fn bitwise_integer_literal_shift_operand_unsupported(left: I32) -> I32 { apply_i32((left << 1) & 1) }\n",
+            "pub fn bitwise_integer_literal_deep_nested_call_unsupported(left: I32) -> I32 { apply_i32(apply_i32(apply_i32(left & 1))) }\n",
+            "pub fn bitwise_integer_literal_generic_target_unsupported(left: I32) -> I32 { generic_fn(left & 1) }\n",
+            "pub fn bitwise_integer_literal_extra_ignored(left: I32) -> I32 { apply_i32(left, left & 1) }\n",
             "pub fn bitwise_computed_operand_unsupported(left: I32, right: I32) -> I32 { apply_i32((left + 1) & right) }\n",
             "pub fn bitwise_nested_operator_unsupported(left: I32, right: I32) -> I32 { apply_i32((left & right) | left) }\n",
             "pub fn bitwise_call_operand_unsupported(left: I32, right: I32) -> I32 { apply_i32(add_one(left) & right) }\n",
@@ -49261,6 +49319,25 @@ property "shared"() {}
             ("F32", "float_fn", PrimTy::F32),
             ("F64", "apply_double", PrimTy::F64),
         ];
+        let bitwise_integer_literal_types = bitwise_primitive_types
+            .iter()
+            .copied()
+            .filter(|(_, _, primitive)| {
+                matches!(
+                    primitive,
+                    PrimTy::I8
+                        | PrimTy::I16
+                        | PrimTy::I32
+                        | PrimTy::I64
+                        | PrimTy::ISize
+                        | PrimTy::U8
+                        | PrimTy::U16
+                        | PrimTy::U32
+                        | PrimTy::U64
+                        | PrimTy::USize
+                )
+            })
+            .collect::<Vec<_>>();
         let mut bitwise_rhs_cases = Vec::new();
         let mut generated_bitwise_cases = String::new();
         let rhs_parameters = bitwise_primitive_types
@@ -49337,6 +49414,91 @@ property "shared"() {}
                 .push_str(&format!("    let valid = {callee}(left)\n    valid\n}}\n"));
         }
         root.push_str(&generated_bitwise_cases);
+        let mut generated_bitwise_integer_literal_cases = String::new();
+        for (left_name, callee, _) in bitwise_integer_literal_types.iter().copied() {
+            let suffix = left_name.to_ascii_lowercase();
+            generated_bitwise_integer_literal_cases.push_str(&format!(
+                "pub fn bitwise_integer_literal_rhs_{suffix}(left: {left_name}) -> {left_name} {{\n"
+            ));
+            for (name, operator, literal) in
+                [("and", "&", "1"), ("or", "|", "2"), ("xor", "^", "3")]
+            {
+                generated_bitwise_integer_literal_cases.push_str(&format!(
+                    "    let {name}_value = {callee}(left {operator} {literal})\n"
+                ));
+            }
+            generated_bitwise_integer_literal_cases
+                .push_str(&format!("    {callee}(left ^ 3)\n}}\n"));
+
+            generated_bitwise_integer_literal_cases.push_str(&format!(
+                "pub fn nested_bitwise_integer_literal_rhs_{suffix}(left: {left_name}) -> {left_name} {{\n"
+            ));
+            for (name, operator, literal) in
+                [("and", "&", "1"), ("or", "|", "2"), ("xor", "^", "3")]
+            {
+                generated_bitwise_integer_literal_cases.push_str(&format!(
+                    "    let {name}_value = {callee}({callee}(left {operator} {literal}))\n"
+                ));
+            }
+            generated_bitwise_integer_literal_cases
+                .push_str(&format!("    {callee}({callee}(left ^ 3))\n}}\n"));
+        }
+        let bitwise_integer_literal_boundaries = [
+            ("I8", "apply_i8", "-128", "127"),
+            ("I16", "apply_i16", "-32768", "32767"),
+            ("I32", "apply_i32", "-2147483648", "2147483647"),
+            (
+                "I64",
+                "apply_i64",
+                "-9223372036854775808",
+                "9223372036854775807",
+            ),
+            ("ISize", "apply_isize", "-2147483648", "2147483647"),
+            ("U8", "apply_u8", "0", "255"),
+            ("U16", "apply_u16", "0", "65535"),
+            ("U32", "apply_u32", "0", "4294967295"),
+            ("U64", "apply_u64", "0", "18446744073709551615"),
+            ("USize", "apply_usize", "0", "4294967295"),
+        ];
+        for (left_name, callee, minimum, maximum) in bitwise_integer_literal_boundaries {
+            let suffix = left_name.to_ascii_lowercase();
+            generated_bitwise_integer_literal_cases.push_str(&format!(
+                "pub fn bitwise_integer_literal_boundaries_{suffix}(left: {left_name}) -> {left_name} {{\n"
+            ));
+            generated_bitwise_integer_literal_cases
+                .push_str(&format!("    let minimum = {callee}(left & {minimum})\n"));
+            generated_bitwise_integer_literal_cases
+                .push_str(&format!("    {callee}(left | {maximum})\n}}\n"));
+        }
+        let bitwise_integer_literal_out_of_range = [
+            ("I8", "apply_i8", "below_min", "-129"),
+            ("I8", "apply_i8", "above_max", "128"),
+            ("I16", "apply_i16", "below_min", "-32769"),
+            ("I16", "apply_i16", "above_max", "32768"),
+            ("I32", "apply_i32", "below_min", "-2147483649"),
+            ("I32", "apply_i32", "above_max", "2147483648"),
+            ("I64", "apply_i64", "below_min", "-9223372036854775809"),
+            ("I64", "apply_i64", "above_max", "9223372036854775808"),
+            ("ISize", "apply_isize", "below_min", "-2147483649"),
+            ("ISize", "apply_isize", "above_max", "2147483648"),
+            ("U8", "apply_u8", "below_min", "-1"),
+            ("U8", "apply_u8", "above_max", "256"),
+            ("U16", "apply_u16", "below_min", "-1"),
+            ("U16", "apply_u16", "above_max", "65536"),
+            ("U32", "apply_u32", "below_min", "-1"),
+            ("U32", "apply_u32", "above_max", "4294967296"),
+            ("U64", "apply_u64", "below_min", "-1"),
+            ("U64", "apply_u64", "above_max", "18446744073709551616"),
+            ("USize", "apply_usize", "below_min", "-1"),
+            ("USize", "apply_usize", "above_max", "4294967296"),
+        ];
+        for (left_name, callee, side, literal) in bitwise_integer_literal_out_of_range {
+            let suffix = left_name.to_ascii_lowercase();
+            generated_bitwise_integer_literal_cases.push_str(&format!(
+                "pub fn bitwise_integer_literal_out_of_range_{suffix}_{side}(left: {left_name}) -> {left_name} {{ {callee}(left & {literal}) }}\n"
+            ));
+        }
+        root.push_str(&generated_bitwise_integer_literal_cases);
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
@@ -49419,38 +49581,44 @@ property "shared"() {}
             .iter()
             .map(|name| owner_named(&database, &resolved, name))
             .collect::<Vec<_>>();
-        let assert_supported = |name: &str, expected_codes: &[sai_diagnostics::Code]| {
-            let owner = owner_named(&database, &resolved, name);
-            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
-                .body_type_check()
-                .expect("owner body check is available")
-            else {
-                panic!("function `{name}` should stay in the supported call slice");
+        let assert_supported =
+            |database: &RootDatabase, name: &str, expected_codes: &[sai_diagnostics::Code]| {
+                let owner = owner_named(database, &resolved, name);
+                let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                    .body_type_check()
+                    .expect("owner body check is available")
+                else {
+                    panic!("function `{name}` should stay in the supported call slice");
+                };
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.code)
+                        .collect::<Vec<_>>(),
+                    expected_codes,
+                    "diagnostics for `{name}`"
+                );
+                let type_results = owner
+                    .primitive_body_type_results()
+                    .expect("supported direct-call owner has no projection error")
+                    .expect("supported direct-call owner publishes primitive facts");
+                assert_primitive_type_result_parity(database, type_results);
+                owner
             };
-            assert_eq!(
-                diagnostics
-                    .iter()
-                    .map(|diagnostic| diagnostic.code)
-                    .collect::<Vec<_>>(),
-                expected_codes,
-                "diagnostics for `{name}`"
-            );
-            let type_results = owner
-                .primitive_body_type_results()
-                .expect("supported direct-call owner has no projection error")
-                .expect("supported direct-call owner publishes primitive facts");
-            assert_primitive_type_result_parity(&database, type_results);
-            owner
-        };
-        let initializer = assert_supported("initializer", &[]);
-        let tail_call = assert_supported("tail_call", &[]);
-        let forward_call = assert_supported("forward_call", &[]);
-        let recursive_call = assert_supported("recursive_call", &[]);
-        let nested_initializer = assert_supported("nested_initializer", &[]);
-        let nested_tail = assert_supported("nested_tail", &[]);
-        let nested_inner_error =
-            assert_supported("nested_inner_error", &[sai_diagnostics::Code::TypeMismatch]);
+        assert_supported(&database, "bitwise_integer_literal_unsupported", &[]);
+        let initializer = assert_supported(&database, "initializer", &[]);
+        let tail_call = assert_supported(&database, "tail_call", &[]);
+        let forward_call = assert_supported(&database, "forward_call", &[]);
+        let recursive_call = assert_supported(&database, "recursive_call", &[]);
+        let nested_initializer = assert_supported(&database, "nested_initializer", &[]);
+        let nested_tail = assert_supported(&database, "nested_tail", &[]);
+        let nested_inner_error = assert_supported(
+            &database,
+            "nested_inner_error",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         let nested_named_inner_error = assert_supported(
+            &database,
             "nested_named_inner_error",
             &[
                 sai_diagnostics::Code::NamedArgumentOnFunction,
@@ -49458,124 +49626,146 @@ property "shared"() {}
             ],
         );
         let nested_return_mismatch = assert_supported(
+            &database,
             "nested_return_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let nested_inner_too_few = assert_supported(
+            &database,
             "nested_inner_too_few",
             &[sai_diagnostics::Code::WrongArgumentCount],
         );
         let nested_inner_too_many = assert_supported(
+            &database,
             "nested_inner_too_many",
             &[sai_diagnostics::Code::WrongArgumentCount],
         );
         let nested_call_with_arithmetic_argument =
-            assert_supported("nested_call_with_arithmetic_argument", &[]);
-        let arithmetic_call_argument = assert_supported("arithmetic_call_argument", &[]);
+            assert_supported(&database, "nested_call_with_arithmetic_argument", &[]);
+        let arithmetic_call_argument = assert_supported(&database, "arithmetic_call_argument", &[]);
         let arithmetic_subtraction_call_argument =
-            assert_supported("arithmetic_subtraction_call_argument", &[]);
+            assert_supported(&database, "arithmetic_subtraction_call_argument", &[]);
         let arithmetic_multiplication_call_argument =
-            assert_supported("arithmetic_multiplication_call_argument", &[]);
+            assert_supported(&database, "arithmetic_multiplication_call_argument", &[]);
         let arithmetic_division_call_argument =
-            assert_supported("arithmetic_division_call_argument", &[]);
+            assert_supported(&database, "arithmetic_division_call_argument", &[]);
         let arithmetic_local_paths_call_argument =
-            assert_supported("arithmetic_local_paths_call_argument", &[]);
+            assert_supported(&database, "arithmetic_local_paths_call_argument", &[]);
         let nested_call_with_basic_arithmetic_argument =
-            assert_supported("nested_call_with_basic_arithmetic_argument", &[]);
-        let comparison_operators = assert_supported("comparison_operators", &[]);
-        let comparison_literal_leaves = assert_supported("comparison_literal_leaves", &[]);
-        let nested_comparison_call = assert_supported("nested_comparison_call", &[]);
-        let logical_and_call_argument = assert_supported("logical_and_call_argument", &[]);
-        let logical_or_call_argument = assert_supported("logical_or_call_argument", &[]);
+            assert_supported(&database, "nested_call_with_basic_arithmetic_argument", &[]);
+        let comparison_operators = assert_supported(&database, "comparison_operators", &[]);
+        let comparison_literal_leaves =
+            assert_supported(&database, "comparison_literal_leaves", &[]);
+        let nested_comparison_call = assert_supported(&database, "nested_comparison_call", &[]);
+        let logical_and_call_argument =
+            assert_supported(&database, "logical_and_call_argument", &[]);
+        let logical_or_call_argument = assert_supported(&database, "logical_or_call_argument", &[]);
         let nested_logical_and_call_argument =
-            assert_supported("nested_logical_and_call_argument", &[]);
+            assert_supported(&database, "nested_logical_and_call_argument", &[]);
         let nested_logical_or_call_argument =
-            assert_supported("nested_logical_or_call_argument", &[]);
+            assert_supported(&database, "nested_logical_or_call_argument", &[]);
         let logical_local_paths_call_argument =
-            assert_supported("logical_local_paths_call_argument", &[]);
-        let logical_path_literal_and = assert_supported("logical_path_literal_and", &[]);
-        let logical_literal_path_and = assert_supported("logical_literal_path_and", &[]);
-        let logical_path_literal_or = assert_supported("logical_path_literal_or", &[]);
-        let logical_literal_path_or = assert_supported("logical_literal_path_or", &[]);
-        let logical_literal_pair_and = assert_supported("logical_literal_pair_and", &[]);
-        let logical_literal_pair_or = assert_supported("logical_literal_pair_or", &[]);
+            assert_supported(&database, "logical_local_paths_call_argument", &[]);
+        let logical_path_literal_and = assert_supported(&database, "logical_path_literal_and", &[]);
+        let logical_literal_path_and = assert_supported(&database, "logical_literal_path_and", &[]);
+        let logical_path_literal_or = assert_supported(&database, "logical_path_literal_or", &[]);
+        let logical_literal_path_or = assert_supported(&database, "logical_literal_path_or", &[]);
+        let logical_literal_pair_and = assert_supported(&database, "logical_literal_pair_and", &[]);
+        let logical_literal_pair_or = assert_supported(&database, "logical_literal_pair_or", &[]);
         let nested_logical_path_literal_and =
-            assert_supported("nested_logical_path_literal_and", &[]);
+            assert_supported(&database, "nested_logical_path_literal_and", &[]);
         let nested_logical_literal_path_and =
-            assert_supported("nested_logical_literal_path_and", &[]);
+            assert_supported(&database, "nested_logical_literal_path_and", &[]);
         let nested_logical_path_literal_or =
-            assert_supported("nested_logical_path_literal_or", &[]);
+            assert_supported(&database, "nested_logical_path_literal_or", &[]);
         let nested_logical_literal_path_or =
-            assert_supported("nested_logical_literal_path_or", &[]);
+            assert_supported(&database, "nested_logical_literal_path_or", &[]);
         let nested_logical_literal_pair_and =
-            assert_supported("nested_logical_literal_pair_and", &[]);
+            assert_supported(&database, "nested_logical_literal_pair_and", &[]);
         let nested_logical_literal_pair_or =
-            assert_supported("nested_logical_literal_pair_or", &[]);
+            assert_supported(&database, "nested_logical_literal_pair_or", &[]);
         let logical_literal_operand_mismatch = assert_supported(
+            &database,
             "logical_literal_operand_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let logical_literal_parameter_mismatch = assert_supported(
+            &database,
             "logical_literal_parameter_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
-        let not_call_argument = assert_supported("not_call_argument", &[]);
-        let nested_not_call_argument = assert_supported("nested_not_call_argument", &[]);
-        let not_local_path_call_argument = assert_supported("not_local_path_call_argument", &[]);
-        let not_true_call_argument = assert_supported("not_true_call_argument", &[]);
-        let not_false_call_argument = assert_supported("not_false_call_argument", &[]);
-        let nested_not_true_call_argument = assert_supported("nested_not_true_call_argument", &[]);
+        let not_call_argument = assert_supported(&database, "not_call_argument", &[]);
+        let nested_not_call_argument = assert_supported(&database, "nested_not_call_argument", &[]);
+        let not_local_path_call_argument =
+            assert_supported(&database, "not_local_path_call_argument", &[]);
+        let not_true_call_argument = assert_supported(&database, "not_true_call_argument", &[]);
+        let not_false_call_argument = assert_supported(&database, "not_false_call_argument", &[]);
+        let nested_not_true_call_argument =
+            assert_supported(&database, "nested_not_true_call_argument", &[]);
         let nested_not_false_call_argument =
-            assert_supported("nested_not_false_call_argument", &[]);
-        let bitnot_call_argument = assert_supported("bitnot_call_argument", &[]);
-        let bitnot_unsigned_call_argument = assert_supported("bitnot_unsigned_call_argument", &[]);
+            assert_supported(&database, "nested_not_false_call_argument", &[]);
+        let bitnot_call_argument = assert_supported(&database, "bitnot_call_argument", &[]);
+        let bitnot_unsigned_call_argument =
+            assert_supported(&database, "bitnot_unsigned_call_argument", &[]);
         let bitnot_shadowed_unsigned_call_argument =
-            assert_supported("bitnot_shadowed_unsigned_call_argument", &[]);
-        let nested_bitnot_call_argument = assert_supported("nested_bitnot_call_argument", &[]);
+            assert_supported(&database, "bitnot_shadowed_unsigned_call_argument", &[]);
+        let nested_bitnot_call_argument =
+            assert_supported(&database, "nested_bitnot_call_argument", &[]);
         let bitnot_parameter_mismatch = assert_supported(
+            &database,
             "bitnot_parameter_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let bitnot_operator_not_supported = assert_supported(
+            &database,
             "bitnot_operator_not_supported",
             &[sai_diagnostics::Code::OperatorNotSupported],
         );
         let bitnot_float_operator_not_supported = assert_supported(
+            &database,
             "bitnot_float_operator_not_supported",
             &[sai_diagnostics::Code::OperatorNotSupported],
         );
         let bitnot_char_operator_not_supported = assert_supported(
+            &database,
             "bitnot_char_operator_not_supported",
             &[sai_diagnostics::Code::OperatorNotSupported],
         );
         let bitnot_double_float_operator_not_supported = assert_supported(
+            &database,
             "bitnot_double_float_operator_not_supported",
             &[sai_diagnostics::Code::OperatorNotSupported],
         );
-        let shift_i8_call_argument = assert_supported("shift_i8_call_argument", &[]);
-        let shift_i16_call_argument = assert_supported("shift_i16_call_argument", &[]);
-        let shift_i32_call_argument = assert_supported("shift_i32_call_argument", &[]);
-        let shift_i64_call_argument = assert_supported("shift_i64_call_argument", &[]);
-        let shift_u8_call_argument = assert_supported("shift_u8_call_argument", &[]);
-        let shift_u16_call_argument = assert_supported("shift_u16_call_argument", &[]);
-        let shift_u32_call_argument = assert_supported("shift_u32_call_argument", &[]);
-        let shift_u64_call_argument = assert_supported("shift_u64_call_argument", &[]);
-        let shift_isize_call_argument = assert_supported("shift_isize_call_argument", &[]);
-        let shift_usize_call_argument = assert_supported("shift_usize_call_argument", &[]);
-        let shift_byte_call_argument = assert_supported("shift_byte_call_argument", &[]);
-        let nested_shift_call_argument = assert_supported("nested_shift_call_argument", &[]);
+        let shift_i8_call_argument = assert_supported(&database, "shift_i8_call_argument", &[]);
+        let shift_i16_call_argument = assert_supported(&database, "shift_i16_call_argument", &[]);
+        let shift_i32_call_argument = assert_supported(&database, "shift_i32_call_argument", &[]);
+        let shift_i64_call_argument = assert_supported(&database, "shift_i64_call_argument", &[]);
+        let shift_u8_call_argument = assert_supported(&database, "shift_u8_call_argument", &[]);
+        let shift_u16_call_argument = assert_supported(&database, "shift_u16_call_argument", &[]);
+        let shift_u32_call_argument = assert_supported(&database, "shift_u32_call_argument", &[]);
+        let shift_u64_call_argument = assert_supported(&database, "shift_u64_call_argument", &[]);
+        let shift_isize_call_argument =
+            assert_supported(&database, "shift_isize_call_argument", &[]);
+        let shift_usize_call_argument =
+            assert_supported(&database, "shift_usize_call_argument", &[]);
+        let shift_byte_call_argument = assert_supported(&database, "shift_byte_call_argument", &[]);
+        let nested_shift_call_argument =
+            assert_supported(&database, "nested_shift_call_argument", &[]);
         let shift_local_paths_call_argument =
-            assert_supported("shift_local_paths_call_argument", &[]);
-        let shift_shadowed_binding = assert_supported("shift_shadowed_binding", &[]);
+            assert_supported(&database, "shift_local_paths_call_argument", &[]);
+        let shift_shadowed_binding = assert_supported(&database, "shift_shadowed_binding", &[]);
         let shift_right_type_mismatch = assert_supported(
+            &database,
             "shift_right_type_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let shift_extra_ignored = assert_supported(
+            &database,
             "shift_extra_ignored",
             &[sai_diagnostics::Code::WrongArgumentCount],
         );
         let shift_bool_unsupported = assert_supported(
+            &database,
             "shift_bool_unsupported",
             &[
                 sai_diagnostics::Code::TypeMismatch,
@@ -49583,6 +49773,7 @@ property "shared"() {}
             ],
         );
         let shift_f32_unsupported = assert_supported(
+            &database,
             "shift_f32_unsupported",
             &[
                 sai_diagnostics::Code::TypeMismatch,
@@ -49590,6 +49781,7 @@ property "shared"() {}
             ],
         );
         let shift_f64_unsupported = assert_supported(
+            &database,
             "shift_f64_unsupported",
             &[
                 sai_diagnostics::Code::TypeMismatch,
@@ -49597,54 +49789,73 @@ property "shared"() {}
             ],
         );
         let shift_char_unsupported = assert_supported(
+            &database,
             "shift_char_unsupported",
             &[
                 sai_diagnostics::Code::TypeMismatch,
                 sai_diagnostics::Code::OperatorNotSupported,
             ],
         );
-        let bitwise_i8_call_arguments = assert_supported("bitwise_i8_call_arguments", &[]);
-        let bitwise_i16_call_arguments = assert_supported("bitwise_i16_call_arguments", &[]);
-        let bitwise_i32_call_arguments = assert_supported("bitwise_i32_call_arguments", &[]);
-        let bitwise_i64_call_arguments = assert_supported("bitwise_i64_call_arguments", &[]);
-        let bitwise_isize_call_arguments = assert_supported("bitwise_isize_call_arguments", &[]);
-        let bitwise_u8_call_arguments = assert_supported("bitwise_u8_call_arguments", &[]);
-        let bitwise_u16_call_arguments = assert_supported("bitwise_u16_call_arguments", &[]);
-        let bitwise_u32_call_arguments = assert_supported("bitwise_u32_call_arguments", &[]);
-        let bitwise_u64_call_arguments = assert_supported("bitwise_u64_call_arguments", &[]);
-        let bitwise_usize_call_arguments = assert_supported("bitwise_usize_call_arguments", &[]);
-        let bitwise_byte_call_arguments = assert_supported("bitwise_byte_call_arguments", &[]);
-        let nested_bitwise_call_argument = assert_supported("nested_bitwise_call_argument", &[]);
+        let bitwise_i8_call_arguments =
+            assert_supported(&database, "bitwise_i8_call_arguments", &[]);
+        let bitwise_i16_call_arguments =
+            assert_supported(&database, "bitwise_i16_call_arguments", &[]);
+        let bitwise_i32_call_arguments =
+            assert_supported(&database, "bitwise_i32_call_arguments", &[]);
+        let bitwise_i64_call_arguments =
+            assert_supported(&database, "bitwise_i64_call_arguments", &[]);
+        let bitwise_isize_call_arguments =
+            assert_supported(&database, "bitwise_isize_call_arguments", &[]);
+        let bitwise_u8_call_arguments =
+            assert_supported(&database, "bitwise_u8_call_arguments", &[]);
+        let bitwise_u16_call_arguments =
+            assert_supported(&database, "bitwise_u16_call_arguments", &[]);
+        let bitwise_u32_call_arguments =
+            assert_supported(&database, "bitwise_u32_call_arguments", &[]);
+        let bitwise_u64_call_arguments =
+            assert_supported(&database, "bitwise_u64_call_arguments", &[]);
+        let bitwise_usize_call_arguments =
+            assert_supported(&database, "bitwise_usize_call_arguments", &[]);
+        let bitwise_byte_call_arguments =
+            assert_supported(&database, "bitwise_byte_call_arguments", &[]);
+        let nested_bitwise_call_argument =
+            assert_supported(&database, "nested_bitwise_call_argument", &[]);
         let nested_bitwise_and_call_argument =
-            assert_supported("nested_bitwise_and_call_argument", &[]);
+            assert_supported(&database, "nested_bitwise_and_call_argument", &[]);
         let nested_bitwise_or_call_argument =
-            assert_supported("nested_bitwise_or_call_argument", &[]);
+            assert_supported(&database, "nested_bitwise_or_call_argument", &[]);
         let bitwise_local_paths_call_argument =
-            assert_supported("bitwise_local_paths_call_argument", &[]);
-        let bitwise_shadowed_binding = assert_supported("bitwise_shadowed_binding", &[]);
+            assert_supported(&database, "bitwise_local_paths_call_argument", &[]);
+        let bitwise_shadowed_binding = assert_supported(&database, "bitwise_shadowed_binding", &[]);
         let bitwise_common_prefix = assert_supported(
+            &database,
             "bitwise_common_prefix",
             &[sai_diagnostics::Code::WrongArgumentCount],
         );
         let bitwise_integer_rhs_mismatch = assert_supported(
+            &database,
             "bitwise_integer_rhs_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let bitwise_byte_rhs_mismatch = assert_supported(
+            &database,
             "bitwise_byte_rhs_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let bitwise_argument_parameter_mismatch = assert_supported(
+            &database,
             "bitwise_argument_parameter_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let bitwise_char_unresolved_rhs_sibling =
-            assert_supported("bitwise_char_unresolved_rhs_sibling", &[]);
+            assert_supported(&database, "bitwise_char_unresolved_rhs_sibling", &[]);
         let bitwise_bool_matching_unsupported = assert_supported(
+            &database,
             "bitwise_bool_matching_unsupported",
             &[sai_diagnostics::Code::OperatorNotSupported],
         );
         let bitwise_bool_mismatch_unsupported = assert_supported(
+            &database,
             "bitwise_bool_mismatch_unsupported",
             &[
                 sai_diagnostics::Code::TypeMismatch,
@@ -49652,10 +49863,12 @@ property "shared"() {}
             ],
         );
         let bitwise_f32_matching_unsupported = assert_supported(
+            &database,
             "bitwise_f32_matching_unsupported",
             &[sai_diagnostics::Code::OperatorNotSupported],
         );
         let bitwise_f32_mismatch_unsupported = assert_supported(
+            &database,
             "bitwise_f32_mismatch_unsupported",
             &[
                 sai_diagnostics::Code::TypeMismatch,
@@ -49663,10 +49876,12 @@ property "shared"() {}
             ],
         );
         let bitwise_f64_matching_unsupported = assert_supported(
+            &database,
             "bitwise_f64_matching_unsupported",
             &[sai_diagnostics::Code::OperatorNotSupported],
         );
         let bitwise_f64_mismatch_unsupported = assert_supported(
+            &database,
             "bitwise_f64_mismatch_unsupported",
             &[
                 sai_diagnostics::Code::TypeMismatch,
@@ -49674,34 +49889,104 @@ property "shared"() {}
             ],
         );
         let bitwise_char_trait_unsupported = assert_supported(
+            &database,
             "bitwise_char_trait_unsupported",
             &[sai_diagnostics::Code::OperatorNotSupported],
         );
+        let bitwise_integer_literal_parameter_mismatch = assert_supported(
+            &database,
+            "bitwise_integer_literal_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_byte_integer_literal_mismatch = assert_supported(
+            &database,
+            "bitwise_byte_integer_literal_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_bool_integer_literal_unsupported = assert_supported(
+            &database,
+            "bitwise_bool_integer_literal_unsupported",
+            &[
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+        );
+        let bitwise_f32_integer_literal_unsupported = assert_supported(
+            &database,
+            "bitwise_f32_integer_literal_unsupported",
+            &[
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+        );
+        let bitwise_f64_integer_literal_unsupported = assert_supported(
+            &database,
+            "bitwise_f64_integer_literal_unsupported",
+            &[
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+        );
+        let bitwise_char_integer_literal_trait_unsupported = assert_supported(
+            &database,
+            "bitwise_char_integer_literal_trait_unsupported",
+            &[sai_diagnostics::Code::OperatorNotSupported],
+        );
+        let bitwise_char_integer_literal_out_of_range = assert_supported(
+            &database,
+            "bitwise_char_integer_literal_out_of_range",
+            &[
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+        );
+        let bitwise_char_integer_literal_below_range = assert_supported(
+            &database,
+            "bitwise_char_integer_literal_below_range",
+            &[
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+        );
+        let bitwise_integer_literal_alias_left =
+            assert_supported(&database, "bitwise_integer_literal_alias_left", &[]);
+        let bitwise_integer_literal_extra_ignored = assert_supported(
+            &database,
+            "bitwise_integer_literal_extra_ignored",
+            &[sai_diagnostics::Code::WrongArgumentCount],
+        );
         let not_operand_mismatch = assert_supported(
+            &database,
             "not_operand_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let not_parameter_mismatch = assert_supported(
+            &database,
             "not_parameter_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let not_true_parameter_mismatch = assert_supported(
+            &database,
             "not_true_parameter_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let not_literal_taint_preserves_sibling = assert_supported(
+            &database,
             "not_literal_taint_preserves_sibling",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let not_taint_preserves_sibling = assert_supported(
+            &database,
             "not_taint_preserves_sibling",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let logical_operand_mismatch = assert_supported(
+            &database,
             "logical_operand_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let logical_two_operand_mismatch = assert_supported(
+            &database,
             "logical_two_operand_mismatch",
             &[
                 sai_diagnostics::Code::TypeMismatch,
@@ -49709,38 +49994,47 @@ property "shared"() {}
             ],
         );
         let logical_argument_parameter_mismatch = assert_supported(
+            &database,
             "logical_argument_parameter_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let logical_call_argument_extra_ignored = assert_supported(
+            &database,
             "logical_call_argument_extra_ignored",
             &[sai_diagnostics::Code::WrongArgumentCount],
         );
         let comparison_parameter_mismatch = assert_supported(
+            &database,
             "comparison_parameter_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let comparison_operand_mismatch = assert_supported(
+            &database,
             "comparison_operand_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let comparison_literal_family_mismatch = assert_supported(
+            &database,
             "comparison_literal_family_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let comparison_taint_preserves_sibling = assert_supported(
+            &database,
             "comparison_taint_preserves_sibling",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let comparison_call_argument_extra_ignored = assert_supported(
+            &database,
             "comparison_call_argument_extra_ignored",
             &[sai_diagnostics::Code::WrongArgumentCount],
         );
         let comparison_literal_range = assert_supported(
+            &database,
             "comparison_literal_range",
             &[sai_diagnostics::Code::LiteralOutOfRange],
         );
         let comparison_literal_left_range_and_mismatch = assert_supported(
+            &database,
             "comparison_literal_left_range_and_mismatch",
             &[
                 sai_diagnostics::Code::LiteralOutOfRange,
@@ -49748,14 +50042,15 @@ property "shared"() {}
             ],
         );
         let arithmetic_call_argument_literal_left =
-            assert_supported("arithmetic_call_argument_literal_left", &[]);
+            assert_supported(&database, "arithmetic_call_argument_literal_left", &[]);
         let arithmetic_call_argument_integer_literals =
-            assert_supported("arithmetic_call_argument_integer_literals", &[]);
+            assert_supported(&database, "arithmetic_call_argument_integer_literals", &[]);
         let arithmetic_call_argument_float =
-            assert_supported("arithmetic_call_argument_float", &[]);
+            assert_supported(&database, "arithmetic_call_argument_float", &[]);
         let float_literal_pair_call_argument =
-            assert_supported("float_literal_pair_call_argument", &[]);
+            assert_supported(&database, "float_literal_pair_call_argument", &[]);
         let float_literal_pair_out_of_range = assert_supported(
+            &database,
             "float_literal_pair_out_of_range",
             &[
                 sai_diagnostics::Code::LiteralOutOfRange,
@@ -49763,18 +50058,21 @@ property "shared"() {}
             ],
         );
         let double_literal_pair_call_argument =
-            assert_supported("double_literal_pair_call_argument", &[]);
+            assert_supported(&database, "double_literal_pair_call_argument", &[]);
         let nested_float_literal_pair_call_argument =
-            assert_supported("nested_float_literal_pair_call_argument", &[]);
+            assert_supported(&database, "nested_float_literal_pair_call_argument", &[]);
         let arithmetic_call_argument_result_mismatch = assert_supported(
+            &database,
             "arithmetic_call_argument_result_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let arithmetic_subtraction_result_mismatch = assert_supported(
+            &database,
             "arithmetic_subtraction_result_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let arithmetic_call_argument_errors = assert_supported(
+            &database,
             "arithmetic_call_argument_errors",
             &[
                 sai_diagnostics::Code::TypeMismatch,
@@ -49782,26 +50080,45 @@ property "shared"() {}
             ],
         );
         let arithmetic_call_argument_extra_ignored = assert_supported(
+            &database,
             "arithmetic_call_argument_extra_ignored",
             &[sai_diagnostics::Code::WrongArgumentCount],
         );
         let arithmetic_call_argument_extra_basic_ignored = assert_supported(
+            &database,
             "arithmetic_call_argument_extra_basic_ignored",
             &[sai_diagnostics::Code::WrongArgumentCount],
         );
-        let mismatched = assert_supported("mismatched", &[sai_diagnostics::Code::TypeMismatch]);
-        let annotated_mismatch =
-            assert_supported("annotated_mismatch", &[sai_diagnostics::Code::TypeMismatch]);
+        let mismatched = assert_supported(
+            &database,
+            "mismatched",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let annotated_mismatch = assert_supported(
+            &database,
+            "annotated_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         let too_many = assert_supported(
+            &database,
             "too_many",
             &[
                 sai_diagnostics::Code::WrongArgumentCount,
                 sai_diagnostics::Code::TypeMismatch,
             ],
         );
-        let too_few = assert_supported("too_few", &[sai_diagnostics::Code::WrongArgumentCount]);
-        let named = assert_supported("named", &[sai_diagnostics::Code::NamedArgumentOnFunction]);
+        let too_few = assert_supported(
+            &database,
+            "too_few",
+            &[sai_diagnostics::Code::WrongArgumentCount],
+        );
+        let named = assert_supported(
+            &database,
+            "named",
+            &[sai_diagnostics::Code::NamedArgumentOnFunction],
+        );
         let named_and_mismatched = assert_supported(
+            &database,
             "named_and_mismatched",
             &[
                 sai_diagnostics::Code::NamedArgumentOnFunction,
@@ -49810,9 +50127,12 @@ property "shared"() {}
                 sai_diagnostics::Code::TypeMismatch,
             ],
         );
-        let float_call = assert_supported("float_call", &[]);
-        let float_mismatch =
-            assert_supported("float_mismatch", &[sai_diagnostics::Code::TypeMismatch]);
+        let float_call = assert_supported(&database, "float_call", &[]);
+        let float_mismatch = assert_supported(
+            &database,
+            "float_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         for name in [
             "generic_call",
             "str_call",
@@ -49852,7 +50172,20 @@ property "shared"() {}
             "shift_deep_nested_call_unsupported",
             "shift_unresolved_local_unsupported",
             "shift_unresolved_left_local_unsupported",
-            "bitwise_integer_literal_unsupported",
+            "bitwise_literal_rhs_bool_unsupported",
+            "bitwise_literal_rhs_byte_unsupported",
+            "bitwise_literal_rhs_char_unsupported",
+            "bitwise_literal_rhs_float_unsupported",
+            "bitwise_unresolved_integer_literal_path_unsupported",
+            "bitwise_unresolved_integer_literal_left_unsupported",
+            "bitwise_integer_literal_forward_left_unsupported",
+            "bitwise_integer_literal_computed_left_unsupported",
+            "bitwise_integer_literal_nested_operator_unsupported",
+            "bitwise_integer_literal_call_operand_unsupported",
+            "bitwise_integer_literal_not_operand_unsupported",
+            "bitwise_integer_literal_shift_operand_unsupported",
+            "bitwise_integer_literal_deep_nested_call_unsupported",
+            "bitwise_integer_literal_generic_target_unsupported",
             "bitwise_literal_left_unsupported",
             "bitwise_literal_pair_unsupported",
             "bitwise_computed_operand_unsupported",
@@ -49899,8 +50232,11 @@ property "shared"() {}
             );
         }
 
+        let mut source_hir_ids_by_owner =
+            HashMap::<OwnerId, HashMap<sai_diagnostics::TextRange, Vec<HirId>>>::new();
         let mut expression_type_at_range =
-            |owner: &FunctionOwnerResolution,
+            |database: &mut RootDatabase,
+             owner: &FunctionOwnerResolution,
              function: &str,
              source_context: &str,
              expression_offset: usize,
@@ -49933,36 +50269,6 @@ property "shared"() {}
                         .values()
                         .all(|hir_id| hir_id.owner == owner.owner())
                 );
-                let descriptor = *collection
-                    .scopes
-                    .top_level_owners
-                    .iter()
-                    .find(|descriptor| descriptor.owner == owner.owner())
-                    .expect("the function has an exact top-level descriptor");
-                let inputs = database
-                    .current_owner_inputs(&snapshot, descriptor.file, &collection.target_cfg)
-                    .expect("the selected owner inputs are current");
-                let path = database
-                    .resolve_def_path(owner.owner().def_id.to_def_id())
-                    .expect("the owner definition path resolves")
-                    .expect("the owner has a definition path");
-                let arena = HirArena::new();
-                let context = HirLoweringContext::new(
-                    &inputs.ast_ids,
-                    &snapshot,
-                    &inputs.root,
-                    &arena,
-                    &database.symbols,
-                    &database.def_paths[&owner.owner().def_id.package()],
-                );
-                let (_, source_map) = lower_top_level_owner(
-                    descriptor,
-                    &path,
-                    &inputs.filtered_item_tree,
-                    &inputs.retained_item_kinds,
-                    &context,
-                )
-                .expect("the selected function lowers to HIR");
                 let function_start = root
                     .find(function)
                     .unwrap_or_else(|| panic!("function source `{function}` exists"));
@@ -49981,16 +50287,58 @@ property "shared"() {}
                     sai_diagnostics::TextSize::new(expression_start + expression_len as u32),
                 )
                 .expect("the exact expression range is ordered");
-                let hir_ids = source_map
-                    .node_to_syntax()
-                    .iter_enumerated()
-                    .filter_map(|(local_id, pointer)| {
-                        (pointer.text_range() == range).then_some(HirId {
-                            owner: owner.owner(),
-                            local_id,
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                let hir_ids_by_range =
+                    source_hir_ids_by_owner
+                        .entry(owner.owner())
+                        .or_insert_with(|| {
+                            let descriptor = *collection
+                                .scopes
+                                .top_level_owners
+                                .iter()
+                                .find(|descriptor| descriptor.owner == owner.owner())
+                                .expect("the function has an exact top-level descriptor");
+                            let inputs = database
+                                .current_owner_inputs(
+                                    &snapshot,
+                                    descriptor.file,
+                                    &collection.target_cfg,
+                                )
+                                .expect("the selected owner inputs are current");
+                            let path = database
+                                .resolve_def_path(owner.owner().def_id.to_def_id())
+                                .expect("the owner definition path resolves")
+                                .expect("the owner has a definition path");
+                            let arena = HirArena::new();
+                            let context = HirLoweringContext::new(
+                                &inputs.ast_ids,
+                                &snapshot,
+                                &inputs.root,
+                                &arena,
+                                &database.symbols,
+                                &database.def_paths[&owner.owner().def_id.package()],
+                            );
+                            let (_, source_map) = lower_top_level_owner(
+                                descriptor,
+                                &path,
+                                &inputs.filtered_item_tree,
+                                &inputs.retained_item_kinds,
+                                &context,
+                            )
+                            .expect("the selected function lowers to HIR");
+                            let mut hir_ids_by_range = HashMap::new();
+                            for (local_id, pointer) in source_map.node_to_syntax().iter_enumerated()
+                            {
+                                hir_ids_by_range
+                                    .entry(pointer.text_range())
+                                    .or_insert_with(Vec::new)
+                                    .push(HirId {
+                                        owner: owner.owner(),
+                                        local_id,
+                                    });
+                            }
+                            hir_ids_by_range
+                        });
+                let hir_ids = hir_ids_by_range.get(&range).cloned().unwrap_or_default();
                 let typed_types = hir_ids
                     .iter()
                     .filter_map(|hir_id| results.expression_type(*hir_id))
@@ -50001,8 +50349,861 @@ property "shared"() {}
                 );
                 typed_types.first().copied()
             };
+        for (left_name, callee, primitive) in bitwise_integer_literal_types.iter().copied() {
+            let suffix = left_name.to_ascii_lowercase();
+            let function_name = format!("bitwise_integer_literal_rhs_{suffix}");
+            let nested_function_name = format!("nested_bitwise_integer_literal_rhs_{suffix}");
+            let function = format!("pub fn {function_name}");
+            let nested_function = format!("pub fn {nested_function_name}");
+            let owner = assert_supported(&database, &function_name, &[]);
+            let nested_owner = assert_supported(&database, &nested_function_name, &[]);
+
+            for (operator, literal) in [("&", "1"), ("|", "2"), ("^", "3")] {
+                let operator_expression = format!("left {operator} {literal}");
+                let call = format!("{callee}({operator_expression})");
+                let operator_offset = call
+                    .find(&operator_expression)
+                    .expect("the direct-call bitwise expression occurs in its call");
+                let literal_offset = operator_offset + operator_expression.len() - literal.len();
+                assert_eq!(
+                    expression_type_at_range(&mut database, owner, &function, &call, 0, call.len()),
+                    Some(primitive),
+                    "{left_name} {operator} integer literal keeps the concrete left type"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &call,
+                        operator_offset,
+                        operator_expression.len()
+                    ),
+                    Some(primitive),
+                    "the exact root {left_name} {operator} expression has a type fact"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &call,
+                        operator_offset,
+                        "left".len()
+                    ),
+                    Some(primitive),
+                    "the root {left_name} path keeps its exact type"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &call,
+                        literal_offset,
+                        literal.len()
+                    ),
+                    Some(primitive),
+                    "the root integer literal is checked against {left_name}"
+                );
+
+                let nested_inner_call = format!("{callee}({operator_expression})");
+                let nested_call = format!("{callee}({nested_inner_call})");
+                let nested_inner_offset = callee.len() + 1;
+                let nested_operator_offset = nested_inner_offset + callee.len() + 1;
+                let nested_literal_offset =
+                    nested_operator_offset + operator_expression.len() - literal.len();
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        nested_owner,
+                        &nested_function,
+                        &nested_call,
+                        0,
+                        nested_call.len()
+                    ),
+                    Some(primitive),
+                    "nested {left_name} {operator} integer literal keeps the outer call typed"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        nested_owner,
+                        &nested_function,
+                        &nested_call,
+                        nested_inner_offset,
+                        nested_inner_call.len()
+                    ),
+                    Some(primitive),
+                    "the inner call containing {left_name} {operator} has a type fact"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        nested_owner,
+                        &nested_function,
+                        &nested_call,
+                        nested_operator_offset,
+                        operator_expression.len()
+                    ),
+                    Some(primitive),
+                    "the exact nested {left_name} {operator} expression has a type fact"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        nested_owner,
+                        &nested_function,
+                        &nested_call,
+                        nested_operator_offset,
+                        "left".len()
+                    ),
+                    Some(primitive),
+                    "the nested {left_name} path keeps its exact type"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        nested_owner,
+                        &nested_function,
+                        &nested_call,
+                        nested_literal_offset,
+                        literal.len()
+                    ),
+                    Some(primitive),
+                    "the nested integer literal is checked against {left_name}"
+                );
+            }
+        }
+
+        for (left_name, callee, minimum, maximum) in bitwise_integer_literal_boundaries {
+            let primitive = bitwise_integer_literal_types
+                .iter()
+                .find_map(|(name, _, primitive)| (*name == left_name).then_some(*primitive))
+                .expect("the boundary primitive is an integer type");
+            let suffix = left_name.to_ascii_lowercase();
+            let function_name = format!("bitwise_integer_literal_boundaries_{suffix}");
+            let function = format!("pub fn {function_name}");
+            let owner = assert_supported(&database, &function_name, &[]);
+            for (operator, literal) in [("&", minimum), ("|", maximum)] {
+                let operator_expression = format!("left {operator} {literal}");
+                let call = format!("{callee}({operator_expression})");
+                let operator_offset = call
+                    .find(&operator_expression)
+                    .expect("the boundary bitwise expression occurs in its call");
+                let literal_offset = operator_offset + operator_expression.len() - literal.len();
+                assert_eq!(
+                    expression_type_at_range(&mut database, owner, &function, &call, 0, call.len()),
+                    Some(primitive),
+                    "{left_name} boundary literal is accepted without widening"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &call,
+                        operator_offset,
+                        operator_expression.len()
+                    ),
+                    Some(primitive)
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &call,
+                        literal_offset,
+                        literal.len()
+                    ),
+                    Some(primitive),
+                    "{left_name} boundary literal gets the exact left type"
+                );
+            }
+        }
+
+        for (left_name, callee, side, literal) in bitwise_integer_literal_out_of_range {
+            let primitive = bitwise_integer_literal_types
+                .iter()
+                .find_map(|(name, _, primitive)| (*name == left_name).then_some(*primitive))
+                .expect("the range primitive is an integer type");
+            let suffix = left_name.to_ascii_lowercase();
+            let function_name = format!("bitwise_integer_literal_out_of_range_{suffix}_{side}");
+            let function = format!("pub fn {function_name}");
+            let owner = assert_supported(
+                &database,
+                &function_name,
+                &[sai_diagnostics::Code::LiteralOutOfRange],
+            );
+            let operator_expression = format!("left & {literal}");
+            let call = format!("{callee}({operator_expression})");
+            let operator_offset = call
+                .find(&operator_expression)
+                .expect("the out-of-range expression occurs in its direct call");
+            let literal_offset = operator_offset + operator_expression.len() - literal.len();
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("out-of-range bitwise literal body is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("out-of-range {left_name} literal remains diagnostic-supported")
+                }
+            };
+            let function_start = root
+                .find(&function)
+                .expect("the range-check function source exists");
+            let literal_start = function_start
+                + root[function_start..]
+                    .find(literal)
+                    .expect("the entire signed out-of-range literal occurs in the function");
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("the range diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(literal_start as u32),
+                    sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                )
+                .expect("the signed literal range is ordered"),
+                "{left_name} {side} diagnostic spans the complete signed literal"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    operator_offset,
+                    operator_expression.len()
+                ),
+                None,
+                "an out-of-range {left_name} literal suppresses its operator fact"
+            );
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, &call, 0, call.len()),
+                None,
+                "an out-of-range {left_name} literal taints the containing call"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    operator_offset,
+                    "left".len()
+                ),
+                Some(primitive),
+                "the valid {left_name} left path remains typed next to a range error"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    literal_offset,
+                    literal.len()
+                ),
+                None,
+                "the out-of-range {left_name} literal has no trusted type fact"
+            );
+        }
+
+        let bitwise_integer_literal_mismatch_cases = [
+            (
+                bitwise_bool_integer_literal_unsupported,
+                "pub fn bitwise_bool_integer_literal_unsupported",
+                "apply_bool(left & 1)",
+                "left & 1",
+                "1",
+                PrimTy::Bool,
+                "Bool",
+            ),
+            (
+                bitwise_f32_integer_literal_unsupported,
+                "pub fn bitwise_f32_integer_literal_unsupported",
+                "float_fn(left | 1)",
+                "left | 1",
+                "1",
+                PrimTy::F32,
+                "F32",
+            ),
+            (
+                bitwise_f64_integer_literal_unsupported,
+                "pub fn bitwise_f64_integer_literal_unsupported",
+                "apply_double(left ^ 1)",
+                "left ^ 1",
+                "1",
+                PrimTy::F64,
+                "F64",
+            ),
+        ];
+        for (owner, function, call, operator_expression, literal, primitive, primitive_name) in
+            bitwise_integer_literal_mismatch_cases
+        {
+            let operator_offset = call
+                .find(operator_expression)
+                .expect("the unsupported bitwise expression occurs in its call");
+            let literal_offset = operator_offset + operator_expression.len() - literal.len();
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    operator_offset,
+                    operator_expression.len()
+                ),
+                None,
+                "{primitive_name} integer-literal bitwise operation has no trusted operator fact"
+            );
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
+                None,
+                "{primitive_name} integer-literal bitwise operation taints its call"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    literal_offset,
+                    literal.len()
+                ),
+                None,
+                "{primitive_name} does not constrain an integer literal to its call parameter"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    operator_offset,
+                    "left".len()
+                ),
+                Some(primitive),
+                "the {primitive_name} left path remains typed after the operator errors"
+            );
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("unsupported primitive bitwise body is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{primitive_name} operator failure remains diagnostic-supported")
+                }
+            };
+            let function_start = root
+                .find(function)
+                .expect("the primitive function source exists");
+            let literal_start = function_start
+                + root[function_start..]
+                    .find(operator_expression)
+                    .expect("the primitive expression occurs in the function")
+                + operator_expression.len()
+                - literal.len();
+            let operator_start = function_start
+                + root[function_start..]
+                    .find(operator_expression)
+                    .expect("the primitive expression occurs in the function");
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [
+                    sai_diagnostics::Code::TypeMismatch,
+                    sai_diagnostics::Code::OperatorNotSupported,
+                ],
+                "{primitive_name} keeps the literal mismatch before unsupported operator"
+            );
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("literal mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(literal_start as u32),
+                    sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                )
+                .expect("literal mismatch span is ordered")
+            );
+            assert_eq!(
+                diagnostics[1]
+                    .primary()
+                    .expect("operator diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(operator_start as u32),
+                    sai_diagnostics::TextSize::new(
+                        (operator_start + operator_expression.len()) as u32
+                    ),
+                )
+                .expect("operator diagnostic span is ordered")
+            );
+        }
+
+        let integer_literal_parameter_call = "apply_bool(left & 1)";
+        let integer_literal_parameter_operator = "left & 1";
+        let integer_literal_parameter_operator_start = integer_literal_parameter_call
+            .find(integer_literal_parameter_operator)
+            .expect("mismatched argument contains the bitwise expression");
+        let integer_literal_parameter_rhs_start =
+            integer_literal_parameter_operator_start + integer_literal_parameter_operator.len() - 1;
         assert_eq!(
             expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_parameter_mismatch,
+                "pub fn bitwise_integer_literal_parameter_mismatch",
+                integer_literal_parameter_call,
+                integer_literal_parameter_operator_start,
+                integer_literal_parameter_operator.len()
+            ),
+            None,
+            "a Bool parameter mismatch taints the integer-literal bitwise operator"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_parameter_mismatch,
+                "pub fn bitwise_integer_literal_parameter_mismatch",
+                integer_literal_parameter_call,
+                0,
+                integer_literal_parameter_call.len()
+            ),
+            None,
+            "a Bool parameter mismatch taints the containing call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_parameter_mismatch,
+                "pub fn bitwise_integer_literal_parameter_mismatch",
+                integer_literal_parameter_call,
+                integer_literal_parameter_rhs_start,
+                1
+            ),
+            Some(PrimTy::I32),
+            "the I32 left path constrains the literal despite a Bool call parameter"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_parameter_mismatch,
+                "pub fn bitwise_integer_literal_parameter_mismatch",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "an inferred dependent alias remains tainted after parameter mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_parameter_mismatch,
+                "pub fn bitwise_integer_literal_parameter_mismatch",
+                "apply_i32(left & 2)",
+                0,
+                "apply_i32(left & 2)".len()
+            ),
+            Some(PrimTy::I32),
+            "an independent valid sibling bitwise call stays typed"
+        );
+
+        let bitwise_byte_literal_call = "apply_byte(left & 1)";
+        let bitwise_byte_literal_expression = "left & 1";
+        let bitwise_byte_literal_expression_offset = bitwise_byte_literal_call
+            .find(bitwise_byte_literal_expression)
+            .expect("the Byte call contains the integer-literal expression");
+        let bitwise_byte_diagnostics = match bitwise_byte_integer_literal_mismatch
+            .body_type_check()
+            .expect("Byte integer-literal mismatch body is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("Byte integer-literal mismatch remains diagnostic-supported")
+            }
+        };
+        let bitwise_byte_function_start = root
+            .find("pub fn bitwise_byte_integer_literal_mismatch")
+            .expect("the Byte mismatch function exists");
+        let bitwise_byte_call_start = bitwise_byte_function_start
+            + root[bitwise_byte_function_start..]
+                .find(bitwise_byte_literal_call)
+                .expect("the Byte call exists");
+        let bitwise_byte_literal_start =
+            bitwise_byte_call_start + bitwise_byte_literal_call.len() - 2;
+        assert_eq!(
+            bitwise_byte_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch]
+        );
+        assert_eq!(
+            bitwise_byte_diagnostics[0]
+                .primary()
+                .expect("Byte literal mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(bitwise_byte_literal_start as u32),
+                sai_diagnostics::TextSize::new((bitwise_byte_literal_start + 1) as u32),
+            )
+            .expect("Byte integer-literal mismatch span is ordered")
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_byte_integer_literal_mismatch,
+                "pub fn bitwise_byte_integer_literal_mismatch",
+                bitwise_byte_literal_call,
+                bitwise_byte_literal_expression_offset,
+                bitwise_byte_literal_expression.len()
+            ),
+            None,
+            "a mismatched Byte integer literal suppresses the bitwise fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_byte_integer_literal_mismatch,
+                "pub fn bitwise_byte_integer_literal_mismatch",
+                "apply_byte(left)",
+                0,
+                "apply_byte(left)".len()
+            ),
+            Some(PrimTy::Byte),
+            "the valid Byte sibling survives an integer-literal mismatch"
+        );
+
+        let bitwise_char_literal_call = "identity_char(left ^ 1)";
+        let bitwise_char_literal_expression = "left ^ 1";
+        let bitwise_char_literal_expression_offset = bitwise_char_literal_call
+            .find(bitwise_char_literal_expression)
+            .expect("the Char call contains the integer-literal expression");
+        let bitwise_char_diagnostics = match bitwise_char_integer_literal_trait_unsupported
+            .body_type_check()
+            .expect("Char integer-literal trait body is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("Char integer-literal trait failure remains diagnostic-supported")
+            }
+        };
+        let bitwise_char_function_start = root
+            .find("pub fn bitwise_char_integer_literal_trait_unsupported")
+            .expect("the Char trait function exists");
+        let bitwise_char_literal_operator_start = bitwise_char_function_start
+            + root[bitwise_char_function_start..]
+                .find(bitwise_char_literal_expression)
+                .expect("the Char integer-literal expression exists");
+        assert_eq!(
+            bitwise_char_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::OperatorNotSupported],
+            "Char reports its missing trait without a synthetic literal mismatch"
+        );
+        assert_eq!(
+            bitwise_char_diagnostics[0]
+                .primary()
+                .expect("Char trait diagnostic has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(bitwise_char_literal_operator_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (bitwise_char_literal_operator_start + bitwise_char_literal_expression.len())
+                        as u32
+                ),
+            )
+            .expect("Char trait span covers the complete operator expression")
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_char_integer_literal_trait_unsupported,
+                "pub fn bitwise_char_integer_literal_trait_unsupported",
+                bitwise_char_literal_call,
+                bitwise_char_literal_expression_offset + bitwise_char_literal_expression.len() - 1,
+                1
+            ),
+            Some(PrimTy::I64),
+            "Char's integer RHS literal follows rule 3 and defaults to I64"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_char_integer_literal_trait_unsupported,
+                "pub fn bitwise_char_integer_literal_trait_unsupported",
+                bitwise_char_literal_call,
+                bitwise_char_literal_expression_offset,
+                bitwise_char_literal_expression.len()
+            ),
+            None,
+            "the unsupported Char operator publishes no expression fact"
+        );
+        let bitwise_char_range_diagnostics = match bitwise_char_integer_literal_out_of_range
+            .body_type_check()
+            .expect("Char integer-literal range body is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("Char integer-literal range remains diagnostic-supported")
+            }
+        };
+        let bitwise_char_range_function_start = root
+            .find("pub fn bitwise_char_integer_literal_out_of_range")
+            .expect("the Char range function exists");
+        let bitwise_char_range_literal = "9223372036854775808";
+        let bitwise_char_range_literal_start = bitwise_char_range_function_start
+            + root[bitwise_char_range_function_start..]
+                .find(bitwise_char_range_literal)
+                .expect("the out-of-range Char RHS literal exists");
+        let bitwise_char_range_operator = "left & 9223372036854775808";
+        let bitwise_char_range_operator_start = bitwise_char_range_function_start
+            + root[bitwise_char_range_function_start..]
+                .find(bitwise_char_range_operator)
+                .expect("the Char bitwise expression exists");
+        assert_eq!(
+            bitwise_char_range_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+            "Char reports I64 literal range before the rule-3 trait diagnostic"
+        );
+        assert_eq!(
+            bitwise_char_range_diagnostics[0]
+                .primary()
+                .expect("Char literal range diagnostic has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(bitwise_char_range_literal_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (bitwise_char_range_literal_start + bitwise_char_range_literal.len()) as u32
+                ),
+            )
+            .expect("Char I64 range span covers the whole integer literal")
+        );
+        assert_eq!(
+            bitwise_char_range_diagnostics[1]
+                .primary()
+                .expect("Char trait diagnostic has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(bitwise_char_range_operator_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (bitwise_char_range_operator_start + bitwise_char_range_operator.len()) as u32
+                ),
+            )
+            .expect("Char rule-3 diagnostic span is ordered")
+        );
+
+        let bitwise_char_below_range_diagnostics = match bitwise_char_integer_literal_below_range
+            .body_type_check()
+            .expect("Char below-range body is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("Char below-range remains diagnostic-supported")
+            }
+        };
+        let bitwise_char_below_range_function = "pub fn bitwise_char_integer_literal_below_range";
+        let bitwise_char_below_range_function_start = root
+            .find(bitwise_char_below_range_function)
+            .expect("the Char below-range function exists");
+        let bitwise_char_below_range_literal = "-9223372036854775809";
+        let bitwise_char_below_range_operator = "left ^ -9223372036854775809";
+        let bitwise_char_below_range_call = "identity_char(left ^ -9223372036854775809)";
+        let bitwise_char_below_range_literal_start = bitwise_char_below_range_function_start
+            + root[bitwise_char_below_range_function_start..]
+                .find(bitwise_char_below_range_literal)
+                .expect("the negative out-of-range Char literal exists");
+        let bitwise_char_below_range_operator_start = bitwise_char_below_range_function_start
+            + root[bitwise_char_below_range_function_start..]
+                .find(bitwise_char_below_range_operator)
+                .expect("the Char below-range operator expression exists");
+        assert_eq!(
+            bitwise_char_below_range_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+            "Char reports a negative I64 range error before the rule-3 trait diagnostic"
+        );
+        assert_eq!(
+            bitwise_char_below_range_diagnostics[0]
+                .primary()
+                .expect("Char below-range diagnostic has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(bitwise_char_below_range_literal_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (bitwise_char_below_range_literal_start
+                        + bitwise_char_below_range_literal.len()) as u32
+                ),
+            )
+            .expect("Char negative I64 range span covers the sign and full integer literal")
+        );
+        assert_eq!(
+            bitwise_char_below_range_diagnostics[1]
+                .primary()
+                .expect("Char below-range trait diagnostic has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(bitwise_char_below_range_operator_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (bitwise_char_below_range_operator_start
+                        + bitwise_char_below_range_operator.len()) as u32
+                ),
+            )
+            .expect("Char negative rule-3 span covers the complete operator expression")
+        );
+
+        let mut assert_char_range_fact_suppression =
+            |database: &mut RootDatabase,
+             owner: &FunctionOwnerResolution,
+             function: &str,
+             call: &str,
+             operator_expression: &str,
+             literal: &str| {
+                let operator_offset = call
+                    .find(operator_expression)
+                    .expect("Char range call contains its operator expression");
+                let literal_offset = operator_offset + operator_expression.len() - literal.len();
+                assert_eq!(
+                    expression_type_at_range(
+                        database,
+                        owner,
+                        function,
+                        call,
+                        operator_offset,
+                        operator_expression.len()
+                    ),
+                    None,
+                    "an out-of-range Char literal suppresses the operator fact"
+                );
+                assert_eq!(
+                    expression_type_at_range(database, owner, function, call, 0, call.len()),
+                    None,
+                    "an out-of-range Char literal taints the containing call"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        database,
+                        owner,
+                        function,
+                        call,
+                        operator_offset,
+                        "left".len()
+                    ),
+                    Some(PrimTy::Char),
+                    "the valid Char left path remains typed after its literal range error"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        database,
+                        owner,
+                        function,
+                        call,
+                        literal_offset,
+                        literal.len()
+                    ),
+                    None,
+                    "an out-of-range Char I64 literal has no trusted fact"
+                );
+            };
+        assert_char_range_fact_suppression(
+            &mut database,
+            bitwise_char_integer_literal_out_of_range,
+            "pub fn bitwise_char_integer_literal_out_of_range",
+            "identity_char(left & 9223372036854775808)",
+            bitwise_char_range_operator,
+            bitwise_char_range_literal,
+        );
+        assert_char_range_fact_suppression(
+            &mut database,
+            bitwise_char_integer_literal_below_range,
+            bitwise_char_below_range_function,
+            bitwise_char_below_range_call,
+            bitwise_char_below_range_operator,
+            bitwise_char_below_range_literal,
+        );
+
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_alias_left,
+                "pub fn bitwise_integer_literal_alias_left",
+                "apply_i32(copy & 1)",
+                0,
+                "apply_i32(copy & 1)".len()
+            ),
+            Some(PrimTy::I32),
+            "a preceding direct-copy local stays eligible like IR-966 path pairs"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_alias_left,
+                "pub fn bitwise_integer_literal_alias_left",
+                "apply_i32(copy & 1)",
+                "apply_i32(".len(),
+                "copy & 1".len()
+            ),
+            Some(PrimTy::I32),
+            "the direct-copy local and literal expression have a concrete type"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_alias_left,
+                "pub fn bitwise_integer_literal_alias_left",
+                "apply_i32(copy & 1)",
+                "apply_i32(copy & ".len(),
+                1
+            ),
+            Some(PrimTy::I32),
+            "the integer literal is constrained by the resolved local's type"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_extra_ignored,
+                "pub fn bitwise_integer_literal_extra_ignored",
+                "apply_i32(left, left & 1)",
+                "apply_i32(left, ".len(),
+                "left & 1".len()
+            ),
+            None,
+            "the extra argument is outside the positional common prefix and stays unchecked"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
                 initializer,
                 "pub fn initializer",
                 "apply(input)",
@@ -50013,6 +51214,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 tail_call,
                 "pub fn tail_call",
                 "apply(input)",
@@ -50023,6 +51225,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 forward_call,
                 "pub fn forward_call",
                 "later(1)",
@@ -50033,6 +51236,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 recursive_call,
                 "pub fn recursive_call",
                 "recursive_call(value)",
@@ -50047,13 +51251,14 @@ property "shared"() {}
         ] {
             let context = "apply(add_one(input))";
             assert_eq!(
-                expression_type_at_range(owner, function, context, 0, context.len()),
+                expression_type_at_range(&mut database, owner, function, context, 0, context.len()),
                 Some(PrimTy::I32),
                 "outer direct-call result is recorded in `{function}`"
             );
             let nested_call = "add_one(input)";
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     context,
@@ -50067,6 +51272,7 @@ property "shared"() {}
         let nested_call_with_arithmetic_context = "apply(add_one(input + 1))";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_call_with_arithmetic_argument,
                 "pub fn nested_call_with_arithmetic_argument",
                 nested_call_with_arithmetic_context,
@@ -50077,6 +51283,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_call_with_arithmetic_argument,
                 "pub fn nested_call_with_arithmetic_argument",
                 nested_call_with_arithmetic_context,
@@ -50087,6 +51294,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_call_with_arithmetic_argument,
                 "pub fn nested_call_with_arithmetic_argument",
                 nested_call_with_arithmetic_context,
@@ -50113,12 +51321,13 @@ property "shared"() {}
             ),
         ] {
             assert_eq!(
-                expression_type_at_range(owner, function, context, 0, context.len()),
+                expression_type_at_range(&mut database, owner, function, context, 0, context.len()),
                 Some(PrimTy::I32),
                 "the containing direct call receives its exact result type in `{function}`"
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     context,
@@ -50180,12 +51389,13 @@ property "shared"() {}
             ),
         ] {
             assert_eq!(
-                expression_type_at_range(owner, function, context, 0, context.len()),
+                expression_type_at_range(&mut database, owner, function, context, 0, context.len()),
                 Some(expected),
                 "the containing call retains its exact output type in `{function}`"
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     context,
@@ -50199,6 +51409,7 @@ property "shared"() {}
         let nested_basic_arithmetic = "apply(add_one(input * 2))";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_call_with_basic_arithmetic_argument,
                 "pub fn nested_call_with_basic_arithmetic_argument",
                 nested_basic_arithmetic,
@@ -50209,6 +51420,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_call_with_basic_arithmetic_argument,
                 "pub fn nested_call_with_basic_arithmetic_argument",
                 nested_basic_arithmetic,
@@ -50219,6 +51431,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_call_with_basic_arithmetic_argument,
                 "pub fn nested_call_with_basic_arithmetic_argument",
                 nested_basic_arithmetic,
@@ -50238,6 +51451,7 @@ property "shared"() {}
             let call = format!("apply_bool({comparison})");
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     comparison_operators,
                     "pub fn comparison_operators",
                     &call,
@@ -50249,6 +51463,7 @@ property "shared"() {}
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     comparison_operators,
                     "pub fn comparison_operators",
                     &call,
@@ -50273,6 +51488,7 @@ property "shared"() {}
         ] {
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     comparison_literal_leaves,
                     "pub fn comparison_literal_leaves",
                     call,
@@ -50284,6 +51500,7 @@ property "shared"() {}
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     comparison_literal_leaves,
                     "pub fn comparison_literal_leaves",
                     call,
@@ -50297,6 +51514,7 @@ property "shared"() {}
         let nested_comparison = "apply_bool(apply_bool(value <= limit))";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_comparison_call,
                 "pub fn nested_comparison_call",
                 nested_comparison,
@@ -50307,6 +51525,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_comparison_call,
                 "pub fn nested_comparison_call",
                 nested_comparison,
@@ -50317,6 +51536,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_comparison_call,
                 "pub fn nested_comparison_call",
                 nested_comparison,
@@ -50339,12 +51559,13 @@ property "shared"() {}
         ] {
             let call = format!("apply_bool({expression})");
             assert_eq!(
-                expression_type_at_range(owner, function, &call, 0, call.len()),
+                expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
                 Some(PrimTy::Bool),
                 "a direct call with a logical argument retains its exact result in `{function}`"
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     &call,
@@ -50369,12 +51590,13 @@ property "shared"() {}
         ] {
             let call = format!("apply_bool(apply_bool({expression}))");
             assert_eq!(
-                expression_type_at_range(owner, function, &call, 0, call.len()),
+                expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
                 Some(PrimTy::Bool),
                 "one nested direct call with a logical argument retains its exact result in `{function}`"
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     &call,
@@ -50386,6 +51608,7 @@ property "shared"() {}
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     &call,
@@ -50399,6 +51622,7 @@ property "shared"() {}
         let logical_local_call = "apply_bool(left_copy and right_copy)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_local_paths_call_argument,
                 "pub fn logical_local_paths_call_argument",
                 logical_local_call,
@@ -50531,13 +51755,14 @@ property "shared"() {}
             ),
         ] {
             assert_eq!(
-                expression_type_at_range(owner, function, call, 0, call.len()),
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
                 Some(PrimTy::Bool),
                 "the direct-call result retains its Bool fact for `{logical}`"
             );
             if let Some(nested_call) = nested_call {
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         call,
@@ -50552,18 +51777,39 @@ property "shared"() {}
                 .rfind(logical)
                 .expect("the direct-call logical expression exists in its context");
             assert_eq!(
-                expression_type_at_range(owner, function, call, logical_start, logical.len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    logical_start,
+                    logical.len()
+                ),
                 Some(PrimTy::Bool),
                 "the exact logical operator expression retains a Bool fact for `{logical}`"
             );
             let right_start = logical_start + left.len() + operator.len();
             assert_eq!(
-                expression_type_at_range(owner, function, call, logical_start, left.len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    logical_start,
+                    left.len()
+                ),
                 Some(PrimTy::Bool),
                 "the exact left operand retains a Bool fact for `{logical}`"
             );
             assert_eq!(
-                expression_type_at_range(owner, function, call, right_start, right.len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    right_start,
+                    right.len()
+                ),
                 Some(PrimTy::Bool),
                 "the exact right operand retains a Bool fact for `{logical}`"
             );
@@ -50581,7 +51827,7 @@ property "shared"() {}
             ),
         ] {
             assert_eq!(
-                expression_type_at_range(owner, function, call, 0, call.len()),
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
                 Some(PrimTy::Bool),
                 "the direct-call result keeps its Bool fact for `{function}`"
             );
@@ -50589,13 +51835,21 @@ property "shared"() {}
                 .rfind("not value")
                 .expect("the unary-not argument exists");
             assert_eq!(
-                expression_type_at_range(owner, function, call, not_start, "not value".len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    not_start,
+                    "not value".len()
+                ),
                 Some(PrimTy::Bool),
                 "the unary-not expression keeps its exact Bool fact for `{function}`"
             );
             if call.starts_with("apply_bool(apply_bool(") {
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         call,
@@ -50609,6 +51863,7 @@ property "shared"() {}
         }
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_call_argument,
                 "pub fn bitnot_call_argument",
                 "apply(~value)",
@@ -50620,6 +51875,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_call_argument,
                 "pub fn bitnot_call_argument",
                 "apply(~value)",
@@ -50631,6 +51887,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_call_argument,
                 "pub fn bitnot_call_argument",
                 "apply(~value)",
@@ -50643,6 +51900,7 @@ property "shared"() {}
         let unsigned_bitnot_call = "apply_u32(~value)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_unsigned_call_argument,
                 "pub fn bitnot_unsigned_call_argument",
                 unsigned_bitnot_call,
@@ -50654,6 +51912,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_unsigned_call_argument,
                 "pub fn bitnot_unsigned_call_argument",
                 unsigned_bitnot_call,
@@ -50666,6 +51925,7 @@ property "shared"() {}
         let shadowed_bitnot_call = "apply_u32(~value)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_shadowed_unsigned_call_argument,
                 "pub fn bitnot_shadowed_unsigned_call_argument",
                 shadowed_bitnot_call,
@@ -50677,6 +51937,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_shadowed_unsigned_call_argument,
                 "pub fn bitnot_shadowed_unsigned_call_argument",
                 shadowed_bitnot_call,
@@ -50688,6 +51949,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_shadowed_unsigned_call_argument,
                 "pub fn bitnot_shadowed_unsigned_call_argument",
                 shadowed_bitnot_call,
@@ -50700,6 +51962,7 @@ property "shared"() {}
         let nested_bitnot_call = "apply_byte(apply_byte(~copy))";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_bitnot_call_argument,
                 "pub fn nested_bitnot_call_argument",
                 nested_bitnot_call,
@@ -50711,6 +51974,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_bitnot_call_argument,
                 "pub fn nested_bitnot_call_argument",
                 nested_bitnot_call,
@@ -50722,6 +51986,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_bitnot_call_argument,
                 "pub fn nested_bitnot_call_argument",
                 nested_bitnot_call,
@@ -50733,6 +51998,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_bitnot_call_argument,
                 "pub fn nested_bitnot_call_argument",
                 nested_bitnot_call,
@@ -50745,6 +52011,7 @@ property "shared"() {}
         let bitnot_parameter_context = "apply_bool(~value)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_parameter_mismatch,
                 "pub fn bitnot_parameter_mismatch",
                 bitnot_parameter_context,
@@ -50756,6 +52023,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_parameter_mismatch,
                 "pub fn bitnot_parameter_mismatch",
                 bitnot_parameter_context,
@@ -50767,6 +52035,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_parameter_mismatch,
                 "pub fn bitnot_parameter_mismatch",
                 bitnot_parameter_context,
@@ -50778,6 +52047,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_parameter_mismatch,
                 "pub fn bitnot_parameter_mismatch",
                 "let alias = result",
@@ -50789,6 +52059,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitnot_parameter_mismatch,
                 "pub fn bitnot_parameter_mismatch",
                 "apply(value)",
@@ -50848,6 +52119,7 @@ property "shared"() {}
                         .expect("the unsupported bit-not expression exists in the call");
                     assert_eq!(
                         expression_type_at_range(
+                            &mut database,
                             owner,
                             function,
                             call,
@@ -50858,12 +52130,20 @@ property "shared"() {}
                         "unsupported {primitive} bit-not does not publish an operator fact"
                     );
                     assert_eq!(
-                        expression_type_at_range(owner, function, call, 0, call.len()),
+                        expression_type_at_range(
+                            &mut database,
+                            owner,
+                            function,
+                            call,
+                            0,
+                            call.len()
+                        ),
                         None,
                         "unsupported {primitive} bit-not taints its direct-call fact"
                     );
                     assert_eq!(
                         expression_type_at_range(
+                            &mut database,
                             owner,
                             function,
                             call,
@@ -50875,6 +52155,7 @@ property "shared"() {}
                     );
                     assert_eq!(
                         expression_type_at_range(
+                            &mut database,
                             owner,
                             function,
                             "let alias = result",
@@ -50886,6 +52167,7 @@ property "shared"() {}
                     );
                     assert_eq!(
                         expression_type_at_range(
+                            &mut database,
                             owner,
                             function,
                             sibling_call,
@@ -51074,12 +52356,13 @@ property "shared"() {}
             ),
         ] {
             assert_eq!(
-                expression_type_at_range(owner, function, call, 0, call.len()),
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
                 Some(primitive),
                 "the direct call retains its exact {primitive:?} return type"
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     call,
@@ -51097,12 +52380,20 @@ property "shared"() {}
                 .or_else(|| operator_expression.find(">>"))
                 .expect("shift expression contains one supported operator");
             assert_eq!(
-                expression_type_at_range(owner, function, call, shift_offset, "left".len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    shift_offset,
+                    "left".len()
+                ),
                 Some(primitive),
                 "the exact left {primitive:?} path fact is retained"
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     call,
@@ -51116,6 +52407,7 @@ property "shared"() {}
         let nested_shift_context = "apply_i32(apply_i32(left >> count))";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_shift_call_argument,
                 "pub fn nested_shift_call_argument",
                 nested_shift_context,
@@ -51127,6 +52419,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_shift_call_argument,
                 "pub fn nested_shift_call_argument",
                 nested_shift_context,
@@ -51138,6 +52431,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_shift_call_argument,
                 "pub fn nested_shift_call_argument",
                 nested_shift_context,
@@ -51149,6 +52443,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_shift_call_argument,
                 "pub fn nested_shift_call_argument",
                 nested_shift_context,
@@ -51160,6 +52455,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_shift_call_argument,
                 "pub fn nested_shift_call_argument",
                 nested_shift_context,
@@ -51172,6 +52468,7 @@ property "shared"() {}
         let local_shift_context = "apply_i16(left_copy << count_copy)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 shift_local_paths_call_argument,
                 "pub fn shift_local_paths_call_argument",
                 local_shift_context,
@@ -51184,6 +52481,7 @@ property "shared"() {}
         let shadowed_shift_context = "apply_i8(value << count)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 shift_shadowed_binding,
                 "pub fn shift_shadowed_binding",
                 shadowed_shift_context,
@@ -51195,6 +52493,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 shift_shadowed_binding,
                 "pub fn shift_shadowed_binding",
                 shadowed_shift_context,
@@ -51209,6 +52508,7 @@ property "shared"() {}
         let shift_right_mismatch_expression = "left << count";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 shift_right_type_mismatch,
                 "pub fn shift_right_type_mismatch",
                 shift_right_mismatch_context,
@@ -51220,6 +52520,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 shift_right_type_mismatch,
                 "pub fn shift_right_type_mismatch",
                 shift_right_mismatch_context,
@@ -51231,6 +52532,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 shift_right_type_mismatch,
                 "pub fn shift_right_type_mismatch",
                 shift_right_mismatch_context,
@@ -51242,6 +52544,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 shift_right_type_mismatch,
                 "pub fn shift_right_type_mismatch",
                 shift_right_mismatch_context,
@@ -51253,6 +52556,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 shift_right_type_mismatch,
                 "pub fn shift_right_type_mismatch",
                 "let alias = result",
@@ -51264,6 +52568,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 shift_right_type_mismatch,
                 "pub fn shift_right_type_mismatch",
                 "apply_i64(left)",
@@ -51313,6 +52618,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 shift_extra_ignored,
                 "pub fn shift_extra_ignored",
                 "apply_i32(left, left << 1)",
@@ -51366,6 +52672,7 @@ property "shared"() {}
                 .expect("unsupported shift expression exists");
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     call,
@@ -51376,17 +52683,25 @@ property "shared"() {}
                 "unsupported {primitive} shift suppresses its operator fact"
             );
             assert_eq!(
-                expression_type_at_range(owner, function, call, 0, call.len()),
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
                 None,
                 "unsupported {primitive} shift taints its containing call fact"
             );
             assert_eq!(
-                expression_type_at_range(owner, function, call, shift_start, "left".len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    shift_start,
+                    "left".len()
+                ),
                 Some(operand_type),
                 "unsupported {primitive} shift preserves its left operand fact"
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     call,
@@ -51398,6 +52713,7 @@ property "shared"() {}
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     "let alias = result",
@@ -51408,7 +52724,14 @@ property "shared"() {}
                 "an inferred alias of an unsupported {primitive} shift remains tainted"
             );
             assert_eq!(
-                expression_type_at_range(owner, function, sibling_call, 0, sibling_call.len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    sibling_call,
+                    0,
+                    sibling_call.len()
+                ),
                 Some(operand_type),
                 "a valid sibling call remains typed beside unsupported {primitive} shift"
             );
@@ -51551,12 +52874,20 @@ property "shared"() {}
                     .find(&operator_expression)
                     .expect("the bitwise operator expression is in the call");
                 assert_eq!(
-                    expression_type_at_range(owner, function, &argument, 0, argument.len()),
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &argument,
+                        0,
+                        argument.len()
+                    ),
                     Some(primitive),
                     "the direct {primitive:?} call retains its exact type for `{operator}`"
                 );
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         &argument,
@@ -51568,6 +52899,7 @@ property "shared"() {}
                 );
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         &argument,
@@ -51579,6 +52911,7 @@ property "shared"() {}
                 );
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         &argument,
@@ -51612,6 +52945,7 @@ property "shared"() {}
             let operator_expression = format!("left {operator} right");
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     &nested_bitwise_context,
@@ -51623,6 +52957,7 @@ property "shared"() {}
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     &nested_bitwise_context,
@@ -51634,6 +52969,7 @@ property "shared"() {}
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     &nested_bitwise_context,
@@ -51647,6 +52983,7 @@ property "shared"() {}
         let local_bitwise_context = "apply_i32(lhs & rhs)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_local_paths_call_argument,
                 "pub fn bitwise_local_paths_call_argument",
                 local_bitwise_context,
@@ -51658,6 +52995,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_local_paths_call_argument,
                 "pub fn bitwise_local_paths_call_argument",
                 local_bitwise_context,
@@ -51669,6 +53007,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_local_paths_call_argument,
                 "pub fn bitwise_local_paths_call_argument",
                 local_bitwise_context,
@@ -51682,6 +53021,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_char_unresolved_rhs_sibling,
                 "pub fn bitwise_char_unresolved_rhs_sibling",
                 "identity_char(left)",
@@ -51694,6 +53034,7 @@ property "shared"() {}
         let shadowed_bitwise_context = "apply_i8(value | other)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_shadowed_binding,
                 "pub fn bitwise_shadowed_binding",
                 shadowed_bitwise_context,
@@ -51705,6 +53046,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_shadowed_binding,
                 "pub fn bitwise_shadowed_binding",
                 shadowed_bitwise_context,
@@ -51717,6 +53059,7 @@ property "shared"() {}
         let common_prefix_context = "apply_pair(left & right, left & right, left & bad)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_common_prefix,
                 "pub fn bitwise_common_prefix",
                 common_prefix_context,
@@ -51728,6 +53071,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_common_prefix,
                 "pub fn bitwise_common_prefix",
                 common_prefix_context,
@@ -51739,6 +53083,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_common_prefix,
                 "pub fn bitwise_common_prefix",
                 common_prefix_context,
@@ -51758,6 +53103,7 @@ property "shared"() {}
              sibling_call: &str| {
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         call,
@@ -51769,7 +53115,7 @@ property "shared"() {}
                     "the RHS mismatch taints the {left_type:?} bitwise operator fact"
                 );
                 assert_eq!(
-                    expression_type_at_range(owner, function, call, 0, call.len()),
+                    expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
                     None,
                     "the RHS mismatch taints its containing direct-call fact"
                 );
@@ -51777,12 +53123,20 @@ property "shared"() {}
                     .find(operator_expression)
                     .expect("the bitwise mismatch occurs in the call");
                 assert_eq!(
-                    expression_type_at_range(owner, function, call, operator_start, "left".len()),
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        call,
+                        operator_start,
+                        "left".len()
+                    ),
                     Some(left_type),
                     "the exact left {left_type:?} path fact survives the mismatch"
                 );
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         call,
@@ -51794,6 +53148,7 @@ property "shared"() {}
                 );
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         "let alias = result",
@@ -51804,7 +53159,14 @@ property "shared"() {}
                     "an inferred alias of the failed bitwise call remains tainted"
                 );
                 assert_eq!(
-                    expression_type_at_range(owner, function, sibling_call, 0, sibling_call.len()),
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        sibling_call,
+                        0,
+                        sibling_call.len()
+                    ),
                     Some(left_type),
                     "a valid sibling call remains typed after the mismatch"
                 );
@@ -51872,6 +53234,7 @@ property "shared"() {}
             .expect("the annotated bitwise expression occurs in the call");
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_argument_parameter_mismatch,
                 "pub fn bitwise_argument_parameter_mismatch",
                 annotated_bitwise_call,
@@ -51883,6 +53246,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_argument_parameter_mismatch,
                 "pub fn bitwise_argument_parameter_mismatch",
                 annotated_bitwise_call,
@@ -51894,6 +53258,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_argument_parameter_mismatch,
                 "pub fn bitwise_argument_parameter_mismatch",
                 annotated_bitwise_call,
@@ -51905,6 +53270,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_argument_parameter_mismatch,
                 "pub fn bitwise_argument_parameter_mismatch",
                 annotated_bitwise_call,
@@ -51916,6 +53282,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_argument_parameter_mismatch,
                 "pub fn bitwise_argument_parameter_mismatch",
                 "let alias = result",
@@ -51927,6 +53294,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_argument_parameter_mismatch,
                 "pub fn bitwise_argument_parameter_mismatch",
                 "apply_bool(true)",
@@ -51993,6 +53361,7 @@ property "shared"() {}
                     .expect("the matching unsupported bitwise expression exists");
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         call,
@@ -52003,7 +53372,7 @@ property "shared"() {}
                     "matching unsupported {primitive_name} operands do not publish an operator fact"
                 );
                 assert_eq!(
-                    expression_type_at_range(owner, function, call, 0, call.len()),
+                    expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
                     None,
                     "matching unsupported {primitive_name} operands taint the direct call"
                 );
@@ -52012,7 +53381,14 @@ property "shared"() {}
                     (operator_start + "left ".len() + operator.len() + 1, "right"),
                 ] {
                     assert_eq!(
-                        expression_type_at_range(owner, function, call, offset, operand.len()),
+                        expression_type_at_range(
+                            &mut database,
+                            owner,
+                            function,
+                            call,
+                            offset,
+                            operand.len()
+                        ),
                         Some(primitive),
                         "matching unsupported {primitive_name} keeps each operand fact"
                     );
@@ -52101,6 +53477,7 @@ property "shared"() {}
                     .expect("the mismatched unsupported bitwise expression exists");
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         call,
@@ -52111,17 +53488,25 @@ property "shared"() {}
                     "mismatched unsupported {primitive_name} operands suppress the operator fact"
                 );
                 assert_eq!(
-                    expression_type_at_range(owner, function, call, 0, call.len()),
+                    expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
                     None,
                     "mismatched unsupported {primitive_name} operands taint the direct call"
                 );
                 assert_eq!(
-                    expression_type_at_range(owner, function, call, operator_start, "left".len()),
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        call,
+                        operator_start,
+                        "left".len()
+                    ),
                     Some(primitive),
                     "the mismatched unsupported {primitive_name} preserves the valid left fact"
                 );
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         call,
@@ -52133,6 +53518,7 @@ property "shared"() {}
                 );
                 assert_eq!(
                     expression_type_at_range(
+                        &mut database,
                         owner,
                         function,
                         "let alias = result",
@@ -52143,7 +53529,14 @@ property "shared"() {}
                     "an inferred alias of unsupported {primitive_name} remains tainted"
                 );
                 assert_eq!(
-                    expression_type_at_range(owner, function, sibling_call, 0, sibling_call.len()),
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        sibling_call,
+                        0,
+                        sibling_call.len()
+                    ),
                     Some(primitive),
                     "a valid {primitive_name} sibling call stays typed"
                 );
@@ -52243,6 +53636,7 @@ property "shared"() {}
             .expect("the Char bitwise expression occurs in the call");
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_char_trait_unsupported,
                 "pub fn bitwise_char_trait_unsupported",
                 char_bitwise_call,
@@ -52254,6 +53648,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_char_trait_unsupported,
                 "pub fn bitwise_char_trait_unsupported",
                 char_bitwise_call,
@@ -52265,6 +53660,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_char_trait_unsupported,
                 "pub fn bitwise_char_trait_unsupported",
                 char_bitwise_call,
@@ -52276,6 +53672,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_char_trait_unsupported,
                 "pub fn bitwise_char_trait_unsupported",
                 char_bitwise_call,
@@ -52287,6 +53684,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_char_trait_unsupported,
                 "pub fn bitwise_char_trait_unsupported",
                 "let alias = result",
@@ -52298,6 +53696,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 bitwise_char_trait_unsupported,
                 "pub fn bitwise_char_trait_unsupported",
                 "identity_char(left)",
@@ -52377,6 +53776,7 @@ property "shared"() {}
             let right_start = operator_start + operator_expression.len() - rhs_path.len();
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     &function,
                     &call,
@@ -52387,22 +53787,37 @@ property "shared"() {}
                 "the {left_name} {operator} {right_name} error suppresses its exact operator fact"
             );
             assert_eq!(
-                expression_type_at_range(owner, &function, &call, 0, call.len()),
+                expression_type_at_range(&mut database, owner, &function, &call, 0, call.len()),
                 None,
                 "the {left_name} {operator} {right_name} error taints the direct call"
             );
             assert_eq!(
-                expression_type_at_range(owner, &function, &call, operator_start, "left".len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    operator_start,
+                    "left".len()
+                ),
                 Some(left_type),
                 "the exact {left_name} left operand fact survives"
             );
             assert_eq!(
-                expression_type_at_range(owner, &function, &call, right_start, rhs_path.len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    right_start,
+                    rhs_path.len()
+                ),
                 (left_name == "Char").then_some(right_type),
                 "only Char's rule-3 diagnostic retains the concrete RHS fact"
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     &function,
                     &format!(
@@ -52421,7 +53836,14 @@ property "shared"() {}
                 .expect("the left primitive has a direct-call target");
             let sibling_call = format!("{callee}(left)");
             assert_eq!(
-                expression_type_at_range(owner, &function, &sibling_call, 0, sibling_call.len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &sibling_call,
+                    0,
+                    sibling_call.len()
+                ),
                 Some(left_type),
                 "a valid {left_name} sibling call survives the error"
             );
@@ -52547,6 +53969,7 @@ property "shared"() {}
         let local_not_call = "apply_bool(not copy)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_local_path_call_argument,
                 "pub fn not_local_path_call_argument",
                 local_not_call,
@@ -52558,6 +53981,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_local_path_call_argument,
                 "pub fn not_local_path_call_argument",
                 local_not_call,
@@ -52582,12 +54006,13 @@ property "shared"() {}
             ),
         ] {
             assert_eq!(
-                expression_type_at_range(owner, function, call, 0, call.len()),
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
                 Some(PrimTy::Bool),
                 "the root direct call retains its Bool fact for `{not_expression}`"
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     call,
@@ -52605,7 +54030,14 @@ property "shared"() {}
                 .strip_prefix("not ")
                 .expect("the operand is the exact Boolean literal");
             assert_eq!(
-                expression_type_at_range(owner, function, call, literal_start, literal.len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    literal_start,
+                    literal.len()
+                ),
                 Some(PrimTy::Bool),
                 "the exact Boolean-literal child retains its Bool HIR fact"
             );
@@ -52627,12 +54059,13 @@ property "shared"() {}
             ),
         ] {
             assert_eq!(
-                expression_type_at_range(owner, function, call, 0, call.len()),
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
                 Some(PrimTy::Bool),
                 "the outer direct call retains its Bool fact for `{not_expression}`"
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     call,
@@ -52646,7 +54079,14 @@ property "shared"() {}
                 .rfind(not_expression)
                 .expect("unary-not expression exists");
             assert_eq!(
-                expression_type_at_range(owner, function, call, not_start, not_expression.len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    not_start,
+                    not_expression.len()
+                ),
                 Some(PrimTy::Bool),
                 "the nested unary-not expression retains its exact Bool HIR fact"
             );
@@ -52658,7 +54098,14 @@ property "shared"() {}
                 .strip_prefix("not ")
                 .expect("the operand is the exact Boolean literal");
             assert_eq!(
-                expression_type_at_range(owner, function, call, literal_start, literal.len()),
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    literal_start,
+                    literal.len()
+                ),
                 Some(PrimTy::Bool),
                 "the exact nested Boolean-literal child retains its Bool HIR fact"
             );
@@ -52666,6 +54113,7 @@ property "shared"() {}
         let not_operand_mismatch_call = "apply_bool(not value)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_operand_mismatch,
                 "pub fn not_operand_mismatch",
                 not_operand_mismatch_call,
@@ -52677,6 +54125,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_operand_mismatch,
                 "pub fn not_operand_mismatch",
                 not_operand_mismatch_call,
@@ -52726,6 +54175,7 @@ property "shared"() {}
         let not_parameter_call = "apply(not value)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_parameter_mismatch,
                 "pub fn not_parameter_mismatch",
                 not_parameter_call,
@@ -52737,6 +54187,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_parameter_mismatch,
                 "pub fn not_parameter_mismatch",
                 not_parameter_call,
@@ -52785,6 +54236,7 @@ property "shared"() {}
         let not_true_parameter_call = "apply(not true)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_true_parameter_mismatch,
                 "pub fn not_true_parameter_mismatch",
                 not_true_parameter_call,
@@ -52796,6 +54248,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_true_parameter_mismatch,
                 "pub fn not_true_parameter_mismatch",
                 not_true_parameter_call,
@@ -52807,6 +54260,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_true_parameter_mismatch,
                 "pub fn not_true_parameter_mismatch",
                 not_true_parameter_call,
@@ -52856,6 +54310,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_literal_taint_preserves_sibling,
                 "pub fn not_literal_taint_preserves_sibling",
                 "apply(not false)",
@@ -52867,6 +54322,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_literal_taint_preserves_sibling,
                 "pub fn not_literal_taint_preserves_sibling",
                 "let alias = result",
@@ -52878,6 +54334,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_literal_taint_preserves_sibling,
                 "pub fn not_literal_taint_preserves_sibling",
                 "apply(value)",
@@ -52889,6 +54346,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_taint_preserves_sibling,
                 "pub fn not_taint_preserves_sibling",
                 "apply_bool(not value)",
@@ -52900,6 +54358,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_taint_preserves_sibling,
                 "pub fn not_taint_preserves_sibling",
                 "let alias = result",
@@ -52911,6 +54370,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 not_taint_preserves_sibling,
                 "pub fn not_taint_preserves_sibling",
                 "apply(value)",
@@ -52922,6 +54382,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_call_argument_extra_ignored,
                 "pub fn logical_call_argument_extra_ignored",
                 "apply(1, left and right)",
@@ -52934,6 +54395,7 @@ property "shared"() {}
         let mismatched_comparison = "value < limit";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_parameter_mismatch,
                 "pub fn comparison_parameter_mismatch",
                 "apply(value < limit)",
@@ -52945,6 +54407,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_parameter_mismatch,
                 "pub fn comparison_parameter_mismatch",
                 "apply(value < limit)",
@@ -52988,6 +54451,7 @@ property "shared"() {}
         let mismatched_operand = "condition";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_operand_mismatch,
                 "pub fn comparison_operand_mismatch",
                 "apply_bool(value == condition)",
@@ -52999,6 +54463,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_operand_mismatch,
                 "pub fn comparison_operand_mismatch",
                 "apply_bool(value == condition)",
@@ -53039,6 +54504,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_literal_family_mismatch,
                 "pub fn comparison_literal_family_mismatch",
                 "apply_bool(value < true)",
@@ -53050,6 +54516,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_literal_family_mismatch,
                 "pub fn comparison_literal_family_mismatch",
                 "apply_bool(value < true)",
@@ -53085,6 +54552,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_taint_preserves_sibling,
                 "pub fn comparison_taint_preserves_sibling",
                 "apply_bool(value == condition)",
@@ -53096,6 +54564,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_taint_preserves_sibling,
                 "pub fn comparison_taint_preserves_sibling",
                 "apply_bool(value == condition)",
@@ -53107,6 +54576,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_taint_preserves_sibling,
                 "pub fn comparison_taint_preserves_sibling",
                 "let alias = result",
@@ -53118,6 +54588,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_taint_preserves_sibling,
                 "pub fn comparison_taint_preserves_sibling",
                 "apply(1)",
@@ -53131,6 +54602,7 @@ property "shared"() {}
         let logical_expression = "left and right";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_operand_mismatch,
                 "pub fn logical_operand_mismatch",
                 logical_mismatch_context,
@@ -53142,6 +54614,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_operand_mismatch,
                 "pub fn logical_operand_mismatch",
                 logical_mismatch_context,
@@ -53153,6 +54626,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_operand_mismatch,
                 "pub fn logical_operand_mismatch",
                 "let alias = result",
@@ -53164,6 +54638,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_operand_mismatch,
                 "pub fn logical_operand_mismatch",
                 "apply_bool(true)",
@@ -53214,6 +54689,7 @@ property "shared"() {}
         let logical_literal_mismatch_expression = "value and true";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_operand_mismatch,
                 "pub fn logical_literal_operand_mismatch",
                 logical_literal_mismatch_call,
@@ -53225,6 +54701,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_operand_mismatch,
                 "pub fn logical_literal_operand_mismatch",
                 logical_literal_mismatch_call,
@@ -53236,6 +54713,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_operand_mismatch,
                 "pub fn logical_literal_operand_mismatch",
                 logical_literal_mismatch_call,
@@ -53247,6 +54725,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_operand_mismatch,
                 "pub fn logical_literal_operand_mismatch",
                 logical_literal_mismatch_call,
@@ -53258,6 +54737,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_operand_mismatch,
                 "pub fn logical_literal_operand_mismatch",
                 "let alias = result",
@@ -53269,6 +54749,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_operand_mismatch,
                 "pub fn logical_literal_operand_mismatch",
                 "apply_bool(false)",
@@ -53320,6 +54801,7 @@ property "shared"() {}
         let logical_literal_parameter_expression = "value and true";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_parameter_mismatch,
                 "pub fn logical_literal_parameter_mismatch",
                 logical_literal_parameter_call,
@@ -53331,6 +54813,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_parameter_mismatch,
                 "pub fn logical_literal_parameter_mismatch",
                 logical_literal_parameter_call,
@@ -53342,6 +54825,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_parameter_mismatch,
                 "pub fn logical_literal_parameter_mismatch",
                 logical_literal_parameter_call,
@@ -53353,6 +54837,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_parameter_mismatch,
                 "pub fn logical_literal_parameter_mismatch",
                 logical_literal_parameter_call,
@@ -53364,6 +54849,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_parameter_mismatch,
                 "pub fn logical_literal_parameter_mismatch",
                 "let alias = result",
@@ -53375,6 +54861,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_literal_parameter_mismatch,
                 "pub fn logical_literal_parameter_mismatch",
                 "apply(1)",
@@ -53480,6 +54967,7 @@ property "shared"() {}
         let logical_parameter_expression = "left and right";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_argument_parameter_mismatch,
                 "pub fn logical_argument_parameter_mismatch",
                 logical_parameter_context,
@@ -53491,6 +54979,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 logical_argument_parameter_mismatch,
                 "pub fn logical_argument_parameter_mismatch",
                 logical_parameter_context,
@@ -53533,6 +55022,7 @@ property "shared"() {}
         let out_of_range_comparison = "value < 1e100";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_literal_range,
                 "pub fn comparison_literal_range",
                 "apply_bool(value < 1e100)",
@@ -53544,6 +55034,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_literal_range,
                 "pub fn comparison_literal_range",
                 "apply_bool(value < 1e100)",
@@ -53556,6 +55047,7 @@ property "shared"() {}
         let literal_left_comparison = "1e400 < value";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_literal_left_range_and_mismatch,
                 "pub fn comparison_literal_left_range_and_mismatch",
                 "apply_bool(1e400 < value)",
@@ -53611,6 +55103,7 @@ property "shared"() {}
         }
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_call_argument_float,
                 "pub fn arithmetic_call_argument_float",
                 "float_fn(value + 1.5)",
@@ -53622,6 +55115,7 @@ property "shared"() {}
         let nested_float_literal_pair = "apply_float(double_fn(3.5 * 2.0))";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_float_literal_pair_call_argument,
                 "pub fn nested_float_literal_pair_call_argument",
                 nested_float_literal_pair,
@@ -53632,6 +55126,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_float_literal_pair_call_argument,
                 "pub fn nested_float_literal_pair_call_argument",
                 nested_float_literal_pair,
@@ -53642,6 +55137,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_float_literal_pair_call_argument,
                 "pub fn nested_float_literal_pair_call_argument",
                 nested_float_literal_pair,
@@ -53653,6 +55149,7 @@ property "shared"() {}
         let out_of_range_float_pair = "float_fn(1e100 / 2e100)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 float_literal_pair_out_of_range,
                 "pub fn float_literal_pair_out_of_range",
                 out_of_range_float_pair,
@@ -53664,6 +55161,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 float_literal_pair_out_of_range,
                 "pub fn float_literal_pair_out_of_range",
                 out_of_range_float_pair,
@@ -53717,6 +55215,7 @@ property "shared"() {}
         let mismatched_addition = "input + 1";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_call_argument_result_mismatch,
                 "pub fn arithmetic_call_argument_result_mismatch",
                 "float_fn(input + 1)",
@@ -53728,6 +55227,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_call_argument_result_mismatch,
                 "pub fn arithmetic_call_argument_result_mismatch",
                 "float_fn(input + 1)",
@@ -53772,6 +55272,7 @@ property "shared"() {}
         let mismatched_subtraction = "input - 1";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_subtraction_result_mismatch,
                 "pub fn arithmetic_subtraction_result_mismatch",
                 "float_fn(input - 1)",
@@ -53783,6 +55284,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_subtraction_result_mismatch,
                 "pub fn arithmetic_subtraction_result_mismatch",
                 "float_fn(input - 1)",
@@ -53826,6 +55328,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 float_call,
                 "pub fn float_call",
                 "float_fn(1.5)",
@@ -53836,6 +55339,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 float_mismatch,
                 "pub fn float_mismatch",
                 "float_fn(1)",
@@ -53876,13 +55380,14 @@ property "shared"() {}
             ),
         ] {
             assert_eq!(
-                expression_type_at_range(owner, function, call, 0, call.len()),
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
                 None,
                 "diagnosed call {call:?} in `{function}` is omitted from primitive results"
             );
         }
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_call_argument_extra_ignored,
                 "pub fn arithmetic_call_argument_extra_ignored",
                 "apply(input, 1 + 2)",
@@ -53894,6 +55399,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_call_argument_extra_basic_ignored,
                 "pub fn arithmetic_call_argument_extra_basic_ignored",
                 "apply(input, 1 - 2)",
@@ -53905,6 +55411,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 comparison_call_argument_extra_ignored,
                 "pub fn comparison_call_argument_extra_ignored",
                 "apply(1, value < limit)",
@@ -53929,7 +55436,7 @@ property "shared"() {}
             ),
         ] {
             assert_eq!(
-                expression_type_at_range(owner, function, context, 0, context.len()),
+                expression_type_at_range(&mut database, owner, function, context, 0, context.len()),
                 None,
                 "an errored nested argument suppresses its enclosing call result"
             );
@@ -53938,6 +55445,7 @@ property "shared"() {}
                 .expect("nested call occurs in context");
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     context,
@@ -53969,7 +55477,7 @@ property "shared"() {}
             ),
         ] {
             assert_eq!(
-                expression_type_at_range(owner, function, context, 0, context.len()),
+                expression_type_at_range(&mut database, owner, function, context, 0, context.len()),
                 None,
                 "the enclosing call is omitted after a nested call error in `{function}`"
             );
@@ -53978,6 +55486,7 @@ property "shared"() {}
                 .expect("nested call occurs in its enclosing call");
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     context,
@@ -53989,6 +55498,7 @@ property "shared"() {}
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     "let alias = result",
@@ -54000,6 +55510,7 @@ property "shared"() {}
             );
             assert_eq!(
                 expression_type_at_range(
+                    &mut database,
                     owner,
                     function,
                     "let valid = apply(input)",
@@ -54012,6 +55523,7 @@ property "shared"() {}
         }
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_inner_error,
                 "pub fn nested_inner_error",
                 "let alias = result",
@@ -54023,6 +55535,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 nested_inner_error,
                 "pub fn nested_inner_error",
                 "let valid = apply(input)",
@@ -54034,6 +55547,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 mismatched,
                 "pub fn mismatched",
                 "let alias = result",
@@ -54045,6 +55559,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 mismatched,
                 "pub fn mismatched",
                 "let derived = alias + 1",
@@ -54056,6 +55571,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 mismatched,
                 "pub fn mismatched",
                 "let derived = alias + 1",
@@ -54185,6 +55701,7 @@ property "shared"() {}
         let arithmetic_error_call = "apply_pair(input + float_value, true)";
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_call_argument_errors,
                 "pub fn arithmetic_call_argument_errors",
                 arithmetic_error_call,
@@ -54196,6 +55713,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_call_argument_errors,
                 "pub fn arithmetic_call_argument_errors",
                 arithmetic_error_call,
@@ -54207,6 +55725,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_call_argument_errors,
                 "pub fn arithmetic_call_argument_errors",
                 arithmetic_error_call,
@@ -54218,6 +55737,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_call_argument_errors,
                 "pub fn arithmetic_call_argument_errors",
                 "let alias = result",
@@ -54229,6 +55749,7 @@ property "shared"() {}
         );
         assert_eq!(
             expression_type_at_range(
+                &mut database,
                 arithmetic_call_argument_errors,
                 "pub fn arithmetic_call_argument_errors",
                 "let valid = apply(input)",
@@ -54300,7 +55821,6 @@ property "shared"() {}
             "the full-call arity span precedes common-prefix argument errors"
         );
 
-        drop(expression_type_at_range);
         let binding_type = |owner: &FunctionOwnerResolution, name: &str| {
             let results = owner
                 .primitive_body_type_results()
