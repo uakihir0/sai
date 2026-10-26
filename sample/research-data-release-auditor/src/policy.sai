@@ -1,0 +1,84 @@
+use acme:research-data-release-auditor/model.{
+    AuditInput
+    ContributorConsent
+    Dataset
+    Finding
+    ReleaseScope
+}
+
+pub fn scope_covers(maximum_scope: ReleaseScope, requested_scope: ReleaseScope) -> Bool {
+    match maximum_scope {
+        ReleaseScope.Public => true
+        ReleaseScope.Controlled => requested_scope != ReleaseScope.Public
+        ReleaseScope.Internal => requested_scope == ReleaseScope.Internal
+    }
+}
+
+pub fn risk_limit(scope: ReleaseScope) -> U32 {
+    match scope {
+        ReleaseScope.Public => 1
+        ReleaseScope.Controlled => 3
+        ReleaseScope.Internal => 6
+    }
+}
+
+pub fn consent_finding(input: AuditInput, dataset: Dataset) -> Option<Finding> {
+    var missing_consent = false
+    var withdrawn = false
+    var scope_exceeded = false
+
+    for contributor_index in 0..dataset.required_contributor_count {
+        let contributor_id: Str = dataset.required_contributor_ids[contributor_index].unwrap()
+        var matched_contributor = false
+        for consent_index in 0..input.consent_count {
+            let consent: ContributorConsent = input.consents[consent_index].unwrap()
+            if consent.dataset_id == dataset.id and consent.contributor_id == contributor_id {
+                matched_contributor = true
+                if not consent.consent_on_file {
+                    missing_consent = true
+                } else if consent.withdrawn {
+                    withdrawn = true
+                } else if not scope_covers(consent.maximum_release_scope, dataset.requested_scope) {
+                    scope_exceeded = true
+                }
+            }
+        }
+        if not matched_contributor {
+            missing_consent = true
+        }
+    }
+
+    if missing_consent {
+        Some(Finding.MissingContributorConsent)
+    } else if withdrawn {
+        Some(Finding.ConsentWithdrawn)
+    } else if scope_exceeded {
+        Some(Finding.ConsentScopeExceeded)
+    } else {
+        None
+    }
+}
+
+pub fn audience_policy_finding(dataset: Dataset) -> Option<Finding> {
+    if scope_covers(dataset.policy_maximum_scope, dataset.requested_scope) {
+        None
+    } else {
+        Some(Finding.AudiencePolicyExceeded)
+    }
+}
+
+pub fn is_rejection(finding: Finding) -> Bool {
+    match finding {
+        Finding.ManifestDatasetMismatch => true
+        Finding.UnknownSource => true
+        Finding.SourceNotApproved => true
+        Finding.SourceLicenseScopeExceeded => true
+        Finding.ConsentWithdrawn => true
+        Finding.ConsentScopeExceeded => true
+        Finding.AudiencePolicyExceeded => true
+        Finding.UnknownParent => true
+        Finding.RetentionExpired => true
+        Finding.DuplicateDatasetId => true
+        _ => false
+    }
+}

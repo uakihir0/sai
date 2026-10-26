@@ -1,0 +1,59 @@
+use acme:research-data-release-auditor/model.{
+    AuditInput
+    ContributorConsent
+    Dataset
+    Source
+    SourceManifest
+}
+
+pub fn source_index(input: AuditInput, source_id: Str) -> Option<USize> {
+    for index in 0..input.source_count {
+        if input.sources[index].unwrap().id == source_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn manifest_index(input: AuditInput, manifest_id: Str) -> Option<USize> {
+    for index in 0..input.manifest_count {
+        if input.manifests[index].unwrap().id == manifest_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn dataset_index(input: AuditInput, dataset_id: Str) -> Option<USize> {
+    for index in 0..input.dataset_count {
+        if input.datasets[index].unwrap().id == dataset_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn dataset_has_prior_id(input: AuditInput, before_index: USize, dataset_id: Str) -> Bool {
+    for index in 0..before_index {
+        if input.datasets[index].unwrap().id == dataset_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn consent_for_dataset(input: AuditInput, index: USize) -> ContributorConsent {
+    input.consents[index].unwrap()
+}
+
+pub fn source_for_dataset(input: AuditInput, index: USize) -> Source {
+    input.sources[index].unwrap()
+}
+
+pub fn manifest_for_dataset(input: AuditInput, index: USize) -> SourceManifest {
+    input.manifests[index].unwrap()
+}
+
+pub fn dataset_for_index(input: AuditInput, index: USize) -> Dataset {
+    input.datasets[index].unwrap()
+}

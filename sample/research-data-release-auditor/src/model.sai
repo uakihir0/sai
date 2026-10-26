@@ -1,0 +1,114 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReleaseScope {
+    Internal
+    Controlled
+    Public
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Decision {
+    Released
+    Held
+    Rejected
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Finding {
+    DuplicateDatasetId
+    MissingSourceManifest
+    ManifestDatasetMismatch
+    UnknownSource
+    SourceNotApproved
+    IncompleteProvenance
+    BrokenCustodyChain
+    SourceLicenseScopeExceeded
+    MissingContributorConsent
+    ConsentWithdrawn
+    ConsentScopeExceeded
+    AudiencePolicyExceeded
+    UnknownParent
+    ParentNotReady
+    ParentNotReleased
+    DeidentificationEvidenceMissing
+    DisclosureRiskTooHigh
+    SchemaInvalid
+    ContentChecksumMismatch
+    LegalHold
+    RetentionExpired
+    EmbargoActive
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Source {
+    pub id: Str
+    pub approved_for_research: Bool
+    pub maximum_release_scope: ReleaseScope
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SourceManifest {
+    pub id: Str
+    pub dataset_id: Str
+    pub source_id: Str
+    pub accession_recorded: Bool
+    pub provenance_complete: Bool
+    pub custody_chain_intact: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ContributorConsent {
+    pub dataset_id: Str
+    pub contributor_id: Str
+    pub consent_on_file: Bool
+    pub withdrawn: Bool
+    pub maximum_release_scope: ReleaseScope
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Dataset {
+    pub id: Str
+    pub manifest_id: Str
+    pub required_contributor_ids: Array<Option<Str>, 2>
+    pub required_contributor_count: USize
+    pub parent_dataset_id: Option<Str>
+    pub requested_scope: ReleaseScope
+    pub policy_maximum_scope: ReleaseScope
+    pub deidentification_attested: Bool
+    pub disclosure_risk_score: U32
+    pub schema_valid: Bool
+    pub content_checksum_valid: Bool
+    pub legal_hold: Bool
+    pub retained_through_day: U32
+    pub embargo_until_day: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditInput {
+    pub sources: Array<Option<Source>, 3>
+    pub source_count: USize
+    pub manifests: Array<Option<SourceManifest>, 16>
+    pub manifest_count: USize
+    pub consents: Array<Option<ContributorConsent>, 17>
+    pub consent_count: USize
+    pub datasets: Array<Option<Dataset>, 16>
+    pub dataset_count: USize
+    pub review_day: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DatasetDecision {
+    pub dataset_id: Str
+    pub decision: Decision
+    pub finding: Option<Finding>
+    pub requested_scope: ReleaseScope
+    pub parent_dataset_id: Option<Str>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReleaseAudit {
+    pub decisions: Array<Option<DatasetDecision>, 16>
+    pub dataset_count: USize
+    pub released_count: USize
+    pub held_count: USize
+    pub rejected_count: USize
+}

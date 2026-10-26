@@ -1,0 +1,37 @@
+use acme:research-data-release-auditor/lookup
+use acme:research-data-release-auditor/model.{
+    AuditInput
+    Dataset
+    DatasetDecision
+    Decision
+    Finding
+}
+
+pub fn parent_finding(
+    input: AuditInput,
+    decisions: Array<Option<DatasetDecision>, 16>,
+    current_index: USize,
+    dataset: Dataset,
+) -> Option<Finding> {
+    match dataset.parent_dataset_id {
+        None => None
+        Some(parent_id) => {
+            let parent_index = match lookup.dataset_index(input, parent_id) {
+                Some(index) => index
+                None => return Some(Finding.UnknownParent)
+            }
+            if parent_index >= current_index {
+                return Some(Finding.ParentNotReady)
+            }
+            let parent_decision = match decisions[parent_index] {
+                Some(value) => value
+                None => return Some(Finding.ParentNotReady)
+            }
+            if parent_decision.decision == Decision.Released {
+                None
+            } else {
+                Some(Finding.ParentNotReleased)
+            }
+        }
+    }
+}

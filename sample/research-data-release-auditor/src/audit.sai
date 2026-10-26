@@ -1,0 +1,130 @@
+use acme:research-data-release-auditor/lineage
+use acme:research-data-release-auditor/lookup
+use acme:research-data-release-auditor/model.{
+    AuditInput
+    Dataset
+    DatasetDecision
+    Decision
+    Finding
+    ReleaseAudit
+}
+use acme:research-data-release-auditor/policy
+
+fn first_finding(
+    input: AuditInput,
+    dataset: Dataset,
+    decisions: Array<Option<DatasetDecision>, 16>,
+    dataset_index: USize,
+) -> Option<Finding> {
+    if lookup.dataset_has_prior_id(input, dataset_index, dataset.id) {
+        return Some(Finding.DuplicateDatasetId)
+    }
+
+    let manifest_index = match lookup.manifest_index(input, dataset.manifest_id) {
+        Some(index) => index
+        None => return Some(Finding.MissingSourceManifest)
+    }
+    let manifest = lookup.manifest_for_dataset(input, manifest_index)
+    if manifest.dataset_id != dataset.id {
+        return Some(Finding.ManifestDatasetMismatch)
+    }
+    let source_index = match lookup.source_index(input, manifest.source_id) {
+        Some(index) => index
+        None => return Some(Finding.UnknownSource)
+    }
+    let source = lookup.source_for_dataset(input, source_index)
+    if not source.approved_for_research {
+        return Some(Finding.SourceNotApproved)
+    }
+    if not manifest.accession_recorded or not manifest.provenance_complete {
+        return Some(Finding.IncompleteProvenance)
+    }
+    if not manifest.custody_chain_intact {
+        return Some(Finding.BrokenCustodyChain)
+    }
+    if not policy.scope_covers(source.maximum_release_scope, dataset.requested_scope) {
+        return Some(Finding.SourceLicenseScopeExceeded)
+    }
+
+    let consent_finding = policy.consent_finding(input, dataset)
+    if consent_finding.is_some() {
+        return consent_finding
+    }
+    let audience_finding = policy.audience_policy_finding(dataset)
+    if audience_finding.is_some() {
+        return audience_finding
+    }
+
+    let parent_finding = lineage.parent_finding(input, decisions, dataset_index, dataset)
+    if parent_finding.is_some() {
+        return parent_finding
+    }
+    if not dataset.deidentification_attested {
+        return Some(Finding.DeidentificationEvidenceMissing)
+    }
+    if dataset.disclosure_risk_score > policy.risk_limit(dataset.requested_scope) {
+        return Some(Finding.DisclosureRiskTooHigh)
+    }
+    if not dataset.schema_valid {
+        return Some(Finding.SchemaInvalid)
+    }
+    if not dataset.content_checksum_valid {
+        return Some(Finding.ContentChecksumMismatch)
+    }
+    if dataset.legal_hold {
+        return Some(Finding.LegalHold)
+    }
+    if input.review_day > dataset.retained_through_day {
+        return Some(Finding.RetentionExpired)
+    }
+    if input.review_day < dataset.embargo_until_day {
+        return Some(Finding.EmbargoActive)
+    }
+
+    None
+}
+
+pub fn audit(input: AuditInput) -> ReleaseAudit {
+    var decisions: Array<Option<DatasetDecision>, 16> =
+        Array<Option<DatasetDecision>, 16>.filled(None)
+    var released_count: USize = 0
+    var held_count: USize = 0
+    var rejected_count: USize = 0
+
+    for index in 0..input.dataset_count {
+        let dataset = lookup.dataset_for_index(input, index)
+        let finding = first_finding(input, dataset, decisions, index)
+        let decision = match finding {
+            Some(reason) => if policy.is_rejection(reason) {
+                Decision.Rejected
+            } else {
+                Decision.Held
+            }
+            None => Decision.Released
+        }
+        decisions[index] = Some(
+            DatasetDecision(
+                dataset_id: dataset.id,
+                decision: decision,
+                finding: finding,
+                requested_scope: dataset.requested_scope,
+                parent_dataset_id: dataset.parent_dataset_id,
+            ),
+        )
+        if decision == Decision.Released {
+            released_count += 1
+        } else if decision == Decision.Held {
+            held_count += 1
+        } else {
+            rejected_count += 1
+        }
+    }
+
+    ReleaseAudit(
+        decisions: decisions,
+        dataset_count: input.dataset_count,
+        released_count: released_count,
+        held_count: held_count,
+        rejected_count: rejected_count,
+    )
+}
