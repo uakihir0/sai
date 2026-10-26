@@ -2432,6 +2432,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
+                ExprKind::Binary(BinOp::Add, left, right)
+                    if is_supported_direct_call_arithmetic_operand(left)
+                        && is_supported_direct_call_arithmetic_operand(right) =>
+                {
+                    let local_type =
+                        self.check_arithmetic(BinOp::Add, left, right, argument.expr.hir_id)?;
+                    self.record_expression_type(argument.expr.hir_id, local_type);
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
                 _ => return Err(()),
             }
         }
@@ -4767,6 +4776,14 @@ fn primitive_literal_kind(literal: Lit<'_>) -> Option<PrimitiveLiteralKind> {
         Lit::Byte(_) => Some(PrimitiveLiteralKind::Byte),
         Lit::Char(_) => Some(PrimitiveLiteralKind::Character),
         Lit::Str(_) | Lit::ByteStr(_) => None,
+    }
+}
+
+fn is_supported_direct_call_arithmetic_operand(expression: &Expr<'_>) -> bool {
+    match expression.kind {
+        ExprKind::Lit(literal) => primitive_literal_kind(literal).is_some(),
+        ExprKind::Path(_) => true,
+        _ => false,
     }
 }
 

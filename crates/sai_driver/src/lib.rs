@@ -8982,6 +8982,15 @@ fn is_supported_direct_call_argument_shape(
         ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Binary(BinOp::Add, left, right) => {
+            is_supported_direct_call_leaf_argument_shape(left, preceding_bindings, locals, inputs)
+                && is_supported_direct_call_leaf_argument_shape(
+                    right,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                )
+        }
         ExprKind::Call {
             callee,
             args,
@@ -8996,7 +9005,7 @@ fn is_supported_direct_call_argument_shape(
             args.iter()
                 .take(signature.parameters.len())
                 .all(|argument| {
-                    is_supported_direct_call_leaf_argument_shape(
+                    is_supported_direct_call_arithmetic_argument_shape(
                         argument.expr,
                         preceding_bindings,
                         locals,
@@ -9005,6 +9014,31 @@ fn is_supported_direct_call_argument_shape(
                 })
         }
         _ => false,
+    }
+}
+
+fn is_supported_direct_call_arithmetic_argument_shape(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    match expression.kind {
+        ExprKind::Binary(BinOp::Add, left, right) => {
+            is_supported_direct_call_leaf_argument_shape(left, preceding_bindings, locals, inputs)
+                && is_supported_direct_call_leaf_argument_shape(
+                    right,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                )
+        }
+        _ => is_supported_direct_call_leaf_argument_shape(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+        ),
     }
 }
 
@@ -48484,9 +48518,29 @@ property "shared"() {}
             "}\n",
             "pub fn nested_shadowed_call(add_one: I32) -> I32 { apply(add_one(1)) }\n",
             "pub fn nested_generic_unsupported() -> I32 { apply(generic_fn(1)) }\n",
+            "pub fn nested_call_with_arithmetic_argument(input: I32) -> I32 {\n",
+            "    apply(add_one(input + 1))\n",
+            "}\n",
             "pub fn deep_nested_call(input: I32) -> I32 {\n",
             "    apply(add_one(add_one(input)))\n",
             "}\n",
+            "pub fn arithmetic_call_argument(input: I32) -> I32 {\n",
+            "    let result = apply(input + 1)\n",
+            "    result\n",
+            "}\n",
+            "pub fn arithmetic_call_argument_literal_left(input: I32) -> I32 { apply(1 + input) }\n",
+            "pub fn arithmetic_call_argument_integer_literals() -> I32 { apply(1 + 2) }\n",
+            "pub fn arithmetic_call_argument_float(value: F32) -> F32 { float_fn(value + 1.5) }\n",
+            "pub fn arithmetic_call_argument_result_mismatch(input: I32) -> F32 { float_fn(input + 1) }\n",
+            "pub fn arithmetic_call_argument_errors(input: I32, float_value: F32) -> I32 {\n",
+            "    let result = apply_pair(input + float_value, true)\n",
+            "    let alias = result\n",
+            "    let valid = apply(input)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn arithmetic_call_argument_extra_ignored(input: I32) -> I32 { apply(input, 1 + 2) }\n",
+            "pub fn nested_arithmetic_argument(input: I32) -> I32 { apply((input + 1) + 2) }\n",
+            "pub fn call_under_arithmetic_argument(input: I32) -> I32 { apply(add_one(input) + 1) }\n",
             "pub fn call_in_operator(input: I32) -> I32 {\n",
             "    let result = apply(input) + 1\n",
             "    result\n",
@@ -48614,6 +48668,30 @@ property "shared"() {}
             "nested_inner_too_many",
             &[sai_diagnostics::Code::WrongArgumentCount],
         );
+        let nested_call_with_arithmetic_argument =
+            assert_supported("nested_call_with_arithmetic_argument", &[]);
+        let arithmetic_call_argument = assert_supported("arithmetic_call_argument", &[]);
+        let arithmetic_call_argument_literal_left =
+            assert_supported("arithmetic_call_argument_literal_left", &[]);
+        let arithmetic_call_argument_integer_literals =
+            assert_supported("arithmetic_call_argument_integer_literals", &[]);
+        let arithmetic_call_argument_float =
+            assert_supported("arithmetic_call_argument_float", &[]);
+        let arithmetic_call_argument_result_mismatch = assert_supported(
+            "arithmetic_call_argument_result_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let arithmetic_call_argument_errors = assert_supported(
+            "arithmetic_call_argument_errors",
+            &[
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+        );
+        let arithmetic_call_argument_extra_ignored = assert_supported(
+            "arithmetic_call_argument_extra_ignored",
+            &[sai_diagnostics::Code::WrongArgumentCount],
+        );
         let mismatched = assert_supported("mismatched", &[sai_diagnostics::Code::TypeMismatch]);
         let annotated_mismatch =
             assert_supported("annotated_mismatch", &[sai_diagnostics::Code::TypeMismatch]);
@@ -48646,6 +48724,8 @@ property "shared"() {}
             "call_in_operator",
             "nested_shadowed_call",
             "nested_generic_unsupported",
+            "nested_arithmetic_argument",
+            "call_under_arithmetic_argument",
         ] {
             assert!(
                 matches!(
@@ -48830,6 +48910,136 @@ property "shared"() {}
                 "nested direct-call result has its exact HIR fact in `{function}`"
             );
         }
+        let nested_call_with_arithmetic_context = "apply(add_one(input + 1))";
+        assert_eq!(
+            expression_type_at_range(
+                nested_call_with_arithmetic_argument,
+                "pub fn nested_call_with_arithmetic_argument",
+                nested_call_with_arithmetic_context,
+                0,
+                nested_call_with_arithmetic_context.len()
+            ),
+            Some(PrimTy::I32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                nested_call_with_arithmetic_argument,
+                "pub fn nested_call_with_arithmetic_argument",
+                nested_call_with_arithmetic_context,
+                "apply(".len(),
+                "add_one(input + 1)".len()
+            ),
+            Some(PrimTy::I32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                nested_call_with_arithmetic_argument,
+                "pub fn nested_call_with_arithmetic_argument",
+                nested_call_with_arithmetic_context,
+                "apply(add_one(".len(),
+                "input + 1".len()
+            ),
+            Some(PrimTy::I32)
+        );
+        for (owner, function, context) in [
+            (
+                arithmetic_call_argument,
+                "pub fn arithmetic_call_argument",
+                "apply(input + 1)",
+            ),
+            (
+                arithmetic_call_argument_literal_left,
+                "pub fn arithmetic_call_argument_literal_left",
+                "apply(1 + input)",
+            ),
+            (
+                arithmetic_call_argument_integer_literals,
+                "pub fn arithmetic_call_argument_integer_literals",
+                "apply(1 + 2)",
+            ),
+        ] {
+            assert_eq!(
+                expression_type_at_range(owner, function, context, 0, context.len()),
+                Some(PrimTy::I32),
+                "the containing direct call receives its exact result type in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    context,
+                    "apply(".len(),
+                    context.len() - "apply(".len() - 1
+                ),
+                Some(PrimTy::I32),
+                "the single addition expression receives its exact HIR type in `{function}`"
+            );
+        }
+        assert_eq!(
+            expression_type_at_range(
+                arithmetic_call_argument_float,
+                "pub fn arithmetic_call_argument_float",
+                "float_fn(value + 1.5)",
+                "float_fn(".len(),
+                "value + 1.5".len()
+            ),
+            Some(PrimTy::F32)
+        );
+        let mismatched_addition = "input + 1";
+        assert_eq!(
+            expression_type_at_range(
+                arithmetic_call_argument_result_mismatch,
+                "pub fn arithmetic_call_argument_result_mismatch",
+                "float_fn(input + 1)",
+                "float_fn(".len(),
+                mismatched_addition.len()
+            ),
+            None,
+            "an addition whose result mismatches the parameter has no trusted expression fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                arithmetic_call_argument_result_mismatch,
+                "pub fn arithmetic_call_argument_result_mismatch",
+                "float_fn(input + 1)",
+                0,
+                "float_fn(input + 1)".len()
+            ),
+            None,
+            "a call with a mismatched arithmetic argument has no trusted call fact"
+        );
+        let mismatch_diagnostics = match arithmetic_call_argument_result_mismatch
+            .body_type_check()
+            .expect("owner body check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("arithmetic result mismatch remains a supported diagnostic")
+            }
+        };
+        assert_eq!(mismatch_diagnostics.len(), 1);
+        let function_start = root
+            .find("pub fn arithmetic_call_argument_result_mismatch")
+            .expect("arithmetic result mismatch function exists");
+        let expression_start = function_start
+            + root[function_start..]
+                .find(mismatched_addition)
+                .expect("mismatched addition is within its function");
+        assert_eq!(
+            mismatch_diagnostics[0]
+                .primary()
+                .expect("arithmetic result mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(expression_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (expression_start + mismatched_addition.len()) as u32,
+                ),
+            )
+            .expect("arithmetic mismatch span is ordered"),
+            "an addition-result mismatch covers the complete argument expression"
+        );
         assert_eq!(
             expression_type_at_range(
                 float_call,
@@ -48859,6 +49069,11 @@ property "shared"() {}
             ),
             (too_many, "pub fn too_many", "apply(input, true)"),
             (too_few, "pub fn too_few", "apply()"),
+            (
+                arithmetic_call_argument_extra_ignored,
+                "pub fn arithmetic_call_argument_extra_ignored",
+                "apply(input, 1 + 2)",
+            ),
             (named, "pub fn named", "apply(value: input)"),
             (
                 named_and_mismatched,
@@ -48872,6 +49087,17 @@ property "shared"() {}
                 "diagnosed call {call:?} in `{function}` is omitted from primitive results"
             );
         }
+        assert_eq!(
+            expression_type_at_range(
+                arithmetic_call_argument_extra_ignored,
+                "pub fn arithmetic_call_argument_extra_ignored",
+                "apply(input, 1 + 2)",
+                "apply(input, ".len(),
+                "1 + 2".len()
+            ),
+            None,
+            "an unmatched extra argument remains outside the arithmetic call-argument slice"
+        );
         for (owner, function, context, nested_call) in [
             (
                 nested_inner_error,
@@ -49023,8 +49249,6 @@ property "shared"() {}
             None,
             "the exact operator expression depending on a mismatched call is omitted"
         );
-        drop(expression_type_at_range);
-
         let named_and_mismatched_diagnostics = match named_and_mismatched
             .body_type_check()
             .expect("owner body check is available")
@@ -49142,6 +49366,103 @@ property "shared"() {}
                 "nested result/arity diagnostics use the complete inner call span"
             );
         }
+        let arithmetic_error_call = "apply_pair(input + float_value, true)";
+        assert_eq!(
+            expression_type_at_range(
+                arithmetic_call_argument_errors,
+                "pub fn arithmetic_call_argument_errors",
+                arithmetic_error_call,
+                0,
+                arithmetic_error_call.len()
+            ),
+            None,
+            "a call with an erroneous arithmetic argument has no call type fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                arithmetic_call_argument_errors,
+                "pub fn arithmetic_call_argument_errors",
+                arithmetic_error_call,
+                "apply_pair(".len(),
+                "input + float_value".len()
+            ),
+            None,
+            "an erroneous arithmetic argument has no expression type fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                arithmetic_call_argument_errors,
+                "pub fn arithmetic_call_argument_errors",
+                arithmetic_error_call,
+                "apply_pair(input + ".len(),
+                "float_value".len()
+            ),
+            None,
+            "the mismatched arithmetic operand path has no trusted type fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                arithmetic_call_argument_errors,
+                "pub fn arithmetic_call_argument_errors",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "an inferred alias of an errored arithmetic call is omitted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                arithmetic_call_argument_errors,
+                "pub fn arithmetic_call_argument_errors",
+                "let valid = apply(input)",
+                "let valid = ".len(),
+                "apply(input)".len()
+            ),
+            Some(PrimTy::I32),
+            "a valid independent sibling call remains available"
+        );
+        let arithmetic_diagnostics = match arithmetic_call_argument_errors
+            .body_type_check()
+            .expect("owner body check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("supported arithmetic mismatches remain diagnostic errors")
+            }
+        };
+        assert_eq!(
+            arithmetic_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ]
+        );
+        let arithmetic_error_call_start = root
+            .find(arithmetic_error_call)
+            .expect("two-argument arithmetic mismatch call exists");
+        for (diagnostic, (offset, token)) in arithmetic_diagnostics.iter().zip([
+            ("apply_pair(input + ".len(), "float_value"),
+            ("apply_pair(input + float_value, ".len(), "true"),
+        ]) {
+            let start = arithmetic_error_call_start + offset;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("arithmetic mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + token.len()) as u32),
+                )
+                .expect("arithmetic mismatch span is ordered"),
+                "arithmetic and later argument mismatches preserve source order and exact spans"
+            );
+        }
         let too_many_diagnostics = match too_many
             .body_type_check()
             .expect("owner body check is available")
@@ -49163,6 +49484,7 @@ property "shared"() {}
             "the full-call arity span precedes common-prefix argument errors"
         );
 
+        drop(expression_type_at_range);
         let binding_type = |owner: &FunctionOwnerResolution, name: &str| {
             let results = owner
                 .primitive_body_type_results()
@@ -49197,6 +49519,11 @@ property "shared"() {}
             Some(PrimTy::I32),
             "a local initialized by a nested direct call retains its output type"
         );
+        assert_eq!(
+            binding_type(arithmetic_call_argument, "result"),
+            Some(PrimTy::I32),
+            "a local initialized by a direct call with an arithmetic argument retains its output type"
+        );
         assert_eq!(binding_type(nested_inner_error, "result"), None);
         assert_eq!(
             binding_type(nested_inner_error, "alias"),
@@ -49225,6 +49552,19 @@ property "shared"() {}
                 "an independent sibling binding remains available"
             );
         }
+        assert_eq!(
+            binding_type(arithmetic_call_argument_errors, "result"),
+            None
+        );
+        assert_eq!(
+            binding_type(arithmetic_call_argument_errors, "alias"),
+            None,
+            "an inferred alias of an arithmetic call error remains tainted"
+        );
+        assert_eq!(
+            binding_type(arithmetic_call_argument_errors, "valid"),
+            Some(PrimTy::I32)
+        );
         assert_eq!(binding_type(mismatched, "result"), None);
         assert_eq!(
             binding_type(mismatched, "alias"),
