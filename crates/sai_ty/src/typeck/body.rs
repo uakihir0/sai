@@ -33,8 +33,20 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// local uses do not produce cascading primitive-type errors.
     pub unknown_self_fields: Option<&'a HashSet<HirId>>,
     pub local_paths: &'a HashMap<HirId, BindingId>,
+    /// Direct, supported function signatures resolved for call expressions
+    /// in this owner's simple block.
+    pub call_signatures: Option<&'a HashMap<HirId, PrimitiveCallSignature>>,
     pub symbols: &'a Interner,
     pub pointer_width: u8,
+}
+
+/// A direct function signature projected by the owner-aware driver for one
+/// call site. The call site and callee identities are both checked before use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrimitiveCallSignature {
+    pub callee: HirId,
+    pub parameters: Vec<PrimTy>,
+    pub output: PrimTy,
 }
 
 /// Result of checking a function body in the annotated-local slice.
@@ -126,6 +138,13 @@ pub enum PrimitiveBodyErrorKind {
     UnaryOperatorNotSupported {
         operator: UnOp,
         operand: PrimTy,
+    },
+    WrongArgumentCount {
+        expected: usize,
+        found: usize,
+    },
+    NamedArgumentOnFunction {
+        name_span: sai_hir::Span,
     },
 }
 
@@ -411,7 +430,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     .input
                     .unknown_self_fields
                     .is_some_and(|fields| fields.contains(&tail.hir_id));
-        if block.stmts.is_empty() && !is_supported_field_tail {
+        let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
+            && self
+                .input
+                .call_signatures
+                .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
+        if block.stmts.is_empty() && !is_supported_field_tail && !is_supported_call_tail {
             return Err(());
         }
         for stmt in block.stmts {
@@ -520,6 +544,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         LocalType::Concrete(expected)
                     } else {
                         source_type
+                    }
+                }
+                ExprKind::Call { .. } => {
+                    let call_type = self.check_direct_call(init)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(call_type, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        call_type
                     }
                 }
                 ExprKind::Binary(operator, left, right) => {
@@ -2229,6 +2262,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         } else {
             match expression.kind {
+                ExprKind::Call { .. } => self.check_direct_call(expression)?,
                 ExprKind::Field { .. } => LocalType::Concrete(
                     self.input
                         .self_field_projections
@@ -2275,6 +2309,66 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         self.record_expression_type(expression.hir_id, local_type);
         Ok(())
+    }
+
+    fn check_direct_call(&mut self, expression: &Expr<'hir>) -> Result<LocalType, ()> {
+        let ExprKind::Call {
+            callee,
+            args,
+            base: None,
+        } = expression.kind
+        else {
+            return Err(());
+        };
+        let signature = self
+            .input
+            .call_signatures
+            .and_then(|signatures| signatures.get(&expression.hir_id))
+            .filter(|signature| signature.callee == callee.hir_id)
+            .cloned()
+            .ok_or(())?;
+
+        if args.len() != signature.parameters.len() {
+            self.errors.push(PrimitiveBodyError {
+                node: expression.hir_id,
+                kind: PrimitiveBodyErrorKind::WrongArgumentCount {
+                    expected: signature.parameters.len(),
+                    found: args.len(),
+                },
+            });
+        }
+
+        // Check only the positional prefix shared by the source arguments and
+        // the resolved signature. Unmatched extra arguments remain outside
+        // this bounded checker slice, though named-argument errors are still
+        // reported for every written argument.
+        for (index, argument) in args.iter().enumerate() {
+            if let Some(name) = argument.name {
+                self.errors.push(PrimitiveBodyError {
+                    node: expression.hir_id,
+                    kind: PrimitiveBodyErrorKind::NamedArgumentOnFunction {
+                        name_span: name.span,
+                    },
+                });
+            }
+            let Some(expected) = signature.parameters.get(index) else {
+                continue;
+            };
+            match argument.expr.kind {
+                ExprKind::Lit(literal) => {
+                    let Some(found) = primitive_literal_kind(literal) else {
+                        return Err(());
+                    };
+                    self.check_annotated_literal(*expected, literal, found, argument.expr.hir_id);
+                }
+                ExprKind::Path(_) => {
+                    let local_type = self.check_local_path(argument.expr)?;
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
+                _ => return Err(()),
+            }
+        }
+        Ok(LocalType::Concrete(signature.output))
     }
 
     fn expression_has_unknown_field_error(&self, expression: &Expr<'hir>) -> bool {
@@ -3277,6 +3371,15 @@ fn collect_primitive_expression_nodes<'hir>(
             collect_primitive_expression_nodes(left, nodes);
             collect_primitive_expression_nodes(right, nodes);
         }
+        ExprKind::Call { callee, args, base } => {
+            collect_primitive_expression_nodes(callee, nodes);
+            for argument in args {
+                collect_primitive_expression_nodes(argument.expr, nodes);
+            }
+            if let Some(base) = base {
+                collect_primitive_expression_nodes(base, nodes);
+            }
+        }
         _ => {}
     }
 }
@@ -3321,6 +3424,31 @@ fn expression_has_primitive_result_taint(
                     local_paths,
                     tainted_bindings,
                 )
+            }
+            ExprKind::Call { callee, args, base } => {
+                expression_has_primitive_result_taint(
+                    callee,
+                    error_nodes,
+                    unknown_self_fields,
+                    local_paths,
+                    tainted_bindings,
+                ) || args.iter().any(|argument| {
+                    expression_has_primitive_result_taint(
+                        argument.expr,
+                        error_nodes,
+                        unknown_self_fields,
+                        local_paths,
+                        tainted_bindings,
+                    )
+                }) || base.is_some_and(|base| {
+                    expression_has_primitive_result_taint(
+                        base,
+                        error_nodes,
+                        unknown_self_fields,
+                        local_paths,
+                        tainted_bindings,
+                    )
+                })
             }
             _ => false,
         }

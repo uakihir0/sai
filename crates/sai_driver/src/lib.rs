@@ -7433,6 +7433,7 @@ fn check_function_body_type(
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -7471,7 +7472,18 @@ fn check_function_body_type(
     }
     if sig.params.len() == body.params.len() {
         if let Some((diagnostics, type_results)) = check_function_body_primitive_local_block(
-            owner, sig, body, locals, type_paths, symbols, None, None, inputs, snapshot, target_cfg,
+            owner,
+            sig,
+            body,
+            locals,
+            type_paths,
+            direct_call_signatures,
+            symbols,
+            None,
+            None,
+            inputs,
+            snapshot,
+            target_cfg,
         )? {
             *primitive_type_results = Some(type_results);
             return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
@@ -8028,6 +8040,7 @@ fn check_inherent_method_body_type(
         &explicit_body,
         locals,
         type_paths,
+        None,
         symbols,
         Some(&self_field_projections),
         Some(&unknown_self_fields),
@@ -8391,6 +8404,7 @@ fn check_function_body_primitive_local_block(
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
@@ -8457,6 +8471,8 @@ fn check_function_body_primitive_local_block(
     let is_supported_field_tail = matches!(tail.kind, ExprKind::Field { .. })
         && (self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id))
             || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
+    let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
+        && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8466,9 +8482,10 @@ fn check_function_body_primitive_local_block(
             Some(tail_binding)
         }
         ExprKind::Field { .. } if is_supported_field_tail => None,
+        ExprKind::Call { .. } if is_supported_call_tail => None,
         _ => return Ok(None),
     };
-    if block.stmts.is_empty() && !is_supported_field_tail {
+    if block.stmts.is_empty() && !is_supported_field_tail && !is_supported_call_tail {
         return Ok(None);
     }
 
@@ -8572,6 +8589,22 @@ fn check_function_body_primitive_local_block(
                 if self_field_projections
                     .is_some_and(|fields| fields.contains_key(&init.hir_id))
                     || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id)) => {}
+            ExprKind::Call {
+                args, base: None, ..
+            } if direct_call_signatures
+                .and_then(|signatures| signatures.get(&init.hir_id))
+                .is_some_and(|signature| {
+                    args.iter()
+                        .take(signature.parameters.len())
+                        .all(|argument| {
+                            is_supported_direct_call_argument_shape(
+                                argument.expr,
+                                &preceding_bindings,
+                                locals,
+                                inputs,
+                            )
+                        })
+                }) => {}
             ExprKind::Path(path) => {
                 let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
                 else {
@@ -8722,6 +8755,33 @@ fn check_function_body_primitive_local_block(
     if tail_binding.is_some_and(|binding| !preceding_bindings.contains(&binding)) {
         return Ok(None);
     }
+    if let (
+        true,
+        ExprKind::Call {
+            args, base: None, ..
+        },
+    ) = (is_supported_call_tail, tail.kind)
+    {
+        let Some(signature) =
+            direct_call_signatures.and_then(|signatures| signatures.get(&tail.hir_id))
+        else {
+            return Ok(None);
+        };
+        if !args
+            .iter()
+            .take(signature.parameters.len())
+            .all(|argument| {
+                is_supported_direct_call_argument_shape(
+                    argument.expr,
+                    &preceding_bindings,
+                    locals,
+                    inputs,
+                )
+            })
+        {
+            return Ok(None);
+        }
+    }
 
     let local_paths = locals
         .paths
@@ -8744,6 +8804,7 @@ fn check_function_body_primitive_local_block(
             self_field_projections,
             unknown_self_fields,
             local_paths: &local_paths,
+            call_signatures: direct_call_signatures,
             symbols,
             pointer_width: target_cfg.pointer_width(),
         },
@@ -8814,6 +8875,20 @@ fn resolved_plain_local_path_binding(
     }
 }
 
+fn is_supported_direct_call_argument_shape(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    match expression.kind {
+        ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        _ => false,
+    }
+}
+
 fn primitive_body_errors_to_diagnostics(
     owner: &HirOwner<'_>,
     block: &sai_hir::expressions::Block<'_>,
@@ -8830,14 +8905,19 @@ fn primitive_body_errors_to_diagnostics(
     });
     let mut diagnostics = Vec::with_capacity(errors.len());
     for error in errors {
-        let span = block
-            .stmts
-            .iter()
-            .find_map(|stmt| match stmt.kind {
-                StmtKind::Let { init, .. } => primitive_body_error_span(init, error.node),
-                _ => None,
-            })
-            .or_else(|| (error.node == tail.hir_id).then_some(tail.span));
+        let span = match error.kind {
+            sai_ty::typeck::body::PrimitiveBodyErrorKind::NamedArgumentOnFunction { name_span } => {
+                Some(name_span)
+            }
+            _ => block
+                .stmts
+                .iter()
+                .find_map(|stmt| match stmt.kind {
+                    StmtKind::Let { init, .. } => primitive_body_error_span(init, error.node),
+                    _ => None,
+                })
+                .or_else(|| primitive_body_error_span(tail, error.node)),
+        };
         let Some(span) = span else {
             return Ok(None);
         };
@@ -9007,6 +9087,31 @@ fn primitive_body_errors_to_diagnostics(
                     "operator trait implementation is not available",
                 )?
             }
+            PrimitiveBodyErrorKind::WrongArgumentCount { expected, found } => {
+                let noun = if expected == 1 {
+                    "argument"
+                } else {
+                    "arguments"
+                };
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::WrongArgumentCount,
+                    format!("function expects {expected} {noun} but found {found}"),
+                    "wrong number of arguments",
+                )?
+            }
+            PrimitiveBodyErrorKind::NamedArgumentOnFunction { .. } => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::NamedArgumentOnFunction,
+                "named arguments are only allowed when constructing a record".to_owned(),
+                "named argument is not allowed in a function call",
+            )?,
         };
         diagnostics.push(diagnostic);
     }
@@ -9031,6 +9136,12 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
                 None
             }
         }
+        ExprKind::Call { callee, args, base } => primitive_body_error_span(callee, node)
+            .or_else(|| {
+                args.iter()
+                    .find_map(|argument| primitive_body_error_span(argument.expr, node))
+            })
+            .or_else(|| base.and_then(|base| primitive_body_error_span(base, node))),
         _ => None,
     }
 }
@@ -9418,6 +9529,13 @@ enum FunctionDirectType {
     Unit,
 }
 
+#[derive(Clone, Debug)]
+struct PrimitiveFunctionCallSignature {
+    owner: OwnerId,
+    parameters: Vec<sai_resolve::prelude::PrimTy>,
+    output: sai_resolve::prelude::PrimTy,
+}
+
 fn resolve_function_direct_type(
     ty: Ty<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
@@ -9437,6 +9555,88 @@ fn function_direct_type_name(ty: FunctionDirectType) -> &'static str {
         FunctionDirectType::Str => "Str",
         FunctionDirectType::Unit => "()",
     }
+}
+
+fn direct_primitive_call_sites(
+    body: &sai_hir::body::Body<'_>,
+    module_paths: &ModuleResolution,
+    signatures: &HashMap<DefId, PrimitiveFunctionCallSignature>,
+    requesting_package: PackageId,
+    inputs: &CurrentOwnerInputs,
+) -> HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature> {
+    let mut calls = HashMap::new();
+    if module_paths.owner != body.owner {
+        return calls;
+    }
+    let ExprKind::Block(block) = body.value.kind else {
+        return calls;
+    };
+    for statement in block.stmts {
+        if let StmtKind::Let { init, .. } = statement.kind
+            && matches!(init.kind, ExprKind::Call { .. })
+            && let Some(signature) = direct_primitive_call_site(
+                init,
+                module_paths,
+                signatures,
+                requesting_package,
+                inputs,
+            )
+        {
+            calls.insert(init.hir_id, signature);
+        }
+    }
+    if let Some(tail) = block.tail
+        && matches!(tail.kind, ExprKind::Call { .. })
+        && let Some(signature) =
+            direct_primitive_call_site(tail, module_paths, signatures, requesting_package, inputs)
+    {
+        calls.insert(tail.hir_id, signature);
+    }
+    calls
+}
+
+fn direct_primitive_call_site(
+    expression: &HirExpr<'_>,
+    module_paths: &ModuleResolution,
+    signatures: &HashMap<DefId, PrimitiveFunctionCallSignature>,
+    requesting_package: PackageId,
+    inputs: &CurrentOwnerInputs,
+) -> Option<sai_ty::typeck::body::PrimitiveCallSignature> {
+    let ExprKind::Call {
+        callee, base: None, ..
+    } = expression.kind
+    else {
+        return None;
+    };
+    let ExprKind::Path(path) = callee.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain
+        || path.segments.len() != 1
+        || path.segments[0].args.is_some()
+        || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+    {
+        return None;
+    }
+    let Some(PathRes {
+        base: Res::Def(DefKind::Fn, target),
+        resolved_segments: 1,
+        segment_count: 1,
+    }) = module_paths.paths.get(&path.hir_id)
+    else {
+        return None;
+    };
+    if target.package != requesting_package {
+        return None;
+    }
+    let signature = signatures.get(target)?;
+    (signature.owner.def_id.to_def_id() == *target
+        && signature.owner.def_id.package() == requesting_package)
+        .then(|| sai_ty::typeck::body::PrimitiveCallSignature {
+            callee: callee.hir_id,
+            parameters: signature.parameters.clone(),
+            output: signature.output,
+        })
 }
 
 fn check_const_tuple_literal(
@@ -19065,6 +19265,171 @@ impl RootDatabase {
         self.resolve_function_owner_analyses(collection, module_tree, snapshot)
     }
 
+    fn index_direct_primitive_function_signatures(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        snapshot: &WorkspaceSnapshot,
+        top_level_owner_index: &HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
+        module_members: &ModuleMemberIndex<'_>,
+        source_graph_packages: &HashSet<PackageId>,
+    ) -> HashMap<DefId, PrimitiveFunctionCallSignature> {
+        let Ok(primitive_prelude) = self.primitive_prelude.clone() else {
+            return HashMap::new();
+        };
+        let mut signatures = HashMap::new();
+        let mut ambiguous_definitions = HashSet::new();
+        let mut owner_inputs_by_file = HashMap::<FileId, Option<CurrentOwnerInputs>>::new();
+
+        for descriptor in &collection.scopes.function_owners {
+            let def_id = descriptor.owner.def_id.to_def_id();
+            if descriptor.owner.def_id.package() != collection.module_tree.package
+                || def_id.package != collection.module_tree.package
+            {
+                continue;
+            }
+            if !owner_inputs_by_file.contains_key(&descriptor.file) {
+                owner_inputs_by_file.insert(
+                    descriptor.file,
+                    self.current_owner_inputs(snapshot, descriptor.file, &collection.target_cfg)
+                        .ok(),
+                );
+            }
+            let Some(Some(inputs)) = owner_inputs_by_file.get(&descriptor.file) else {
+                continue;
+            };
+            let Ok(module_scope) =
+                module_scope_for_file(collection, &collection.module_tree, descriptor.file)
+            else {
+                continue;
+            };
+            let Ok(owner_descriptor) = find_top_level_owner_descriptor(
+                top_level_owner_index,
+                descriptor.owner,
+                descriptor.file,
+                descriptor.item_id,
+                TopLevelOwnerKind::Function,
+            ) else {
+                continue;
+            };
+            let Some(def_paths) = self.def_paths.get(&descriptor.owner.def_id.package()) else {
+                continue;
+            };
+            let Ok(Some(expected_path)) = def_paths.resolve_def_id(def_id) else {
+                continue;
+            };
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &inputs.ast_ids,
+                snapshot,
+                &inputs.root,
+                &arena,
+                &self.symbols,
+                def_paths,
+            );
+            let Ok((hir_owner, _source_map)) = lower_top_level_owner(
+                owner_descriptor,
+                &expected_path,
+                &inputs.filtered_item_tree,
+                &inputs.retained_item_kinds,
+                &context,
+            ) else {
+                continue;
+            };
+            if !hir_owner.raw_attrs.is_empty() || hir_owner.id != descriptor.owner {
+                continue;
+            }
+            let OwnerNode::Item(item) = hir_owner.node else {
+                continue;
+            };
+            let ItemKind::Fn {
+                sig,
+                generics,
+                has_body: true,
+            } = item.kind
+            else {
+                continue;
+            };
+            if item.owner_id != descriptor.owner
+                || sig.safety != sai_hir::Safety::Safe
+                || sig.is_async
+                || sig.borrows.is_some()
+                || sig.effects.is_some()
+                || !sig.requires.is_empty()
+                || !sig.ensures.is_empty()
+                || !generics.params.is_empty()
+                || !generics.where_preds.is_empty()
+                || hir_owner.body.is_none()
+            {
+                continue;
+            }
+
+            let type_path_candidates = owner_test_only_path_candidates(&hir_owner);
+            let type_paths = resolve_type_owner_module_paths(
+                descriptor.owner,
+                &type_path_candidates,
+                &HashMap::new(),
+                &primitive_prelude,
+                &HashSet::new(),
+                module_scope,
+                Some(module_members),
+                descriptor.owner.def_id.package(),
+                Some(source_graph_packages),
+            );
+            let Some(parameters) = sig
+                .params
+                .iter()
+                .map(|parameter| {
+                    if parameter.is_self || parameter.mutable {
+                        return None;
+                    }
+                    match resolve_function_direct_type(
+                        *parameter.ty,
+                        Some(&type_paths),
+                        &self.symbols,
+                        &inputs,
+                    ) {
+                        Some(FunctionDirectType::Primitive(primitive))
+                            if sai_ty::typeck::literal::supports_primitive_literal(primitive) =>
+                        {
+                            Some(primitive)
+                        }
+                        Some(FunctionDirectType::Str | FunctionDirectType::Unit) | None => None,
+                        Some(FunctionDirectType::Primitive(_)) => None,
+                    }
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let Some(return_ty) = sig.ret else {
+                continue;
+            };
+            let Some(FunctionDirectType::Primitive(output)) =
+                resolve_function_direct_type(*return_ty, Some(&type_paths), &self.symbols, &inputs)
+            else {
+                continue;
+            };
+            if !sai_ty::typeck::literal::supports_primitive_literal(output) {
+                continue;
+            }
+
+            let signature = PrimitiveFunctionCallSignature {
+                owner: descriptor.owner,
+                parameters,
+                output,
+            };
+            if ambiguous_definitions.contains(&def_id) {
+                continue;
+            }
+            if signatures.insert(def_id, signature).is_some() {
+                signatures.remove(&def_id);
+                ambiguous_definitions.insert(def_id);
+            }
+        }
+
+        signatures
+    }
+
     /// Resolves loop labels, lexical locals, module paths, and local
     /// qualified type prefixes for each current top-level function owner.
     /// Unqualified module scopes are taken from the exact scope associated
@@ -19266,6 +19631,13 @@ impl RootDatabase {
             .map(|scopes| &scopes.source_graph_packages)
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let primitive_function_call_signatures = self.index_direct_primitive_function_signatures(
+            collection,
+            snapshot,
+            &top_level_owner_index,
+            &module_members,
+            source_graph_packages,
+        );
         let local_type_owners = self.resolve_type_owner_paths_inner(
             collection,
             module_tree,
@@ -19587,17 +19959,6 @@ impl RootDatabase {
                                         .as_ref()
                                         .and_then(|result| result.as_ref().ok())
                                         .and_then(Option::as_ref);
-                                    body_type_check = Some(check_function_body_type(
-                                        &hir_owner,
-                                        body,
-                                        &locals,
-                                        resolved_type_paths,
-                                        &self.symbols,
-                                        &inputs,
-                                        snapshot,
-                                        &collection.target_cfg,
-                                        &mut primitive_body_type_results,
-                                    )?);
                                     let mut module_paths = match &module_scope {
                                         Ok(module_scope) => Ok(resolve_owner_module_paths(
                                             &locals,
@@ -19606,6 +19967,28 @@ impl RootDatabase {
                                         )),
                                         Err(error) => Err(error.clone()),
                                     };
+                                    let direct_call_signatures =
+                                        module_paths.as_ref().ok().map(|module_paths| {
+                                            direct_primitive_call_sites(
+                                                body,
+                                                module_paths,
+                                                &primitive_function_call_signatures,
+                                                collection.module_tree.package,
+                                                &inputs,
+                                            )
+                                        });
+                                    body_type_check = Some(check_function_body_type(
+                                        &hir_owner,
+                                        body,
+                                        &locals,
+                                        resolved_type_paths,
+                                        direct_call_signatures.as_ref(),
+                                        &self.symbols,
+                                        &inputs,
+                                        snapshot,
+                                        &collection.target_cfg,
+                                        &mut primitive_body_type_results,
+                                    )?);
                                     world_field_resolution =
                                         Some(match (world_fields, &module_paths) {
                                             (Some(world_fields), Ok(module_paths)) => {
@@ -47249,6 +47632,482 @@ property "shared"() {}
             None,
             "a closure body never leaks expression results into the parent owner"
         );
+    }
+
+    #[test]
+    fn primitive_body_type_results_include_exact_direct_function_calls() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "use acme:phase1/child.{apply, apply_pair, float_fn, generic_fn, text_fn}\n",
+            "pub fn initializer(input: I32) -> I32 {\n",
+            "    let result = apply(input)\n",
+            "    let valid = result\n",
+            "    valid\n",
+            "}\n",
+            "pub fn tail_call(input: I32) -> I32 { apply(input) }\n",
+            "pub fn forward_call() -> I32 { later(1) }\n",
+            "pub fn later(value: I32) -> I32 { value }\n",
+            "pub fn recursive_call(value: I32) -> I32 { recursive_call(value) }\n",
+            "pub fn mismatched(input: Bool) -> I32 {\n",
+            "    let result = apply(input)\n",
+            "    let alias = result\n",
+            "    let derived = alias + 1\n",
+            "    let valid = 1\n",
+            "    valid\n",
+            "}\n",
+            "pub fn annotated_mismatch(input: Bool) -> I32 {\n",
+            "    let result: I32 = apply(input)\n",
+            "    result\n",
+            "}\n",
+            "pub fn too_many(input: Bool) -> I32 { apply(input, true) }\n",
+            "pub fn too_few() -> I32 { apply() }\n",
+            "pub fn named(input: I32) -> I32 {\n",
+            "    let result = apply(value: input)\n",
+            "    let valid = 1\n",
+            "    valid\n",
+            "}\n",
+            "pub fn named_and_mismatched(input: Bool) -> I32 {\n",
+            "    apply_pair(first: input, second: true)\n",
+            "}\n",
+            "pub fn float_call() -> F32 { float_fn(1.5) }\n",
+            "pub fn float_mismatch() -> F32 { float_fn(1) }\n",
+            "pub fn generic_call() -> I32 { generic_fn(1) }\n",
+            "pub fn str_call() -> I32 { text_fn(\"text\") }\n",
+            "pub fn shadowed_call(apply: I32) -> I32 { apply(1) }\n",
+        );
+        let child = concat!(
+            "pub fn apply(value: I32) -> I32 { value }\n",
+            "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
+            "pub fn float_fn(value: F32) -> F32 { value }\n",
+            "pub fn generic_fn<T>(value: T) -> I32 { 0 }\n",
+            "pub fn text_fn(value: Str) -> I32 { 0 }\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{name}` is present"))
+        }
+        let assert_supported = |name: &str, expected_codes: &[sai_diagnostics::Code]| {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("owner body check is available")
+            else {
+                panic!("function `{name}` should stay in the supported call slice");
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                expected_codes,
+                "diagnostics for `{name}`"
+            );
+            owner
+        };
+        let initializer = assert_supported("initializer", &[]);
+        let tail_call = assert_supported("tail_call", &[]);
+        let forward_call = assert_supported("forward_call", &[]);
+        let recursive_call = assert_supported("recursive_call", &[]);
+        let mismatched = assert_supported("mismatched", &[sai_diagnostics::Code::TypeMismatch]);
+        let annotated_mismatch =
+            assert_supported("annotated_mismatch", &[sai_diagnostics::Code::TypeMismatch]);
+        let too_many = assert_supported(
+            "too_many",
+            &[
+                sai_diagnostics::Code::WrongArgumentCount,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+        );
+        let too_few = assert_supported("too_few", &[sai_diagnostics::Code::WrongArgumentCount]);
+        let named = assert_supported("named", &[sai_diagnostics::Code::NamedArgumentOnFunction]);
+        let named_and_mismatched = assert_supported(
+            "named_and_mismatched",
+            &[
+                sai_diagnostics::Code::NamedArgumentOnFunction,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::NamedArgumentOnFunction,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+        );
+        let float_call = assert_supported("float_call", &[]);
+        let float_mismatch =
+            assert_supported("float_mismatch", &[sai_diagnostics::Code::TypeMismatch]);
+        for name in ["generic_call", "str_call", "shadowed_call"] {
+            assert!(
+                matches!(
+                    owner_named(&database, &resolved, name)
+                        .body_type_check()
+                        .expect("owner body check is available"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "unsupported direct-call target `{name}` remains behind the feature gate"
+            );
+            assert_eq!(
+                owner_named(&database, &resolved, name)
+                    .primitive_body_type_results()
+                    .expect("owner projection is available"),
+                None,
+                "unsupported direct-call target `{name}` publishes no primitive facts"
+            );
+        }
+
+        let mut expression_type_at_range =
+            |owner: &FunctionOwnerResolution,
+             function: &str,
+             source_context: &str,
+             expression_offset: usize,
+             expression_len: usize| {
+                let results = owner
+                    .primitive_body_type_results()
+                    .expect("owner projection has no resolution error")
+                    .expect("supported owner publishes primitive results");
+                assert_eq!(results.owner(), owner.owner());
+                assert!(
+                    results
+                        .expression_types()
+                        .keys()
+                        .all(|hir_id| { hir_id.owner == owner.owner() })
+                );
+                let descriptor = *collection
+                    .scopes
+                    .top_level_owners
+                    .iter()
+                    .find(|descriptor| descriptor.owner == owner.owner())
+                    .expect("the function has an exact top-level descriptor");
+                let inputs = database
+                    .current_owner_inputs(&snapshot, descriptor.file, &collection.target_cfg)
+                    .expect("the selected owner inputs are current");
+                let path = database
+                    .resolve_def_path(owner.owner().def_id.to_def_id())
+                    .expect("the owner definition path resolves")
+                    .expect("the owner has a definition path");
+                let arena = HirArena::new();
+                let context = HirLoweringContext::new(
+                    &inputs.ast_ids,
+                    &snapshot,
+                    &inputs.root,
+                    &arena,
+                    &database.symbols,
+                    &database.def_paths[&owner.owner().def_id.package()],
+                );
+                let (_, source_map) = lower_top_level_owner(
+                    descriptor,
+                    &path,
+                    &inputs.filtered_item_tree,
+                    &inputs.retained_item_kinds,
+                    &context,
+                )
+                .expect("the selected function lowers to HIR");
+                let function_start = root
+                    .find(function)
+                    .unwrap_or_else(|| panic!("function source `{function}` exists"));
+                let function_end = root[function_start..]
+                    .find("\npub fn ")
+                    .map_or(root.len(), |offset| function_start + offset);
+                let function_text = &root[function_start..function_end];
+                let context_relative_start =
+                    function_text.find(source_context).unwrap_or_else(|| {
+                        panic!("source context {source_context:?} exists in `{function}`")
+                    });
+                let expression_start =
+                    (function_start + context_relative_start + expression_offset) as u32;
+                let range = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(expression_start),
+                    sai_diagnostics::TextSize::new(expression_start + expression_len as u32),
+                )
+                .expect("the exact expression range is ordered");
+                let hir_ids = source_map
+                    .node_to_syntax()
+                    .iter_enumerated()
+                    .filter_map(|(local_id, pointer)| {
+                        (pointer.text_range() == range).then_some(HirId {
+                            owner: owner.owner(),
+                            local_id,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let typed_types = hir_ids
+                    .iter()
+                    .filter_map(|hir_id| results.expression_type(*hir_id))
+                    .collect::<Vec<_>>();
+                assert!(
+                    typed_types.len() <= 1,
+                    "expression in {source_context:?} for `{function}` has at most one exact HIR type"
+                );
+                typed_types.first().copied()
+            };
+        assert_eq!(
+            expression_type_at_range(
+                initializer,
+                "pub fn initializer",
+                "apply(input)",
+                0,
+                "apply(input)".len()
+            ),
+            Some(PrimTy::I32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                tail_call,
+                "pub fn tail_call",
+                "apply(input)",
+                0,
+                "apply(input)".len()
+            ),
+            Some(PrimTy::I32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                forward_call,
+                "pub fn forward_call",
+                "later(1)",
+                0,
+                "later(1)".len()
+            ),
+            Some(PrimTy::I32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                recursive_call,
+                "pub fn recursive_call",
+                "recursive_call(value)",
+                0,
+                "recursive_call(value)".len()
+            ),
+            Some(PrimTy::I32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                float_call,
+                "pub fn float_call",
+                "float_fn(1.5)",
+                0,
+                "float_fn(1.5)".len()
+            ),
+            Some(PrimTy::F32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                float_mismatch,
+                "pub fn float_mismatch",
+                "float_fn(1)",
+                0,
+                "float_fn(1)".len()
+            ),
+            None
+        );
+        for (owner, function, call) in [
+            (mismatched, "pub fn mismatched", "apply(input)"),
+            (
+                annotated_mismatch,
+                "pub fn annotated_mismatch",
+                "apply(input)",
+            ),
+            (too_many, "pub fn too_many", "apply(input, true)"),
+            (too_few, "pub fn too_few", "apply()"),
+            (named, "pub fn named", "apply(value: input)"),
+            (
+                named_and_mismatched,
+                "pub fn named_and_mismatched",
+                "apply_pair(first: input, second: true)",
+            ),
+        ] {
+            assert_eq!(
+                expression_type_at_range(owner, function, call, 0, call.len()),
+                None,
+                "diagnosed call {call:?} in `{function}` is omitted from primitive results"
+            );
+        }
+        assert_eq!(
+            expression_type_at_range(
+                mismatched,
+                "pub fn mismatched",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "the exact local-path expression depending on a mismatched call is omitted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                mismatched,
+                "pub fn mismatched",
+                "let derived = alias + 1",
+                "let derived = ".len(),
+                "alias".len()
+            ),
+            None,
+            "the operator's exact alias-path operand is omitted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                mismatched,
+                "pub fn mismatched",
+                "let derived = alias + 1",
+                "let derived = ".len(),
+                "alias + 1".len()
+            ),
+            None,
+            "the exact operator expression depending on a mismatched call is omitted"
+        );
+        drop(expression_type_at_range);
+
+        let named_and_mismatched_diagnostics = match named_and_mismatched
+            .body_type_check()
+            .expect("owner body check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("named argument mismatches remain in the supported direct call slice")
+            }
+        };
+        let named_call_start = root
+            .find("apply_pair(first: input, second: true)")
+            .expect("two-argument named call exists");
+        for (diagnostic, (offset, token)) in named_and_mismatched_diagnostics.iter().zip([
+            ("apply_pair(".len(), "first"),
+            ("apply_pair(first: ".len(), "input"),
+            ("apply_pair(first: input, ".len(), "second"),
+            ("apply_pair(first: input, second: ".len(), "true"),
+        ]) {
+            let start = named_call_start + offset;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("direct call diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + token.len()) as u32),
+                )
+                .expect("diagnostic argument range is ordered"),
+                "call argument diagnostics retain source order and exact spans"
+            );
+        }
+        let too_many_diagnostics = match too_many
+            .body_type_check()
+            .expect("owner body check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("wrong arity with a mismatched common prefix remains supported")
+            }
+        };
+        assert_eq!(
+            too_many_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::WrongArgumentCount,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+            "the full-call arity span precedes common-prefix argument errors"
+        );
+
+        let binding_type = |owner: &FunctionOwnerResolution, name: &str| {
+            let results = owner
+                .primitive_body_type_results()
+                .expect("owner projection has no resolution error")
+                .expect("supported owner publishes primitive results");
+            let local_resolution = owner
+                .local_resolution()
+                .expect("owner local resolution has no error");
+            let locals = local_resolution
+                .as_ref()
+                .expect("owner locals were resolved");
+            let binding = locals
+                .bindings
+                .iter()
+                .find_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved| resolved.as_ref() == name)
+                            .map(|_| *binding)
+                    })
+                })
+                .unwrap_or_else(|| panic!("local binding `{name}` exists"));
+            results.binding_type(binding)
+        };
+        assert_eq!(binding_type(initializer, "result"), Some(PrimTy::I32));
+        assert_eq!(binding_type(initializer, "valid"), Some(PrimTy::I32));
+        assert_eq!(binding_type(mismatched, "result"), None);
+        assert_eq!(
+            binding_type(mismatched, "alias"),
+            None,
+            "an inferred path alias of a mismatched call is omitted"
+        );
+        assert_eq!(
+            binding_type(mismatched, "derived"),
+            None,
+            "an inferred operator result depending on a mismatched call is omitted"
+        );
+        assert_eq!(binding_type(mismatched, "valid"), Some(PrimTy::I32));
+        assert_eq!(
+            binding_type(annotated_mismatch, "result"),
+            Some(PrimTy::I32),
+            "an explicit annotation remains authoritative after an argument mismatch"
+        );
+        assert_eq!(binding_type(named, "result"), None);
+        assert_eq!(binding_type(named, "valid"), Some(PrimTy::I32));
+        for owner in [mismatched, annotated_mismatch, too_many, too_few, named] {
+            let results = owner
+                .primitive_body_type_results()
+                .expect("owner projection has no resolution error")
+                .expect("supported error owner keeps a partial projection");
+            assert!(
+                results
+                    .expression_types()
+                    .keys()
+                    .all(|hir_id| { hir_id.owner == owner.owner() }),
+                "diagnosed calls keep expression facts scoped to their exact owner"
+            );
+        }
     }
 
     #[test]
