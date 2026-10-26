@@ -2730,6 +2730,26 @@ projection.
 This result is not `TypeckResults::node_types`, does not provide a complete
 `TypeckResults`, and does not change diagnostics or source-acceptance gates.
 
+**IR-952 direct primitive calls.** The existing primitive-local body checker
+also checks a bounded direct-call slice and records the output type for a
+successful call under its exact owner `HirId`. The call must have no receiver
+base, and its callee must be a plain one-segment path without explicit generic
+arguments that resolves through the exact module resolution to a current
+package free-function `DefId`. A preindex of exact function definitions,
+owners and signatures permits forward, recursive and cross-file calls without
+using another owner's body results or falling back to a name lookup. Only
+non-generic synchronous signatures whose parameters and output are supported
+primitive types are eligible. Arguments must be positional literals or
+resolved local paths. Arity errors are reported at the call; only the common
+argument prefix is type-checked, in source order, and each named argument is
+diagnosed at its name span. Calls with errors have no expression result, and
+their inferred local aliases and supported operator dependents are omitted by
+the existing taint policy. An explicit local annotation remains authoritative
+for that binding. This implementation slice does not change the CLI Stage 0
+incomplete-check gate. Method/constructor/function-pointer/extern/WIT calls,
+generic or otherwise unsupported signatures, nested calls or compound
+arguments, call contracts and `call_kinds` remain outside the projection.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
@@ -3374,7 +3394,11 @@ checker, with expression keys checked against its `OwnerId`. It coexists with
 diagnostics for independent nodes, drops tainted or unresolved facts, and
 keeps a written local annotation as the binding type after an initializer
 mismatch. It does not populate `node_types` or satisfy the complete
-`TypeckResults` contract.
+`TypeckResults` contract. IR-952 adds checked output facts for the exact
+supported direct calls described in §3.7.12; a call with an arity or argument
+error and its inferred dependents are omitted. This remains a partial
+projection and does not make direct calls available through the CLI's current
+Stage 0 checking gate.
 
 ### 3.15.1 Contents
 
