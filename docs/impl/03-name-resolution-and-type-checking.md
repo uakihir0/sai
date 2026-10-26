@@ -857,6 +857,16 @@ the existing tuple-argument walk, the declared unit type produces the existing
 tuple-versus-local-type mismatch. The initializer is ignored, while
 `UnitAlias`, parameters, tuple-pattern locals, nested-scope and `else`
 declarations, and unmatched extra arguments remain excluded.
+IR-949 handles the inverse tuple-shape case: a direct path to a simple
+outer-block `let` or `var` with a written nonempty tuple annotation, when the
+signature-backed expected type at that top-level or nested argument position
+is a supported scalar or unit. It reports one mismatch over the full path
+span, using the expected type and the annotated tuple arity. The annotation is
+authoritative, so initializer contents are ignored. Tuple annotations remain
+compared with expected tuples by the IR-946 shape pass and IR-947 leaf pass;
+aliases, empty tuple annotations, tuple-pattern locals, parameters,
+nested-scope or `else` declarations, unsupported expected types, and
+unmatched extra arguments remain excluded.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -2662,6 +2672,17 @@ is reached inside an argument tuple. The annotation remains authoritative, so
 the initializer is not read. Sibling argument checks continue, unmatched extra
 arguments stay unchecked, and the CLI Stage 0 incomplete-check gate remains
 in place.
+IR-949 recognizes a direct nonempty tuple annotation on a simple outer-block
+`let` or `var` local when the signature-backed expected type is a supported
+primitive or unit, at either the top-level argument position or a nested
+position reached through the tuple-argument walk. It reports
+`expected \`T\`, found tuple of arity N` over the full direct-path span, once
+for that argument. It uses the annotation only and ignores the initializer.
+The existing tuple-shape pass still takes precedence when the expected type is
+a tuple; tuple-pattern locals, aliases, empty tuple annotations, parameters,
+nested-scope and `else` declarations, unsupported or unresolved expected
+types, and unmatched extra arguments are outside this slice. Sibling checks
+and the Stage 0 incomplete-check gate remain unchanged.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
