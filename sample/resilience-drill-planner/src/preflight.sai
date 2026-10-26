@@ -1,0 +1,24 @@
+use acme:resilience-drill-planner/model.{Drill, Finding}
+
+fn covers_any_scenario(drill: Drill) -> Bool {
+    (
+        drill.covers_regional_power
+        or drill.covers_credential_revocation
+        or drill.covers_queue_backpressure
+        or drill.covers_schema_rollback
+    )
+}
+
+pub fn finding(drill: Drill) -> Option<Finding> {
+    if not drill.preparation_confirmed {
+        Some(Finding.PreparationNotConfirmed)
+    } else if not drill.runbook_approved {
+        Some(Finding.RunbookNotApproved)
+    } else if drill.team_size > drill.team_limit {
+        Some(Finding.TeamCapacityExceeded)
+    } else if not covers_any_scenario(drill) {
+        Some(Finding.NoScenarioCoverage)
+    } else {
+        None
+    }
+}

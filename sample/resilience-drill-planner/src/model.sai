@@ -1,0 +1,89 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ScenarioKind {
+    RegionalPower
+    CredentialRevocation
+    QueueBackpressure
+    SchemaRollback
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Outcome {
+    Pending
+    Scheduled
+    Held
+    Deferred
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Finding {
+    PreparationNotConfirmed
+    RunbookNotApproved
+    TeamCapacityExceeded
+    NoScenarioCoverage
+    HoursBudgetExceeded
+    DrillCountLimitReached
+    CoverageAlreadyPlanned
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Scenario {
+    pub kind: ScenarioKind
+    pub name: Str
+    pub weight: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Coverage {
+    pub regional_power: Bool
+    pub credential_revocation: Bool
+    pub queue_backpressure: Bool
+    pub schema_rollback: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Drill {
+    pub id: U32
+    pub title: Str
+    pub duration_hours: U32
+    pub team_size: U32
+    pub team_limit: U32
+    pub preparation_confirmed: Bool
+    pub runbook_approved: Bool
+    pub covers_regional_power: Bool
+    pub covers_credential_revocation: Bool
+    pub covers_queue_backpressure: Bool
+    pub covers_schema_rollback: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PlanInput {
+    pub scenarios: Array<Scenario, 4>
+    pub scenario_count: USize
+    pub drills: Array<Drill, 8>
+    pub drill_count: USize
+    pub hours_budget: U32
+    pub drill_count_limit: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DrillPlan {
+    pub drill_id: U32
+    pub outcome: Outcome
+    pub finding: Option<Finding>
+    pub selection_order: Option<USize>
+    pub marginal_weight: U32
+    pub duration_hours: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PlanReport {
+    pub drills: Array<Option<DrillPlan>, 8>
+    pub drill_count: USize
+    pub scheduled_count: USize
+    pub held_count: USize
+    pub deferred_count: USize
+    pub hours_used: U32
+    pub covered_weight: U32
+    pub total_weight: U32
+    pub covered_scenarios: Coverage
+}

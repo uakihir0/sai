@@ -1,0 +1,5 @@
+package acme:resilience-drill-planner @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Build a fixed-fixture tabletop resilience drill plan under readiness and capacity limits"

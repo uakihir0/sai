@@ -1,0 +1,97 @@
+use acme:resilience-drill-planner/fixtures
+use acme:resilience-drill-planner/model.{Finding, Outcome}
+use acme:resilience-drill-planner/planner
+
+test "the fixture greedily covers all weighted scenarios in seven hours" {
+    let report = planner.build(fixtures.sample_input())
+    assert report.drill_count == 8
+    assert report.scheduled_count == 3
+    assert report.held_count == 3
+    assert report.deferred_count == 2
+    assert report.hours_used == 7
+    assert report.covered_weight == 15
+    assert report.total_weight == 15
+    assert report.covered_scenarios.regional_power
+    assert report.covered_scenarios.credential_revocation
+    assert report.covered_scenarios.queue_backpressure
+    assert report.covered_scenarios.schema_rollback
+
+    assert report.drills[1].unwrap().drill_id == 103
+    assert report.drills[1].unwrap().outcome == Outcome.Scheduled
+    assert report.drills[1].unwrap().selection_order == Some(1)
+    assert report.drills[1].unwrap().marginal_weight == 8
+
+    assert report.drills[3].unwrap().drill_id == 101
+    assert report.drills[3].unwrap().selection_order == Some(2)
+    assert report.drills[3].unwrap().marginal_weight == 5
+
+    assert report.drills[5].unwrap().drill_id == 102
+    assert report.drills[5].unwrap().selection_order == Some(3)
+    assert report.drills[5].unwrap().marginal_weight == 2
+}
+
+test "recalculated marginal coverage and stable tie-breaks retire redundant candidates" {
+    let input = fixtures.sample_input()
+    let report = planner.build(fixtures.sample_input())
+    // After D3 and D1, each has only Schema Rollback (weight 2) left as marginal coverage.
+    // D2 beats D6 on duration, then beats equally short D8 on ID.
+    assert input.hours_budget - 5 == input.drills[0].duration_hours
+    assert input.drills[5].duration_hours < input.drills[0].duration_hours
+    assert input.drills[5].duration_hours == input.drills[7].duration_hours
+    assert input.drills[5].id < input.drills[7].id
+    assert report.drills[0].unwrap().drill_id == 106
+    assert report.drills[0].unwrap().outcome == Outcome.Deferred
+    assert report.drills[0].unwrap().finding == Some(Finding.CoverageAlreadyPlanned)
+    assert report.drills[0].unwrap().marginal_weight == 0
+    assert report.drills[7].unwrap().drill_id == 108
+    assert report.drills[7].unwrap().finding == Some(Finding.CoverageAlreadyPlanned)
+    assert report.drills[7].unwrap().marginal_weight == 0
+}
+
+test "preflight holds over-capacity, unapproved, and unconfirmed drills" {
+    let report = planner.build(fixtures.sample_input())
+    assert report.drills[2].unwrap().outcome == Outcome.Held
+    assert report.drills[2].unwrap().finding == Some(Finding.TeamCapacityExceeded)
+    assert report.drills[6].unwrap().outcome == Outcome.Held
+    assert report.drills[6].unwrap().finding == Some(Finding.RunbookNotApproved)
+    assert report.drills[4].unwrap().outcome == Outcome.Held
+    assert report.drills[4].unwrap().finding == Some(Finding.PreparationNotConfirmed)
+}
+
+test "the drill count cap leaves schema rollback uncovered" {
+    var input = fixtures.sample_input()
+    input.drill_count_limit = 2
+    let report = planner.build(input)
+    assert report.scheduled_count == 2
+    assert report.hours_used == 5
+    assert report.covered_weight == 13
+    assert not report.covered_scenarios.schema_rollback
+    assert report.drills[5].unwrap().outcome == Outcome.Deferred
+    assert report.drills[5].unwrap().finding == Some(Finding.DrillCountLimitReached)
+}
+
+test "the hour budget skips drills that cannot fit and reports remaining coverage" {
+    var input = fixtures.sample_input()
+    input.hours_budget = 5
+    let report = planner.build(input)
+    assert report.scheduled_count == 2
+    assert report.hours_used == 5
+    assert report.covered_weight == 13
+    assert not report.covered_scenarios.schema_rollback
+    assert report.drills[5].unwrap().outcome == Outcome.Deferred
+    assert report.drills[5].unwrap().finding == Some(Finding.HoursBudgetExceeded)
+}
+
+test "the drill-count finding takes precedence when both limits block a drill" {
+    var input = fixtures.sample_input()
+    input.hours_budget = 5
+    input.drill_count_limit = 2
+    let report = planner.build(input)
+    assert report.scheduled_count == 2
+    assert report.hours_used == 5
+    assert report.covered_weight == 13
+    assert report.drills[5].unwrap().drill_id == 102
+    assert report.drills[5].unwrap().outcome == Outcome.Deferred
+    assert report.drills[5].unwrap().marginal_weight == 2
+    assert report.drills[5].unwrap().finding == Some(Finding.DrillCountLimitReached)
+}

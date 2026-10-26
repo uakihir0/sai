@@ -1,0 +1,7 @@
+use acme:resilience-drill-planner/fixtures
+use acme:resilience-drill-planner/model.{PlanReport}
+use acme:resilience-drill-planner/planner
+
+pub fn sample_plan() -> PlanReport {
+    planner.build(fixtures.sample_input())
+}
