@@ -2745,18 +2745,25 @@ owners and signatures permits forward, recursive and cross-file calls without
 using another owner's body results or falling back to a name lookup. Only
 non-generic synchronous signatures whose parameters and output are supported
 primitive types are eligible. Arguments must be positional literals or
-resolved local paths, or one direct `+` node whose two operands are scalar
-literals or resolved preceding local paths. The addition shape is not
-recursive: nested operators and calls under an operator remain unsupported.
-IR-956 adds one nested-call level: an eligible direct call in an eligible
-call's argument may itself be checked, with the same leaf or one-addition
-argument shape. Calls cannot appear as addition operands, and the nested call
-cannot contain another call. Both calls and supported addition expressions
-retain their exact owner `HirId` result facts; additions use the existing
-arithmetic checker and its diagnostics. Arity errors are reported at their
-call; only each call's common argument prefix is type-checked, in source
+resolved local paths, or one direct `+`, `-`, `*`, or `/` node whose two
+operands are integer/float literals or resolved preceding local paths.
+Same-kind integer and float literal pairs are supported; a direct-call
+parameter constrains both literals to the expected integer or float type, and
+both literal spans are checked for range. Mixed integer/float pairs remain
+unsupported, as do Bool, Byte, or Char literal pairs. The arithmetic shape is
+not recursive: mixed/nested operators and calls under an operator remain
+unsupported; `%` and wrapping arithmetic are not included.
+IR-956 adds one nested-call level; IR-957 and IR-958 apply the same bounded
+leaf-or-single-basic-arithmetic argument shape at both call levels. Calls
+cannot appear as arithmetic operands, and the nested call cannot contain
+another call. Both calls and supported arithmetic expressions retain their
+exact owner `HirId` result facts. Integer pairs and literal/path or path/path
+forms use the existing arithmetic checker; a same-kind float literal pair
+uses one paired literal variable constrained by the call parameter. Both
+forms retain their diagnostics. Arity errors are reported at
+their call; only each call's common argument prefix is type-checked, in source
 order, and each named argument is diagnosed at its name span. An inner call
-error, addition error, or mismatch taints the enclosing call result and
+error, arithmetic error, or mismatch taints the enclosing call result and
 inferred local dependents; valid independent siblings remain available. An
 explicit local annotation remains authoritative for that binding. This
 implementation slice does not change the CLI Stage 0 incomplete-check gate.
