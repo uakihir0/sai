@@ -1,0 +1,140 @@
+use acme:facility-ghg-inventory-auditor/model.{
+    ActivityRecord
+    HoldReason
+    InventoryInput
+    InventoryInputIssue
+    InventorySite
+}
+
+fn site_lookup(batch: InventoryInput, site_id: U32) -> Result<InventorySite, HoldReason> {
+    var found: Option<InventorySite> = None
+    var has_missing_record = false
+    for index in 0..batch.site_count {
+        match batch.sites[index] {
+            Some(site) => {
+                if site.id == site_id {
+                    match found {
+                        Some(_) => return Err(HoldReason.DuplicateSiteId)
+                        None => {
+                            found = Some(site)
+                        }
+                    }
+                }
+            }
+            None => {
+                has_missing_record = true
+            }
+        }
+    }
+    if has_missing_record {
+        return Err(HoldReason.MissingSiteRecord)
+    }
+    match found { Some(site) => Ok(site), None => Err(HoldReason.UnknownSite) }
+}
+
+fn duplicate_activity_id(batch: InventoryInput, activity_id: U32) -> Bool {
+    var matches: USize = 0
+    for index in 0..batch.activity_count {
+        match batch.activities[index] {
+            Some(activity) => {
+                if activity.id == activity_id {
+                    matches += 1
+                }
+            }
+            None => {}
+        }
+    }
+    matches > 1
+}
+
+fn duplicate_evidence_reference(batch: InventoryInput, evidence_id: U32) -> Bool {
+    var matches: USize = 0
+    for index in 0..batch.activity_count {
+        match batch.activities[index] {
+            Some(activity) => {
+                if activity.evidence_reference_id == evidence_id {
+                    matches += 1
+                }
+            }
+            None => {}
+        }
+    }
+    matches > 1
+}
+
+fn site_id_is_duplicated(batch: InventoryInput, site_id: U32) -> Bool {
+    var matches: USize = 0
+    for index in 0..batch.site_count {
+        match batch.sites[index] {
+            Some(site) => {
+                if site.id == site_id {
+                    matches += 1
+                }
+            }
+            None => {}
+        }
+    }
+    matches > 1
+}
+
+pub fn site_catalog_issue(batch: InventoryInput) -> Option<InventoryInputIssue> {
+    if batch.site_count > batch.sites.len() {
+        return Some(InventoryInputIssue.CountExceedsCapacity)
+    }
+    for index in 0..batch.site_count {
+        match batch.sites[index] {
+            Some(site) => {
+                if site.id == 0 {
+                    return Some(InventoryInputIssue.InvalidSiteId)
+                }
+                if site_id_is_duplicated(batch, site.id) {
+                    return Some(InventoryInputIssue.DuplicateSiteId)
+                }
+            }
+            None => return Some(InventoryInputIssue.MissingSiteRecord)
+        }
+    }
+    None
+}
+
+pub fn first_issue(batch: InventoryInput, activity: ActivityRecord) -> Option<HoldReason> {
+    if (
+        batch.site_count > batch.sites.len()
+        or batch.activity_count > batch.activities.len()
+        or batch.factor_count > batch.factors.len()
+    ) {
+        return Some(HoldReason.InputCountExceedsCapacity)
+    }
+    if activity.id == 0 {
+        return Some(HoldReason.InvalidActivityId)
+    }
+    if duplicate_activity_id(batch, activity.id) {
+        return Some(HoldReason.DuplicateActivityId)
+    }
+    if activity.evidence_reference_id == 0 {
+        return Some(HoldReason.MissingActivityEvidence)
+    }
+    if duplicate_evidence_reference(batch, activity.evidence_reference_id) {
+        return Some(HoldReason.DuplicateActivityEvidence)
+    }
+
+    let site = match site_lookup(batch, activity.site_id) {
+        Ok(site) => site
+        Err(reason) => return Some(reason)
+    }
+    if not site.in_boundary {
+        return Some(HoldReason.OutsideBoundary)
+    }
+    if (
+        activity.reporting_year != batch.report_year
+        or activity.period_start_day == 0
+        or activity.period_start_day > activity.period_end_day
+        or activity.period_end_day > 365
+    ) {
+        return Some(HoldReason.OutsideInventoryPeriod)
+    }
+    if activity.quantity == 0 {
+        return Some(HoldReason.ZeroQuantity)
+    }
+    None
+}

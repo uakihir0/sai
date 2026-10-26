@@ -1,0 +1,142 @@
+use acme:facility-ghg-inventory-auditor/audit
+use acme:facility-ghg-inventory-auditor/data
+use acme:facility-ghg-inventory-auditor/model.{
+    DecisionStatus
+    HoldReason
+    InventoryInputIssue
+    InventoryReport
+    ReportingScope
+}
+use sai:core/num.{U32_MAX}
+
+pub fn fixture_report() -> InventoryReport {
+    audit.audit(data.fixture())
+}
+
+test "fixture keeps Scope 2 accounting methods separate" {
+    let report = fixture_report()
+    assert report.input_issue == None
+    assert report.totals.reviewed_count == 14
+    assert report.totals.accepted_count == 4
+    assert report.totals.held_count == 10
+    assert report.totals.scope1_grams == 6396000
+    assert report.totals.scope2_location_grams == 4920000
+    assert report.totals.scope2_market_grams == 264000
+    assert report.totals.scope3_grams == 632000
+    assert report.totals.location_based_total_grams == 11948000
+    assert report.totals.market_based_total_grams == 7292000
+    assert report.totals.location_based_total_grams != report.totals.market_based_total_grams
+
+    let electricity = report.decisions[0].unwrap()
+    assert electricity.status == DecisionStatus.Accepted
+    assert electricity.scope == Some(ReportingScope.Scope2)
+    assert electricity.primary_grams == 4920000
+    assert electricity.market_grams == 264000
+}
+
+test "out-of-date, missing, and zero-quantity inputs are held" {
+    let report = fixture_report()
+    assert report.decisions[4].unwrap().reason == Some(HoldReason.ExpiredFactor)
+    assert report.decisions[5].unwrap().reason == Some(HoldReason.MissingFactor)
+    assert report.decisions[6].unwrap().reason == Some(HoldReason.ZeroQuantity)
+}
+
+test "boundary, period, identity, and evidence defects fail closed" {
+    let report = fixture_report()
+    assert report.decisions[7].unwrap().reason == Some(HoldReason.OutsideBoundary)
+    assert report.decisions[8].unwrap().reason == Some(HoldReason.OutsideInventoryPeriod)
+    assert report.decisions[9].unwrap().reason == Some(HoldReason.DuplicateActivityId)
+    assert report.decisions[10].unwrap().reason == Some(HoldReason.DuplicateActivityId)
+    assert report.decisions[11].unwrap().reason == Some(HoldReason.DuplicateActivityEvidence)
+    assert report.decisions[12].unwrap().reason == Some(HoldReason.DuplicateActivityEvidence)
+    assert report.decisions[13].unwrap().reason == Some(HoldReason.MissingActivityEvidence)
+}
+
+test "sparse site and factor catalogs reject the entire batch" {
+    var batch = data.fixture()
+    batch.sites[0] = None
+    let site_report = audit.audit(batch)
+    assert site_report.input_issue == Some(InventoryInputIssue.MissingSiteRecord)
+    assert site_report.totals.reviewed_count == 0
+    assert site_report.decisions[0] == None
+
+    batch = data.fixture()
+    batch.factors[0] = None
+    let factor_report = audit.audit(batch)
+    assert factor_report.input_issue == Some(InventoryInputIssue.MissingFactorRecord)
+    assert factor_report.totals.reviewed_count == 0
+    assert factor_report.decisions[0] == None
+}
+
+test "unreferenced duplicate and zero-valued site IDs fail preflight" {
+    var batch = data.fixture()
+    var first_unused_site = batch.sites[1].unwrap()
+    first_unused_site.id = 40
+    batch.sites[1] = Some(first_unused_site)
+    var second_unused_site = batch.sites[2].unwrap()
+    second_unused_site.id = 40
+    batch.sites[2] = Some(second_unused_site)
+    for index in 0..batch.activity_count {
+        let activity = batch.activities[index].unwrap()
+        assert activity.site_id != 40
+    }
+    let site_report = audit.audit(batch)
+    assert site_report.input_issue == Some(InventoryInputIssue.DuplicateSiteId)
+
+    batch = data.fixture()
+    var zero_id_site = batch.sites[2].unwrap()
+    zero_id_site.id = 0
+    batch.sites[2] = Some(zero_id_site)
+    let zero_site_report = audit.audit(batch)
+    assert zero_site_report.input_issue == Some(InventoryInputIssue.InvalidSiteId)
+}
+
+test "factor IDs are globally unique across scopes and nonzero" {
+    var batch = data.fixture()
+    var cross_scope_factor = batch.factors[4].unwrap()
+    cross_scope_factor.id = 3
+    batch.factors[4] = Some(cross_scope_factor)
+    let factor_report = audit.audit(batch)
+    assert factor_report.input_issue == Some(InventoryInputIssue.DuplicateFactorId)
+
+    batch = data.fixture()
+    var zero_id_factor = batch.factors[4].unwrap()
+    zero_id_factor.id = 0
+    batch.factors[4] = Some(zero_id_factor)
+    let zero_factor_report = audit.audit(batch)
+    assert zero_factor_report.input_issue == Some(InventoryInputIssue.InvalidFactorId)
+}
+
+test "counts beyond fixed array capacity reject the batch" {
+    var batch = data.fixture()
+    batch.activity_count = 15
+    let report = audit.audit(batch)
+    assert report.input_issue == Some(InventoryInputIssue.CountExceedsCapacity)
+    assert report.totals.reviewed_count == 0
+}
+
+test "multiplication and aggregate overflow are held without changing totals" {
+    var batch = data.fixture()
+    var oversized = batch.activities[0].unwrap()
+    oversized.quantity = U32_MAX
+    batch.activities[0] = Some(oversized)
+    let multiplication_report = audit.audit(batch)
+    let multiplication_reason = multiplication_report.decisions[0].unwrap().reason
+    assert multiplication_reason == Some(HoldReason.ArithmeticOverflow)
+    assert multiplication_report.totals.scope2_location_grams == 0
+
+    batch = data.fixture()
+    var overflowing = batch.activities[9].unwrap()
+    overflowing.id = 1020
+    overflowing.quantity = 810371
+    batch.activities[9] = Some(overflowing)
+    var after_overflow = batch.activities[10].unwrap()
+    after_overflow.id = 1021
+    after_overflow.quantity = 1
+    batch.activities[10] = Some(after_overflow)
+
+    let aggregate_report = audit.audit(batch)
+    assert aggregate_report.decisions[9].unwrap().reason == Some(HoldReason.TotalOverflow)
+    assert aggregate_report.decisions[10].unwrap().status == DecisionStatus.Accepted
+    assert aggregate_report.totals.scope1_grams == 6401300
+}

@@ -1,0 +1,94 @@
+use acme:facility-ghg-inventory-auditor/model.{
+    ActivityRecord
+    CalculatedImpact
+    EmissionFactor
+    HoldReason
+    InventoryInput
+    ReportingScope
+    Scope2Method
+}
+use acme:facility-ghg-inventory-auditor/registry
+use sai:core/num.{U32_MAX}
+
+fn multiply_quantity(quantity: U32, factor: EmissionFactor) -> Result<U32, HoldReason> {
+    if quantity == 0 {
+        return Err(HoldReason.ZeroQuantity)
+    }
+    if factor.grams_per_unit == 0 {
+        return Err(HoldReason.InvalidFactor)
+    }
+    if quantity > U32_MAX / factor.grams_per_unit {
+        return Err(HoldReason.ArithmeticOverflow)
+    }
+    Ok(quantity * factor.grams_per_unit)
+}
+
+pub fn calculate(batch: InventoryInput, activity: ActivityRecord) -> Result<
+    CalculatedImpact,
+    HoldReason,
+> {
+    let scope = registry.scope_for_source(activity.source)
+    match scope {
+        ReportingScope.Scope2 => {
+            let location_factor = match registry.select_factor(
+                batch.factors,
+                batch.factor_count,
+                activity.source,
+                activity.unit,
+                ReportingScope.Scope2,
+                Scope2Method.LocationBased,
+                batch.report_year,
+            ) { Ok(factor) => factor, Err(reason) => return Err(reason) }
+            let market_factor = match registry.select_factor(
+                batch.factors,
+                batch.factor_count,
+                activity.source,
+                activity.unit,
+                ReportingScope.Scope2,
+                Scope2Method.MarketBased,
+                batch.report_year,
+            ) { Ok(factor) => factor, Err(reason) => return Err(reason) }
+            let location_grams = match multiply_quantity(activity.quantity, location_factor) {
+                Ok(value) => value
+                Err(reason) => return Err(reason)
+            }
+            let market_grams = match multiply_quantity(activity.quantity, market_factor) {
+                Ok(value) => value
+                Err(reason) => return Err(reason)
+            }
+            Ok(
+                CalculatedImpact(
+                    scope: scope,
+                    primary_grams: location_grams,
+                    market_grams: market_grams,
+                    primary_factor_id: location_factor.id,
+                    market_factor_id: Some(market_factor.id),
+                ),
+            )
+        }
+        ReportingScope.Scope1 | ReportingScope.Scope3 => {
+            let factor = match registry.select_factor(
+                batch.factors,
+                batch.factor_count,
+                activity.source,
+                activity.unit,
+                scope,
+                Scope2Method.NotApplicable,
+                batch.report_year,
+            ) { Ok(value) => value, Err(reason) => return Err(reason) }
+            let grams = match multiply_quantity(activity.quantity, factor) {
+                Ok(value) => value
+                Err(reason) => return Err(reason)
+            }
+            Ok(
+                CalculatedImpact(
+                    scope: scope,
+                    primary_grams: grams,
+                    market_grams: 0,
+                    primary_factor_id: factor.id,
+                    market_factor_id: None,
+                ),
+            )
+        }
+    }
+}

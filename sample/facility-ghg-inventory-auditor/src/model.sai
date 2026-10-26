@@ -1,0 +1,170 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum EmissionSource {
+    GridElectricity
+    NaturalGas
+    FleetDiesel
+    PassengerFlight
+    RefrigerantLeak
+    LandfillWaste
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ActivityUnit {
+    KilowattHour
+    Therm
+    Liter
+    PassengerKilometer
+    Kilogram
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReportingScope {
+    Scope1
+    Scope2
+    Scope3
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Scope2Method {
+    NotApplicable
+    LocationBased
+    MarketBased
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum DecisionStatus {
+    Accepted
+    Held
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    MissingActivityRecord
+    InvalidActivityId
+    DuplicateActivityId
+    DuplicateActivityEvidence
+    MissingActivityEvidence
+    UnknownSite
+    DuplicateSiteId
+    InvalidSiteId
+    MissingSiteRecord
+    OutsideBoundary
+    OutsideInventoryPeriod
+    ZeroQuantity
+    MissingFactor
+    InvalidFactorId
+    MissingFactorRecord
+    UnitMismatch
+    FactorNotYetValid
+    ExpiredFactor
+    FactorCoverageGap
+    AmbiguousFactor
+    DuplicateFactorId
+    InvalidFactor
+    InputCountExceedsCapacity
+    ArithmeticOverflow
+    TotalOverflow
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum InventoryInputIssue {
+    CountExceedsCapacity
+    MissingSiteRecord
+    InvalidSiteId
+    DuplicateSiteId
+    MissingFactorRecord
+    InvalidFactorId
+    DuplicateFactorId
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type InventorySite {
+    pub id: U32
+    pub in_boundary: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ActivityRecord {
+    pub id: U32
+    pub site_id: U32
+    pub source: EmissionSource
+    pub unit: ActivityUnit
+    pub quantity: U32
+    pub reporting_year: U32
+    pub period_start_day: U32
+    pub period_end_day: U32
+    // An opaque source-document reference. Zero means the evidence is absent.
+    pub evidence_reference_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type EmissionFactor {
+    pub id: U32
+    pub source: EmissionSource
+    pub unit: ActivityUnit
+    pub scope: ReportingScope
+    pub method: Scope2Method
+    // Integer grams of CO2e per activity unit.
+    pub grams_per_unit: U32
+    pub valid_from_year: U32
+    pub valid_through_year: U32
+    pub document_reference_id: U32
+    pub approved: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type InventoryInput {
+    pub report_year: U32
+    pub sites: Array<Option<InventorySite>, 3>
+    pub site_count: USize
+    pub activities: Array<Option<ActivityRecord>, 14>
+    pub activity_count: USize
+    pub factors: Array<Option<EmissionFactor>, 6>
+    pub factor_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CalculatedImpact {
+    pub scope: ReportingScope
+    // Scope 1/3 use this one factor. Scope 2 uses the location-based factor.
+    pub primary_grams: U32
+    // Zero except for a Scope 2 market-based result.
+    pub market_grams: U32
+    pub primary_factor_id: U32
+    pub market_factor_id: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type InventoryDecision {
+    pub activity_id: U32
+    pub site_id: U32
+    pub source: Option<EmissionSource>
+    pub status: DecisionStatus
+    pub reason: Option<HoldReason>
+    pub scope: Option<ReportingScope>
+    pub primary_grams: U32
+    pub market_grams: U32
+    pub primary_factor_id: Option<U32>
+    pub market_factor_id: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type InventoryTotals {
+    pub reviewed_count: USize
+    pub accepted_count: USize
+    pub held_count: USize
+    pub scope1_grams: U32
+    pub scope2_location_grams: U32
+    pub scope2_market_grams: U32
+    pub scope3_grams: U32
+    // These totals use one Scope 2 method apiece; the methods are alternatives.
+    pub location_based_total_grams: U32
+    pub market_based_total_grams: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type InventoryReport {
+    pub decisions: Array<Option<InventoryDecision>, 14>
+    pub totals: InventoryTotals
+    pub input_issue: Option<InventoryInputIssue>
+}
