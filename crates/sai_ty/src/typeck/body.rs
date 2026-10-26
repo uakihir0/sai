@@ -671,24 +671,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                 }
                 ExprKind::Unary(UnOp::Not, operand) => {
-                    let operand_type = self
-                        .check_local_path(operand)
-                        .ok()
-                        .and_then(|local_type| self.concrete_local_type(local_type))
-                        .ok_or(())?;
-                    match primitive_bool_operand_result(operand_type) {
-                        PrimitiveBoolOperandResult::Bool => {}
-                        PrimitiveBoolOperandResult::TypeMismatch { found } => {
-                            self.errors.push(PrimitiveBodyError {
-                                node: operand.hir_id,
-                                kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                    expected: PrimTy::Bool,
-                                    found,
-                                },
-                            });
-                        }
-                        PrimitiveBoolOperandResult::Unsupported => return Err(()),
-                    }
+                    let result = self.check_logical_not(operand)?;
                     if let Some(expected) = annotation {
                         if expected != PrimTy::Bool {
                             self.errors.push(PrimitiveBodyError {
@@ -700,7 +683,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             });
                         }
                     }
-                    LocalType::Concrete(PrimTy::Bool)
+                    result
                 }
                 ExprKind::Unary(UnOp::BitNot, operand) => {
                     if let ExprKind::Lit(literal) = operand.kind {
@@ -2466,10 +2449,39 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
+                ExprKind::Unary(UnOp::Not, operand)
+                    if is_supported_direct_call_not_operand(operand) =>
+                {
+                    let local_type = self.check_logical_not(operand)?;
+                    self.record_expression_type(argument.expr.hir_id, local_type);
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
                 _ => return Err(()),
             }
         }
         Ok(LocalType::Concrete(signature.output))
+    }
+
+    fn check_logical_not(&mut self, operand: &'hir Expr<'hir>) -> Result<LocalType, ()> {
+        let operand_type = self
+            .check_local_path(operand)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .ok_or(())?;
+        match primitive_bool_operand_result(operand_type) {
+            PrimitiveBoolOperandResult::Bool => {}
+            PrimitiveBoolOperandResult::TypeMismatch { found } => {
+                self.errors.push(PrimitiveBodyError {
+                    node: operand.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                        expected: PrimTy::Bool,
+                        found,
+                    },
+                });
+            }
+            PrimitiveBoolOperandResult::Unsupported => return Err(()),
+        }
+        Ok(LocalType::Concrete(PrimTy::Bool))
     }
 
     fn check_direct_call_arithmetic(
@@ -4907,6 +4919,10 @@ fn is_supported_direct_call_comparison_operands(left: &Expr<'_>, right: &Expr<'_
 
 fn is_supported_direct_call_logical_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
     matches!(left.kind, ExprKind::Path(_)) && matches!(right.kind, ExprKind::Path(_))
+}
+
+fn is_supported_direct_call_not_operand(operand: &Expr<'_>) -> bool {
+    matches!(operand.kind, ExprKind::Path(_))
 }
 
 fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
