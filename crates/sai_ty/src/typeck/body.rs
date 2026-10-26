@@ -2452,7 +2452,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 ExprKind::Unary(UnOp::Not, operand)
                     if is_supported_direct_call_not_operand(operand) =>
                 {
-                    let local_type = self.check_logical_not(operand)?;
+                    let local_type = self.check_direct_call_logical_not(operand)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
@@ -2482,6 +2482,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             PrimitiveBoolOperandResult::Unsupported => return Err(()),
         }
         Ok(LocalType::Concrete(PrimTy::Bool))
+    }
+
+    fn check_direct_call_logical_not(
+        &mut self,
+        operand: &'hir Expr<'hir>,
+    ) -> Result<LocalType, ()> {
+        match operand.kind {
+            ExprKind::Lit(Lit::Bool(_)) => {
+                let bool_type = LocalType::Concrete(PrimTy::Bool);
+                self.record_expression_type(operand.hir_id, bool_type);
+                Ok(bool_type)
+            }
+            ExprKind::Path(_) => self.check_logical_not(operand),
+            _ => Err(()),
+        }
     }
 
     fn check_direct_call_arithmetic(
@@ -4922,7 +4937,10 @@ fn is_supported_direct_call_logical_operands(left: &Expr<'_>, right: &Expr<'_>) 
 }
 
 fn is_supported_direct_call_not_operand(operand: &Expr<'_>) -> bool {
-    matches!(operand.kind, ExprKind::Path(_))
+    matches!(
+        operand.kind,
+        ExprKind::Path(_) | ExprKind::Lit(Lit::Bool(_))
+    )
 }
 
 fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
