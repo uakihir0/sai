@@ -3121,6 +3121,48 @@ mismatches.
   --check`. IR-787's flat-local Byte bitwise literal mismatch checks are the
   semantic precedent; no new operator-checking or lowering behavior is
   planned.
+**IR-976 direct-call remainder with an integer-literal RHS** extends the root
+or existing one-level nested direct-call argument slice to one direct `%`
+expression with a plain path on the left and one direct integer literal on
+the right. The path must resolve by exact `BindingId` to a parameter or
+preceding local, and the call target and signature must satisfy the existing
+direct-call gates. Reuse `check_remainder`, so the left path's concrete type
+controls the RHS literal check and its range. All ten integer primitives
+produce an expression fact of their left type on success; a float path keeps
+the established integer-literal mismatch and `OPERATOR_NOT_SUPPORTED`
+diagnostics for `%`. A direct-call parameter mismatch checks only the
+completed remainder result and suppresses tainted operator and call facts.
+Keep literal-left, literal/literal, floating-literal RHS, computed or nested
+operands, deeper calls, generic targets, and unsupported signatures gated.
+The CLI Stage 0 incomplete-check gate remains unchanged, and this slice adds
+no remainder evaluation or runtime behavior.
+
+- **Review required:** Challenge the driver and body-checker gate agreement at
+  root and one nested call level, including exact `BindingId` selection for a
+  parameter, a same-name `I16` local shadowing an `I64` parameter, and a
+  preceding local copy. Verify success facts for all ten integer primitive
+  types, full signed literal range diagnostics,
+  left-path fact retention and valid sibling facts after an out-of-range
+  literal, and taint when the direct-call parameter mismatches. Confirm a
+  floating-point left path preserves the existing literal mismatch and
+  unsupported-operator pair, while literal-left/pair, float-literal RHS,
+  computed/nested/deeper call, generic target, and unsupported-signature
+  forms remain gated. Preserve the Stage 0 gate and make no runtime claim.
+
+- **Planned test matrix:** Expand
+  `primitive_body_type_results_include_exact_direct_function_calls` to cover
+  each integer type at the root, I32 at the nested level and through a
+  preceding local copy, a same-name I16 local shadowing an I64 parameter, an
+  I8 out-of-range negative RHS with its complete signed span and an independent
+  valid sibling, an argument mismatch, and a float-left diagnostic. Keep
+  excluded shapes in its `Unsupported` fixture. Add a CLI regression
+  confirming root, nested, copied-path, and shadowed-path examples still
+  reach the existing Stage 0 incomplete-check gate. The pinned driver and CLI
+  tests, formatting check, and diff check passed; the focused facts assert the
+  shadowed call, remainder, path, and RHS are all I16. Initial hostile review
+  found the shadowing case missing; it has been added, and a follow-up reviewer
+  confirmed the regression meaningfully checks shadow-binding facts with no
+  remaining actionable findings.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 

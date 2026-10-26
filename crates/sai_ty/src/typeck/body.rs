@@ -2430,6 +2430,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
+                ExprKind::Binary(BinOp::Rem, left, right)
+                    if is_supported_direct_call_remainder_operands(left, right) =>
+                {
+                    let local_type = self.check_remainder(left, right, argument.expr.hir_id)?;
+                    self.record_expression_type(argument.expr.hir_id, local_type);
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
                 ExprKind::Binary(
                     operator @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div),
                     left,
@@ -4979,6 +4986,10 @@ fn is_supported_direct_call_arithmetic_operands(left: &Expr<'_>, right: &Expr<'_
         );
     }
     true
+}
+
+fn is_supported_direct_call_remainder_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
+    matches!(left.kind, ExprKind::Path(_)) && matches!(right.kind, ExprKind::Lit(Lit::Int { .. }))
 }
 
 fn is_supported_direct_call_comparison_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
