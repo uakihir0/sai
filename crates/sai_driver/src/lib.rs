@@ -9262,6 +9262,14 @@ fn is_supported_direct_call_bitwise_operands_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
 ) -> bool {
+    if matches!(left.kind, ExprKind::Lit(Lit::Int { .. })) {
+        let ExprKind::Path(path) = right.kind else {
+            return false;
+        };
+        return resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding));
+    }
+
     let ExprKind::Path(path) = left.kind else {
         return false;
     };
@@ -49133,8 +49141,57 @@ property "shared"() {}
             "    valid\n",
             "}\n",
             "pub fn bitwise_integer_literal_unsupported(left: I32) -> I32 { apply_i32(left & 1) }\n",
-            "pub fn bitwise_literal_left_unsupported(right: I32) -> I32 { apply_i32(1 | right) }\n",
+            "pub fn bitwise_literal_left_argument(right: I32) -> I32 { apply_i32(1 | right) }\n",
             "pub fn bitwise_literal_pair_unsupported() -> I32 { apply_i32(1 ^ 2) }\n",
+            "pub fn bitwise_integer_literal_left_copy(right: I32) -> I32 {\n",
+            "    let copy = right\n",
+            "    apply_i32(1 & copy)\n",
+            "}\n",
+            "pub fn bitwise_integer_literal_left_rhs_mismatch(right: Bool, valid: I32) -> I32 {\n",
+            "    let result = apply_i32(1 & right)\n",
+            "    let alias = result\n",
+            "    apply_i32(2 ^ valid)\n",
+            "}\n",
+            "pub fn bitwise_integer_literal_left_parameter_mismatch(right: I32) -> I32 {\n",
+            "    let result = apply_bool(1 & right)\n",
+            "    let alias = result\n",
+            "    let valid = apply_i32(2 ^ right)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn bitwise_integer_literal_left_byte_rhs_mismatch(right: Byte) -> I32 { apply_i32(1 & right) }\n",
+            "pub fn bitwise_integer_literal_left_bool_rhs_mismatch(right: Bool) -> I32 { apply_i32(1 | right) }\n",
+            "pub fn bitwise_integer_literal_left_char_rhs_mismatch(right: Char) -> I32 { apply_i32(1 ^ right) }\n",
+            "pub fn bitwise_integer_literal_left_f32_rhs_mismatch(right: F32) -> I32 { apply_i32(1 & right) }\n",
+            "pub fn bitwise_integer_literal_left_f64_rhs_mismatch(right: F64) -> I32 { apply_i32(1 | right) }\n",
+            "pub fn bitwise_integer_literal_left_boundaries_isize(right: ISize) -> ISize {\n",
+            "    let minimum = apply_isize(-2147483648 & right)\n",
+            "    apply_isize(2147483647 | right)\n",
+            "}\n",
+            "pub fn bitwise_integer_literal_left_boundaries_usize(right: USize) -> USize {\n",
+            "    let zero = apply_usize(0 & right)\n",
+            "    apply_usize(4294967295 ^ right)\n",
+            "}\n",
+            "pub fn bitwise_integer_literal_left_out_of_range_isize_below(right: ISize) -> ISize { apply_isize(-2147483649 & right) }\n",
+            "pub fn bitwise_integer_literal_left_out_of_range_isize_above(right: ISize) -> ISize { apply_isize(2147483648 | right) }\n",
+            "pub fn bitwise_integer_literal_left_out_of_range_usize_below(right: USize) -> USize { apply_usize(-1 ^ right) }\n",
+            "pub fn bitwise_integer_literal_left_out_of_range_usize_above(right: USize) -> USize { apply_usize(4294967296 & right) }\n",
+            "pub fn bitwise_integer_literal_left_unresolved_path_unsupported() -> I32 {\n",
+            "    let right = 1\n",
+            "    apply_i32(1 & right)\n",
+            "}\n",
+            "pub fn bitwise_integer_literal_left_forward_path_unsupported(right: I32) -> I32 {\n",
+            "    let result = apply_i32(1 & later)\n",
+            "    let later = right\n",
+            "    result\n",
+            "}\n",
+            "pub fn bitwise_integer_literal_left_computed_path_unsupported(right: I32) -> I32 { apply_i32(1 & (right + 1)) }\n",
+            "pub fn bitwise_integer_literal_left_call_path_unsupported(right: I32) -> I32 { apply_i32(1 & add_one(right)) }\n",
+            "pub fn bitwise_integer_literal_left_other_operator_unsupported(right: I32) -> I32 { apply_i32(1 << right) }\n",
+            "pub fn bitwise_integer_literal_left_deep_call_unsupported(right: I32) -> I32 { apply_i32(apply_i32(apply_i32(1 & right))) }\n",
+            "pub fn bitwise_byte_literal_left_path_unsupported(right: Byte) -> Byte { apply_byte(b'x' & right) }\n",
+            "pub fn bitwise_bool_literal_left_path_unsupported(right: Bool) -> Bool { apply_bool(false | right) }\n",
+            "pub fn bitwise_char_literal_left_path_unsupported(right: Char) -> Char { identity_char('x' ^ right) }\n",
+            "pub fn bitwise_float_literal_left_path_unsupported(right: F32) -> F32 { float_fn(1.0 & right) }\n",
             "pub fn bitwise_integer_literal_parameter_mismatch(left: I32) -> I32 {\n",
             "    let result = apply_bool(left & 1)\n",
             "    let alias = result\n",
@@ -49181,6 +49238,7 @@ property "shared"() {}
             "pub fn bitwise_integer_literal_shift_operand_unsupported(left: I32) -> I32 { apply_i32((left << 1) & 1) }\n",
             "pub fn bitwise_integer_literal_deep_nested_call_unsupported(left: I32) -> I32 { apply_i32(apply_i32(apply_i32(left & 1))) }\n",
             "pub fn bitwise_integer_literal_generic_target_unsupported(left: I32) -> I32 { generic_fn(left & 1) }\n",
+            "pub fn bitwise_integer_literal_left_generic_target_unsupported(right: I32) -> I32 { generic_fn(1 & right) }\n",
             "pub fn bitwise_integer_literal_extra_ignored(left: I32) -> I32 { apply_i32(left, left & 1) }\n",
             "pub fn bitwise_computed_operand_unsupported(left: I32, right: I32) -> I32 { apply_i32((left + 1) & right) }\n",
             "pub fn bitwise_nested_operator_unsupported(left: I32, right: I32) -> I32 { apply_i32((left & right) | left) }\n",
@@ -49443,6 +49501,35 @@ property "shared"() {}
             generated_bitwise_integer_literal_cases
                 .push_str(&format!("    {callee}({callee}(left ^ 3))\n}}\n"));
         }
+        let mut generated_bitwise_integer_literal_left_cases = String::new();
+        for (right_name, callee, _) in bitwise_integer_literal_types.iter().copied() {
+            let suffix = right_name.to_ascii_lowercase();
+            generated_bitwise_integer_literal_left_cases.push_str(&format!(
+                "pub fn bitwise_integer_literal_left_{suffix}(right: {right_name}) -> {right_name} {{\n"
+            ));
+            for (name, operator, literal) in
+                [("and", "&", "1"), ("or", "|", "2"), ("xor", "^", "3")]
+            {
+                generated_bitwise_integer_literal_left_cases.push_str(&format!(
+                    "    let {name}_value = {callee}({literal} {operator} right)\n"
+                ));
+            }
+            generated_bitwise_integer_literal_left_cases
+                .push_str(&format!("    {callee}(3 ^ right)\n}}\n"));
+
+            generated_bitwise_integer_literal_left_cases.push_str(&format!(
+                "pub fn nested_bitwise_integer_literal_left_{suffix}(right: {right_name}) -> {right_name} {{\n"
+            ));
+            for (name, operator, literal) in
+                [("and", "&", "1"), ("or", "|", "2"), ("xor", "^", "3")]
+            {
+                generated_bitwise_integer_literal_left_cases.push_str(&format!(
+                    "    let {name}_value = {callee}({callee}({literal} {operator} right))\n"
+                ));
+            }
+            generated_bitwise_integer_literal_left_cases
+                .push_str(&format!("    {callee}({callee}(3 ^ right))\n}}\n"));
+        }
         let bitwise_integer_literal_boundaries = [
             ("I8", "apply_i8", "-128", "127"),
             ("I16", "apply_i16", "-32768", "32767"),
@@ -49499,6 +49586,7 @@ property "shared"() {}
             ));
         }
         root.push_str(&generated_bitwise_integer_literal_cases);
+        root.push_str(&generated_bitwise_integer_literal_left_cases);
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
@@ -49606,6 +49694,75 @@ property "shared"() {}
                 owner
             };
         assert_supported(&database, "bitwise_integer_literal_unsupported", &[]);
+        let bitwise_literal_left_argument =
+            assert_supported(&database, "bitwise_literal_left_argument", &[]);
+        let bitwise_integer_literal_left_copy =
+            assert_supported(&database, "bitwise_integer_literal_left_copy", &[]);
+        let bitwise_integer_literal_left_rhs_mismatch = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_rhs_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_integer_literal_left_parameter_mismatch = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_integer_literal_left_byte_rhs_mismatch = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_byte_rhs_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_integer_literal_left_bool_rhs_mismatch = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_bool_rhs_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_integer_literal_left_char_rhs_mismatch = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_char_rhs_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_integer_literal_left_f32_rhs_mismatch = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_f32_rhs_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_integer_literal_left_f64_rhs_mismatch = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_f64_rhs_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_integer_literal_left_boundaries_isize = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_boundaries_isize",
+            &[],
+        );
+        let bitwise_integer_literal_left_boundaries_usize = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_boundaries_usize",
+            &[],
+        );
+        let bitwise_integer_literal_left_out_of_range_isize_below = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_out_of_range_isize_below",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let bitwise_integer_literal_left_out_of_range_isize_above = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_out_of_range_isize_above",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let bitwise_integer_literal_left_out_of_range_usize_below = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_out_of_range_usize_below",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let bitwise_integer_literal_left_out_of_range_usize_above = assert_supported(
+            &database,
+            "bitwise_integer_literal_left_out_of_range_usize_above",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
         let initializer = assert_supported(&database, "initializer", &[]);
         let tail_call = assert_supported(&database, "tail_call", &[]);
         let forward_call = assert_supported(&database, "forward_call", &[]);
@@ -50186,7 +50343,17 @@ property "shared"() {}
             "bitwise_integer_literal_shift_operand_unsupported",
             "bitwise_integer_literal_deep_nested_call_unsupported",
             "bitwise_integer_literal_generic_target_unsupported",
-            "bitwise_literal_left_unsupported",
+            "bitwise_integer_literal_left_generic_target_unsupported",
+            "bitwise_integer_literal_left_unresolved_path_unsupported",
+            "bitwise_integer_literal_left_forward_path_unsupported",
+            "bitwise_integer_literal_left_computed_path_unsupported",
+            "bitwise_integer_literal_left_call_path_unsupported",
+            "bitwise_integer_literal_left_other_operator_unsupported",
+            "bitwise_integer_literal_left_deep_call_unsupported",
+            "bitwise_byte_literal_left_path_unsupported",
+            "bitwise_bool_literal_left_path_unsupported",
+            "bitwise_char_literal_left_path_unsupported",
+            "bitwise_float_literal_left_path_unsupported",
             "bitwise_literal_pair_unsupported",
             "bitwise_computed_operand_unsupported",
             "bitwise_nested_operator_unsupported",
@@ -50349,6 +50516,581 @@ property "shared"() {}
                 );
                 typed_types.first().copied()
             };
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_literal_left_argument,
+                "pub fn bitwise_literal_left_argument",
+                "apply_i32(1 | right)",
+                0,
+                "apply_i32(1 | right)".len()
+            ),
+            Some(PrimTy::I32),
+            "a direct integer literal on the left resolves from an eligible path"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_literal_left_argument,
+                "pub fn bitwise_literal_left_argument",
+                "apply_i32(1 | right)",
+                "apply_i32(".len(),
+                "1 | right".len()
+            ),
+            Some(PrimTy::I32),
+            "the exact literal-left bitwise operator fact is retained"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_literal_left_argument,
+                "pub fn bitwise_literal_left_argument",
+                "apply_i32(1 | right)",
+                "apply_i32(".len(),
+                1
+            ),
+            Some(PrimTy::I32),
+            "the direct integer literal gets the concrete right-path type"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_literal_left_argument,
+                "pub fn bitwise_literal_left_argument",
+                "apply_i32(1 | right)",
+                "apply_i32(1 | ".len(),
+                "right".len()
+            ),
+            Some(PrimTy::I32),
+            "the exact right path retains its type fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_copy,
+                "pub fn bitwise_integer_literal_left_copy",
+                "apply_i32(1 & copy)",
+                0,
+                "apply_i32(1 & copy)".len()
+            ),
+            Some(PrimTy::I32),
+            "a preceding direct-copy local remains an eligible exact right binding"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_copy,
+                "pub fn bitwise_integer_literal_left_copy",
+                "apply_i32(1 & copy)",
+                "apply_i32(".len(),
+                "1 & copy".len()
+            ),
+            Some(PrimTy::I32),
+            "the direct-copy path supplies the literal-left operator fact"
+        );
+        let literal_left_rhs_mismatch_call = "apply_i32(1 & right)";
+        let literal_left_rhs_mismatch_operator = "1 & right";
+        let literal_left_rhs_mismatch_start = literal_left_rhs_mismatch_call
+            .find(literal_left_rhs_mismatch_operator)
+            .expect("the integer-literal-left RHS mismatch call is present");
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_rhs_mismatch",
+                literal_left_rhs_mismatch_call,
+                literal_left_rhs_mismatch_start,
+                literal_left_rhs_mismatch_operator.len()
+            ),
+            None,
+            "a concrete non-integer right path taints the literal-left operator fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_rhs_mismatch",
+                literal_left_rhs_mismatch_call,
+                0,
+                literal_left_rhs_mismatch_call.len()
+            ),
+            None,
+            "a concrete non-integer right path taints its containing call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_rhs_mismatch",
+                literal_left_rhs_mismatch_call,
+                literal_left_rhs_mismatch_start,
+                1
+            ),
+            Some(PrimTy::I32),
+            "the direct call parameter later resolves the left literal without hiding the mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_rhs_mismatch",
+                literal_left_rhs_mismatch_call,
+                literal_left_rhs_mismatch_start + "1 & ".len(),
+                "right".len()
+            ),
+            None,
+            "the mismatched right operand type fact is suppressed"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_rhs_mismatch",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "an inferred alias of the failed literal-left call remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_rhs_mismatch",
+                "apply_i32(2 ^ valid)",
+                0,
+                "apply_i32(2 ^ valid)".len()
+            ),
+            Some(PrimTy::I32),
+            "an independent valid call sibling retains its type after RHS mismatch"
+        );
+        let literal_left_rhs_diagnostics = match bitwise_integer_literal_left_rhs_mismatch
+            .body_type_check()
+            .expect("literal-left RHS mismatch diagnostics are available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("literal-left RHS mismatch remains diagnostic-supported")
+            }
+        };
+        assert_eq!(
+            literal_left_rhs_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch],
+            "the non-integer right path mismatch does not add an operator diagnostic"
+        );
+        let literal_left_rhs_function_start = root
+            .find("pub fn bitwise_integer_literal_left_rhs_mismatch")
+            .expect("the literal-left RHS mismatch function exists");
+        let literal_left_rhs_start = literal_left_rhs_function_start
+            + root[literal_left_rhs_function_start..]
+                .find("1 & right")
+                .expect("the literal-left RHS mismatch expression exists")
+            + "1 & ".len();
+        assert_eq!(
+            literal_left_rhs_diagnostics[0]
+                .primary()
+                .expect("the literal-left RHS mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(literal_left_rhs_start as u32),
+                sai_diagnostics::TextSize::new((literal_left_rhs_start + "right".len()) as u32),
+            )
+            .expect("the mismatched right path span is ordered")
+        );
+
+        let literal_left_parameter_call = "apply_bool(1 & right)";
+        let literal_left_parameter_operator = "1 & right";
+        let literal_left_parameter_operator_start = literal_left_parameter_call
+            .find(literal_left_parameter_operator)
+            .expect("the literal-left parameter mismatch call is present");
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_parameter_mismatch,
+                "pub fn bitwise_integer_literal_left_parameter_mismatch",
+                literal_left_parameter_call,
+                literal_left_parameter_operator_start,
+                literal_left_parameter_operator.len()
+            ),
+            None,
+            "a mismatched direct-call parameter taints the literal-left operator fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_parameter_mismatch,
+                "pub fn bitwise_integer_literal_left_parameter_mismatch",
+                literal_left_parameter_call,
+                0,
+                literal_left_parameter_call.len()
+            ),
+            None,
+            "a mismatched direct-call parameter taints its call fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_parameter_mismatch,
+                "pub fn bitwise_integer_literal_left_parameter_mismatch",
+                literal_left_parameter_call,
+                literal_left_parameter_operator_start,
+                1
+            ),
+            Some(PrimTy::I32),
+            "the exact right path still constrains its left integer literal"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_parameter_mismatch,
+                "pub fn bitwise_integer_literal_left_parameter_mismatch",
+                literal_left_parameter_call,
+                literal_left_parameter_operator_start + "1 & ".len(),
+                "right".len()
+            ),
+            Some(PrimTy::I32),
+            "the exact right path remains typed through the parameter mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_parameter_mismatch,
+                "pub fn bitwise_integer_literal_left_parameter_mismatch",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "the failed literal-left call's dependent alias remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_left_parameter_mismatch,
+                "pub fn bitwise_integer_literal_left_parameter_mismatch",
+                "apply_i32(2 ^ right)",
+                0,
+                "apply_i32(2 ^ right)".len()
+            ),
+            Some(PrimTy::I32),
+            "an independent literal-left sibling remains typed after parameter mismatch"
+        );
+        for (owner, function, call, operator_expression, right_type) in [
+            (
+                bitwise_integer_literal_left_byte_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_byte_rhs_mismatch",
+                "apply_i32(1 & right)",
+                "1 & right",
+                "Byte",
+            ),
+            (
+                bitwise_integer_literal_left_bool_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_bool_rhs_mismatch",
+                "apply_i32(1 | right)",
+                "1 | right",
+                "Bool",
+            ),
+            (
+                bitwise_integer_literal_left_char_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_char_rhs_mismatch",
+                "apply_i32(1 ^ right)",
+                "1 ^ right",
+                "Char",
+            ),
+            (
+                bitwise_integer_literal_left_f32_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_f32_rhs_mismatch",
+                "apply_i32(1 & right)",
+                "1 & right",
+                "F32",
+            ),
+            (
+                bitwise_integer_literal_left_f64_rhs_mismatch,
+                "pub fn bitwise_integer_literal_left_f64_rhs_mismatch",
+                "apply_i32(1 | right)",
+                "1 | right",
+                "F64",
+            ),
+        ] {
+            let operator_offset = call
+                .find(operator_expression)
+                .expect("the non-integer literal-left expression occurs in its call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    operator_offset,
+                    operator_expression.len()
+                ),
+                None,
+                "{right_type} RHS mismatch taints the literal-left operator"
+            );
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
+                None,
+                "{right_type} RHS mismatch taints its containing call"
+            );
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, call, operator_offset, 1),
+                Some(PrimTy::I32),
+                "the direct integer literal remains constrained by the call parameter after a {right_type} RHS mismatch"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    operator_offset + operator_expression.len() - "right".len(),
+                    "right".len()
+                ),
+                None,
+                "the mismatched {right_type} RHS has no trusted path fact"
+            );
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("non-integer literal-left diagnostics are available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{right_type} literal-left mismatch remains supported")
+                }
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [sai_diagnostics::Code::TypeMismatch],
+                "{right_type} RHS reports no extra operator diagnostic"
+            );
+            assert_eq!(
+                diagnostics[0].message,
+                format!("expected `I64`, found `{right_type}`"),
+                "the integer literal family mismatch remains independent of the call parameter"
+            );
+            let function_start = root
+                .find(function)
+                .expect("the non-integer literal-left fixture function exists");
+            let function_end = root[function_start..]
+                .find("\npub fn ")
+                .map_or(root.len(), |offset| function_start + offset);
+            let right_start = function_start
+                + root[function_start..function_end]
+                    .rfind("right")
+                    .expect("the RHS path occurs in the fixture function");
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("the non-integer RHS mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(right_start as u32),
+                    sai_diagnostics::TextSize::new((right_start + "right".len()) as u32),
+                )
+                .expect("the non-integer RHS path range is ordered"),
+                "{right_type} mismatch points at the exact RHS path"
+            );
+        }
+
+        for (owner, function, primitive, callee, operator, literal) in [
+            (
+                bitwise_integer_literal_left_out_of_range_isize_below,
+                "pub fn bitwise_integer_literal_left_out_of_range_isize_below",
+                PrimTy::ISize,
+                "apply_isize",
+                "&",
+                "-2147483649",
+            ),
+            (
+                bitwise_integer_literal_left_out_of_range_isize_above,
+                "pub fn bitwise_integer_literal_left_out_of_range_isize_above",
+                PrimTy::ISize,
+                "apply_isize",
+                "|",
+                "2147483648",
+            ),
+            (
+                bitwise_integer_literal_left_out_of_range_usize_below,
+                "pub fn bitwise_integer_literal_left_out_of_range_usize_below",
+                PrimTy::USize,
+                "apply_usize",
+                "^",
+                "-1",
+            ),
+            (
+                bitwise_integer_literal_left_out_of_range_usize_above,
+                "pub fn bitwise_integer_literal_left_out_of_range_usize_above",
+                PrimTy::USize,
+                "apply_usize",
+                "&",
+                "4294967296",
+            ),
+        ] {
+            let operator_expression = format!("{literal} {operator} right");
+            let call = format!("{callee}({operator_expression})");
+            let operator_offset = call
+                .find(&operator_expression)
+                .expect("the pointer-width range expression occurs in its call");
+            let literal_offset = operator_offset;
+            let right_offset = operator_offset + literal.len() + operator.len() + 2;
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("pointer-width range diagnostics are available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{function} remains supported with a range diagnostic")
+                }
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [sai_diagnostics::Code::LiteralOutOfRange],
+                "{function} reports only the pointer-width range error"
+            );
+            let function_start = root
+                .find(function)
+                .expect("the pointer-width range fixture function exists");
+            let literal_start = function_start
+                + root[function_start..]
+                    .find(literal)
+                    .expect("the complete signed pointer-width literal exists");
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("pointer-width range error has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(literal_start as u32),
+                    sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                )
+                .expect("the complete signed pointer-width literal range is ordered"),
+                "{function} range diagnostic covers the complete literal, including its sign"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    operator_offset,
+                    operator_expression.len()
+                ),
+                None,
+                "{function} suppresses the operator fact after range failure"
+            );
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
+                None,
+                "{function} taints the containing call after range failure"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    literal_offset,
+                    literal.len()
+                ),
+                None,
+                "{function} suppresses the out-of-range literal fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    right_offset,
+                    "right".len()
+                ),
+                Some(primitive),
+                "{function} preserves the exact target-typed RHS path fact"
+            );
+        }
+
+        for (owner, function, primitive, callee, operator, literal) in [
+            (
+                bitwise_integer_literal_left_boundaries_isize,
+                "pub fn bitwise_integer_literal_left_boundaries_isize",
+                PrimTy::ISize,
+                "apply_isize",
+                "&",
+                "-2147483648",
+            ),
+            (
+                bitwise_integer_literal_left_boundaries_isize,
+                "pub fn bitwise_integer_literal_left_boundaries_isize",
+                PrimTy::ISize,
+                "apply_isize",
+                "|",
+                "2147483647",
+            ),
+            (
+                bitwise_integer_literal_left_boundaries_usize,
+                "pub fn bitwise_integer_literal_left_boundaries_usize",
+                PrimTy::USize,
+                "apply_usize",
+                "&",
+                "0",
+            ),
+            (
+                bitwise_integer_literal_left_boundaries_usize,
+                "pub fn bitwise_integer_literal_left_boundaries_usize",
+                PrimTy::USize,
+                "apply_usize",
+                "^",
+                "4294967295",
+            ),
+        ] {
+            let operator_expression = format!("{literal} {operator} right");
+            let call = format!("{callee}({operator_expression})");
+            let operator_offset = call
+                .find(&operator_expression)
+                .expect("the target-width boundary expression occurs in its call");
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
+                Some(primitive),
+                "{function} accepts the in-range target-width boundary"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    operator_offset,
+                    operator_expression.len()
+                ),
+                Some(primitive),
+                "{function} records the exact target-width operator fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    operator_offset,
+                    literal.len()
+                ),
+                Some(primitive),
+                "{function} checks the full boundary literal against its pointer-width type"
+            );
+        }
         for (left_name, callee, primitive) in bitwise_integer_literal_types.iter().copied() {
             let suffix = left_name.to_ascii_lowercase();
             let function_name = format!("bitwise_integer_literal_rhs_{suffix}");
@@ -50472,6 +51214,134 @@ property "shared"() {}
                     ),
                     Some(primitive),
                     "the nested integer literal is checked against {left_name}"
+                );
+            }
+        }
+
+        for (right_name, callee, primitive) in bitwise_integer_literal_types.iter().copied() {
+            let suffix = right_name.to_ascii_lowercase();
+            let function_name = format!("bitwise_integer_literal_left_{suffix}");
+            let nested_function_name = format!("nested_bitwise_integer_literal_left_{suffix}");
+            let function = format!("pub fn {function_name}");
+            let nested_function = format!("pub fn {nested_function_name}");
+            let owner = assert_supported(&database, &function_name, &[]);
+            let nested_owner = assert_supported(&database, &nested_function_name, &[]);
+
+            for (operator, literal) in [("&", "1"), ("|", "2"), ("^", "3")] {
+                let operator_expression = format!("{literal} {operator} right");
+                let call = format!("{callee}({operator_expression})");
+                let operator_offset = call
+                    .find(&operator_expression)
+                    .expect("the direct-call bitwise expression occurs in its call");
+                let literal_offset = operator_offset;
+                let right_offset = operator_offset + literal.len() + operator.len() + 2;
+                assert_eq!(
+                    expression_type_at_range(&mut database, owner, &function, &call, 0, call.len()),
+                    Some(primitive),
+                    "root literal-left {right_name} {operator} keeps its path type"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &call,
+                        operator_offset,
+                        operator_expression.len()
+                    ),
+                    Some(primitive),
+                    "the exact root literal-left {right_name} {operator} expression has a type fact"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &call,
+                        literal_offset,
+                        literal.len()
+                    ),
+                    Some(primitive),
+                    "the root integer literal is inferred from the exact {right_name} path"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &call,
+                        right_offset,
+                        "right".len()
+                    ),
+                    Some(primitive),
+                    "the root {right_name} right path keeps its exact type"
+                );
+
+                let nested_inner_call = format!("{callee}({operator_expression})");
+                let nested_call = format!("{callee}({nested_inner_call})");
+                let nested_inner_offset = callee.len() + 1;
+                let nested_operator_offset = nested_inner_offset + callee.len() + 1;
+                let nested_right_offset =
+                    nested_operator_offset + literal.len() + operator.len() + 2;
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        nested_owner,
+                        &nested_function,
+                        &nested_call,
+                        0,
+                        nested_call.len()
+                    ),
+                    Some(primitive),
+                    "nested literal-left {right_name} {operator} keeps the outer call typed"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        nested_owner,
+                        &nested_function,
+                        &nested_call,
+                        nested_inner_offset,
+                        nested_inner_call.len()
+                    ),
+                    Some(primitive),
+                    "the inner call containing literal-left {right_name} {operator} is typed"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        nested_owner,
+                        &nested_function,
+                        &nested_call,
+                        nested_operator_offset,
+                        operator_expression.len()
+                    ),
+                    Some(primitive),
+                    "the exact nested literal-left {right_name} {operator} expression has a type fact"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        nested_owner,
+                        &nested_function,
+                        &nested_call,
+                        nested_operator_offset,
+                        literal.len()
+                    ),
+                    Some(primitive),
+                    "the nested integer literal is inferred from {right_name}"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        nested_owner,
+                        &nested_function,
+                        &nested_call,
+                        nested_right_offset,
+                        "right".len()
+                    ),
+                    Some(primitive),
+                    "the nested {right_name} right path keeps its exact type"
                 );
             }
         }

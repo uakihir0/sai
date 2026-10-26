@@ -19066,6 +19066,27 @@ fn binary_bitwise_integer_literal_rhs_arguments_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn binary_bitwise_integer_literal_lhs_arguments_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn bitwise_and_integer_literal_argument(right: I32) -> I32 { identity_i32(1 & right) }\n",
+        "pub fn bitwise_or_integer_literal_argument(right: U64) -> U64 { identity_u64(2 | right) }\n",
+        "pub fn nested_bitwise_xor_integer_literal_argument(right: I8) -> I8 { identity_i8(identity_i8(3 ^ right)) }\n",
+        "pub fn bitwise_integer_literal_copy_argument(right: I32) -> I32 {\n",
+        "    let copy = right\n",
+        "    identity_i32(-1 ^ copy)\n",
+        "}\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_i8(value: I8) -> I8 { value }\n",
+        "fn identity_u64(value: U64) -> U64 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root or one-level nested direct calls with integer-literal LHS bitwise arguments",
+    );
+}
+
+#[test]
 fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
     let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);

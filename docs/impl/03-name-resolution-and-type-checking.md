@@ -2937,6 +2937,21 @@ nesting, and unsupported call targets or signatures gated. Preserve exact
 facts, taint, siblings, and the CLI Stage 0 gate; add no bitwise lowering or
 runtime behavior.
 
+**IR-968 direct-call bitwise integer-literal LHS** additionally admits one
+direct integer literal on the left of `&`, `|`, or `^` when the right operand
+is an eligible exact-binding path. Integer RHS paths constrain the literal
+to their exact primitive type and supply the expression result; preserve full
+signed-span and target pointer-width range checks for `ISize` and `USize`.
+For concrete `Byte`, `Bool`, `Char`, `F32`, and `F64` RHS paths, keep the
+flat-local integer-literal family behavior: report one `TYPE_MISMATCH` at the
+path, expecting `I64`, with no additional operator diagnostic. An enclosing
+call parameter may still constrain the literal, but does not hide that path
+mismatch. Reject unresolved numeric RHS locals, literal pairs, non-integer
+literal LHS forms, computed/call operands, other operators, deeper calls, and
+unsupported targets or signatures. Preserve exact facts, taint, valid
+siblings, and the CLI Stage 0 gate; add no bitwise lowering or runtime
+behavior.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:

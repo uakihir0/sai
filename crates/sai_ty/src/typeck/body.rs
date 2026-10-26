@@ -5011,11 +5011,13 @@ fn is_supported_direct_call_shift_operands(left: &Expr<'_>, right: &Expr<'_>) ->
 }
 
 fn is_supported_direct_call_bitwise_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
-    matches!(left.kind, ExprKind::Path(_))
+    (matches!(left.kind, ExprKind::Path(_))
         && matches!(
             right.kind,
             ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })
-        )
+        ))
+        || (matches!(left.kind, ExprKind::Lit(Lit::Int { .. }))
+            && matches!(right.kind, ExprKind::Path(_)))
 }
 
 fn is_supported_direct_call_not_operand(operand: &Expr<'_>) -> bool {
