@@ -3164,6 +3164,40 @@ no remainder evaluation or runtime behavior.
   confirmed the regression meaningfully checks shadow-binding facts with no
   remaining actionable findings.
 
+**IR-977 direct-call remainder with two paths** extends the root or existing
+one-level nested direct-call argument slice to one direct `path % path`
+expression. Each operand must independently resolve by exact `BindingId` to a
+parameter or preceding local. Reuse `check_remainder`; the left operand keeps
+its established arithmetic-type direction and mismatches taint the operator
+and containing call facts. The path-pair shape admits the existing remainder
+checker to diagnose floating-point operands but does not enable floating-point
+remainder. Keep computed, unresolved, self-referential, forward, unresolved
+numeric, non-arithmetic, deeper-call, generic-target, and unsupported-signature
+forms gated. Preserve the CLI Stage 0 incomplete-check gate and do not add
+remainder evaluation or runtime behavior.
+
+- **Review required:** Challenge driver/body-checker agreement for two eligible
+  path operands at root and one nested-call level. Verify all ten integer
+  primitive result and operand facts, copied and shadowed `BindingId`
+  selection, and exact mismatch recovery: an incompatible path RHS diagnoses
+  the RHS span and suppresses operator/call facts, while a call-parameter
+  mismatch taints the argument expression and keeps an independent valid
+  sibling. Verify float paths retain `OPERATOR_NOT_SUPPORTED`, with no
+  floating-remainder fact. Confirm unresolved, unresolved numeric, self and
+  forward locals, computed operands, non-arithmetic paths, deeper nesting,
+  generic targets, and unsupported signatures remain unsupported. Preserve
+  Stage 0 and make no execution claim.
+
+- **Planned test matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` with all
+  ten integer path-pair result/operand types, the existing nested-call depth,
+  copied locals, two same-name I16 locals shadowing I64 parameters, both
+  operand-type and call-parameter mismatches, float diagnostics, sibling
+  retention, and every excluded shape. Add isolated CLI Stage 0 tests for
+  accepted root/nested/copy/shadow forms and excluded computed, unresolved,
+  forward, and deep forms. Run the pinned focused driver and CLI tests,
+  formatting, and diff checks; request an independent hostile review.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:

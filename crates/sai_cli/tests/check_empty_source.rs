@@ -18952,6 +18952,56 @@ fn remainder_path_integer_literal_arguments_to_direct_calls_remain_behind_the_st
 }
 
 #[test]
+fn remainder_path_pair_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn remainder_paths(left: I32, right: I32) -> I32 { identity_i32(left % right) }\n",
+        "pub fn nested_remainder_paths(left: I32, right: I32) -> I32 {\n",
+        "    identity_i32(identity_i32(left % right))\n",
+        "}\n",
+        "pub fn copied_remainder_paths(left: I32, right: I32) -> I32 {\n",
+        "    let lhs = left\n",
+        "    let rhs = right\n",
+        "    identity_i32(lhs % rhs)\n",
+        "}\n",
+        "pub fn shadowed_remainder_paths(left: I64, right: I64) -> I16 {\n",
+        "    let left: I16 = 1\n",
+        "    let right: I16 = 2\n",
+        "    identity_i16(left % right)\n",
+        "}\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_i16(value: I16) -> I16 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct-call remainder path pairs",
+    );
+}
+
+#[test]
+fn unsupported_remainder_path_pair_shapes_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn computed_left(left: I32, right: I32) -> I32 { identity_i32((left + 1) % right) }\n",
+        "pub fn computed_right(left: I32, right: I32) -> I32 { identity_i32(left % (right + 1)) }\n",
+        "pub fn unresolved_rhs(left: I32) -> I32 { identity_i32(left % missing) }\n",
+        "pub fn forward_rhs(left: I32) -> I32 {\n",
+        "    let result = identity_i32(left % later)\n",
+        "    let later: I32 = 2\n",
+        "    result\n",
+        "}\n",
+        "pub fn deep_nested(left: I32, right: I32) -> I32 {\n",
+        "    identity_i32(identity_i32(identity_i32(left % right)))\n",
+        "}\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "computed, unresolved, forward, and deeper direct-call remainder operands",
+    );
+}
+
+#[test]
 fn comparison_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn is_below_limit(value: I32, limit: I32) -> Bool { identity_bool(value < limit) }\n",

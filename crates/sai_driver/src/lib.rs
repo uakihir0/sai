@@ -9203,9 +9203,19 @@ fn is_supported_direct_call_remainder_argument_shape(
     let ExprKind::Path(path) = left.kind else {
         return false;
     };
-    matches!(right.kind, ExprKind::Lit(Lit::Int { .. }))
-        && resolved_plain_local_path_binding(path, locals, inputs)
-            .is_some_and(|binding| preceding_bindings.contains(&binding))
+    let Some(left_binding) = resolved_plain_local_path_binding(path, locals, inputs) else {
+        return false;
+    };
+    if !preceding_bindings.contains(&left_binding) {
+        return false;
+    }
+
+    match right.kind {
+        ExprKind::Lit(Lit::Int { .. }) => true,
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        _ => false,
+    }
 }
 
 fn is_supported_direct_call_arithmetic_operands_shape(
@@ -48854,6 +48864,38 @@ property "shared"() {}
             "    let failed = apply_i8(input % -129)\n",
             "    apply_i8(input % 2)\n",
             "}\n",
+            "pub fn remainder_path_pair_i8_call_argument(left: I8, right: I8) -> I8 { apply_i8(left % right) }\n",
+            "pub fn remainder_path_pair_i16_call_argument(left: I16, right: I16) -> I16 { apply_i16(left % right) }\n",
+            "pub fn remainder_path_pair_i32_call_argument(left: I32, right: I32) -> I32 { apply(left % right) }\n",
+            "pub fn remainder_path_pair_i64_call_argument(left: I64, right: I64) -> I64 { apply_i64(left % right) }\n",
+            "pub fn remainder_path_pair_isize_call_argument(left: ISize, right: ISize) -> ISize { apply_isize(left % right) }\n",
+            "pub fn remainder_path_pair_u8_call_argument(left: U8, right: U8) -> U8 { apply_u8(left % right) }\n",
+            "pub fn remainder_path_pair_u16_call_argument(left: U16, right: U16) -> U16 { apply_u16(left % right) }\n",
+            "pub fn remainder_path_pair_u32_call_argument(left: U32, right: U32) -> U32 { apply_u32(left % right) }\n",
+            "pub fn remainder_path_pair_u64_call_argument(left: U64, right: U64) -> U64 { apply_u64(left % right) }\n",
+            "pub fn remainder_path_pair_usize_call_argument(left: USize, right: USize) -> USize { apply_usize(left % right) }\n",
+            "pub fn nested_remainder_path_pair_call_argument(left: I32, right: I32) -> I32 { apply_i32(apply(left % right)) }\n",
+            "pub fn remainder_path_pair_local_copies_call_argument(left: I32, right: I32) -> I32 {\n",
+            "    let lhs = left\n",
+            "    let rhs = right\n",
+            "    apply(lhs % rhs)\n",
+            "}\n",
+            "pub fn remainder_path_pair_shadowed_bindings_call_argument(left: I64, right: I64) -> I16 {\n",
+            "    let left: I16 = 1\n",
+            "    let right: I16 = 2\n",
+            "    apply_i16(left % right)\n",
+            "}\n",
+            "pub fn remainder_path_pair_parameter_mismatch(left: I32, right: I32) -> I32 {\n",
+            "    let failed = apply_bool(left % right)\n",
+            "    let alias = failed\n",
+            "    apply(left)\n",
+            "}\n",
+            "pub fn remainder_path_pair_operand_mismatch(left: I32, right: F32) -> I32 {\n",
+            "    let failed = apply(left % right)\n",
+            "    let alias = failed\n",
+            "    apply(left)\n",
+            "}\n",
+            "pub fn remainder_path_pair_float_unsupported(left: F32, right: F32) -> F32 { float_fn(left % right) }\n",
             "pub fn remainder_float_left_call_argument(value: F32) -> F32 { float_fn(value % 2) }\n",
             "pub fn remainder_call_argument_result_mismatch(input: I32) -> F32 { float_fn(input % 2) }\n",
             "pub fn arithmetic_local_paths_call_argument(input: I32) -> I32 {\n",
@@ -48894,9 +48936,31 @@ property "shared"() {}
             "pub fn remainder_computed_rhs_call_argument(input: I32) -> I32 { apply(input % (1 + 2)) }\n",
             "pub fn remainder_nested_operator_call_argument(input: I32) -> I32 { apply((input % 2) + 1) }\n",
             "pub fn remainder_call_operand_call_argument(input: I32) -> I32 { apply(input % add_one(input)) }\n",
+            "pub fn remainder_path_pair_computed_left_unsupported(left: I32, right: I32) -> I32 { apply((left + 1) % right) }\n",
+            "pub fn remainder_path_pair_computed_right_unsupported(left: I32, right: I32) -> I32 { apply(left % (right + 1)) }\n",
+            "pub fn remainder_path_pair_unresolved_right_unsupported(left: I32) -> I32 { apply(left % missing) }\n",
+            "pub fn remainder_path_pair_self_right_unsupported(left: I32) -> I32 {\n",
+            "    let result = apply(left % result)\n",
+            "    result\n",
+            "}\n",
+            "pub fn remainder_path_pair_forward_right_unsupported(left: I32) -> I32 {\n",
+            "    let result = apply(left % later)\n",
+            "    let later: I32 = 2\n",
+            "    result\n",
+            "}\n",
+            "pub fn remainder_path_pair_unresolved_numeric_right_unsupported(left: I32) -> I32 {\n",
+            "    let divisor = 2\n",
+            "    apply(left % divisor)\n",
+            "}\n",
+            "pub fn remainder_path_pair_bool_operands_unsupported(left: Bool, right: Bool) -> Bool { apply_bool(left % right) }\n",
+            "pub fn remainder_path_pair_byte_operands_unsupported(left: Byte, right: Byte) -> Byte { apply_byte(left % right) }\n",
+            "pub fn remainder_path_pair_char_operands_unsupported(left: Char, right: Char) -> Char { identity_char(left % right) }\n",
             "pub fn remainder_deep_nested_call_argument(input: I32) -> I32 { apply_i32(apply(apply_i32(input % 2))) }\n",
+            "pub fn remainder_path_pair_deep_nested_unsupported(left: I32, right: I32) -> I32 { apply_i32(apply_i32(apply_i32(left % right))) }\n",
             "pub fn remainder_generic_target_call_argument(input: I32) -> I32 { generic_fn(input % 2) }\n",
+            "pub fn remainder_path_pair_generic_target_unsupported(left: I32, right: I32) -> I32 { generic_fn(left % right) }\n",
             "pub fn remainder_unsupported_signature_call_argument(input: I32) -> I32 { text_fn(input % 2) }\n",
+            "pub fn remainder_path_pair_unsupported_signature_unsupported(left: I32, right: I32) -> I32 { text_fn(left % right) }\n",
             "pub fn call_under_arithmetic_argument(input: I32) -> I32 { apply(add_one(input) + 1) }\n",
             "pub fn call_in_operator(input: I32) -> I32 {\n",
             "    let result = apply(input) + 1\n",
@@ -50291,6 +50355,53 @@ property "shared"() {}
             "remainder_call_argument_result_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
+        let remainder_path_pair_i8_call_argument =
+            assert_supported(&database, "remainder_path_pair_i8_call_argument", &[]);
+        let remainder_path_pair_i16_call_argument =
+            assert_supported(&database, "remainder_path_pair_i16_call_argument", &[]);
+        let remainder_path_pair_i32_call_argument =
+            assert_supported(&database, "remainder_path_pair_i32_call_argument", &[]);
+        let remainder_path_pair_i64_call_argument =
+            assert_supported(&database, "remainder_path_pair_i64_call_argument", &[]);
+        let remainder_path_pair_isize_call_argument =
+            assert_supported(&database, "remainder_path_pair_isize_call_argument", &[]);
+        let remainder_path_pair_u8_call_argument =
+            assert_supported(&database, "remainder_path_pair_u8_call_argument", &[]);
+        let remainder_path_pair_u16_call_argument =
+            assert_supported(&database, "remainder_path_pair_u16_call_argument", &[]);
+        let remainder_path_pair_u32_call_argument =
+            assert_supported(&database, "remainder_path_pair_u32_call_argument", &[]);
+        let remainder_path_pair_u64_call_argument =
+            assert_supported(&database, "remainder_path_pair_u64_call_argument", &[]);
+        let remainder_path_pair_usize_call_argument =
+            assert_supported(&database, "remainder_path_pair_usize_call_argument", &[]);
+        let nested_remainder_path_pair_call_argument =
+            assert_supported(&database, "nested_remainder_path_pair_call_argument", &[]);
+        let remainder_path_pair_local_copies_call_argument = assert_supported(
+            &database,
+            "remainder_path_pair_local_copies_call_argument",
+            &[],
+        );
+        let remainder_path_pair_shadowed_bindings_call_argument = assert_supported(
+            &database,
+            "remainder_path_pair_shadowed_bindings_call_argument",
+            &[],
+        );
+        let remainder_path_pair_parameter_mismatch = assert_supported(
+            &database,
+            "remainder_path_pair_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let remainder_path_pair_operand_mismatch = assert_supported(
+            &database,
+            "remainder_path_pair_operand_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let remainder_path_pair_float_unsupported = assert_supported(
+            &database,
+            "remainder_path_pair_float_unsupported",
+            &[sai_diagnostics::Code::OperatorNotSupported],
+        );
         let arithmetic_local_paths_call_argument =
             assert_supported(&database, "arithmetic_local_paths_call_argument", &[]);
         let nested_call_with_basic_arithmetic_argument =
@@ -50873,9 +50984,21 @@ property "shared"() {}
             "remainder_computed_rhs_call_argument",
             "remainder_nested_operator_call_argument",
             "remainder_call_operand_call_argument",
+            "remainder_path_pair_computed_left_unsupported",
+            "remainder_path_pair_computed_right_unsupported",
+            "remainder_path_pair_unresolved_right_unsupported",
+            "remainder_path_pair_self_right_unsupported",
+            "remainder_path_pair_forward_right_unsupported",
+            "remainder_path_pair_unresolved_numeric_right_unsupported",
+            "remainder_path_pair_bool_operands_unsupported",
+            "remainder_path_pair_byte_operands_unsupported",
+            "remainder_path_pair_char_operands_unsupported",
             "remainder_deep_nested_call_argument",
+            "remainder_path_pair_deep_nested_unsupported",
             "remainder_generic_target_call_argument",
+            "remainder_path_pair_generic_target_unsupported",
             "remainder_unsupported_signature_call_argument",
+            "remainder_path_pair_unsupported_signature_unsupported",
             "logical_forward_local_paths_unsupported",
             "logical_integer_literal_operand_unsupported",
             "logical_character_literal_operand_unsupported",
@@ -54178,6 +54301,488 @@ property "shared"() {}
                 "the RHS literal is checked against the left path in `{function}`"
             );
         }
+        for (owner, function, callee, expected) in [
+            (
+                remainder_path_pair_i8_call_argument,
+                "pub fn remainder_path_pair_i8_call_argument",
+                "apply_i8",
+                PrimTy::I8,
+            ),
+            (
+                remainder_path_pair_i16_call_argument,
+                "pub fn remainder_path_pair_i16_call_argument",
+                "apply_i16",
+                PrimTy::I16,
+            ),
+            (
+                remainder_path_pair_i32_call_argument,
+                "pub fn remainder_path_pair_i32_call_argument",
+                "apply",
+                PrimTy::I32,
+            ),
+            (
+                remainder_path_pair_i64_call_argument,
+                "pub fn remainder_path_pair_i64_call_argument",
+                "apply_i64",
+                PrimTy::I64,
+            ),
+            (
+                remainder_path_pair_isize_call_argument,
+                "pub fn remainder_path_pair_isize_call_argument",
+                "apply_isize",
+                PrimTy::ISize,
+            ),
+            (
+                remainder_path_pair_u8_call_argument,
+                "pub fn remainder_path_pair_u8_call_argument",
+                "apply_u8",
+                PrimTy::U8,
+            ),
+            (
+                remainder_path_pair_u16_call_argument,
+                "pub fn remainder_path_pair_u16_call_argument",
+                "apply_u16",
+                PrimTy::U16,
+            ),
+            (
+                remainder_path_pair_u32_call_argument,
+                "pub fn remainder_path_pair_u32_call_argument",
+                "apply_u32",
+                PrimTy::U32,
+            ),
+            (
+                remainder_path_pair_u64_call_argument,
+                "pub fn remainder_path_pair_u64_call_argument",
+                "apply_u64",
+                PrimTy::U64,
+            ),
+            (
+                remainder_path_pair_usize_call_argument,
+                "pub fn remainder_path_pair_usize_call_argument",
+                "apply_usize",
+                PrimTy::USize,
+            ),
+        ] {
+            let call = format!("{callee}(left % right)");
+            let remainder_start = callee.len() + 1;
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
+                Some(expected),
+                "the direct call retains its exact result type in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    remainder_start,
+                    "left % right".len()
+                ),
+                Some(expected),
+                "the path-pair remainder retains its exact integer type in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    remainder_start,
+                    "left".len()
+                ),
+                Some(expected),
+                "the left parameter has its exact type in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    remainder_start + "left % ".len(),
+                    "right".len()
+                ),
+                Some(expected),
+                "the right parameter has its exact type in `{function}`"
+            );
+        }
+        let nested_path_pair = "apply_i32(apply(left % right))";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                nested_remainder_path_pair_call_argument,
+                "pub fn nested_remainder_path_pair_call_argument",
+                nested_path_pair,
+                0,
+                nested_path_pair.len()
+            ),
+            Some(PrimTy::I32),
+            "the one-level nested path-pair call retains its result"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                nested_remainder_path_pair_call_argument,
+                "pub fn nested_remainder_path_pair_call_argument",
+                nested_path_pair,
+                "apply_i32(".len(),
+                "apply(left % right)".len()
+            ),
+            Some(PrimTy::I32),
+            "the inner call retains its result"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                nested_remainder_path_pair_call_argument,
+                "pub fn nested_remainder_path_pair_call_argument",
+                nested_path_pair,
+                "apply_i32(apply(".len(),
+                "left % right".len()
+            ),
+            Some(PrimTy::I32),
+            "the nested remainder retains its result"
+        );
+        for (offset, name) in [
+            ("apply_i32(apply(".len(), "left"),
+            ("apply_i32(apply(left % ".len(), "right"),
+        ] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    nested_remainder_path_pair_call_argument,
+                    "pub fn nested_remainder_path_pair_call_argument",
+                    nested_path_pair,
+                    offset,
+                    name.len()
+                ),
+                Some(PrimTy::I32),
+                "both path operands keep their exact nested type"
+            );
+        }
+        let copied_path_pair = "apply(lhs % rhs)";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_local_copies_call_argument,
+                "pub fn remainder_path_pair_local_copies_call_argument",
+                copied_path_pair,
+                0,
+                copied_path_pair.len()
+            ),
+            Some(PrimTy::I32),
+            "preceding local copies are eligible path-pair operands"
+        );
+        for (offset, name) in [("apply(".len(), "lhs"), ("apply(lhs % ".len(), "rhs")] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    remainder_path_pair_local_copies_call_argument,
+                    "pub fn remainder_path_pair_local_copies_call_argument",
+                    copied_path_pair,
+                    offset,
+                    name.len()
+                ),
+                Some(PrimTy::I32),
+                "the copied operand resolves to its preceding local binding"
+            );
+        }
+        let shadowed_path_pair = "apply_i16(left % right)";
+        let shadowed_path_pair_function =
+            "pub fn remainder_path_pair_shadowed_bindings_call_argument";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_shadowed_bindings_call_argument,
+                shadowed_path_pair_function,
+                shadowed_path_pair,
+                0,
+                shadowed_path_pair.len()
+            ),
+            Some(PrimTy::I16),
+            "the shadowing locals, rather than the I64 parameters, determine the call type"
+        );
+        for (offset, name) in [
+            ("apply_i16(".len(), "left"),
+            ("apply_i16(left % ".len(), "right"),
+        ] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    remainder_path_pair_shadowed_bindings_call_argument,
+                    shadowed_path_pair_function,
+                    shadowed_path_pair,
+                    offset,
+                    name.len()
+                ),
+                Some(PrimTy::I16),
+                "the same-name operand resolves to the I16 local BindingId"
+            );
+        }
+
+        let mismatched_parameter_call = "apply_bool(left % right)";
+        let mismatched_parameter_function = "pub fn remainder_path_pair_parameter_mismatch";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_parameter_mismatch,
+                mismatched_parameter_function,
+                mismatched_parameter_call,
+                0,
+                mismatched_parameter_call.len()
+            ),
+            None,
+            "a call parameter mismatch taints the call fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_parameter_mismatch,
+                mismatched_parameter_function,
+                mismatched_parameter_call,
+                "apply_bool(".len(),
+                "left % right".len()
+            ),
+            None,
+            "a call parameter mismatch taints the remainder fact"
+        );
+        for (offset, name) in [
+            ("apply_bool(".len(), "left"),
+            ("apply_bool(left % ".len(), "right"),
+        ] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    remainder_path_pair_parameter_mismatch,
+                    mismatched_parameter_function,
+                    mismatched_parameter_call,
+                    offset,
+                    name.len()
+                ),
+                Some(PrimTy::I32),
+                "operand facts survive a mismatched call parameter"
+            );
+        }
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_parameter_mismatch,
+                mismatched_parameter_function,
+                "let alias = failed",
+                "let alias = ".len(),
+                "failed".len()
+            ),
+            None,
+            "an inferred alias of the failed call remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_parameter_mismatch,
+                mismatched_parameter_function,
+                "apply(left)",
+                0,
+                "apply(left)".len()
+            ),
+            Some(PrimTy::I32),
+            "a valid sibling call retains facts after the parameter mismatch"
+        );
+        let path_pair_parameter_diagnostics = match remainder_path_pair_parameter_mismatch
+            .body_type_check()
+            .expect("owner body check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("the path-pair parameter mismatch is a supported diagnostic")
+            }
+        };
+        assert_eq!(
+            path_pair_parameter_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch],
+            "the parameter mismatch produces only its existing diagnostic"
+        );
+        let path_pair_parameter_function_start = root
+            .find(mismatched_parameter_function)
+            .expect("the parameter mismatch function exists");
+        let path_pair_parameter_mismatch_start = path_pair_parameter_function_start
+            + root[path_pair_parameter_function_start..]
+                .find("left % right")
+                .expect("the mismatched call argument exists");
+        assert_eq!(
+            path_pair_parameter_diagnostics[0]
+                .primary()
+                .expect("the parameter mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(path_pair_parameter_mismatch_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (path_pair_parameter_mismatch_start + "left % right".len()) as u32
+                ),
+            )
+            .expect("the call-argument mismatch span is ordered")
+        );
+
+        let operand_mismatch_function = "pub fn remainder_path_pair_operand_mismatch";
+        let operand_mismatch_call = "apply(left % right)";
+        let operand_mismatch_diagnostics = match remainder_path_pair_operand_mismatch
+            .body_type_check()
+            .expect("owner body check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("a mismatched path-pair operand is a supported diagnostic")
+            }
+        };
+        assert_eq!(
+            operand_mismatch_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch],
+            "the path-pair mismatch uses the existing type diagnostic"
+        );
+        let operand_mismatch_function_start = root
+            .find(operand_mismatch_function)
+            .expect("the operand mismatch function exists");
+        let operand_mismatch_right_start = operand_mismatch_function_start
+            + root[operand_mismatch_function_start..]
+                .find("left % right")
+                .expect("the mismatched RHS path exists")
+            + "left % ".len();
+        assert_eq!(
+            operand_mismatch_diagnostics[0]
+                .primary()
+                .expect("the path mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(operand_mismatch_right_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (operand_mismatch_right_start + "right".len()) as u32
+                ),
+            )
+            .expect("the mismatched RHS path span is ordered")
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_operand_mismatch,
+                operand_mismatch_function,
+                operand_mismatch_call,
+                0,
+                operand_mismatch_call.len()
+            ),
+            None,
+            "an operand mismatch taints the containing call fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_operand_mismatch,
+                operand_mismatch_function,
+                operand_mismatch_call,
+                "apply(".len(),
+                "left % right".len()
+            ),
+            None,
+            "an operand mismatch taints the remainder fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_operand_mismatch,
+                operand_mismatch_function,
+                operand_mismatch_call,
+                "apply(left % ".len(),
+                "right".len()
+            ),
+            None,
+            "the mismatched RHS path fact is suppressed with its operator"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_operand_mismatch,
+                operand_mismatch_function,
+                operand_mismatch_call,
+                "apply(".len(),
+                "left".len()
+            ),
+            Some(PrimTy::I32),
+            "the left path fact survives the RHS type mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_operand_mismatch,
+                operand_mismatch_function,
+                "let alias = failed",
+                "let alias = ".len(),
+                "failed".len()
+            ),
+            None,
+            "an inferred alias of the failed operand-mismatch call remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_operand_mismatch,
+                operand_mismatch_function,
+                "apply(left)",
+                0,
+                "apply(left)".len()
+            ),
+            Some(PrimTy::I32),
+            "an independent valid sibling remains typed after the path mismatch"
+        );
+
+        let float_path_pair_call = "float_fn(left % right)";
+        let float_path_pair_diagnostics = match remainder_path_pair_float_unsupported
+            .body_type_check()
+            .expect("owner body check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("float path-pair recovery remains diagnostic-supported")
+            }
+        };
+        assert_eq!(
+            float_path_pair_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::OperatorNotSupported],
+            "float paths retain the existing unsupported-remainder diagnostic"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_float_unsupported,
+                "pub fn remainder_path_pair_float_unsupported",
+                float_path_pair_call,
+                0,
+                float_path_pair_call.len()
+            ),
+            None,
+            "the unsupported float remainder suppresses the call fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_path_pair_float_unsupported,
+                "pub fn remainder_path_pair_float_unsupported",
+                float_path_pair_call,
+                "float_fn(".len(),
+                "left % right".len()
+            ),
+            None,
+            "the unsupported float remainder suppresses its operator fact"
+        );
         let nested_remainder = "apply_i32(apply(input % 2))";
         assert_eq!(
             expression_type_at_range(
