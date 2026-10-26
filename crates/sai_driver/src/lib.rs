@@ -9292,20 +9292,20 @@ fn is_supported_direct_call_shift_operands_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
 ) -> bool {
-    let left_is_eligible_path = match left.kind {
+    let left_shape_is_supported = match left.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Byte(_)) => true,
         _ => false,
     };
-    if !left_is_eligible_path {
+    if !left_shape_is_supported {
         return false;
     }
 
     match right.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
-        ExprKind::Lit(Lit::Int { .. }) => matches!(left.kind, ExprKind::Path(_)),
+        ExprKind::Lit(Lit::Int { .. }) => true,
         _ => false,
     }
 }
@@ -49299,7 +49299,6 @@ property "shared"() {}
             "pub fn shift_integer_literal_rhs_deep_nested_unsupported(left: I32) -> I32 { apply_i32(apply_i32(apply_i32(left << 1))) }\n",
             "pub fn shift_integer_literal_rhs_generic_target_unsupported(left: I32) -> I32 { generic_fn(left << 1) }\n",
             "pub fn shift_integer_literal_rhs_unsupported_signature(left: I32) -> I32 { text_fn(left << 1) }\n",
-            "pub fn shift_byte_literal_lhs_integer_literal_rhs_unsupported(count: U32) -> Byte { apply_byte(b'a' << 1) }\n",
             "pub fn shift_integer_literal_lhs_path_rhs_unsupported(count: U32) -> U32 { apply_u32(1 << count) }\n",
             "pub fn shift_byte_literal_lhs_byte_literal_rhs_unsupported() -> Byte { apply_byte(b'a' << b'b') }\n",
             "pub fn shift_byte_literal_lhs_computed_rhs_unsupported(count: U32) -> Byte { apply_byte(b'a' << (count + 1)) }\n",
@@ -50162,6 +50161,8 @@ property "shared"() {}
         }
         let mut generated_shift_literal_rhs_cases = String::new();
         let mut shift_literal_rhs_cases = Vec::new();
+        let mut generated_byte_shift_literal_rhs_cases = String::new();
+        let mut byte_shift_literal_rhs_cases = Vec::new();
         for (left_type, callee, type_name) in [
             ("I8", "apply_i8", "i8"),
             ("I16", "apply_i16", "i16"),
@@ -50209,11 +50210,42 @@ property "shared"() {}
                 }
             }
         }
+        for (operator, operator_name) in [("<<", "left"), (">>", "right")] {
+            for (nested, position) in [(false, "root"), (true, "nested")] {
+                for (literal_name, literal, in_range) in [
+                    ("zero", "0", true),
+                    ("u32_max", "4294967295", true),
+                    ("negative_one", "-1", false),
+                    ("u32_max_plus_one", "4294967296", false),
+                ] {
+                    let name = format!(
+                        "direct_call_byte_shift_literal_rhs_{position}_{operator_name}_{literal_name}"
+                    );
+                    let operator_expression = format!("b'a' {operator} {literal}");
+                    let inner_call = format!("apply_byte({operator_expression})");
+                    let call = if nested {
+                        format!("apply_byte({inner_call})")
+                    } else {
+                        inner_call
+                    };
+                    generated_byte_shift_literal_rhs_cases
+                        .push_str(&format!("pub fn {name}() -> Byte {{ {call} }}\n"));
+                    byte_shift_literal_rhs_cases.push((
+                        name,
+                        nested,
+                        operator_expression,
+                        literal,
+                        in_range,
+                    ));
+                }
+            }
+        }
         root.push_str(&generated_bitwise_integer_literal_cases);
         root.push_str(&generated_bitwise_integer_literal_left_cases);
         root.push_str(&generated_bitwise_integer_literal_pair_cases);
         root.push_str(&generated_bitwise_signed_integer_literal_pair_cases);
         root.push_str(&generated_shift_literal_rhs_cases);
+        root.push_str(&generated_byte_shift_literal_rhs_cases);
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
@@ -51319,7 +51351,6 @@ property "shared"() {}
             "shift_integer_literal_rhs_byte_unsupported",
             "shift_integer_literal_rhs_char_unsupported",
             "shift_integer_literal_rhs_float_unsupported",
-            "shift_byte_literal_lhs_integer_literal_rhs_unsupported",
             "shift_integer_literal_lhs_path_rhs_unsupported",
             "shift_byte_literal_lhs_byte_literal_rhs_unsupported",
             "shift_byte_literal_lhs_computed_rhs_unsupported",
@@ -51706,6 +51737,130 @@ property "shared"() {}
                     )
                     .expect("out-of-range U32 literal span is ordered"),
                     "the {name} range diagnostic covers the exact literal token"
+                );
+            }
+        }
+
+        for (name, nested, operator_expression, literal, in_range) in &byte_shift_literal_rhs_cases
+        {
+            let owner = assert_supported(
+                &database,
+                name,
+                if *in_range {
+                    &[]
+                } else {
+                    &[sai_diagnostics::Code::LiteralOutOfRange]
+                },
+            );
+            let function = format!("pub fn {name}");
+            let inner_call = format!("apply_byte({operator_expression})");
+            let call = if *nested {
+                format!("apply_byte({inner_call})")
+            } else {
+                inner_call.clone()
+            };
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, &call, 0, call.len(),),
+                (*in_range).then_some(PrimTy::Byte),
+                "{name} publishes a Byte call fact only for an in-range U32 count"
+            );
+            if *nested {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &call,
+                        call.find(&inner_call)
+                            .expect("the one-level inner Byte call occurs in its outer call"),
+                        inner_call.len(),
+                    ),
+                    (*in_range).then_some(PrimTy::Byte),
+                    "{name} propagates literal-range taint through the nested call"
+                );
+            }
+
+            let operator_start = call
+                .find(operator_expression)
+                .expect("the Byte-literal shift expression occurs in the call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    operator_start,
+                    operator_expression.len(),
+                ),
+                (*in_range).then_some(PrimTy::Byte),
+                "{name} publishes the Byte shift fact only for an in-range count"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    operator_start,
+                    "b'a'".len(),
+                ),
+                None,
+                "{name} does not synthesize a separate Byte-literal fact"
+            );
+            let literal_start = operator_expression
+                .rfind(literal)
+                .expect("the direct integer count literal occurs in the shift");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    operator_start + literal_start,
+                    literal.len(),
+                ),
+                (*in_range).then_some(PrimTy::U32),
+                "{name} checks the count as U32 and taints an out-of-range literal"
+            );
+
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("Byte-literal direct-call shift body check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{name} remains in the supported Byte shift literal slice")
+                }
+            };
+            if *in_range {
+                assert!(
+                    diagnostics.is_empty(),
+                    "{name} accepts in-range count {literal} without static Byte-width overflow"
+                );
+            } else {
+                let function_start = root
+                    .find(&function)
+                    .expect("the generated Byte shift function occurs in the test root");
+                let source_operator_start = function_start
+                    + root[function_start..]
+                        .find(operator_expression)
+                        .expect("the generated Byte shift expression occurs in the source");
+                assert_eq!(
+                    diagnostics[0]
+                        .primary()
+                        .expect("out-of-range U32 count has a primary span")
+                        .span
+                        .range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(
+                            (source_operator_start + literal_start) as u32,
+                        ),
+                        sai_diagnostics::TextSize::new(
+                            (source_operator_start + literal_start + literal.len()) as u32,
+                        ),
+                    )
+                    .expect("out-of-range U32 literal span is ordered"),
+                    "{name} diagnoses the complete integer count token"
                 );
             }
         }

@@ -3398,6 +3398,58 @@ diagnostic, fact, and static-versus-runtime boundaries are **Review required**.
   it was removed, and the focused tests and formatting/diff checks passed
   afterward. No actionable findings remain.
 
+**IR-982 direct-call shifts with a Byte-literal LHS and integer-literal RHS**
+extends the root or existing one-level nested positional direct-call shift
+form to a direct HIR Byte character literal on the left and a direct integer
+literal on the right for `<<` or `>>`. Reuse `check_shift`: the left operand
+is `Byte`, and the integer literal is checked as `U32`. Counts `0` and
+`4294967295` produce a `Byte` shift result even when the count exceeds the
+Byte width; this type-checking slice does not report static `ShiftOverflow`.
+Preserve the IR-980 eligible-path-left/integer-literal-right form unchanged.
+Counts `-1` and `4294967296` produce `LITERAL_OUT_OF_RANGE` over the complete
+literal token, including the sign, and suppress the shift and containing call
+facts. The Byte character literal receives no separate expression fact.
+Preserve existing direct-call target, signature, positional-prefix, nesting,
+diagnostic, recovery, taint, and sibling-fact behavior. Keep computed,
+non-integer, and Byte-literal RHSs, integer-literal or computed LHSs, deeper
+calls, generic targets, and unsupported signatures gated. Preserve the CLI
+Stage 0 gate and add no lowering or runtime behavior. These shape, range,
+recovery, fact, and static-versus-runtime boundaries are **Review required**.
+See spec/06 §§6.3.1, 6.3.3, 6.5.1, 6.8.2, 6.8.5 and spec/05 §5.16.2.
+
+- **Review required:** Challenge driver/body-checker gate parity for only
+  `(Lit::Byte, Lit::Int)` at root and one nested-call level, while retaining
+  the IR-980 eligible-path/integer-literal form. Verify both shift operators
+  and `0`, `4294967295`, `-1`, and `4294967296`. Check the exact `U32` RHS
+  fact, `Byte` shift and call facts for in-range counts, full signed literal
+  diagnostic spans, taint and suppression for out-of-range counts, and
+  absence of a separate Byte-literal fact. Confirm that `U32::MAX` does not
+  produce static `ShiftOverflow`. Reject integer-literal and computed LHSs,
+  Byte-literal or other non-integer RHSs, computed operands, deeper calls,
+  generic targets, and unsupported signatures. Confirm Stage 0 remains gated
+  and make no lowering/runtime claim.
+- **Planned verification matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` with
+  generated root and one-level nested `<<` and `>>` forms for all four
+  boundaries, exact literal/operator/call facts, and full out-of-range spans.
+  Retain and verify unsupported-shape cases. Add a separate CLI Stage 0
+  fixture for accepted Byte-literal-left/integer-literal-right forms.
+  Run only the pinned focused driver and CLI filters, formatting, and diff
+  checks; obtain an independent hostile review before committing.
+- **Verification:** With pinned Rust 1.99.1, the focused
+  `primitive_body_type_results_include_exact_direct_function_calls` driver
+  test passed (1 test). CLI filter
+  `binary_shift_byte_literal_lhs` passed (3 Stage 0 tests), covering the new
+  literal-RHS fixture, existing path-RHS fixture, and excluded shapes. The
+  broader `binary_shift_` CLI filter passed (6 Stage 0 tests), retaining
+  IR-980 path and literal-count gate coverage. Pinned `cargo fmt --all
+  -- --check` and `git diff --check` passed.
+- **Hostile review:** Independent read-only hostile review found no actionable
+  findings. It confirmed only the intended Byte-literal/integer-literal pair
+  was added, prior path forms and exclusions remain consistent, the fact,
+  range, and recovery assertions match the contract, and Stage 0 remains
+  gated.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
