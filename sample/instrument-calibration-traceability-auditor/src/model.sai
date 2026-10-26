@@ -1,0 +1,114 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CalibrationResult {
+    Pass
+    Fail
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum AuditStatus {
+    Ready
+    DueSoon
+    Hold
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum AuditIssue {
+    NoCalibration
+    FutureCalibrationOnly
+    DuplicateInstrumentId
+    DuplicateStandardId
+    DuplicateCalibrationId
+    UnknownInstrument
+    UnknownStandard
+    CalibrationFailed
+    CertificateExpired
+    CalibrationOverdue
+    CalibrationWindowOverflow
+    CalibrationScopeTooNarrow
+    ReferenceCycleOrChainTooDeep
+    ReferenceNotAccredited
+    ReferenceRevoked
+    ReferenceInvalidAtCalibration
+    ReferenceRangeTooNarrow
+    UncertaintyOverflow
+    UncertaintyExceeded
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CatalogEntityKind {
+    Instrument
+    ReferenceStandard
+    Calibration
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Instrument {
+    pub id: U32
+    pub name: Str
+    pub range_min: I32
+    pub range_max: I32
+    pub maximum_uncertainty_milli: U32
+    pub calibration_interval_minutes: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReferenceStandard {
+    pub id: U32
+    pub name: Str
+    pub parent_id: Option<U32>
+    pub valid_from_minute: U32
+    pub valid_until_minute: U32
+    pub range_min: I32
+    pub range_max: I32
+    pub uncertainty_milli: U32
+    pub accredited: Bool
+    pub revoked_at_minute: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CalibrationRecord {
+    pub id: U32
+    pub instrument_id: U32
+    pub standard_id: U32
+    pub performed_minute: U32
+    pub certificate_valid_until_minute: U32
+    pub scope_min: I32
+    pub scope_max: I32
+    pub measured_uncertainty_milli: U32
+    pub result: CalibrationResult
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditPolicy {
+    pub now_minute: U32
+    pub due_soon_window_minutes: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CatalogIssue {
+    pub entity_kind: CatalogEntityKind
+    pub entity_id: U32
+    pub issue: AuditIssue
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Finding {
+    pub instrument_id: U32
+    pub instrument_name: Str
+    pub status: AuditStatus
+    pub calibration_id: Option<U32>
+    pub combined_uncertainty_milli: Option<U32>
+    pub minutes_until_due: Option<U32>
+    pub issue: Option<AuditIssue>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditReport {
+    pub findings: Array<Option<Finding>, 6>
+    pub finding_count: USize
+    pub catalog_issues: Array<Option<CatalogIssue>, 64>
+    pub catalog_issue_count: USize
+    pub ready_count: U32
+    pub due_soon_count: U32
+    pub hold_count: U32
+}

@@ -1,0 +1,426 @@
+use acme:instrument-calibration-traceability-auditor/model.{
+    AuditIssue
+    AuditPolicy
+    AuditReport
+    AuditStatus
+    CalibrationRecord
+    CalibrationResult
+    CatalogEntityKind
+    CatalogIssue
+    Finding
+    Instrument
+    ReferenceStandard
+}
+use acme:instrument-calibration-traceability-auditor/registry.{
+    calibration_id_is_duplicated
+    has_future_calibration
+    instrument_index
+    latest_calibration
+    standard_index
+}
+use acme:instrument-calibration-traceability-auditor/traceability.{reference_chain_uncertainty}
+use sai:core/num.{U32_MAX}
+
+fn held(
+    instrument: Instrument,
+    calibration_id: Option<U32>,
+    combined_uncertainty_milli: Option<U32>,
+    minutes_until_due: Option<U32>,
+    issue: AuditIssue,
+) -> Finding {
+    Finding(
+        instrument_id: instrument.id,
+        instrument_name: instrument.name,
+        status: AuditStatus.Hold,
+        calibration_id: calibration_id,
+        combined_uncertainty_milli: combined_uncertainty_milli,
+        minutes_until_due: minutes_until_due,
+        issue: Some(issue),
+    )
+}
+
+fn no_calibration_issue(
+    calibrations: Array<CalibrationRecord, 6>,
+    instrument_id: U32,
+    now_minute: U32,
+) -> AuditIssue {
+    if has_future_calibration(calibrations, instrument_id, now_minute) {
+        AuditIssue.FutureCalibrationOnly
+    } else {
+        AuditIssue.NoCalibration
+    }
+}
+
+fn assess_instrument(
+    instruments: Array<Instrument, 6>,
+    standards: Array<ReferenceStandard, 5>,
+    calibrations: Array<CalibrationRecord, 6>,
+    policy: AuditPolicy,
+    instrument: Instrument,
+) -> Finding {
+    match instrument_index(instruments, instrument.id) {
+        Err(issue) => return held(instrument, None, None, None, issue)
+        Ok(_) => {}
+    }
+
+    let calibration = match latest_calibration(calibrations, instrument.id, policy.now_minute) {
+        Some(value) => value
+        None => {
+            return held(
+                instrument,
+                None,
+                None,
+                None,
+                no_calibration_issue(calibrations, instrument.id, policy.now_minute),
+            )
+        }
+    }
+
+    if calibration_id_is_duplicated(calibrations, calibration.id) {
+        return held(instrument, Some(calibration.id), None, None, AuditIssue.DuplicateCalibrationId)
+    }
+    if calibration.result == CalibrationResult.Fail {
+        return held(instrument, Some(calibration.id), None, None, AuditIssue.CalibrationFailed)
+    }
+    if policy.now_minute > calibration.certificate_valid_until_minute {
+        return held(instrument, Some(calibration.id), None, None, AuditIssue.CertificateExpired)
+    }
+    if (
+        calibration.scope_min > instrument.range_min or calibration.scope_max < instrument.range_max
+    ) {
+        return held(
+            instrument,
+            Some(calibration.id),
+            None,
+            None,
+            AuditIssue.CalibrationScopeTooNarrow,
+        )
+    }
+    if instrument.calibration_interval_minutes > U32_MAX - calibration.performed_minute {
+        return held(
+            instrument,
+            Some(calibration.id),
+            None,
+            None,
+            AuditIssue.CalibrationWindowOverflow,
+        )
+    }
+    let due_minute = calibration.performed_minute + instrument.calibration_interval_minutes
+    if policy.now_minute > due_minute {
+        return held(instrument, Some(calibration.id), None, None, AuditIssue.CalibrationOverdue)
+    }
+
+    let chain_uncertainty = match reference_chain_uncertainty(
+        standards,
+        policy.now_minute,
+        calibration.performed_minute,
+        instrument,
+        calibration.standard_id,
+    ) {
+        Ok(value) => value
+        Err(issue) => return held(instrument, Some(calibration.id), None, None, issue)
+    }
+    if calibration.measured_uncertainty_milli > U32_MAX - chain_uncertainty {
+        return held(instrument, Some(calibration.id), None, None, AuditIssue.UncertaintyOverflow)
+    }
+    let combined_uncertainty = calibration.measured_uncertainty_milli + chain_uncertainty
+    if combined_uncertainty > instrument.maximum_uncertainty_milli {
+        return held(
+            instrument,
+            Some(calibration.id),
+            Some(combined_uncertainty),
+            None,
+            AuditIssue.UncertaintyExceeded,
+        )
+    }
+
+    let minutes_until_due = due_minute - policy.now_minute
+    let status = if minutes_until_due <= policy.due_soon_window_minutes {
+        AuditStatus.DueSoon
+    } else {
+        AuditStatus.Ready
+    }
+    Finding(
+        instrument_id: instrument.id,
+        instrument_name: instrument.name,
+        status: status,
+        calibration_id: Some(calibration.id),
+        combined_uncertainty_milli: Some(combined_uncertainty),
+        minutes_until_due: Some(minutes_until_due),
+        issue: None,
+    )
+}
+
+fn instrument_id_is_duplicated(instruments: Array<Instrument, 6>, instrument_id: U32) -> Bool {
+    match instrument_index(instruments, instrument_id) {
+        Err(AuditIssue.DuplicateInstrumentId) => true
+        _ => false
+    }
+}
+
+fn standard_id_is_duplicated(standards: Array<ReferenceStandard, 5>, standard_id: U32) -> Bool {
+    match standard_index(standards, standard_id) {
+        Err(AuditIssue.DuplicateStandardId) => true
+        _ => false
+    }
+}
+
+fn instrument_id_exists(instruments: Array<Instrument, 6>, instrument_id: U32) -> Bool {
+    for index in 0..instruments.len() {
+        if instruments[index].id == instrument_id {
+            return true
+        }
+    }
+    false
+}
+
+fn standard_id_exists(standards: Array<ReferenceStandard, 5>, standard_id: U32) -> Bool {
+    for index in 0..standards.len() {
+        if standards[index].id == standard_id {
+            return true
+        }
+    }
+    false
+}
+
+fn calibration_id_is_duplicated_in(
+    calibrations: Array<CalibrationRecord, 6>,
+    calibration_id: U32,
+) -> Bool {
+    var matches: USize = 0
+    for index in 0..calibrations.len() {
+        if calibrations[index].id == calibration_id {
+            matches += 1
+        }
+    }
+    matches > 1
+}
+
+fn catalog_issues(
+    instruments: Array<Instrument, 6>,
+    standards: Array<ReferenceStandard, 5>,
+    calibrations: Array<CalibrationRecord, 6>,
+) -> (Array<Option<CatalogIssue>, 64>, USize) {
+    var issues = Array<Option<CatalogIssue>, 64>.filled(None)
+    var issue_count: USize = 0
+
+    for index in 0..instruments.len() {
+        let instrument = instruments[index]
+        if instrument_id_is_duplicated(instruments, instrument.id) {
+            issues[issue_count] = Some(
+                CatalogIssue(
+                    entity_kind: CatalogEntityKind.Instrument,
+                    entity_id: instrument.id,
+                    issue: AuditIssue.DuplicateInstrumentId,
+                ),
+            )
+            issue_count += 1
+        }
+    }
+    for index in 0..standards.len() {
+        let standard = standards[index]
+        if standard_id_is_duplicated(standards, standard.id) {
+            issues[issue_count] = Some(
+                CatalogIssue(
+                    entity_kind: CatalogEntityKind.ReferenceStandard,
+                    entity_id: standard.id,
+                    issue: AuditIssue.DuplicateStandardId,
+                ),
+            )
+            issue_count += 1
+        }
+    }
+    for index in 0..calibrations.len() {
+        let calibration = calibrations[index]
+        if calibration_id_is_duplicated_in(calibrations, calibration.id) {
+            issues[issue_count] = Some(
+                CatalogIssue(
+                    entity_kind: CatalogEntityKind.Calibration,
+                    entity_id: calibration.id,
+                    issue: AuditIssue.DuplicateCalibrationId,
+                ),
+            )
+            issue_count += 1
+        }
+        if not instrument_id_exists(instruments, calibration.instrument_id) {
+            issues[issue_count] = Some(
+                CatalogIssue(
+                    entity_kind: CatalogEntityKind.Calibration,
+                    entity_id: calibration.id,
+                    issue: AuditIssue.UnknownInstrument,
+                ),
+            )
+            issue_count += 1
+        }
+        if not standard_id_exists(standards, calibration.standard_id) {
+            issues[issue_count] = Some(
+                CatalogIssue(
+                    entity_kind: CatalogEntityKind.Calibration,
+                    entity_id: calibration.id,
+                    issue: AuditIssue.UnknownStandard,
+                ),
+            )
+            issue_count += 1
+        }
+    }
+    (issues, issue_count)
+}
+
+pub fn audit_all(
+    instruments: Array<Instrument, 6>,
+    standards: Array<ReferenceStandard, 5>,
+    calibrations: Array<CalibrationRecord, 6>,
+    policy: AuditPolicy,
+) -> AuditReport {
+    var findings = Array<Option<Finding>, 6>.filled(None)
+    let (catalog_issue_entries, catalog_issue_count) =
+        catalog_issues(instruments, standards, calibrations)
+    var ready_count: U32 = 0
+    var due_soon_count: U32 = 0
+    var hold_count: U32 = 0
+
+    for index in 0..instruments.len() {
+        let finding =
+            assess_instrument(instruments, standards, calibrations, policy, instruments[index])
+        findings[index] = Some(finding)
+        match finding.status {
+            AuditStatus.Ready => {
+                ready_count += 1
+            }
+            AuditStatus.DueSoon => {
+                due_soon_count += 1
+            }
+            AuditStatus.Hold => {
+                hold_count += 1
+            }
+        }
+    }
+
+    AuditReport(
+        findings: findings,
+        finding_count: instruments.len(),
+        catalog_issues: catalog_issue_entries,
+        catalog_issue_count: catalog_issue_count,
+        ready_count: ready_count,
+        due_soon_count: due_soon_count,
+        hold_count: hold_count,
+    )
+}
+
+test "the fixture separates ready, due-soon, and held instruments" {
+    let report = audit_all(data.instruments(), data.standards(), data.calibrations(), data.policy())
+    assert report.finding_count == 6
+    assert report.ready_count == 2
+    assert report.due_soon_count == 1
+    assert report.hold_count == 3
+    assert report.catalog_issue_count == 0
+}
+
+test "scope and combined uncertainty are checked over the entire instrument range" {
+    let report = audit_all(data.instruments(), data.standards(), data.calibrations(), data.policy())
+    assert report.findings[2].unwrap().combined_uncertainty_milli == Some(2)
+    assert report.findings[3].unwrap().combined_uncertainty_milli == Some(8)
+    assert report.findings[3].unwrap().issue == Some(AuditIssue.UncertaintyExceeded)
+
+    var calibrations = data.calibrations()
+    calibrations[0].scope_max = 59999
+    let narrow = assess_instrument(
+        data.instruments(),
+        data.standards(),
+        calibrations,
+        data.policy(),
+        data.instruments()[0],
+    )
+    assert narrow.issue == Some(AuditIssue.CalibrationScopeTooNarrow)
+}
+
+test "a reference chain adds conservative uncertainty bounds and rejects revoked nodes" {
+    let amount = reference_chain_uncertainty(
+        data.standards(),
+        data.policy().now_minute,
+        data.calibrations()[2].performed_minute,
+        data.instruments()[2],
+        1002,
+    )
+    assert amount == Ok(2)
+
+    let report = audit_all(data.instruments(), data.standards(), data.calibrations(), data.policy())
+    assert report.findings[4].unwrap().issue == Some(AuditIssue.ReferenceRevoked)
+}
+
+test "the newest failed calibration prevents a stale passing record from being selected" {
+    var calibrations = data.calibrations()
+    calibrations[5] = CalibrationRecord(
+        id: 2007,
+        instrument_id: 101,
+        standard_id: 1000,
+        performed_minute: 1390,
+        certificate_valid_until_minute: 1700,
+        scope_min: 0,
+        scope_max: 60000,
+        measured_uncertainty_milli: 1,
+        result: CalibrationResult.Fail,
+    )
+    let finding = assess_instrument(
+        data.instruments(),
+        data.standards(),
+        calibrations,
+        data.policy(),
+        data.instruments()[0],
+    )
+    assert finding.calibration_id == Some(2007)
+    assert finding.issue == Some(AuditIssue.CalibrationFailed)
+}
+
+test "the due-soon threshold includes its exact boundary and overdue is strict" {
+    let report = audit_all(data.instruments(), data.standards(), data.calibrations(), data.policy())
+    assert report.findings[5].unwrap().status == AuditStatus.DueSoon
+    assert report.findings[5].unwrap().minutes_until_due == Some(120)
+
+    var calibrations = data.calibrations()
+    calibrations[5].performed_minute = 1250
+    let due_now = assess_instrument(
+        data.instruments(),
+        data.standards(),
+        calibrations,
+        data.policy(),
+        data.instruments()[5],
+    )
+    assert due_now.status == AuditStatus.DueSoon
+    assert due_now.minutes_until_due == Some(0)
+    calibrations[5].performed_minute = 1249
+    let overdue = assess_instrument(
+        data.instruments(),
+        data.standards(),
+        calibrations,
+        data.policy(),
+        data.instruments()[5],
+    )
+    assert overdue.issue == Some(AuditIssue.CalibrationOverdue)
+}
+
+test "cycles and duplicate standard identities fail closed" {
+    var standards = data.standards()
+    standards[0].parent_id = Some(1002)
+    let cycle = reference_chain_uncertainty(
+        standards,
+        data.policy().now_minute,
+        data.calibrations()[2].performed_minute,
+        data.instruments()[2],
+        1002,
+    )
+    assert cycle == Err(AuditIssue.ReferenceCycleOrChainTooDeep)
+
+    standards = data.standards()
+    standards[1].id = 1000
+    let ambiguous = reference_chain_uncertainty(
+        standards,
+        data.policy().now_minute,
+        data.calibrations()[1].performed_minute,
+        data.instruments()[1],
+        1000,
+    )
+    assert ambiguous == Err(AuditIssue.DuplicateStandardId)
+    let report = audit_all(data.instruments(), standards, data.calibrations(), data.policy())
+    assert report.catalog_issue_count == 2
+}

@@ -1,0 +1,97 @@
+use acme:instrument-calibration-traceability-auditor/model.{
+    AuditIssue
+    CalibrationRecord
+    Instrument
+    ReferenceStandard
+}
+
+pub fn instrument_index(instruments: Array<Instrument, 6>, instrument_id: U32) -> Result<
+    USize,
+    AuditIssue,
+> {
+    var found: Option<USize> = None
+    for index in 0..instruments.len() {
+        if instruments[index].id == instrument_id {
+            match found {
+                Some(_) => return Err(AuditIssue.DuplicateInstrumentId)
+                None => {
+                    found = Some(index)
+                }
+            }
+        }
+    }
+    match found { Some(index) => Ok(index), None => Err(AuditIssue.UnknownInstrument) }
+}
+
+pub fn standard_index(standards: Array<ReferenceStandard, 5>, standard_id: U32) -> Result<
+    USize,
+    AuditIssue,
+> {
+    var found: Option<USize> = None
+    for index in 0..standards.len() {
+        if standards[index].id == standard_id {
+            match found {
+                Some(_) => return Err(AuditIssue.DuplicateStandardId)
+                None => {
+                    found = Some(index)
+                }
+            }
+        }
+    }
+    match found { Some(index) => Ok(index), None => Err(AuditIssue.UnknownStandard) }
+}
+
+fn preferred_calibration(candidate: CalibrationRecord, current: CalibrationRecord) -> Bool {
+    (
+        candidate.performed_minute > current.performed_minute
+        or (candidate.performed_minute == current.performed_minute and candidate.id < current.id)
+    )
+}
+
+pub fn latest_calibration(
+    calibrations: Array<CalibrationRecord, 6>,
+    instrument_id: U32,
+    now_minute: U32,
+) -> Option<CalibrationRecord> {
+    var selected: Option<CalibrationRecord> = None
+    for index in 0..calibrations.len() {
+        let candidate = calibrations[index]
+        if candidate.instrument_id == instrument_id and candidate.performed_minute <= now_minute {
+            let is_better = match selected {
+                Some(current) => preferred_calibration(candidate, current)
+                None => true
+            }
+            if is_better {
+                selected = Some(candidate)
+            }
+        }
+    }
+    selected
+}
+
+pub fn has_future_calibration(
+    calibrations: Array<CalibrationRecord, 6>,
+    instrument_id: U32,
+    now_minute: U32,
+) -> Bool {
+    for index in 0..calibrations.len() {
+        let candidate = calibrations[index]
+        if candidate.instrument_id == instrument_id and candidate.performed_minute > now_minute {
+            return true
+        }
+    }
+    false
+}
+
+pub fn calibration_id_is_duplicated(
+    calibrations: Array<CalibrationRecord, 6>,
+    calibration_id: U32,
+) -> Bool {
+    var matches: USize = 0
+    for index in 0..calibrations.len() {
+        if calibrations[index].id == calibration_id {
+            matches += 1
+        }
+    }
+    matches > 1
+}

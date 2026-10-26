@@ -1,0 +1,200 @@
+use acme:instrument-calibration-traceability-auditor/model.{
+    AuditPolicy
+    CalibrationRecord
+    CalibrationResult
+    Instrument
+    ReferenceStandard
+}
+
+pub fn policy() -> AuditPolicy {
+    AuditPolicy(now_minute: 1400, due_soon_window_minutes: 120)
+}
+
+pub fn instruments() -> Array<Instrument, 6> {
+    [
+        Instrument(
+            id: 101,
+            name: "Optical comparator",
+            range_min: 0,
+            range_max: 60000,
+            maximum_uncertainty_milli: 8,
+            calibration_interval_minutes: 900,
+        ),
+        Instrument(
+            id: 102,
+            name: "Hydraulic pressure cell",
+            range_min: 100,
+            range_max: 300000,
+            maximum_uncertainty_milli: 10,
+            calibration_interval_minutes: 600,
+        ),
+        Instrument(
+            id: 103,
+            name: "Bench balance",
+            range_min: 0,
+            range_max: 20000,
+            maximum_uncertainty_milli: 6,
+            calibration_interval_minutes: 800,
+        ),
+        Instrument(
+            id: 104,
+            name: "Thermal chamber",
+            range_min: -40000,
+            range_max: 180000,
+            maximum_uncertainty_milli: 6,
+            calibration_interval_minutes: 900,
+        ),
+        Instrument(
+            id: 105,
+            name: "Flow meter",
+            range_min: 0,
+            range_max: 1000000,
+            maximum_uncertainty_milli: 5,
+            calibration_interval_minutes: 700,
+        ),
+        Instrument(
+            id: 106,
+            name: "Reference laser",
+            range_min: 0,
+            range_max: 200000,
+            maximum_uncertainty_milli: 6,
+            calibration_interval_minutes: 150,
+        ),
+    ]
+}
+
+pub fn standards() -> Array<ReferenceStandard, 5> {
+    [
+        ReferenceStandard(
+            id: 1000,
+            name: "Laboratory master",
+            parent_id: None,
+            valid_from_minute: 0,
+            valid_until_minute: 2000,
+            range_min: -50000,
+            range_max: 1500000,
+            uncertainty_milli: 1,
+            accredited: true,
+            revoked_at_minute: None,
+        ),
+        ReferenceStandard(
+            id: 1001,
+            name: "Pressure transfer standard",
+            parent_id: Some(1000),
+            valid_from_minute: 300,
+            valid_until_minute: 1800,
+            range_min: 0,
+            range_max: 500000,
+            uncertainty_milli: 2,
+            accredited: true,
+            revoked_at_minute: None,
+        ),
+        ReferenceStandard(
+            id: 1002,
+            name: "Mass transfer standard",
+            parent_id: Some(1000),
+            valid_from_minute: 300,
+            valid_until_minute: 1800,
+            range_min: 0,
+            range_max: 50000,
+            uncertainty_milli: 1,
+            accredited: true,
+            revoked_at_minute: None,
+        ),
+        ReferenceStandard(
+            id: 1003,
+            name: "Thermal probe reference",
+            parent_id: Some(1000),
+            valid_from_minute: 500,
+            valid_until_minute: 1800,
+            range_min: -50000,
+            range_max: 200000,
+            uncertainty_milli: 3,
+            accredited: true,
+            revoked_at_minute: None,
+        ),
+        ReferenceStandard(
+            id: 1004,
+            name: "Flow reference under recall",
+            parent_id: Some(1000),
+            valid_from_minute: 800,
+            valid_until_minute: 1800,
+            range_min: 0,
+            range_max: 1200000,
+            uncertainty_milli: 1,
+            accredited: true,
+            revoked_at_minute: Some(1350),
+        ),
+    ]
+}
+
+pub fn calibrations() -> Array<CalibrationRecord, 6> {
+    [
+        CalibrationRecord(
+            id: 2001,
+            instrument_id: 101,
+            standard_id: 1000,
+            performed_minute: 650,
+            certificate_valid_until_minute: 1800,
+            scope_min: 0,
+            scope_max: 60000,
+            measured_uncertainty_milli: 2,
+            result: CalibrationResult.Pass,
+        ),
+        CalibrationRecord(
+            id: 2002,
+            instrument_id: 102,
+            standard_id: 1001,
+            performed_minute: 500,
+            certificate_valid_until_minute: 1600,
+            scope_min: 100,
+            scope_max: 300000,
+            measured_uncertainty_milli: 1,
+            result: CalibrationResult.Pass,
+        ),
+        CalibrationRecord(
+            id: 2003,
+            instrument_id: 103,
+            standard_id: 1002,
+            performed_minute: 1250,
+            certificate_valid_until_minute: 1700,
+            scope_min: 0,
+            scope_max: 20000,
+            measured_uncertainty_milli: 1,
+            result: CalibrationResult.Pass,
+        ),
+        CalibrationRecord(
+            id: 2004,
+            instrument_id: 104,
+            standard_id: 1003,
+            performed_minute: 1300,
+            certificate_valid_until_minute: 1700,
+            scope_min: -40000,
+            scope_max: 180000,
+            measured_uncertainty_milli: 4,
+            result: CalibrationResult.Pass,
+        ),
+        CalibrationRecord(
+            id: 2005,
+            instrument_id: 105,
+            standard_id: 1004,
+            performed_minute: 1390,
+            certificate_valid_until_minute: 1800,
+            scope_min: 0,
+            scope_max: 1000000,
+            measured_uncertainty_milli: 1,
+            result: CalibrationResult.Pass,
+        ),
+        CalibrationRecord(
+            id: 2006,
+            instrument_id: 106,
+            standard_id: 1000,
+            performed_minute: 1370,
+            certificate_valid_until_minute: 1750,
+            scope_min: 0,
+            scope_max: 200000,
+            measured_uncertainty_milli: 3,
+            result: CalibrationResult.Pass,
+        ),
+    ]
+}
