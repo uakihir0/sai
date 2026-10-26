@@ -1,0 +1,21 @@
+use acme:community-radio-rundown/report
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_rundown(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if args[1].as_str() == "rundown" {
+        report.print_rundown(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: community-radio-rundown [rundown]\n")
+    process.ExitCode.failure()
+}

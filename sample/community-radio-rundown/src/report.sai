@@ -1,0 +1,36 @@
+use acme:community-radio-rundown/audit
+use acme:community-radio-rundown/clock
+use acme:community-radio-rundown/model.{Kind}
+use acme:community-radio-rundown/planner
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+pub fn print_rundown(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = planner.build()
+    out.write_str("30-minute community radio rundown\n")
+    for index in 0..plan.len {
+        let entry = plan.entries[index].unwrap()
+        let label = if entry.segment.kind == Kind.Break {
+            "break"
+        } else {
+            "segment"
+        }
+        out.write_str(
+            f"minute {entry.start_minute}-{entry.end_minute}: {label} — {entry.segment.title}\n".as_str(),
+        )
+    }
+    if plan.skipped_optional > 0 {
+        out.write_str(
+            f"{plan.skipped_optional} optional segment held for another episode\n".as_str(),
+        )
+    }
+    if audit.is_valid(plan) {
+        out.write_str(
+            f"ends at minute {plan.total_minutes}; the {clock.SHOW_MINUTES}-minute timing checks pass\n".as_str(),
+        )
+    } else {
+        out.write_str("timing review required: the rundown violates a clock rule\n")
+    }
+}
