@@ -1,0 +1,170 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Analyte {
+    EColi
+    Turbidity
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum MeasurementSource {
+    Sensor
+    Laboratory
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum QualityFlag {
+    Accepted
+    Suspect
+    CalibrationExpired
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum QualityIssue {
+    UnknownSite
+    MissingThreshold
+    SourceFlagged
+    ReceivedBeforeCollection
+    DeliveryTooLate
+    SequenceRegression
+    TimestampRegression
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum FindingState {
+    Clear
+    Watch
+    Confirmed
+    Critical
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ZoneState {
+    Clear
+    Watch
+    AdvisoryActive
+    Critical
+    RecoveryReview
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum NextAction {
+    NoAction
+    CollectConfirmatoryLab
+    IssueOrMaintainAdvisory
+    DispatchAlternateSupply
+    ContactHealthAuthority
+    ReviewRecoveryBeforeLifting
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Site {
+    pub id: U32
+    pub name: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Threshold {
+    pub site_id: U32
+    pub analyte: Analyte
+    pub warning_limit_milli: U32
+    pub critical_limit_milli: U32
+    pub recovery_limit_milli: U32
+    pub confirmation_window_minutes: U32
+    pub recovery_separation_minutes: U32
+    pub maximum_delivery_delay_minutes: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Measurement {
+    pub id: U32
+    pub site_id: U32
+    pub analyte: Analyte
+    pub source: MeasurementSource
+    pub collected_minute: U32
+    pub received_minute: U32
+    pub sequence: U32
+    pub value_milli: U32
+    pub quality: QualityFlag
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Exposure {
+    pub site_id: U32
+    pub zone_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Advisory {
+    pub site_id: U32
+    pub analyte: Analyte
+    pub zone_id: U32
+    pub issued_minute: U32
+    pub active: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ZoneSupply {
+    pub zone_id: U32
+    pub zone_name: Str
+    pub demand_liters: U32
+    pub daily_delivery_capacity_liters: U32
+    pub committed_liters: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Scenario {
+    pub sites: Array<Site, 4>
+    pub thresholds: Array<Threshold, 5>
+    pub measurements: Array<Measurement, 14>
+    pub exposures: Array<Exposure, 5>
+    pub advisories: Array<Advisory, 1>
+    pub supplies: Array<ZoneSupply, 5>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Finding {
+    pub site_id: U32
+    pub site_name: Str
+    pub analyte: Analyte
+    pub state: FindingState
+    pub warning_limit_milli: U32
+    pub critical_limit_milli: U32
+    pub recovery_limit_milli: U32
+    pub confirmation_window_minutes: U32
+    pub recovery_separation_minutes: U32
+    pub sensor_sample_id: Option<U32>
+    pub sensor_value_milli: Option<U32>
+    pub sensor_minute: Option<U32>
+    pub laboratory_sample_id: Option<U32>
+    pub laboratory_value_milli: Option<U32>
+    pub laboratory_minute: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ZoneDecision {
+    pub zone_id: U32
+    pub zone_name: Str
+    pub state: ZoneState
+    pub active_advisory: Bool
+    pub recovery_evidence_ready: Bool
+    pub affected_finding_count: U32
+    pub demand_liters: U32
+    pub delivery_capacity_liters: U32
+    pub committed_liters: U32
+    pub available_liters: U32
+    pub shortfall_liters: U32
+    pub next_action: NextAction
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Assessment {
+    pub findings: Array<Finding, 5>
+    pub decisions: Array<ZoneDecision, 5>
+    pub accepted_measurement_count: U32
+    pub rejected_measurement_count: U32
+    pub clear_finding_count: U32
+    pub watch_finding_count: U32
+    pub confirmed_finding_count: U32
+    pub critical_finding_count: U32
+    pub recovery_review_count: U32
+    pub shortfall_zone_count: U32
+}

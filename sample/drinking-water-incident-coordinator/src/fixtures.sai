@@ -1,0 +1,18 @@
+use acme:drinking-water-incident-coordinator/fixture_advisories
+use acme:drinking-water-incident-coordinator/fixture_exposures
+use acme:drinking-water-incident-coordinator/fixture_measurements
+use acme:drinking-water-incident-coordinator/fixture_sites
+use acme:drinking-water-incident-coordinator/fixture_supplies
+use acme:drinking-water-incident-coordinator/fixture_thresholds
+use acme:drinking-water-incident-coordinator/model.{Scenario}
+
+pub fn incident_window() -> Scenario {
+    Scenario(
+        sites: fixture_sites.sites(),
+        thresholds: fixture_thresholds.thresholds(),
+        measurements: fixture_measurements.measurements(),
+        exposures: fixture_exposures.exposures(),
+        advisories: fixture_advisories.advisories(),
+        supplies: fixture_supplies.supplies(),
+    )
+}

@@ -1,0 +1,80 @@
+use acme:drinking-water-incident-coordinator/detection
+use acme:drinking-water-incident-coordinator/fixtures
+use acme:drinking-water-incident-coordinator/model.{
+    Assessment
+    FindingState
+    NextAction
+    QualityIssue
+    ZoneState
+}
+use acme:drinking-water-incident-coordinator/quality
+use acme:drinking-water-incident-coordinator/response
+
+pub fn assess_fixture() -> Assessment {
+    response.assess(fixtures.incident_window())
+}
+
+test "qualified sensor and laboratory evidence confirms intake turbidity" {
+    let snapshot = fixtures.incident_window()
+    let report = response.assess(snapshot)
+    assert report.findings[0].state == FindingState.Confirmed
+    assert report.findings[0].sensor_sample_id == Some(1001)
+    assert report.findings[0].laboratory_sample_id == Some(1010)
+    assert report.confirmed_finding_count == 1
+    assert report.findings[1].state == FindingState.Watch
+    assert report.findings[3].state == FindingState.Watch
+}
+
+test "late and regressing records are rejected before threshold evaluation" {
+    let snapshot = fixtures.incident_window()
+    assert quality.rejection_reason(snapshot, 11) == Some(QualityIssue.DeliveryTooLate)
+    assert quality.rejection_reason(snapshot, 12) == Some(QualityIssue.TimestampRegression)
+    assert quality.rejection_reason(snapshot, 13) == Some(QualityIssue.SequenceRegression)
+    assert report_count_is_stable()
+}
+
+pub fn report_count_is_stable() -> Bool {
+    let report = assess_fixture()
+    (
+        report.accepted_measurement_count == 11
+        and report.rejected_measurement_count == 3
+        and report.clear_finding_count == 1
+        and report.watch_finding_count == 2
+        and report.confirmed_finding_count == 1
+        and report.critical_finding_count == 1
+    )
+}
+
+test "critical threshold escalates and supply capacity is reported separately" {
+    let report = assess_fixture()
+    assert report.findings[4].state == FindingState.Critical
+    assert report.decisions[3].state == ZoneState.Critical
+    assert report.decisions[3].next_action == NextAction.ContactHealthAuthority
+    assert not report.decisions[3].active_advisory
+    assert report.decisions[3].shortfall_liters == 0
+}
+
+test "recovery needs two current safe sources and a human closure review" {
+    let report = assess_fixture()
+    assert report.findings[2].state == FindingState.Clear
+    assert report.decisions[2].state == ZoneState.RecoveryReview
+    assert report.decisions[2].active_advisory
+    assert report.decisions[2].recovery_evidence_ready
+    assert report.decisions[2].next_action == NextAction.ReviewRecoveryBeforeLifting
+}
+
+test "confirmed planning actions are separate from issued advisories" {
+    let report = assess_fixture()
+    assert report.decisions[0].state == ZoneState.AdvisoryActive
+    assert not report.decisions[0].active_advisory
+    assert report.decisions[0].next_action == NextAction.DispatchAlternateSupply
+    assert report.decisions[0].available_liters == 1500
+    assert report.decisions[0].shortfall_liters == 500
+    assert report.decisions[1].next_action == NextAction.IssueOrMaintainAdvisory
+    assert not report.decisions[1].active_advisory
+    assert report.decisions[4].state == ZoneState.Watch
+    assert not report.decisions[4].active_advisory
+    assert report.decisions[4].next_action == NextAction.CollectConfirmatoryLab
+    assert report.decisions[4].shortfall_liters == 500
+    assert report.shortfall_zone_count == 2
+}

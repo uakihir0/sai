@@ -1,0 +1,5 @@
+use acme:drinking-water-incident-coordinator/model.{Advisory, Analyte}
+
+pub fn advisories() -> Array<Advisory, 1> {
+    [Advisory(site_id: 102, analyte: Analyte.EColi, zone_id: 3, issued_minute: 515, active: true)]
+}

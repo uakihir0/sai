@@ -1,0 +1,41 @@
+use acme:drinking-water-incident-coordinator/model.{ZoneSupply}
+
+pub fn supplies() -> Array<ZoneSupply, 5> {
+    [
+        ZoneSupply(
+            zone_id: 1,
+            zone_name: "Northbank",
+            demand_liters: 2000,
+            daily_delivery_capacity_liters: 2000,
+            committed_liters: 500,
+        ),
+        ZoneSupply(
+            zone_id: 2,
+            zone_name: "Mill Ward",
+            demand_liters: 1200,
+            daily_delivery_capacity_liters: 1800,
+            committed_liters: 300,
+        ),
+        ZoneSupply(
+            zone_id: 3,
+            zone_name: "Cedar Heights",
+            demand_liters: 800,
+            daily_delivery_capacity_liters: 1500,
+            committed_liters: 600,
+        ),
+        ZoneSupply(
+            zone_id: 4,
+            zone_name: "Southbank",
+            demand_liters: 1500,
+            daily_delivery_capacity_liters: 2200,
+            committed_liters: 400,
+        ),
+        ZoneSupply(
+            zone_id: 5,
+            zone_name: "East Ward",
+            demand_liters: 600,
+            daily_delivery_capacity_liters: 1000,
+            committed_liters: 900,
+        ),
+    ]
+}

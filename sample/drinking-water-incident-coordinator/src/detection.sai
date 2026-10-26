@@ -1,0 +1,150 @@
+use acme:drinking-water-incident-coordinator/model.{
+    Analyte
+    Finding
+    FindingState
+    Measurement
+    MeasurementSource
+    Scenario
+    Threshold
+}
+use acme:drinking-water-incident-coordinator/quality
+
+pub fn site_name(snapshot: Scenario, site_id: U32) -> Str {
+    var index: USize = 0
+    while index < snapshot.sites.len() {
+        let site = snapshot.sites[index]
+        if site.id == site_id {
+            return site.name
+        }
+        index = index + 1
+    }
+    "Unknown site"
+}
+
+pub fn minute_distance(left: U32, right: U32) -> U32 {
+    if left >= right {
+        left - right
+    } else {
+        right - left
+    }
+}
+
+pub fn latest_qualified(
+    snapshot: Scenario,
+    threshold: Threshold,
+    source: MeasurementSource,
+) -> Option<Measurement> {
+    var selected: Option<Measurement> = None
+    var index: USize = 0
+    while index < snapshot.measurements.len() {
+        let measurement = snapshot.measurements[index]
+        if (
+            measurement.site_id == threshold.site_id
+            and measurement.analyte == threshold.analyte
+            and measurement.source == source
+            and quality.is_accepted(snapshot, index)
+        ) {
+            match selected {
+                Some(current) => {
+                    if (
+                        measurement.collected_minute > current.collected_minute
+                        or (
+                            measurement.collected_minute == current.collected_minute
+                            and measurement.sequence > current.sequence
+                        )
+                    ) {
+                        selected = Some(measurement)
+                    }
+                }
+                None => {
+                    selected = Some(measurement)
+                }
+            }
+        }
+        index = index + 1
+    }
+    selected
+}
+
+pub fn finding_for(snapshot: Scenario, threshold: Threshold) -> Finding {
+    let sensor = latest_qualified(snapshot, threshold, MeasurementSource.Sensor)
+    let lab = latest_qualified(snapshot, threshold, MeasurementSource.Laboratory)
+    var sensor_high = false
+    var lab_high = false
+    var critical = false
+
+    match sensor {
+        Some(measurement) => {
+            sensor_high = measurement.value_milli >= threshold.warning_limit_milli
+            critical = measurement.value_milli >= threshold.critical_limit_milli
+        }
+        None => {}
+    }
+    match lab {
+        Some(measurement) => {
+            lab_high = measurement.value_milli >= threshold.warning_limit_milli
+            critical = critical or measurement.value_milli >= threshold.critical_limit_milli
+        }
+        None => {}
+    }
+
+    var confirmed = false
+    if sensor_high and lab_high {
+        match (sensor, lab) {
+            (Some(sensor_measurement), Some(lab_measurement)) => {
+                confirmed = (
+                    minute_distance(
+                        sensor_measurement.collected_minute,
+                        lab_measurement.collected_minute,
+                    )
+                    <= threshold.confirmation_window_minutes
+                )
+            }
+            _ => {}
+        }
+    }
+
+    var state = FindingState.Clear
+    if critical {
+        state = FindingState.Critical
+    } else if confirmed {
+        state = FindingState.Confirmed
+    } else if sensor_high or lab_high {
+        state = FindingState.Watch
+    }
+
+    let sensor_id = match sensor { Some(value) => Some(value.id), None => None }
+    let sensor_value = match sensor { Some(value) => Some(value.value_milli), None => None }
+    let sensor_minute = match sensor { Some(value) => Some(value.collected_minute), None => None }
+    let lab_id = match lab { Some(value) => Some(value.id), None => None }
+    let lab_value = match lab { Some(value) => Some(value.value_milli), None => None }
+    let lab_minute = match lab { Some(value) => Some(value.collected_minute), None => None }
+
+    Finding(
+        site_id: threshold.site_id,
+        site_name: site_name(snapshot, threshold.site_id),
+        analyte: threshold.analyte,
+        state: state,
+        warning_limit_milli: threshold.warning_limit_milli,
+        critical_limit_milli: threshold.critical_limit_milli,
+        recovery_limit_milli: threshold.recovery_limit_milli,
+        confirmation_window_minutes: threshold.confirmation_window_minutes,
+        recovery_separation_minutes: threshold.recovery_separation_minutes,
+        sensor_sample_id: sensor_id,
+        sensor_value_milli: sensor_value,
+        sensor_minute: sensor_minute,
+        laboratory_sample_id: lab_id,
+        laboratory_value_milli: lab_value,
+        laboratory_minute: lab_minute,
+    )
+}
+
+pub fn findings(snapshot: Scenario) -> Array<Finding, 5> {
+    [
+        finding_for(snapshot, snapshot.thresholds[0]),
+        finding_for(snapshot, snapshot.thresholds[1]),
+        finding_for(snapshot, snapshot.thresholds[2]),
+        finding_for(snapshot, snapshot.thresholds[3]),
+        finding_for(snapshot, snapshot.thresholds[4]),
+    ]
+}

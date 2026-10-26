@@ -1,0 +1,10 @@
+use acme:drinking-water-incident-coordinator/model.{Site}
+
+pub fn sites() -> Array<Site, 4> {
+    [
+        Site(id: 101, name: "North intake"),
+        Site(id: 102, name: "Cedar reservoir"),
+        Site(id: 103, name: "East distribution point"),
+        Site(id: 104, name: "South treatment outlet"),
+    ]
+}

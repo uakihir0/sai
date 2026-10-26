@@ -1,0 +1,228 @@
+use acme:drinking-water-incident-coordinator/detection
+use acme:drinking-water-incident-coordinator/model.{
+    Advisory
+    Assessment
+    Finding
+    FindingState
+    NextAction
+    Scenario
+    ZoneDecision
+    ZoneState
+    ZoneSupply
+}
+use acme:drinking-water-incident-coordinator/quality
+
+pub fn recovery_evidence_ready(finding: Finding, issued_minute: U32) -> Bool {
+    if finding.state != FindingState.Clear {
+        return false
+    }
+    match (
+        finding.sensor_value_milli,
+        finding.sensor_minute,
+        finding.laboratory_value_milli,
+        finding.laboratory_minute,
+    ) {
+        (Some(sensor_value), Some(sensor_minute), Some(lab_value), Some(lab_minute)) => {
+            if (
+                sensor_value > finding.recovery_limit_milli
+                or lab_value > finding.recovery_limit_milli
+                or sensor_minute <= issued_minute
+                or lab_minute <= issued_minute
+            ) {
+                return false
+            }
+            (
+                detection.minute_distance(sensor_minute, lab_minute)
+                >= finding.recovery_separation_minutes
+            )
+        }
+        _ => false
+    }
+}
+
+pub fn finding_is_exposed_to_zone(snapshot: Scenario, finding: Finding, zone_id: U32) -> Bool {
+    var index: USize = 0
+    while index < snapshot.exposures.len() {
+        let exposure = snapshot.exposures[index]
+        if exposure.site_id == finding.site_id and exposure.zone_id == zone_id {
+            return true
+        }
+        index = index + 1
+    }
+    false
+}
+
+pub fn active_advisory_for(snapshot: Scenario, zone_id: U32, finding: Finding) -> Option<Advisory> {
+    var index: USize = 0
+    while index < snapshot.advisories.len() {
+        let advisory = snapshot.advisories[index]
+        if (
+            advisory.zone_id == zone_id
+            and advisory.site_id == finding.site_id
+            and advisory.analyte == finding.analyte
+            and advisory.active
+        ) {
+            return Some(advisory)
+        }
+        index = index + 1
+    }
+    None
+}
+
+pub fn remaining_delivery_capacity(supply: ZoneSupply) -> U32 {
+    if supply.committed_liters >= supply.daily_delivery_capacity_liters {
+        0
+    } else {
+        supply.daily_delivery_capacity_liters - supply.committed_liters
+    }
+}
+
+pub fn supply_shortfall(supply: ZoneSupply) -> U32 {
+    let remaining = remaining_delivery_capacity(supply)
+    if supply.demand_liters > remaining {
+        supply.demand_liters - remaining
+    } else {
+        0
+    }
+}
+
+pub fn decide_zone(
+    snapshot: Scenario,
+    findings: Array<Finding, 5>,
+    supply: ZoneSupply,
+) -> ZoneDecision {
+    var critical = false
+    var confirmed = false
+    var watch = false
+    var recovery_ready = false
+    var prior_advisory = false
+    var affected_finding_count: U32 = 0
+    var finding_index: USize = 0
+    while finding_index < findings.len() {
+        let finding = findings[finding_index]
+        if finding_is_exposed_to_zone(snapshot, finding, supply.zone_id) {
+            if finding.state != FindingState.Clear {
+                affected_finding_count = affected_finding_count + 1
+            }
+            if finding.state == FindingState.Critical {
+                critical = true
+            } else if finding.state == FindingState.Confirmed {
+                confirmed = true
+            } else if finding.state == FindingState.Watch {
+                watch = true
+            }
+
+            match active_advisory_for(snapshot, supply.zone_id, finding) {
+                Some(advisory) => {
+                    prior_advisory = true
+                    recovery_ready =
+                        recovery_ready or recovery_evidence_ready(finding, advisory.issued_minute)
+                }
+                None => {}
+            }
+        }
+        finding_index = finding_index + 1
+    }
+
+    var state = ZoneState.Clear
+    if critical {
+        state = ZoneState.Critical
+    } else if confirmed {
+        state = ZoneState.AdvisoryActive
+    } else if prior_advisory and recovery_ready {
+        state = ZoneState.RecoveryReview
+    } else if prior_advisory {
+        state = ZoneState.AdvisoryActive
+    } else if watch {
+        state = ZoneState.Watch
+    }
+    let advisory_active = prior_advisory and state != ZoneState.Clear
+    let available_liters = remaining_delivery_capacity(supply)
+    let shortfall_liters = supply_shortfall(supply)
+    var next_action = NextAction.NoAction
+    if critical {
+        next_action = NextAction.ContactHealthAuthority
+    } else if state == ZoneState.AdvisoryActive and shortfall_liters > 0 {
+        next_action = NextAction.DispatchAlternateSupply
+    } else if state == ZoneState.AdvisoryActive {
+        next_action = NextAction.IssueOrMaintainAdvisory
+    } else if state == ZoneState.RecoveryReview {
+        next_action = NextAction.ReviewRecoveryBeforeLifting
+    } else if state == ZoneState.Watch {
+        next_action = NextAction.CollectConfirmatoryLab
+    }
+
+    ZoneDecision(
+        zone_id: supply.zone_id,
+        zone_name: supply.zone_name,
+        state: state,
+        active_advisory: advisory_active,
+        recovery_evidence_ready: recovery_ready,
+        affected_finding_count: affected_finding_count,
+        demand_liters: supply.demand_liters,
+        delivery_capacity_liters: supply.daily_delivery_capacity_liters,
+        committed_liters: supply.committed_liters,
+        available_liters: available_liters,
+        shortfall_liters: shortfall_liters,
+        next_action: next_action,
+    )
+}
+
+pub fn assess(snapshot: Scenario) -> Assessment {
+    let findings = detection.findings(snapshot)
+    var clear_count: U32 = 0
+    var watch_count: U32 = 0
+    var confirmed_count: U32 = 0
+    var critical_count: U32 = 0
+    var finding_index: USize = 0
+    while finding_index < findings.len() {
+        match findings[finding_index].state {
+            FindingState.Clear => {
+                clear_count = clear_count + 1
+            }
+            FindingState.Watch => {
+                watch_count = watch_count + 1
+            }
+            FindingState.Confirmed => {
+                confirmed_count = confirmed_count + 1
+            }
+            FindingState.Critical => {
+                critical_count = critical_count + 1
+            }
+        }
+        finding_index = finding_index + 1
+    }
+
+    let decisions = [
+        decide_zone(snapshot, findings, snapshot.supplies[0]),
+        decide_zone(snapshot, findings, snapshot.supplies[1]),
+        decide_zone(snapshot, findings, snapshot.supplies[2]),
+        decide_zone(snapshot, findings, snapshot.supplies[3]),
+        decide_zone(snapshot, findings, snapshot.supplies[4]),
+    ]
+    var recovery_review_count: U32 = 0
+    var shortfall_zone_count: U32 = 0
+    var zone_index: USize = 0
+    while zone_index < decisions.len() {
+        if decisions[zone_index].state == ZoneState.RecoveryReview {
+            recovery_review_count = recovery_review_count + 1
+        }
+        if decisions[zone_index].shortfall_liters > 0 {
+            shortfall_zone_count = shortfall_zone_count + 1
+        }
+        zone_index = zone_index + 1
+    }
+
+    Assessment(
+        findings: findings,
+        decisions: decisions,
+        accepted_measurement_count: quality.accepted_measurement_count(snapshot),
+        rejected_measurement_count: quality.rejected_measurement_count(snapshot),
+        clear_finding_count: clear_count,
+        watch_finding_count: watch_count,
+        confirmed_finding_count: confirmed_count,
+        critical_finding_count: critical_count,
+        recovery_review_count: recovery_review_count,
+        shortfall_zone_count: shortfall_zone_count,
+    )
+}

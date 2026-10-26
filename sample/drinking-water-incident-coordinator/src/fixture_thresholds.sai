@@ -1,0 +1,56 @@
+use acme:drinking-water-incident-coordinator/model.{Analyte, Threshold}
+
+pub fn thresholds() -> Array<Threshold, 5> {
+    [
+        Threshold(
+            site_id: 101,
+            analyte: Analyte.Turbidity,
+            warning_limit_milli: 2000,
+            critical_limit_milli: 5000,
+            recovery_limit_milli: 500,
+            confirmation_window_minutes: 45,
+            recovery_separation_minutes: 60,
+            maximum_delivery_delay_minutes: 30,
+        ),
+        Threshold(
+            site_id: 101,
+            analyte: Analyte.EColi,
+            warning_limit_milli: 1000,
+            critical_limit_milli: 3000,
+            recovery_limit_milli: 0,
+            confirmation_window_minutes: 60,
+            recovery_separation_minutes: 60,
+            maximum_delivery_delay_minutes: 30,
+        ),
+        Threshold(
+            site_id: 102,
+            analyte: Analyte.EColi,
+            warning_limit_milli: 1000,
+            critical_limit_milli: 4000,
+            recovery_limit_milli: 0,
+            confirmation_window_minutes: 60,
+            recovery_separation_minutes: 60,
+            maximum_delivery_delay_minutes: 30,
+        ),
+        Threshold(
+            site_id: 103,
+            analyte: Analyte.Turbidity,
+            warning_limit_milli: 1000,
+            critical_limit_milli: 5000,
+            recovery_limit_milli: 500,
+            confirmation_window_minutes: 45,
+            recovery_separation_minutes: 60,
+            maximum_delivery_delay_minutes: 30,
+        ),
+        Threshold(
+            site_id: 104,
+            analyte: Analyte.EColi,
+            warning_limit_milli: 1000,
+            critical_limit_milli: 5000,
+            recovery_limit_milli: 0,
+            confirmation_window_minutes: 60,
+            recovery_separation_minutes: 60,
+            maximum_delivery_delay_minutes: 30,
+        ),
+    ]
+}
