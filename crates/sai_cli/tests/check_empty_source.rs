@@ -18916,6 +18916,19 @@ fn arithmetic_arguments_to_direct_calls_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn basic_arithmetic_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn subtract_one(value: I32) -> I32 { identity(value - 1) }\n",
+        "fn identity(value: I32) -> I32 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "a direct call with a basic arithmetic argument",
+    );
+}
+
+#[test]
 fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
     let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);

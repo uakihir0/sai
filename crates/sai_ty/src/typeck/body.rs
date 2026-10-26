@@ -2432,12 +2432,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
-                ExprKind::Binary(BinOp::Add, left, right)
-                    if is_supported_direct_call_arithmetic_operand(left)
-                        && is_supported_direct_call_arithmetic_operand(right) =>
-                {
-                    let local_type =
-                        self.check_arithmetic(BinOp::Add, left, right, argument.expr.hir_id)?;
+                ExprKind::Binary(
+                    operator @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div),
+                    left,
+                    right,
+                ) if is_supported_direct_call_arithmetic_operands(left, right) => {
+                    let local_type = self.check_direct_call_arithmetic(
+                        operator,
+                        left,
+                        right,
+                        argument.expr.hir_id,
+                    )?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
@@ -2445,6 +2450,44 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
         Ok(LocalType::Concrete(signature.output))
+    }
+
+    fn check_direct_call_arithmetic(
+        &mut self,
+        operator: BinOp,
+        left: &'hir Expr<'hir>,
+        right: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<LocalType, ()> {
+        if matches!(
+            (left.kind, right.kind),
+            (
+                ExprKind::Lit(Lit::Float { .. }),
+                ExprKind::Lit(Lit::Float { .. })
+            )
+        ) {
+            if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                return Err(());
+            }
+            let ExprKind::Lit(left_literal) = left.kind else {
+                return Err(());
+            };
+            let ExprKind::Lit(right_literal) = right.kind else {
+                return Err(());
+            };
+            let local_type = self.local_type_for_unannotated_literal(
+                left_literal,
+                PrimitiveLiteralKind::FloatingPoint,
+                left.hir_id,
+            );
+            let LocalType::LiteralVariable(id) = local_type else {
+                return Err(());
+            };
+            self.add_float_literal_constraint(id, right_literal, right.hir_id)?;
+            return Ok(local_type);
+        }
+
+        self.check_arithmetic(operator, left, right, expression)
     }
 
     fn expression_has_unknown_field_error(&self, expression: &Expr<'hir>) -> bool {
@@ -3188,6 +3231,28 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         };
         if variable.kind != PrimitiveLiteralKind::Integer
+            || variable.resolved.is_some()
+            || variable.additional_site.is_some()
+        {
+            return Err(());
+        }
+        variable.additional_site = Some(LiteralSite { literal, origin });
+        Ok(())
+    }
+
+    fn add_float_literal_constraint(
+        &mut self,
+        id: usize,
+        literal: Lit<'hir>,
+        origin: HirId,
+    ) -> Result<(), ()> {
+        if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::FloatingPoint) {
+            return Err(());
+        }
+        let Some(variable) = self.literal_variables.get_mut(id) else {
+            return Err(());
+        };
+        if variable.kind != PrimitiveLiteralKind::FloatingPoint
             || variable.resolved.is_some()
             || variable.additional_site.is_some()
         {
@@ -4779,12 +4844,30 @@ fn primitive_literal_kind(literal: Lit<'_>) -> Option<PrimitiveLiteralKind> {
     }
 }
 
-fn is_supported_direct_call_arithmetic_operand(expression: &Expr<'_>) -> bool {
-    match expression.kind {
-        ExprKind::Lit(literal) => primitive_literal_kind(literal).is_some(),
-        ExprKind::Path(_) => true,
+fn is_supported_direct_call_arithmetic_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
+    let is_numeric_literal_or_path = |expression: &Expr<'_>| match expression.kind {
+        ExprKind::Lit(Lit::Int { .. } | Lit::Float { .. }) | ExprKind::Path(_) => true,
         _ => false,
+    };
+    if !is_numeric_literal_or_path(left) || !is_numeric_literal_or_path(right) {
+        return false;
     }
+
+    // This call-argument slice can constrain same-kind numeric literal pairs;
+    // mixed integer/float literal pairs remain outside its bounded inference.
+    if matches!(left.kind, ExprKind::Lit(_)) && matches!(right.kind, ExprKind::Lit(_)) {
+        return matches!(
+            (left.kind, right.kind),
+            (
+                ExprKind::Lit(Lit::Int { .. }),
+                ExprKind::Lit(Lit::Int { .. })
+            ) | (
+                ExprKind::Lit(Lit::Float { .. }),
+                ExprKind::Lit(Lit::Float { .. })
+            )
+        );
+    }
+    true
 }
 
 fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
