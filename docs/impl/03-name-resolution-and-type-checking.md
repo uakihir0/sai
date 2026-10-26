@@ -2897,6 +2897,34 @@ binary_shift_path_arguments_to_direct_calls_remain_behind_the_stage_gate
 `git diff --check` passed. Final hostile review found no actionable P0–P3
 findings.
 
+**IR-966 direct-call bitwise path pairs** extend IR-776 to accept exactly
+one `&`, `|`, or `^` node as an immediate positional argument to an eligible
+direct call at the root or within the existing one-level nested-call form.
+Both operands must be plain, one-segment, non-generic paths resolving by
+exact `BindingId` to eligible parameters or preceding locals with concrete
+primitive types. Matching integer or `Byte` pairs succeed without widening.
+For an integer or `Byte` left path with a differing concrete supported
+primitive RHS, report `TYPE_MISMATCH` at the RHS path and recover the
+expression to the left type. For `Bool`, `F32`, or `F64` on the left, a
+differing RHS reports its path mismatch before `OPERATOR_NOT_SUPPORTED` on
+the whole expression and recovers to the left type; matching operands report
+only `OPERATOR_NOT_SUPPORTED`.
+`Char` on the left always follows rule 3: report only
+`OPERATOR_NOT_SUPPORTED` naming the operator trait and both operand types,
+with no synthetic mismatch, whether the RHS type matches or differs.
+Preserve existing source spans/order, recovery, exact operator and call
+facts, taint, valid sibling facts, and common positional-prefix behavior at
+each call level. Each operand path must resolve by exact `BindingId` to an
+eligible parameter or preceding simple local with a concrete supported
+primitive type; a direct-copy local such as `let lhs = left` is eligible.
+Reject literals, unresolved numeric paths, self/forward references, computed
+or nested bitwise operands, `~` or shift operands, calls as bitwise operands,
+deeper call nesting, and unsupported direct-call targets or signatures.
+Paths that do not satisfy the exact binding and concrete-type checks receive
+no general alias or coercion behavior. Logical `and`/`or` remain unchanged.
+Do not add bitwise lowering or runtime behavior; keep the CLI Stage 0 gate
+unchanged.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
