@@ -867,6 +867,11 @@ compared with expected tuples by the IR-946 shape pass and IR-947 leaf pass;
 aliases, empty tuple annotations, tuple-pattern locals, parameters,
 nested-scope or `else` declarations, unsupported expected types, and
 unmatched extra arguments remain excluded.
+IR-950 extends this declaration search through ordinary lexical blocks nested
+in the function body. Exact resolved binding identity, the written tuple
+annotation, path spans, signature-argument bounds and sibling order are
+preserved. Nested function/closure and async bodies, and declarations with an
+`else` block, remain excluded.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -2683,6 +2688,22 @@ a tuple; tuple-pattern locals, aliases, empty tuple annotations, parameters,
 nested-scope and `else` declarations, unsupported or unresolved expected
 types, and unmatched extra arguments are outside this slice. Sibling checks
 and the Stage 0 incomplete-check gate remain unchanged.
+IR-950 extends the local declaration lookup into ordinary lexical blocks
+nested within the function body. It traverses nested block expressions,
+including blocks in `if` branches, match arms, loops and regions, while
+retaining exact `BindingId`, path/declaration name, binding kind and
+`let`/`var` mode checks. It still requires a simple local with a direct,
+nonempty tuple annotation and no `else`; the annotation remains authoritative
+and the initializer is ignored. The selected path must remain within the
+existing signature/argument zip and tuple traversal, with the same
+tuple-shape-before-leaf precedence, full path span and source-order sibling
+checks. Nested function/closure and async bodies, a `let-else` declaration or
+its `else` block, tuple-pattern declarations, aliases, empty tuple
+annotations, parameters, unsupported expected types, unmatched extra
+arguments, and general expression typing remain excluded. This scoped lookup
+follows the lexical block and local-resolution boundaries in spec/06 §6.11.1
+and spec/04 §§4.5.1 and 4.7.2; tuple-variant argument checks remain under
+spec/06 §6.18.2. The CLI Stage 0 incomplete-check gate is unchanged.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
