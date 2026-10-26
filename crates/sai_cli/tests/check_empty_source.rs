@@ -18929,6 +18929,29 @@ fn basic_arithmetic_arguments_to_direct_calls_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn remainder_path_integer_literal_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn remainder(value: I32) -> I32 { identity(value % 2) }\n",
+        "pub fn nested_remainder(value: I32) -> I32 { identity(identity(value % 2)) }\n",
+        "pub fn copied_remainder(value: I32) -> I32 {\n",
+        "    let copied = value\n",
+        "    identity(copied % 2)\n",
+        "}\n",
+        "pub fn shadowed_remainder(value: I64) -> I16 {\n",
+        "    let value: I16 = 1\n",
+        "    identity_i16(value % 2)\n",
+        "}\n",
+        "fn identity(value: I32) -> I32 { value }\n",
+        "fn identity_i16(value: I16) -> I16 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct-call remainder arguments",
+    );
+}
+
+#[test]
 fn comparison_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn is_below_limit(value: I32, limit: I32) -> Bool { identity_bool(value < limit) }\n",

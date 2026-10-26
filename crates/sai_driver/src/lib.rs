@@ -8994,6 +8994,15 @@ fn is_supported_direct_call_argument_shape(
             locals,
             inputs,
         ),
+        ExprKind::Binary(BinOp::Rem, left, right) => {
+            is_supported_direct_call_remainder_argument_shape(
+                left,
+                right,
+                preceding_bindings,
+                locals,
+                inputs,
+            )
+        }
         ExprKind::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, left, right) => {
             is_supported_direct_call_arithmetic_operands_shape(
                 left,
@@ -9074,6 +9083,15 @@ fn is_supported_direct_call_arithmetic_argument_shape(
     inputs: &CurrentOwnerInputs,
 ) -> bool {
     match expression.kind {
+        ExprKind::Binary(BinOp::Rem, left, right) => {
+            is_supported_direct_call_remainder_argument_shape(
+                left,
+                right,
+                preceding_bindings,
+                locals,
+                inputs,
+            )
+        }
         ExprKind::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, left, right) => {
             is_supported_direct_call_arithmetic_operands_shape(
                 left,
@@ -9173,6 +9191,21 @@ fn is_supported_direct_call_bitwise_not_argument_shape(
     };
     resolved_plain_local_path_binding(path, locals, inputs)
         .is_some_and(|binding| preceding_bindings.contains(&binding))
+}
+
+fn is_supported_direct_call_remainder_argument_shape(
+    left: &HirExpr<'_>,
+    right: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let ExprKind::Path(path) = left.kind else {
+        return false;
+    };
+    matches!(right.kind, ExprKind::Lit(Lit::Int { .. }))
+        && resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding))
 }
 
 fn is_supported_direct_call_arithmetic_operands_shape(
@@ -48798,6 +48831,31 @@ property "shared"() {}
             "pub fn arithmetic_subtraction_call_argument(input: I32) -> I32 { apply(input - 1) }\n",
             "pub fn arithmetic_multiplication_call_argument(input: I32) -> I32 { apply(2 * input) }\n",
             "pub fn arithmetic_division_call_argument(value: F32) -> F32 { float_fn(value / 2.0) }\n",
+            "pub fn remainder_i8_call_argument(input: I8) -> I8 { apply_i8(input % 2) }\n",
+            "pub fn remainder_i16_call_argument(input: I16) -> I16 { apply_i16(input % 2) }\n",
+            "pub fn remainder_i32_call_argument(input: I32) -> I32 { apply(input % 2) }\n",
+            "pub fn remainder_i64_call_argument(input: I64) -> I64 { apply_i64(input % 2) }\n",
+            "pub fn remainder_isize_call_argument(input: ISize) -> ISize { apply_isize(input % 2) }\n",
+            "pub fn remainder_u8_call_argument(input: U8) -> U8 { apply_u8(input % 2) }\n",
+            "pub fn remainder_u16_call_argument(input: U16) -> U16 { apply_u16(input % 2) }\n",
+            "pub fn remainder_u32_call_argument(input: U32) -> U32 { apply_u32(input % 2) }\n",
+            "pub fn remainder_u64_call_argument(input: U64) -> U64 { apply_u64(input % 2) }\n",
+            "pub fn remainder_usize_call_argument(input: USize) -> USize { apply_usize(input % 2) }\n",
+            "pub fn nested_remainder_call_argument(input: I32) -> I32 { apply_i32(apply(input % 2)) }\n",
+            "pub fn remainder_local_path_call_argument(input: I32) -> I32 {\n",
+            "    let copied = input\n",
+            "    apply(copied % 2)\n",
+            "}\n",
+            "pub fn remainder_shadowed_local_path_call_argument(input: I64) -> I16 {\n",
+            "    let input: I16 = 1\n",
+            "    apply_i16(input % 2)\n",
+            "}\n",
+            "pub fn remainder_call_argument_out_of_range(input: I8) -> I8 {\n",
+            "    let failed = apply_i8(input % -129)\n",
+            "    apply_i8(input % 2)\n",
+            "}\n",
+            "pub fn remainder_float_left_call_argument(value: F32) -> F32 { float_fn(value % 2) }\n",
+            "pub fn remainder_call_argument_result_mismatch(input: I32) -> F32 { float_fn(input % 2) }\n",
             "pub fn arithmetic_local_paths_call_argument(input: I32) -> I32 {\n",
             "    let bias: I32 = 1\n",
             "    apply(input - bias)\n",
@@ -48830,7 +48888,15 @@ property "shared"() {}
             "pub fn bool_literal_pair() -> I32 { apply(true + false) }\n",
             "pub fn byte_literal_pair() -> I32 { apply(b'a' + b'b') }\n",
             "pub fn char_literal_pair() -> I32 { apply('a' + 'b') }\n",
-            "pub fn remainder_call_argument(input: I32) -> I32 { apply(input % 2) }\n",
+            "pub fn remainder_literal_left_call_argument(input: I32) -> I32 { apply(2 % input) }\n",
+            "pub fn remainder_literal_pair_call_argument() -> I32 { apply(1 % 2) }\n",
+            "pub fn remainder_float_literal_rhs_call_argument(input: I32) -> I32 { apply(input % 2.0) }\n",
+            "pub fn remainder_computed_rhs_call_argument(input: I32) -> I32 { apply(input % (1 + 2)) }\n",
+            "pub fn remainder_nested_operator_call_argument(input: I32) -> I32 { apply((input % 2) + 1) }\n",
+            "pub fn remainder_call_operand_call_argument(input: I32) -> I32 { apply(input % add_one(input)) }\n",
+            "pub fn remainder_deep_nested_call_argument(input: I32) -> I32 { apply_i32(apply(apply_i32(input % 2))) }\n",
+            "pub fn remainder_generic_target_call_argument(input: I32) -> I32 { generic_fn(input % 2) }\n",
+            "pub fn remainder_unsupported_signature_call_argument(input: I32) -> I32 { text_fn(input % 2) }\n",
             "pub fn call_under_arithmetic_argument(input: I32) -> I32 { apply(add_one(input) + 1) }\n",
             "pub fn call_in_operator(input: I32) -> I32 {\n",
             "    let result = apply(input) + 1\n",
@@ -50178,6 +50244,53 @@ property "shared"() {}
             assert_supported(&database, "arithmetic_multiplication_call_argument", &[]);
         let arithmetic_division_call_argument =
             assert_supported(&database, "arithmetic_division_call_argument", &[]);
+        let remainder_i8_call_argument =
+            assert_supported(&database, "remainder_i8_call_argument", &[]);
+        let remainder_i16_call_argument =
+            assert_supported(&database, "remainder_i16_call_argument", &[]);
+        let remainder_i32_call_argument =
+            assert_supported(&database, "remainder_i32_call_argument", &[]);
+        let remainder_i64_call_argument =
+            assert_supported(&database, "remainder_i64_call_argument", &[]);
+        let remainder_isize_call_argument =
+            assert_supported(&database, "remainder_isize_call_argument", &[]);
+        let remainder_u8_call_argument =
+            assert_supported(&database, "remainder_u8_call_argument", &[]);
+        let remainder_u16_call_argument =
+            assert_supported(&database, "remainder_u16_call_argument", &[]);
+        let remainder_u32_call_argument =
+            assert_supported(&database, "remainder_u32_call_argument", &[]);
+        let remainder_u64_call_argument =
+            assert_supported(&database, "remainder_u64_call_argument", &[]);
+        let remainder_usize_call_argument =
+            assert_supported(&database, "remainder_usize_call_argument", &[]);
+        let nested_remainder_call_argument =
+            assert_supported(&database, "nested_remainder_call_argument", &[]);
+        let remainder_local_path_call_argument =
+            assert_supported(&database, "remainder_local_path_call_argument", &[]);
+        let remainder_shadowed_local_path_call_argument = assert_supported(
+            &database,
+            "remainder_shadowed_local_path_call_argument",
+            &[],
+        );
+        let remainder_call_argument_out_of_range = assert_supported(
+            &database,
+            "remainder_call_argument_out_of_range",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let remainder_float_left_call_argument = assert_supported(
+            &database,
+            "remainder_float_left_call_argument",
+            &[
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+        );
+        let remainder_call_argument_result_mismatch = assert_supported(
+            &database,
+            "remainder_call_argument_result_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         let arithmetic_local_paths_call_argument =
             assert_supported(&database, "arithmetic_local_paths_call_argument", &[]);
         let nested_call_with_basic_arithmetic_argument =
@@ -50754,7 +50867,15 @@ property "shared"() {}
             "bool_literal_pair",
             "byte_literal_pair",
             "char_literal_pair",
-            "remainder_call_argument",
+            "remainder_literal_left_call_argument",
+            "remainder_literal_pair_call_argument",
+            "remainder_float_literal_rhs_call_argument",
+            "remainder_computed_rhs_call_argument",
+            "remainder_nested_operator_call_argument",
+            "remainder_call_operand_call_argument",
+            "remainder_deep_nested_call_argument",
+            "remainder_generic_target_call_argument",
+            "remainder_unsupported_signature_call_argument",
             "logical_forward_local_paths_unsupported",
             "logical_integer_literal_operand_unsupported",
             "logical_character_literal_operand_unsupported",
@@ -53941,6 +54062,423 @@ property "shared"() {}
                 "the single arithmetic expression retains its exact type in `{function}`"
             );
         }
+        for (owner, function, callee, remainder, expected) in [
+            (
+                remainder_i8_call_argument,
+                "pub fn remainder_i8_call_argument",
+                "apply_i8",
+                "input % 2",
+                PrimTy::I8,
+            ),
+            (
+                remainder_i16_call_argument,
+                "pub fn remainder_i16_call_argument",
+                "apply_i16",
+                "input % 2",
+                PrimTy::I16,
+            ),
+            (
+                remainder_i32_call_argument,
+                "pub fn remainder_i32_call_argument",
+                "apply",
+                "input % 2",
+                PrimTy::I32,
+            ),
+            (
+                remainder_i64_call_argument,
+                "pub fn remainder_i64_call_argument",
+                "apply_i64",
+                "input % 2",
+                PrimTy::I64,
+            ),
+            (
+                remainder_isize_call_argument,
+                "pub fn remainder_isize_call_argument",
+                "apply_isize",
+                "input % 2",
+                PrimTy::ISize,
+            ),
+            (
+                remainder_u8_call_argument,
+                "pub fn remainder_u8_call_argument",
+                "apply_u8",
+                "input % 2",
+                PrimTy::U8,
+            ),
+            (
+                remainder_u16_call_argument,
+                "pub fn remainder_u16_call_argument",
+                "apply_u16",
+                "input % 2",
+                PrimTy::U16,
+            ),
+            (
+                remainder_u32_call_argument,
+                "pub fn remainder_u32_call_argument",
+                "apply_u32",
+                "input % 2",
+                PrimTy::U32,
+            ),
+            (
+                remainder_u64_call_argument,
+                "pub fn remainder_u64_call_argument",
+                "apply_u64",
+                "input % 2",
+                PrimTy::U64,
+            ),
+            (
+                remainder_usize_call_argument,
+                "pub fn remainder_usize_call_argument",
+                "apply_usize",
+                "input % 2",
+                PrimTy::USize,
+            ),
+        ] {
+            let call = format!("{callee}({remainder})");
+            let remainder_start = callee.len() + 1;
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
+                Some(expected),
+                "the direct call retains its result type in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    remainder_start,
+                    remainder.len()
+                ),
+                Some(expected),
+                "the remainder expression retains the exact integer type in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    remainder_start,
+                    "input".len()
+                ),
+                Some(expected),
+                "the left local path keeps its exact type in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    remainder_start + "input % ".len(),
+                    "2".len()
+                ),
+                Some(expected),
+                "the RHS literal is checked against the left path in `{function}`"
+            );
+        }
+        let nested_remainder = "apply_i32(apply(input % 2))";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                nested_remainder_call_argument,
+                "pub fn nested_remainder_call_argument",
+                nested_remainder,
+                0,
+                nested_remainder.len()
+            ),
+            Some(PrimTy::I32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                nested_remainder_call_argument,
+                "pub fn nested_remainder_call_argument",
+                nested_remainder,
+                "apply_i32(".len(),
+                "apply(input % 2)".len()
+            ),
+            Some(PrimTy::I32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                nested_remainder_call_argument,
+                "pub fn nested_remainder_call_argument",
+                nested_remainder,
+                "apply_i32(apply(".len(),
+                "input % 2".len()
+            ),
+            Some(PrimTy::I32)
+        );
+        let local_remainder = "apply(copied % 2)";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_local_path_call_argument,
+                "pub fn remainder_local_path_call_argument",
+                local_remainder,
+                0,
+                local_remainder.len()
+            ),
+            Some(PrimTy::I32),
+            "a preceding local path can be the remainder's left operand"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_local_path_call_argument,
+                "pub fn remainder_local_path_call_argument",
+                local_remainder,
+                "apply(".len(),
+                "copied % 2".len()
+            ),
+            Some(PrimTy::I32)
+        );
+        let shadowed_local_remainder = "apply_i16(input % 2)";
+        let shadowed_local_function = "pub fn remainder_shadowed_local_path_call_argument";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_shadowed_local_path_call_argument,
+                shadowed_local_function,
+                shadowed_local_remainder,
+                0,
+                shadowed_local_remainder.len()
+            ),
+            Some(PrimTy::I16),
+            "the same-name local, rather than the I64 parameter, determines the call type"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_shadowed_local_path_call_argument,
+                shadowed_local_function,
+                shadowed_local_remainder,
+                "apply_i16(".len(),
+                "input % 2".len()
+            ),
+            Some(PrimTy::I16),
+            "the same-name local binding drives remainder checking"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_shadowed_local_path_call_argument,
+                shadowed_local_function,
+                shadowed_local_remainder,
+                "apply_i16(".len(),
+                "input".len()
+            ),
+            Some(PrimTy::I16),
+            "the shadowing path resolves to the I16 local BindingId"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_shadowed_local_path_call_argument,
+                shadowed_local_function,
+                shadowed_local_remainder,
+                "apply_i16(input % ".len(),
+                "2".len()
+            ),
+            Some(PrimTy::I16),
+            "the RHS literal is checked against the shadowing local type"
+        );
+
+        let failed_remainder_call = "apply_i8(input % -129)";
+        let failed_remainder = "input % -129";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_call_argument_out_of_range,
+                "pub fn remainder_call_argument_out_of_range",
+                failed_remainder_call,
+                0,
+                failed_remainder_call.len()
+            ),
+            None,
+            "an out-of-range RHS taints the containing call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_call_argument_out_of_range,
+                "pub fn remainder_call_argument_out_of_range",
+                failed_remainder_call,
+                "apply_i8(".len(),
+                failed_remainder.len()
+            ),
+            None,
+            "an out-of-range RHS suppresses the remainder fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_call_argument_out_of_range,
+                "pub fn remainder_call_argument_out_of_range",
+                failed_remainder_call,
+                "apply_i8(".len(),
+                "input".len()
+            ),
+            Some(PrimTy::I8),
+            "the left path fact survives a literal range error"
+        );
+        let valid_remainder_sibling = "apply_i8(input % 2)";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_call_argument_out_of_range,
+                "pub fn remainder_call_argument_out_of_range",
+                valid_remainder_sibling,
+                0,
+                valid_remainder_sibling.len()
+            ),
+            Some(PrimTy::I8),
+            "a valid sibling call remains typed after the range error"
+        );
+        let remainder_range_diagnostics = match remainder_call_argument_out_of_range
+            .body_type_check()
+            .expect("owner body check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("the remainder range error is a supported diagnostic")
+            }
+        };
+        assert_eq!(
+            remainder_range_diagnostics.len(),
+            1,
+            "only the out-of-range literal is diagnosed"
+        );
+        let range_function_start = root
+            .find("pub fn remainder_call_argument_out_of_range")
+            .expect("the remainder range function exists");
+        let range_literal_start = range_function_start
+            + root[range_function_start..]
+                .find("-129")
+                .expect("the negative integer literal is inside the function");
+        assert_eq!(
+            remainder_range_diagnostics[0]
+                .primary()
+                .expect("the range error has a primary literal span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(range_literal_start as u32),
+                sai_diagnostics::TextSize::new((range_literal_start + "-129".len()) as u32),
+            )
+            .expect("the signed literal span is ordered")
+        );
+
+        let float_remainder_context = "float_fn(value % 2)";
+        let float_remainder_diagnostics = match remainder_float_left_call_argument
+            .body_type_check()
+            .expect("owner body check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("the float remainder diagnostics are supported")
+            }
+        };
+        assert_eq!(
+            float_remainder_diagnostics.len(),
+            2,
+            "a float-left remainder keeps the integer-literal mismatch and unsupported-operator errors"
+        );
+        assert_eq!(
+            float_remainder_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ]
+        );
+        let float_remainder_function_start = root
+            .find("pub fn remainder_float_left_call_argument")
+            .expect("the float remainder function exists");
+        let float_remainder_start = float_remainder_function_start
+            + root[float_remainder_function_start..]
+                .find("value % 2")
+                .expect("the float remainder expression is inside the function");
+        assert_eq!(
+            float_remainder_diagnostics[0]
+                .primary()
+                .expect("the literal mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new((float_remainder_start + "value % ".len()) as u32,),
+                sai_diagnostics::TextSize::new((float_remainder_start + "value % 2".len()) as u32,),
+            )
+            .expect("the mismatched integer literal span is ordered")
+        );
+        assert_eq!(
+            float_remainder_diagnostics[1]
+                .primary()
+                .expect("the unsupported operator has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(float_remainder_start as u32),
+                sai_diagnostics::TextSize::new((float_remainder_start + "value % 2".len()) as u32,),
+            )
+            .expect("the remainder expression span is ordered")
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_float_left_call_argument,
+                "pub fn remainder_float_left_call_argument",
+                float_remainder_context,
+                "float_fn(".len(),
+                "value % 2".len()
+            ),
+            None,
+            "a float remainder error suppresses its expression fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_float_left_call_argument,
+                "pub fn remainder_float_left_call_argument",
+                float_remainder_context,
+                "float_fn(".len(),
+                "value".len()
+            ),
+            Some(PrimTy::F32),
+            "the left path fact survives the unsupported remainder"
+        );
+
+        let remainder_result_mismatch = "float_fn(input % 2)";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_call_argument_result_mismatch,
+                "pub fn remainder_call_argument_result_mismatch",
+                remainder_result_mismatch,
+                0,
+                remainder_result_mismatch.len()
+            ),
+            None,
+            "a direct-call parameter mismatch suppresses the call fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_call_argument_result_mismatch,
+                "pub fn remainder_call_argument_result_mismatch",
+                remainder_result_mismatch,
+                "float_fn(".len(),
+                "input % 2".len()
+            ),
+            None,
+            "a direct-call parameter mismatch suppresses the remainder fact"
+        );
+
         let nested_basic_arithmetic = "apply(add_one(input * 2))";
         assert_eq!(
             expression_type_at_range(
