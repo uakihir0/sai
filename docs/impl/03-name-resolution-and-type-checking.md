@@ -834,6 +834,10 @@ and initializer recursively have the same shape and arity through at most
 three tuple nodes and every initializer leaf, including wildcard siblings, is
 a direct fixed-type Bool, Byte, Char, or unit literal. It retains exact
 `BindingId` and binding-mode checks; annotated tuple patterns remain separate.
+IR-944 adds direct paths to simple leaves of explicitly annotated outer-block
+tuple patterns at nonempty tuple expectations. It reuses the existing
+three-level recursive annotation projection and supported primitive/unit leaf
+set, matches the resolved `BindingId`, and does not inspect the initializer.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -2593,14 +2597,21 @@ binding leaves in unannotated outer-block tuple patterns when pattern and
 initializer recursively match in shape and arity through at most three tuple
 nodes and every initializer leaf, including wildcard siblings, is a direct
 fixed-type Bool, Byte, Char, or unit literal. The selected binding's exact
-`BindingId`, name, pattern kind, and mode must match. Annotated patterns,
-`else` declarations, nested scopes, depth-four patterns, shape/arity
-mismatches, complex patterns, numeric or computed leaves, and unsupported
-wildcard siblings remain excluded. Empty tuple/unit and `(e)` versus `(e,)`
-retain their distinct meanings; other paths, calls, coercions, aliases, and
-unsupported payload types remain excluded. These diagnostics preserve eligible
-sibling checks, independent named-argument and outer-arity errors, and the CLI
-incomplete-stage gate.
+`BindingId`, name, pattern kind, and mode must match. IR-944 also checks a
+direct path to a simple binding leaf in an explicitly annotated outer-block
+tuple pattern at a nonempty expected tuple position. It reuses the bounded
+recursive annotation projection: pattern and annotation shape/arity must
+match through at most three tuple nodes, and every binding and wildcard leaf
+must resolve directly to a supported primitive type or unit. The annotation is
+authoritative for this projection; the initializer does not participate. Both
+slices exclude `else` declarations, nested scopes, depth-four patterns,
+shape/arity mismatches, complex patterns, aliases, unsupported leaf types, and
+unmatched extra arguments. IR-943 additionally excludes numeric or computed
+initializer leaves and unsupported wildcard siblings. Empty tuple/unit and
+`(e)` versus `(e,)` retain their distinct meanings; other paths, calls,
+coercions, and unsupported payload types remain excluded. These diagnostics
+preserve eligible sibling checks, independent named-argument and outer-arity
+errors, and the CLI incomplete-stage gate.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 

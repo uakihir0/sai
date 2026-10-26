@@ -10275,10 +10275,16 @@ fn check_local_enum_variant_literal_argument(
 
         if let sai_ty::ty::TyKind::Tuple(expected_elements) = expected_type.kind()
             && !expected_elements.is_empty()
-            && let Some(actual_type) = local_enum_variant_unannotated_fixed_let_var_type(
-                value, body, locals,
-            )
-            .or_else(|| local_enum_variant_unannotated_fixed_pattern_type(value, body, locals))
+            && let Some(actual_type) =
+                local_enum_variant_unannotated_fixed_let_var_type(value, body, locals)
+                    .or_else(|| {
+                        local_enum_variant_unannotated_fixed_pattern_type(value, body, locals)
+                    })
+                    .or_else(|| {
+                        local_enum_variant_annotated_tuple_local_type(
+                            value, body, locals, type_paths, symbols, inputs,
+                        )
+                    })
         {
             diagnostics.push(const_literal_diagnostic(
                 owner,
@@ -98249,7 +98255,16 @@ interface facade { use middle.{payload}; }"#;
             "fn nested_call_tuple_inferred_tuple_pattern_extra_exclusion() {\n    let (extra, _) = (true, false)\n    InferredTuplePayload.Shape((1, (true,), 2, (3,)), extra)\n}\n",
             "fn nested_call_tuple_inferred_tuple_pattern_computed_wildcard_exclusion() {\n    let (actual, _) = (true, true && false)\n    InferredTuplePayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_inferred_tuple_pattern_depth_four_exclusion() {\n    let ((((actual, _), _), _), _) = ((((true, false), true), false), true)\n    InferredTuplePayload.Shape(actual)\n}\n",
-            "fn nested_call_tuple_inferred_tuple_pattern_annotated_exclusion() {\n    let (actual, _): (Bool, Bool) = (true, false)\n    InferredTuplePayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_outer_mismatch() {\n    let (actual, _): (Bool, Bool) = true\n    InferredTuplePayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_nested_byte_mismatch() {\n    let (other, (nested,), third, (var actual,)): (Bool, (Bool,), USize, (Byte,)) = (true, (false,), 1, (b'x',))\n    InferredTuplePayload.Shape((1, (true,), 2, actual))\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_i8_mismatch() {\n    let (actual, _): (I8, Bool) = (1, false)\n    InferredTuplePayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_shadow_mismatch(actual: Bool) {\n    let (actual, _): (Byte, Bool) = (b'x', false)\n    InferredTuplePayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_depth_three_mismatch() {\n    let (((actual, _), _), _): (((Bool, Char), Bool), Bool) = true\n    DeepPayload.DeepByte(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_unit_mismatch() {\n    let (actual, _): ((), Bool) = true\n    InferredTuplePayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_sibling_order() {\n    let (var sibling, _): (Bool, Bool) = true\n    InferredTuplePayload.Shape((1, sibling, true, (3,)))\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_extra_exclusion() {\n    let (extra, _): (Bool, Bool) = true\n    InferredTuplePayload.Shape((1, (true,), 2, (3,)), extra)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_str_wildcard_exclusion() {\n    let (actual, _): (Bool, Str) = (true, \"text\")\n    InferredTuplePayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_depth_four_exclusion() {\n    let ((((actual, _), _), _), _): ((((Bool, Bool), Bool), Bool), Bool) = true\n    InferredTuplePayload.Shape(actual)\n}\n",
             "fn nested_call_annotated_mismatch() {\n    let actual: USize = 2\n    NestedPayload.Nested(((actual, 'x'), ((), 2)))\n}\n",
             "fn tuple_call_shadowed(actual: Bool) { let actual: U8 = 1; Payload.Pair(actual, true) }\n",
             "fn tuple_call_named_param_mismatch(actual: Bool) { Payload.Pair(left: actual, true) }\n",
@@ -98854,7 +98869,6 @@ interface facade { use middle.{payload}; }"#;
             "nested_call_tuple_annotated_unit_exclusion",
             "nested_call_tuple_annotated_nominal_exclusion",
             "nested_call_tuple_annotated_tuple_type_exclusion",
-            "nested_call_tuple_annotated_tuple_pattern_exclusion",
             "tuple_call_inferred_fixed_locals_ok",
             "tuple_call_inferred_nested_scope",
             "tuple_call_inferred_nested_scope_only",
@@ -99525,6 +99539,11 @@ interface facade { use middle.{payload}; }"#;
 
         for (name, call, expected_message) in [
             (
+                "nested_call_tuple_annotated_tuple_pattern_exclusion",
+                "NestedPayload.Single(actual)",
+                "expected tuple of arity 1, found `Bool`",
+            ),
+            (
                 "nested_call_tuple_inferred_tuple_pattern_outer_mismatch",
                 "InferredTuplePayload.Shape(actual)",
                 "expected tuple of arity 4, found `Bool`",
@@ -99548,6 +99567,36 @@ interface facade { use middle.{payload}; }"#;
                 "nested_call_tuple_inferred_tuple_pattern_shadow_mismatch",
                 "InferredTuplePayload.Shape(actual)",
                 "expected tuple of arity 4, found `Byte`",
+            ),
+            (
+                "nested_call_tuple_annotated_tuple_pattern_outer_mismatch",
+                "InferredTuplePayload.Shape(actual)",
+                "expected tuple of arity 4, found `Bool`",
+            ),
+            (
+                "nested_call_tuple_annotated_tuple_pattern_i8_mismatch",
+                "InferredTuplePayload.Shape(actual)",
+                "expected tuple of arity 4, found `I8`",
+            ),
+            (
+                "nested_call_tuple_annotated_tuple_pattern_nested_byte_mismatch",
+                "InferredTuplePayload.Shape((1, (true,), 2, actual))",
+                "expected tuple of arity 1, found `Byte`",
+            ),
+            (
+                "nested_call_tuple_annotated_tuple_pattern_shadow_mismatch",
+                "InferredTuplePayload.Shape(actual)",
+                "expected tuple of arity 4, found `Byte`",
+            ),
+            (
+                "nested_call_tuple_annotated_tuple_pattern_depth_three_mismatch",
+                "DeepPayload.DeepByte(actual)",
+                "expected tuple of arity 2, found `Bool`",
+            ),
+            (
+                "nested_call_tuple_annotated_tuple_pattern_unit_mismatch",
+                "InferredTuplePayload.Shape(actual)",
+                "expected tuple of arity 4, found `()`",
             ),
         ] {
             let paths = paths_for(name);
@@ -99646,6 +99695,32 @@ interface facade { use middle.{payload}; }"#;
             ["sibling", "true"]
         );
 
+        let annotated_pattern_sibling_order =
+            paths_for("nested_call_tuple_annotated_tuple_pattern_sibling_order");
+        let annotated_pattern_sibling_mismatches = annotated_pattern_sibling_order
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            annotated_pattern_sibling_mismatches
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected tuple of arity 1, found `Bool`",
+                "expected `USize`, found a Bool literal",
+            ],
+            "the annotated tuple-pattern path mismatch stops at its path while eligible siblings remain in source order"
+        );
+        assert_eq!(
+            annotated_pattern_sibling_mismatches
+                .iter()
+                .map(|diagnostic| diagnostic_primary_text(diagnostic))
+                .collect::<Vec<_>>(),
+            ["sibling", "true"]
+        );
+
         let inferred_pattern_extra =
             paths_for("nested_call_tuple_inferred_tuple_pattern_extra_exclusion");
         assert_eq!(
@@ -99657,6 +99732,19 @@ interface facade { use middle.{payload}; }"#;
             inferred_pattern_extra.call_diagnostics()[0].code,
             sai_diagnostics::Code::WrongArgumentCount,
             "the extra pattern-bound path retains only the independent outer arity diagnostic"
+        );
+
+        let annotated_pattern_extra =
+            paths_for("nested_call_tuple_annotated_tuple_pattern_extra_exclusion");
+        assert_eq!(
+            annotated_pattern_extra.call_diagnostics().len(),
+            1,
+            "an annotated tuple-pattern local in an unmatched extra argument receives no expected-type diagnostic"
+        );
+        assert_eq!(
+            annotated_pattern_extra.call_diagnostics()[0].code,
+            sai_diagnostics::Code::WrongArgumentCount,
+            "the unmatched annotated pattern path retains only the outer arity diagnostic"
         );
 
         let inferred_named_extra = paths_for("nested_call_tuple_inferred_named_extra");
@@ -99707,7 +99795,8 @@ interface facade { use middle.{payload}; }"#;
             "nested_call_tuple_inferred_tuple_pattern_numeric_wildcard_exclusion",
             "nested_call_tuple_inferred_tuple_pattern_computed_wildcard_exclusion",
             "nested_call_tuple_inferred_tuple_pattern_depth_four_exclusion",
-            "nested_call_tuple_inferred_tuple_pattern_annotated_exclusion",
+            "nested_call_tuple_annotated_tuple_pattern_str_wildcard_exclusion",
+            "nested_call_tuple_annotated_tuple_pattern_depth_four_exclusion",
         ] {
             assert!(
                 paths_for(name).call_diagnostics().is_empty(),
