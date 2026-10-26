@@ -3198,6 +3198,52 @@ remainder evaluation or runtime behavior.
   forward, and deep forms. Run the pinned focused driver and CLI tests,
   formatting, and diff checks; request an independent hostile review.
 
+**IR-978 direct-call remainder with an integer-literal LHS** extends the root
+or existing one-level nested direct-call argument slice to one direct
+`integer_literal % path` expression. The left leaf must be a direct HIR
+`Lit::Int` (including a directly folded negative token); the right leaf must
+resolve by exact `BindingId` to an eligible parameter or preceding local.
+Reuse `check_remainder`, preserving its left-directed integer-literal
+constraint, source-span, target-width range, and mismatch behavior. Keep
+integer-literal/integer-literal, floating-literal, computed, unresolved,
+self-referential, forward, deeper-call, generic-target, and unsupported-
+signature forms gated. Preserve the CLI Stage 0 incomplete-check gate and add
+no remainder evaluation or runtime behavior.
+
+- **Review required:** Challenge driver/body-checker agreement for root and
+  one-level nested literal-left calls. Verify all ten integer primitive
+  results, direct literal and RHS facts, copied RHS locals, and a same-name
+  shadow whose local type differs from its parameter. Check sign-inclusive
+  `I8 -129` and `U8 -1` range diagnostics and taint while preserving a valid
+  sibling. Check call-parameter mismatch taint and recovery, plus a
+  floating-point RHS type mismatch without enabling float remainder.
+  Confirm literal-pair, float-literal, computed-left/right, unresolved,
+  self/forward, deeper-call, generic-target, and unsupported-signature cases
+  remain outside the supported body slice. Keep CLI fixtures isolated so
+  accepted shapes cannot mask exclusions. Preserve Stage 0 and make no
+  execution claim.
+
+- **Planned test matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` with the
+  ten integer types, root/nested/copy/shadow binding facts, I8/U8 signed range
+  failures, call-parameter mismatch and valid sibling, RHS float mismatch,
+  including exact F32/F64 mismatch text and RHS spans, and excluded shapes.
+  Add isolated CLI Stage 0 fixtures for accepted
+  root/nested/copy/shadow forms and rejected literal-pair, float-literal,
+  computed, unresolved, self/forward, deeper, generic, and unsupported-
+  signature forms. Run the pinned focused driver and CLI tests, formatting,
+  and diff checks; request independent hostile review.
+- **Verification:** With pinned Rust 1.99.1, the focused driver test passed
+  (1 test), including exact F32/F64 mismatch messages and RHS spans. The
+  isolated accepted and excluded literal-left CLI Stage 0 tests each passed
+  (1 test), and the
+  existing path-pair CLI Stage 0 regressions passed (2 tests).
+  `cargo fmt --all -- --check` and `git diff --check` passed.
+- **Hostile review:** The initial independent review identified a missing F64
+  exact-diagnostic assertion. The driver fixture now covers both F32 and F64
+  messages and RHS spans; follow-up review found no remaining actionable
+  findings.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:

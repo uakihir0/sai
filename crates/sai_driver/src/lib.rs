@@ -9200,20 +9200,22 @@ fn is_supported_direct_call_remainder_argument_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
 ) -> bool {
-    let ExprKind::Path(path) = left.kind else {
-        return false;
-    };
-    let Some(left_binding) = resolved_plain_local_path_binding(path, locals, inputs) else {
-        return false;
-    };
-    if !preceding_bindings.contains(&left_binding) {
-        return false;
-    }
-
-    match right.kind {
-        ExprKind::Lit(Lit::Int { .. }) => true,
-        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
-            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+    match (left.kind, right.kind) {
+        (ExprKind::Path(left_path), ExprKind::Lit(Lit::Int { .. })) => {
+            resolved_plain_local_path_binding(left_path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding))
+        }
+        (ExprKind::Path(left_path), ExprKind::Path(right_path)) => {
+            let left_precedes = resolved_plain_local_path_binding(left_path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding));
+            let right_precedes = resolved_plain_local_path_binding(right_path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding));
+            left_precedes && right_precedes
+        }
+        (ExprKind::Lit(Lit::Int { .. }), ExprKind::Path(right_path)) => {
+            resolved_plain_local_path_binding(right_path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding))
+        }
         _ => false,
     }
 }
@@ -48874,6 +48876,41 @@ property "shared"() {}
             "pub fn remainder_path_pair_u32_call_argument(left: U32, right: U32) -> U32 { apply_u32(left % right) }\n",
             "pub fn remainder_path_pair_u64_call_argument(left: U64, right: U64) -> U64 { apply_u64(left % right) }\n",
             "pub fn remainder_path_pair_usize_call_argument(left: USize, right: USize) -> USize { apply_usize(left % right) }\n",
+            "pub fn remainder_literal_left_i8_call_argument(right: I8) -> I8 { apply_i8(1 % right) }\n",
+            "pub fn remainder_literal_left_i16_call_argument(right: I16) -> I16 { apply_i16(1 % right) }\n",
+            "pub fn remainder_literal_left_i32_call_argument(right: I32) -> I32 { apply(1 % right) }\n",
+            "pub fn remainder_literal_left_i64_call_argument(right: I64) -> I64 { apply_i64(1 % right) }\n",
+            "pub fn remainder_literal_left_isize_call_argument(right: ISize) -> ISize { apply_isize(1 % right) }\n",
+            "pub fn remainder_literal_left_u8_call_argument(right: U8) -> U8 { apply_u8(1 % right) }\n",
+            "pub fn remainder_literal_left_u16_call_argument(right: U16) -> U16 { apply_u16(1 % right) }\n",
+            "pub fn remainder_literal_left_u32_call_argument(right: U32) -> U32 { apply_u32(1 % right) }\n",
+            "pub fn remainder_literal_left_u64_call_argument(right: U64) -> U64 { apply_u64(1 % right) }\n",
+            "pub fn remainder_literal_left_usize_call_argument(right: USize) -> USize { apply_usize(1 % right) }\n",
+            "pub fn nested_remainder_literal_left_call_argument(right: I32) -> I32 { apply_i32(apply(1 % right)) }\n",
+            "pub fn remainder_literal_left_local_copy_call_argument(right: I32) -> I32 {\n",
+            "    let copied = right\n",
+            "    apply(1 % copied)\n",
+            "}\n",
+            "pub fn remainder_literal_left_shadowed_local_call_argument(right: I64) -> I16 {\n",
+            "    let right: I16 = 2\n",
+            "    apply_i16(1 % right)\n",
+            "}\n",
+            "pub fn remainder_literal_left_ranges(signed: I8, unsigned: U8) -> I8 {\n",
+            "    let failed_signed = apply_i8(-129 % signed)\n",
+            "    let failed_unsigned = apply_u8(-1 % unsigned)\n",
+            "    apply_i8(-128 % signed)\n",
+            "}\n",
+            "pub fn remainder_literal_left_parameter_mismatch(right: I32) -> I32 {\n",
+            "    let failed = apply_bool(1 % right)\n",
+            "    let alias = failed\n",
+            "    apply(1 % right)\n",
+            "}\n",
+            "pub fn remainder_literal_left_rhs_float_mismatch(right: F32) -> I32 {\n",
+            "    apply(1 % right)\n",
+            "}\n",
+            "pub fn remainder_literal_left_rhs_double_mismatch(right: F64) -> I32 {\n",
+            "    apply(1 % right)\n",
+            "}\n",
             "pub fn nested_remainder_path_pair_call_argument(left: I32, right: I32) -> I32 { apply_i32(apply(left % right)) }\n",
             "pub fn remainder_path_pair_local_copies_call_argument(left: I32, right: I32) -> I32 {\n",
             "    let lhs = left\n",
@@ -48961,6 +48998,23 @@ property "shared"() {}
             "pub fn remainder_path_pair_generic_target_unsupported(left: I32, right: I32) -> I32 { generic_fn(left % right) }\n",
             "pub fn remainder_unsupported_signature_call_argument(input: I32) -> I32 { text_fn(input % 2) }\n",
             "pub fn remainder_path_pair_unsupported_signature_unsupported(left: I32, right: I32) -> I32 { text_fn(left % right) }\n",
+            "pub fn remainder_literal_left_integer_pair_unsupported() -> I32 { apply(1 % 2) }\n",
+            "pub fn remainder_literal_left_float_unsupported(right: F32) -> F32 { float_fn(1.0 % right) }\n",
+            "pub fn remainder_literal_left_computed_left_unsupported(right: I32) -> I32 { apply((1 + 2) % right) }\n",
+            "pub fn remainder_literal_left_computed_right_unsupported(right: I32) -> I32 { apply(1 % (right + 1)) }\n",
+            "pub fn remainder_literal_left_unresolved_rhs_unsupported() -> I32 { apply(1 % missing) }\n",
+            "pub fn remainder_literal_left_self_rhs_unsupported() -> I32 {\n",
+            "    let result = apply(1 % result)\n",
+            "    result\n",
+            "}\n",
+            "pub fn remainder_literal_left_forward_rhs_unsupported(right: I32) -> I32 {\n",
+            "    let result = apply(1 % later)\n",
+            "    let later: I32 = right\n",
+            "    result\n",
+            "}\n",
+            "pub fn remainder_literal_left_deep_nested_unsupported(right: I32) -> I32 { apply_i32(apply_i32(apply(1 % right))) }\n",
+            "pub fn remainder_literal_left_generic_target_unsupported(right: I32) -> I32 { generic_fn(1 % right) }\n",
+            "pub fn remainder_literal_left_unsupported_signature(right: I32) -> I32 { text_fn(1 % right) }\n",
             "pub fn call_under_arithmetic_argument(input: I32) -> I32 { apply(add_one(input) + 1) }\n",
             "pub fn call_in_operator(input: I32) -> I32 {\n",
             "    let result = apply(input) + 1\n",
@@ -50402,6 +50456,31 @@ property "shared"() {}
             "remainder_path_pair_float_unsupported",
             &[sai_diagnostics::Code::OperatorNotSupported],
         );
+        let remainder_literal_left_ranges = assert_supported(
+            &database,
+            "remainder_literal_left_ranges",
+            &[
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::LiteralOutOfRange,
+            ],
+        );
+        let remainder_literal_left_call_argument =
+            assert_supported(&database, "remainder_literal_left_call_argument", &[]);
+        let remainder_literal_left_parameter_mismatch = assert_supported(
+            &database,
+            "remainder_literal_left_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let remainder_literal_left_rhs_float_mismatch = assert_supported(
+            &database,
+            "remainder_literal_left_rhs_float_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let remainder_literal_left_rhs_double_mismatch = assert_supported(
+            &database,
+            "remainder_literal_left_rhs_double_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         let arithmetic_local_paths_call_argument =
             assert_supported(&database, "arithmetic_local_paths_call_argument", &[]);
         let nested_call_with_basic_arithmetic_argument =
@@ -50978,7 +51057,6 @@ property "shared"() {}
             "bool_literal_pair",
             "byte_literal_pair",
             "char_literal_pair",
-            "remainder_literal_left_call_argument",
             "remainder_literal_pair_call_argument",
             "remainder_float_literal_rhs_call_argument",
             "remainder_computed_rhs_call_argument",
@@ -50999,6 +51077,16 @@ property "shared"() {}
             "remainder_path_pair_generic_target_unsupported",
             "remainder_unsupported_signature_call_argument",
             "remainder_path_pair_unsupported_signature_unsupported",
+            "remainder_literal_left_integer_pair_unsupported",
+            "remainder_literal_left_float_unsupported",
+            "remainder_literal_left_computed_left_unsupported",
+            "remainder_literal_left_computed_right_unsupported",
+            "remainder_literal_left_unresolved_rhs_unsupported",
+            "remainder_literal_left_self_rhs_unsupported",
+            "remainder_literal_left_forward_rhs_unsupported",
+            "remainder_literal_left_deep_nested_unsupported",
+            "remainder_literal_left_generic_target_unsupported",
+            "remainder_literal_left_unsupported_signature",
             "logical_forward_local_paths_unsupported",
             "logical_integer_literal_operand_unsupported",
             "logical_character_literal_operand_unsupported",
@@ -54518,6 +54606,422 @@ property "shared"() {}
                 ),
                 Some(PrimTy::I16),
                 "the same-name operand resolves to the I16 local BindingId"
+            );
+        }
+
+        for (primitive, callee, expected) in [
+            ("I8", "apply_i8", PrimTy::I8),
+            ("I16", "apply_i16", PrimTy::I16),
+            ("I32", "apply", PrimTy::I32),
+            ("I64", "apply_i64", PrimTy::I64),
+            ("ISize", "apply_isize", PrimTy::ISize),
+            ("U8", "apply_u8", PrimTy::U8),
+            ("U16", "apply_u16", PrimTy::U16),
+            ("U32", "apply_u32", PrimTy::U32),
+            ("U64", "apply_u64", PrimTy::U64),
+            ("USize", "apply_usize", PrimTy::USize),
+        ] {
+            let name = format!(
+                "remainder_literal_left_{}_call_argument",
+                primitive.to_ascii_lowercase()
+            );
+            let function = format!("pub fn {name}");
+            let owner = assert_supported(&database, &name, &[]);
+            let call = format!("{callee}(1 % right)");
+            let remainder_start = callee.len() + 1;
+            for (offset, length) in [
+                (0, call.len()),
+                (remainder_start, "1 % right".len()),
+                (remainder_start, "1".len()),
+                (remainder_start + "1 % ".len(), "right".len()),
+            ] {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &call,
+                        offset,
+                        length
+                    ),
+                    Some(expected),
+                    "the root literal-left call, remainder, literal, and RHS retain {primitive}"
+                );
+            }
+        }
+        let nested_literal_left = "apply_i32(apply(1 % right))";
+        let nested_literal_left_function = "pub fn nested_remainder_literal_left_call_argument";
+        let nested_literal_left_owner = assert_supported(
+            &database,
+            "nested_remainder_literal_left_call_argument",
+            &[],
+        );
+        for (offset, length) in [
+            (0, nested_literal_left.len()),
+            ("apply_i32(".len(), "apply(1 % right)".len()),
+            ("apply_i32(apply(".len(), "1 % right".len()),
+            ("apply_i32(apply(".len(), "1".len()),
+            ("apply_i32(apply(1 % ".len(), "right".len()),
+        ] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    nested_literal_left_owner,
+                    nested_literal_left_function,
+                    nested_literal_left,
+                    offset,
+                    length
+                ),
+                Some(PrimTy::I32),
+                "root and one-level nested direct calls retain literal-left facts"
+            );
+        }
+        let copied_literal_left = "apply(1 % copied)";
+        let copied_literal_left_function = "pub fn remainder_literal_left_local_copy_call_argument";
+        let copied_literal_left_owner = assert_supported(
+            &database,
+            "remainder_literal_left_local_copy_call_argument",
+            &[],
+        );
+        for (offset, length) in [
+            (0, copied_literal_left.len()),
+            ("apply(".len(), "1 % copied".len()),
+            ("apply(".len(), "1".len()),
+            ("apply(1 % ".len(), "copied".len()),
+        ] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    copied_literal_left_owner,
+                    copied_literal_left_function,
+                    copied_literal_left,
+                    offset,
+                    length
+                ),
+                Some(PrimTy::I32),
+                "the literal and copied RHS use the preceding local BindingId"
+            );
+        }
+        let shadowed_literal_left = "apply_i16(1 % right)";
+        let shadowed_literal_left_function =
+            "pub fn remainder_literal_left_shadowed_local_call_argument";
+        let shadowed_literal_left_owner = assert_supported(
+            &database,
+            "remainder_literal_left_shadowed_local_call_argument",
+            &[],
+        );
+        for (offset, length) in [
+            (0, shadowed_literal_left.len()),
+            ("apply_i16(".len(), "1 % right".len()),
+            ("apply_i16(".len(), "1".len()),
+            ("apply_i16(1 % ".len(), "right".len()),
+        ] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    shadowed_literal_left_owner,
+                    shadowed_literal_left_function,
+                    shadowed_literal_left,
+                    offset,
+                    length
+                ),
+                Some(PrimTy::I16),
+                "shadowed RHS and literal-left remainder use the I16 local BindingId"
+            );
+        }
+        let path_directed_literal_left = "apply(2 % input)";
+        for (offset, length) in [
+            (0, path_directed_literal_left.len()),
+            ("apply(".len(), "2 % input".len()),
+            ("apply(".len(), "2".len()),
+            ("apply(2 % ".len(), "input".len()),
+        ] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    remainder_literal_left_call_argument,
+                    "pub fn remainder_literal_left_call_argument",
+                    path_directed_literal_left,
+                    offset,
+                    length
+                ),
+                Some(PrimTy::I32),
+                "the RHS path constrains a direct literal-left remainder"
+            );
+        }
+
+        let literal_left_range_diagnostics = match remainder_literal_left_ranges
+            .body_type_check()
+            .expect("the literal-left range check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("signed literal-left range errors remain supported diagnostics")
+            }
+        };
+        assert_eq!(
+            literal_left_range_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::LiteralOutOfRange,
+            ],
+            "I8 -129 and U8 -1 retain the existing literal range diagnostics"
+        );
+        let literal_left_range_function_start = root
+            .find("pub fn remainder_literal_left_ranges")
+            .expect("the literal-left range function exists");
+        for (diagnostic, (needle, literal)) in literal_left_range_diagnostics
+            .iter()
+            .zip([("-129 % signed", "-129"), ("-1 % unsigned", "-1")])
+        {
+            let start = literal_left_range_function_start
+                + root[literal_left_range_function_start..]
+                    .find(needle)
+                    .expect("the signed literal expression is present in the range function");
+            let span = diagnostic
+                .primary()
+                .expect("the range diagnostic points to its complete signed literal")
+                .span
+                .range;
+            assert_eq!(
+                span,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + literal.len()) as u32),
+                )
+                .expect("the signed literal range span is ordered"),
+                "the primary range span includes the direct negative sign"
+            );
+        }
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_left_ranges,
+                "pub fn remainder_literal_left_ranges",
+                "apply_i8(-129 % signed)",
+                "apply_i8(".len() + "-129 % ".len(),
+                "signed".len()
+            ),
+            Some(PrimTy::I8),
+            "an out-of-range literal retains its exact RHS path fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_left_ranges,
+                "pub fn remainder_literal_left_ranges",
+                "apply_u8(-1 % unsigned)",
+                "apply_u8(".len() + "-1 % ".len(),
+                "unsigned".len()
+            ),
+            Some(PrimTy::U8),
+            "the unsigned out-of-range literal retains its exact RHS path fact"
+        );
+        for call in ["apply_i8(-129 % signed)", "apply_u8(-1 % unsigned)"] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    remainder_literal_left_ranges,
+                    "pub fn remainder_literal_left_ranges",
+                    call,
+                    0,
+                    call.len()
+                ),
+                None,
+                "an out-of-range signed literal taints its containing call"
+            );
+            let argument_start = call.find('(').expect("the direct call has arguments") + 1;
+            let argument_end = call.len() - 1;
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    remainder_literal_left_ranges,
+                    "pub fn remainder_literal_left_ranges",
+                    call,
+                    argument_start,
+                    argument_end - argument_start
+                ),
+                None,
+                "an out-of-range signed literal taints its remainder operator"
+            );
+        }
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_left_ranges,
+                "pub fn remainder_literal_left_ranges",
+                "apply_i8(-128 % signed)",
+                0,
+                "apply_i8(-128 % signed)".len()
+            ),
+            Some(PrimTy::I8),
+            "a valid sibling call keeps its exact type after both range errors"
+        );
+
+        let literal_left_parameter_call = "apply_bool(1 % right)";
+        let literal_left_parameter_function = "pub fn remainder_literal_left_parameter_mismatch";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_left_parameter_mismatch,
+                literal_left_parameter_function,
+                literal_left_parameter_call,
+                0,
+                literal_left_parameter_call.len()
+            ),
+            None,
+            "a direct-call parameter mismatch suppresses its call fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_left_parameter_mismatch,
+                literal_left_parameter_function,
+                literal_left_parameter_call,
+                "apply_bool(".len(),
+                "1 % right".len()
+            ),
+            None,
+            "a direct-call parameter mismatch suppresses its remainder fact"
+        );
+        for (offset, length) in [
+            ("apply_bool(".len(), "1".len()),
+            ("apply_bool(1 % ".len(), "right".len()),
+        ] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    remainder_literal_left_parameter_mismatch,
+                    literal_left_parameter_function,
+                    literal_left_parameter_call,
+                    offset,
+                    length
+                ),
+                Some(PrimTy::I32),
+                "literal and RHS facts survive the containing parameter mismatch"
+            );
+        }
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_left_parameter_mismatch,
+                literal_left_parameter_function,
+                "let alias = failed",
+                "let alias = ".len(),
+                "failed".len()
+            ),
+            None,
+            "a copied alias of the failed call remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_left_parameter_mismatch,
+                literal_left_parameter_function,
+                "apply(1 % right)",
+                0,
+                "apply(1 % right)".len()
+            ),
+            Some(PrimTy::I32),
+            "an independent valid literal-left sibling keeps its type"
+        );
+
+        for (float_type, owner, function) in [
+            (
+                "F32",
+                &remainder_literal_left_rhs_float_mismatch,
+                "pub fn remainder_literal_left_rhs_float_mismatch",
+            ),
+            (
+                "F64",
+                &remainder_literal_left_rhs_double_mismatch,
+                "pub fn remainder_literal_left_rhs_double_mismatch",
+            ),
+        ] {
+            let literal_left_rhs_float_call = "apply(1 % right)";
+            let literal_left_rhs_float_diagnostics = match owner
+                .body_type_check()
+                .expect("the RHS float mismatch check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("the numeric-family mismatch remains a supported diagnostic")
+                }
+            };
+            assert_eq!(
+                literal_left_rhs_float_diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [sai_diagnostics::Code::TypeMismatch],
+                "integer literal-left remainder reports the existing family mismatch only for {float_type}"
+            );
+            assert_eq!(
+                literal_left_rhs_float_diagnostics[0].message,
+                format!("expected `I64`, found `{float_type}`"),
+                "the mismatch retains the integer literal's default type for {float_type}"
+            );
+            let literal_left_rhs_float_function_start = root
+                .find(function)
+                .expect("the RHS float mismatch function exists");
+            let literal_left_rhs_float_path_start = literal_left_rhs_float_function_start
+                + root[literal_left_rhs_float_function_start..]
+                    .find("1 % right")
+                    .expect("the literal-left remainder appears in the mismatch function")
+                + "1 % ".len();
+            assert_eq!(
+                literal_left_rhs_float_diagnostics[0]
+                    .primary()
+                    .expect("the RHS mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(literal_left_rhs_float_path_start as u32),
+                    sai_diagnostics::TextSize::new(
+                        (literal_left_rhs_float_path_start + "right".len()) as u32
+                    ),
+                )
+                .expect("the RHS path mismatch span is ordered"),
+                "the integer/float family mismatch points to the RHS path for {float_type}"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    *owner,
+                    function,
+                    literal_left_rhs_float_call,
+                    0,
+                    literal_left_rhs_float_call.len()
+                ),
+                None,
+                "the RHS family mismatch taints the containing call for {float_type}"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    *owner,
+                    function,
+                    literal_left_rhs_float_call,
+                    "apply(".len(),
+                    "1 % right".len()
+                ),
+                None,
+                "the RHS family mismatch suppresses the remainder fact for {float_type}"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    *owner,
+                    function,
+                    literal_left_rhs_float_call,
+                    "apply(1 % ".len(),
+                    "right".len()
+                ),
+                None,
+                "the mismatched float path has no fabricated operand fact for {float_type}"
             );
         }
 

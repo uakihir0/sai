@@ -4989,11 +4989,13 @@ fn is_supported_direct_call_arithmetic_operands(left: &Expr<'_>, right: &Expr<'_
 }
 
 fn is_supported_direct_call_remainder_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
-    matches!(left.kind, ExprKind::Path(_))
-        && matches!(
-            right.kind,
+    matches!(
+        (left.kind, right.kind),
+        (
+            ExprKind::Path(_),
             ExprKind::Lit(Lit::Int { .. }) | ExprKind::Path(_)
-        )
+        ) | (ExprKind::Lit(Lit::Int { .. }), ExprKind::Path(_))
+    )
 }
 
 fn is_supported_direct_call_comparison_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
