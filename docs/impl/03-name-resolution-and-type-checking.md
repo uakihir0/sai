@@ -2745,15 +2745,20 @@ owners and signatures permits forward, recursive and cross-file calls without
 using another owner's body results or falling back to a name lookup. Only
 non-generic synchronous signatures whose parameters and output are supported
 primitive types are eligible. Arguments must be positional literals or
-resolved local paths. Arity errors are reported at the call; only the common
-argument prefix is type-checked, in source order, and each named argument is
-diagnosed at its name span. Calls with errors have no expression result, and
-their inferred local aliases and supported operator dependents are omitted by
-the existing taint policy. An explicit local annotation remains authoritative
-for that binding. This implementation slice does not change the CLI Stage 0
-incomplete-check gate. Method/constructor/function-pointer/extern/WIT calls,
-generic or otherwise unsupported signatures, nested calls or compound
-arguments, call contracts and `call_kinds` remain outside the projection.
+resolved local paths, except for the one nested-call level added by IR-956:
+an eligible direct call in an eligible call's argument may itself be checked
+when its own arguments are positional literals or resolved local paths.
+Both calls retain their exact owner `HirId` result facts. Arity errors are
+reported at their call; only each call's common argument prefix is
+type-checked, in source order, and each named argument is diagnosed at its
+name span. An inner call error or mismatch taints the enclosing call result
+and inferred local dependents; valid independent siblings remain available.
+An explicit local annotation remains authoritative for that binding. This
+implementation slice does not change the CLI Stage 0 incomplete-check gate.
+Method/constructor/function-pointer/extern/WIT calls, generic or otherwise
+unsupported signatures, calls nested more than one argument level, calls
+inside compound expressions or operators, compound call arguments, call
+contracts and `call_kinds` remain outside the projection.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 

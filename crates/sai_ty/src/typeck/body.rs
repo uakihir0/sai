@@ -605,7 +605,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                 }
                 ExprKind::Call { .. } => {
-                    let call_type = self.check_direct_call(init)?;
+                    let call_type = self.check_direct_call(init, false)?;
                     if let Some(expected) = annotation {
                         self.check_annotated_path(call_type, expected, init.hir_id)?;
                         LocalType::Concrete(expected)
@@ -2320,7 +2320,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         } else {
             match expression.kind {
-                ExprKind::Call { .. } => self.check_direct_call(expression)?,
+                ExprKind::Call { .. } => self.check_direct_call(expression, false)?,
                 ExprKind::Field { .. } => LocalType::Concrete(
                     self.input
                         .self_field_projections
@@ -2369,7 +2369,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(())
     }
 
-    fn check_direct_call(&mut self, expression: &Expr<'hir>) -> Result<LocalType, ()> {
+    fn check_direct_call(
+        &mut self,
+        expression: &Expr<'hir>,
+        nested: bool,
+    ) -> Result<LocalType, ()> {
         let ExprKind::Call {
             callee,
             args,
@@ -2421,6 +2425,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 ExprKind::Path(_) => {
                     let local_type = self.check_local_path(argument.expr)?;
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
+                ExprKind::Call { .. } if !nested => {
+                    let local_type = self.check_direct_call(argument.expr, true)?;
+                    self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
                 _ => return Err(()),
