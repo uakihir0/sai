@@ -2119,6 +2119,155 @@ fn check_reports_tuple_expected_annotated_tuple_pattern_local_mismatches() {
     }
 }
 
+#[test]
+fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() {
+    let source = concat!(
+        "enum NestedPayload { Single((I8,)) }\n",
+        "enum InferredTuplePayload { Shape((I8, (Bool,), USize, (USize,))) }\n",
+        "type TupleAlias = (I8,)\n",
+        "fn outer() {\n",
+        "    let actual: (Bool, Byte) = (true, b'x')\n",
+        "    InferredTuplePayload.Shape(actual)\n",
+        "}\n",
+        "fn initializer_shape_ignored() {\n",
+        "    let actual: (Bool, Byte) = (true,)\n",
+        "    InferredTuplePayload.Shape(actual)\n",
+        "}\n",
+        "fn nested_var() {\n",
+        "    var actual: (Bool, Bool) = (true, false)\n",
+        "    InferredTuplePayload.Shape((1, actual, true, (3,)))\n",
+        "}\n",
+        "fn shadowed(parameter: (Bool,)) {\n",
+        "    let parameter: (Bool, Bool) = (true, false)\n",
+        "    InferredTuplePayload.Shape(parameter)\n",
+        "}\n",
+        "fn same_arity_element_mismatch() {\n",
+        "    let actual: (Char,) = ('x',)\n",
+        "    NestedPayload.Single(actual)\n",
+        "}\n",
+        "fn unit_exclusion() {\n",
+        "    let actual: () = ()\n",
+        "    NestedPayload.Single(actual)\n",
+        "}\n",
+        "fn alias_exclusion() {\n",
+        "    let actual: TupleAlias = (1,)\n",
+        "    NestedPayload.Single(actual)\n",
+        "}\n",
+        "fn extra_argument() {\n",
+        "    let extra: (Bool, Bool) = (true, false)\n",
+        "    NestedPayload.Single((1,), extra)\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "tuple-expected annotated simple tuple locals",
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        5,
+        "only direct tuple-local arity mismatches and the eligible Bool sibling mismatch are reported:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
+        1,
+        "the unmatched extra argument retains its independent outer arity diagnostic"
+    );
+
+    for (function, call, path, expected_message) in [
+        (
+            "outer",
+            "InferredTuplePayload.Shape(actual)",
+            "actual",
+            "expected tuple of arity 4, found tuple of arity 2",
+        ),
+        (
+            "initializer_shape_ignored",
+            "InferredTuplePayload.Shape(actual)",
+            "actual",
+            "expected tuple of arity 4, found tuple of arity 2",
+        ),
+        (
+            "nested_var",
+            "InferredTuplePayload.Shape((1, actual, true, (3,)))",
+            "actual",
+            "expected tuple of arity 1, found tuple of arity 2",
+        ),
+        (
+            "shadowed",
+            "InferredTuplePayload.Shape(parameter)",
+            "parameter",
+            "expected tuple of arity 4, found tuple of arity 2",
+        ),
+    ] {
+        let function_start = source
+            .find(&format!("fn {function}"))
+            .expect("annotated tuple-local mismatch function exists");
+        let call_start = function_start
+            + source[function_start..]
+                .find(call)
+                .expect("annotated tuple-local mismatch call exists");
+        let path_start = call_start
+            + call
+                .find(path)
+                .expect("annotated tuple-local path occurs in its call");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            expected_message,
+            path_start,
+            path_start + path.len(),
+        );
+    }
+
+    let sibling_call = "InferredTuplePayload.Shape((1, actual, true, (3,)))";
+    let sibling_start = source
+        .find(sibling_call)
+        .expect("annotated tuple-local sibling call exists");
+    let sibling_literal_start = sibling_start
+        + sibling_call
+            .find("true")
+            .expect("eligible Bool sibling literal exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `USize`, found a Bool literal",
+        sibling_literal_start,
+        sibling_literal_start + "true".len(),
+    );
+    let tuple_local_record = stdout
+        .find("\"message\":\"expected tuple of arity 1, found tuple of arity 2\"")
+        .expect("nested annotated tuple-local mismatch record exists");
+    let sibling_record = stdout
+        .find("\"message\":\"expected `USize`, found a Bool literal\"")
+        .expect("following sibling literal mismatch record exists");
+    assert!(
+        tuple_local_record < sibling_record,
+        "the local path mismatch and eligible sibling diagnostic retain source order"
+    );
+
+    let extra_call = "NestedPayload.Single((1,), extra)";
+    let extra_start = source
+        .find(extra_call)
+        .expect("annotated tuple-local extra-argument call exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "WRONG_ARGUMENT_COUNT",
+        "Single: tuple variant expects 1 arguments but found 2",
+        extra_start,
+        extra_start + extra_call.len(),
+    );
+    let extra_path_start = extra_start + extra_call.rfind("extra").expect("extra path exists");
+    assert!(
+        !stdout.lines().any(|record| {
+            record.contains("\"code\":\"TYPE_MISMATCH\"")
+                && record.contains(&format!("\"start\":{{\"byte\":{extra_path_start},"))
+        }),
+        "an unmatched annotated tuple-local path receives no expected-type check:\n{stdout}"
+    );
+}
+
 #[cfg(all(
     unix,
     not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))

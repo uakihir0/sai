@@ -838,6 +838,10 @@ IR-944 adds direct paths to simple leaves of explicitly annotated outer-block
 tuple patterns at nonempty tuple expectations. It reuses the existing
 three-level recursive annotation projection and supported primitive/unit leaf
 set, matches the resolved `BindingId`, and does not inspect the initializer.
+IR-945 adds only outer-arity mismatch diagnostics for a direct path to a simple
+outer-block `let` or `var` local with an explicitly written nonempty tuple
+annotation. Equal arity stops without comparing elements, and the initializer
+does not participate.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -2612,6 +2616,15 @@ initializer leaves and unsupported wildcard siblings. Empty tuple/unit and
 coercions, and unsupported payload types remain excluded. These diagnostics
 preserve eligible sibling checks, independent named-argument and outer-arity
 errors, and the CLI incomplete-stage gate.
+IR-945 separately checks a simple explicitly annotated outer-block tuple local
+when a nonempty tuple is expected: a direct, nonempty tuple annotation with a
+different outer arity produces one mismatch over the full path. Equal outer
+arity produces no diagnostic and does not compare element types or nested
+tuple shapes. This check uses the annotation only, requires exact binding
+identity, name, and `let`/`var` mode, and remains bounded by signature-backed
+arguments and equal-arity tuple traversal. Unit and alias annotations,
+tuple-pattern bindings, initializer evidence, and unmatched extra arguments
+remain outside this slice.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
