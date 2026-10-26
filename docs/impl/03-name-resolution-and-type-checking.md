@@ -2778,6 +2778,17 @@ records `Bool` under its exact owner `HirId`; operand and parameter diagnostics
 retain their source spans and taint the comparison, call, and inferred local
 dependents. This remains a sparse body-check result, not complete expression
 typing, and the CLI Stage 0 gate is unchanged.
+**IR-960 logical call arguments** add exactly one `and` or `or`
+binary node as an immediate positional argument to an eligible direct call or
+its existing one-level nested call. Both operands must be plain, one-segment,
+non-generic paths that resolve by exact `BindingId` to an eligible function
+parameter or a local declared before the expression. Reuse the existing
+logical checker to check both operands against `Bool` in written source order,
+preserve its operand diagnostics and taint behavior, and record a successful
+logical expression as `Bool` under its exact owner `HirId`. Keep the existing
+direct-call target/signature, common-prefix, nested-call-depth, result-taint,
+and CLI Stage 0 gates unchanged. Literals, `not`, nested or chained logical
+expressions, and all other compound or computed operands remain unsupported.
 Method/constructor/function-pointer/extern/WIT calls, generic or otherwise
 unsupported signatures, calls nested more than one argument level, calls
 inside compound expressions or operators, compound call arguments, call
