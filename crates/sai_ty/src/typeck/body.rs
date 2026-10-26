@@ -5014,7 +5014,7 @@ fn is_supported_direct_call_bitwise_operands(left: &Expr<'_>, right: &Expr<'_>) 
     (matches!(left.kind, ExprKind::Path(_))
         && matches!(
             right.kind,
-            ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })
+            ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_))
         ))
         || (matches!(left.kind, ExprKind::Lit(Lit::Int { .. }))
             && matches!(right.kind, ExprKind::Path(_)))

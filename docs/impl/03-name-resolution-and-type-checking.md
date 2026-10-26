@@ -2931,11 +2931,12 @@ is an eligible exact-binding path. Reuse `check_bitwise` so integer left
 paths constrain the literal to their concrete type, with full signed-span and
 target-width range diagnostics; preserve the existing `Byte`, `Bool`/float,
 and `Char` recovery and operator-diagnostic rules. The call parameter does
-not infer the literal's type. Keep literal-left/pair forms, other literal
-kinds on the right, unresolved paths, computed/nested operands, deeper call
-nesting, and unsupported call targets or signatures gated. Preserve exact
-facts, taint, siblings, and the CLI Stage 0 gate; add no bitwise lowering or
-runtime behavior.
+not infer the literal's type. At this IR-967 boundary, keep literal-left/pair
+forms and non-integer RHS literal kinds gated; IR-970 below adds only the
+direct `Byte` literal. Also keep unresolved paths, computed/nested operands,
+deeper call nesting, and unsupported call targets or signatures gated.
+Preserve exact facts, taint, siblings, and the CLI Stage 0 gate; add no
+bitwise lowering or runtime behavior.
 
 **IR-968 direct-call bitwise integer-literal LHS** additionally admits one
 direct integer literal on the left of `&`, `|`, or `^` when the right operand
@@ -2965,6 +2966,28 @@ forms, computed/nested operators, deeper calls, and unsupported targets or
 signatures gated. Preserve exact facts, mismatch diagnostics, taint, valid
 siblings, and the CLI Stage 0 gate; add no bitwise lowering or runtime
 behavior.
+
+**IR-970 direct-call bitwise `Byte` literal RHS** additionally admits one
+direct byte literal on the right of `&`, `|`, or `^` when the left operand is
+an eligible exact-binding path, at a root or existing one-level nested call
+argument position. Reuse `check_bitwise`: a `Byte` path and byte literal
+match, while an integer, `Bool`, `F32`, or `F64` path receives
+`TYPE_MISMATCH` at the byte literal and recovers to the left type. `Bool`,
+`F32`, and `F64` also retain the full-expression `OPERATOR_NOT_SUPPORTED`
+diagnostic; a `Char` path instead reports only the missing operator trait
+with concrete RHS type `Byte`. Successful `Byte` cases record the literal,
+operator, and call facts. An operand mismatch or unsupported operator
+suppresses the successful literal/operator/call facts while retaining the
+exact left-path fact. If the operator and Byte operands succeed but the
+enclosing call parameter later mismatches, the left-path and Byte-literal
+facts remain while the tainted operator/call facts are suppressed. Preserve
+valid independent siblings and the existing positional common-prefix
+behavior. Do not broaden this Byte-literal leaf to byte strings or other
+literal kinds; preserve the previously admitted integer-literal forms.
+Reject computed/nested operands,
+shifts, unary operators, unresolved/self/forward paths, deeper calls, or
+unsupported targets/signatures. Keep the CLI Stage 0 gate
+unchanged; this is typechecking-only and adds no lowering/runtime behavior.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 

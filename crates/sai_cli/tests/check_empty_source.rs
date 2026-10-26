@@ -19122,6 +19122,60 @@ fn binary_bitwise_integer_literal_pairs_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn binary_bitwise_byte_literal_rhs_arguments_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn byte_literal_rhs_root(left: Byte) -> Byte {\n",
+        "    let and_value = identity_byte(left & b'a')\n",
+        "    let or_value = identity_byte(left | b'b')\n",
+        "    identity_byte(left ^ b'c')\n",
+        "}\n",
+        "pub fn byte_literal_rhs_nested(left: Byte) -> Byte {\n",
+        "    let and_value = identity_byte(identity_byte(left & b'a'))\n",
+        "    let or_value = identity_byte(identity_byte(left | b'b'))\n",
+        "    identity_byte(identity_byte(left ^ b'c'))\n",
+        "}\n",
+        "pub fn integer_left_byte_literal_rhs(left: I32) -> I32 { identity_i32(left & b'a') }\n",
+        "pub fn bool_left_byte_literal_rhs(left: Bool) -> Bool { identity_bool(left | b'a') }\n",
+        "pub fn float_left_byte_literal_rhs(left: F32) -> F32 { identity_f32(left ^ b'a') }\n",
+        "pub fn char_left_byte_literal_rhs(left: Char) -> Char { identity_char(left & b'a') }\n",
+        "pub fn non_byte_bool_rhs_stays_gated(left: Byte) -> Byte { identity_byte(left & true) }\n",
+        "pub fn non_byte_char_rhs_stays_gated(left: Byte) -> Byte { identity_byte(left | 'a') }\n",
+        "pub fn non_byte_float_rhs_stays_gated(left: Byte) -> Byte { identity_byte(left ^ 1.0) }\n",
+        "pub fn byte_string_rhs_stays_gated(left: Byte) -> Byte { identity_byte(left & b\"ab\") }\n",
+        "pub fn computed_byte_rhs_stays_gated(left: Byte, right: Byte) -> Byte { identity_byte(left & (right | b'a')) }\n",
+        "pub fn nested_byte_operator_rhs_stays_gated(left: Byte) -> Byte { identity_byte((left & b'a') | left) }\n",
+        "pub fn deep_byte_literal_call_stays_gated(left: Byte) -> Byte { identity_byte(identity_byte(identity_byte(left & b'a'))) }\n",
+        "pub fn unresolved_byte_rhs_stays_gated(left: Byte) -> Byte {\n",
+        "    let right = 1\n",
+        "    identity_byte(left & right)\n",
+        "}\n",
+        "pub fn self_byte_rhs_stays_gated(left: Byte) -> Byte {\n",
+        "    let right = identity_byte(left & right)\n",
+        "    right\n",
+        "}\n",
+        "pub fn forward_byte_rhs_stays_gated(left: Byte) -> Byte {\n",
+        "    let result = identity_byte(left & right)\n",
+        "    let right: Byte = left\n",
+        "    result\n",
+        "}\n",
+        "pub fn generic_byte_literal_target_stays_gated(left: Byte) -> I32 { generic_identity(left & b'a') }\n",
+        "pub fn unsupported_byte_literal_signature_stays_gated(left: Byte) -> I32 { text_fn(left & b'a') }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+        "fn identity_bool(value: Bool) -> Bool { value }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_f32(value: F32) -> F32 { value }\n",
+        "fn identity_char(value: Char) -> Char { value }\n",
+        "fn generic_identity<T>(value: T) -> I32 { 0 }\n",
+        "fn text_fn(value: Str) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested bitwise arguments with Byte literal RHSs",
+    );
+}
+
+#[test]
 fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
     let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);
