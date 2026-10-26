@@ -841,7 +841,15 @@ set, matches the resolved `BindingId`, and does not inspect the initializer.
 IR-945 adds only outer-arity mismatch diagnostics for a direct path to a simple
 outer-block `let` or `var` local with an explicitly written nonempty tuple
 annotation. Equal arity stops without comparing elements, and the initializer
-does not participate.
+does not participate. IR-946 extends this through corresponding directly
+written nonempty nested tuples, reporting the first arity mismatch in
+depth-first source order.
+IR-947 runs after that complete shape check succeeds and compares corresponding
+directly resolved primitive/unit leaves in depth-first order, reporting only
+the first unequal pair over the full local-path span. The annotation remains
+authoritative and the initializer is ignored. Nonempty tuple-versus-scalar or
+unit nodes and alias, `Str`, nominal, or unresolved leaves remain excluded;
+skipping one unsupported pair does not suppress later supported leaves.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -2632,6 +2640,16 @@ not check leaf types; tuple-vs-scalar, tuple-vs-unit, and local alias nodes
 remain excluded, and the initializer is still ignored. The iterative walk
 avoids recursive call-stack growth, checks only signature-backed arguments,
 and preserves sibling diagnostics and the Stage 0 incomplete-check gate.
+IR-947 first runs this complete tuple-shape walk, so an outer or nested arity
+mismatch takes precedence over any leaf mismatch in that argument. When the
+shape walk passes, the driver compares corresponding direct primitive/unit
+leaves depth-first and reports the first unequal pair as
+`expected \`T\`, found \`U\`` over the full local-path span. Unit is compared
+as a supported leaf; a nonempty tuple paired with a scalar or unit remains
+excluded. Alias, `Str`, nominal, and unresolved annotation leaves are skipped
+individually, allowing a later supported leaf to be checked. The initializer
+is not read, sibling argument checks continue, unmatched extra arguments stay
+unchecked, and the CLI Stage 0 incomplete-check gate remains in place.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
