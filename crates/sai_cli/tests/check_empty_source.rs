@@ -2128,6 +2128,7 @@ fn check_reports_tuple_expected_annotated_tuple_pattern_local_mismatches() {
 #[test]
 fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() {
     let source = concat!(
+        "enum Payload { Pair(U8, Bool), UnitPayload(()), USizePayload(USize) }\n",
         "enum NestedPayload { Single((I8,)) }\n",
         "enum InferredTuplePayload { Shape((I8, (Bool,), USize, (USize,))) }\n",
         "enum NestedShapeOrder { Shape((I8, ((Bool,),), (USize, USize))) }\n",
@@ -2189,7 +2190,7 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         "    TupleVsLeafPayload.Shape(actual)\n",
         "}\n",
         "fn unsupported_leaf_exclusions() {\n",
-        "    let actual: (BoolAlias, Str, Widget, (Bool,)) = (true, \"text\", true, (false,))\n",
+        "    let actual: (BoolAlias, Str, Widget, USize) = (true, \"text\", true, 1)\n",
         "    UnsupportedLeafPayload.Shape(actual)\n",
         "}\n",
         "fn unresolved_leaf_then_supported_mismatch() {\n",
@@ -2248,6 +2249,69 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         "    let actual: UnitAlias = ()\n",
         "    NestedPayload.Single(actual)\n",
         "}\n",
+        "fn scalar_tuple_local_mismatch() {\n",
+        "    let actual: (Bool, Byte) = (true,)\n",
+        "    Payload.Pair(1, actual)\n",
+        "}\n",
+        "fn unit_tuple_local_mismatch() {\n",
+        "    var actual: (Bool, Byte) = (true, b'x')\n",
+        "    Payload.UnitPayload(actual)\n",
+        "}\n",
+        "fn usize_tuple_local_mismatch() {\n",
+        "    let actual: (Bool, Byte) = (true, b'x')\n",
+        "    Payload.USizePayload(actual)\n",
+        "}\n",
+        "fn scalar_tuple_local_shadowed_var_mismatch(actual: (USize,)) {\n",
+        "    var actual: (Bool, Byte) = (true, b'x')\n",
+        "    Payload.Pair(1, actual)\n",
+        "}\n",
+        "fn nested_scalar_and_unit_tuple_local_mismatches() {\n",
+        "    let scalar_actual: (Byte,) = (b'x',)\n",
+        "    let unit_actual: (USize,) = (1,)\n",
+        "    LeafShapePriority.Shape((scalar_actual, (b'x',)))\n",
+        "    UnitLeafPayload.Shape((unit_actual, true))\n",
+        "}\n",
+        "fn nested_tuple_local_first_depth_first_mismatch() {\n",
+        "    let actual: ((Byte,), (Bool,)) = ((b'x',), (true,))\n",
+        "    LeafShapePriority.Shape(actual)\n",
+        "}\n",
+        "fn nested_tuple_local_shape_precedence() {\n",
+        "    let actual: ((Byte, Byte), (Bool, Bool)) = ((b'x', b'y'), (true, false))\n",
+        "    LeafShapePriority.Shape(actual)\n",
+        "}\n",
+        "fn scalar_tuple_local_sibling_order() {\n",
+        "    let actual: (Bool, Byte) = (true, b'x')\n",
+        "    LeafShapePriority.Shape((actual, (true,)))\n",
+        "}\n",
+        "fn scalar_tuple_alias_exclusion() {\n",
+        "    let actual: TupleAlias = (1,)\n",
+        "    Payload.Pair(1, actual)\n",
+        "}\n",
+        "fn scalar_unit_annotation_exclusion() {\n",
+        "    let actual: () = ()\n",
+        "    Payload.Pair(actual, true)\n",
+        "}\n",
+        "fn scalar_unit_alias_exclusion() {\n",
+        "    let actual: UnitAlias = ()\n",
+        "    Payload.Pair(1, actual)\n",
+        "}\n",
+        "fn scalar_tuple_parameter_exclusion(actual: (Bool, Byte)) {\n",
+        "    Payload.Pair(1, actual)\n",
+        "}\n",
+        "fn scalar_tuple_nested_scope_exclusion() {\n",
+        "    {\n",
+        "        let actual: (Bool, Byte) = (true, b'x')\n",
+        "        Payload.Pair(1, actual)\n",
+        "    }\n",
+        "}\n",
+        "fn scalar_tuple_else_exclusion() {\n",
+        "    let actual: (Bool, Byte) = (true, b'x') else { return }\n",
+        "    Payload.Pair(1, actual)\n",
+        "}\n",
+        "fn scalar_tuple_extra_exclusion() {\n",
+        "    let actual: (Bool, Byte) = (true, b'x')\n",
+        "    Payload.Pair(1, true, actual)\n",
+        "}\n",
         "fn alias_exclusion() {\n",
         "    let actual: TupleAlias = (1,)\n",
         "    NestedPayload.Single(actual)\n",
@@ -2265,13 +2329,13 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        21,
-        "only direct or nested tuple-local shape/leaf mismatches and eligible fixed-literal siblings are reported:\n{stdout}"
+        32,
+        "only direct or nested tuple-local shape/scalar mismatches and eligible fixed-literal siblings are reported:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
-        1,
-        "the unmatched extra argument retains its independent outer arity diagnostic"
+        2,
+        "unmatched extra arguments retain their independent outer arity diagnostics"
     );
 
     for (function, call, path, expected_message) in [
@@ -2348,6 +2412,48 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
             "expected tuple of arity 1, found `()`",
         ),
         (
+            "scalar_tuple_local_mismatch",
+            "Payload.Pair(1, actual)",
+            "actual",
+            "expected `Bool`, found tuple of arity 2",
+        ),
+        (
+            "unit_tuple_local_mismatch",
+            "Payload.UnitPayload(actual)",
+            "actual",
+            "expected `()`, found tuple of arity 2",
+        ),
+        (
+            "usize_tuple_local_mismatch",
+            "Payload.USizePayload(actual)",
+            "actual",
+            "expected `USize`, found tuple of arity 2",
+        ),
+        (
+            "scalar_tuple_local_shadowed_var_mismatch",
+            "Payload.Pair(1, actual)",
+            "actual",
+            "expected `Bool`, found tuple of arity 2",
+        ),
+        (
+            "nested_tuple_local_first_depth_first_mismatch",
+            "LeafShapePriority.Shape(actual)",
+            "actual",
+            "expected `Bool`, found tuple of arity 1",
+        ),
+        (
+            "nested_tuple_local_shape_precedence",
+            "LeafShapePriority.Shape(actual)",
+            "actual",
+            "expected tuple of arity 1, found tuple of arity 2",
+        ),
+        (
+            "tuple_vs_scalar_and_unit_exclusions",
+            "TupleVsLeafPayload.Shape(actual)",
+            "actual",
+            "expected `()`, found tuple of arity 1",
+        ),
+        (
             "unresolved_leaf_then_supported_mismatch",
             "UnresolvedLeafPayload.Shape(actual)",
             "actual",
@@ -2404,6 +2510,37 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         );
     }
 
+    let nested_scalar_call = "LeafShapePriority.Shape((scalar_actual, (b'x',)))";
+    let nested_scalar_start = source
+        .find(nested_scalar_call)
+        .expect("nested scalar/unit tuple-local call exists");
+    let scalar_path_start = nested_scalar_start
+        + nested_scalar_call
+            .find("scalar_actual")
+            .expect("scalar path exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found tuple of arity 1",
+        scalar_path_start,
+        scalar_path_start + "scalar_actual".len(),
+    );
+    let unit_scalar_call = "UnitLeafPayload.Shape((unit_actual, true))";
+    let unit_scalar_start = source
+        .find(unit_scalar_call)
+        .expect("nested unit tuple-local call exists");
+    let unit_path_start = unit_scalar_start
+        + unit_scalar_call
+            .find("unit_actual")
+            .expect("unit path exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `()`, found tuple of arity 1",
+        unit_path_start,
+        unit_path_start + "unit_actual".len(),
+    );
+
     let sibling_call = "InferredTuplePayload.Shape((1, actual, true, (3,)))";
     let sibling_start = source
         .find(sibling_call)
@@ -2428,6 +2565,43 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
     assert!(
         tuple_local_record < sibling_record,
         "the local path mismatch and eligible sibling diagnostic retain source order"
+    );
+
+    let scalar_sibling_call = "LeafShapePriority.Shape((actual, (true,)))";
+    let scalar_sibling_start = source
+        .find(scalar_sibling_call)
+        .expect("tuple-versus-scalar sibling call exists");
+    let scalar_local_start = scalar_sibling_start
+        + scalar_sibling_call
+            .find("actual")
+            .expect("local path exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found tuple of arity 2",
+        scalar_local_start,
+        scalar_local_start + "actual".len(),
+    );
+    let scalar_sibling_literal_start = scalar_sibling_start
+        + scalar_sibling_call
+            .find("true")
+            .expect("Bool literal sibling exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Byte`, found a Bool literal",
+        scalar_sibling_literal_start,
+        scalar_sibling_literal_start + "true".len(),
+    );
+    let scalar_local_record = stdout
+        .find("\"message\":\"expected `Bool`, found tuple of arity 2\"")
+        .expect("tuple-versus-scalar mismatch record exists");
+    let scalar_sibling_record = stdout
+        .find("\"message\":\"expected `Byte`, found a Bool literal\"")
+        .expect("following scalar sibling mismatch record exists");
+    assert!(
+        scalar_local_record < scalar_sibling_record,
+        "tuple-versus-scalar path and following sibling mismatch retain source order"
     );
 
     let leaf_sibling_call = "InferredTuplePayload.Shape((1, actual, true, (3,)))";
@@ -2465,18 +2639,25 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         "the tuple-local leaf mismatch and eligible sibling diagnostic retain source order"
     );
 
-    for function in [
-        "supported_leaf_equal",
-        "tuple_vs_scalar_and_unit_exclusions",
-        "unsupported_leaf_exclusions",
-        "nested_same_arity",
-        "nested_scalar_and_alias_exclusions",
-        "nested_unit_exclusion",
+    for (function, call) in [
+        ("supported_leaf_equal", "SupportedLeafPayload.Shape(actual)"),
+        (
+            "unsupported_leaf_exclusions",
+            "UnsupportedLeafPayload.Shape(actual)",
+        ),
+        ("nested_same_arity", "InferredTuplePayload.Shape(actual)"),
+        (
+            "nested_scalar_and_alias_exclusions",
+            "InferredTuplePayload.Shape(actual)",
+        ),
+        (
+            "nested_unit_exclusion",
+            "InferredTuplePayload.Shape(actual)",
+        ),
     ] {
         let function_start = source
             .find(&format!("fn {function}"))
             .expect("annotated nested tuple-local exclusion function exists");
-        let call = "InferredTuplePayload.Shape(actual)";
         let call_start = function_start
             + source[function_start..]
                 .find(call)
@@ -2488,6 +2669,44 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
                     && record.contains(&format!("\"start\":{{\"byte\":{path_start},"))
             }),
             "{function}: equal, scalar, alias, and unit shapes do not produce nested arity diagnostics:\n{stdout}"
+        );
+    }
+
+    for (function, call) in [
+        ("scalar_tuple_alias_exclusion", "Payload.Pair(1, actual)"),
+        (
+            "scalar_unit_annotation_exclusion",
+            "Payload.Pair(actual, true)",
+        ),
+        ("scalar_unit_alias_exclusion", "Payload.Pair(1, actual)"),
+        (
+            "scalar_tuple_parameter_exclusion",
+            "Payload.Pair(1, actual)",
+        ),
+        (
+            "scalar_tuple_nested_scope_exclusion",
+            "Payload.Pair(1, actual)",
+        ),
+        ("scalar_tuple_else_exclusion", "Payload.Pair(1, actual)"),
+        (
+            "scalar_tuple_extra_exclusion",
+            "Payload.Pair(1, true, actual)",
+        ),
+    ] {
+        let function_start = source
+            .find(&format!("fn {function}"))
+            .expect("annotated scalar tuple-local exclusion function exists");
+        let call_start = function_start
+            + source[function_start..]
+                .find(call)
+                .expect("annotated scalar tuple-local exclusion call exists");
+        let path_start = call_start + call.find("actual").expect("tuple-local path exists");
+        assert!(
+            !stdout.lines().any(|record| {
+                record.contains("\"code\":\"TYPE_MISMATCH\"")
+                    && record.contains(&format!("\"start\":{{\"byte\":{path_start},"))
+            }),
+            "{function}: unsupported declarations and unmatched arguments receive no scalar tuple-local mismatch:\n{stdout}"
         );
     }
 
@@ -2521,6 +2740,17 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         "Single: tuple variant expects 1 arguments but found 2",
         extra_start,
         extra_start + extra_call.len(),
+    );
+    let scalar_extra_call = "Payload.Pair(1, true, actual)";
+    let scalar_extra_start = source
+        .find(scalar_extra_call)
+        .expect("tuple-versus-scalar extra-argument call exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "WRONG_ARGUMENT_COUNT",
+        "Pair: tuple variant expects 2 arguments but found 3",
+        scalar_extra_start,
+        scalar_extra_start + scalar_extra_call.len(),
     );
     let extra_path_start = extra_start + extra_call.rfind("extra").expect("extra path exists");
     assert!(
