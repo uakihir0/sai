@@ -1,0 +1,47 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Decision {
+    Allowed
+    RateLimited
+    UnknownClient
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ClientBucket {
+    pub client_id: U32
+    pub window_start_seconds: U32
+    pub admitted_count: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Request {
+    pub request_id: U32
+    pub client_id: U32
+    pub at_seconds: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Admission {
+    pub request_id: U32
+    pub client_id: U32
+    pub at_seconds: U32
+    pub decision: Decision
+    pub remaining_in_window: U32
+    // Zero means there is no retry deadline for this decision.
+    pub retry_at_seconds: U32
+    pub retry_after_seconds: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Scenario {
+    pub clients: Array<ClientBucket, 2>
+    pub requests: Array<Request, 12>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Report {
+    pub clients: Array<ClientBucket, 2>
+    pub admissions: Array<Option<Admission>, 12>
+    pub allowed_count: USize
+    pub rate_limited_count: USize
+    pub unknown_client_count: USize
+}

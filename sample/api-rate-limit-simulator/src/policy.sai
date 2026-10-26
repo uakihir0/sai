@@ -1,0 +1,14 @@
+pub const WINDOW_SECONDS: U32 = 10
+pub const MAX_ADMISSIONS_PER_WINDOW: U32 = 2
+
+pub fn window_start(at_seconds: U32) -> U32 {
+    (at_seconds / WINDOW_SECONDS) * WINDOW_SECONDS
+}
+
+pub fn retry_at(at_seconds: U32) -> U32 {
+    window_start(at_seconds) + WINDOW_SECONDS
+}
+
+pub fn retry_after(at_seconds: U32) -> U32 {
+    retry_at(at_seconds) - at_seconds
+}

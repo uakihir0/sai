@@ -1,0 +1,5 @@
+package acme:api-rate-limit-simulator @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Simulate fixed-window API request limits per registered client"

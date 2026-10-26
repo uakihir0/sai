@@ -1,0 +1,87 @@
+use acme:api-rate-limit-simulator/fixtures
+use acme:api-rate-limit-simulator/model.{Admission, Decision, Report}
+use acme:api-rate-limit-simulator/policy
+
+pub fn simulate() -> Report {
+    let scenario = fixtures.scenario()
+    var clients = scenario.clients
+    var admissions: Array<Option<Admission>, 12> = Array<Option<Admission>, 12>.filled(None)
+    var allowed_count: USize = 0
+    var rate_limited_count: USize = 0
+    var unknown_client_count: USize = 0
+
+    for request_index in 0..scenario.requests.len() {
+        let request = scenario.requests[request_index]
+        let start = policy.window_start(request.at_seconds)
+        var bucket_index: Option<USize> = None
+
+        for client_index in 0..clients.len() {
+            if clients[client_index].client_id == request.client_id {
+                bucket_index = Some(client_index)
+            }
+        }
+
+        match bucket_index {
+            None => {
+                admissions[request_index] = Some(
+                    Admission(
+                        request_id: request.request_id,
+                        client_id: request.client_id,
+                        at_seconds: request.at_seconds,
+                        decision: Decision.UnknownClient,
+                        remaining_in_window: 0,
+                        retry_at_seconds: 0,
+                        retry_after_seconds: 0,
+                    ),
+                )
+                unknown_client_count += 1
+            }
+            Some(index) => {
+                var bucket = clients[index]
+                if bucket.window_start_seconds != start {
+                    bucket.window_start_seconds = start
+                    bucket.admitted_count = 0
+                }
+
+                if bucket.admitted_count < policy.MAX_ADMISSIONS_PER_WINDOW {
+                    bucket.admitted_count += 1
+                    admissions[request_index] = Some(
+                        Admission(
+                            request_id: request.request_id,
+                            client_id: request.client_id,
+                            at_seconds: request.at_seconds,
+                            decision: Decision.Allowed,
+                            remaining_in_window: policy.MAX_ADMISSIONS_PER_WINDOW
+                                - bucket.admitted_count,
+                            retry_at_seconds: 0,
+                            retry_after_seconds: 0,
+                        ),
+                    )
+                    allowed_count += 1
+                } else {
+                    admissions[request_index] = Some(
+                        Admission(
+                            request_id: request.request_id,
+                            client_id: request.client_id,
+                            at_seconds: request.at_seconds,
+                            decision: Decision.RateLimited,
+                            remaining_in_window: 0,
+                            retry_at_seconds: policy.retry_at(request.at_seconds),
+                            retry_after_seconds: policy.retry_after(request.at_seconds),
+                        ),
+                    )
+                    rate_limited_count += 1
+                }
+                clients[index] = bucket
+            }
+        }
+    }
+
+    Report(
+        clients: clients,
+        admissions: admissions,
+        allowed_count: allowed_count,
+        rate_limited_count: rate_limited_count,
+        unknown_client_count: unknown_client_count,
+    )
+}
