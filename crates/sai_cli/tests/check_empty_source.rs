@@ -19087,6 +19087,41 @@ fn binary_bitwise_integer_literal_lhs_arguments_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn binary_bitwise_integer_literal_pairs_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn bitwise_and_integer_literal_pair_argument() -> I32 { identity_i32(7 & 3) }\n",
+        "pub fn bitwise_or_integer_literal_pair_argument() -> I32 { identity_i32(7 | 3) }\n",
+        "pub fn bitwise_xor_integer_literal_pair_argument() -> I32 { identity_i32(7 ^ 3) }\n",
+        "pub fn nested_bitwise_and_integer_literal_pair_argument() -> I32 { identity_i32(identity_i32(7 & 3)) }\n",
+        "pub fn nested_bitwise_or_integer_literal_pair_argument() -> I32 { identity_i32(identity_i32(7 | 3)) }\n",
+        "pub fn nested_bitwise_xor_integer_literal_pair_argument() -> I32 { identity_i32(identity_i32(7 ^ 3)) }\n",
+        "pub fn signed_left_integer_literal_pair_stays_gated() -> I32 { identity_i32(-1 & 3) }\n",
+        "pub fn signed_right_integer_literal_pair_stays_gated() -> I32 { identity_i32(7 | -3) }\n",
+        "pub fn byte_literal_pair_stays_gated() -> Byte { identity_byte(b'a' ^ b'b') }\n",
+        "pub fn bool_literal_pair_stays_gated() -> Bool { identity_bool(true & false) }\n",
+        "pub fn char_literal_pair_stays_gated() -> Char { identity_char('a' | 'b') }\n",
+        "pub fn float_literal_pair_stays_gated() -> F32 { identity_f32(1.0 ^ 2.0) }\n",
+        "pub fn double_literal_pair_stays_gated() -> F64 { identity_f64(1.0 | 2.0) }\n",
+        "pub fn computed_integer_literal_pair_stays_gated() -> I32 { identity_i32((1 + 2) ^ 3) }\n",
+        "pub fn nested_operator_integer_literal_pair_stays_gated() -> I32 { identity_i32((1 & 2) ^ 3) }\n",
+        "pub fn deep_integer_literal_pair_call_stays_gated() -> I32 { identity_i32(identity_i32(identity_i32(1 & 2))) }\n",
+        "pub fn generic_integer_literal_pair_target_stays_gated() -> I32 { generic_identity(1 ^ 2) }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+        "fn identity_bool(value: Bool) -> Bool { value }\n",
+        "fn identity_char(value: Char) -> Char { value }\n",
+        "fn identity_f32(value: F32) -> F32 { value }\n",
+        "fn identity_f64(value: F64) -> F64 { value }\n",
+        "fn generic_identity<T>(value: T) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct calls with integer-literal bitwise pairs",
+    );
+}
+
+#[test]
 fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
     let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);

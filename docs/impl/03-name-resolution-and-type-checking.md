@@ -2952,6 +2952,20 @@ unsupported targets or signatures. Preserve exact facts, taint, valid
 siblings, and the CLI Stage 0 gate; add no bitwise lowering or runtime
 behavior.
 
+**IR-969 direct-call bitwise integer-literal pairs** additionally admit one
+`&`, `|`, or `^` node with two direct non-negative integer literals as the
+argument to a direct call at the root or at the existing one-level nested
+call position. Reuse `check_bitwise`'s shared integer-literal variable so the
+concrete call parameter constrains both operands, with the existing exact-literal,
+defaulting, and range behavior. This includes fixed integer bounds and the
+configured pointer-width bounds for `ISize` and `USize`; an out-of-range site
+retains its exact literal span and taints the operator and call. Keep signed
+literal pairs, Byte/Bool/Char/float pairs, additional mixed path/literal
+forms, computed/nested operators, deeper calls, and unsupported targets or
+signatures gated. Preserve exact facts, mismatch diagnostics, taint, valid
+siblings, and the CLI Stage 0 gate; add no bitwise lowering or runtime
+behavior.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
