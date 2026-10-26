@@ -3080,6 +3080,48 @@ shape, recovery, span, fact, and gate choices are **Review required**.
   unsupported signatures. Run focused driver and CLI Stage 0 tests, formatting,
   and diff checks.
 
+**IR-975 direct-call bitwise scalar-literal RHS on a Byte literal LHS**
+additionally admits direct `Bool`, `Char`, or floating-point literal RHS
+leaves after a direct Byte character literal LHS for exactly one `&`, `|`, or
+`^` at the root or existing one-level nested direct-call argument position.
+Reuse the flat-local `check_bitwise` behavior: check each RHS as `Byte`, report
+the existing `TYPE_MISMATCH` over only the literal RHS span, and recover the
+operator as `Byte`. These are diagnostic-recovery shapes, not successful
+mixed-type bitwise operations. The mismatch taints the operator and
+containing call facts; neither literal receives a separate fabricated `Byte`
+fact, while independent valid siblings remain typed. Do not default floating
+literals or add range or unsupported-operator diagnostics for these RHS
+mismatches.
+
+- **Failure boundary and judgment:** Match only direct HIR `Lit::Bool`,
+  `Lit::Char`, and `Lit::Float` leaves in both the driver and type-checker
+  gates. Keep the already-supported direct Byte and integer literal RHS
+  behavior. Continue rejecting byte strings, computed or nested operators,
+  arbitrary unary expressions, deeper calls, generic targets, and unsupported
+  signatures. Keep Stage 0 gated and add no lowering/runtime behavior. The
+  exact leaf families and recovery behavior are **Review required**.
+- **Review required:** Challenge parity between the driver and body-checker
+  gates for each of `&`, `|`, and `^` at root and one nested position. Check
+  all three scalar families for exactly one `TYPE_MISMATCH`, the literal-only
+  RHS span and message, Byte recovery, no float defaulting, no range or
+  unsupported-operator diagnostic, and suppression of RHS/operator/call
+  facts under taint. Confirm the Byte literal LHS has no separate fact and
+  valid sibling call/operator/RHS-path facts survive. Reject byte strings,
+  computed/nested operators, deeper calls, generic targets, and unsupported
+  signatures. Confirm the CLI Stage 0 gate remains unchanged.
+- **Planned test matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` with
+  Bool, Char, and float RHS cases for all three operators at root and one
+  nested call level. Assert exact diagnostic code, message, RHS span, absent
+  literal/operator/call facts, nested-call taint, and a valid Byte sibling's
+  operator/call/path facts. Keep byte-string, computed/nested/deep-call,
+  generic-target, and unsupported-signature cases unsupported. Add a
+  dedicated CLI Stage 0 fixture for the new root/nested shapes and those
+  exclusions; run both focused tests, pinned formatting, and `git diff
+  --check`. IR-787's flat-local Byte bitwise literal mismatch checks are the
+  semantic precedent; no new operator-checking or lowering behavior is
+  planned.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:

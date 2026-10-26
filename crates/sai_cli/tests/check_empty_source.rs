@@ -19280,6 +19280,62 @@ fn binary_bitwise_byte_integer_literal_rhs_remains_behind_the_stage_gate() {
 }
 
 #[test]
+fn binary_bitwise_byte_scalar_literal_rhs_remains_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn byte_scalar_literal_root(valid: Byte) -> Byte {\n",
+        "    let and_bool = identity_byte(b'a' & true)\n",
+        "    let and_char = identity_byte(b'a' & 'x')\n",
+        "    let and_float = identity_byte(b'a' & 1.0)\n",
+        "    let or_bool = identity_byte(b'a' | false)\n",
+        "    let or_char = identity_byte(b'a' | 'y')\n",
+        "    let or_float = identity_byte(b'a' | 2.0)\n",
+        "    let xor_bool = identity_byte(b'a' ^ true)\n",
+        "    let xor_char = identity_byte(b'a' ^ 'z')\n",
+        "    let xor_float = identity_byte(b'a' ^ 3.0)\n",
+        "    identity_byte(b'b' ^ valid)\n",
+        "}\n",
+        "pub fn byte_scalar_literal_nested(valid: Byte) -> Byte {\n",
+        "    let and_bool = identity_byte(identity_byte(b'a' & true))\n",
+        "    let and_char = identity_byte(identity_byte(b'a' & 'x'))\n",
+        "    let and_float = identity_byte(identity_byte(b'a' & 1.0))\n",
+        "    let or_bool = identity_byte(identity_byte(b'a' | false))\n",
+        "    let or_char = identity_byte(identity_byte(b'a' | 'y'))\n",
+        "    let or_float = identity_byte(identity_byte(b'a' | 2.0))\n",
+        "    let xor_bool = identity_byte(identity_byte(b'a' ^ true))\n",
+        "    let xor_char = identity_byte(identity_byte(b'a' ^ 'z'))\n",
+        "    let xor_float = identity_byte(identity_byte(b'a' ^ 3.0))\n",
+        "    identity_byte(identity_byte(b'b' ^ valid))\n",
+        "}\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct-call Byte-literal-left Bool, Char, and float RHS shapes",
+    );
+}
+
+#[test]
+fn binary_bitwise_byte_scalar_literal_rhs_exclusions_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn byte_string_rhs_stays_gated() -> Byte { identity_byte(b'a' & b\"ab\") }\n",
+        "pub fn computed_rhs_stays_gated(right: Byte) -> Byte { identity_byte(b'a' & (right | b'b')) }\n",
+        "pub fn nested_operator_rhs_stays_gated() -> Byte { identity_byte(b'a' & (b'b' | b'c')) }\n",
+        "pub fn deep_scalar_literal_call_stays_gated() -> Byte { identity_byte(identity_byte(identity_byte(b'a' & true))) }\n",
+        "pub fn generic_scalar_literal_target_stays_gated() -> I32 { generic_identity(b'a' ^ false) }\n",
+        "pub fn unsupported_scalar_literal_signature_stays_gated() -> I32 { text_fn(b'a' | 'b') }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+        "fn generic_identity<T>(value: T) -> I32 { 0 }\n",
+        "fn text_fn(value: Str) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "unsupported scalar-literal RHS families and computed, nested, deep, generic, and signature shapes",
+    );
+}
+
+#[test]
 fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
     let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);
