@@ -19004,9 +19004,44 @@ fn remainder_integer_literal_left_path_arguments_to_direct_calls_remain_behind_t
 }
 
 #[test]
+fn remainder_integer_literal_pairs_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn remainder_literal_pair_i8() -> I8 { identity_i8(7 % 3) }\n",
+        "pub fn remainder_literal_pair_i16() -> I16 { identity_i16(7 % 3) }\n",
+        "pub fn remainder_literal_pair_i32() -> I32 { identity_i32(7 % 3) }\n",
+        "pub fn remainder_literal_pair_i64() -> I64 { identity_i64(7 % 3) }\n",
+        "pub fn remainder_literal_pair_isize() -> ISize { identity_isize(7 % 3) }\n",
+        "pub fn remainder_literal_pair_u8() -> U8 { identity_u8(7 % 3) }\n",
+        "pub fn remainder_literal_pair_u16() -> U16 { identity_u16(7 % 3) }\n",
+        "pub fn remainder_literal_pair_u32() -> U32 { identity_u32(7 % 3) }\n",
+        "pub fn remainder_literal_pair_u64() -> U64 { identity_u64(7 % 3) }\n",
+        "pub fn remainder_literal_pair_usize() -> USize { identity_usize(7 % 3) }\n",
+        "pub fn nested_remainder_literal_pair() -> I32 {\n",
+        "    identity_i32(identity_i32(7 % 3))\n",
+        "}\n",
+        "pub fn remainder_literal_pair_zero_divisor() -> I32 { identity_i32(1 % 0) }\n",
+        "pub fn remainder_literal_pair_signed_min() -> I8 { identity_i8(-128 % -1) }\n",
+        "fn identity_i8(value: I8) -> I8 { value }\n",
+        "fn identity_i16(value: I16) -> I16 { value }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_i64(value: I64) -> I64 { value }\n",
+        "fn identity_isize(value: ISize) -> ISize { value }\n",
+        "fn identity_u8(value: U8) -> U8 { value }\n",
+        "fn identity_u16(value: U16) -> U16 { value }\n",
+        "fn identity_u32(value: U32) -> U32 { value }\n",
+        "fn identity_u64(value: U64) -> U64 { value }\n",
+        "fn identity_usize(value: USize) -> USize { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root/nested direct-call integer-literal remainder pairs",
+    );
+}
+
+#[test]
 fn unsupported_remainder_integer_literal_left_path_shapes_remain_behind_the_stage_gate() {
     let source = concat!(
-        "pub fn literal_pair() -> I32 { identity_i32(1 % 2) }\n",
         "pub fn float_literal(right: F32) -> F32 { identity_f32(1.0 % right) }\n",
         "pub fn computed_left(right: I32) -> I32 { identity_i32((1 + 2) % right) }\n",
         "pub fn computed_right(right: I32) -> I32 { identity_i32(1 % (right + 1)) }\n",
@@ -19033,7 +19068,35 @@ fn unsupported_remainder_integer_literal_left_path_shapes_remain_behind_the_stag
     let output = run_check(source, "", &[], &[]);
     assert_check_stays_gated_without_syntax_errors(
         &output,
-        "literal pairs, float literals, computed/unresolved paths, deep/generic calls, and unsupported signatures",
+        "float literals, computed/unresolved paths, deep/generic calls, and unsupported signatures",
+    );
+}
+
+#[test]
+fn unsupported_remainder_integer_literal_pair_shapes_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn float_left() -> F32 { identity_f32(1.0 % 2.0) }\n",
+        "pub fn float_right() -> I32 { identity_i32(1 % 2.0) }\n",
+        "pub fn byte_pair() -> Byte { identity_byte(b'a' % b'b') }\n",
+        "pub fn bool_pair() -> Bool { identity_bool(true % false) }\n",
+        "pub fn char_pair() -> Char { identity_char('a' % 'b') }\n",
+        "pub fn computed_left() -> I32 { identity_i32((1 + 2) % 3) }\n",
+        "pub fn computed_right() -> I32 { identity_i32(1 % (2 + 3)) }\n",
+        "pub fn deep_nested() -> I32 { identity_i32(identity_i32(identity_i32(1 % 2))) }\n",
+        "pub fn generic_target() -> I32 { generic_identity(1 % 2) }\n",
+        "pub fn unsupported_signature() -> I32 { text(1 % 2) }\n",
+        "fn identity_f32(value: F32) -> F32 { value }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+        "fn identity_bool(value: Bool) -> Bool { value }\n",
+        "fn identity_char(value: Char) -> Char { value }\n",
+        "fn generic_identity<T>(value: T) -> T { value }\n",
+        "fn text(value: String) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "float/mixed/Byte/Bool/Char/computed/deep/generic/unsupported remainder literal pairs",
     );
 }
 
