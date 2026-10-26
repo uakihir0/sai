@@ -1379,7 +1379,7 @@ fn check_reports_tuple_expected_annotated_primitive_local_mismatches() {
         "    let text_local: Str = \"text\"\n",
         "    Payload.Single(text_local)\n",
         "}\n",
-        "fn unit_exclusion() {\n",
+        "fn unit_local_mismatch() {\n",
         "    let unit_local: () = ()\n",
         "    Payload.Single(unit_local)\n",
         "}\n",
@@ -1405,7 +1405,7 @@ fn check_reports_tuple_expected_annotated_primitive_local_mismatches() {
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        8,
+        9,
         "explicit primitive locals, an annotated tuple-pattern local, and the eligible tuple sibling mismatch:\n{stdout}"
     );
     assert_eq!(
@@ -1468,6 +1468,12 @@ fn check_reports_tuple_expected_annotated_primitive_local_mismatches() {
         "Payload.Single(pattern_local)",
         "pattern_local",
         "expected tuple of arity 1, found `Bool`",
+        0,
+    );
+    assert_path_mismatch(
+        "Payload.Single(unit_local)",
+        "unit_local",
+        "expected tuple of arity 1, found `()`",
         0,
     );
     assert_path_mismatch(
@@ -2136,6 +2142,7 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         "type TupleAlias = (I8,)\n",
         "type NestedTupleAlias = (USize, USize)\n",
         "type BoolAlias = Bool\n",
+        "type UnitAlias = ()\n",
         "type Widget { value: Bool }\n",
         "fn outer() {\n",
         "    let actual: (Bool, Byte) = (true, b'x')\n",
@@ -2225,8 +2232,20 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         "    let actual: (Char,) = ('x',)\n",
         "    NestedPayload.Single(actual)\n",
         "}\n",
-        "fn unit_exclusion() {\n",
-        "    let actual: () = ()\n",
+        "fn unit_mismatch() {\n",
+        "    let actual: () = true\n",
+        "    NestedPayload.Single(actual)\n",
+        "}\n",
+        "fn var_unit_mismatch() {\n",
+        "    var actual: () = ()\n",
+        "    NestedPayload.Single(actual)\n",
+        "}\n",
+        "fn nested_unit_mismatch() {\n",
+        "    let actual: () = true\n",
+        "    InferredTuplePayload.Shape((1, actual, 2, (3,)))\n",
+        "}\n",
+        "fn unit_alias_exclusion() {\n",
+        "    let actual: UnitAlias = ()\n",
         "    NestedPayload.Single(actual)\n",
         "}\n",
         "fn alias_exclusion() {\n",
@@ -2246,7 +2265,7 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        18,
+        21,
         "only direct or nested tuple-local shape/leaf mismatches and eligible fixed-literal siblings are reported:\n{stdout}"
     );
     assert_eq!(
@@ -2309,6 +2328,24 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
             "UnitLeafPayload.Shape(actual)",
             "actual",
             "expected `()`, found `Bool`",
+        ),
+        (
+            "unit_mismatch",
+            "NestedPayload.Single(actual)",
+            "actual",
+            "expected tuple of arity 1, found `()`",
+        ),
+        (
+            "var_unit_mismatch",
+            "NestedPayload.Single(actual)",
+            "actual",
+            "expected tuple of arity 1, found `()`",
+        ),
+        (
+            "nested_unit_mismatch",
+            "InferredTuplePayload.Shape((1, actual, 2, (3,)))",
+            "actual",
+            "expected tuple of arity 1, found `()`",
         ),
         (
             "unresolved_leaf_then_supported_mismatch",
@@ -2453,6 +2490,26 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
             "{function}: equal, scalar, alias, and unit shapes do not produce nested arity diagnostics:\n{stdout}"
         );
     }
+
+    let unit_alias_function_start = source
+        .find("fn unit_alias_exclusion()")
+        .expect("unit alias exclusion function exists");
+    let unit_alias_call = "NestedPayload.Single(actual)";
+    let unit_alias_call_start = unit_alias_function_start
+        + source[unit_alias_function_start..]
+            .find(unit_alias_call)
+            .expect("unit alias exclusion call exists");
+    let unit_alias_path_start = unit_alias_call_start
+        + unit_alias_call
+            .find("actual")
+            .expect("unit alias path exists");
+    assert!(
+        !stdout.lines().any(|record| {
+            record.contains("\"code\":\"TYPE_MISMATCH\"")
+                && record.contains(&format!("\"start\":{{\"byte\":{unit_alias_path_start},"))
+        }),
+        "a `UnitAlias` annotation is not treated as a direct unit type:\n{stdout}"
+    );
 
     let extra_call = "NestedPayload.Single((1,), extra)";
     let extra_start = source
