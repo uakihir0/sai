@@ -19015,6 +19015,20 @@ fn unary_bitwise_not_path_arguments_to_direct_calls_remain_behind_the_stage_gate
 }
 
 #[test]
+fn binary_shift_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn left_shift_argument(value: I32, count: U32) -> I32 { identity_i32(value << count) }\n",
+        "pub fn nested_right_shift_argument(value: I32, count: U32) -> I32 { identity_i32(identity_i32(value >> count)) }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct calls with binary shift path arguments",
+    );
+}
+
+#[test]
 fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
     let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);

@@ -2858,6 +2858,45 @@ unary_bitwise_not_path_arguments_to_direct_calls_remain_behind_the_stage_gate
 `git diff --check` passed. Final hostile review found no actionable P0–P3
 findings.
 
+**IR-965 direct-call shift arguments** add exactly one `<<` or `>>` node as
+an immediate positional argument to an eligible direct call at the root or
+within the existing one-level nested-call form. Both operands must be plain,
+one-segment, non-generic paths resolving by exact `BindingId` to eligible
+parameters or preceding locals with concrete types. Reuse IR-783's shift
+checker: the left type must be one of the ten integer primitives or `Byte`,
+and the right type must be `U32`. A concrete non-`U32` primitive right path
+reports `TYPE_MISMATCH` at that path and recovers the shift result to the
+left type. `Bool`, `Char`, `F32`, or `F64` on the left retains
+`OPERATOR_NOT_SUPPORTED` over the full expression; preserve the independent
+right-path diagnostic as well when both operands are invalid. Record a
+successful shift result under the exact shift `HirId`. Preserve existing
+operand and call diagnostic spans/order, recovery, taint, valid sibling
+facts, and common positional-prefix behavior at each call level. An
+unresolved literal-origin local path remains `Unsupported` and is not
+constrained by the call parameter or the other shift operand. Literals,
+computed or nested shift operands, calls as shift operands, deeper call
+nesting, and unsupported direct-call targets or signatures remain
+unsupported. Do not add shift-count range checks, lowering, or runtime
+`ShiftOverflow` behavior; keep the CLI Stage 0 gate unchanged.
+
+**IR-965 verification:** With pinned Rust 1.99.1 and the shared target
+directory, `cargo test -p sai_driver
+direct_call_shift_counts_mismatch_for_every_non_u32_primitive --locked
+--offline` passed (1 test), covering all 14 concrete non-`U32` primitive
+RHS types, exact count-path mismatch spans, and recovery to the left type.
+`cargo test -p sai_driver
+primitive_body_type_results_include_exact_direct_function_calls --locked
+--offline` passed (1 test), including both shift operators at root and
+one-level nested-call positions, exact shift/call facts, unsupported-left
+diagnostics, taint and sibling behavior, and the unresolved numeric left
+local `let value = 1; apply(value << count)` as `Unsupported` with no
+primitive projection. The CLI regression
+`cargo test -p sai_cli --test check_empty_source
+binary_shift_path_arguments_to_direct_calls_remain_behind_the_stage_gate
+--locked --offline` passed (1 test). `cargo fmt --all -- --check` and
+`git diff --check` passed. Final hostile review found no actionable P0–P3
+findings.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
