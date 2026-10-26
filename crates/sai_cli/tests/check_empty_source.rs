@@ -1588,8 +1588,8 @@ fn check_reports_tuple_expected_inferred_fixed_primitive_local_mismatches() {
         "    let else_local = true else { return }\n",
         "    Payload.Shape(else_local)\n",
         "}\n",
-        "fn tuple_pattern_exclusion() {\n",
-        "    let (pattern_local, _) = (true, false)\n",
+        "fn tuple_pattern_numeric_wildcard_exclusion() {\n",
+        "    let (pattern_local, _) = (true, 1)\n",
         "    Payload.Shape(pattern_local)\n",
         "}\n",
     );
@@ -1711,6 +1711,223 @@ fn check_reports_tuple_expected_inferred_fixed_primitive_local_mismatches() {
         named_start,
         named_start + named_call.len(),
     );
+}
+
+#[test]
+fn check_reports_tuple_expected_inferred_tuple_pattern_local_mismatches() {
+    let source = concat!(
+        "enum Payload { Shape((I8, (Bool,), USize, (USize,))) }\n",
+        "fn outer() {\n",
+        "    let (actual, _) = (true, false)\n",
+        "    Payload.Shape(actual)\n",
+        "}\n",
+        "fn nested_var() {\n",
+        "    let ((other, var actual), _) = ((true, b'x'), false)\n",
+        "    Payload.Shape((1, actual, 2, (3,)))\n",
+        "}\n",
+        "fn nested_char() {\n",
+        "    let (_, actual) = (false, 'x')\n",
+        "    Payload.Shape((1, (true,), 2, actual))\n",
+        "}\n",
+        "fn unit() {\n",
+        "    let (actual, _) = ((), false)\n",
+        "    Payload.Shape(actual)\n",
+        "}\n",
+        "fn shadowed(parameter: Bool) {\n",
+        "    let (parameter, _) = (b'x', false)\n",
+        "    Payload.Shape(parameter)\n",
+        "}\n",
+        "fn sibling_order() {\n",
+        "    let (var sibling_local, _) = (true, false)\n",
+        "    Payload.Shape((1, sibling_local, true, (3,)))\n",
+        "}\n",
+        "fn extra_tuple_pattern_local() {\n",
+        "    let (extra, _) = (true, false)\n",
+        "    Payload.Shape((1, (true,), 2, (3,)), extra)\n",
+        "}\n",
+        "fn numeric_wildcard_exclusion() {\n",
+        "    let (actual, _) = (true, 1)\n",
+        "    Payload.Shape(actual)\n",
+        "}\n",
+        "fn computed_wildcard_exclusion() {\n",
+        "    let (actual, _) = (true, true and false)\n",
+        "    Payload.Shape(actual)\n",
+        "}\n",
+        "fn depth_four_exclusion() {\n",
+        "    let ((((actual, _), _), _), _) = ((((true, false), true), false), true)\n",
+        "    Payload.Shape(actual)\n",
+        "}\n",
+        "fn annotated_pattern_exclusion() {\n",
+        "    let (actual, _): (Bool, Bool) = (true, false)\n",
+        "    Payload.Shape(actual)\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "tuple-expected inferred tuple-pattern locals",
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        7,
+        "eligible fixed-literal tuple-pattern paths mismatch tuple expectations and sibling checks continue:\n{stdout}"
+    );
+
+    for (function, call, path, expected_message) in [
+        (
+            "outer",
+            "Payload.Shape(actual)",
+            "actual",
+            "expected tuple of arity 4, found `Bool`",
+        ),
+        (
+            "nested_var",
+            "Payload.Shape((1, actual, 2, (3,)))",
+            "actual",
+            "expected tuple of arity 1, found `Byte`",
+        ),
+        (
+            "nested_char",
+            "Payload.Shape((1, (true,), 2, actual))",
+            "actual",
+            "expected tuple of arity 1, found `Char`",
+        ),
+        (
+            "unit",
+            "Payload.Shape(actual)",
+            "actual",
+            "expected tuple of arity 4, found `()`",
+        ),
+        (
+            "shadowed",
+            "Payload.Shape(parameter)",
+            "parameter",
+            "expected tuple of arity 4, found `Byte`",
+        ),
+    ] {
+        let function_start = source
+            .find(&format!("fn {function}"))
+            .expect("tuple-pattern local mismatch function exists");
+        let call_start = function_start
+            + source[function_start..]
+                .find(call)
+                .expect("tuple-pattern local mismatch call exists");
+        let path_start = call_start
+            + call
+                .find(path)
+                .expect("tuple-pattern local path occurs in its call");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            expected_message,
+            path_start,
+            path_start + path.len(),
+        );
+    }
+
+    let sibling_call = "Payload.Shape((1, sibling_local, true, (3,)))";
+    let sibling_start = source
+        .find(sibling_call)
+        .expect("tuple-pattern sibling call exists");
+    let sibling_path_start = sibling_start
+        + sibling_call
+            .find("sibling_local")
+            .expect("tuple-pattern local path exists");
+    let sibling_literal_start = sibling_start
+        + sibling_call
+            .find("true")
+            .expect("eligible Bool sibling literal exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected tuple of arity 1, found `Bool`",
+        sibling_path_start,
+        sibling_path_start + "sibling_local".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `USize`, found a Bool literal",
+        sibling_literal_start,
+        sibling_literal_start + "true".len(),
+    );
+    let sibling_path_record = stdout
+        .find(&format!("\"start\":{{\"byte\":{sibling_path_start},"))
+        .expect("tuple-pattern mismatch record exists");
+    let sibling_literal_record = stdout
+        .find(&format!("\"start\":{{\"byte\":{sibling_literal_start},"))
+        .expect("following eligible literal mismatch record exists");
+    assert!(
+        sibling_path_record < sibling_literal_record,
+        "tuple-pattern local and following eligible literal diagnostics retain source order"
+    );
+
+    let extra_call = "Payload.Shape((1, (true,), 2, (3,)), extra)";
+    let extra_call_start = source
+        .find(extra_call)
+        .expect("extra tuple-pattern local call exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "WRONG_ARGUMENT_COUNT",
+        "Shape: tuple variant expects 1 arguments but found 2",
+        extra_call_start,
+        extra_call_start + extra_call.len(),
+    );
+    let extra_path_start = extra_call_start
+        + extra_call
+            .rfind("extra")
+            .expect("tuple-pattern local appears in extra argument");
+    assert!(
+        !stdout.lines().any(|record| {
+            record.contains("\"code\":\"TYPE_MISMATCH\"")
+                && record.contains(&format!("\"start\":{{\"byte\":{extra_path_start},"))
+        }),
+        "an unmatched extra tuple-pattern path has no signature-backed type expectation:\n{stdout}"
+    );
+
+    for (function, call, path) in [
+        (
+            "numeric_wildcard_exclusion",
+            "Payload.Shape(actual)",
+            "actual",
+        ),
+        (
+            "computed_wildcard_exclusion",
+            "Payload.Shape(actual)",
+            "actual",
+        ),
+        (
+            "extra_tuple_pattern_local",
+            "Payload.Shape((1, (true,), 2, (3,)), extra)",
+            "extra",
+        ),
+        ("depth_four_exclusion", "Payload.Shape(actual)", "actual"),
+        (
+            "annotated_pattern_exclusion",
+            "Payload.Shape(actual)",
+            "actual",
+        ),
+    ] {
+        let function_start = source
+            .find(&format!("fn {function}"))
+            .expect("tuple-pattern exclusion function exists");
+        let call_start = function_start
+            + source[function_start..]
+                .find(call)
+                .expect("tuple-pattern exclusion call exists");
+        let path_start = call_start
+            + call
+                .find(path)
+                .expect("tuple-pattern exclusion path exists");
+        assert!(
+            !stdout.lines().any(|record| {
+                record.contains("\"code\":\"TYPE_MISMATCH\"")
+                    && record.contains(&format!("\"start\":{{\"byte\":{path_start},"))
+            }),
+            "{function}: unsupported tuple-pattern local receives no tuple mismatch:\n{stdout}"
+        );
+    }
 }
 
 #[cfg(all(
