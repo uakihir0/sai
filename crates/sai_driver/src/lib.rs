@@ -42635,6 +42635,21 @@ property "shared"() {}
             .map(|descriptor| descriptor.owner.def_id.to_def_id())
             .collect::<Vec<_>>();
         assert_ne!(same_def_ids[0], same_def_ids[1]);
+        for descriptor in &same_owners {
+            let by_exact_def_id = lookup(descriptor.owner.def_id.to_def_id());
+            let by_owner = resolved
+                .signature_projection_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    descriptor.owner,
+                )
+                .expect("matching owner identity and closures guard the lookup");
+            assert_eq!(
+                by_exact_def_id, by_owner,
+                "each complete DefId lookup matches its corresponding OwnerId projection"
+            );
+        }
         let mut saw_bool = false;
         let mut saw_u8 = false;
         for def_id in &same_def_ids {
