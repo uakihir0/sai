@@ -9216,6 +9216,7 @@ fn is_supported_direct_call_remainder_argument_shape(
             resolved_plain_local_path_binding(right_path, locals, inputs)
                 .is_some_and(|binding| preceding_bindings.contains(&binding))
         }
+        (ExprKind::Lit(Lit::Int { .. }), ExprKind::Lit(Lit::Int { .. })) => true,
         _ => false,
     }
 }
@@ -48911,6 +48912,38 @@ property "shared"() {}
             "pub fn remainder_literal_left_rhs_double_mismatch(right: F64) -> I32 {\n",
             "    apply(1 % right)\n",
             "}\n",
+            "pub fn remainder_literal_pair_i8_call_argument() -> I8 { apply_i8(7 % 3) }\n",
+            "pub fn remainder_literal_pair_i16_call_argument() -> I16 { apply_i16(7 % 3) }\n",
+            "pub fn remainder_literal_pair_i32_call_argument() -> I32 { apply_i32(7 % 3) }\n",
+            "pub fn remainder_literal_pair_i64_call_argument() -> I64 { apply_i64(7 % 3) }\n",
+            "pub fn remainder_literal_pair_isize_call_argument() -> ISize { apply_isize(7 % 3) }\n",
+            "pub fn remainder_literal_pair_u8_call_argument() -> U8 { apply_u8(7 % 3) }\n",
+            "pub fn remainder_literal_pair_u16_call_argument() -> U16 { apply_u16(7 % 3) }\n",
+            "pub fn remainder_literal_pair_u32_call_argument() -> U32 { apply_u32(7 % 3) }\n",
+            "pub fn remainder_literal_pair_u64_call_argument() -> U64 { apply_u64(7 % 3) }\n",
+            "pub fn remainder_literal_pair_usize_call_argument() -> USize { apply_usize(7 % 3) }\n",
+            "pub fn nested_remainder_literal_pair_call_argument() -> I32 { apply_i32(apply_i32(7 % 3)) }\n",
+            "pub fn remainder_literal_pair_zero_divisor_call_argument() -> I32 { apply_i32(1 % 0) }\n",
+            "pub fn remainder_literal_pair_signed_min_call_argument() -> I8 { apply_i8(-128 % -1) }\n",
+            "pub fn remainder_literal_pair_ranges_i8() -> I8 {\n",
+            "    let failed_left = apply_i8(-129 % 1)\n",
+            "    let failed_right = apply_i8(1 % -129)\n",
+            "    apply_i8(-128 % -1)\n",
+            "}\n",
+            "pub fn remainder_literal_pair_ranges_u8() -> U8 {\n",
+            "    let failed_left = apply_u8(-1 % 1)\n",
+            "    let failed_right = apply_u8(1 % -1)\n",
+            "    apply_u8(1 % 0)\n",
+            "}\n",
+            "pub fn remainder_literal_pair_isize_pointer_bounds() -> ISize { apply_isize(2147483647 % 1) }\n",
+            "pub fn remainder_literal_pair_usize_pointer_bounds() -> USize { apply_usize(1 % 4294967295) }\n",
+            "pub fn remainder_literal_pair_isize_pointer_range() -> ISize { apply_isize(1 % 2147483648) }\n",
+            "pub fn remainder_literal_pair_usize_pointer_range() -> USize { apply_usize(4294967296 % 1) }\n",
+            "pub fn remainder_literal_pair_parameter_mismatch() -> I32 {\n",
+            "    let failed = apply_bool(1 % 2)\n",
+            "    let alias = failed\n",
+            "    apply_i32(3 % 1)\n",
+            "}\n",
             "pub fn nested_remainder_path_pair_call_argument(left: I32, right: I32) -> I32 { apply_i32(apply(left % right)) }\n",
             "pub fn remainder_path_pair_local_copies_call_argument(left: I32, right: I32) -> I32 {\n",
             "    let lhs = left\n",
@@ -48968,7 +49001,6 @@ property "shared"() {}
             "pub fn byte_literal_pair() -> I32 { apply(b'a' + b'b') }\n",
             "pub fn char_literal_pair() -> I32 { apply('a' + 'b') }\n",
             "pub fn remainder_literal_left_call_argument(input: I32) -> I32 { apply(2 % input) }\n",
-            "pub fn remainder_literal_pair_call_argument() -> I32 { apply(1 % 2) }\n",
             "pub fn remainder_float_literal_rhs_call_argument(input: I32) -> I32 { apply(input % 2.0) }\n",
             "pub fn remainder_computed_rhs_call_argument(input: I32) -> I32 { apply(input % (1 + 2)) }\n",
             "pub fn remainder_nested_operator_call_argument(input: I32) -> I32 { apply((input % 2) + 1) }\n",
@@ -48998,7 +49030,6 @@ property "shared"() {}
             "pub fn remainder_path_pair_generic_target_unsupported(left: I32, right: I32) -> I32 { generic_fn(left % right) }\n",
             "pub fn remainder_unsupported_signature_call_argument(input: I32) -> I32 { text_fn(input % 2) }\n",
             "pub fn remainder_path_pair_unsupported_signature_unsupported(left: I32, right: I32) -> I32 { text_fn(left % right) }\n",
-            "pub fn remainder_literal_left_integer_pair_unsupported() -> I32 { apply(1 % 2) }\n",
             "pub fn remainder_literal_left_float_unsupported(right: F32) -> F32 { float_fn(1.0 % right) }\n",
             "pub fn remainder_literal_left_computed_left_unsupported(right: I32) -> I32 { apply((1 + 2) % right) }\n",
             "pub fn remainder_literal_left_computed_right_unsupported(right: I32) -> I32 { apply(1 % (right + 1)) }\n",
@@ -49015,6 +49046,16 @@ property "shared"() {}
             "pub fn remainder_literal_left_deep_nested_unsupported(right: I32) -> I32 { apply_i32(apply_i32(apply(1 % right))) }\n",
             "pub fn remainder_literal_left_generic_target_unsupported(right: I32) -> I32 { generic_fn(1 % right) }\n",
             "pub fn remainder_literal_left_unsupported_signature(right: I32) -> I32 { text_fn(1 % right) }\n",
+            "pub fn remainder_literal_pair_float_left_unsupported() -> F32 { float_fn(1.0 % 2.0) }\n",
+            "pub fn remainder_literal_pair_float_right_unsupported() -> I32 { apply_i32(1 % 2.0) }\n",
+            "pub fn remainder_literal_pair_byte_unsupported() -> Byte { apply_byte(b'a' % b'b') }\n",
+            "pub fn remainder_literal_pair_bool_unsupported() -> Bool { apply_bool(true % false) }\n",
+            "pub fn remainder_literal_pair_char_unsupported() -> Char { identity_char('a' % 'b') }\n",
+            "pub fn remainder_literal_pair_computed_left_unsupported() -> I32 { apply_i32((1 + 2) % 3) }\n",
+            "pub fn remainder_literal_pair_computed_right_unsupported() -> I32 { apply_i32(1 % (2 + 3)) }\n",
+            "pub fn remainder_literal_pair_deep_nested_unsupported() -> I32 { apply_i32(apply_i32(apply_i32(1 % 2))) }\n",
+            "pub fn remainder_literal_pair_generic_target_unsupported() -> I32 { generic_fn(1 % 2) }\n",
+            "pub fn remainder_literal_pair_unsupported_signature() -> I32 { text_fn(1 % 2) }\n",
             "pub fn call_under_arithmetic_argument(input: I32) -> I32 { apply(add_one(input) + 1) }\n",
             "pub fn call_in_operator(input: I32) -> I32 {\n",
             "    let result = apply(input) + 1\n",
@@ -50466,6 +50507,37 @@ property "shared"() {}
         );
         let remainder_literal_left_call_argument =
             assert_supported(&database, "remainder_literal_left_call_argument", &[]);
+        let remainder_literal_pair_ranges_i8 = assert_supported(
+            &database,
+            "remainder_literal_pair_ranges_i8",
+            &[
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::LiteralOutOfRange,
+            ],
+        );
+        let remainder_literal_pair_ranges_u8 = assert_supported(
+            &database,
+            "remainder_literal_pair_ranges_u8",
+            &[
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::LiteralOutOfRange,
+            ],
+        );
+        let remainder_literal_pair_isize_pointer_range = assert_supported(
+            &database,
+            "remainder_literal_pair_isize_pointer_range",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let remainder_literal_pair_usize_pointer_range = assert_supported(
+            &database,
+            "remainder_literal_pair_usize_pointer_range",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let remainder_literal_pair_parameter_mismatch = assert_supported(
+            &database,
+            "remainder_literal_pair_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         let remainder_literal_left_parameter_mismatch = assert_supported(
             &database,
             "remainder_literal_left_parameter_mismatch",
@@ -51057,7 +51129,6 @@ property "shared"() {}
             "bool_literal_pair",
             "byte_literal_pair",
             "char_literal_pair",
-            "remainder_literal_pair_call_argument",
             "remainder_float_literal_rhs_call_argument",
             "remainder_computed_rhs_call_argument",
             "remainder_nested_operator_call_argument",
@@ -51077,7 +51148,6 @@ property "shared"() {}
             "remainder_path_pair_generic_target_unsupported",
             "remainder_unsupported_signature_call_argument",
             "remainder_path_pair_unsupported_signature_unsupported",
-            "remainder_literal_left_integer_pair_unsupported",
             "remainder_literal_left_float_unsupported",
             "remainder_literal_left_computed_left_unsupported",
             "remainder_literal_left_computed_right_unsupported",
@@ -51087,6 +51157,16 @@ property "shared"() {}
             "remainder_literal_left_deep_nested_unsupported",
             "remainder_literal_left_generic_target_unsupported",
             "remainder_literal_left_unsupported_signature",
+            "remainder_literal_pair_float_left_unsupported",
+            "remainder_literal_pair_float_right_unsupported",
+            "remainder_literal_pair_byte_unsupported",
+            "remainder_literal_pair_bool_unsupported",
+            "remainder_literal_pair_char_unsupported",
+            "remainder_literal_pair_computed_left_unsupported",
+            "remainder_literal_pair_computed_right_unsupported",
+            "remainder_literal_pair_deep_nested_unsupported",
+            "remainder_literal_pair_generic_target_unsupported",
+            "remainder_literal_pair_unsupported_signature",
             "logical_forward_local_paths_unsupported",
             "logical_integer_literal_operand_unsupported",
             "logical_character_literal_operand_unsupported",
@@ -54749,6 +54829,447 @@ property "shared"() {}
                 "the RHS path constrains a direct literal-left remainder"
             );
         }
+
+        for (primitive_name, callee, primitive) in [
+            ("I8", "apply_i8", PrimTy::I8),
+            ("I16", "apply_i16", PrimTy::I16),
+            ("I32", "apply_i32", PrimTy::I32),
+            ("I64", "apply_i64", PrimTy::I64),
+            ("ISize", "apply_isize", PrimTy::ISize),
+            ("U8", "apply_u8", PrimTy::U8),
+            ("U16", "apply_u16", PrimTy::U16),
+            ("U32", "apply_u32", PrimTy::U32),
+            ("U64", "apply_u64", PrimTy::U64),
+            ("USize", "apply_usize", PrimTy::USize),
+        ] {
+            let suffix = primitive_name.to_ascii_lowercase();
+            let function_name = format!("remainder_literal_pair_{suffix}_call_argument");
+            let function = format!("pub fn {function_name}");
+            let owner = assert_supported(&database, &function_name, &[]);
+            let call = format!("{callee}(7 % 3)");
+            let operator_offset = callee.len() + 1;
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, &call, 0, call.len()),
+                Some(primitive),
+                "the {primitive_name} argument type constrains both integer literals"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    operator_offset,
+                    "7 % 3".len()
+                ),
+                Some(primitive),
+                "the {primitive_name} literal-pair remainder has an exact type fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    operator_offset,
+                    "7".len()
+                ),
+                Some(primitive),
+                "the left literal inherits the {primitive_name} call argument type"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    &call,
+                    operator_offset + "7 % ".len(),
+                    "3".len()
+                ),
+                None,
+                "the pair's RHS constraint is not exposed as an independent literal fact"
+            );
+        }
+
+        let nested_literal_pair = "apply_i32(apply_i32(7 % 3))";
+        let nested_literal_pair_function = "pub fn nested_remainder_literal_pair_call_argument";
+        let nested_literal_pair_owner = assert_supported(
+            &database,
+            "nested_remainder_literal_pair_call_argument",
+            &[],
+        );
+        for (offset, length) in [
+            (0, nested_literal_pair.len()),
+            ("apply_i32(".len(), "apply_i32(7 % 3)".len()),
+            ("apply_i32(apply_i32(".len(), "7 % 3".len()),
+            ("apply_i32(apply_i32(".len(), "7".len()),
+        ] {
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    nested_literal_pair_owner,
+                    nested_literal_pair_function,
+                    nested_literal_pair,
+                    offset,
+                    length
+                ),
+                Some(PrimTy::I32),
+                "the one-level nested call constrains the integer-literal pair"
+            );
+        }
+
+        for (function_name, function, call, primitive, left_literal) in [
+            (
+                "remainder_literal_pair_zero_divisor_call_argument",
+                "pub fn remainder_literal_pair_zero_divisor_call_argument",
+                "apply_i32(1 % 0)",
+                PrimTy::I32,
+                "1",
+            ),
+            (
+                "remainder_literal_pair_signed_min_call_argument",
+                "pub fn remainder_literal_pair_signed_min_call_argument",
+                "apply_i8(-128 % -1)",
+                PrimTy::I8,
+                "-128",
+            ),
+        ] {
+            let owner = assert_supported(&database, function_name, &[]);
+            let operator_offset = call.find('(').expect("the call has an opening delimiter") + 1;
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
+                Some(primitive),
+                "{function_name} is type-checked without evaluating remainder"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    operator_offset,
+                    call.len() - operator_offset - 1
+                ),
+                Some(primitive),
+                "{function_name} retains its exact remainder fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    operator_offset,
+                    left_literal.len()
+                ),
+                Some(primitive),
+                "{function_name} constrains the left literal to its call parameter"
+            );
+        }
+
+        for (owner, function, cases, sibling_call, sibling_type) in [
+            (
+                remainder_literal_pair_ranges_i8,
+                "pub fn remainder_literal_pair_ranges_i8",
+                [("-129 % 1", "-129", 0), ("1 % -129", "-129", "1 % ".len())],
+                "apply_i8(-128 % -1)",
+                PrimTy::I8,
+            ),
+            (
+                remainder_literal_pair_ranges_u8,
+                "pub fn remainder_literal_pair_ranges_u8",
+                [("-1 % 1", "-1", 0), ("1 % -1", "-1", "1 % ".len())],
+                "apply_u8(1 % 0)",
+                PrimTy::U8,
+            ),
+        ] {
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("literal-pair range diagnostics are available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{function} remains supported with literal range diagnostics")
+                }
+            };
+            let primitive = if function.ends_with("_i8") {
+                "I8"
+            } else {
+                "U8"
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    format!("integer literal is out of range for `{primitive}`"),
+                    format!("integer literal is out of range for `{primitive}`"),
+                ],
+                "{function} checks both literal operands against the call-selected type"
+            );
+            let function_start = root
+                .find(function)
+                .expect("the literal-pair range function exists");
+            for (diagnostic, (expression, literal, offset)) in diagnostics.iter().zip(cases) {
+                let expression_start = function_start
+                    + root[function_start..]
+                        .find(expression)
+                        .expect("the out-of-range literal-pair expression exists");
+                let literal_start = expression_start + offset;
+                assert_eq!(
+                    diagnostic
+                        .primary()
+                        .expect("the literal range diagnostic has a primary span")
+                        .span
+                        .range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(literal_start as u32),
+                        sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                    )
+                    .expect("the sign-inclusive literal span is ordered"),
+                    "{function} reports the exact signed operand span"
+                );
+                let call = match function {
+                    "pub fn remainder_literal_pair_ranges_i8" => {
+                        format!("apply_i8({expression})")
+                    }
+                    _ => format!("apply_u8({expression})"),
+                };
+                assert_eq!(
+                    expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
+                    None,
+                    "{function} taints the call containing an out-of-range pair"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &call,
+                        call.find('(').expect("the call has an opening delimiter") + 1,
+                        expression.len()
+                    ),
+                    None,
+                    "{function} suppresses the failed remainder fact"
+                );
+            }
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    sibling_call,
+                    0,
+                    sibling_call.len()
+                ),
+                Some(sibling_type),
+                "{function} retains a valid sibling after range errors"
+            );
+        }
+
+        for (function_name, function, call, expected, literal, literal_offset) in [
+            (
+                "remainder_literal_pair_isize_pointer_bounds",
+                "pub fn remainder_literal_pair_isize_pointer_bounds",
+                "apply_isize(2147483647 % 1)",
+                PrimTy::ISize,
+                "2147483647",
+                "apply_isize(".len(),
+            ),
+            (
+                "remainder_literal_pair_usize_pointer_bounds",
+                "pub fn remainder_literal_pair_usize_pointer_bounds",
+                "apply_usize(1 % 4294967295)",
+                PrimTy::USize,
+                "4294967295",
+                "apply_usize(1 % ".len(),
+            ),
+        ] {
+            let owner = assert_supported(&database, function_name, &[]);
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
+                Some(expected),
+                "{function_name} accepts the wasm32 pointer-width boundary"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    call.find('(').expect("the call has an opening delimiter") + 1,
+                    call.len() - call.find('(').expect("the call has an opening delimiter") - 2
+                ),
+                Some(expected),
+                "{function_name} retains the pointer-width boundary remainder fact"
+            );
+            assert!(call[literal_offset..].starts_with(literal));
+        }
+
+        for (owner, function, call, message, literal, offset) in [
+            (
+                remainder_literal_pair_isize_pointer_range,
+                "pub fn remainder_literal_pair_isize_pointer_range",
+                "apply_isize(1 % 2147483648)",
+                "integer literal is out of range for `ISize`",
+                "2147483648",
+                "apply_isize(1 % ".len(),
+            ),
+            (
+                remainder_literal_pair_usize_pointer_range,
+                "pub fn remainder_literal_pair_usize_pointer_range",
+                "apply_usize(4294967296 % 1)",
+                "integer literal is out of range for `USize`",
+                "4294967296",
+                "apply_usize(".len(),
+            ),
+        ] {
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("pointer-width range diagnostics are available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{function} remains supported with a pointer-width range diagnostic")
+                }
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>(),
+                [message],
+                "{function} reports the selected pointer-width range"
+            );
+            let function_start = root
+                .find(function)
+                .expect("the pointer-width range function exists");
+            let literal_start = function_start
+                + root[function_start..]
+                    .find(literal)
+                    .expect("the out-of-range pointer-width literal exists");
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("the pointer-width range has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(literal_start as u32),
+                    sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                )
+                .expect("the pointer-width literal span is ordered"),
+                "{function} reports the exact pointer-width operand span"
+            );
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
+                None,
+                "{function} taints the containing call on range failure"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    offset,
+                    call.len() - offset - 1
+                ),
+                None,
+                "{function} suppresses the failed remainder fact"
+            );
+        }
+
+        let literal_pair_mismatch_call = "apply_bool(1 % 2)";
+        let literal_pair_mismatch_function = "pub fn remainder_literal_pair_parameter_mismatch";
+        let literal_pair_mismatch_operator_offset = "apply_bool(".len();
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_pair_parameter_mismatch,
+                literal_pair_mismatch_function,
+                literal_pair_mismatch_call,
+                0,
+                literal_pair_mismatch_call.len()
+            ),
+            None,
+            "a mismatched call parameter taints the literal-pair call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_pair_parameter_mismatch,
+                literal_pair_mismatch_function,
+                literal_pair_mismatch_call,
+                literal_pair_mismatch_operator_offset,
+                "1 % 2".len()
+            ),
+            None,
+            "a mismatched call parameter taints the literal-pair operator"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_pair_parameter_mismatch,
+                literal_pair_mismatch_function,
+                "let alias = failed",
+                "let alias = ".len(),
+                "failed".len()
+            ),
+            None,
+            "an inferred alias of a failed literal-pair call remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                remainder_literal_pair_parameter_mismatch,
+                literal_pair_mismatch_function,
+                "apply_i32(3 % 1)",
+                0,
+                "apply_i32(3 % 1)".len()
+            ),
+            Some(PrimTy::I32),
+            "a valid literal-pair sibling retains its exact call fact"
+        );
+        let literal_pair_mismatch_diagnostics = match remainder_literal_pair_parameter_mismatch
+            .body_type_check()
+            .expect("literal-pair parameter mismatch diagnostics are available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("literal-pair parameter mismatch remains supported")
+            }
+        };
+        assert_eq!(
+            literal_pair_mismatch_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["expected `Bool`, found an integer literal"],
+            "the call's expected parameter type is checked against the inferred pair"
+        );
+        let literal_pair_mismatch_function_start = root
+            .find(literal_pair_mismatch_function)
+            .expect("the literal-pair mismatch function exists");
+        let literal_pair_mismatch_start = literal_pair_mismatch_function_start
+            + root[literal_pair_mismatch_function_start..]
+                .find("1 % 2")
+                .expect("the mismatched literal-pair operator exists");
+        assert_eq!(
+            literal_pair_mismatch_diagnostics[0]
+                .primary()
+                .expect("the literal-pair mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(literal_pair_mismatch_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (literal_pair_mismatch_start + "1 % 2".len()) as u32
+                ),
+            )
+            .expect("the literal-pair parameter mismatch span is ordered")
+        );
 
         let literal_left_range_diagnostics = match remainder_literal_left_ranges
             .body_type_check()

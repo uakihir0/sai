@@ -4995,6 +4995,10 @@ fn is_supported_direct_call_remainder_operands(left: &Expr<'_>, right: &Expr<'_>
             ExprKind::Path(_),
             ExprKind::Lit(Lit::Int { .. }) | ExprKind::Path(_)
         ) | (ExprKind::Lit(Lit::Int { .. }), ExprKind::Path(_))
+            | (
+                ExprKind::Lit(Lit::Int { .. }),
+                ExprKind::Lit(Lit::Int { .. })
+            )
     )
 }
 

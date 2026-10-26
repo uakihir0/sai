@@ -3244,6 +3244,49 @@ no remainder evaluation or runtime behavior.
   messages and RHS spans; follow-up review found no remaining actionable
   findings.
 
+**IR-979 direct-call remainder with integer-literal pairs** extends the root
+or existing one-level nested direct-call argument slice to one exact
+`integer_literal % integer_literal` expression. Both leaves must be direct HIR
+`Lit::Int` nodes, including integer tokens whose negative signs were folded
+into the literal. The selected callee parameter constrains the shared integer
+literal variable through `check_remainder`; retain its existing target-width
+range diagnostics and recovery. Keep `1 % 0` and signed `I8 -128 % -1`
+type-checkable without evaluating either remainder. The focused driver
+fixtures use `wasm32-core`, so their `ISize`/`USize` boundary values are
+explicitly 32-bit. Preserve root/one-level nesting, direct-call signature and
+common-prefix constraints, the CLI Stage 0 gate, and the absence of runtime
+remainder semantics. Mixed/floating, `Byte`, `Bool`, `Char`, computed, deeper,
+generic-target, and unsupported-signature forms remain gated.
+
+- **Review required:** Challenge that only two direct integer literal leaves
+  are admitted and that both driver and body-checker gates agree. Verify the
+  callee parameter selects the type for both operands and the operator across
+  all ten integer primitives, including root and one nested call. Confirm
+  `1 % 0` and `I8 -128 % -1` are type-checked without constant evaluation.
+  Check sign-inclusive left and right range spans for `I8 -129` and `U8 -1`,
+  wasm32 `ISize`/`USize` boundaries, call-parameter mismatch taint and
+  recovery, and an independent valid sibling. Reject float/mixed families,
+  `Byte`/`Bool`/`Char`, computed operands, deep nesting, generic targets, and
+  unsupported signatures. Keep the CLI fixture for accepted pairs separate
+  from pair exclusions and make no runtime claim.
+- **Planned test matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` with all
+  ten parameter-selected types, root/nested calls, zero divisor, signed
+  minimum `% -1`, sign-inclusive I8/U8 left and right range failures, wasm32
+  `ISize`/`USize` boundaries, mismatch taint, and valid sibling recovery.
+  Reject non-integer literal families, computed/deep/generic/signature shapes.
+  Add isolated accepted and excluded CLI Stage 0 fixtures. Run pinned driver
+  and CLI tests, formatting, and diff checks; request independent hostile
+  review.
+- **Verification:** With pinned Rust 1.99.1,
+  `cargo test -p sai_driver --lib --locked --offline primitive_body_type_results_include_exact_direct_function_calls`
+  passed (1 test). CLI filters
+  `remainder_integer_literal_pair`, `remainder_integer_literal_left`, and
+  `remainder_path_pair` passed (2 tests each), covering the isolated pair
+  fixtures and prior regressions. `cargo fmt --all -- --check` and
+  `git diff --check` passed.
+- **Hostile review:** Independent read-only hostile review found no actionable findings and confirmed the gate, test, and documentation coverage.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
