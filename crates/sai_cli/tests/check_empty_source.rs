@@ -18946,12 +18946,39 @@ fn logical_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn both_ready(left: Bool, right: Bool) -> Bool { identity_bool(left and right) }\n",
         "pub fn either_ready(left: Bool, right: Bool) -> Bool { identity_bool(identity_bool(left or right)) }\n",
+        "pub fn literal_and(left: Bool) -> Bool { identity_bool(left and true) }\n",
+        "pub fn literal_or(right: Bool) -> Bool { identity_bool(false or right) }\n",
+        "pub fn literal_pair() -> Bool { identity_bool(true and false) }\n",
+        "pub fn nested_literal_and(left: Bool) -> Bool { identity_bool(identity_bool(left and true)) }\n",
+        "pub fn nested_literal_or() -> Bool { identity_bool(identity_bool(false or true)) }\n",
         "fn identity_bool(value: Bool) -> Bool { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
     assert_check_stays_gated_without_syntax_errors(
         &output,
-        "a direct or one-level nested call with a logical argument",
+        "a direct or one-level nested call with path and Bool-literal logical operands",
+    );
+}
+
+#[test]
+fn unary_not_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn negate(value: Bool) -> Bool { identity_bool(not value) }\n",
+        "pub fn nested_negate(value: Bool) -> Bool { identity_bool(identity_bool(not value)) }\n",
+        "pub fn negate_true() -> Bool { identity_bool(not true) }\n",
+        "pub fn negate_false() -> Bool { identity_bool(not false) }\n",
+        "pub fn nested_negate_true() -> Bool { identity_bool(identity_bool(not true)) }\n",
+        "pub fn nested_negate_false() -> Bool { identity_bool(identity_bool(not false)) }\n",
+        "pub fn negate_local(value: Bool) -> Bool {\n",
+        "    let copy = value\n",
+        "    identity_bool(not copy)\n",
+        "}\n",
+        "fn identity_bool(value: Bool) -> Bool { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "a direct or one-level nested call with a unary-not path or Bool literal argument",
     );
 }
 
