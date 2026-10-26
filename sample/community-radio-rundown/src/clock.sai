@@ -1,0 +1,4 @@
+pub const SHOW_MINUTES: U32 = 30
+pub const BREAK_START: U32 = 12
+pub const BREAK_MINUTES: U32 = 2
+pub const CLOSING_MINUTES: U32 = 1

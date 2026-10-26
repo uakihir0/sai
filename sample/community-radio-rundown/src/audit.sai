@@ -1,0 +1,132 @@
+use acme:community-radio-rundown/clock
+use acme:community-radio-rundown/data
+use acme:community-radio-rundown/model.{Kind, Plan, ScheduledSegment, Segment}
+use acme:community-radio-rundown/planner
+
+fn contains_segment(plan: Plan, segment_id: U32) -> Bool {
+    for index in 0..plan.len {
+        if plan.entries[index].unwrap().segment.id == segment_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn is_valid(plan: Plan) -> Bool {
+    if plan.len < 2 {
+        return false
+    }
+
+    let first = plan.entries[0].unwrap()
+    let last = plan.entries[plan.len - 1].unwrap()
+    if first.segment.kind != Kind.Opening or last.segment.kind != Kind.Closing {
+        return false
+    }
+    if plan.total_minutes != last.end_minute or plan.total_minutes > clock.SHOW_MINUTES {
+        return false
+    }
+
+    var break_count: U32 = 0
+    for index in 0..plan.len {
+        let current = plan.entries[index].unwrap()
+        if current.end_minute < current.start_minute {
+            return false
+        }
+        if current.end_minute > clock.SHOW_MINUTES {
+            return false
+        }
+        if current.end_minute - current.start_minute != current.segment.duration_minutes {
+            return false
+        }
+        if current.segment.kind == Kind.Break {
+            break_count += 1
+            if (
+                current.start_minute != clock.BREAK_START
+                or current.end_minute - current.start_minute != clock.BREAK_MINUTES
+            ) {
+                return false
+            }
+        }
+        if index + 1 < plan.len {
+            let next = plan.entries[index + 1].unwrap()
+            if current.end_minute > next.start_minute {
+                return false
+            }
+        }
+        for prior_index in 0..index {
+            let prior = plan.entries[prior_index].unwrap()
+            if prior.segment.id == current.segment.id {
+                return false
+            }
+        }
+    }
+    if break_count != 1 {
+        return false
+    }
+
+    for segment in data.segments() {
+        if not segment.optional and not contains_segment(plan, segment.id) {
+            return false
+        }
+    }
+    true
+}
+
+test "the rundown fits the slot and keeps the break at minute twelve" {
+    let plan = planner.build()
+    assert is_valid(plan)
+    assert plan.total_minutes == clock.SHOW_MINUTES
+    assert plan.skipped_optional == 1
+    assert plan.entries[3].unwrap().start_minute == clock.BREAK_START
+    assert plan.entries[3].unwrap().end_minute == clock.BREAK_START + clock.BREAK_MINUTES
+}
+
+test "a one-minute sponsor break fails the clock audit" {
+    let plan = planner.build()
+    let scheduled_break = plan.entries[3].unwrap()
+    let short_break = ScheduledSegment(
+        segment: Segment(
+            id: scheduled_break.segment.id,
+            title: scheduled_break.segment.title,
+            kind: scheduled_break.segment.kind,
+            duration_minutes: clock.BREAK_MINUTES - 1,
+            optional: scheduled_break.segment.optional,
+        ),
+        start_minute: scheduled_break.start_minute,
+        end_minute: scheduled_break.start_minute + clock.BREAK_MINUTES - 1,
+    )
+    var entries = plan.entries
+    entries[3] = Some(short_break)
+    let short_plan = Plan(
+        entries: entries,
+        len: plan.len,
+        total_minutes: plan.total_minutes,
+        skipped_optional: plan.skipped_optional,
+    )
+    assert not is_valid(short_plan)
+}
+
+test "segment duration metadata matches the scheduled interval" {
+    let plan = planner.build()
+    let scheduled_break = plan.entries[3].unwrap()
+    let inconsistent_break = ScheduledSegment(
+        segment: Segment(
+            id: scheduled_break.segment.id,
+            title: scheduled_break.segment.title,
+            kind: scheduled_break.segment.kind,
+            duration_minutes: clock.BREAK_MINUTES - 1,
+            optional: scheduled_break.segment.optional,
+        ),
+        start_minute: scheduled_break.start_minute,
+        end_minute: scheduled_break.end_minute,
+    )
+    var entries = plan.entries
+    entries[3] = Some(inconsistent_break)
+    let inconsistent_plan = Plan(
+        entries: entries,
+        len: plan.len,
+        total_minutes: plan.total_minutes,
+        skipped_optional: plan.skipped_optional,
+    )
+    assert not is_valid(inconsistent_plan)
+}

@@ -1,0 +1,49 @@
+use acme:community-radio-rundown/clock
+use acme:community-radio-rundown/data
+use acme:community-radio-rundown/model.{Kind, Plan, ScheduledSegment, Segment}
+
+fn append(
+    entries: borrow mut Array<Option<ScheduledSegment>, 10>,
+    len: borrow mut USize,
+    segment: Segment,
+    start_minute: U32,
+) {
+    entries[*len] = Some(
+        ScheduledSegment(
+            segment: segment,
+            start_minute: start_minute,
+            end_minute: start_minute + segment.duration_minutes,
+        ),
+    )
+    *len += 1
+}
+
+pub fn build() -> Plan {
+    var entries = Array<Option<ScheduledSegment>, 10>.filled(None)
+    var len: USize = 0
+    var cursor: U32 = 0
+    var skipped_optional: U32 = 0
+
+    for segment in data.segments() {
+        if segment.kind == Kind.Break {
+            if cursor < clock.BREAK_START {
+                cursor = clock.BREAK_START
+            }
+            append(borrow mut entries, borrow mut len, segment, cursor)
+            cursor += segment.duration_minutes
+        } else if segment.kind == Kind.Closing {
+            append(borrow mut entries, borrow mut len, segment, cursor)
+            cursor += segment.duration_minutes
+        } else {
+            let proposed_end = cursor + segment.duration_minutes
+            if not segment.optional or proposed_end + clock.CLOSING_MINUTES <= clock.SHOW_MINUTES {
+                append(borrow mut entries, borrow mut len, segment, cursor)
+                cursor = proposed_end
+            } else {
+                skipped_optional += 1
+            }
+        }
+    }
+
+    Plan(entries: entries, len: len, total_minutes: cursor, skipped_optional: skipped_optional)
+}

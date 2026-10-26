@@ -1,0 +1,64 @@
+use acme:community-radio-rundown/model.{Kind, Segment}
+
+pub fn segments() -> Array<Segment, 10> {
+    [
+        Segment(id: 1, title: "Opening", kind: Kind.Opening, duration_minutes: 1, optional: false),
+        Segment(
+            id: 2,
+            title: "Five-minute headlines",
+            kind: Kind.Headline,
+            duration_minutes: 5,
+            optional: false,
+        ),
+        Segment(
+            id: 3,
+            title: "Repair cafe guest interview",
+            kind: Kind.Interview,
+            duration_minutes: 6,
+            optional: false,
+        ),
+        Segment(
+            id: 4,
+            title: "Sponsor break",
+            kind: Kind.Break,
+            duration_minutes: 2,
+            optional: false,
+        ),
+        Segment(
+            id: 5,
+            title: "Listener mail: fixing an old radio",
+            kind: Kind.ListenerMail,
+            duration_minutes: 5,
+            optional: false,
+        ),
+        Segment(
+            id: 6,
+            title: "Community calendar",
+            kind: Kind.Calendar,
+            duration_minutes: 3,
+            optional: false,
+        ),
+        Segment(
+            id: 7,
+            title: "Local band spotlight",
+            kind: Kind.Music,
+            duration_minutes: 3,
+            optional: false,
+        ),
+        Segment(
+            id: 8,
+            title: "More listener questions",
+            kind: Kind.ListenerMail,
+            duration_minutes: 4,
+            optional: false,
+        ),
+        Segment(
+            id: 9,
+            title: "Behind the scenes at the studio",
+            kind: Kind.BehindScenes,
+            duration_minutes: 2,
+            optional: true,
+        ),
+        Segment(id: 10, title: "Closing", kind: Kind.Closing, duration_minutes: 1, optional: false),
+    ]
+}

@@ -35,6 +35,7 @@ source repository before a package resolver can fetch them.
 | Intermediate | [`facility-maintenance-queue`](facility-maintenance-queue/README.md) | Schedule a fixed facilities backlog across qualified technicians, shift windows, due times, and a shared parts cupboard. |
 | Intermediate | [`neighborhood-bike-share-rebalancer`](neighborhood-bike-share-rebalancer/README.md) | Plan direct bike-share rebalancing trips by station need and donor inventory while preserving docks reserved for adaptive cycles. |
 | Advanced | [`event-planner`](event-planner/README.md) | Apply session capacity and waitlists, then detect conflicts between confirmed sessions. |
+| Advanced | [`community-radio-rundown`](community-radio-rundown/README.md) | Plan serial broadcast content around a protected break and hard sign-off with a minute-level content clock. |
 | Advanced | [`university-enrollment-planner`](university-enrollment-planner/README.md) | Enforce year, program, prerequisite, credit, and timetable rules while ranking eligible section waitlists. |
 | Advanced | [`turn-based-duel`](turn-based-duel/README.md) | Simulate stateful turns with combat rules, mutable state, and a deterministic opponent strategy. |
 | Advanced | [`incident-response-console`](incident-response-console/README.md) | Score incidents, apply response deadlines, and identify SLA breaches and escalations. |
