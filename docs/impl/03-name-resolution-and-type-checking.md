@@ -2625,6 +2625,13 @@ identity, name, and `let`/`var` mode, and remains bounded by signature-backed
 arguments and equal-arity tuple traversal. Unit and alias annotations,
 tuple-pattern bindings, initializer evidence, and unmatched extra arguments
 remain outside this slice.
+IR-946 extends that check through corresponding directly written nonempty
+nested tuple nodes. It reports only the first nested arity mismatch in
+depth-first source order over the full local-path span. Equal nested arities do
+not check leaf types; tuple-vs-scalar, tuple-vs-unit, and local alias nodes
+remain excluded, and the initializer is still ignored. The iterative walk
+avoids recursive call-stack growth, checks only signature-backed arguments,
+and preserves sibling diagnostics and the Stage 0 incomplete-check gate.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 

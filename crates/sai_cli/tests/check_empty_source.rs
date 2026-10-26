@@ -2124,13 +2124,35 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
     let source = concat!(
         "enum NestedPayload { Single((I8,)) }\n",
         "enum InferredTuplePayload { Shape((I8, (Bool,), USize, (USize,))) }\n",
+        "enum NestedShapeOrder { Shape((I8, ((Bool,),), (USize, USize))) }\n",
         "type TupleAlias = (I8,)\n",
+        "type NestedTupleAlias = (USize, USize)\n",
         "fn outer() {\n",
         "    let actual: (Bool, Byte) = (true, b'x')\n",
         "    InferredTuplePayload.Shape(actual)\n",
         "}\n",
         "fn initializer_shape_ignored() {\n",
         "    let actual: (Bool, Byte) = (true,)\n",
+        "    InferredTuplePayload.Shape(actual)\n",
+        "}\n",
+        "fn nested_first_mismatch() {\n",
+        "    var actual: (Bool, (Bool, Bool), USize, (Char, Char, Char)) = (true, (true, false), 1, ('a', 'b', 'c'))\n",
+        "    InferredTuplePayload.Shape(actual)\n",
+        "}\n",
+        "fn nested_depth_first_mismatch() {\n",
+        "    let actual: (Bool, ((Bool, Bool),), (USize, USize, USize)) = (true, ((true, false),), (1, 2, 3))\n",
+        "    NestedShapeOrder.Shape(actual)\n",
+        "}\n",
+        "fn nested_same_arity() {\n",
+        "    let actual: (Bool, (Char,), USize, (Char,)) = (true, ('x',), 1, ('y',))\n",
+        "    InferredTuplePayload.Shape(actual)\n",
+        "}\n",
+        "fn nested_scalar_and_alias_exclusions() {\n",
+        "    let actual: (Bool, Bool, USize, NestedTupleAlias) = (true, true, 1, (2, 3))\n",
+        "    InferredTuplePayload.Shape(actual)\n",
+        "}\n",
+        "fn nested_unit_exclusion() {\n",
+        "    let actual: (Bool, (), USize, (USize,)) = (true, (), 1, (2,))\n",
         "    InferredTuplePayload.Shape(actual)\n",
         "}\n",
         "fn nested_var() {\n",
@@ -2166,8 +2188,8 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        5,
-        "only direct tuple-local arity mismatches and the eligible Bool sibling mismatch are reported:\n{stdout}"
+        7,
+        "only direct or nested tuple-local arity mismatches and the eligible Bool sibling mismatch are reported:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
@@ -2187,6 +2209,18 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
             "InferredTuplePayload.Shape(actual)",
             "actual",
             "expected tuple of arity 4, found tuple of arity 2",
+        ),
+        (
+            "nested_first_mismatch",
+            "InferredTuplePayload.Shape(actual)",
+            "actual",
+            "expected tuple of arity 1, found tuple of arity 2",
+        ),
+        (
+            "nested_depth_first_mismatch",
+            "NestedShapeOrder.Shape(actual)",
+            "actual",
+            "expected tuple of arity 1, found tuple of arity 2",
         ),
         (
             "nested_var",
@@ -2246,6 +2280,29 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         tuple_local_record < sibling_record,
         "the local path mismatch and eligible sibling diagnostic retain source order"
     );
+
+    for function in [
+        "nested_same_arity",
+        "nested_scalar_and_alias_exclusions",
+        "nested_unit_exclusion",
+    ] {
+        let function_start = source
+            .find(&format!("fn {function}"))
+            .expect("annotated nested tuple-local exclusion function exists");
+        let call = "InferredTuplePayload.Shape(actual)";
+        let call_start = function_start
+            + source[function_start..]
+                .find(call)
+                .expect("annotated nested tuple-local exclusion call exists");
+        let path_start = call_start + call.find("actual").expect("annotated local path exists");
+        assert!(
+            !stdout.lines().any(|record| {
+                record.contains("\"code\":\"TYPE_MISMATCH\"")
+                    && record.contains(&format!("\"start\":{{\"byte\":{path_start},"))
+            }),
+            "{function}: equal, scalar, alias, and unit shapes do not produce nested arity diagnostics:\n{stdout}"
+        );
+    }
 
     let extra_call = "NestedPayload.Single((1,), extra)";
     let extra_start = source

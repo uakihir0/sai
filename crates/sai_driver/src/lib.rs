@@ -9652,11 +9652,11 @@ fn local_enum_variant_annotated_local_primitive(
     }
 }
 
-fn local_enum_variant_annotated_simple_tuple_local_arity(
-    value: &HirExpr<'_>,
-    body: &sai_hir::body::Body<'_>,
+fn local_enum_variant_annotated_simple_tuple_local_annotation<'hir>(
+    value: &HirExpr<'hir>,
+    body: &sai_hir::body::Body<'hir>,
     locals: &LocalResolution,
-) -> Option<usize> {
+) -> Option<&'hir sai_hir::types::Ty<'hir>> {
     let ExprKind::Path(path) = value.kind else {
         return None;
     };
@@ -9682,7 +9682,7 @@ fn local_enum_variant_annotated_simple_tuple_local_arity(
     let ExprKind::Block(body_block) = body.value.kind else {
         return None;
     };
-    let mut annotated_arity = None;
+    let mut annotation = None;
     for statement in body_block.stmts {
         let StmtKind::Let {
             pat,
@@ -9711,7 +9711,7 @@ fn local_enum_variant_annotated_simple_tuple_local_arity(
                 (BindingKind::Let, sai_hir::patterns::BindingMode::Value)
                     | (BindingKind::Var, sai_hir::patterns::BindingMode::Var)
             )
-            || annotated_arity.is_some()
+            || annotation.is_some()
         {
             return None;
         }
@@ -9721,9 +9721,39 @@ fn local_enum_variant_annotated_simple_tuple_local_arity(
         if elements.is_empty() {
             return None;
         }
-        annotated_arity = Some(elements.len());
+        annotation = Some(ty);
     }
-    annotated_arity
+    annotation
+}
+
+fn local_enum_variant_annotated_tuple_local_arity_mismatch(
+    expected_type: &sai_ty::ty::Ty,
+    annotation: &sai_hir::types::Ty<'_>,
+) -> Option<(usize, usize)> {
+    let mut pending = vec![(expected_type, annotation)];
+    while let Some((expected_type, annotation)) = pending.pop() {
+        let (
+            sai_ty::ty::TyKind::Tuple(expected_elements),
+            sai_hir::types::TyKind::Tuple(actual_elements),
+        ) = (expected_type.kind(), annotation.kind)
+        else {
+            continue;
+        };
+        if expected_elements.is_empty() || actual_elements.is_empty() {
+            continue;
+        }
+        if expected_elements.len() != actual_elements.len() {
+            return Some((expected_elements.len(), actual_elements.len()));
+        }
+        pending.extend(
+            expected_elements
+                .iter()
+                .zip(actual_elements)
+                .rev()
+                .map(|(expected, actual)| (expected, actual)),
+        );
+    }
+    None
 }
 
 fn local_enum_variant_annotated_tuple_local_type(
@@ -10326,9 +10356,10 @@ fn check_local_enum_variant_literal_argument(
 
         if let sai_ty::ty::TyKind::Tuple(expected_elements) = expected_type.kind()
             && !expected_elements.is_empty()
-            && let Some(actual_arity) =
-                local_enum_variant_annotated_simple_tuple_local_arity(value, body, locals)
-            && actual_arity != expected_elements.len()
+            && let Some(annotation) =
+                local_enum_variant_annotated_simple_tuple_local_annotation(value, body, locals)
+            && let Some((expected_arity, actual_arity)) =
+                local_enum_variant_annotated_tuple_local_arity_mismatch(expected_type, annotation)
         {
             diagnostics.push(const_literal_diagnostic(
                 owner,
@@ -10338,8 +10369,7 @@ fn check_local_enum_variant_literal_argument(
                 sai_diagnostics::Code::TypeMismatch,
                 format!(
                     "expected tuple of arity {}, found tuple of arity {}",
-                    expected_elements.len(),
-                    actual_arity
+                    expected_arity, actual_arity
                 ),
                 "type mismatch",
             )?);
@@ -98186,6 +98216,7 @@ interface facade { use middle.{payload}; }"#;
             "enum Payload { Unit, Pair(U8, Bool), Fixed(Bool, Byte, Char, ()), Named(value: Bool), UnitPayload(()), CharPayload(Char), Signed(ISize), Wide(USize) }\n",
             "enum NestedPayload { Nested(((I8, Char), ((), USize))), Fixed(((I8, Byte), (Char, Bool))), Single((I8,)) }\n",
             "enum InferredTuplePayload { Shape((I8, (Bool,), USize, (USize,))) }\n",
+            "enum NestedShapeOrder { Shape((I8, ((Bool,),), (USize, USize))) }\n",
             "enum DeepPayload { DeepBool((((Bool, Char), Bool), Bool)), DeepByte((((Byte, Char), Bool), Bool)) }\n",
             "enum Generic<T> { Value(T) }\n",
             "enum Broken { Huge = 170141183460469231731687303715884105728 }\n",
@@ -98363,6 +98394,11 @@ interface facade { use middle.{payload}; }"#;
             "fn nested_call_tuple_annotated_tuple_pattern_depth_four_exclusion() {\n    let ((((actual, _), _), _), _): ((((Bool, Bool), Bool), Bool), Bool) = true\n    InferredTuplePayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_outer_arity_mismatch() {\n    let actual: (Bool, Byte) = (true, b'x')\n    InferredTuplePayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_initializer_shape_ignored() {\n    let actual: (Bool, Byte) = (true,)\n    InferredTuplePayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_local_nested_shape_first_mismatch() {\n    var actual: (Bool, (Bool, Bool), USize, (Char, Char, Char)) = (true, (true, false), 1, ('a', 'b', 'c'))\n    InferredTuplePayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_local_nested_shape_depth_first() {\n    let actual: (Bool, ((Bool, Bool),), (USize, USize, USize)) = (true, ((true, false),), (1, 2, 3))\n    NestedShapeOrder.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_local_nested_shape_same_arity() {\n    let actual: (Bool, (Char,), USize, (Char,)) = (true, ('x',), 1, ('y',))\n    InferredTuplePayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_local_nested_shape_scalar_alias_exclusions() {\n    let actual: (Bool, Bool, USize, TupleAlias) = (true, true, 1, (1, 'x'))\n    InferredTuplePayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_local_nested_shape_unit_exclusion() {\n    let actual: (Bool, (), USize, (USize,)) = (true, (), 1, (2,))\n    InferredTuplePayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_nested_arity_mismatch() {\n    var actual: (Bool, Bool) = (true, false)\n    InferredTuplePayload.Shape((1, actual, true, (3,)))\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_shadow_mismatch(actual: (Bool,)) {\n    let actual: (Bool, Bool) = (true, false)\n    InferredTuplePayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_same_arity() {\n    let actual: (Char,) = ('x',)\n    NestedPayload.Single(actual)\n}\n",
@@ -99713,6 +99749,16 @@ interface facade { use middle.{payload}; }"#;
                 "expected tuple of arity 4, found tuple of arity 2",
             ),
             (
+                "nested_call_tuple_annotated_tuple_local_nested_shape_first_mismatch",
+                "InferredTuplePayload.Shape(actual)",
+                "expected tuple of arity 1, found tuple of arity 2",
+            ),
+            (
+                "nested_call_tuple_annotated_tuple_local_nested_shape_depth_first",
+                "NestedShapeOrder.Shape(actual)",
+                "expected tuple of arity 1, found tuple of arity 2",
+            ),
+            (
                 "nested_call_tuple_annotated_tuple_local_shadow_mismatch",
                 "InferredTuplePayload.Shape(actual)",
                 "expected tuple of arity 4, found tuple of arity 2",
@@ -99748,12 +99794,15 @@ interface facade { use middle.{payload}; }"#;
 
         for name in [
             "nested_call_tuple_annotated_tuple_local_same_arity",
+            "nested_call_tuple_annotated_tuple_local_nested_shape_same_arity",
+            "nested_call_tuple_annotated_tuple_local_nested_shape_scalar_alias_exclusions",
+            "nested_call_tuple_annotated_tuple_local_nested_shape_unit_exclusion",
             "nested_call_tuple_annotated_tuple_local_unit_exclusion",
             "nested_call_tuple_annotated_tuple_local_alias_exclusion",
         ] {
             assert!(
                 paths_for(name).call_diagnostics().is_empty(),
-                "{name}: tuple-local arity projection does not compare elements or accept unit/alias annotations"
+                "{name}: tuple-local shape projection checks only corresponding nonempty tuple arities"
             );
         }
 
