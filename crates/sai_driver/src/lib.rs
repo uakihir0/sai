@@ -9263,6 +9263,15 @@ fn is_supported_direct_call_bitwise_operands_shape(
     inputs: &CurrentOwnerInputs,
 ) -> bool {
     if matches!(left.kind, ExprKind::Lit(Lit::Int { .. })) {
+        if matches!(
+            (left.kind, right.kind),
+            (
+                ExprKind::Lit(Lit::Int { negated: false, .. }),
+                ExprKind::Lit(Lit::Int { negated: false, .. })
+            )
+        ) {
+            return true;
+        }
         let ExprKind::Path(path) = right.kind else {
             return false;
         };
@@ -49142,7 +49151,20 @@ property "shared"() {}
             "}\n",
             "pub fn bitwise_integer_literal_unsupported(left: I32) -> I32 { apply_i32(left & 1) }\n",
             "pub fn bitwise_literal_left_argument(right: I32) -> I32 { apply_i32(1 | right) }\n",
-            "pub fn bitwise_literal_pair_unsupported() -> I32 { apply_i32(1 ^ 2) }\n",
+            "pub fn bitwise_literal_pair_argument() -> I32 { apply_i32(1 ^ 2) }\n",
+            "pub fn bitwise_integer_literal_pair_bounds_i8() -> I8 { apply_i8(127 & 1) }\n",
+            "pub fn bitwise_integer_literal_pair_out_of_range_i8_left() -> I8 { apply_i8(128 & 1) }\n",
+            "pub fn bitwise_integer_literal_pair_out_of_range_i8_right() -> I8 { apply_i8(1 & 128) }\n",
+            "pub fn bitwise_integer_literal_pair_bounds_isize() -> ISize { apply_isize(2147483647 | 1) }\n",
+            "pub fn bitwise_integer_literal_pair_out_of_range_isize() -> ISize { apply_isize(2147483648 | 1) }\n",
+            "pub fn bitwise_integer_literal_pair_bounds_usize() -> USize { apply_usize(4294967295 ^ 1) }\n",
+            "pub fn bitwise_integer_literal_pair_out_of_range_usize() -> USize { apply_usize(4294967296 ^ 1) }\n",
+            "pub fn bitwise_integer_literal_pair_parameter_mismatch() -> I32 {\n",
+            "    let result = apply_bool(1 & 2)\n",
+            "    let alias = result\n",
+            "    let valid = apply_i32(3 ^ 1)\n",
+            "    valid\n",
+            "}\n",
             "pub fn bitwise_integer_literal_left_copy(right: I32) -> I32 {\n",
             "    let copy = right\n",
             "    apply_i32(1 & copy)\n",
@@ -49192,6 +49214,17 @@ property "shared"() {}
             "pub fn bitwise_bool_literal_left_path_unsupported(right: Bool) -> Bool { apply_bool(false | right) }\n",
             "pub fn bitwise_char_literal_left_path_unsupported(right: Char) -> Char { identity_char('x' ^ right) }\n",
             "pub fn bitwise_float_literal_left_path_unsupported(right: F32) -> F32 { float_fn(1.0 & right) }\n",
+            "pub fn bitwise_integer_literal_pair_signed_left_unsupported() -> I32 { apply_i32(-1 & 2) }\n",
+            "pub fn bitwise_integer_literal_pair_signed_right_unsupported() -> I32 { apply_i32(1 & -2) }\n",
+            "pub fn bitwise_byte_literal_pair_unsupported() -> Byte { apply_byte(b'a' & b'b') }\n",
+            "pub fn bitwise_bool_literal_pair_unsupported() -> Bool { apply_bool(true | false) }\n",
+            "pub fn bitwise_char_literal_pair_unsupported() -> Char { identity_char('a' ^ 'b') }\n",
+            "pub fn bitwise_float_literal_pair_unsupported() -> F32 { float_fn(1.0 & 2.0) }\n",
+            "pub fn bitwise_double_literal_pair_unsupported() -> F64 { double_fn(1.0 | 2.0) }\n",
+            "pub fn bitwise_integer_literal_pair_computed_unsupported() -> I32 { apply_i32((1 + 2) ^ 3) }\n",
+            "pub fn bitwise_integer_literal_pair_nested_operator_unsupported() -> I32 { apply_i32((1 & 2) ^ 3) }\n",
+            "pub fn bitwise_integer_literal_pair_call_operand_unsupported() -> I32 { apply_i32(add_one(1) ^ 2) }\n",
+            "pub fn bitwise_integer_literal_pair_generic_target_unsupported() -> I32 { generic_fn(1 ^ 2) }\n",
             "pub fn bitwise_integer_literal_parameter_mismatch(left: I32) -> I32 {\n",
             "    let result = apply_bool(left & 1)\n",
             "    let alias = result\n",
@@ -49530,6 +49563,22 @@ property "shared"() {}
             generated_bitwise_integer_literal_left_cases
                 .push_str(&format!("    {callee}({callee}(3 ^ right))\n}}\n"));
         }
+        let mut generated_bitwise_integer_literal_pair_cases = String::new();
+        let pair_root_operators = ["&", "|", "^"];
+        let pair_nested_operators = ["|", "^", "&"];
+        for (index, (primitive_name, callee, _)) in
+            bitwise_integer_literal_types.iter().copied().enumerate()
+        {
+            let suffix = primitive_name.to_ascii_lowercase();
+            let root_operator = pair_root_operators[index % pair_root_operators.len()];
+            let nested_operator = pair_nested_operators[index % pair_nested_operators.len()];
+            generated_bitwise_integer_literal_pair_cases.push_str(&format!(
+                "pub fn bitwise_integer_literal_pair_root_{suffix}() -> {primitive_name} {{ {callee}(7 {root_operator} 3) }}\n"
+            ));
+            generated_bitwise_integer_literal_pair_cases.push_str(&format!(
+                "pub fn bitwise_integer_literal_pair_nested_{suffix}() -> {primitive_name} {{ {callee}({callee}(9 {nested_operator} 5)) }}\n"
+            ));
+        }
         let bitwise_integer_literal_boundaries = [
             ("I8", "apply_i8", "-128", "127"),
             ("I16", "apply_i16", "-32768", "32767"),
@@ -49587,6 +49636,7 @@ property "shared"() {}
         }
         root.push_str(&generated_bitwise_integer_literal_cases);
         root.push_str(&generated_bitwise_integer_literal_left_cases);
+        root.push_str(&generated_bitwise_integer_literal_pair_cases);
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
@@ -49696,6 +49746,39 @@ property "shared"() {}
         assert_supported(&database, "bitwise_integer_literal_unsupported", &[]);
         let bitwise_literal_left_argument =
             assert_supported(&database, "bitwise_literal_left_argument", &[]);
+        let bitwise_literal_pair_argument =
+            assert_supported(&database, "bitwise_literal_pair_argument", &[]);
+        let bitwise_integer_literal_pair_parameter_mismatch = assert_supported(
+            &database,
+            "bitwise_integer_literal_pair_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_integer_literal_pair_bounds_i8 =
+            assert_supported(&database, "bitwise_integer_literal_pair_bounds_i8", &[]);
+        let bitwise_integer_literal_pair_out_of_range_i8_left = assert_supported(
+            &database,
+            "bitwise_integer_literal_pair_out_of_range_i8_left",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let bitwise_integer_literal_pair_out_of_range_i8_right = assert_supported(
+            &database,
+            "bitwise_integer_literal_pair_out_of_range_i8_right",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let bitwise_integer_literal_pair_bounds_isize =
+            assert_supported(&database, "bitwise_integer_literal_pair_bounds_isize", &[]);
+        let bitwise_integer_literal_pair_out_of_range_isize = assert_supported(
+            &database,
+            "bitwise_integer_literal_pair_out_of_range_isize",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let bitwise_integer_literal_pair_bounds_usize =
+            assert_supported(&database, "bitwise_integer_literal_pair_bounds_usize", &[]);
+        let bitwise_integer_literal_pair_out_of_range_usize = assert_supported(
+            &database,
+            "bitwise_integer_literal_pair_out_of_range_usize",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
         let bitwise_integer_literal_left_copy =
             assert_supported(&database, "bitwise_integer_literal_left_copy", &[]);
         let bitwise_integer_literal_left_rhs_mismatch = assert_supported(
@@ -50354,7 +50437,17 @@ property "shared"() {}
             "bitwise_bool_literal_left_path_unsupported",
             "bitwise_char_literal_left_path_unsupported",
             "bitwise_float_literal_left_path_unsupported",
-            "bitwise_literal_pair_unsupported",
+            "bitwise_integer_literal_pair_signed_left_unsupported",
+            "bitwise_integer_literal_pair_signed_right_unsupported",
+            "bitwise_byte_literal_pair_unsupported",
+            "bitwise_bool_literal_pair_unsupported",
+            "bitwise_char_literal_pair_unsupported",
+            "bitwise_float_literal_pair_unsupported",
+            "bitwise_double_literal_pair_unsupported",
+            "bitwise_integer_literal_pair_computed_unsupported",
+            "bitwise_integer_literal_pair_nested_operator_unsupported",
+            "bitwise_integer_literal_pair_call_operand_unsupported",
+            "bitwise_integer_literal_pair_generic_target_unsupported",
             "bitwise_computed_operand_unsupported",
             "bitwise_nested_operator_unsupported",
             "bitwise_call_operand_unsupported",
@@ -51345,6 +51438,358 @@ property "shared"() {}
                 );
             }
         }
+
+        for (index, (primitive_name, callee, primitive)) in
+            bitwise_integer_literal_types.iter().copied().enumerate()
+        {
+            let suffix = primitive_name.to_ascii_lowercase();
+            let root_function_name = format!("bitwise_integer_literal_pair_root_{suffix}");
+            let nested_function_name = format!("bitwise_integer_literal_pair_nested_{suffix}");
+            let root_function = format!("pub fn {root_function_name}");
+            let nested_function = format!("pub fn {nested_function_name}");
+            let root_owner = assert_supported(&database, &root_function_name, &[]);
+            let nested_owner = assert_supported(&database, &nested_function_name, &[]);
+            let root_operator = pair_root_operators[index % pair_root_operators.len()];
+            let root_expression = format!("7 {root_operator} 3");
+            let root_call = format!("{callee}({root_expression})");
+            let root_operator_offset = callee.len() + 1;
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    root_owner,
+                    &root_function,
+                    &root_call,
+                    0,
+                    root_call.len()
+                ),
+                Some(primitive),
+                "{primitive_name} call parameter constrains a root integer-literal pair"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    root_owner,
+                    &root_function,
+                    &root_call,
+                    root_operator_offset,
+                    root_expression.len()
+                ),
+                Some(primitive),
+                "the exact root {primitive_name} literal-pair operator has a type fact"
+            );
+
+            let nested_operator = pair_nested_operators[index % pair_nested_operators.len()];
+            let nested_expression = format!("9 {nested_operator} 5");
+            let nested_inner_call = format!("{callee}({nested_expression})");
+            let nested_call = format!("{callee}({nested_inner_call})");
+            let nested_inner_offset = callee.len() + 1;
+            let nested_operator_offset = nested_inner_offset + callee.len() + 1;
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    nested_owner,
+                    &nested_function,
+                    &nested_call,
+                    0,
+                    nested_call.len()
+                ),
+                Some(primitive),
+                "{primitive_name} parameter context types the nested outer call"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    nested_owner,
+                    &nested_function,
+                    &nested_call,
+                    nested_inner_offset,
+                    nested_inner_call.len()
+                ),
+                Some(primitive),
+                "the nested {primitive_name} direct call has an exact call fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    nested_owner,
+                    &nested_function,
+                    &nested_call,
+                    nested_operator_offset,
+                    nested_expression.len()
+                ),
+                Some(primitive),
+                "the exact nested {primitive_name} literal-pair operator has a type fact"
+            );
+        }
+
+        let literal_pair_root_call = "apply_i32(1 ^ 2)";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_literal_pair_argument,
+                "pub fn bitwise_literal_pair_argument",
+                literal_pair_root_call,
+                0,
+                literal_pair_root_call.len()
+            ),
+            Some(PrimTy::I32),
+            "a root integer-literal pair remains available through its concrete call parameter"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_literal_pair_argument,
+                "pub fn bitwise_literal_pair_argument",
+                literal_pair_root_call,
+                "apply_i32(".len(),
+                "1 ^ 2".len()
+            ),
+            Some(PrimTy::I32),
+            "the exact root literal-pair operator receives the call parameter type"
+        );
+        for (owner, function, primitive, callee, operator, left_literal, right_literal) in [
+            (
+                bitwise_integer_literal_pair_bounds_i8,
+                "pub fn bitwise_integer_literal_pair_bounds_i8",
+                PrimTy::I8,
+                "apply_i8",
+                "&",
+                "127",
+                "1",
+            ),
+            (
+                bitwise_integer_literal_pair_bounds_isize,
+                "pub fn bitwise_integer_literal_pair_bounds_isize",
+                PrimTy::ISize,
+                "apply_isize",
+                "|",
+                "2147483647",
+                "1",
+            ),
+            (
+                bitwise_integer_literal_pair_bounds_usize,
+                "pub fn bitwise_integer_literal_pair_bounds_usize",
+                PrimTy::USize,
+                "apply_usize",
+                "^",
+                "4294967295",
+                "1",
+            ),
+        ] {
+            let operator_expression = format!("{left_literal} {operator} {right_literal}");
+            let call = format!("{callee}({operator_expression})");
+            let operator_offset = callee.len() + 1;
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
+                Some(primitive),
+                "{function} accepts the fixed upper bound as a direct literal pair"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    operator_offset,
+                    operator_expression.len()
+                ),
+                Some(primitive),
+                "{function} records the boundary operator with its exact type"
+            );
+        }
+
+        for (owner, function, callee, operator, out_of_range_literal, valid_literal) in [
+            (
+                bitwise_integer_literal_pair_out_of_range_i8_left,
+                "pub fn bitwise_integer_literal_pair_out_of_range_i8_left",
+                "apply_i8",
+                "&",
+                "128",
+                "1",
+            ),
+            (
+                bitwise_integer_literal_pair_out_of_range_i8_right,
+                "pub fn bitwise_integer_literal_pair_out_of_range_i8_right",
+                "apply_i8",
+                "&",
+                "128",
+                "1",
+            ),
+            (
+                bitwise_integer_literal_pair_out_of_range_isize,
+                "pub fn bitwise_integer_literal_pair_out_of_range_isize",
+                "apply_isize",
+                "|",
+                "2147483648",
+                "1",
+            ),
+            (
+                bitwise_integer_literal_pair_out_of_range_usize,
+                "pub fn bitwise_integer_literal_pair_out_of_range_usize",
+                "apply_usize",
+                "^",
+                "4294967296",
+                "1",
+            ),
+        ] {
+            let (left_literal, right_literal) = if function.ends_with("_right") {
+                (valid_literal, out_of_range_literal)
+            } else {
+                (out_of_range_literal, valid_literal)
+            };
+            let operator_expression = format!("{left_literal} {operator} {right_literal}");
+            let call = format!("{callee}({operator_expression})");
+            let operator_offset = callee.len() + 1;
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("literal-pair range diagnostics are available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{function} remains supported with a range diagnostic")
+                }
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [sai_diagnostics::Code::LiteralOutOfRange],
+                "{function} reports one range diagnostic"
+            );
+            let function_start = root
+                .find(function)
+                .expect("the integer-literal-pair range function exists");
+            let actual_literal_start = function_start
+                + root[function_start..]
+                    .find(out_of_range_literal)
+                    .expect("the out-of-range literal occurs in the function");
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("the literal-pair range diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(actual_literal_start as u32),
+                    sai_diagnostics::TextSize::new(
+                        (actual_literal_start + out_of_range_literal.len()) as u32
+                    ),
+                )
+                .expect("the literal-pair out-of-range span is ordered"),
+                "{function} points to the exact out-of-range operand"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    &call,
+                    operator_offset,
+                    operator_expression.len()
+                ),
+                None,
+                "{function} suppresses the operator fact on literal range failure"
+            );
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
+                None,
+                "{function} taints the containing call on literal range failure"
+            );
+        }
+
+        let literal_pair_mismatch_call = "apply_bool(1 & 2)";
+        let literal_pair_mismatch_operator_offset = "apply_bool(".len();
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_pair_parameter_mismatch,
+                "pub fn bitwise_integer_literal_pair_parameter_mismatch",
+                literal_pair_mismatch_call,
+                0,
+                literal_pair_mismatch_call.len()
+            ),
+            None,
+            "a mismatched call parameter taints the literal-pair call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_pair_parameter_mismatch,
+                "pub fn bitwise_integer_literal_pair_parameter_mismatch",
+                literal_pair_mismatch_call,
+                literal_pair_mismatch_operator_offset,
+                "1 & 2".len()
+            ),
+            None,
+            "a mismatched call parameter taints the literal-pair operator"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_pair_parameter_mismatch,
+                "pub fn bitwise_integer_literal_pair_parameter_mismatch",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "an inferred alias of a failed literal-pair call remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_integer_literal_pair_parameter_mismatch,
+                "pub fn bitwise_integer_literal_pair_parameter_mismatch",
+                "apply_i32(3 ^ 1)",
+                0,
+                "apply_i32(3 ^ 1)".len()
+            ),
+            Some(PrimTy::I32),
+            "an independent literal-pair sibling retains its exact call fact"
+        );
+        let literal_pair_mismatch_diagnostics =
+            match bitwise_integer_literal_pair_parameter_mismatch
+                .body_type_check()
+                .expect("literal-pair parameter mismatch diagnostics are available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("literal-pair parameter mismatch remains supported")
+                }
+            };
+        assert_eq!(
+            literal_pair_mismatch_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch],
+            "a differing concrete call parameter produces one mismatch"
+        );
+        assert_eq!(
+            literal_pair_mismatch_diagnostics[0].message,
+            "expected `Bool`, found an integer literal",
+            "the direct call preserves the literal-pair parameter mismatch diagnostic"
+        );
+        let mismatch_function_start = root
+            .find("pub fn bitwise_integer_literal_pair_parameter_mismatch")
+            .expect("the literal-pair parameter mismatch fixture exists");
+        let mismatch_operator_start = mismatch_function_start
+            + root[mismatch_function_start..]
+                .find("1 & 2")
+                .expect("the literal-pair parameter mismatch operator exists");
+        assert_eq!(
+            literal_pair_mismatch_diagnostics[0]
+                .primary()
+                .expect("the literal-pair parameter mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(mismatch_operator_start as u32),
+                sai_diagnostics::TextSize::new((mismatch_operator_start + "1 & 2".len()) as u32),
+            )
+            .expect("the literal-pair parameter mismatch span is ordered")
+        );
 
         for (left_name, callee, minimum, maximum) in bitwise_integer_literal_boundaries {
             let primitive = bitwise_integer_literal_types
