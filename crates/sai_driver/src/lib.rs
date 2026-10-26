@@ -9698,46 +9698,151 @@ fn local_enum_variant_annotated_simple_tuple_local_annotation<'hir>(
     let ExprKind::Block(body_block) = body.value.kind else {
         return None;
     };
+
+    enum Work<'hir> {
+        Block(&'hir HirBlock<'hir>),
+        Expr(&'hir HirExpr<'hir>),
+        Stmt(&'hir Stmt<'hir>),
+    }
+
     let mut annotation = None;
-    for statement in body_block.stmts {
-        let StmtKind::Let {
-            pat,
-            ty: Some(ty),
-            els: None,
-            ..
-        } = statement.kind
-        else {
-            continue;
-        };
-        let PatKind::Binding {
-            mode,
-            name,
-            binding: declared_binding,
-            sub: None,
-        } = pat.kind
-        else {
-            continue;
-        };
-        if declared_binding != binding {
-            continue;
+    let mut work = vec![Work::Block(body_block)];
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Block(block) => {
+                if let Some(tail) = block.tail {
+                    work.push(Work::Expr(tail));
+                }
+                work.extend(block.stmts.iter().rev().map(Work::Stmt));
+            }
+            Work::Stmt(statement) => match statement.kind {
+                StmtKind::Let { pat, ty, init, els } => {
+                    if let PatKind::Binding {
+                        mode,
+                        name,
+                        binding: declared_binding,
+                        sub: None,
+                    } = pat.kind
+                        && declared_binding == binding
+                    {
+                        let Some(ty) = ty else {
+                            return None;
+                        };
+                        if els.is_some()
+                            || name.sym != path.segments[0].name.sym
+                            || !matches!(
+                                (binding_kind, mode),
+                                (BindingKind::Let, sai_hir::patterns::BindingMode::Value)
+                                    | (BindingKind::Var, sai_hir::patterns::BindingMode::Var)
+                            )
+                            || annotation.is_some()
+                        {
+                            return None;
+                        }
+                        let sai_hir::types::TyKind::Tuple(elements) = ty.kind else {
+                            return None;
+                        };
+                        if elements.is_empty() {
+                            return None;
+                        }
+                        annotation = Some(ty);
+                    }
+                    // `let ... else` declarations remain out of this bounded
+                    // projection, including declarations in their else block.
+                    work.push(Work::Expr(init));
+                }
+                StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                    work.push(Work::Expr(rhs));
+                    work.push(Work::Expr(lhs));
+                }
+                StmtKind::Assert { cond, msg, .. } => {
+                    if let Some(msg) = msg {
+                        work.push(Work::Expr(msg));
+                    }
+                    work.push(Work::Expr(cond));
+                }
+                StmtKind::Expr(expr) => work.push(Work::Expr(expr)),
+            },
+            Work::Expr(expression) => match expression.kind {
+                ExprKind::Field { base, .. }
+                | ExprKind::TupleField { base, .. }
+                | ExprKind::Unary(_, base)
+                | ExprKind::Borrow(_, base)
+                | ExprKind::Try(base)
+                | ExprKind::Await(base) => work.push(Work::Expr(base)),
+                ExprKind::Call { callee, args, base } => {
+                    if let Some(base) = base {
+                        work.push(Work::Expr(base));
+                    }
+                    work.extend(args.iter().rev().map(|argument| Work::Expr(&argument.expr)));
+                    work.push(Work::Expr(callee));
+                }
+                ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
+                    work.push(Work::Expr(right));
+                    work.push(Work::Expr(left));
+                }
+                ExprKind::Range { start, end, .. } => {
+                    if let Some(end) = end {
+                        work.push(Work::Expr(end));
+                    }
+                    if let Some(start) = start {
+                        work.push(Work::Expr(start));
+                    }
+                }
+                ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
+                    work.extend(elements.iter().rev().map(Work::Expr));
+                }
+                ExprKind::Block(block)
+                | ExprKind::Loop { body: block, .. }
+                | ExprKind::Region { block, .. } => work.push(Work::Block(block)),
+                ExprKind::If { cond, then, els } => {
+                    if let Some(els) = els {
+                        work.push(Work::Expr(els));
+                    }
+                    work.push(Work::Block(then));
+                    work.push(Work::Expr(cond));
+                }
+                ExprKind::Match {
+                    scrutinee, arms, ..
+                } => {
+                    for arm in arms.iter().rev() {
+                        work.push(Work::Expr(&arm.body));
+                        if let Some(guard) = arm.guard {
+                            work.push(Work::Expr(guard));
+                        }
+                    }
+                    work.push(Work::Expr(scrutinee));
+                }
+                ExprKind::Break { value, .. } | ExprKind::Return(value) => {
+                    if let Some(value) = value {
+                        work.push(Work::Expr(value));
+                    }
+                }
+                ExprKind::FormatString(pieces) => {
+                    for piece in pieces.iter().rev() {
+                        if let FmtPiece::Arg { expr, .. } = piece {
+                            work.push(Work::Expr(expr));
+                        }
+                    }
+                }
+                ExprKind::ContractOld { args, base } => {
+                    if let Some(base) = base {
+                        work.push(Work::Expr(base));
+                    }
+                    work.extend(args.iter().rev().map(|argument| Work::Expr(&argument.expr)));
+                }
+                ExprKind::AsCast { operand, .. } => work.push(Work::Expr(operand)),
+                // These introduce nested body owners and are intentionally
+                // outside the ordinary lexical-block search.
+                ExprKind::AsyncBlock { .. } | ExprKind::Closure(_) => {}
+                ExprKind::Lit(_)
+                | ExprKind::Path(_)
+                | ExprKind::ImplicitMember(_)
+                | ExprKind::Continue { .. }
+                | ExprKind::ContractResult
+                | ExprKind::Err => {}
+            },
         }
-        if name.sym != path.segments[0].name.sym
-            || !matches!(
-                (binding_kind, mode),
-                (BindingKind::Let, sai_hir::patterns::BindingMode::Value)
-                    | (BindingKind::Var, sai_hir::patterns::BindingMode::Var)
-            )
-            || annotation.is_some()
-        {
-            return None;
-        }
-        let sai_hir::types::TyKind::Tuple(elements) = ty.kind else {
-            return None;
-        };
-        if elements.is_empty() {
-            return None;
-        }
-        annotation = Some(ty);
     }
     annotation
 }
@@ -98382,6 +98487,7 @@ interface facade { use middle.{payload}; }"#;
             "enum NestedShapeOrder { Shape((I8, ((Bool,),), (USize, USize))) }\n",
             "enum LeafShapeOrder { Shape((I8, ((Bool,),), (USize, USize))) }\n",
             "enum LeafShapePriority { Shape((Bool, (Byte,))) }\n",
+            "enum NestedLocalShapePriority { Shape(((I8, Char), ((), USize))) }\n",
             "enum UnitLeafPayload { Shape(((), Bool)) }\n",
             "enum TupleVsLeafPayload { Shape(((Bool,), (), (USize,))) }\n",
             "enum UnsupportedLeafPayload { Shape((Bool, Byte, Char, USize)) }\n",
@@ -98540,7 +98646,11 @@ interface facade { use middle.{payload}; }"#;
             "fn nested_call_annotated_tuple_scalar_unit_annotation_exclusion() {\n    let actual: () = ()\n    Payload.Pair(actual, true)\n}\n",
             "fn nested_call_annotated_tuple_scalar_unit_alias_exclusion() {\n    let actual: UnitAlias = ()\n    Payload.Pair(1, actual)\n}\n",
             "fn nested_call_annotated_tuple_scalar_parameter_exclusion(actual: (Bool, Byte)) {\n    Payload.Pair(1, actual)\n}\n",
-            "fn nested_call_annotated_tuple_scalar_nested_scope_exclusion() {\n    {\n        let actual: (Bool, Byte) = (true, b'x')\n        Payload.Pair(1, actual)\n    }\n}\n",
+            "fn nested_call_annotated_tuple_scalar_nested_scope_mismatch() {\n    {\n        let actual: (Bool, Byte) = (true, b'x')\n        Payload.Pair(1, actual)\n    }\n}\n",
+            "fn nested_call_annotated_tuple_scalar_nested_scope_shape_precedence() {\n    {\n        let actual: ((Bool,), ((), Bool)) = ((true,), ((), false))\n        NestedLocalShapePriority.Shape(actual)\n    }\n}\n",
+            "fn nested_call_annotated_tuple_scalar_deep_shadowed_var_sibling_order() {\n    let actual: (USize, Char) = (1, 'x')\n    {\n        {\n            var actual: (Byte,) = true\n            LeafShapePriority.Shape((actual, (true,)))\n        }\n    }\n}\n",
+            "fn nested_call_annotated_tuple_scalar_closure_scope_exclusion() {\n    fn() {\n        let actual: (Bool, Byte) = (true, b'x')\n        Payload.Pair(1, actual)\n    }\n}\n",
+            "fn nested_call_annotated_tuple_scalar_nested_else_exclusion() {\n    {\n        let actual: (Bool, Byte) = (true, b'x') else { return }\n        Payload.Pair(1, actual)\n    }\n}\n",
             "fn nested_call_annotated_tuple_scalar_else_exclusion() {\n    let actual: (Bool, Byte) = (true, b'x') else { return }\n    Payload.Pair(1, actual)\n}\n",
             "fn nested_call_annotated_tuple_scalar_extra_exclusion() {\n    let actual: (Bool, Byte) = (true, b'x')\n    Payload.Pair(1, true, actual)\n}\n",
             "fn nested_call_tuple_annotated_nominal_exclusion() {\n    let actual: Widget = true\n    NestedPayload.Single(actual)\n}\n",
@@ -99211,7 +99321,8 @@ interface facade { use middle.{payload}; }"#;
             "nested_call_annotated_tuple_scalar_unit_annotation_exclusion",
             "nested_call_annotated_tuple_scalar_unit_alias_exclusion",
             "nested_call_annotated_tuple_scalar_parameter_exclusion",
-            "nested_call_annotated_tuple_scalar_nested_scope_exclusion",
+            "nested_call_annotated_tuple_scalar_closure_scope_exclusion",
+            "nested_call_annotated_tuple_scalar_nested_else_exclusion",
             "nested_call_annotated_tuple_scalar_else_exclusion",
             "nested_call_tuple_annotated_nominal_exclusion",
             "nested_call_tuple_annotated_tuple_type_exclusion",
@@ -99445,6 +99556,14 @@ interface facade { use middle.{payload}; }"#;
             (
                 "nested_call_annotated_tuple_scalar_mismatch",
                 "expected `Bool`, found tuple of arity 2",
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_nested_scope_mismatch",
+                "expected `Bool`, found tuple of arity 2",
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_nested_scope_shape_precedence",
+                "expected tuple of arity 2, found tuple of arity 1",
             ),
             (
                 "nested_call_annotated_tuple_unit_mismatch",
@@ -99690,6 +99809,21 @@ interface facade { use middle.{payload}; }"#;
                 "nested_call_annotated_tuple_scalar_mismatch",
                 "Payload.Pair(1, actual)",
                 "Payload.Pair(1, ".len(),
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_nested_scope_mismatch",
+                "Payload.Pair(1, actual)",
+                "Payload.Pair(1, ".len(),
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_nested_scope_shape_precedence",
+                "NestedLocalShapePriority.Shape(actual)",
+                "NestedLocalShapePriority.Shape(".len(),
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_deep_shadowed_var_sibling_order",
+                "LeafShapePriority.Shape((actual, (true,)))",
+                "LeafShapePriority.Shape((".len(),
             ),
             (
                 "nested_call_annotated_tuple_unit_mismatch",
@@ -100341,6 +100475,82 @@ interface facade { use middle.{payload}; }"#;
             scalar_sibling_mismatches[1],
             scalar_sibling_call_start + "LeafShapePriority.Shape((actual, (".len(),
             "true".len(),
+        );
+
+        let nested_scope_tuple_shape =
+            paths_for("nested_call_annotated_tuple_scalar_nested_scope_shape_precedence");
+        let nested_scope_tuple_shape_mismatches = nested_scope_tuple_shape
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            nested_scope_tuple_shape_mismatches
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["expected tuple of arity 2, found tuple of arity 1"],
+            "a nested tuple-shape mismatch takes precedence over later leaf mismatches"
+        );
+        assert_eq!(
+            diagnostic_primary_text(nested_scope_tuple_shape_mismatches[0]),
+            "actual",
+            "the nested-block tuple path is the full primary span"
+        );
+
+        let nested_scope_shadowed_var =
+            paths_for("nested_call_annotated_tuple_scalar_deep_shadowed_var_sibling_order");
+        let nested_scope_shadowed_var_mismatches = nested_scope_shadowed_var
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            nested_scope_shadowed_var_mismatches
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected `Bool`, found tuple of arity 1",
+                "expected `Byte`, found a Bool literal",
+            ],
+            "a deeply nested shadowing var path is checked before its eligible sibling"
+        );
+        assert_eq!(
+            nested_scope_shadowed_var_mismatches
+                .iter()
+                .map(|diagnostic| diagnostic_primary_text(diagnostic))
+                .collect::<Vec<_>>(),
+            ["actual", "true"]
+        );
+        let nested_scope_shadowed_var_function_start = root
+            .find("fn nested_call_annotated_tuple_scalar_deep_shadowed_var_sibling_order(")
+            .expect("nested shadowed var function exists");
+        let nested_scope_shadowed_var_call = "LeafShapePriority.Shape((actual, (true,)))";
+        let nested_scope_shadowed_var_call_start = nested_scope_shadowed_var_function_start
+            + root[nested_scope_shadowed_var_function_start..]
+                .find(nested_scope_shadowed_var_call)
+                .expect("nested shadowed var call exists");
+        assert_primary_span(
+            nested_scope_shadowed_var_mismatches[0],
+            nested_scope_shadowed_var_call_start + "LeafShapePriority.Shape((".len(),
+            "actual".len(),
+        );
+        assert_primary_span(
+            nested_scope_shadowed_var_mismatches[1],
+            nested_scope_shadowed_var_call_start + "LeafShapePriority.Shape((actual, (".len(),
+            "true".len(),
+        );
+
+        let closure_scope = paths_for("nested_call_annotated_tuple_scalar_closure_scope_exclusion");
+        assert_eq!(
+            closure_scope.calls().len(),
+            1,
+            "the closure-local constructor call is still projected"
+        );
+        assert!(
+            closure_scope.call_diagnostics().is_empty(),
+            "the outer-body local search does not cross into a closure body"
         );
 
         let annotated_tuple_local_leaf_sibling_order =
