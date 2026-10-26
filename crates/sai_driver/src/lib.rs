@@ -48954,6 +48954,10 @@ property "shared"() {}
             "    let count = 1\n",
             "    apply_i32(left << count)\n",
             "}\n",
+            "pub fn shift_unresolved_left_local_unsupported(count: U32) -> I32 {\n",
+            "    let value = 1\n",
+            "    apply(value << count)\n",
+            "}\n",
             "pub fn shift_extra_ignored(left: I32) -> I32 { apply_i32(left, left << 1) }\n",
             "pub fn not_operand_mismatch(value: I32) -> Bool {\n",
             "    let result = apply_bool(not value)\n",
@@ -49478,6 +49482,7 @@ property "shared"() {}
             "shift_forward_local_unsupported",
             "shift_deep_nested_call_unsupported",
             "shift_unresolved_local_unsupported",
+            "shift_unresolved_left_local_unsupported",
             "not_nested_operand_unsupported",
             "not_call_operand_unsupported",
             "not_logical_operand_unsupported",
@@ -53050,6 +53055,123 @@ property "shared"() {}
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {:?} (index {index}) unexpectedly failed the supported body slice: {check:?}",
                 owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn direct_call_shift_counts_mismatch_for_every_non_u32_primitive() {
+        let rhs_types = [
+            ("i8", "I8"),
+            ("i16", "I16"),
+            ("i32", "I32"),
+            ("i64", "I64"),
+            ("u8", "U8"),
+            ("u16", "U16"),
+            ("u64", "U64"),
+            ("isize", "ISize"),
+            ("usize", "USize"),
+            ("byte", "Byte"),
+            ("bool", "Bool"),
+            ("char", "Char"),
+            ("f32", "F32"),
+            ("f64", "F64"),
+        ];
+        let mut root = String::new();
+        for (name, ty) in rhs_types {
+            root.push_str(&format!(
+                "pub fn shift_rhs_{name}(left: I64, count: {ty}) -> I64 {{ apply(left << count) }}\n"
+            ));
+        }
+        root.push_str("fn apply(value: I64) -> I64 { value }\n");
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        for (name, rhs_type) in rhs_types {
+            let function_name = format!("shift_rhs_{name}");
+            let owner = resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == function_name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{function_name}` exists"));
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("shift RHS owner body check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("concrete RHS type `{rhs_type}` remains a supported mismatch")
+                }
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [sai_diagnostics::Code::TypeMismatch],
+                "only the RHS mismatch is reported for `{rhs_type}`; this also verifies recovery with the I64 left type"
+            );
+            assert_eq!(
+                diagnostics[0].message,
+                format!("expected `U32`, found `{rhs_type}`"),
+                "non-U32 `{rhs_type}` reports the shift-count constraint"
+            );
+            let function_start = root
+                .find(&format!("pub fn {function_name}"))
+                .expect("generated shift function exists");
+            let rhs_start = function_start
+                + root[function_start..]
+                    .find("left << count")
+                    .expect("generated shift expression exists")
+                + "left << ".len();
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("shift RHS mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(rhs_start as u32),
+                    sai_diagnostics::TextSize::new((rhs_start + "count".len()) as u32),
+                )
+                .expect("shift RHS span is ordered"),
+                "the `{rhs_type}` mismatch points at the exact count path"
+            );
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("supported RHS mismatch has no projection error")
+                    .is_some(),
+                "the `{rhs_type}` mismatch still publishes supported primitive results"
             );
         }
     }
