@@ -18983,6 +18983,38 @@ fn unary_not_arguments_to_direct_calls_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn unary_bitwise_not_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn bitnot_path(value: I32) -> I32 { identity_i32(~value) }\n",
+        "pub fn nested_bitnot_local(value: Byte) -> Byte {\n",
+        "    let copy = value\n",
+        "    identity_byte(identity_byte(~copy))\n",
+        "}\n",
+        "pub fn bitnot_literal() -> I32 { identity_i32(~1) }\n",
+        "pub fn bitnot_double(value: I32) -> I32 { identity_i32(~~value) }\n",
+        "pub fn bitnot_computed(value: I32) -> I32 { identity_i32(~(value + 1)) }\n",
+        "pub fn bitnot_call(value: I32) -> I32 { identity_i32(~identity_i32(value)) }\n",
+        "pub fn bitnot_generic(value: I32) -> I32 { generic_identity(~value) }\n",
+        "pub fn bitnot_forward_local(value: I32) -> I32 {\n",
+        "    let result = identity_i32(~copy)\n",
+        "    let copy = value\n",
+        "    result\n",
+        "}\n",
+        "pub fn bitnot_deep_nested(value: I32) -> I32 {\n",
+        "    identity_i32(identity_i32(identity_i32(~value)))\n",
+        "}\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+        "fn generic_identity<T>(value: T) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root or one-level nested direct calls with unary bit-not path arguments",
+    );
+}
+
+#[test]
 fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
     let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);
