@@ -18895,17 +18895,21 @@ fn primitive_const_success_stays_limited_to_the_default_unlocked_check() {
 fn direct_function_calls_remain_behind_the_current_cli_stage_gate() {
     let source = concat!(
         "pub fn direct_call(value: I32) -> I32 { identity(value) }\n",
+        "pub fn nested_direct_call(value: I32) -> I32 { identity(identity(value)) }\n",
         "pub fn identity(value: I32) -> I32 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(&output, "direct function call");
+    assert_check_stays_gated_without_syntax_errors(&output, "direct and nested function calls");
 }
 
 #[test]
 fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
-    let source = "pub fn recurse(value: I32) -> I32 { recurse(value) }\n";
+    let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(&output, "direct self-recursive function");
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "nested direct self-recursive function",
+    );
 }
 
 #[test]
