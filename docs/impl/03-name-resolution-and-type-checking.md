@@ -3394,11 +3394,20 @@ checker, with expression keys checked against its `OwnerId`. It coexists with
 diagnostics for independent nodes, drops tainted or unresolved facts, and
 keeps a written local annotation as the binding type after an initializer
 mismatch. It does not populate `node_types` or satisfy the complete
-`TypeckResults` contract. IR-952 adds checked output facts for the exact
-supported direct calls described in §3.7.12; a call with an arity or argument
-error and its inferred dependents are omitted. This remains a partial
-projection and does not make direct calls available through the CLI's current
-Stage 0 checking gate.
+`TypeckResults` contract. IR-953 stores those facts in `PartialTypeckResults`,
+an owner-scoped sparse result built by `PartialTypeckResultsBuilder`;
+`PrimitiveBodyTypeResults` remains the compatibility view exposed by the
+owner-aware driver. The builder rejects expression IDs and binding witnesses
+whose `HirId.owner` differs from its owner. Because `BindingId` is only an
+owner-local index, each binding fact must be paired with the exact parameter
+or binding-pattern `HirId` from that body; the checker obtains this pair from
+the current body's HIR before insertion. The stored primitive facts remain
+`PrimTy` values and do not pretend to populate canonical `Ty`-valued
+`node_types` or any other complete-result table. IR-952 adds checked output
+facts for the exact supported direct calls described in §3.7.12; a call with
+an arity or argument error and its inferred dependents are omitted. This
+remains a partial projection and does not make direct calls available through
+the CLI's current Stage 0 checking gate.
 
 ### 3.15.1 Contents
 
