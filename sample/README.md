@@ -39,6 +39,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`incident-response-console`](incident-response-console/README.md) | Score incidents, apply response deadlines, and identify SLA breaches and escalations. |
 | Advanced | [`island-grid-dispatch`](island-grid-dispatch/README.md) | Allocate a constrained one-hour power budget by criticality while preserving a battery reserve. |
 | Advanced | [`clinic-shift-roster`](clinic-shift-roster/README.md) | Validate clinician credentials, availability, shift caps, rest periods, and required coverage. |
+| Advanced | [`care-transition-handoff-coordinator`](care-transition-handoff-coordinator/README.md) | Route fictional discharge cases through clinician-supplied clearance and ordered pharmacy, transport, home-support, and follow-up handoffs; assign each next action to one team. |
 | Advanced | [`court-calendar-planner`](court-calendar-planner/README.md) | Schedule fixed hearings around deadlines, judges, courtrooms, parties, witnesses, and session capacity; report unscheduled cases. |
 | Advanced | [`community-food-bank`](community-food-bank/README.md) | Allocate expiring pantry stock across household requests with dietary eligibility and priority rules. |
 | Advanced | [`community-irrigation-rotation`](community-irrigation-rotation/README.md) | Plan drought-restricted garden watering across zone windows, field and canal losses, priority order, flow caps, and a weekly allotment. |
@@ -123,6 +124,9 @@ source repository before a package resolver can fetch them.
   idempotent operations and reverse-order compensation after partial failure.
 - [`reproducible-pipeline-planner`](reproducible-pipeline-planner/README.md)
   validates task dependencies and schedules bounded deterministic batches.
+- [`care-transition-handoff-coordinator`](care-transition-handoff-coordinator/README.md)
+  routes each fictional case's first unresolved required handoff to its owning
+  team while keeping clinical clearance outside the coordinator's authority.
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or

@@ -1,0 +1,82 @@
+use acme:care-transition-handoff-coordinator/data
+use acme:care-transition-handoff-coordinator/model.{
+    Action
+    CoordinationDecision
+    DischargeCase
+    Handoff
+    HandoffStatus
+    Team
+}
+
+fn decision(
+    case_id: U32,
+    action: Action,
+    owner: Team,
+    handoff_index: Option<USize>,
+) -> CoordinationDecision {
+    CoordinationDecision(
+        case_id: case_id,
+        action: action,
+        owner: owner,
+        handoff_index: handoff_index,
+    )
+}
+
+fn confirmation_is_current(handoff: Handoff, now_minute: U32) -> Bool {
+    match handoff.evidence_expires_minute {
+        Some(expiration) => now_minute <= expiration
+        None => false
+    }
+}
+
+pub fn next_action(case: DischargeCase) -> CoordinationDecision {
+    let now_minute = data.fixture_minute()
+    if not case.clinical_clearance {
+        return decision(case.id, Action.AwaitClinicalClearance, Team.Attending, None)
+    }
+
+    var handoff_index: USize = 0
+    for handoff in case.handoffs {
+        if handoff.required {
+            match handoff.status {
+                HandoffStatus.NotRequested => {
+                    return decision(
+                        case.id,
+                        Action.RequestHandoff,
+                        handoff.team,
+                        Some(handoff_index),
+                    )
+                }
+                HandoffStatus.Requested => {
+                    return decision(
+                        case.id,
+                        Action.AwaitHandoffResponse,
+                        handoff.team,
+                        Some(handoff_index),
+                    )
+                }
+                HandoffStatus.Returned => {
+                    return decision(
+                        case.id,
+                        Action.CorrectReturnedHandoff,
+                        handoff.team,
+                        Some(handoff_index),
+                    )
+                }
+                HandoffStatus.Confirmed => {
+                    if not confirmation_is_current(handoff, now_minute) {
+                        return decision(
+                            case.id,
+                            Action.RefreshExpiredEvidence,
+                            handoff.team,
+                            Some(handoff_index),
+                        )
+                    }
+                }
+            }
+        }
+        handoff_index += 1
+    }
+
+    decision(case.id, Action.ReadyForDischargeDesk, Team.DischargeDesk, None)
+}

@@ -1,0 +1,32 @@
+use acme:care-transition-handoff-coordinator/coordinator
+use acme:care-transition-handoff-coordinator/data
+use acme:care-transition-handoff-coordinator/model.{Action, Team}
+
+fn team_name(team: Team) -> Str {
+    match team {
+        Team.Attending => "attending team"
+        Team.Pharmacy => "pharmacy"
+        Team.Transport => "transport"
+        Team.HomeSupport => "home support"
+        Team.FollowUp => "follow-up desk"
+        Team.DischargeDesk => "discharge desk"
+    }
+}
+
+fn action_name(action: Action) -> Str {
+    match action {
+        Action.AwaitClinicalClearance => "await clinician clearance"
+        Action.RequestHandoff => "create handoff"
+        Action.AwaitHandoffResponse => "await team response"
+        Action.CorrectReturnedHandoff => "correct returned handoff"
+        Action.RefreshExpiredEvidence => "refresh expired evidence"
+        Action.ReadyForDischargeDesk => "ready for discharge desk"
+    }
+}
+
+pub fn describe_fixture() -> String {
+    let plan = coordinator.coordinate()
+    let first_index = plan.service_order[0]
+    let first_case = data.cases()[first_index]
+    f"Care transition handoff plan: first case #{first_case.id} is owned by {team_name(plan.decisions[first_index].owner)} ({action_name(plan.decisions[first_index].action)})."
+}
