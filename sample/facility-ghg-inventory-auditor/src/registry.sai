@@ -1,0 +1,200 @@
+use acme:facility-ghg-inventory-auditor/model.{
+    ActivityUnit
+    EmissionFactor
+    EmissionSource
+    HoldReason
+    InventoryInputIssue
+    ReportingScope
+    Scope2Method
+}
+
+fn factor_id_is_duplicated(
+    factors: Array<Option<EmissionFactor>, 6>,
+    factor_count: USize,
+    factor_id: U32,
+) -> Bool {
+    var matches: USize = 0
+    for index in 0..factor_count {
+        match factors[index] {
+            Some(factor) => {
+                if factor.id == factor_id {
+                    matches += 1
+                }
+            }
+            None => {}
+        }
+    }
+    matches > 1
+}
+
+pub fn factor_catalog_issue(
+    factors: Array<Option<EmissionFactor>, 6>,
+    factor_count: USize,
+) -> Option<InventoryInputIssue> {
+    if factor_count > factors.len() {
+        return Some(InventoryInputIssue.CountExceedsCapacity)
+    }
+    for index in 0..factor_count {
+        match factors[index] {
+            Some(factor) => {
+                if factor.id == 0 {
+                    return Some(InventoryInputIssue.InvalidFactorId)
+                }
+                if factor_id_is_duplicated(factors, factor_count, factor.id) {
+                    return Some(InventoryInputIssue.DuplicateFactorId)
+                }
+            }
+            None => return Some(InventoryInputIssue.MissingFactorRecord)
+        }
+    }
+    None
+}
+
+pub fn scope_for_source(source: EmissionSource) -> ReportingScope {
+    match source {
+        EmissionSource.GridElectricity => ReportingScope.Scope2
+        EmissionSource.NaturalGas => ReportingScope.Scope1
+        EmissionSource.FleetDiesel => ReportingScope.Scope1
+        EmissionSource.PassengerFlight => ReportingScope.Scope3
+        EmissionSource.RefrigerantLeak => ReportingScope.Scope1
+        EmissionSource.LandfillWaste => ReportingScope.Scope3
+    }
+}
+
+pub fn select_factor(
+    factors: Array<Option<EmissionFactor>, 6>,
+    factor_count: USize,
+    source: EmissionSource,
+    unit: ActivityUnit,
+    scope: ReportingScope,
+    method: Scope2Method,
+    report_year: U32,
+) -> Result<EmissionFactor, HoldReason> {
+    if factor_count > factors.len() {
+        return Err(HoldReason.MissingFactorRecord)
+    }
+    match factor_catalog_issue(factors, factor_count) {
+        Some(InventoryInputIssue.MissingFactorRecord) => return Err(HoldReason.MissingFactorRecord)
+        Some(InventoryInputIssue.InvalidFactorId) => return Err(HoldReason.InvalidFactorId)
+        Some(InventoryInputIssue.DuplicateFactorId) => return Err(HoldReason.DuplicateFactorId)
+        Some(InventoryInputIssue.CountExceedsCapacity) => return Err(HoldReason.MissingFactorRecord)
+        Some(_) => return Err(HoldReason.MissingFactorRecord)
+        None => {}
+    }
+
+    var in_year_count: USize = 0
+    var exact_candidate_count: USize = 0
+    var in_year_factor: Option<EmissionFactor> = None
+    var source_method_wrong_unit = false
+    var has_expired = false
+    var has_future = false
+    var has_malformed_period = false
+
+    for index in 0..factor_count {
+        match factors[index] {
+            Some(factor) => {
+                if (factor.source == source and factor.scope == scope and factor.method == method) {
+                    if factor.unit != unit {
+                        source_method_wrong_unit = true
+                    } else {
+                        exact_candidate_count += 1
+                        if factor.valid_from_year > factor.valid_through_year {
+                            has_malformed_period = true
+                        } else if report_year < factor.valid_from_year {
+                            has_future = true
+                        } else if report_year > factor.valid_through_year {
+                            has_expired = true
+                        } else {
+                            in_year_count += 1
+                            in_year_factor = Some(factor)
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    if in_year_count > 1 {
+        return Err(HoldReason.AmbiguousFactor)
+    }
+    let factor = match in_year_factor {
+        Some(value) => value
+        None => {
+            if exact_candidate_count == 0 {
+                if source_method_wrong_unit {
+                    return Err(HoldReason.UnitMismatch)
+                }
+                return Err(HoldReason.MissingFactor)
+            }
+            if has_malformed_period {
+                return Err(HoldReason.InvalidFactor)
+            }
+            if has_expired and has_future {
+                return Err(HoldReason.FactorCoverageGap)
+            }
+            if has_expired {
+                return Err(HoldReason.ExpiredFactor)
+            }
+            if has_future {
+                return Err(HoldReason.FactorNotYetValid)
+            }
+            return Err(HoldReason.MissingFactor)
+        }
+    }
+
+    if factor_id_is_duplicated(factors, factor_count, factor.id) {
+        return Err(HoldReason.DuplicateFactorId)
+    }
+    if (
+        factor.grams_per_unit == 0
+        or factor.valid_from_year > factor.valid_through_year
+        or factor.document_reference_id == 0
+        or not factor.approved
+    ) {
+        return Err(HoldReason.InvalidFactor)
+    }
+    Ok(factor)
+}
+
+test "factor history selects the unique version covering the report year" {
+    var factors: Array<Option<EmissionFactor>, 6> = Array<Option<EmissionFactor>, 6>.filled(None)
+    factors[0] = Some(
+        EmissionFactor(
+            id: 31,
+            source: EmissionSource.NaturalGas,
+            unit: ActivityUnit.Therm,
+            scope: ReportingScope.Scope1,
+            method: Scope2Method.NotApplicable,
+            grams_per_unit: 5200,
+            valid_from_year: 2024,
+            valid_through_year: 2024,
+            document_reference_id: 9101,
+            approved: true,
+        ),
+    )
+    factors[1] = Some(
+        EmissionFactor(
+            id: 32,
+            source: EmissionSource.NaturalGas,
+            unit: ActivityUnit.Therm,
+            scope: ReportingScope.Scope1,
+            method: Scope2Method.NotApplicable,
+            grams_per_unit: 5300,
+            valid_from_year: 2025,
+            valid_through_year: 2025,
+            document_reference_id: 9102,
+            approved: true,
+        ),
+    )
+    let selected = match select_factor(
+        factors,
+        2,
+        EmissionSource.NaturalGas,
+        ActivityUnit.Therm,
+        ReportingScope.Scope1,
+        Scope2Method.NotApplicable,
+        2025,
+    ) { Ok(factor) => factor, Err(_) => panic("the 2025 version should be selected") }
+    assert selected.id == 32
+}

@@ -1,0 +1,294 @@
+use acme:facility-ghg-inventory-auditor/model.{
+    ActivityRecord
+    ActivityUnit
+    EmissionFactor
+    EmissionSource
+    InventoryInput
+    InventorySite
+    ReportingScope
+    Scope2Method
+}
+
+pub fn fixture() -> InventoryInput {
+    InventoryInput(
+        report_year: 2025,
+        sites: [
+            Some(InventorySite(id: 10, in_boundary: true)),
+            Some(InventorySite(id: 20, in_boundary: true)),
+            Some(InventorySite(id: 30, in_boundary: false)),
+        ],
+        site_count: 3,
+        activities: [
+            Some(
+                ActivityRecord(
+                    id: 1001,
+                    site_id: 10,
+                    source: EmissionSource.GridElectricity,
+                    unit: ActivityUnit.KilowattHour,
+                    quantity: 12000,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8001,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1002,
+                    site_id: 10,
+                    source: EmissionSource.NaturalGas,
+                    unit: ActivityUnit.Therm,
+                    quantity: 600,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8002,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1003,
+                    site_id: 20,
+                    source: EmissionSource.FleetDiesel,
+                    unit: ActivityUnit.Liter,
+                    quantity: 1200,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8003,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1004,
+                    site_id: 20,
+                    source: EmissionSource.PassengerFlight,
+                    unit: ActivityUnit.PassengerKilometer,
+                    quantity: 4000,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8004,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1005,
+                    site_id: 10,
+                    source: EmissionSource.RefrigerantLeak,
+                    unit: ActivityUnit.Kilogram,
+                    quantity: 4,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8005,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1006,
+                    site_id: 20,
+                    source: EmissionSource.LandfillWaste,
+                    unit: ActivityUnit.Kilogram,
+                    quantity: 900,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8006,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1007,
+                    site_id: 10,
+                    source: EmissionSource.GridElectricity,
+                    unit: ActivityUnit.KilowattHour,
+                    quantity: 0,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8007,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1008,
+                    site_id: 30,
+                    source: EmissionSource.NaturalGas,
+                    unit: ActivityUnit.Therm,
+                    quantity: 20,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8008,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1009,
+                    site_id: 20,
+                    source: EmissionSource.FleetDiesel,
+                    unit: ActivityUnit.Liter,
+                    quantity: 5,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 366,
+                    evidence_reference_id: 8009,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1010,
+                    site_id: 10,
+                    source: EmissionSource.NaturalGas,
+                    unit: ActivityUnit.Therm,
+                    quantity: 10,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8010,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1010,
+                    site_id: 10,
+                    source: EmissionSource.NaturalGas,
+                    unit: ActivityUnit.Therm,
+                    quantity: 11,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8011,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1012,
+                    site_id: 20,
+                    source: EmissionSource.FleetDiesel,
+                    unit: ActivityUnit.Liter,
+                    quantity: 2,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8012,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1013,
+                    site_id: 20,
+                    source: EmissionSource.FleetDiesel,
+                    unit: ActivityUnit.Liter,
+                    quantity: 3,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 8012,
+                ),
+            ),
+            Some(
+                ActivityRecord(
+                    id: 1014,
+                    site_id: 10,
+                    source: EmissionSource.NaturalGas,
+                    unit: ActivityUnit.Therm,
+                    quantity: 1,
+                    reporting_year: 2025,
+                    period_start_day: 1,
+                    period_end_day: 365,
+                    evidence_reference_id: 0,
+                ),
+            ),
+        ],
+        activity_count: 14,
+        factors: [
+            Some(
+                EmissionFactor(
+                    id: 1,
+                    source: EmissionSource.GridElectricity,
+                    unit: ActivityUnit.KilowattHour,
+                    scope: ReportingScope.Scope2,
+                    method: Scope2Method.LocationBased,
+                    grams_per_unit: 410,
+                    valid_from_year: 2025,
+                    valid_through_year: 2025,
+                    document_reference_id: 9001,
+                    approved: true,
+                ),
+            ),
+            Some(
+                EmissionFactor(
+                    id: 2,
+                    source: EmissionSource.GridElectricity,
+                    unit: ActivityUnit.KilowattHour,
+                    scope: ReportingScope.Scope2,
+                    method: Scope2Method.MarketBased,
+                    grams_per_unit: 22,
+                    valid_from_year: 2025,
+                    valid_through_year: 2025,
+                    document_reference_id: 9002,
+                    approved: true,
+                ),
+            ),
+            Some(
+                EmissionFactor(
+                    id: 3,
+                    source: EmissionSource.NaturalGas,
+                    unit: ActivityUnit.Therm,
+                    scope: ReportingScope.Scope1,
+                    method: Scope2Method.NotApplicable,
+                    grams_per_unit: 5300,
+                    valid_from_year: 2025,
+                    valid_through_year: 2025,
+                    document_reference_id: 9003,
+                    approved: true,
+                ),
+            ),
+            Some(
+                EmissionFactor(
+                    id: 4,
+                    source: EmissionSource.FleetDiesel,
+                    unit: ActivityUnit.Liter,
+                    scope: ReportingScope.Scope1,
+                    method: Scope2Method.NotApplicable,
+                    grams_per_unit: 2680,
+                    valid_from_year: 2025,
+                    valid_through_year: 2025,
+                    document_reference_id: 9004,
+                    approved: true,
+                ),
+            ),
+            Some(
+                EmissionFactor(
+                    id: 5,
+                    source: EmissionSource.PassengerFlight,
+                    unit: ActivityUnit.PassengerKilometer,
+                    scope: ReportingScope.Scope3,
+                    method: Scope2Method.NotApplicable,
+                    grams_per_unit: 158,
+                    valid_from_year: 2025,
+                    valid_through_year: 2025,
+                    document_reference_id: 9005,
+                    approved: true,
+                ),
+            ),
+            Some(
+                EmissionFactor(
+                    id: 6,
+                    source: EmissionSource.RefrigerantLeak,
+                    unit: ActivityUnit.Kilogram,
+                    scope: ReportingScope.Scope1,
+                    method: Scope2Method.NotApplicable,
+                    grams_per_unit: 1430,
+                    valid_from_year: 2023,
+                    valid_through_year: 2024,
+                    document_reference_id: 9006,
+                    approved: true,
+                ),
+            ),
+        ],
+        factor_count: 6,
+    )
+}

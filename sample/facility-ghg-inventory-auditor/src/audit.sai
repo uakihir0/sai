@@ -1,0 +1,200 @@
+use acme:facility-ghg-inventory-auditor/calculator
+use acme:facility-ghg-inventory-auditor/model.{
+    ActivityRecord
+    CalculatedImpact
+    DecisionStatus
+    EmissionSource
+    HoldReason
+    InventoryDecision
+    InventoryInput
+    InventoryInputIssue
+    InventoryReport
+    InventoryTotals
+    ReportingScope
+}
+use acme:facility-ghg-inventory-auditor/registry
+use acme:facility-ghg-inventory-auditor/validation
+use sai:core/num.{U32_MAX}
+
+fn held_decision(
+    activity_id: U32,
+    site_id: U32,
+    source: Option<EmissionSource>,
+    scope: Option<ReportingScope>,
+    reason: HoldReason,
+) -> InventoryDecision {
+    InventoryDecision(
+        activity_id: activity_id,
+        site_id: site_id,
+        source: source,
+        status: DecisionStatus.Held,
+        reason: Some(reason),
+        scope: scope,
+        primary_grams: 0,
+        market_grams: 0,
+        primary_factor_id: None,
+        market_factor_id: None,
+    )
+}
+
+fn accepted_decision(activity: ActivityRecord, impact: CalculatedImpact) -> InventoryDecision {
+    InventoryDecision(
+        activity_id: activity.id,
+        site_id: activity.site_id,
+        source: Some(activity.source),
+        status: DecisionStatus.Accepted,
+        reason: None,
+        scope: Some(impact.scope),
+        primary_grams: impact.primary_grams,
+        market_grams: impact.market_grams,
+        primary_factor_id: Some(impact.primary_factor_id),
+        market_factor_id: impact.market_factor_id,
+    )
+}
+
+fn can_add(current: U32, amount: U32) -> Bool {
+    amount <= U32_MAX - current
+}
+
+fn totals_can_add(totals: InventoryTotals, impact: CalculatedImpact) -> Bool {
+    match impact.scope {
+        ReportingScope.Scope1 => {
+            (
+                can_add(totals.scope1_grams, impact.primary_grams)
+                and can_add(totals.location_based_total_grams, impact.primary_grams)
+                and can_add(totals.market_based_total_grams, impact.primary_grams)
+            )
+        }
+        ReportingScope.Scope2 => {
+            (
+                can_add(totals.scope2_location_grams, impact.primary_grams)
+                and can_add(totals.scope2_market_grams, impact.market_grams)
+                and can_add(totals.location_based_total_grams, impact.primary_grams)
+                and can_add(totals.market_based_total_grams, impact.market_grams)
+            )
+        }
+        ReportingScope.Scope3 => {
+            (
+                can_add(totals.scope3_grams, impact.primary_grams)
+                and can_add(totals.location_based_total_grams, impact.primary_grams)
+                and can_add(totals.market_based_total_grams, impact.primary_grams)
+            )
+        }
+    }
+}
+
+fn accumulate(totals: InventoryTotals, impact: CalculatedImpact) -> InventoryTotals {
+    var next = totals
+    match impact.scope {
+        ReportingScope.Scope1 => {
+            next.scope1_grams += impact.primary_grams
+            next.location_based_total_grams += impact.primary_grams
+            next.market_based_total_grams += impact.primary_grams
+        }
+        ReportingScope.Scope2 => {
+            next.scope2_location_grams += impact.primary_grams
+            next.scope2_market_grams += impact.market_grams
+            next.location_based_total_grams += impact.primary_grams
+            next.market_based_total_grams += impact.market_grams
+        }
+        ReportingScope.Scope3 => {
+            next.scope3_grams += impact.primary_grams
+            next.location_based_total_grams += impact.primary_grams
+            next.market_based_total_grams += impact.primary_grams
+        }
+    }
+    next
+}
+
+fn empty_report(issue: Option<InventoryInputIssue>) -> InventoryReport {
+    InventoryReport(
+        decisions: Array<Option<InventoryDecision>, 14>.filled(None),
+        totals: InventoryTotals(
+            reviewed_count: 0,
+            accepted_count: 0,
+            held_count: 0,
+            scope1_grams: 0,
+            scope2_location_grams: 0,
+            scope2_market_grams: 0,
+            scope3_grams: 0,
+            location_based_total_grams: 0,
+            market_based_total_grams: 0,
+        ),
+        input_issue: issue,
+    )
+}
+
+fn input_issue(batch: InventoryInput) -> Option<InventoryInputIssue> {
+    if (
+        batch.site_count > batch.sites.len()
+        or batch.activity_count > batch.activities.len()
+        or batch.factor_count > batch.factors.len()
+    ) {
+        return Some(InventoryInputIssue.CountExceedsCapacity)
+    }
+    match validation.site_catalog_issue(batch) { Some(issue) => return Some(issue), None => {} }
+    registry.factor_catalog_issue(batch.factors, batch.factor_count)
+}
+
+fn review_activity(batch: InventoryInput, activity: ActivityRecord) -> InventoryDecision {
+    let scope = registry.scope_for_source(activity.source)
+    match validation.first_issue(batch, activity) {
+        Some(reason) => {
+            return held_decision(
+                activity.id,
+                activity.site_id,
+                Some(activity.source),
+                Some(scope),
+                reason,
+            )
+        }
+        None => {}
+    }
+    match calculator.calculate(batch, activity) {
+        Ok(impact) => accepted_decision(activity, impact)
+        Err(reason) =>
+            held_decision(activity.id, activity.site_id, Some(activity.source), Some(scope), reason)
+    }
+}
+
+pub fn audit(batch: InventoryInput) -> InventoryReport {
+    match input_issue(batch) { Some(issue) => return empty_report(Some(issue)), None => {} }
+
+    var report = empty_report(None)
+    for index in 0..batch.activity_count {
+        let candidate = match batch.activities[index] {
+            Some(activity) => review_activity(batch, activity)
+            None => held_decision(0, 0, None, None, HoldReason.MissingActivityRecord)
+        }
+        report.totals.reviewed_count += 1
+        match candidate.status {
+            DecisionStatus.Held => {
+                report.totals.held_count += 1
+                report.decisions[index] = Some(candidate)
+            }
+            DecisionStatus.Accepted => {
+                let impact = CalculatedImpact(
+                    scope: candidate.scope.unwrap(),
+                    primary_grams: candidate.primary_grams,
+                    market_grams: candidate.market_grams,
+                    primary_factor_id: candidate.primary_factor_id.unwrap(),
+                    market_factor_id: candidate.market_factor_id,
+                )
+                if totals_can_add(report.totals, impact) {
+                    report.totals = accumulate(report.totals, impact)
+                    report.totals.accepted_count += 1
+                    report.decisions[index] = Some(candidate)
+                } else {
+                    report.totals.held_count += 1
+                    var overflow_decision = candidate
+                    overflow_decision.status = DecisionStatus.Held
+                    overflow_decision.reason = Some(HoldReason.TotalOverflow)
+                    overflow_decision.primary_grams = 0
+                    overflow_decision.market_grams = 0
+                    report.decisions[index] = Some(overflow_decision)
+                }
+            }
+        }
+    }
+    report
+}

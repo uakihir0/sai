@@ -1,0 +1,5 @@
+package acme:facility-ghg-inventory-auditor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Audit a fixed multi-site greenhouse gas inventory"
