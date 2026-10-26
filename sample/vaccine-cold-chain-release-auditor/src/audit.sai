@@ -1,0 +1,267 @@
+use acme:vaccine-cold-chain-release-auditor/logger
+use acme:vaccine-cold-chain-release-auditor/model.{
+    AuditInput
+    AuditReport
+    ColdChainLot
+    Finding
+    LoggerAssessment
+    LoggerCalibration
+    LotBalance
+    Outcome
+    Shipment
+    ShipmentDecision
+}
+use acme:vaccine-cold-chain-release-auditor/policy
+
+fn find_lot(input: AuditInput, lot_id: Str) -> Option<ColdChainLot> {
+    for index in 0..input.lot_count {
+        let lot = input.lots[index].unwrap()
+        if lot.id == lot_id {
+            return Some(lot)
+        }
+    }
+    None
+}
+
+fn find_calibration(input: AuditInput, logger_id: Str) -> Option<LoggerCalibration> {
+    for index in 0..input.calibration_count {
+        let calibration = input.calibrations[index].unwrap()
+        if calibration.logger_id == logger_id {
+            return Some(calibration)
+        }
+    }
+    None
+}
+
+fn has_duplicate_shipment_id(input: AuditInput, shipment_id: Str) -> Bool {
+    var matches: USize = 0
+    for index in 0..input.shipment_count {
+        if input.shipments[index].unwrap().id == shipment_id {
+            matches += 1
+        }
+    }
+    matches > 1
+}
+
+fn released_doses_for_lot(
+    decisions: Array<Option<ShipmentDecision>, 4>,
+    decision_count: USize,
+    lot_id: Str,
+) -> U32 {
+    var total: U32 = 0
+    for index in 0..decision_count {
+        let decision = decisions[index].unwrap()
+        if decision.outcome == Outcome.Released and decision.lot_id == lot_id {
+            total += decision.credited_doses
+        }
+    }
+    total
+}
+
+fn add_finding(decision: borrow mut ShipmentDecision, finding: Finding) {
+    decision.findings[decision.finding_count] = Some(finding)
+    decision.finding_count += 1
+}
+
+fn assess_calibration(input: AuditInput, logger_id: Str, decision: borrow mut ShipmentDecision) {
+    match find_calibration(input, logger_id) {
+        Some(calibration) => {
+            if not calibration.certificate_present {
+                add_finding(borrow mut decision, Finding.CalibrationCertificateMissing)
+            }
+            if (
+                input.review_day < calibration.valid_from_day
+                or input.review_day > calibration.valid_through_day
+            ) {
+                add_finding(borrow mut decision, Finding.CalibrationOutOfDate)
+            }
+            if not calibration.calibration_passed {
+                add_finding(borrow mut decision, Finding.CalibrationFailed)
+            }
+        }
+        None => {
+            add_finding(borrow mut decision, Finding.MissingCalibrationRecord)
+        }
+    }
+}
+
+fn retain_logger_assessment(assessment: LoggerAssessment, decision: borrow mut ShipmentDecision) {
+    decision.uncovered_minutes = assessment.uncovered_minutes
+    decision.largest_gap_minutes = assessment.largest_gap_minutes
+    decision.excursion_minutes = assessment.excursion_minutes
+    if assessment.invalid_intervals {
+        add_finding(borrow mut decision, Finding.InvalidLoggerInterval)
+    }
+    if assessment.largest_gap_minutes > policy.MAXIMUM_UNCOVERED_GAP_MINUTES {
+        add_finding(borrow mut decision, Finding.LoggerGap)
+    }
+    if assessment.excursion_minutes > policy.CRITICAL_EXCURSION_MINUTES {
+        add_finding(borrow mut decision, Finding.CriticalExcursion)
+    } else if assessment.excursion_minutes > policy.RELEASE_EXCURSION_MINUTES {
+        add_finding(borrow mut decision, Finding.ExcursionReviewRequired)
+    }
+}
+
+fn assess_custody(shipment: Shipment, decision: borrow mut ShipmentDecision) {
+    if not shipment.pickup_evidence_present {
+        add_finding(borrow mut decision, Finding.MissingPickupEvidence)
+    }
+    if not shipment.carrier_handoff_present {
+        add_finding(borrow mut decision, Finding.MissingCarrierHandoff)
+    }
+    if not shipment.delivery_evidence_present {
+        add_finding(borrow mut decision, Finding.MissingDeliveryEvidence)
+    }
+    if not shipment.custody_chain_intact {
+        add_finding(borrow mut decision, Finding.CustodyChainBroken)
+    }
+    if not shipment.seal_intact {
+        add_finding(borrow mut decision, Finding.SealCompromised)
+    }
+}
+
+fn choose_outcome(decision: ShipmentDecision) -> Outcome {
+    var outcome = Outcome.Released
+    for index in 0..decision.finding_count {
+        let finding = decision.findings[index].unwrap()
+        if policy.is_rejection(finding) {
+            return Outcome.Rejected
+        }
+        outcome = Outcome.Held
+    }
+    outcome
+}
+
+fn assess_shipment(
+    input: AuditInput,
+    shipment: Shipment,
+    previous_decisions: Array<Option<ShipmentDecision>, 4>,
+    previous_count: USize,
+) -> ShipmentDecision {
+    var decision = ShipmentDecision(
+        shipment_id: shipment.id,
+        lot_id: shipment.lot_id,
+        outcome: Outcome.Released,
+        findings: Array<Option<Finding>, 20>.filled(None),
+        finding_count: 0,
+        uncovered_minutes: 0,
+        largest_gap_minutes: 0,
+        excursion_minutes: 0,
+        credited_doses: 0,
+    )
+
+    if has_duplicate_shipment_id(input, shipment.id) {
+        add_finding(borrow mut decision, Finding.DuplicateShipmentId)
+    }
+
+    match find_lot(input, shipment.lot_id) {
+        Some(lot) => {
+            let expired = input.review_day > lot.expiration_day
+            if expired {
+                add_finding(borrow mut decision, Finding.LotExpired)
+            }
+            if shipment.doses == 0 {
+                add_finding(borrow mut decision, Finding.InvalidShipmentQuantity)
+            }
+            if not expired {
+                let used_doses = released_doses_for_lot(previous_decisions, previous_count, lot.id)
+                if (
+                    used_doses <= lot.available_doses
+                    and shipment.doses > lot.available_doses - used_doses
+                ) {
+                    add_finding(borrow mut decision, Finding.InsufficientUsableStock)
+                }
+            }
+        }
+        None => {
+            add_finding(borrow mut decision, Finding.UnknownLot)
+        }
+    }
+
+    if shipment.transit_minutes == 0 {
+        add_finding(borrow mut decision, Finding.InvalidTransitDuration)
+    }
+
+    match shipment.logger_id {
+        Some(logger_id) => {
+            assess_calibration(input, logger_id, borrow mut decision)
+            let telemetry = logger.assess(shipment)
+            retain_logger_assessment(telemetry, borrow mut decision)
+        }
+        None => {
+            add_finding(borrow mut decision, Finding.MissingLogger)
+        }
+    }
+
+    assess_custody(shipment, borrow mut decision)
+    decision.outcome = choose_outcome(decision)
+    if decision.outcome == Outcome.Released {
+        decision.credited_doses = shipment.doses
+    }
+    decision
+}
+
+fn lot_balances(
+    input: AuditInput,
+    decisions: Array<Option<ShipmentDecision>, 4>,
+    decision_count: USize,
+) -> Array<Option<LotBalance>, 3> {
+    var balances = Array<Option<LotBalance>, 3>.filled(None)
+    for index in 0..input.lot_count {
+        let lot = input.lots[index].unwrap()
+        let expired = input.review_day > lot.expiration_day
+        let released = released_doses_for_lot(decisions, decision_count, lot.id)
+        let usable = if expired {
+            0
+        } else {
+            lot.available_doses
+        }
+        balances[index] = Some(
+            LotBalance(
+                lot_id: lot.id,
+                expired_at_review: expired,
+                registered_doses: lot.available_doses,
+                released_doses: released,
+                remaining_usable_doses: usable - released,
+            ),
+        )
+    }
+    balances
+}
+
+pub fn audit(input: AuditInput) -> AuditReport {
+    var decisions = Array<Option<ShipmentDecision>, 4>.filled(None)
+    var released_count: USize = 0
+    var held_count: USize = 0
+    var rejected_count: USize = 0
+    var total_released_doses: U32 = 0
+
+    for index in 0..input.shipment_count {
+        let shipment = input.shipments[index].unwrap()
+        let decision = assess_shipment(input, shipment, decisions, index)
+        decisions[index] = Some(decision)
+        match decision.outcome {
+            Outcome.Released => {
+                released_count += 1
+                total_released_doses += decision.credited_doses
+            }
+            Outcome.Held => {
+                held_count += 1
+            }
+            Outcome.Rejected => {
+                rejected_count += 1
+            }
+        }
+    }
+
+    AuditReport(
+        decisions: decisions,
+        decision_count: input.shipment_count,
+        lot_balances: lot_balances(input, decisions, input.shipment_count),
+        lot_count: input.lot_count,
+        released_count: released_count,
+        held_count: held_count,
+        rejected_count: rejected_count,
+        released_doses: total_released_doses,
+    )
+}

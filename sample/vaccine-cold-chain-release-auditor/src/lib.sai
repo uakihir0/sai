@@ -1,0 +1,111 @@
+use acme:vaccine-cold-chain-release-auditor/audit
+use acme:vaccine-cold-chain-release-auditor/fixtures
+use acme:vaccine-cold-chain-release-auditor/model.{
+    AuditReport
+    Finding
+    Outcome
+    TemperatureInterval
+}
+use acme:vaccine-cold-chain-release-auditor/policy
+
+pub fn audit_fixture() -> AuditReport {
+    audit.audit(fixtures.sample_input())
+}
+
+test "the fixture releases only supported stock and preserves every finding" {
+    let report = audit_fixture()
+    assert report.decision_count == 4
+    assert report.released_count == 1
+    assert report.held_count == 2
+    assert report.rejected_count == 1
+    assert report.released_doses == 700
+
+    assert report.decisions[0].unwrap().outcome == Outcome.Released
+    assert report.decisions[0].unwrap().finding_count == 0
+
+    let stock_limited = report.decisions[1].unwrap()
+    assert stock_limited.outcome == Outcome.Held
+    assert stock_limited.finding_count == 1
+    assert stock_limited.findings[0].unwrap() == Finding.InsufficientUsableStock
+    assert stock_limited.excursion_minutes == 10
+
+    let evidence_hold = report.decisions[2].unwrap()
+    assert evidence_hold.outcome == Outcome.Held
+    assert evidence_hold.uncovered_minutes == 15
+    assert evidence_hold.largest_gap_minutes == 15
+    assert evidence_hold.excursion_minutes == 30
+    assert evidence_hold.findings[0].unwrap() == Finding.CalibrationOutOfDate
+    assert evidence_hold.findings[1].unwrap() == Finding.LoggerGap
+    assert evidence_hold.findings[2].unwrap() == Finding.ExcursionReviewRequired
+    assert evidence_hold.findings[3].unwrap() == Finding.MissingCarrierHandoff
+    assert evidence_hold.findings[4].unwrap() == Finding.CustodyChainBroken
+    assert evidence_hold.findings[5].unwrap() == Finding.SealCompromised
+
+    let rejected = report.decisions[3].unwrap()
+    assert rejected.outcome == Outcome.Rejected
+    assert rejected.findings[0].unwrap() == Finding.LotExpired
+    assert rejected.findings[1].unwrap() == Finding.CriticalExcursion
+    assert rejected.findings[2].unwrap() == Finding.MissingDeliveryEvidence
+}
+
+test "held and rejected proposals reserve no stock" {
+    let report = audit_fixture()
+    assert report.lot_balances[0].unwrap().released_doses == 700
+    assert report.lot_balances[0].unwrap().remaining_usable_doses == 500
+    assert report.lot_balances[1].unwrap().released_doses == 0
+    assert report.lot_balances[1].unwrap().remaining_usable_doses == 500
+    assert report.lot_balances[2].unwrap().expired_at_review
+    assert report.lot_balances[2].unwrap().remaining_usable_doses == 0
+}
+
+test "every shipment with a duplicate ID is rejected before reserving stock" {
+    var input = fixtures.sample_input()
+    var duplicate = input.shipments[1].unwrap()
+    duplicate.id = input.shipments[0].unwrap().id
+    input.shipments[1] = Some(duplicate)
+
+    let report = audit.audit(input)
+    assert report.decisions[0].unwrap().outcome == Outcome.Rejected
+    assert report.decisions[0].unwrap().findings[0].unwrap() == Finding.DuplicateShipmentId
+    assert report.decisions[1].unwrap().outcome == Outcome.Rejected
+    assert report.decisions[1].unwrap().findings[0].unwrap() == Finding.DuplicateShipmentId
+    assert report.released_doses == 0
+    assert report.lot_balances[0].unwrap().remaining_usable_doses == 1200
+}
+
+test "expiry, calibration validity, logger gaps, and excursion limits are inclusive" {
+    var input = fixtures.sample_input()
+    input.review_day = input.lots[0].unwrap().expiration_day
+    var calibration = input.calibrations[0].unwrap()
+    calibration.valid_through_day = input.review_day
+    input.calibrations[0] = Some(calibration)
+    let inclusive = audit.audit(input)
+    assert inclusive.decisions[0].unwrap().outcome == Outcome.Released
+
+    var short_gap = fixtures.sample_input()
+    var shipment = short_gap.shipments[2].unwrap()
+    shipment.intervals[3] = Some(
+        TemperatureInterval(start_minute: 50, end_minute: 60, low_tenths_c: 50, high_tenths_c: 60),
+    )
+    short_gap.shipments[2] = Some(shipment)
+    let gap_report = audit.audit(short_gap)
+    assert (
+        gap_report.decisions[2].unwrap().largest_gap_minutes == policy.MAXIMUM_UNCOVERED_GAP_MINUTES
+    )
+    assert (
+        gap_report.decisions[2].unwrap().findings[1].unwrap() == Finding.ExcursionReviewRequired
+    )
+
+    var excursion_limit = fixtures.sample_input()
+    var shipment = excursion_limit.shipments[2].unwrap()
+    shipment.intervals[2] = Some(
+        TemperatureInterval(start_minute: 25, end_minute: 30, low_tenths_c: 90, high_tenths_c: 100),
+    )
+    shipment.intervals[3] = Some(
+        TemperatureInterval(start_minute: 55, end_minute: 60, low_tenths_c: 50, high_tenths_c: 60),
+    )
+    excursion_limit.shipments[2] = Some(shipment)
+    let boundary = audit.audit(excursion_limit)
+    assert (boundary.decisions[2].unwrap().excursion_minutes == policy.RELEASE_EXCURSION_MINUTES)
+    assert (boundary.decisions[2].unwrap().findings[2].unwrap() == Finding.MissingCarrierHandoff)
+}

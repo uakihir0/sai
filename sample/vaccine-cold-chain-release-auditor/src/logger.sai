@@ -1,0 +1,58 @@
+use acme:vaccine-cold-chain-release-auditor/model.{LoggerAssessment, Shipment}
+use acme:vaccine-cold-chain-release-auditor/policy
+
+fn observe_gap(assessment: borrow mut LoggerAssessment, gap_minutes: U32) {
+    if gap_minutes > 0 {
+        assessment.uncovered_minutes += gap_minutes
+        if gap_minutes > assessment.largest_gap_minutes {
+            assessment.largest_gap_minutes = gap_minutes
+        }
+    }
+}
+
+pub fn assess(shipment: Shipment) -> LoggerAssessment {
+    var result = LoggerAssessment(
+        uncovered_minutes: 0,
+        largest_gap_minutes: 0,
+        excursion_minutes: 0,
+        invalid_intervals: false,
+    )
+    if shipment.transit_minutes == 0 {
+        result.invalid_intervals = true
+        return result
+    }
+
+    var covered_through: U32 = 0
+    for index in 0..shipment.interval_count {
+        let interval = shipment.intervals[index].unwrap()
+        let invalid_bounds = (
+            interval.end_minute <= interval.start_minute
+            or interval.start_minute > shipment.transit_minutes
+            or interval.end_minute > shipment.transit_minutes
+            or interval.low_tenths_c > interval.high_tenths_c
+        )
+
+        if invalid_bounds {
+            result.invalid_intervals = true
+        } else if interval.start_minute < covered_through {
+            result.invalid_intervals = true
+        } else {
+            if interval.start_minute > covered_through {
+                observe_gap(borrow mut result, interval.start_minute - covered_through)
+            }
+            let duration = interval.end_minute - interval.start_minute
+            if (
+                interval.low_tenths_c < policy.MINIMUM_TEMPERATURE_TENTHS_C
+                or interval.high_tenths_c > policy.MAXIMUM_TEMPERATURE_TENTHS_C
+            ) {
+                result.excursion_minutes += duration
+            }
+            covered_through = interval.end_minute
+        }
+    }
+
+    if covered_through < shipment.transit_minutes {
+        observe_gap(borrow mut result, shipment.transit_minutes - covered_through)
+    }
+    result
+}

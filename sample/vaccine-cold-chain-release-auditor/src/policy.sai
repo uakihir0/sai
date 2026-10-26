@@ -1,0 +1,34 @@
+use acme:vaccine-cold-chain-release-auditor/model.{Finding}
+
+// Fictional modeling thresholds only; these are not vaccine handling advice.
+pub const MINIMUM_TEMPERATURE_TENTHS_C: I32 = 20
+
+pub const MAXIMUM_TEMPERATURE_TENTHS_C: I32 = 80
+pub const MAXIMUM_UNCOVERED_GAP_MINUTES: U32 = 10
+pub const RELEASE_EXCURSION_MINUTES: U32 = 20
+pub const CRITICAL_EXCURSION_MINUTES: U32 = 60
+
+pub fn is_rejection(finding: Finding) -> Bool {
+    match finding {
+        Finding.DuplicateShipmentId => true
+        Finding.UnknownLot => true
+        Finding.LotExpired => true
+        Finding.InvalidShipmentQuantity => true
+        Finding.InsufficientUsableStock => false
+        Finding.MissingLogger => false
+        Finding.MissingCalibrationRecord => false
+        Finding.CalibrationCertificateMissing => false
+        Finding.CalibrationOutOfDate => false
+        Finding.CalibrationFailed => false
+        Finding.InvalidTransitDuration => false
+        Finding.InvalidLoggerInterval => false
+        Finding.LoggerGap => false
+        Finding.ExcursionReviewRequired => false
+        Finding.CriticalExcursion => true
+        Finding.MissingPickupEvidence => false
+        Finding.MissingCarrierHandoff => false
+        Finding.MissingDeliveryEvidence => false
+        Finding.CustodyChainBroken => false
+        Finding.SealCompromised => false
+    }
+}
