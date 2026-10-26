@@ -2767,6 +2767,17 @@ error, arithmetic error, or mismatch taints the enclosing call result and
 inferred local dependents; valid independent siblings remain available. An
 explicit local annotation remains authoritative for that binding. This
 implementation slice does not change the CLI Stage 0 incomplete-check gate.
+**IR-959 comparisons** add exactly one `==`, `!=`, `<`, `<=`, `>`, or `>=`
+node as an immediate call argument at either supported call level. Its leaves
+must be one or two exact preceding local paths, with at least one path, and
+otherwise direct primitive scalar literals (`Bool`, `Char`, `Byte`, integer,
+or float) in either operand order. Literal/literal comparisons, nested or
+computed operands, calls under comparisons, unresolved literal-origin local
+paths, and deeper call nesting remain unsupported. A supported comparison
+records `Bool` under its exact owner `HirId`; operand and parameter diagnostics
+retain their source spans and taint the comparison, call, and inferred local
+dependents. This remains a sparse body-check result, not complete expression
+typing, and the CLI Stage 0 gate is unchanged.
 Method/constructor/function-pointer/extern/WIT calls, generic or otherwise
 unsupported signatures, calls nested more than one argument level, calls
 inside compound expressions or operators, compound call arguments, call

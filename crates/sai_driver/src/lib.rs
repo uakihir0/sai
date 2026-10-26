@@ -8991,6 +8991,17 @@ fn is_supported_direct_call_argument_shape(
                 inputs,
             )
         }
+        ExprKind::Binary(
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+            left,
+            right,
+        ) => is_supported_direct_call_comparison_operands_shape(
+            left,
+            right,
+            preceding_bindings,
+            locals,
+            inputs,
+        ),
         ExprKind::Call {
             callee,
             args,
@@ -9033,6 +9044,17 @@ fn is_supported_direct_call_arithmetic_argument_shape(
                 inputs,
             )
         }
+        ExprKind::Binary(
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+            left,
+            right,
+        ) => is_supported_direct_call_comparison_operands_shape(
+            left,
+            right,
+            preceding_bindings,
+            locals,
+            inputs,
+        ),
         _ => is_supported_direct_call_leaf_argument_shape(
             expression,
             preceding_bindings,
@@ -9074,6 +9096,21 @@ fn is_supported_direct_call_arithmetic_operands_shape(
         );
     }
     true
+}
+
+fn is_supported_direct_call_comparison_operands_shape(
+    left: &HirExpr<'_>,
+    right: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let is_comparison_leaf = |expression: &HirExpr<'_>| {
+        is_supported_direct_call_leaf_argument_shape(expression, preceding_bindings, locals, inputs)
+    };
+    is_comparison_leaf(left)
+        && is_comparison_leaf(right)
+        && (matches!(left.kind, ExprKind::Path(_)) || matches!(right.kind, ExprKind::Path(_)))
 }
 
 fn is_supported_direct_call_leaf_argument_shape(
@@ -48501,7 +48538,7 @@ property "shared"() {}
         use sai_resolve::prelude::PrimTy;
 
         let root = concat!(
-            "use acme:phase1/child.{add_one, apply, apply_float, apply_pair, double_fn, expect_bool, float_fn, generic_fn, is_positive, text_fn}\n",
+            "use acme:phase1/child.{add_one, apply, apply_bool, apply_float, apply_pair, double_fn, expect_bool, float_fn, generic_fn, is_positive, text_fn}\n",
             "pub fn initializer(input: I32) -> I32 {\n",
             "    let result = apply(input)\n",
             "    let valid = result\n",
@@ -48603,6 +48640,48 @@ property "shared"() {}
             "    let result = apply(input) + 1\n",
             "    result\n",
             "}\n",
+            "pub fn comparison_operators(value: I32, limit: I32) -> Bool {\n",
+            "    let equal = apply_bool(value == limit)\n",
+            "    let not_equal = apply_bool(value != limit)\n",
+            "    let less = apply_bool(value < limit)\n",
+            "    let less_equal = apply_bool(value <= limit)\n",
+            "    let greater = apply_bool(value > limit)\n",
+            "    apply_bool(value >= limit)\n",
+            "}\n",
+            "pub fn comparison_literal_leaves(value: I32, condition: Bool, letter: Char, code: Byte, measurement: F32) -> Bool {\n",
+            "    let int_left = apply_bool(1 < value)\n",
+            "    let int_right = apply_bool(value < 1)\n",
+            "    let bool_right = apply_bool(condition == true)\n",
+            "    let bool_left = apply_bool(false != condition)\n",
+            "    let char_right = apply_bool(letter == 'x')\n",
+            "    let char_left = apply_bool('x' == letter)\n",
+            "    let byte_right = apply_bool(code == b'x')\n",
+            "    let byte_left = apply_bool(b'x' == code)\n",
+            "    let float_right = apply_bool(measurement > 1.5)\n",
+            "    apply_bool(1.5 < measurement)\n",
+            "}\n",
+            "pub fn nested_comparison_call(value: I32, limit: I32) -> Bool { apply_bool(apply_bool(value <= limit)) }\n",
+            "pub fn comparison_parameter_mismatch(value: I32, limit: I32) -> I32 { apply(value < limit) }\n",
+            "pub fn comparison_operand_mismatch(value: I32, condition: Bool) -> Bool { apply_bool(value == condition) }\n",
+            "pub fn comparison_literal_family_mismatch(value: I32) -> Bool { apply_bool(value < true) }\n",
+            "pub fn comparison_taint_preserves_sibling(value: I32, condition: Bool) -> I32 {\n",
+            "    let result = apply_bool(value == condition)\n",
+            "    let alias = result\n",
+            "    let valid = apply(1)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn comparison_call_argument_extra_ignored(value: I32, limit: I32) -> I32 { apply(1, value < limit) }\n",
+            "pub fn comparison_literal_range(value: F32) -> Bool { apply_bool(value < 1e100) }\n",
+            "pub fn comparison_literal_left_range_and_mismatch(value: I32) -> Bool { apply_bool(1e400 < value) }\n",
+            "pub fn literal_pair_comparison_unsupported() -> Bool { apply_bool(1 < 2) }\n",
+            "pub fn nested_comparison_unsupported(value: I32, limit: I32) -> Bool { apply_bool((value < limit) == true) }\n",
+            "pub fn computed_comparison_operand_unsupported(value: I32, limit: I32) -> Bool { apply_bool((value + 1) < limit) }\n",
+            "pub fn call_comparison_operand_unsupported(value: I32, limit: I32) -> Bool { apply_bool(add_one(value) < limit) }\n",
+            "pub fn deep_comparison_call_unsupported(value: I32, limit: I32) -> Bool { apply_bool(apply_bool(apply_bool(value < limit))) }\n",
+            "pub fn unresolved_comparison_local_unsupported(limit: I32) -> Bool {\n",
+            "    let inferred = 1\n",
+            "    apply_bool(inferred < limit)\n",
+            "}\n",
             "pub fn annotated_mismatch(input: Bool) -> I32 {\n",
             "    let result: I32 = apply(input)\n",
             "    result\n",
@@ -48626,6 +48705,7 @@ property "shared"() {}
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
+            "pub fn apply_bool(value: Bool) -> Bool { value }\n",
             "pub fn add_one(value: I32) -> I32 { value }\n",
             "pub fn expect_bool(value: Bool) -> I32 { 0 }\n",
             "pub fn is_positive(value: I32) -> Bool { value > 0 }\n",
@@ -48741,6 +48821,40 @@ property "shared"() {}
             assert_supported("arithmetic_local_paths_call_argument", &[]);
         let nested_call_with_basic_arithmetic_argument =
             assert_supported("nested_call_with_basic_arithmetic_argument", &[]);
+        let comparison_operators = assert_supported("comparison_operators", &[]);
+        let comparison_literal_leaves = assert_supported("comparison_literal_leaves", &[]);
+        let nested_comparison_call = assert_supported("nested_comparison_call", &[]);
+        let comparison_parameter_mismatch = assert_supported(
+            "comparison_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let comparison_operand_mismatch = assert_supported(
+            "comparison_operand_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let comparison_literal_family_mismatch = assert_supported(
+            "comparison_literal_family_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let comparison_taint_preserves_sibling = assert_supported(
+            "comparison_taint_preserves_sibling",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let comparison_call_argument_extra_ignored = assert_supported(
+            "comparison_call_argument_extra_ignored",
+            &[sai_diagnostics::Code::WrongArgumentCount],
+        );
+        let comparison_literal_range = assert_supported(
+            "comparison_literal_range",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let comparison_literal_left_range_and_mismatch = assert_supported(
+            "comparison_literal_left_range_and_mismatch",
+            &[
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+        );
         let arithmetic_call_argument_literal_left =
             assert_supported("arithmetic_call_argument_literal_left", &[]);
         let arithmetic_call_argument_integer_literals =
@@ -48823,6 +48937,12 @@ property "shared"() {}
             "char_literal_pair",
             "remainder_call_argument",
             "call_under_arithmetic_argument",
+            "literal_pair_comparison_unsupported",
+            "nested_comparison_unsupported",
+            "computed_comparison_operand_unsupported",
+            "call_comparison_operand_unsupported",
+            "deep_comparison_call_unsupported",
+            "unresolved_comparison_local_unsupported",
         ] {
             assert!(
                 matches!(
@@ -49170,6 +49290,379 @@ property "shared"() {}
             ),
             Some(PrimTy::I32)
         );
+        for comparison in [
+            "value == limit",
+            "value != limit",
+            "value < limit",
+            "value <= limit",
+            "value > limit",
+            "value >= limit",
+        ] {
+            let call = format!("apply_bool({comparison})");
+            assert_eq!(
+                expression_type_at_range(
+                    comparison_operators,
+                    "pub fn comparison_operators",
+                    &call,
+                    0,
+                    call.len()
+                ),
+                Some(PrimTy::Bool),
+                "the direct call result is recorded for `{comparison}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    comparison_operators,
+                    "pub fn comparison_operators",
+                    &call,
+                    "apply_bool(".len(),
+                    comparison.len()
+                ),
+                Some(PrimTy::Bool),
+                "the comparison root receives its exact Bool HIR type for `{comparison}`"
+            );
+        }
+        for (call, comparison) in [
+            ("apply_bool(1 < value)", "1 < value"),
+            ("apply_bool(value < 1)", "value < 1"),
+            ("apply_bool(condition == true)", "condition == true"),
+            ("apply_bool(false != condition)", "false != condition"),
+            ("apply_bool(letter == 'x')", "letter == 'x'"),
+            ("apply_bool('x' == letter)", "'x' == letter"),
+            ("apply_bool(code == b'x')", "code == b'x'"),
+            ("apply_bool(b'x' == code)", "b'x' == code"),
+            ("apply_bool(measurement > 1.5)", "measurement > 1.5"),
+            ("apply_bool(1.5 < measurement)", "1.5 < measurement"),
+        ] {
+            assert_eq!(
+                expression_type_at_range(
+                    comparison_literal_leaves,
+                    "pub fn comparison_literal_leaves",
+                    call,
+                    0,
+                    call.len()
+                ),
+                Some(PrimTy::Bool),
+                "the scalar comparison call is typed for `{comparison}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    comparison_literal_leaves,
+                    "pub fn comparison_literal_leaves",
+                    call,
+                    "apply_bool(".len(),
+                    comparison.len()
+                ),
+                Some(PrimTy::Bool),
+                "the scalar comparison root is typed for `{comparison}`"
+            );
+        }
+        let nested_comparison = "apply_bool(apply_bool(value <= limit))";
+        assert_eq!(
+            expression_type_at_range(
+                nested_comparison_call,
+                "pub fn nested_comparison_call",
+                nested_comparison,
+                0,
+                nested_comparison.len()
+            ),
+            Some(PrimTy::Bool)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                nested_comparison_call,
+                "pub fn nested_comparison_call",
+                nested_comparison,
+                "apply_bool(".len(),
+                "apply_bool(value <= limit)".len()
+            ),
+            Some(PrimTy::Bool)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                nested_comparison_call,
+                "pub fn nested_comparison_call",
+                nested_comparison,
+                "apply_bool(apply_bool(".len(),
+                "value <= limit".len()
+            ),
+            Some(PrimTy::Bool)
+        );
+        let mismatched_comparison = "value < limit";
+        assert_eq!(
+            expression_type_at_range(
+                comparison_parameter_mismatch,
+                "pub fn comparison_parameter_mismatch",
+                "apply(value < limit)",
+                "apply(".len(),
+                mismatched_comparison.len()
+            ),
+            None,
+            "a comparison passed to a non-Bool parameter is not retained"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                comparison_parameter_mismatch,
+                "pub fn comparison_parameter_mismatch",
+                "apply(value < limit)",
+                0,
+                "apply(value < limit)".len()
+            ),
+            None,
+            "a call with a mismatched comparison argument is not retained"
+        );
+        let parameter_mismatch_diagnostics = match comparison_parameter_mismatch
+            .body_type_check()
+            .expect("comparison parameter mismatch has body diagnostics")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("comparison argument mismatch remains a supported diagnostic")
+            }
+        };
+        assert_eq!(parameter_mismatch_diagnostics.len(), 1);
+        let function_start = root
+            .find("pub fn comparison_parameter_mismatch")
+            .expect("comparison parameter mismatch function exists");
+        let expression_start = function_start
+            + root[function_start..]
+                .find(mismatched_comparison)
+                .expect("mismatched comparison appears in the function");
+        assert_eq!(
+            parameter_mismatch_diagnostics[0]
+                .primary()
+                .expect("comparison parameter mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(expression_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (expression_start + mismatched_comparison.len()) as u32,
+                ),
+            )
+            .expect("comparison mismatch span is ordered")
+        );
+        let mismatched_operand = "condition";
+        assert_eq!(
+            expression_type_at_range(
+                comparison_operand_mismatch,
+                "pub fn comparison_operand_mismatch",
+                "apply_bool(value == condition)",
+                "apply_bool(".len(),
+                "value == condition".len()
+            ),
+            None,
+            "an operand type mismatch prevents publishing the comparison fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                comparison_operand_mismatch,
+                "pub fn comparison_operand_mismatch",
+                "apply_bool(value == condition)",
+                0,
+                "apply_bool(value == condition)".len()
+            ),
+            None,
+            "an operand type mismatch taints the containing call result"
+        );
+        let operand_mismatch_diagnostics = match comparison_operand_mismatch
+            .body_type_check()
+            .expect("comparison operand mismatch has body diagnostics")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("comparison operand mismatch remains a supported diagnostic")
+            }
+        };
+        let function_start = root
+            .find("pub fn comparison_operand_mismatch")
+            .expect("comparison operand mismatch function exists");
+        let operand_start = function_start
+            + root[function_start..]
+                .find("value == condition")
+                .expect("the mismatched operand appears in the function")
+            + "value == ".len();
+        assert_eq!(
+            operand_mismatch_diagnostics[0]
+                .primary()
+                .expect("comparison operand mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(operand_start as u32),
+                sai_diagnostics::TextSize::new((operand_start + mismatched_operand.len()) as u32,),
+            )
+            .expect("comparison operand span is ordered")
+        );
+        assert_eq!(
+            expression_type_at_range(
+                comparison_literal_family_mismatch,
+                "pub fn comparison_literal_family_mismatch",
+                "apply_bool(value < true)",
+                "apply_bool(".len(),
+                "value < true".len()
+            ),
+            None,
+            "a literal-family mismatch prevents publishing the comparison fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                comparison_literal_family_mismatch,
+                "pub fn comparison_literal_family_mismatch",
+                "apply_bool(value < true)",
+                0,
+                "apply_bool(value < true)".len()
+            ),
+            None,
+            "a literal-family mismatch taints the containing call result"
+        );
+        let function_start = root
+            .find("pub fn comparison_literal_family_mismatch")
+            .expect("comparison literal-family mismatch function exists");
+        let literal_start = function_start
+            + root[function_start..]
+                .find("value < true")
+                .expect("the mismatched comparison literal appears in the function")
+            + "value < ".len();
+        assert_eq!(
+            comparison_literal_family_mismatch
+                .body_type_check()
+                .expect("comparison literal-family mismatch has body diagnostics")
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.primary())
+                .expect("comparison literal-family mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(literal_start as u32),
+                sai_diagnostics::TextSize::new((literal_start + "true".len()) as u32),
+            )
+            .expect("comparison literal span is ordered")
+        );
+        assert_eq!(
+            expression_type_at_range(
+                comparison_taint_preserves_sibling,
+                "pub fn comparison_taint_preserves_sibling",
+                "apply_bool(value == condition)",
+                "apply_bool(".len(),
+                "value == condition".len()
+            ),
+            None,
+            "an operand error omits the comparison fact in a body with a valid sibling"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                comparison_taint_preserves_sibling,
+                "pub fn comparison_taint_preserves_sibling",
+                "apply_bool(value == condition)",
+                0,
+                "apply_bool(value == condition)".len()
+            ),
+            None,
+            "an operand error omits its call fact without suppressing sibling checks"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                comparison_taint_preserves_sibling,
+                "pub fn comparison_taint_preserves_sibling",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "an inferred path alias of a failed comparison remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                comparison_taint_preserves_sibling,
+                "pub fn comparison_taint_preserves_sibling",
+                "apply(1)",
+                0,
+                "apply(1)".len()
+            ),
+            Some(PrimTy::I32),
+            "a valid sibling call remains typed next to the comparison error"
+        );
+        let out_of_range_comparison = "value < 1e100";
+        assert_eq!(
+            expression_type_at_range(
+                comparison_literal_range,
+                "pub fn comparison_literal_range",
+                "apply_bool(value < 1e100)",
+                "apply_bool(".len(),
+                out_of_range_comparison.len()
+            ),
+            None,
+            "an out-of-range literal prevents publishing its comparison fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                comparison_literal_range,
+                "pub fn comparison_literal_range",
+                "apply_bool(value < 1e100)",
+                0,
+                "apply_bool(value < 1e100)".len()
+            ),
+            None,
+            "an out-of-range comparison literal taints the call result"
+        );
+        let literal_left_comparison = "1e400 < value";
+        assert_eq!(
+            expression_type_at_range(
+                comparison_literal_left_range_and_mismatch,
+                "pub fn comparison_literal_left_range_and_mismatch",
+                "apply_bool(1e400 < value)",
+                "apply_bool(".len(),
+                literal_left_comparison.len()
+            ),
+            None
+        );
+        let literal_left_diagnostics = match comparison_literal_left_range_and_mismatch
+            .body_type_check()
+            .expect("literal-left comparison has body diagnostics")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("literal-left comparison diagnostics remain supported")
+            }
+        };
+        let function_start = root
+            .find("pub fn comparison_literal_left_range_and_mismatch")
+            .expect("literal-left comparison function exists");
+        assert_eq!(
+            literal_left_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+            "a left literal's range diagnostic precedes the later path mismatch"
+        );
+        for (diagnostic, (expression, context, offset)) in literal_left_diagnostics.iter().zip([
+            ("1e400", "1e400 < value", 0),
+            ("value", "1e400 < value", "1e400 < ".len()),
+        ]) {
+            let start = function_start
+                + root[function_start..]
+                    .find(context)
+                    .expect("diagnostic source expression exists in the function");
+            let start = start + offset;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("comparison diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + expression.len()) as u32),
+                )
+                .expect("comparison diagnostic span is ordered")
+            );
+        }
         assert_eq!(
             expression_type_at_range(
                 arithmetic_call_argument_float,
@@ -49415,6 +49908,11 @@ property "shared"() {}
             (too_many, "pub fn too_many", "apply(input, true)"),
             (too_few, "pub fn too_few", "apply()"),
             (
+                comparison_call_argument_extra_ignored,
+                "pub fn comparison_call_argument_extra_ignored",
+                "apply(1, value < limit)",
+            ),
+            (
                 arithmetic_call_argument_extra_ignored,
                 "pub fn arithmetic_call_argument_extra_ignored",
                 "apply(input, 1 + 2)",
@@ -49458,6 +49956,17 @@ property "shared"() {}
             ),
             None,
             "an unmatched extra basic-arithmetic argument remains outside the checked prefix"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                comparison_call_argument_extra_ignored,
+                "pub fn comparison_call_argument_extra_ignored",
+                "apply(1, value < limit)",
+                "apply(1, ".len(),
+                "value < limit".len()
+            ),
+            None,
+            "an unmatched extra comparison argument remains outside the checked prefix"
         );
         for (owner, function, context, nested_call) in [
             (
@@ -49895,6 +50404,21 @@ property "shared"() {}
             binding_type(nested_inner_error, "valid"),
             Some(PrimTy::I32),
             "a valid sibling call and binding remain available next to nested errors"
+        );
+        assert_eq!(
+            binding_type(comparison_taint_preserves_sibling, "result"),
+            None,
+            "a binding initialized by an operand-invalid comparison call remains omitted"
+        );
+        assert_eq!(
+            binding_type(comparison_taint_preserves_sibling, "alias"),
+            None,
+            "an inferred alias of a comparison error remains tainted"
+        );
+        assert_eq!(
+            binding_type(comparison_taint_preserves_sibling, "valid"),
+            Some(PrimTy::I32),
+            "an independent direct-call sibling remains available beside a comparison error"
         );
         for owner in [
             nested_return_mismatch,

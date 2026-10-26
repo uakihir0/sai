@@ -2130,6 +2130,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 literal_expression.hir_id,
             ),
             Err(expected) => {
+                // Report a failed left literal at its source location before
+                // reporting the later path mismatch.
+                self.check_annotated_literal(
+                    expected,
+                    literal,
+                    literal_kind,
+                    literal_expression.hir_id,
+                );
                 self.errors.push(PrimitiveBodyError {
                     node: path.hir_id,
                     kind: PrimitiveBodyErrorKind::TypeMismatch {
@@ -2137,15 +2145,6 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         found: path_type,
                     },
                 });
-                // Even when a left numeric literal cannot unify with the
-                // path's family, its default type can independently fail
-                // range checking. Keep that diagnostic on the literal.
-                self.check_annotated_literal(
-                    expected,
-                    literal,
-                    literal_kind,
-                    literal_expression.hir_id,
-                );
             }
         }
         Ok(())
@@ -2443,6 +2442,20 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         right,
                         argument.expr.hir_id,
                     )?;
+                    self.record_expression_type(argument.expr.hir_id, local_type);
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
+                ExprKind::Binary(
+                    operator @ (BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge),
+                    left,
+                    right,
+                ) if is_supported_direct_call_comparison_operands(left, right) => {
+                    let local_type = self.check_comparison(operator, left, right)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
@@ -4868,6 +4881,21 @@ fn is_supported_direct_call_arithmetic_operands(left: &Expr<'_>, right: &Expr<'_
         );
     }
     true
+}
+
+fn is_supported_direct_call_comparison_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
+    let is_primitive_literal_or_path = |expression: &Expr<'_>| match expression.kind {
+        ExprKind::Lit(literal) => primitive_literal_kind(literal).is_some(),
+        ExprKind::Path(_) => true,
+        _ => false,
+    };
+    if !is_primitive_literal_or_path(left) || !is_primitive_literal_or_path(right) {
+        return false;
+    }
+
+    // The bounded comparison form needs a concrete local type to constrain a
+    // possible literal. Literal/literal comparisons have no such witness.
+    matches!(left.kind, ExprKind::Path(_)) || matches!(right.kind, ExprKind::Path(_))
 }
 
 fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
