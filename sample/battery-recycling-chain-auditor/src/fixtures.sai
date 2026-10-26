@@ -1,0 +1,251 @@
+use acme:battery-recycling-chain-auditor/model.{
+    AuditInput
+    BatteryLot
+    Manifest
+    MaterialStream
+    RecyclingFacility
+    ShipmentPermit
+}
+
+pub fn sample_input() -> AuditInput {
+    AuditInput(
+        source_lots: [
+            Some(
+                BatteryLot(
+                    id: "NMC-44",
+                    material: MaterialStream.NmcBlackMass,
+                    received_kg: 1400,
+                    source_facility: "North Cell Yard",
+                    source_license_valid: true,
+                ),
+            ),
+            Some(
+                BatteryLot(
+                    id: "LFP-12",
+                    material: MaterialStream.LfpBlackMass,
+                    received_kg: 800,
+                    source_facility: "River Battery Sort",
+                    source_license_valid: true,
+                ),
+            ),
+        ],
+        source_lot_count: 2,
+        permits: [
+            Some(
+                ShipmentPermit(
+                    id: "PER-NMC-240",
+                    material: MaterialStream.NmcBlackMass,
+                    destination_id: "REFINERY-NORTH",
+                    valid_from_day: 180,
+                    valid_through_day: 220,
+                    maximum_kg: 1200,
+                ),
+            ),
+            Some(
+                ShipmentPermit(
+                    id: "PER-LFP-240",
+                    material: MaterialStream.LfpBlackMass,
+                    destination_id: "REFINERY-NORTH",
+                    valid_from_day: 180,
+                    valid_through_day: 240,
+                    maximum_kg: 1000,
+                ),
+            ),
+            Some(
+                ShipmentPermit(
+                    id: "PER-LFP-DEPOT",
+                    material: MaterialStream.LfpBlackMass,
+                    destination_id: "BULK-DEPOT",
+                    valid_from_day: 180,
+                    valid_through_day: 250,
+                    maximum_kg: 1000,
+                ),
+            ),
+        ],
+        permit_count: 3,
+        destinations: [
+            Some(
+                RecyclingFacility(
+                    id: "REFINERY-NORTH",
+                    recycling_license_valid: true,
+                    accepts_nmc_black_mass: true,
+                    accepts_lfp_black_mass: true,
+                ),
+            ),
+            Some(
+                RecyclingFacility(
+                    id: "BULK-DEPOT",
+                    recycling_license_valid: false,
+                    accepts_nmc_black_mass: false,
+                    accepts_lfp_black_mass: false,
+                ),
+            ),
+        ],
+        destination_count: 2,
+        manifests: [
+            Some(
+                Manifest(
+                    id: "RC-401",
+                    source_lot_id: "NMC-44",
+                    permit_id: "PER-NMC-240",
+                    destination_id: "REFINERY-NORTH",
+                    shipment_day: 210,
+                    gross_kg: 620,
+                    tare_kg: 20,
+                    custody_documents_complete: true,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                    assay_percent: Some(20),
+                    recovered_kg: 120,
+                    residue_kg: 450,
+                    process_loss_kg: 30,
+                ),
+            ),
+            Some(
+                Manifest(
+                    id: "RC-402",
+                    source_lot_id: "NMC-44",
+                    permit_id: "PER-NMC-240",
+                    destination_id: "REFINERY-NORTH",
+                    shipment_day: 211,
+                    gross_kg: 310,
+                    tare_kg: 10,
+                    custody_documents_complete: true,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                    assay_percent: Some(20),
+                    recovered_kg: 60,
+                    residue_kg: 225,
+                    process_loss_kg: 15,
+                ),
+            ),
+            Some(
+                Manifest(
+                    id: "RC-403",
+                    source_lot_id: "NMC-44",
+                    permit_id: "PER-NMC-240",
+                    destination_id: "REFINERY-NORTH",
+                    shipment_day: 212,
+                    gross_kg: 360,
+                    tare_kg: 10,
+                    custody_documents_complete: true,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                    assay_percent: Some(20),
+                    recovered_kg: 70,
+                    residue_kg: 262,
+                    process_loss_kg: 18,
+                ),
+            ),
+            Some(
+                Manifest(
+                    id: "RC-404",
+                    source_lot_id: "LFP-12",
+                    permit_id: "PER-LFP-240",
+                    destination_id: "REFINERY-NORTH",
+                    shipment_day: 241,
+                    gross_kg: 160,
+                    tare_kg: 10,
+                    custody_documents_complete: true,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                    assay_percent: Some(30),
+                    recovered_kg: 45,
+                    residue_kg: 96,
+                    process_loss_kg: 9,
+                ),
+            ),
+            Some(
+                Manifest(
+                    id: "RC-405",
+                    source_lot_id: "LFP-12",
+                    permit_id: "PER-LFP-240",
+                    destination_id: "REFINERY-NORTH",
+                    shipment_day: 215,
+                    gross_kg: 155,
+                    tare_kg: 5,
+                    custody_documents_complete: false,
+                    custody_chain_intact: false,
+                    seal_intact: true,
+                    assay_percent: Some(30),
+                    recovered_kg: 45,
+                    residue_kg: 96,
+                    process_loss_kg: 9,
+                ),
+            ),
+            Some(
+                Manifest(
+                    id: "RC-406",
+                    source_lot_id: "LFP-12",
+                    permit_id: "PER-LFP-240",
+                    destination_id: "REFINERY-NORTH",
+                    shipment_day: 216,
+                    gross_kg: 210,
+                    tare_kg: 10,
+                    custody_documents_complete: true,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                    assay_percent: Some(30),
+                    recovered_kg: 90,
+                    residue_kg: 100,
+                    process_loss_kg: 10,
+                ),
+            ),
+            Some(
+                Manifest(
+                    id: "RC-407",
+                    source_lot_id: "LFP-12",
+                    permit_id: "PER-LFP-240",
+                    destination_id: "REFINERY-NORTH",
+                    shipment_day: 217,
+                    gross_kg: 105,
+                    tare_kg: 5,
+                    custody_documents_complete: true,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                    assay_percent: Some(30),
+                    recovered_kg: 30,
+                    residue_kg: 60,
+                    process_loss_kg: 9,
+                ),
+            ),
+            Some(
+                Manifest(
+                    id: "RC-408",
+                    source_lot_id: "LFP-12",
+                    permit_id: "PER-LFP-DEPOT",
+                    destination_id: "BULK-DEPOT",
+                    shipment_day: 218,
+                    gross_kg: 100,
+                    tare_kg: 5,
+                    custody_documents_complete: true,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                    assay_percent: Some(30),
+                    recovered_kg: 28,
+                    residue_kg: 62,
+                    process_loss_kg: 5,
+                ),
+            ),
+            Some(
+                Manifest(
+                    id: "RC-409",
+                    source_lot_id: "NMC-44",
+                    permit_id: "PER-NMC-240",
+                    destination_id: "REFINERY-NORTH",
+                    shipment_day: 219,
+                    gross_kg: 560,
+                    tare_kg: 10,
+                    custody_documents_complete: true,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                    assay_percent: Some(20),
+                    recovered_kg: 110,
+                    residue_kg: 412,
+                    process_loss_kg: 28,
+                ),
+            ),
+        ],
+        manifest_count: 9,
+    )
+}

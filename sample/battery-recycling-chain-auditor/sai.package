@@ -1,0 +1,5 @@
+package acme:battery-recycling-chain-auditor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Audit battery recycling manifests for custody, permits, destination eligibility, and mass balance"

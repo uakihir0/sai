@@ -1,0 +1,41 @@
+use acme:battery-recycling-chain-auditor/auditor
+use acme:battery-recycling-chain-auditor/fixtures
+use acme:battery-recycling-chain-auditor/model.{ChainAudit, Finding, Outcome}
+
+pub fn sample_audit() -> ChainAudit {
+    auditor.audit(fixtures.sample_input())
+}
+
+test "clears only manifests with complete authority and reconciled mass" {
+    let audit = sample_audit()
+    assert audit.manifest_count == 9
+    assert audit.cleared_count == 2
+    assert audit.held_count == 5
+    assert audit.rejected_count == 2
+    assert audit.credited_feed_kg == 900
+    assert audit.credited_recovered_kg == 180
+
+    assert audit.decisions[0].unwrap().outcome == Outcome.Cleared
+    assert audit.decisions[0].unwrap().credited_feed_kg == 600
+    assert audit.decisions[1].unwrap().outcome == Outcome.Cleared
+    assert audit.decisions[1].unwrap().credited_recovered_kg == 60
+    assert audit.decisions[2].unwrap().finding == Some(Finding.PermitQuantityExceeded)
+    assert audit.decisions[3].unwrap().finding == Some(Finding.PermitExpired)
+    assert audit.decisions[4].unwrap().finding == Some(Finding.MissingCustodyDocuments)
+    assert audit.decisions[5].unwrap().finding == Some(Finding.AssayOutsideTolerance)
+    assert audit.decisions[6].unwrap().finding == Some(Finding.MassBalanceMismatch)
+    assert audit.decisions[7].unwrap().finding == Some(Finding.DestinationNotEligible)
+    assert audit.decisions[8].unwrap().finding == Some(Finding.SourceLotQuantityExceeded)
+}
+
+test "only cleared feed consumes source and permit capacity" {
+    let audit = sample_audit()
+    assert audit.source_lot_balances[0].unwrap().credited_kg == 900
+    assert audit.source_lot_balances[0].unwrap().remaining_kg == 500
+    assert audit.source_lot_balances[1].unwrap().credited_kg == 0
+    assert audit.source_lot_balances[1].unwrap().remaining_kg == 800
+    assert audit.permit_balances[0].unwrap().credited_kg == 900
+    assert audit.permit_balances[0].unwrap().remaining_kg == 300
+    assert audit.permit_balances[1].unwrap().credited_kg == 0
+    assert audit.permit_balances[1].unwrap().remaining_kg == 1000
+}
