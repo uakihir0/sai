@@ -1,0 +1,231 @@
+use acme:resilience-drill-planner/model.{
+    Coverage
+    Drill
+    DrillPlan
+    Finding
+    Outcome
+    PlanInput
+    PlanReport
+    ScenarioKind
+}
+use acme:resilience-drill-planner/preflight
+
+fn covers(drill: Drill, kind: ScenarioKind) -> Bool {
+    match kind {
+        ScenarioKind.RegionalPower => drill.covers_regional_power
+        ScenarioKind.CredentialRevocation => drill.covers_credential_revocation
+        ScenarioKind.QueueBackpressure => drill.covers_queue_backpressure
+        ScenarioKind.SchemaRollback => drill.covers_schema_rollback
+    }
+}
+
+fn is_covered(coverage: Coverage, kind: ScenarioKind) -> Bool {
+    match kind {
+        ScenarioKind.RegionalPower => coverage.regional_power
+        ScenarioKind.CredentialRevocation => coverage.credential_revocation
+        ScenarioKind.QueueBackpressure => coverage.queue_backpressure
+        ScenarioKind.SchemaRollback => coverage.schema_rollback
+    }
+}
+
+fn add_coverage(coverage: Coverage, drill: Drill) -> Coverage {
+    var updated = coverage
+    if drill.covers_regional_power {
+        updated.regional_power = true
+    }
+    if drill.covers_credential_revocation {
+        updated.credential_revocation = true
+    }
+    if drill.covers_queue_backpressure {
+        updated.queue_backpressure = true
+    }
+    if drill.covers_schema_rollback {
+        updated.schema_rollback = true
+    }
+    updated
+}
+
+fn marginal_weight(input: PlanInput, coverage: Coverage, drill: Drill) -> U32 {
+    var weight: U32 = 0
+    for index in 0..input.scenario_count {
+        let scenario = input.scenarios[index]
+        if covers(drill, scenario.kind) and not is_covered(coverage, scenario.kind) {
+            weight += scenario.weight
+        }
+    }
+    weight
+}
+
+fn total_weight(input: PlanInput) -> U32 {
+    var weight: U32 = 0
+    for index in 0..input.scenario_count {
+        weight += input.scenarios[index].weight
+    }
+    weight
+}
+
+fn covered_weight(input: PlanInput, coverage: Coverage) -> U32 {
+    var weight: U32 = 0
+    for index in 0..input.scenario_count {
+        let scenario = input.scenarios[index]
+        if is_covered(coverage, scenario.kind) {
+            weight += scenario.weight
+        }
+    }
+    weight
+}
+
+fn outranks(
+    input: PlanInput,
+    coverage: Coverage,
+    candidate_index: USize,
+    current_index: USize,
+) -> Bool {
+    let candidate = input.drills[candidate_index]
+    let current = input.drills[current_index]
+    let candidate_weight = marginal_weight(input, coverage, candidate)
+    let current_weight = marginal_weight(input, coverage, current)
+    if candidate_weight > current_weight {
+        true
+    } else if candidate_weight < current_weight {
+        false
+    } else if candidate.duration_hours < current.duration_hours {
+        true
+    } else if candidate.duration_hours > current.duration_hours {
+        false
+    } else {
+        candidate.id < current.id
+    }
+}
+
+fn next_drill(
+    input: PlanInput,
+    coverage: Coverage,
+    eligible: Array<Bool, 8>,
+    selected: Array<Bool, 8>,
+    remaining_hours: U32,
+    remaining_slots: USize,
+) -> Option<USize> {
+    if remaining_slots == 0 {
+        return None
+    }
+
+    var best: Option<USize> = None
+    for index in 0..input.drill_count {
+        let drill = input.drills[index]
+        let gain = marginal_weight(input, coverage, drill)
+        if (
+            eligible[index]
+            and not selected[index]
+            and gain > 0
+            and drill.duration_hours <= remaining_hours
+        ) {
+            match best {
+                None => {
+                    best = Some(index)
+                }
+                Some(current_index) => {
+                    if outranks(input, coverage, index, current_index) {
+                        best = Some(index)
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+fn planned_drill(
+    drill: Drill,
+    outcome: Outcome,
+    finding: Option<Finding>,
+    selection_order: Option<USize>,
+    marginal: U32,
+) -> DrillPlan {
+    DrillPlan(
+        drill_id: drill.id,
+        outcome: outcome,
+        finding: finding,
+        selection_order: selection_order,
+        marginal_weight: marginal,
+        duration_hours: drill.duration_hours,
+    )
+}
+
+pub fn build(input: PlanInput) -> PlanReport {
+    var plans: Array<Option<DrillPlan>, 8> = Array<Option<DrillPlan>, 8>.filled(None)
+    var eligible: Array<Bool, 8> = Array<Bool, 8>.filled(false)
+    var selected: Array<Bool, 8> = Array<Bool, 8>.filled(false)
+    var coverage = Coverage(
+        regional_power: false,
+        credential_revocation: false,
+        queue_backpressure: false,
+        schema_rollback: false,
+    )
+    var scheduled_count: USize = 0
+    var held_count: USize = 0
+    var deferred_count: USize = 0
+    var hours_used: U32 = 0
+
+    for index in 0..input.drill_count {
+        let drill = input.drills[index]
+        let issue = preflight.finding(drill)
+        if issue.is_some() {
+            plans[index] = Some(planned_drill(drill, Outcome.Held, issue, None, 0))
+            held_count += 1
+        } else {
+            eligible[index] = true
+            plans[index] = Some(planned_drill(drill, Outcome.Pending, None, None, 0))
+        }
+    }
+
+    for _ in 0..input.drill_count {
+        let remaining_hours = input.hours_budget - hours_used
+        let remaining_slots = input.drill_count_limit - scheduled_count
+        let next = next_drill(input, coverage, eligible, selected, remaining_hours, remaining_slots)
+        match next {
+            None => break
+            Some(index) => {
+                let drill = input.drills[index]
+                let gain = marginal_weight(input, coverage, drill)
+                selected[index] = true
+                plans[index] = Some(
+                    planned_drill(drill, Outcome.Scheduled, None, Some(scheduled_count + 1), gain),
+                )
+                scheduled_count += 1
+                hours_used += drill.duration_hours
+                coverage = add_coverage(coverage, drill)
+            }
+        }
+    }
+
+    for index in 0..input.drill_count {
+        if eligible[index] and not selected[index] {
+            let drill = input.drills[index]
+            let remaining_gain = marginal_weight(input, coverage, drill)
+            var reason = Finding.CoverageAlreadyPlanned
+            if remaining_gain > 0 {
+                if scheduled_count >= input.drill_count_limit {
+                    reason = Finding.DrillCountLimitReached
+                } else {
+                    reason = Finding.HoursBudgetExceeded
+                }
+            }
+            plans[index] =
+                Some(planned_drill(drill, Outcome.Deferred, Some(reason), None, remaining_gain))
+            deferred_count += 1
+        }
+    }
+
+    PlanReport(
+        drills: plans,
+        drill_count: input.drill_count,
+        scheduled_count: scheduled_count,
+        held_count: held_count,
+        deferred_count: deferred_count,
+        hours_used: hours_used,
+        covered_weight: covered_weight(input, coverage),
+        total_weight: total_weight(input),
+        covered_scenarios: coverage,
+    )
+}
