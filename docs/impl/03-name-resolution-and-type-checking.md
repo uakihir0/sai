@@ -2793,6 +2793,20 @@ Method/constructor/function-pointer/extern/WIT calls, generic or otherwise
 unsupported signatures, calls nested more than one argument level, calls
 inside compound expressions or operators, compound call arguments, call
 contracts and `call_kinds` remain outside the projection.
+**IR-961 unary logical call arguments** add exactly one unary `not` node as an
+immediate positional argument to an eligible direct call or its existing
+one-level nested call. Its operand must be one plain, one-segment,
+non-generic path that resolves by exact `BindingId` to an eligible function
+parameter or a local declared before the expression. Reuse the existing
+unary logical checker to check the operand against `Bool` and record a
+successful `not` expression as `Bool` under its exact owner `HirId`. Operand
+and expected-parameter diagnostics retain their source spans and source order;
+an error taints the `not`, containing call, and inferred local dependents while
+valid independent siblings remain available. Keep existing direct-call
+target/signature, common-prefix, nested-call-depth, result-taint, and CLI
+Stage 0 gates unchanged. Literals, double or nested `not`, computed or call
+operands, unsupported calls or signatures, and deeper call nesting remain
+unsupported.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
