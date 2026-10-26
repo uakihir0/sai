@@ -8982,6 +8982,12 @@ fn is_supported_direct_call_argument_shape(
         ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Unary(UnOp::Not, _) => is_supported_direct_call_not_argument_shape(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+        ),
         ExprKind::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, left, right) => {
             is_supported_direct_call_arithmetic_operands_shape(
                 left,
@@ -9073,6 +9079,12 @@ fn is_supported_direct_call_arithmetic_argument_shape(
                 inputs,
             )
         }
+        ExprKind::Unary(UnOp::Not, _) => is_supported_direct_call_not_argument_shape(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+        ),
         _ => is_supported_direct_call_leaf_argument_shape(
             expression,
             preceding_bindings,
@@ -9080,6 +9092,22 @@ fn is_supported_direct_call_arithmetic_argument_shape(
             inputs,
         ),
     }
+}
+
+fn is_supported_direct_call_not_argument_shape(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let ExprKind::Unary(UnOp::Not, operand) = expression.kind else {
+        return false;
+    };
+    let ExprKind::Path(path) = operand.kind else {
+        return false;
+    };
+    resolved_plain_local_path_binding(path, locals, inputs)
+        .is_some_and(|binding| preceding_bindings.contains(&binding))
 }
 
 fn is_supported_direct_call_arithmetic_operands_shape(
@@ -48704,6 +48732,23 @@ property "shared"() {}
             "    let right_copy = right\n",
             "    apply_bool(left_copy and right_copy)\n",
             "}\n",
+            "pub fn not_call_argument(value: Bool) -> Bool { apply_bool(not value) }\n",
+            "pub fn nested_not_call_argument(value: Bool) -> Bool { apply_bool(apply_bool(not value)) }\n",
+            "pub fn not_local_path_call_argument(value: Bool) -> Bool {\n",
+            "    let copy = value\n",
+            "    apply_bool(not copy)\n",
+            "}\n",
+            "pub fn not_operand_mismatch(value: I32) -> Bool {\n",
+            "    let result = apply_bool(not value)\n",
+            "    result\n",
+            "}\n",
+            "pub fn not_parameter_mismatch(value: Bool) -> I32 { apply(not value) }\n",
+            "pub fn not_taint_preserves_sibling(value: I32) -> I32 {\n",
+            "    let result = apply_bool(not value)\n",
+            "    let alias = result\n",
+            "    let valid = apply(value)\n",
+            "    valid\n",
+            "}\n",
             "pub fn logical_operand_mismatch(left: Bool, right: I32) -> Bool {\n",
             "    let result = apply_bool(left and right)\n",
             "    let alias = result\n",
@@ -48740,7 +48785,15 @@ property "shared"() {}
             "pub fn call_comparison_operand_unsupported(value: I32, limit: I32) -> Bool { apply_bool(add_one(value) < limit) }\n",
             "pub fn deep_comparison_call_unsupported(value: I32, limit: I32) -> Bool { apply_bool(apply_bool(apply_bool(value < limit))) }\n",
             "pub fn logical_literal_operand_unsupported(left: Bool) -> Bool { apply_bool(left and true) }\n",
-            "pub fn logical_not_operand_unsupported(left: Bool) -> Bool { apply_bool(not left) }\n",
+            "pub fn not_literal_call_argument_unsupported() -> Bool { apply_bool(not true) }\n",
+            "pub fn not_nested_operand_unsupported(value: Bool) -> Bool { apply_bool(not not value) }\n",
+            "pub fn not_call_operand_unsupported(value: Bool) -> Bool { apply_bool(not apply_bool(value)) }\n",
+            "pub fn not_logical_operand_unsupported(value: Bool, enabled: Bool) -> Bool { apply_bool(not value and enabled) }\n",
+            "pub fn not_forward_local_path_unsupported(value: Bool) -> Bool {\n",
+            "    let result = apply_bool(not enabled)\n",
+            "    let enabled = value\n",
+            "    result\n",
+            "}\n",
             "pub fn logical_nested_expression_unsupported(left: Bool, right: Bool) -> Bool { apply_bool((left and right) or left) }\n",
             "pub fn logical_arithmetic_operand_unsupported(left: I32, right: I32) -> Bool { apply_bool((left + right) and true) }\n",
             "pub fn logical_comparison_operand_unsupported(left: I32, right: I32) -> Bool { apply_bool((left < right) and true) }\n",
@@ -48900,6 +48953,21 @@ property "shared"() {}
             assert_supported("nested_logical_or_call_argument", &[]);
         let logical_local_paths_call_argument =
             assert_supported("logical_local_paths_call_argument", &[]);
+        let not_call_argument = assert_supported("not_call_argument", &[]);
+        let nested_not_call_argument = assert_supported("nested_not_call_argument", &[]);
+        let not_local_path_call_argument = assert_supported("not_local_path_call_argument", &[]);
+        let not_operand_mismatch = assert_supported(
+            "not_operand_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let not_parameter_mismatch = assert_supported(
+            "not_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let not_taint_preserves_sibling = assert_supported(
+            "not_taint_preserves_sibling",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         let logical_operand_mismatch = assert_supported(
             "logical_operand_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
@@ -49033,7 +49101,11 @@ property "shared"() {}
             "remainder_call_argument",
             "logical_forward_local_paths_unsupported",
             "logical_literal_operand_unsupported",
-            "logical_not_operand_unsupported",
+            "not_literal_call_argument_unsupported",
+            "not_nested_operand_unsupported",
+            "not_call_operand_unsupported",
+            "not_logical_operand_unsupported",
+            "not_forward_local_path_unsupported",
             "logical_nested_expression_unsupported",
             "logical_arithmetic_operand_unsupported",
             "logical_comparison_operand_unsupported",
@@ -49573,6 +49645,220 @@ property "shared"() {}
             ),
             Some(PrimTy::Bool),
             "a logical call argument over preceding local bindings retains its exact Bool fact"
+        );
+        for (owner, function, call) in [
+            (
+                not_call_argument,
+                "pub fn not_call_argument",
+                "apply_bool(not value)",
+            ),
+            (
+                nested_not_call_argument,
+                "pub fn nested_not_call_argument",
+                "apply_bool(apply_bool(not value))",
+            ),
+        ] {
+            assert_eq!(
+                expression_type_at_range(owner, function, call, 0, call.len()),
+                Some(PrimTy::Bool),
+                "the direct-call result keeps its Bool fact for `{function}`"
+            );
+            let not_start = call
+                .rfind("not value")
+                .expect("the unary-not argument exists");
+            assert_eq!(
+                expression_type_at_range(owner, function, call, not_start, "not value".len()),
+                Some(PrimTy::Bool),
+                "the unary-not expression keeps its exact Bool fact for `{function}`"
+            );
+            if call.starts_with("apply_bool(apply_bool(") {
+                assert_eq!(
+                    expression_type_at_range(
+                        owner,
+                        function,
+                        call,
+                        "apply_bool(".len(),
+                        "apply_bool(not value)".len()
+                    ),
+                    Some(PrimTy::Bool),
+                    "the one-level nested direct call keeps its Bool fact for `{function}`"
+                );
+            }
+        }
+        let local_not_call = "apply_bool(not copy)";
+        assert_eq!(
+            expression_type_at_range(
+                not_local_path_call_argument,
+                "pub fn not_local_path_call_argument",
+                local_not_call,
+                0,
+                local_not_call.len()
+            ),
+            Some(PrimTy::Bool),
+            "a direct call accepts unary not over an exact preceding local binding"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                not_local_path_call_argument,
+                "pub fn not_local_path_call_argument",
+                local_not_call,
+                "apply_bool(".len(),
+                "not copy".len()
+            ),
+            Some(PrimTy::Bool),
+            "unary not over the preceding local retains its Bool type"
+        );
+        let not_operand_mismatch_call = "apply_bool(not value)";
+        assert_eq!(
+            expression_type_at_range(
+                not_operand_mismatch,
+                "pub fn not_operand_mismatch",
+                not_operand_mismatch_call,
+                "apply_bool(".len(),
+                "not value".len()
+            ),
+            None,
+            "a non-Bool unary-not operand prevents publishing the expression fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                not_operand_mismatch,
+                "pub fn not_operand_mismatch",
+                not_operand_mismatch_call,
+                0,
+                not_operand_mismatch_call.len()
+            ),
+            None,
+            "a non-Bool unary-not operand taints its containing call fact"
+        );
+        let not_operand_diagnostics = match not_operand_mismatch
+            .body_type_check()
+            .expect("unary-not operand mismatch has body diagnostics")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("a unary-not operand mismatch remains a supported diagnostic")
+            }
+        };
+        assert_eq!(
+            not_operand_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch],
+            "a non-Bool unary-not operand reports one type mismatch"
+        );
+        let not_operand_function_start = root
+            .find("pub fn not_operand_mismatch")
+            .expect("unary-not mismatch function exists");
+        let not_operand_start = not_operand_function_start
+            + root[not_operand_function_start..]
+                .find("not value")
+                .expect("the unary-not expression appears in the mismatch function")
+            + "not ".len();
+        assert_eq!(
+            not_operand_diagnostics[0]
+                .primary()
+                .expect("unary-not operand mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(not_operand_start as u32),
+                sai_diagnostics::TextSize::new((not_operand_start + "value".len()) as u32),
+            )
+            .expect("unary-not operand mismatch span is ordered")
+        );
+        let not_parameter_call = "apply(not value)";
+        assert_eq!(
+            expression_type_at_range(
+                not_parameter_mismatch,
+                "pub fn not_parameter_mismatch",
+                not_parameter_call,
+                "apply(".len(),
+                "not value".len()
+            ),
+            None,
+            "a Bool unary-not argument passed to I32 has no compatible argument fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                not_parameter_mismatch,
+                "pub fn not_parameter_mismatch",
+                not_parameter_call,
+                0,
+                not_parameter_call.len()
+            ),
+            None,
+            "a direct call with a unary-not parameter mismatch has no result fact"
+        );
+        let not_parameter_diagnostics = match not_parameter_mismatch
+            .body_type_check()
+            .expect("unary-not call parameter mismatch has body diagnostics")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("unary-not call parameter mismatch remains supported")
+            }
+        };
+        let not_parameter_function_start = root
+            .find("pub fn not_parameter_mismatch")
+            .expect("unary-not parameter mismatch function exists");
+        let not_parameter_start = not_parameter_function_start
+            + root[not_parameter_function_start..]
+                .find("not value")
+                .expect("the mismatched unary-not argument appears in the function");
+        assert_eq!(
+            not_parameter_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch],
+            "the incompatible call parameter reports one type mismatch"
+        );
+        assert_eq!(
+            not_parameter_diagnostics[0]
+                .primary()
+                .expect("unary-not call parameter mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(not_parameter_start as u32),
+                sai_diagnostics::TextSize::new((not_parameter_start + "not value".len()) as u32),
+            )
+            .expect("unary-not call parameter mismatch span is ordered")
+        );
+        assert_eq!(
+            expression_type_at_range(
+                not_taint_preserves_sibling,
+                "pub fn not_taint_preserves_sibling",
+                "apply_bool(not value)",
+                "apply_bool(".len(),
+                "not value".len()
+            ),
+            None,
+            "a failed unary-not operand omits its expression fact alongside a valid sibling"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                not_taint_preserves_sibling,
+                "pub fn not_taint_preserves_sibling",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "an inferred alias of a failed unary-not call remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                not_taint_preserves_sibling,
+                "pub fn not_taint_preserves_sibling",
+                "apply(value)",
+                0,
+                "apply(value)".len()
+            ),
+            Some(PrimTy::I32),
+            "a valid sibling call remains typed next to the unary-not operand error"
         );
         assert_eq!(
             expression_type_at_range(

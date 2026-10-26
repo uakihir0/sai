@@ -18956,6 +18956,24 @@ fn logical_arguments_to_direct_calls_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn unary_not_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn negate(value: Bool) -> Bool { identity_bool(not value) }\n",
+        "pub fn nested_negate(value: Bool) -> Bool { identity_bool(identity_bool(not value)) }\n",
+        "pub fn negate_local(value: Bool) -> Bool {\n",
+        "    let copy = value\n",
+        "    identity_bool(not copy)\n",
+        "}\n",
+        "fn identity_bool(value: Bool) -> Bool { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "a direct or one-level nested call with a unary-not path argument",
+    );
+}
+
+#[test]
 fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
     let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);
