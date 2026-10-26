@@ -1,0 +1,209 @@
+use acme:battery-recycling-chain-auditor/lookup
+use acme:battery-recycling-chain-auditor/model.{
+    AuditInput
+    ChainAudit
+    Finding
+    Manifest
+    ManifestDecision
+    Outcome
+    PermitBalance
+    SourceLotBalance
+}
+
+fn first_finding(
+    input: AuditInput,
+    manifest: Manifest,
+    decisions: Array<Option<ManifestDecision>, 9>,
+    previous_count: USize,
+) -> Option<Finding> {
+    if lookup.has_seen_manifest_id(decisions, previous_count, manifest.id) {
+        return Some(Finding.DuplicateManifestId)
+    }
+
+    let lot_index = match lookup.source_lot_index(input, manifest.source_lot_id) {
+        Some(index) => index
+        None => return Some(Finding.UnknownSourceLot)
+    }
+    let lot = input.source_lots[lot_index].unwrap()
+    if not lot.source_license_valid {
+        return Some(Finding.SourceLicenseInvalid)
+    }
+    if not manifest.custody_documents_complete {
+        return Some(Finding.MissingCustodyDocuments)
+    }
+    if not manifest.custody_chain_intact {
+        return Some(Finding.BrokenCustodyChain)
+    }
+    if not manifest.seal_intact {
+        return Some(Finding.BrokenSeal)
+    }
+
+    let permit_index = match lookup.permit_index(input, manifest.permit_id) {
+        Some(index) => index
+        None => return Some(Finding.UnknownPermit)
+    }
+    let permit = input.permits[permit_index].unwrap()
+    if permit.material != lot.material {
+        return Some(Finding.PermitMaterialMismatch)
+    }
+    if permit.destination_id != manifest.destination_id {
+        return Some(Finding.PermitDestinationMismatch)
+    }
+    if manifest.shipment_day < permit.valid_from_day {
+        return Some(Finding.PermitNotYetValid)
+    }
+    if manifest.shipment_day > permit.valid_through_day {
+        return Some(Finding.PermitExpired)
+    }
+
+    let destination_index = match lookup.destination_index(input, manifest.destination_id) {
+        Some(index) => index
+        None => return Some(Finding.UnknownDestination)
+    }
+    let destination = input.destinations[destination_index].unwrap()
+    if not lookup.destination_accepts(destination, lot.material) {
+        return Some(Finding.DestinationNotEligible)
+    }
+    if manifest.tare_kg >= manifest.gross_kg {
+        return Some(Finding.InvalidShipmentWeight)
+    }
+
+    let feed_kg = lookup.feed_kg(manifest)
+    let reserved_lot_kg = lookup.credited_lot_kg(decisions, previous_count, lot.id)
+    if feed_kg > lot.received_kg - reserved_lot_kg {
+        return Some(Finding.SourceLotQuantityExceeded)
+    }
+
+    let reserved_permit_kg =
+        lookup.credited_permit_kg(decisions, previous_count, manifest.permit_id)
+    if feed_kg > permit.maximum_kg - reserved_permit_kg {
+        return Some(Finding.PermitQuantityExceeded)
+    }
+
+    let assay_percent = match manifest.assay_percent {
+        Some(value) => value
+        None => return Some(Finding.MissingAssay)
+    }
+    if assay_percent > 100 {
+        return Some(Finding.InvalidAssayPercent)
+    }
+
+    let expected_recovered_kg = (feed_kg * assay_percent) / 100
+    let variance_kg = if manifest.recovered_kg > expected_recovered_kg {
+        manifest.recovered_kg - expected_recovered_kg
+    } else {
+        expected_recovered_kg - manifest.recovered_kg
+    }
+    if variance_kg > lookup.assay_tolerance_kg(feed_kg) {
+        return Some(Finding.AssayOutsideTolerance)
+    }
+
+    if manifest.recovered_kg + manifest.residue_kg + manifest.process_loss_kg != feed_kg {
+        return Some(Finding.MassBalanceMismatch)
+    }
+
+    None
+}
+
+pub fn audit(input: AuditInput) -> ChainAudit {
+    var decisions: Array<Option<ManifestDecision>, 9> =
+        Array<Option<ManifestDecision>, 9>.filled(None)
+    var cleared_count: USize = 0
+    var held_count: USize = 0
+    var rejected_count: USize = 0
+    var credited_feed_kg: U32 = 0
+    var credited_recovered_kg: U32 = 0
+
+    for index in 0..input.manifest_count {
+        let manifest = input.manifests[index].unwrap()
+        let finding = first_finding(input, manifest, decisions, index)
+        let outcome = match finding {
+            Some(reason) => if lookup.is_rejection(reason) {
+                Outcome.Rejected
+            } else {
+                Outcome.Held
+            }
+            None => Outcome.Cleared
+        }
+        let proposed_feed_kg = if manifest.gross_kg > manifest.tare_kg {
+            lookup.feed_kg(manifest)
+        } else {
+            0
+        }
+        let credited = outcome == Outcome.Cleared
+        let credited_manifest_feed_kg = if credited {
+            proposed_feed_kg
+        } else {
+            0
+        }
+        let credited_manifest_recovered_kg = if credited {
+            manifest.recovered_kg
+        } else {
+            0
+        }
+        decisions[index] = Some(
+            ManifestDecision(
+                manifest_id: manifest.id,
+                source_lot_id: manifest.source_lot_id,
+                permit_id: manifest.permit_id,
+                destination_id: manifest.destination_id,
+                outcome: outcome,
+                finding: finding,
+                proposed_feed_kg: proposed_feed_kg,
+                credited_feed_kg: credited_manifest_feed_kg,
+                credited_recovered_kg: credited_manifest_recovered_kg,
+            ),
+        )
+        if credited {
+            cleared_count += 1
+            credited_feed_kg += credited_manifest_feed_kg
+            credited_recovered_kg += credited_manifest_recovered_kg
+        } else if outcome == Outcome.Held {
+            held_count += 1
+        } else {
+            rejected_count += 1
+        }
+    }
+
+    var source_lot_balances: Array<Option<SourceLotBalance>, 2> =
+        Array<Option<SourceLotBalance>, 2>.filled(None)
+    for index in 0..input.source_lot_count {
+        let lot = input.source_lots[index].unwrap()
+        let used_kg = lookup.credited_lot_kg(decisions, input.manifest_count, lot.id)
+        source_lot_balances[index] = Some(
+            SourceLotBalance(
+                source_lot_id: lot.id,
+                received_kg: lot.received_kg,
+                credited_kg: used_kg,
+                remaining_kg: lot.received_kg - used_kg,
+            ),
+        )
+    }
+
+    var permit_balances: Array<Option<PermitBalance>, 3> =
+        Array<Option<PermitBalance>, 3>.filled(None)
+    for index in 0..input.permit_count {
+        let permit = input.permits[index].unwrap()
+        let used_kg = lookup.credited_permit_kg(decisions, input.manifest_count, permit.id)
+        permit_balances[index] = Some(
+            PermitBalance(
+                permit_id: permit.id,
+                maximum_kg: permit.maximum_kg,
+                credited_kg: used_kg,
+                remaining_kg: permit.maximum_kg - used_kg,
+            ),
+        )
+    }
+
+    ChainAudit(
+        decisions: decisions,
+        source_lot_balances: source_lot_balances,
+        permit_balances: permit_balances,
+        manifest_count: input.manifest_count,
+        cleared_count: cleared_count,
+        held_count: held_count,
+        rejected_count: rejected_count,
+        credited_feed_kg: credited_feed_kg,
+        credited_recovered_kg: credited_recovered_kg,
+    )
+}

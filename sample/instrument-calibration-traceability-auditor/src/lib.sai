@@ -1,0 +1,6 @@
+use acme:instrument-calibration-traceability-auditor/audit.{audit_all}
+use acme:instrument-calibration-traceability-auditor/model.{AuditReport}
+
+pub fn fixture_audit() -> AuditReport {
+    audit_all(data.instruments(), data.standards(), data.calibrations(), data.policy())
+}

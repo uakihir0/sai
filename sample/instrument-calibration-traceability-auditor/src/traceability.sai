@@ -1,0 +1,76 @@
+use acme:instrument-calibration-traceability-auditor/model.{
+    AuditIssue
+    Instrument
+    ReferenceStandard
+}
+use acme:instrument-calibration-traceability-auditor/registry.{standard_index}
+use sai:core/num.{U32_MAX}
+
+pub fn reference_chain_uncertainty(
+    standards: Array<ReferenceStandard, 5>,
+    now_minute: U32,
+    performed_minute: U32,
+    instrument: Instrument,
+    starting_standard_id: U32,
+) -> Result<U32, AuditIssue> {
+    if instrument.range_min > instrument.range_max {
+        return Err(AuditIssue.InvalidInstrumentRange)
+    }
+
+    var visited = Array<Option<U32>, 5>.filled(None)
+    var depth: USize = 0
+    var combined_uncertainty: U32 = 0
+    var cursor: Option<U32> = Some(starting_standard_id)
+
+    while depth < standards.len() {
+        let current_id = match cursor {
+            Some(id) => id
+            None => return Err(AuditIssue.ReferenceCycleOrChainTooDeep)
+        }
+        for seen_index in 0..depth {
+            if visited[seen_index] == Some(current_id) {
+                return Err(AuditIssue.ReferenceCycleOrChainTooDeep)
+            }
+        }
+        visited[depth] = Some(current_id)
+        depth += 1
+
+        let current_index = match standard_index(standards, current_id) {
+            Ok(index) => index
+            Err(issue) => return Err(issue)
+        }
+        let standard = standards[current_index]
+        if not standard.accredited {
+            return Err(AuditIssue.ReferenceNotAccredited)
+        }
+        let has_been_revoked = match standard.revoked_at_minute {
+            Some(revoked_at) => revoked_at <= now_minute
+            None => false
+        }
+        if has_been_revoked {
+            return Err(AuditIssue.ReferenceRevoked)
+        }
+        if (
+            performed_minute < standard.valid_from_minute
+            or performed_minute > standard.valid_until_minute
+        ) {
+            return Err(AuditIssue.ReferenceInvalidAtCalibration)
+        }
+        if standard.range_min > instrument.range_min or standard.range_max < instrument.range_max {
+            return Err(AuditIssue.ReferenceRangeTooNarrow)
+        }
+        if standard.uncertainty_milli > U32_MAX - combined_uncertainty {
+            return Err(AuditIssue.UncertaintyOverflow)
+        }
+        combined_uncertainty += standard.uncertainty_milli
+
+        match standard.parent_id {
+            Some(parent_id) => {
+                cursor = Some(parent_id)
+            }
+            None => return Ok(combined_uncertainty)
+        }
+    }
+
+    Err(AuditIssue.ReferenceCycleOrChainTooDeep)
+}

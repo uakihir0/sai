@@ -1,0 +1,130 @@
+use acme:battery-recycling-chain-auditor/model.{
+    AuditInput
+    Finding
+    Manifest
+    ManifestDecision
+    MaterialStream
+    Outcome
+    RecyclingFacility
+}
+
+pub fn source_lot_index(input: AuditInput, source_lot_id: Str) -> Option<USize> {
+    for index in 0..input.source_lot_count {
+        let lot = input.source_lots[index].unwrap()
+        if lot.id == source_lot_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn permit_index(input: AuditInput, permit_id: Str) -> Option<USize> {
+    for index in 0..input.permit_count {
+        let permit = input.permits[index].unwrap()
+        if permit.id == permit_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn destination_index(input: AuditInput, destination_id: Str) -> Option<USize> {
+    for index in 0..input.destination_count {
+        let destination = input.destinations[index].unwrap()
+        if destination.id == destination_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn has_seen_manifest_id(
+    decisions: Array<Option<ManifestDecision>, 9>,
+    decision_count: USize,
+    manifest_id: Str,
+) -> Bool {
+    for index in 0..decision_count {
+        if decisions[index].unwrap().manifest_id == manifest_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn credited_lot_kg(
+    decisions: Array<Option<ManifestDecision>, 9>,
+    decision_count: USize,
+    source_lot_id: Str,
+) -> U32 {
+    var total: U32 = 0
+    for index in 0..decision_count {
+        let decision = decisions[index].unwrap()
+        if decision.outcome == Outcome.Cleared and decision.source_lot_id == source_lot_id {
+            total += decision.credited_feed_kg
+        }
+    }
+    total
+}
+
+pub fn credited_permit_kg(
+    decisions: Array<Option<ManifestDecision>, 9>,
+    decision_count: USize,
+    permit_id: Str,
+) -> U32 {
+    var total: U32 = 0
+    for index in 0..decision_count {
+        let decision = decisions[index].unwrap()
+        if decision.outcome == Outcome.Cleared and decision.permit_id == permit_id {
+            total += decision.credited_feed_kg
+        }
+    }
+    total
+}
+
+pub fn feed_kg(manifest: Manifest) -> U32 {
+    manifest.gross_kg - manifest.tare_kg
+}
+
+pub fn destination_accepts(destination: RecyclingFacility, material: MaterialStream) -> Bool {
+    if not destination.recycling_license_valid {
+        return false
+    }
+    match material {
+        MaterialStream.NmcBlackMass => destination.accepts_nmc_black_mass
+        MaterialStream.LfpBlackMass => destination.accepts_lfp_black_mass
+    }
+}
+
+pub fn assay_tolerance_kg(feed_kg: U32) -> U32 {
+    let proportional_tolerance = feed_kg / 50
+    if proportional_tolerance < 1 {
+        1
+    } else {
+        proportional_tolerance
+    }
+}
+
+pub fn is_rejection(finding: Finding) -> Bool {
+    match finding {
+        Finding.DuplicateManifestId => true
+        Finding.UnknownSourceLot => true
+        Finding.SourceLicenseInvalid => true
+        Finding.MissingCustodyDocuments => false
+        Finding.BrokenCustodyChain => false
+        Finding.BrokenSeal => false
+        Finding.UnknownPermit => true
+        Finding.PermitMaterialMismatch => true
+        Finding.PermitDestinationMismatch => true
+        Finding.PermitNotYetValid => true
+        Finding.PermitExpired => true
+        Finding.UnknownDestination => true
+        Finding.DestinationNotEligible => true
+        Finding.SourceLotQuantityExceeded => false
+        Finding.PermitQuantityExceeded => false
+        Finding.InvalidShipmentWeight => false
+        Finding.MissingAssay => false
+        Finding.AssayOutsideTolerance => false
+        Finding.InvalidAssayPercent => false
+        Finding.MassBalanceMismatch => false
+    }
+}

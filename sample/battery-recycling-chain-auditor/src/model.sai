@@ -1,0 +1,135 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum MaterialStream {
+    NmcBlackMass
+    LfpBlackMass
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Finding {
+    DuplicateManifestId
+    UnknownSourceLot
+    SourceLicenseInvalid
+    MissingCustodyDocuments
+    BrokenCustodyChain
+    BrokenSeal
+    UnknownPermit
+    PermitMaterialMismatch
+    PermitDestinationMismatch
+    PermitNotYetValid
+    PermitExpired
+    UnknownDestination
+    DestinationNotEligible
+    SourceLotQuantityExceeded
+    PermitQuantityExceeded
+    InvalidShipmentWeight
+    MissingAssay
+    AssayOutsideTolerance
+    InvalidAssayPercent
+    MassBalanceMismatch
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Outcome {
+    Cleared
+    Held
+    Rejected
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BatteryLot {
+    pub id: Str
+    pub material: MaterialStream
+    pub received_kg: U32
+    pub source_facility: Str
+    pub source_license_valid: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ShipmentPermit {
+    pub id: Str
+    pub material: MaterialStream
+    pub destination_id: Str
+    pub valid_from_day: U32
+    pub valid_through_day: U32
+    pub maximum_kg: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RecyclingFacility {
+    pub id: Str
+    pub recycling_license_valid: Bool
+    pub accepts_nmc_black_mass: Bool
+    pub accepts_lfp_black_mass: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Manifest {
+    pub id: Str
+    pub source_lot_id: Str
+    pub permit_id: Str
+    pub destination_id: Str
+    pub shipment_day: U32
+    pub gross_kg: U32
+    pub tare_kg: U32
+    pub custody_documents_complete: Bool
+    pub custody_chain_intact: Bool
+    pub seal_intact: Bool
+    pub assay_percent: Option<U32>
+    pub recovered_kg: U32
+    pub residue_kg: U32
+    pub process_loss_kg: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditInput {
+    pub source_lots: Array<Option<BatteryLot>, 2>
+    pub source_lot_count: USize
+    pub permits: Array<Option<ShipmentPermit>, 3>
+    pub permit_count: USize
+    pub destinations: Array<Option<RecyclingFacility>, 2>
+    pub destination_count: USize
+    pub manifests: Array<Option<Manifest>, 9>
+    pub manifest_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ManifestDecision {
+    pub manifest_id: Str
+    pub source_lot_id: Str
+    pub permit_id: Str
+    pub destination_id: Str
+    pub outcome: Outcome
+    pub finding: Option<Finding>
+    pub proposed_feed_kg: U32
+    pub credited_feed_kg: U32
+    pub credited_recovered_kg: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SourceLotBalance {
+    pub source_lot_id: Str
+    pub received_kg: U32
+    pub credited_kg: U32
+    pub remaining_kg: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PermitBalance {
+    pub permit_id: Str
+    pub maximum_kg: U32
+    pub credited_kg: U32
+    pub remaining_kg: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ChainAudit {
+    pub decisions: Array<Option<ManifestDecision>, 9>
+    pub source_lot_balances: Array<Option<SourceLotBalance>, 2>
+    pub permit_balances: Array<Option<PermitBalance>, 3>
+    pub manifest_count: USize
+    pub cleared_count: USize
+    pub held_count: USize
+    pub rejected_count: USize
+    pub credited_feed_kg: U32
+    pub credited_recovered_kg: U32
+}

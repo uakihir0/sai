@@ -103,6 +103,8 @@ source repository before a package resolver can fetch them.
 | Advanced | [`urban-tree-planting-planner`](urban-tree-planting-planner/README.md) | Match urban planting sites to tree species under soil and clearance limits, district diversity, nursery stock, and a shared establishment-watering budget. |
 | Advanced | [`spaceflight-mission-operations`](spaceflight-mission-operations/README.md) | Schedule a fictional spacecraft timeline across prerequisite graphs, crew windows, and overlapping power and thermal budgets, with explicit blocked and unplaced outcomes. |
 | Advanced | [`key-rotation-readiness-auditor`](key-rotation-readiness-auditor/README.md) | Audit fictional service-key rotations for lifetime coverage, migration evidence freshness, escrow separation, overlap windows, and in-plan dependency order. |
+| Advanced | [`battery-recycling-chain-auditor`](battery-recycling-chain-auditor/README.md) | Audit fictional battery returns through custody, transport permits and quotas, assay quality, available material, destination licenses, and mass balance. |
+| Advanced | [`instrument-calibration-traceability-auditor`](instrument-calibration-traceability-auditor/README.md) | Check calibration windows and instrument scope while tracing reference-standard chains for accreditation, recall, range, and conservative uncertainty. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
