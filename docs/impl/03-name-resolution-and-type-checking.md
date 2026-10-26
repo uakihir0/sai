@@ -2848,6 +2848,16 @@ compound operands, calls as operands, unsupported calls or signatures, and
 deeper call nesting remain unsupported; this type-checking projection adds no
 bitwise lowering or runtime behavior.
 
+**IR-964 verification:** With pinned Rust 1.99.1 and the shared target
+directory, `cargo test -p sai_driver
+primitive_body_type_results_include_exact_direct_function_calls --locked
+--offline` passed (1 test), and
+`cargo test -p sai_cli --test check_empty_source
+unary_bitwise_not_path_arguments_to_direct_calls_remain_behind_the_stage_gate
+--locked --offline` passed (1 test). `cargo fmt --all -- --check` and
+`git diff --check` passed. Final hostile review found no actionable P0–P3
+findings.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
