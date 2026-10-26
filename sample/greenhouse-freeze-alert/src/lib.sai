@@ -1,0 +1,11 @@
+fn calibrated_tenths(raw_tenths: I32, offset_tenths: I32) -> I32 {
+    raw_tenths + offset_tenths
+}
+
+fn is_at_or_below(reading_tenths: I32, threshold_tenths: I32) -> Bool {
+    reading_tenths <= threshold_tenths
+}
+
+pub fn freeze_alert(raw_tenths: I32, offset_tenths: I32, threshold_tenths: I32) -> Bool {
+    is_at_or_below(calibrated_tenths(raw_tenths, offset_tenths), threshold_tenths)
+}
