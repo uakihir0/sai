@@ -2459,6 +2459,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
+                ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right)
+                    if is_supported_direct_call_logical_operands(left, right) =>
+                {
+                    let local_type = self.check_logical(operator, left, right)?;
+                    self.record_expression_type(argument.expr.hir_id, local_type);
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
                 _ => return Err(()),
             }
         }
@@ -4896,6 +4903,10 @@ fn is_supported_direct_call_comparison_operands(left: &Expr<'_>, right: &Expr<'_
     // The bounded comparison form needs a concrete local type to constrain a
     // possible literal. Literal/literal comparisons have no such witness.
     matches!(left.kind, ExprKind::Path(_)) || matches!(right.kind, ExprKind::Path(_))
+}
+
+fn is_supported_direct_call_logical_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
+    matches!(left.kind, ExprKind::Path(_)) && matches!(right.kind, ExprKind::Path(_))
 }
 
 fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
