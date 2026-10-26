@@ -22,6 +22,7 @@ source repository before a package resolver can fetch them.
 | Beginner | [`mini-task-board`](mini-task-board/README.md) | Split a small task board into modules; use records, enums, command dispatch, and summaries. |
 | Beginner | [`profile-check`](profile-check/README.md) | Parse and validate a key-value profile; return structured errors with `Result`. |
 | Intermediate | [`clockwork-escape-room`](clockwork-escape-room/README.md) | Replay a short, readable museum adventure with guarded state transitions, inventory, and a bounded story log. |
+| Intermediate | [`greenhouse-freeze-alert`](greenhouse-freeze-alert/README.md) | Calibrate a signed tenths-of-a-degree sensor reading, then pass one direct helper call as an argument to another direct call. |
 | Intermediate | [`open-source-license-review`](open-source-license-review/README.md) | Review a fixed component inventory for evidence gaps, conflicts, policy exceptions, and unresolved release findings. |
 | Intermediate | [`reading-log`](reading-log/README.md) | Summarize a fixed book queue with status counts, page totals, and next-book selection. |
 | Intermediate | [`market-checkout`](market-checkout/README.md) | Review orders, aggregate repeated stock requests, and calculate discounts and tax. |
