@@ -1,0 +1,44 @@
+use acme:railway-interlocking-auditor/arbitration
+use acme:railway-interlocking-auditor/model.{InterlockingReport, RouteIssue, RouteOutcome}
+
+pub fn fixture_report() -> InterlockingReport {
+    arbitration.fixture_report()
+}
+
+test "fixture uses a stable request order and returns the hand checked outcomes" {
+    let report = fixture_report()
+
+    assert report.decision_count == 9
+    assert report.request_order[0] == Some(3107)
+    assert report.request_order[1] == Some(3101)
+    assert report.request_order[2] == Some(3102)
+    assert report.request_order[3] == Some(3103)
+    assert report.request_order[4] == Some(3104)
+    assert report.request_order[5] == Some(3109)
+    assert report.request_order[6] == Some(3105)
+    assert report.request_order[7] == Some(3106)
+    assert report.request_order[8] == Some(3108)
+    assert report.accepted_count == 3
+    assert report.held_count == 4
+    assert report.rejected_count == 2
+    assert report.decisions[0].unwrap().issue == Some(RouteIssue.UnknownRoute)
+    assert report.decisions[1].unwrap().outcome == RouteOutcome.Accepted
+    assert report.decisions[1].unwrap().start_slot == Some(2)
+    assert report.decisions[1].unwrap().end_slot == Some(4)
+    assert report.decisions[2].unwrap().issue == Some(RouteIssue.BlockReservationConflict)
+    assert report.decisions[3].unwrap().issue == Some(RouteIssue.ExistingBlockOccupancy)
+    assert report.decisions[4].unwrap().start_slot == Some(4)
+    assert report.decisions[4].unwrap().end_slot == Some(6)
+    assert report.decisions[5].unwrap().issue == Some(RouteIssue.TurnoutAlignmentConflict)
+    assert report.decisions[6].unwrap().start_slot == Some(7)
+    assert report.decisions[6].unwrap().end_slot == Some(9)
+    assert report.decisions[7].unwrap().issue == Some(RouteIssue.BlockReservationConflict)
+    assert report.decisions[8].unwrap().issue == Some(RouteIssue.InvalidWindow)
+}
+
+test "the same route request fixture produces the same audit report" {
+    let first = fixture_report()
+    let second = fixture_report()
+
+    assert first == second
+}

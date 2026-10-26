@@ -1,0 +1,126 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Finding {
+    DuplicateShipmentId
+    UnknownLot
+    LotExpired
+    InvalidShipmentQuantity
+    InsufficientUsableStock
+    MissingLogger
+    MissingCalibrationRecord
+    CalibrationCertificateMissing
+    CalibrationOutOfDate
+    CalibrationFailed
+    InvalidTransitDuration
+    InvalidLoggerInterval
+    LoggerGap
+    ExcursionReviewRequired
+    CriticalExcursion
+    MissingPickupEvidence
+    MissingCarrierHandoff
+    MissingDeliveryEvidence
+    CustodyChainBroken
+    SealCompromised
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Outcome {
+    Released
+    Held
+    Rejected
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ColdChainLot {
+    pub id: Str
+    pub expiration_day: U32
+    pub available_doses: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LoggerCalibration {
+    pub logger_id: Str
+    pub certificate_present: Bool
+    pub calibration_passed: Bool
+    pub valid_from_day: U32
+    pub valid_through_day: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TemperatureInterval {
+    pub start_minute: U32
+    pub end_minute: U32
+    // Lowest and highest recorded temperature over this entire interval,
+    // represented in tenths of a degree Celsius.
+    pub low_tenths_c: I32
+    pub high_tenths_c: I32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Shipment {
+    pub id: Str
+    pub lot_id: Str
+    pub doses: U32
+    pub logger_id: Option<Str>
+    // Transit starts at minute zero and is expected to end at this minute.
+    pub transit_minutes: U32
+    pub intervals: Array<Option<TemperatureInterval>, 8>
+    pub interval_count: USize
+    pub pickup_evidence_present: Bool
+    pub carrier_handoff_present: Bool
+    pub delivery_evidence_present: Bool
+    pub custody_chain_intact: Bool
+    pub seal_intact: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditInput {
+    pub review_day: U32
+    pub lots: Array<Option<ColdChainLot>, 3>
+    pub lot_count: USize
+    pub calibrations: Array<Option<LoggerCalibration>, 3>
+    pub calibration_count: USize
+    pub shipments: Array<Option<Shipment>, 4>
+    pub shipment_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LoggerAssessment {
+    pub uncovered_minutes: U32
+    pub largest_gap_minutes: U32
+    pub excursion_minutes: U32
+    pub invalid_intervals: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ShipmentDecision {
+    pub shipment_id: Str
+    pub lot_id: Str
+    pub outcome: Outcome
+    pub findings: Array<Option<Finding>, 20>
+    pub finding_count: USize
+    pub uncovered_minutes: U32
+    pub largest_gap_minutes: U32
+    pub excursion_minutes: U32
+    pub credited_doses: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LotBalance {
+    pub lot_id: Str
+    pub expired_at_review: Bool
+    pub registered_doses: U32
+    pub released_doses: U32
+    pub remaining_usable_doses: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditReport {
+    pub decisions: Array<Option<ShipmentDecision>, 4>
+    pub decision_count: USize
+    pub lot_balances: Array<Option<LotBalance>, 3>
+    pub lot_count: USize
+    pub released_count: USize
+    pub held_count: USize
+    pub rejected_count: USize
+    pub released_doses: U32
+}

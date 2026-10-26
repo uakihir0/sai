@@ -48,6 +48,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`construction-permit-review`](construction-permit-review/README.md) | Screen fictional building permits for evidence gaps and independent zoning, accessibility, and environmental review triggers. |
 | Advanced | [`warehouse-fulfillment`](warehouse-fulfillment/README.md) | Reserve date-eligible inventory for prioritized orders, then choose a warehouse and route under cold-chain, delivery-deadline, and lane-capacity constraints. |
 | Advanced | [`rail-shuttle-dispatch`](rail-shuttle-dispatch/README.md) | Assign a fixed replacement-bus fleet to disrupted transit services under corridor, passenger-capacity, and wheelchair-space constraints; report unresolved requests deterministically. |
+| Advanced | [`railway-interlocking-auditor`](railway-interlocking-auditor/README.md) | Review fictional train-route reservations against protected blocks, turnout alignment, occupied tracks, overlap protection, and deterministic slot allocation. |
 | Advanced | [`weighted-route-finder`](weighted-route-finder/README.md) | Find a minimum-time multi-edge route with Dijkstra's algorithm, stable tie-breaking, and predecessor-based path reconstruction. |
 | Advanced | [`virtual-memory-page-replacement-lab`](virtual-memory-page-replacement-lab/README.md) | Compare FIFO, LRU, and Clock page replacement with per-access frame states, dirty-page writebacks, and final flush accounting. |
 | Advanced | [`bounded-static-linker`](bounded-static-linker/README.md) | Lay out bounded object sections, resolve local/weak/strong symbols, and validate absolute relocations before publishing an image manifest. |
@@ -64,6 +65,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`supply-chain-recall-tracer`](supply-chain-recall-tracer/README.md) | Trace a contaminated component lot through manufacturing lineage, finished goods, shipped quantities, and retailer stock. |
 | Advanced | [`ranked-choice-audit`](ranked-choice-audit/README.md) | Tally fixed ranked ballots by round, track exhausted preferences, and apply a documented tie rule. |
 | Advanced | [`telemetry-frame-decoder`](telemetry-frame-decoder/README.md) | Validate and decode fixed sensor frames with byte masks, a checksum, and ordered structured errors. |
+| Advanced | [`vaccine-cold-chain-release-auditor`](vaccine-cold-chain-release-auditor/README.md) | Audit fictional vaccine shipments against logger coverage, temperature excursions, calibration, custody evidence, lot expiry, and usable-stock limits. |
 | Advanced | [`trial-cohort-auditor`](trial-cohort-auditor/README.md) | Audit a fictional study cohort for duplicate screening IDs, eligibility, visit windows, missing visits, and safety-report deadlines. |
 | Advanced | [`webhook-delivery-audit`](webhook-delivery-audit/README.md) | Replay scripted delivery responses with capped backoff, terminal HTTP classification, attempt histories, and endpoint-scoped idempotency. |
 | Advanced | [`air-quality-monitor`](air-quality-monitor/README.md) | Apply a PM2.5 alert state machine with consecutive-reading hysteresis, sensor-fault resets, and trigger/recovery thresholds. |
@@ -108,6 +110,19 @@ source repository before a package resolver can fetch them.
 | Advanced | [`instrument-calibration-traceability-auditor`](instrument-calibration-traceability-auditor/README.md) | Check calibration windows and instrument scope while tracing reference-standard chains for accreditation, recall, range, and conservative uncertainty. |
 | Advanced | [`drinking-water-incident-coordinator`](drinking-water-incident-coordinator/README.md) | Coordinate fictional drinking-water incidents from qualified sensor and lab evidence through affected-zone advisories, alternate supply, and recovery checks. |
 | Advanced | [`research-data-release-auditor`](research-data-release-auditor/README.md) | Gate research dataset releases on source lineage, contributor consent, disclosure risk, integrity, retention, embargoes, legal holds, and parent decisions. |
+
+## Longer walkthroughs
+
+- [`railway-interlocking-auditor`](railway-interlocking-auditor/README.md)
+  combines deterministic request ordering with protected block reservations
+  and turnout conflicts.
+- [`vaccine-cold-chain-release-auditor`](vaccine-cold-chain-release-auditor/README.md)
+  carries sensor coverage and excursion findings through evidence review,
+  shipment decisions, and inventory accounting.
+- [`order-fulfillment-saga`](order-fulfillment-saga/README.md) replays
+  idempotent operations and reverse-order compensation after partial failure.
+- [`reproducible-pipeline-planner`](reproducible-pipeline-planner/README.md)
+  validates task dependencies and schedules bounded deterministic batches.
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or

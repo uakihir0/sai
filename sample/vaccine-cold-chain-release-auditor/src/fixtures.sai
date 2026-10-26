@@ -1,0 +1,165 @@
+use acme:vaccine-cold-chain-release-auditor/model.{
+    AuditInput
+    ColdChainLot
+    LoggerCalibration
+    Shipment
+    TemperatureInterval
+}
+
+fn interval(start_minute: U32, end_minute: U32, low_tenths_c: I32, high_tenths_c: I32) -> Option<
+    TemperatureInterval,
+> {
+    Some(
+        TemperatureInterval(
+            start_minute: start_minute,
+            end_minute: end_minute,
+            low_tenths_c: low_tenths_c,
+            high_tenths_c: high_tenths_c,
+        ),
+    )
+}
+
+pub fn sample_input() -> AuditInput {
+    AuditInput(
+        review_day: 400,
+        lots: [
+            Some(ColdChainLot(id: "LOT-A", expiration_day: 420, available_doses: 1200)),
+            Some(ColdChainLot(id: "LOT-B", expiration_day: 430, available_doses: 500)),
+            Some(ColdChainLot(id: "LOT-C", expiration_day: 395, available_doses: 100)),
+        ],
+        lot_count: 3,
+        calibrations: [
+            Some(
+                LoggerCalibration(
+                    logger_id: "LOGGER-A",
+                    certificate_present: true,
+                    calibration_passed: true,
+                    valid_from_day: 390,
+                    valid_through_day: 430,
+                ),
+            ),
+            Some(
+                LoggerCalibration(
+                    logger_id: "LOGGER-B",
+                    certificate_present: true,
+                    calibration_passed: true,
+                    valid_from_day: 350,
+                    valid_through_day: 390,
+                ),
+            ),
+            Some(
+                LoggerCalibration(
+                    logger_id: "LOGGER-C",
+                    certificate_present: true,
+                    calibration_passed: true,
+                    valid_from_day: 390,
+                    valid_through_day: 430,
+                ),
+            ),
+        ],
+        calibration_count: 3,
+        shipments: [
+            Some(
+                Shipment(
+                    id: "CC-701",
+                    lot_id: "LOT-A",
+                    doses: 700,
+                    logger_id: Some("LOGGER-A"),
+                    transit_minutes: 60,
+                    intervals: [
+                        interval(0, 10, 50, 60),
+                        interval(10, 20, 50, 60),
+                        interval(20, 30, 50, 60),
+                        interval(30, 40, 50, 60),
+                        interval(40, 50, 50, 60),
+                        interval(50, 60, 50, 60),
+                        None,
+                        None,
+                    ],
+                    interval_count: 6,
+                    pickup_evidence_present: true,
+                    carrier_handoff_present: true,
+                    delivery_evidence_present: true,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                ),
+            ),
+            Some(
+                Shipment(
+                    id: "CC-702",
+                    lot_id: "LOT-A",
+                    doses: 600,
+                    logger_id: Some("LOGGER-A"),
+                    transit_minutes: 60,
+                    intervals: [
+                        interval(0, 10, 50, 60),
+                        interval(10, 20, 50, 60),
+                        interval(20, 30, 90, 100),
+                        interval(30, 40, 50, 60),
+                        interval(40, 60, 50, 60),
+                        None,
+                        None,
+                        None,
+                    ],
+                    interval_count: 5,
+                    pickup_evidence_present: true,
+                    carrier_handoff_present: true,
+                    delivery_evidence_present: true,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                ),
+            ),
+            Some(
+                Shipment(
+                    id: "CC-703",
+                    lot_id: "LOT-B",
+                    doses: 300,
+                    logger_id: Some("LOGGER-B"),
+                    transit_minutes: 60,
+                    intervals: [
+                        interval(0, 10, 50, 60),
+                        interval(10, 25, 90, 100),
+                        interval(25, 40, 90, 100),
+                        interval(55, 60, 50, 60),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                    interval_count: 4,
+                    pickup_evidence_present: true,
+                    carrier_handoff_present: false,
+                    delivery_evidence_present: true,
+                    custody_chain_intact: false,
+                    seal_intact: false,
+                ),
+            ),
+            Some(
+                Shipment(
+                    id: "CC-704",
+                    lot_id: "LOT-C",
+                    doses: 50,
+                    logger_id: Some("LOGGER-C"),
+                    transit_minutes: 80,
+                    intervals: [
+                        interval(0, 10, 50, 60),
+                        interval(10, 80, 110, 120),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                    interval_count: 2,
+                    pickup_evidence_present: true,
+                    carrier_handoff_present: true,
+                    delivery_evidence_present: false,
+                    custody_chain_intact: true,
+                    seal_intact: true,
+                ),
+            ),
+        ],
+        shipment_count: 4,
+    )
+}
