@@ -1,0 +1,112 @@
+use acme:drinking-water-incident-coordinator/model.{
+    Analyte
+    Measurement
+    MeasurementSource
+    QualityFlag
+    QualityIssue
+    Scenario
+    Threshold
+}
+
+pub fn threshold_for(snapshot: Scenario, site_id: U32, analyte: Analyte) -> Option<Threshold> {
+    var index: USize = 0
+    while index < snapshot.thresholds.len() {
+        let threshold = snapshot.thresholds[index]
+        if threshold.site_id == site_id and threshold.analyte == analyte {
+            return Some(threshold)
+        }
+        index = index + 1
+    }
+    None
+}
+
+pub fn site_exists(snapshot: Scenario, site_id: U32) -> Bool {
+    var index: USize = 0
+    while index < snapshot.sites.len() {
+        if snapshot.sites[index].id == site_id {
+            return true
+        }
+        index = index + 1
+    }
+    false
+}
+
+pub fn rejection_reason(snapshot: Scenario, measurement_index: USize) -> Option<QualityIssue> {
+    let measurement = snapshot.measurements[measurement_index]
+    if not site_exists(snapshot, measurement.site_id) {
+        return Some(QualityIssue.UnknownSite)
+    }
+    let threshold = match threshold_for(snapshot, measurement.site_id, measurement.analyte) {
+        Some(value) => value
+        None => return Some(QualityIssue.MissingThreshold)
+    }
+    if measurement.quality != QualityFlag.Accepted {
+        return Some(QualityIssue.SourceFlagged)
+    }
+    if measurement.received_minute < measurement.collected_minute {
+        return Some(QualityIssue.ReceivedBeforeCollection)
+    }
+    if (
+        measurement.received_minute - measurement.collected_minute
+        > threshold.maximum_delivery_delay_minutes
+    ) {
+        return Some(QualityIssue.DeliveryTooLate)
+    }
+
+    // Each source/site/analyte stream is stored in arrival order. A record
+    // that moves either its sequence or collection time backward is excluded.
+    var previous_index: USize = 0
+    while previous_index < measurement_index {
+        let previous = snapshot.measurements[previous_index]
+        if (
+            previous.site_id == measurement.site_id
+            and previous.analyte == measurement.analyte
+            and previous.source == measurement.source
+        ) {
+            if measurement.sequence <= previous.sequence {
+                return Some(QualityIssue.SequenceRegression)
+            }
+            if measurement.collected_minute < previous.collected_minute {
+                return Some(QualityIssue.TimestampRegression)
+            }
+        }
+        previous_index = previous_index + 1
+    }
+    None
+}
+
+pub fn is_accepted(snapshot: Scenario, measurement_index: USize) -> Bool {
+    rejection_reason(snapshot, measurement_index) == None
+}
+
+pub fn accepted_measurement_count(snapshot: Scenario) -> U32 {
+    var count: U32 = 0
+    var index: USize = 0
+    while index < snapshot.measurements.len() {
+        if is_accepted(snapshot, index) {
+            count = count + 1
+        }
+        index = index + 1
+    }
+    count
+}
+
+pub fn rejected_measurement_count(snapshot: Scenario) -> U32 {
+    var count: U32 = 0
+    var index: USize = 0
+    while index < snapshot.measurements.len() {
+        if not is_accepted(snapshot, index) {
+            count = count + 1
+        }
+        index = index + 1
+    }
+    count
+}
+
+pub fn same_stream(left: Measurement, right: Measurement) -> Bool {
+    left.site_id == right.site_id and left.analyte == right.analyte and left.source == right.source
+}
+
+pub fn is_sensor(measurement: Measurement) -> Bool {
+    measurement.source == MeasurementSource.Sensor
+}

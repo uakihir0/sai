@@ -1,0 +1,53 @@
+use acme:research-data-release-auditor/audit
+use acme:research-data-release-auditor/fixtures
+use acme:research-data-release-auditor/model.{Decision, Finding, ReleaseAudit}
+
+pub fn sample_audit() -> ReleaseAudit {
+    audit.audit(fixtures.sample_input())
+}
+
+test "release decisions stop at the first finding in stable fixture order" {
+    let report = sample_audit()
+    assert report.dataset_count == 16
+    assert report.released_count == 2
+    assert report.held_count == 8
+    assert report.rejected_count == 6
+
+    assert report.decisions[0].unwrap().decision == Decision.Released
+    assert report.decisions[1].unwrap().finding == Some(Finding.ConsentScopeExceeded)
+    assert report.decisions[2].unwrap().finding == Some(Finding.BrokenCustodyChain)
+    assert report.decisions[3].unwrap().decision == Decision.Released
+    assert report.decisions[4].unwrap().finding == Some(Finding.ParentNotReleased)
+    assert report.decisions[5].unwrap().finding == Some(Finding.RetentionExpired)
+    assert report.decisions[6].unwrap().finding == Some(Finding.LegalHold)
+    assert report.decisions[7].unwrap().finding == Some(Finding.EmbargoActive)
+    assert report.decisions[8].unwrap().finding == Some(Finding.SchemaInvalid)
+    assert report.decisions[9].unwrap().finding == Some(Finding.ContentChecksumMismatch)
+    assert report.decisions[10].unwrap().finding == Some(Finding.DisclosureRiskTooHigh)
+    assert report.decisions[11].unwrap().finding == Some(Finding.SourceLicenseScopeExceeded)
+    assert report.decisions[12].unwrap().finding == Some(Finding.UnknownSource)
+    assert report.decisions[13].unwrap().finding == Some(Finding.MissingContributorConsent)
+    assert report.decisions[14].unwrap().finding == Some(Finding.ConsentWithdrawn)
+    assert report.decisions[15].unwrap().finding == Some(Finding.DuplicateDatasetId)
+}
+
+test "derived datasets require a released parent before their own evidence is considered" {
+    let report = sample_audit()
+    assert report.decisions[3].unwrap().parent_dataset_id == Some("DS-FIELD-001")
+    assert report.decisions[3].unwrap().decision == Decision.Released
+    assert report.decisions[4].unwrap().parent_dataset_id == Some("DS-INTERVIEW-001")
+    assert report.decisions[4].unwrap().finding == Some(Finding.ParentNotReleased)
+}
+
+test "consent and audience checks use the most restrictive applicable scope" {
+    let report = sample_audit()
+    assert report.decisions[1].unwrap().finding == Some(Finding.ConsentScopeExceeded)
+    assert report.decisions[11].unwrap().finding == Some(Finding.SourceLicenseScopeExceeded)
+    assert report.decisions[3].unwrap().decision == Decision.Released
+}
+
+test "every rostered contributor needs a matching consent row" {
+    let report = sample_audit()
+    assert report.decisions[0].unwrap().decision == Decision.Released
+    assert report.decisions[13].unwrap().finding == Some(Finding.MissingContributorConsent)
+}

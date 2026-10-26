@@ -1,0 +1,11 @@
+use acme:drinking-water-incident-coordinator/model.{Exposure}
+
+pub fn exposures() -> Array<Exposure, 5> {
+    [
+        Exposure(site_id: 101, zone_id: 1),
+        Exposure(site_id: 101, zone_id: 2),
+        Exposure(site_id: 102, zone_id: 3),
+        Exposure(site_id: 103, zone_id: 5),
+        Exposure(site_id: 104, zone_id: 4),
+    ]
+}
