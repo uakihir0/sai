@@ -9,9 +9,10 @@ use sai_hir::expressions::{BinOp, Block, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use sai_hir::literals::Lit;
 use sai_hir::patterns::{BindingMode, PatKind};
 use sai_hir::types::PathRoot;
-use sai_hir::{BindingId, HirId, Safety};
+use sai_hir::{BindingId, HirId, OwnerId, Safety};
 use sai_intern::Interner;
 use sai_resolve::prelude::PrimTy;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 /// Facts resolved by the owner-aware driver before body checking.
@@ -42,7 +43,48 @@ pub enum PrimitiveBodyCheck {
     /// The owner or expression shape is outside this slice.
     Unsupported,
     /// The shape is supported; errors, if any, are anchored by HIR node IDs.
-    Supported { errors: Vec<PrimitiveBodyError> },
+    /// Trustworthy type results are an owner-scoped partial projection and may
+    /// be present alongside diagnostics for other expressions.
+    Supported {
+        errors: Vec<PrimitiveBodyError>,
+        type_results: PrimitiveBodyTypeResults,
+    },
+}
+
+/// Trustworthy primitive facts produced by the bounded primitive-local body
+/// checker.
+///
+/// This is deliberately not a complete type-checking result: unsupported,
+/// unresolved, and error-tainted expressions or bindings are omitted. The
+/// owner is explicit because `BindingId` is only meaningful within one HIR
+/// owner; each `HirId` is also checked against this owner before insertion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrimitiveBodyTypeResults {
+    owner: OwnerId,
+    expression_types: HashMap<HirId, PrimTy>,
+    binding_types: HashMap<BindingId, PrimTy>,
+}
+
+impl PrimitiveBodyTypeResults {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn expression_type(&self, expression: HirId) -> Option<PrimTy> {
+        self.expression_types.get(&expression).copied()
+    }
+
+    pub fn binding_type(&self, binding: BindingId) -> Option<PrimTy> {
+        self.binding_types.get(&binding).copied()
+    }
+
+    pub fn expression_types(&self) -> &HashMap<HirId, PrimTy> {
+        &self.expression_types
+    }
+
+    pub fn binding_types(&self) -> &HashMap<BindingId, PrimTy> {
+        &self.binding_types
+    }
 }
 
 /// One semantic error found in a supported body shape.
@@ -181,14 +223,27 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
     if !supports_primitive_literal(input.return_type) {
         return PrimitiveBodyCheck::Unsupported;
     }
-    let known_bindings = input
+    let known_bindings: HashMap<BindingId, LocalType> = input
         .initial_bindings
         .iter()
         .map(|(binding, ty)| (*binding, LocalType::Concrete(*ty)))
         .collect();
+    let binding_type_candidates = known_bindings.clone();
+    let trusted_bindings = input.initial_bindings.keys().copied().collect();
+    let mut expression_nodes = HashMap::new();
+    if matches!(input.body.value.kind, ExprKind::Block(_)) {
+        collect_primitive_expression_nodes(&input.body.value, &mut expression_nodes);
+    }
     let mut context = FnCtxt {
         input,
         known_bindings,
+        binding_type_candidates,
+        binding_candidate_order: Vec::new(),
+        binding_initializer_roots: HashMap::new(),
+        annotated_bindings: HashSet::new(),
+        trusted_bindings,
+        expression_type_candidates: RefCell::new(HashMap::new()),
+        expression_nodes,
         direct_unannotated_integer_literals: HashSet::new(),
         unannotated_integer_literal_aliases: HashSet::new(),
         resolved_computed_literal_paths: HashSet::new(),
@@ -211,14 +266,23 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
     if context.check_block(block).is_err() {
         return PrimitiveBodyCheck::Unsupported;
     }
+    let type_results = context.primitive_body_type_results();
     PrimitiveBodyCheck::Supported {
         errors: context.errors,
+        type_results,
     }
 }
 
 struct FnCtxt<'a, 'hir> {
     input: PrimitiveBodyInput<'a, 'hir>,
     known_bindings: HashMap<BindingId, LocalType>,
+    binding_type_candidates: HashMap<BindingId, LocalType>,
+    binding_candidate_order: Vec<BindingId>,
+    binding_initializer_roots: HashMap<BindingId, HirId>,
+    annotated_bindings: HashSet<BindingId>,
+    trusted_bindings: HashSet<BindingId>,
+    expression_type_candidates: RefCell<HashMap<HirId, LocalType>>,
+    expression_nodes: HashMap<HirId, Expr<'hir>>,
     direct_unannotated_integer_literals: HashSet<BindingId>,
     unannotated_integer_literal_aliases: HashSet<BindingId>,
     resolved_computed_literal_paths: HashSet<BindingId>,
@@ -237,6 +301,98 @@ struct FnCtxt<'a, 'hir> {
 }
 
 impl<'a, 'hir> FnCtxt<'a, 'hir> {
+    fn primitive_body_type_results(&self) -> PrimitiveBodyTypeResults {
+        let owner = self.input.body.owner;
+        let error_nodes = self
+            .errors
+            .iter()
+            .map(|error| error.node)
+            .collect::<HashSet<_>>();
+        let unknown_self_fields = self.input.unknown_self_fields;
+        let mut tainted_bindings = self
+            .known_bindings
+            .keys()
+            .filter(|binding| {
+                !self.trusted_bindings.contains(binding)
+                    && !self.annotated_bindings.contains(binding)
+            })
+            .copied()
+            .collect::<HashSet<_>>();
+        // The supported checker visits one flat block in source order, and a
+        // local path can resolve only to a parameter or an earlier binding.
+        // A single pass therefore propagates taint transitively without
+        // rescanning every candidate after each newly-tainted declaration.
+        for binding in &self.binding_candidate_order {
+            if self.annotated_bindings.contains(binding) || tainted_bindings.contains(binding) {
+                continue;
+            }
+            let initializer = self
+                .binding_initializer_roots
+                .get(binding)
+                .and_then(|initializer| self.expression_nodes.get(initializer));
+            let initializer_is_tainted = initializer.map_or(true, |initializer| {
+                expression_has_primitive_result_taint(
+                    initializer,
+                    &error_nodes,
+                    unknown_self_fields,
+                    self.input.local_paths,
+                    &tainted_bindings,
+                )
+            });
+            if initializer_is_tainted {
+                tainted_bindings.insert(*binding);
+            }
+        }
+        let expression_types = self
+            .expression_type_candidates
+            .borrow()
+            .iter()
+            .filter_map(|(expression_id, local_type)| {
+                if expression_id.owner != owner {
+                    return None;
+                }
+                let expression = self.expression_nodes.get(expression_id)?;
+                if expression_has_primitive_result_taint(
+                    expression,
+                    &error_nodes,
+                    unknown_self_fields,
+                    self.input.local_paths,
+                    &tainted_bindings,
+                ) {
+                    return None;
+                }
+                Some((*expression_id, self.concrete_local_type(*local_type)?))
+            })
+            .collect();
+        let binding_types = self
+            .binding_type_candidates
+            .iter()
+            .filter_map(|(binding, local_type)| {
+                if !self.trusted_bindings.contains(binding) {
+                    return None;
+                }
+                if !self.annotated_bindings.contains(binding) && tainted_bindings.contains(binding)
+                {
+                    return None;
+                }
+                Some((*binding, self.concrete_local_type(*local_type)?))
+            })
+            .collect();
+        PrimitiveBodyTypeResults {
+            owner,
+            expression_types,
+            binding_types,
+        }
+    }
+
+    fn record_expression_type(&self, expression: HirId, local_type: LocalType) {
+        if expression.owner == self.input.body.owner {
+            self.expression_type_candidates
+                .borrow_mut()
+                .insert(expression, local_type);
+        }
+    }
+
     fn check_block(&mut self, block: &Block<'hir>) -> Result<(), ()> {
         if block.safety != Safety::Safe {
             return Err(());
@@ -301,6 +457,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             None => None,
         };
 
+        let errors_before_initializer = self.errors.len();
         let local_type = if self.expression_has_unknown_field_error(init) {
             self.check_error_tainted_expression(init)?;
             if let Some(id) = self.error_tainted_literal_variable(init) {
@@ -475,6 +632,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                                 }
                             }
                             Some(PrimitiveLiteralKind::Byte) => {
+                                self.record_expression_type(
+                                    operand.hir_id,
+                                    LocalType::Concrete(PrimTy::Byte),
+                                );
                                 if let Some(expected) = annotation {
                                     if expected != PrimTy::Byte {
                                         self.errors.push(PrimitiveBodyError {
@@ -753,6 +914,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     | None => {}
                 }
             }
+        }
+        self.record_expression_type(init.hir_id, local_type);
+        if let Some(annotation) = annotation {
+            self.binding_type_candidates
+                .insert(binding, LocalType::Concrete(annotation));
+            self.binding_candidate_order.push(binding);
+            self.annotated_bindings.insert(binding);
+            self.binding_initializer_roots.insert(binding, init.hir_id);
+            self.trusted_bindings.insert(binding);
+        } else if self.errors.len() == errors_before_initializer
+            && !matches!(
+                local_type,
+                LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
+            )
+        {
+            self.binding_type_candidates.insert(binding, local_type);
+            self.binding_candidate_order.push(binding);
+            self.binding_initializer_roots.insert(binding, init.hir_id);
+            self.trusted_bindings.insert(binding);
         }
         if let Some(source_binding) = self.plain_local_path_binding(init) {
             let source_has_resolved_computed_literal_provenance = self
@@ -1942,7 +2122,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.input.symbols,
             self.input.pointer_width,
         ) {
-            PrimitiveLiteralResult::Match => {}
+            PrimitiveLiteralResult::Match => {
+                self.record_expression_type(node, LocalType::Concrete(expected));
+            }
             PrimitiveLiteralResult::TypeMismatch => {
                 self.errors.push(PrimitiveBodyError {
                     node,
@@ -1964,7 +2146,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         kind: PrimitiveLiteralKind,
         origin: HirId,
     ) -> LocalType {
-        match kind {
+        let local_type = match kind {
             PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint => {
                 let id = self.literal_variables.len();
                 self.literal_variables.push(LiteralVariable {
@@ -1980,7 +2162,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             PrimitiveLiteralKind::Bool => LocalType::Concrete(PrimTy::Bool),
             PrimitiveLiteralKind::Byte => LocalType::Concrete(PrimTy::Byte),
             PrimitiveLiteralKind::Character => LocalType::Concrete(PrimTy::Char),
-        }
+        };
+        self.record_expression_type(origin, local_type);
+        local_type
     }
 
     fn check_annotated_path(
@@ -2089,6 +2273,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
         }
+        self.record_expression_type(expression.hir_id, local_type);
         Ok(())
     }
 
@@ -2101,7 +2286,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return true;
         }
         match expression.kind {
-            ExprKind::Path(_) => self.check_local_path(expression).is_ok_and(|local_type| {
+            ExprKind::Path(_) => self.resolve_local_path(expression).is_ok_and(|local_type| {
                 matches!(
                     local_type,
                     LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
@@ -2946,6 +3131,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_local_path(&self, expression: &Expr<'hir>) -> Result<LocalType, ()> {
+        let local_type = self.resolve_local_path(expression)?;
+        let binding = self.plain_local_path_binding(expression).ok_or(())?;
+        if self.trusted_bindings.contains(&binding) {
+            self.record_expression_type(expression.hir_id, local_type);
+        }
+        Ok(local_type)
+    }
+
+    fn resolve_local_path(&self, expression: &Expr<'hir>) -> Result<LocalType, ()> {
         let ExprKind::Path(path) = expression.kind else {
             return Err(());
         };
@@ -3054,6 +3248,82 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         self.input.local_paths.get(&path.hir_id).copied()
     }
+}
+
+fn collect_primitive_expression_nodes<'hir>(
+    expression: &'hir Expr<'hir>,
+    nodes: &mut HashMap<HirId, Expr<'hir>>,
+) {
+    nodes.insert(expression.hir_id, *expression);
+    match expression.kind {
+        ExprKind::Block(block) => {
+            for stmt in block.stmts {
+                if let StmtKind::Let { init, .. } = stmt.kind {
+                    collect_primitive_expression_nodes(init, nodes);
+                }
+            }
+            if let Some(tail) = block.tail {
+                collect_primitive_expression_nodes(tail, nodes);
+            }
+        }
+        ExprKind::Field { base, .. }
+        | ExprKind::TupleField { base, .. }
+        | ExprKind::Unary(_, base)
+        | ExprKind::Borrow(_, base)
+        | ExprKind::Try(base)
+        | ExprKind::Await(base)
+        | ExprKind::Return(Some(base)) => collect_primitive_expression_nodes(base, nodes),
+        ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
+            collect_primitive_expression_nodes(left, nodes);
+            collect_primitive_expression_nodes(right, nodes);
+        }
+        _ => {}
+    }
+}
+
+fn expression_has_primitive_result_taint(
+    expression: &Expr<'_>,
+    error_nodes: &HashSet<HirId>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    local_paths: &HashMap<HirId, BindingId>,
+    tainted_bindings: &HashSet<BindingId>,
+) -> bool {
+    error_nodes.contains(&expression.hir_id)
+        || unknown_self_fields.is_some_and(|fields| fields.contains(&expression.hir_id))
+        || match expression.kind {
+            ExprKind::Path(path) => local_paths
+                .get(&path.hir_id)
+                .is_some_and(|binding| tainted_bindings.contains(binding)),
+            ExprKind::Field { base, .. }
+            | ExprKind::TupleField { base, .. }
+            | ExprKind::Unary(_, base)
+            | ExprKind::Borrow(_, base)
+            | ExprKind::Try(base)
+            | ExprKind::Await(base)
+            | ExprKind::Return(Some(base)) => expression_has_primitive_result_taint(
+                base,
+                error_nodes,
+                unknown_self_fields,
+                local_paths,
+                tainted_bindings,
+            ),
+            ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
+                expression_has_primitive_result_taint(
+                    left,
+                    error_nodes,
+                    unknown_self_fields,
+                    local_paths,
+                    tainted_bindings,
+                ) || expression_has_primitive_result_taint(
+                    right,
+                    error_nodes,
+                    unknown_self_fields,
+                    local_paths,
+                    tainted_bindings,
+                )
+            }
+            _ => false,
+        }
 }
 
 fn can_track_unannotated_float_literal_alias(
