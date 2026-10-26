@@ -8988,6 +8988,12 @@ fn is_supported_direct_call_argument_shape(
             locals,
             inputs,
         ),
+        ExprKind::Unary(UnOp::BitNot, _) => is_supported_direct_call_bitwise_not_argument_shape(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+        ),
         ExprKind::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, left, right) => {
             is_supported_direct_call_arithmetic_operands_shape(
                 left,
@@ -9085,6 +9091,12 @@ fn is_supported_direct_call_arithmetic_argument_shape(
             locals,
             inputs,
         ),
+        ExprKind::Unary(UnOp::BitNot, _) => is_supported_direct_call_bitwise_not_argument_shape(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+        ),
         _ => is_supported_direct_call_leaf_argument_shape(
             expression,
             preceding_bindings,
@@ -9109,6 +9121,22 @@ fn is_supported_direct_call_not_argument_shape(
         ExprKind::Lit(Lit::Bool(_)) => true,
         _ => false,
     }
+}
+
+fn is_supported_direct_call_bitwise_not_argument_shape(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let ExprKind::Unary(UnOp::BitNot, operand) = expression.kind else {
+        return false;
+    };
+    let ExprKind::Path(path) = operand.kind else {
+        return false;
+    };
+    resolved_plain_local_path_binding(path, locals, inputs)
+        .is_some_and(|binding| preceding_bindings.contains(&binding))
 }
 
 fn is_supported_direct_call_arithmetic_operands_shape(
@@ -48600,7 +48628,7 @@ property "shared"() {}
         use sai_resolve::prelude::PrimTy;
 
         let root = concat!(
-            "use acme:phase1/child.{add_one, apply, apply_bool, apply_float, apply_pair, double_fn, expect_bool, float_fn, generic_fn, is_positive, text_fn}\n",
+            "use acme:phase1/child.{add_one, apply, apply_bool, apply_byte, apply_float, apply_pair, double_fn, expect_bool, float_fn, generic_fn, is_positive, text_fn}\n",
             "pub fn initializer(input: I32) -> I32 {\n",
             "    let result = apply(input)\n",
             "    let valid = result\n",
@@ -48766,6 +48794,33 @@ property "shared"() {}
             "pub fn not_false_call_argument() -> Bool { apply_bool(not false) }\n",
             "pub fn nested_not_true_call_argument() -> Bool { apply_bool(apply_bool(not true)) }\n",
             "pub fn nested_not_false_call_argument() -> Bool { apply_bool(apply_bool(not false)) }\n",
+            "pub fn bitnot_call_argument(value: I32) -> I32 { apply(~value) }\n",
+            "pub fn nested_bitnot_call_argument(value: Byte) -> Byte {\n",
+            "    let copy = value\n",
+            "    apply_byte(apply_byte(~copy))\n",
+            "}\n",
+            "pub fn bitnot_parameter_mismatch(value: I32) -> I32 {\n",
+            "    let result = apply_bool(~value)\n",
+            "    let alias = result\n",
+            "    let valid = apply(value)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn bitnot_operator_not_supported(value: Bool) -> Bool { apply_bool(~value) }\n",
+            "pub fn bitnot_float_operator_not_supported(value: F32) -> F32 { float_fn(~value) }\n",
+            "pub fn bitnot_generic_target(value: I32) -> I32 { generic_fn(~value) }\n",
+            "pub fn bitnot_integer_literal_call_argument_unsupported() -> I32 { apply(~1) }\n",
+            "pub fn bitnot_byte_literal_call_argument_unsupported() -> Byte { apply_byte(~b'x') }\n",
+            "pub fn bitnot_double_operand_unsupported(value: I32) -> I32 { apply(~~value) }\n",
+            "pub fn bitnot_computed_operand_unsupported(value: I32) -> I32 { apply(~(value + 1)) }\n",
+            "pub fn bitnot_call_operand_unsupported(value: I32) -> I32 { apply(~apply(value)) }\n",
+            "pub fn bitnot_forward_local_path_unsupported(value: I32) -> I32 {\n",
+            "    let result = apply(~copy)\n",
+            "    let copy = value\n",
+            "    result\n",
+            "}\n",
+            "pub fn bitnot_deep_nested_call_unsupported(value: I32) -> I32 {\n",
+            "    apply(apply(apply(~value)))\n",
+            "}\n",
             "pub fn not_operand_mismatch(value: I32) -> Bool {\n",
             "    let result = apply_bool(not value)\n",
             "    result\n",
@@ -48866,6 +48921,7 @@ property "shared"() {}
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
             "pub fn apply_bool(value: Bool) -> Bool { value }\n",
+            "pub fn apply_byte(value: Byte) -> Byte { value }\n",
             "pub fn add_one(value: I32) -> I32 { value }\n",
             "pub fn expect_bool(value: Bool) -> I32 { 0 }\n",
             "pub fn is_positive(value: I32) -> Bool { value > 0 }\n",
@@ -49026,6 +49082,20 @@ property "shared"() {}
         let nested_not_true_call_argument = assert_supported("nested_not_true_call_argument", &[]);
         let nested_not_false_call_argument =
             assert_supported("nested_not_false_call_argument", &[]);
+        let bitnot_call_argument = assert_supported("bitnot_call_argument", &[]);
+        let nested_bitnot_call_argument = assert_supported("nested_bitnot_call_argument", &[]);
+        let bitnot_parameter_mismatch = assert_supported(
+            "bitnot_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitnot_operator_not_supported = assert_supported(
+            "bitnot_operator_not_supported",
+            &[sai_diagnostics::Code::OperatorNotSupported],
+        );
+        let bitnot_float_operator_not_supported = assert_supported(
+            "bitnot_float_operator_not_supported",
+            &[sai_diagnostics::Code::OperatorNotSupported],
+        );
         let not_operand_mismatch = assert_supported(
             "not_operand_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
@@ -49183,6 +49253,14 @@ property "shared"() {}
             "logical_float_literal_operand_unsupported",
             "not_integer_literal_call_argument_unsupported",
             "not_character_literal_call_argument_unsupported",
+            "bitnot_integer_literal_call_argument_unsupported",
+            "bitnot_byte_literal_call_argument_unsupported",
+            "bitnot_generic_target",
+            "bitnot_double_operand_unsupported",
+            "bitnot_computed_operand_unsupported",
+            "bitnot_call_operand_unsupported",
+            "bitnot_forward_local_path_unsupported",
+            "bitnot_deep_nested_call_unsupported",
             "not_nested_operand_unsupported",
             "not_call_operand_unsupported",
             "not_logical_operand_unsupported",
@@ -49926,6 +50004,208 @@ property "shared"() {}
                     "the one-level nested direct call keeps its Bool fact for `{function}`"
                 );
             }
+        }
+        assert_eq!(
+            expression_type_at_range(
+                bitnot_call_argument,
+                "pub fn bitnot_call_argument",
+                "apply(~value)",
+                0,
+                "apply(~value)".len()
+            ),
+            Some(PrimTy::I32),
+            "the direct call with a unary bit-not argument retains its exact result"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitnot_call_argument,
+                "pub fn bitnot_call_argument",
+                "apply(~value)",
+                "apply(".len(),
+                "~value".len()
+            ),
+            Some(PrimTy::I32),
+            "the unary bit-not call argument retains its exact integer type"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitnot_call_argument,
+                "pub fn bitnot_call_argument",
+                "apply(~value)",
+                "apply(~".len(),
+                "value".len()
+            ),
+            Some(PrimTy::I32),
+            "the unary bit-not operand retains its exact local path type"
+        );
+        let nested_bitnot_call = "apply_byte(apply_byte(~copy))";
+        assert_eq!(
+            expression_type_at_range(
+                nested_bitnot_call_argument,
+                "pub fn nested_bitnot_call_argument",
+                nested_bitnot_call,
+                0,
+                nested_bitnot_call.len()
+            ),
+            Some(PrimTy::Byte),
+            "the outer nested direct call retains its exact Byte result"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                nested_bitnot_call_argument,
+                "pub fn nested_bitnot_call_argument",
+                nested_bitnot_call,
+                "apply_byte(".len(),
+                "apply_byte(~copy)".len()
+            ),
+            Some(PrimTy::Byte),
+            "the one-level nested direct call retains its exact Byte result"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                nested_bitnot_call_argument,
+                "pub fn nested_bitnot_call_argument",
+                nested_bitnot_call,
+                "apply_byte(apply_byte(".len(),
+                "~copy".len()
+            ),
+            Some(PrimTy::Byte),
+            "unary bit-not over a preceding local retains its Byte type"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                nested_bitnot_call_argument,
+                "pub fn nested_bitnot_call_argument",
+                nested_bitnot_call,
+                "apply_byte(apply_byte(~".len(),
+                "copy".len()
+            ),
+            Some(PrimTy::Byte),
+            "the exact local path operand retains its Byte type"
+        );
+        let bitnot_parameter_context = "apply_bool(~value)";
+        assert_eq!(
+            expression_type_at_range(
+                bitnot_parameter_mismatch,
+                "pub fn bitnot_parameter_mismatch",
+                bitnot_parameter_context,
+                "apply_bool(".len(),
+                "~value".len()
+            ),
+            None,
+            "an I32 bit-not argument mismatched against Bool is tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitnot_parameter_mismatch,
+                "pub fn bitnot_parameter_mismatch",
+                bitnot_parameter_context,
+                0,
+                bitnot_parameter_context.len()
+            ),
+            None,
+            "a parameter mismatch taints the containing direct call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitnot_parameter_mismatch,
+                "pub fn bitnot_parameter_mismatch",
+                bitnot_parameter_context,
+                "apply_bool(~".len(),
+                "value".len()
+            ),
+            Some(PrimTy::I32),
+            "the well-typed local path child retains its I32 fact under a mismatched parent"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitnot_parameter_mismatch,
+                "pub fn bitnot_parameter_mismatch",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "an inferred alias of a call with a mismatched bit-not argument remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitnot_parameter_mismatch,
+                "pub fn bitnot_parameter_mismatch",
+                "apply(value)",
+                0,
+                "apply(value)".len()
+            ),
+            Some(PrimTy::I32),
+            "a valid sibling call retains its fact next to the bit-not mismatch"
+        );
+        let bitnot_parameter_diagnostics = match bitnot_parameter_mismatch
+            .body_type_check()
+            .expect("bit-not parameter mismatch has body diagnostics")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("a mismatched bit-not argument remains a supported diagnostic")
+            }
+        };
+        let bitnot_parameter_function_start = root
+            .find("pub fn bitnot_parameter_mismatch")
+            .expect("bit-not parameter mismatch function exists");
+        let bitnot_parameter_start = bitnot_parameter_function_start
+            + root[bitnot_parameter_function_start..]
+                .find("~value")
+                .expect("mismatched bit-not argument exists");
+        assert_eq!(
+            bitnot_parameter_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch],
+            "the bit-not parameter mismatch emits one type mismatch"
+        );
+        assert_eq!(
+            bitnot_parameter_diagnostics[0]
+                .primary()
+                .expect("bit-not parameter mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(bitnot_parameter_start as u32),
+                sai_diagnostics::TextSize::new((bitnot_parameter_start + "~value".len()) as u32,),
+            )
+            .expect("bit-not parameter mismatch span is ordered")
+        );
+        for (owner, primitive) in [
+            (bitnot_operator_not_supported, "Bool"),
+            (bitnot_float_operator_not_supported, "F32"),
+        ] {
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("unsupported primitive bit-not has body diagnostics")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("unsupported primitive bit-not remains a supported diagnostic")
+                }
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [sai_diagnostics::Code::OperatorNotSupported],
+                "bit-not of {primitive} preserves the existing unsupported-operator diagnostic"
+            );
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect::<Vec<_>>(),
+                vec![format!(
+                    "operator `~` has no `BitNot` implementation for `{primitive}`"
+                )],
+                "bit-not reports the exact existing message for {primitive}"
+            );
         }
         let local_not_call = "apply_bool(not copy)";
         assert_eq!(
