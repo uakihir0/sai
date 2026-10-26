@@ -8693,6 +8693,7 @@ fn check_function_body_primitive_local_block(
                                 &preceding_bindings,
                                 locals,
                                 inputs,
+                                direct_call_signatures,
                             )
                         })
                 }) => {}
@@ -8867,6 +8868,7 @@ fn check_function_body_primitive_local_block(
                     &preceding_bindings,
                     locals,
                     inputs,
+                    direct_call_signatures,
                 )
             })
         {
@@ -8970,6 +8972,43 @@ fn resolved_plain_local_path_binding(
 }
 
 fn is_supported_direct_call_argument_shape(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> bool {
+    match expression.kind {
+        ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Call {
+            callee,
+            args,
+            base: None,
+        } => {
+            let Some(signature) = direct_call_signatures
+                .and_then(|signatures| signatures.get(&expression.hir_id))
+                .filter(|signature| signature.callee == callee.hir_id)
+            else {
+                return false;
+            };
+            args.iter()
+                .take(signature.parameters.len())
+                .all(|argument| {
+                    is_supported_direct_call_leaf_argument_shape(
+                        argument.expr,
+                        preceding_bindings,
+                        locals,
+                        inputs,
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
+fn is_supported_direct_call_leaf_argument_shape(
     expression: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
@@ -9665,26 +9704,49 @@ fn direct_primitive_call_sites(
     let ExprKind::Block(block) = body.value.kind else {
         return calls;
     };
+    let mut index_root_and_one_level_arguments = |expression: &HirExpr<'_>| {
+        let Some(signature) = direct_primitive_call_site(
+            expression,
+            module_paths,
+            signatures,
+            requesting_package,
+            inputs,
+        ) else {
+            return;
+        };
+        let argument_count = signature.parameters.len();
+        calls.insert(expression.hir_id, signature);
+        let ExprKind::Call {
+            args, base: None, ..
+        } = expression.kind
+        else {
+            return;
+        };
+        for argument in args.iter().take(argument_count) {
+            if matches!(argument.expr.kind, ExprKind::Call { .. })
+                && let Some(nested_signature) = direct_primitive_call_site(
+                    argument.expr,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                )
+            {
+                calls.insert(argument.expr.hir_id, nested_signature);
+            }
+        }
+    };
     for statement in block.stmts {
         if let StmtKind::Let { init, .. } = statement.kind
             && matches!(init.kind, ExprKind::Call { .. })
-            && let Some(signature) = direct_primitive_call_site(
-                init,
-                module_paths,
-                signatures,
-                requesting_package,
-                inputs,
-            )
         {
-            calls.insert(init.hir_id, signature);
+            index_root_and_one_level_arguments(init);
         }
     }
     if let Some(tail) = block.tail
         && matches!(tail.kind, ExprKind::Call { .. })
-        && let Some(signature) =
-            direct_primitive_call_site(tail, module_paths, signatures, requesting_package, inputs)
     {
-        calls.insert(tail.hir_id, signature);
+        index_root_and_one_level_arguments(tail);
     }
     calls
 }
@@ -48371,7 +48433,7 @@ property "shared"() {}
         use sai_resolve::prelude::PrimTy;
 
         let root = concat!(
-            "use acme:phase1/child.{apply, apply_pair, float_fn, generic_fn, text_fn}\n",
+            "use acme:phase1/child.{add_one, apply, apply_pair, expect_bool, float_fn, generic_fn, is_positive, text_fn}\n",
             "pub fn initializer(input: I32) -> I32 {\n",
             "    let result = apply(input)\n",
             "    let valid = result\n",
@@ -48387,6 +48449,47 @@ property "shared"() {}
             "    let derived = alias + 1\n",
             "    let valid = 1\n",
             "    valid\n",
+            "}\n",
+            "pub fn nested_initializer(input: I32) -> I32 {\n",
+            "    let result = apply(add_one(input))\n",
+            "    result\n",
+            "}\n",
+            "pub fn nested_tail(input: I32) -> I32 { apply(add_one(input)) }\n",
+            "pub fn nested_inner_error(input: I32) -> I32 {\n",
+            "    let result = apply(expect_bool(input))\n",
+            "    let alias = result\n",
+            "    let valid = apply(input)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn nested_named_inner_error(input: I32) -> I32 {\n",
+            "    apply(value: expect_bool(input))\n",
+            "}\n",
+            "pub fn nested_return_mismatch(input: I32) -> I32 {\n",
+            "    let result = apply(is_positive(input))\n",
+            "    let alias = result\n",
+            "    let valid = apply(input)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn nested_inner_too_few(input: I32) -> I32 {\n",
+            "    let result = apply(add_one())\n",
+            "    let alias = result\n",
+            "    let valid = apply(input)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn nested_inner_too_many(input: I32) -> I32 {\n",
+            "    let result = apply(add_one(input, true))\n",
+            "    let alias = result\n",
+            "    let valid = apply(input)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn nested_shadowed_call(add_one: I32) -> I32 { apply(add_one(1)) }\n",
+            "pub fn nested_generic_unsupported() -> I32 { apply(generic_fn(1)) }\n",
+            "pub fn deep_nested_call(input: I32) -> I32 {\n",
+            "    apply(add_one(add_one(input)))\n",
+            "}\n",
+            "pub fn call_in_operator(input: I32) -> I32 {\n",
+            "    let result = apply(input) + 1\n",
+            "    result\n",
             "}\n",
             "pub fn annotated_mismatch(input: Bool) -> I32 {\n",
             "    let result: I32 = apply(input)\n",
@@ -48411,6 +48514,9 @@ property "shared"() {}
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
+            "pub fn add_one(value: I32) -> I32 { value }\n",
+            "pub fn expect_bool(value: Bool) -> I32 { 0 }\n",
+            "pub fn is_positive(value: I32) -> Bool { value > 0 }\n",
             "pub fn float_fn(value: F32) -> F32 { value }\n",
             "pub fn generic_fn<T>(value: T) -> I32 { 0 }\n",
             "pub fn text_fn(value: Str) -> I32 { 0 }\n",
@@ -48485,6 +48591,29 @@ property "shared"() {}
         let tail_call = assert_supported("tail_call", &[]);
         let forward_call = assert_supported("forward_call", &[]);
         let recursive_call = assert_supported("recursive_call", &[]);
+        let nested_initializer = assert_supported("nested_initializer", &[]);
+        let nested_tail = assert_supported("nested_tail", &[]);
+        let nested_inner_error =
+            assert_supported("nested_inner_error", &[sai_diagnostics::Code::TypeMismatch]);
+        let nested_named_inner_error = assert_supported(
+            "nested_named_inner_error",
+            &[
+                sai_diagnostics::Code::NamedArgumentOnFunction,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+        );
+        let nested_return_mismatch = assert_supported(
+            "nested_return_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let nested_inner_too_few = assert_supported(
+            "nested_inner_too_few",
+            &[sai_diagnostics::Code::WrongArgumentCount],
+        );
+        let nested_inner_too_many = assert_supported(
+            "nested_inner_too_many",
+            &[sai_diagnostics::Code::WrongArgumentCount],
+        );
         let mismatched = assert_supported("mismatched", &[sai_diagnostics::Code::TypeMismatch]);
         let annotated_mismatch =
             assert_supported("annotated_mismatch", &[sai_diagnostics::Code::TypeMismatch]);
@@ -48509,7 +48638,15 @@ property "shared"() {}
         let float_call = assert_supported("float_call", &[]);
         let float_mismatch =
             assert_supported("float_mismatch", &[sai_diagnostics::Code::TypeMismatch]);
-        for name in ["generic_call", "str_call", "shadowed_call"] {
+        for name in [
+            "generic_call",
+            "str_call",
+            "shadowed_call",
+            "deep_nested_call",
+            "call_in_operator",
+            "nested_shadowed_call",
+            "nested_generic_unsupported",
+        ] {
             assert!(
                 matches!(
                     owner_named(&database, &resolved, name)
@@ -48670,6 +48807,29 @@ property "shared"() {}
             ),
             Some(PrimTy::I32)
         );
+        for (owner, function) in [
+            (nested_initializer, "pub fn nested_initializer"),
+            (nested_tail, "pub fn nested_tail"),
+        ] {
+            let context = "apply(add_one(input))";
+            assert_eq!(
+                expression_type_at_range(owner, function, context, 0, context.len()),
+                Some(PrimTy::I32),
+                "outer direct-call result is recorded in `{function}`"
+            );
+            let nested_call = "add_one(input)";
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    context,
+                    "apply(".len(),
+                    nested_call.len()
+                ),
+                Some(PrimTy::I32),
+                "nested direct-call result has its exact HIR fact in `{function}`"
+            );
+        }
         assert_eq!(
             expression_type_at_range(
                 float_call,
@@ -48712,6 +48872,124 @@ property "shared"() {}
                 "diagnosed call {call:?} in `{function}` is omitted from primitive results"
             );
         }
+        for (owner, function, context, nested_call) in [
+            (
+                nested_inner_error,
+                "pub fn nested_inner_error",
+                "apply(expect_bool(input))",
+                "expect_bool(input)",
+            ),
+            (
+                nested_named_inner_error,
+                "pub fn nested_named_inner_error",
+                "apply(value: expect_bool(input))",
+                "expect_bool(input)",
+            ),
+        ] {
+            assert_eq!(
+                expression_type_at_range(owner, function, context, 0, context.len()),
+                None,
+                "an errored nested argument suppresses its enclosing call result"
+            );
+            let nested_offset = context
+                .find(nested_call)
+                .expect("nested call occurs in context");
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    context,
+                    nested_offset,
+                    nested_call.len()
+                ),
+                None,
+                "the nested call's own error-tainted expression fact is omitted"
+            );
+        }
+        for (owner, function, context, nested_call) in [
+            (
+                nested_return_mismatch,
+                "pub fn nested_return_mismatch",
+                "apply(is_positive(input))",
+                "is_positive(input)",
+            ),
+            (
+                nested_inner_too_few,
+                "pub fn nested_inner_too_few",
+                "apply(add_one())",
+                "add_one()",
+            ),
+            (
+                nested_inner_too_many,
+                "pub fn nested_inner_too_many",
+                "apply(add_one(input, true))",
+                "add_one(input, true)",
+            ),
+        ] {
+            assert_eq!(
+                expression_type_at_range(owner, function, context, 0, context.len()),
+                None,
+                "the enclosing call is omitted after a nested call error in `{function}`"
+            );
+            let nested_offset = context
+                .find(nested_call)
+                .expect("nested call occurs in its enclosing call");
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    context,
+                    nested_offset,
+                    nested_call.len()
+                ),
+                None,
+                "the nested call fact is omitted after its result/arity error in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    "let alias = result",
+                    "let alias = ".len(),
+                    "result".len()
+                ),
+                None,
+                "the inferred alias path is omitted after a nested call error in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    "let valid = apply(input)",
+                    "let valid = ".len(),
+                    "apply(input)".len()
+                ),
+                Some(PrimTy::I32),
+                "an independent sibling call remains available in `{function}`"
+            );
+        }
+        assert_eq!(
+            expression_type_at_range(
+                nested_inner_error,
+                "pub fn nested_inner_error",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "a local path depending on the failed nested call is omitted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                nested_inner_error,
+                "pub fn nested_inner_error",
+                "let valid = apply(input)",
+                "let valid = ".len(),
+                "apply(input)".len()
+            ),
+            Some(PrimTy::I32),
+            "an independent sibling call retains its type fact"
+        );
         assert_eq!(
             expression_type_at_range(
                 mismatched,
@@ -48780,6 +49058,90 @@ property "shared"() {}
                 "call argument diagnostics retain source order and exact spans"
             );
         }
+        let nested_named_diagnostics = match nested_named_inner_error
+            .body_type_check()
+            .expect("owner body check is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("one-level nested direct calls remain in the supported slice")
+            }
+        };
+        let nested_named_call = "apply(value: expect_bool(input))";
+        let nested_named_call_start = root
+            .find(nested_named_call)
+            .expect("the nested named call exists");
+        for (diagnostic, (offset, token)) in nested_named_diagnostics.iter().zip([
+            ("apply(".len(), "value"),
+            ("apply(value: expect_bool(".len(), "input"),
+        ]) {
+            let start = nested_named_call_start + offset;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("nested call diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + token.len()) as u32),
+                )
+                .expect("nested diagnostic range is ordered"),
+                "outer named-argument and nested type errors preserve source order and spans"
+            );
+        }
+        for (owner, function, inner_call) in [
+            (
+                nested_return_mismatch,
+                "pub fn nested_return_mismatch",
+                "is_positive(input)",
+            ),
+            (
+                nested_inner_too_few,
+                "pub fn nested_inner_too_few",
+                "add_one()",
+            ),
+            (
+                nested_inner_too_many,
+                "pub fn nested_inner_too_many",
+                "add_one(input, true)",
+            ),
+        ] {
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("owner body check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("nested direct-call errors remain in the supported slice")
+                }
+            };
+            assert_eq!(diagnostics.len(), 1);
+            let function_start = root
+                .find(function)
+                .unwrap_or_else(|| panic!("function source `{function}` exists"));
+            let function_end = root[function_start..]
+                .find("\npub fn ")
+                .map_or(root.len(), |offset| function_start + offset);
+            let function_text = &root[function_start..function_end];
+            let call_start = function_start
+                + function_text
+                    .find(inner_call)
+                    .unwrap_or_else(|| panic!("nested call `{inner_call}` exists in `{function}`"));
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("nested call diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(call_start as u32),
+                    sai_diagnostics::TextSize::new((call_start + inner_call.len()) as u32),
+                )
+                .expect("nested call diagnostic range is ordered"),
+                "nested result/arity diagnostics use the complete inner call span"
+            );
+        }
         let too_many_diagnostics = match too_many
             .body_type_check()
             .expect("owner body check is available")
@@ -48830,6 +49192,39 @@ property "shared"() {}
         };
         assert_eq!(binding_type(initializer, "result"), Some(PrimTy::I32));
         assert_eq!(binding_type(initializer, "valid"), Some(PrimTy::I32));
+        assert_eq!(
+            binding_type(nested_initializer, "result"),
+            Some(PrimTy::I32),
+            "a local initialized by a nested direct call retains its output type"
+        );
+        assert_eq!(binding_type(nested_inner_error, "result"), None);
+        assert_eq!(
+            binding_type(nested_inner_error, "alias"),
+            None,
+            "an inferred alias of an inner-call error remains tainted"
+        );
+        assert_eq!(
+            binding_type(nested_inner_error, "valid"),
+            Some(PrimTy::I32),
+            "a valid sibling call and binding remain available next to nested errors"
+        );
+        for owner in [
+            nested_return_mismatch,
+            nested_inner_too_few,
+            nested_inner_too_many,
+        ] {
+            assert_eq!(binding_type(owner, "result"), None);
+            assert_eq!(
+                binding_type(owner, "alias"),
+                None,
+                "an inferred alias of a nested-call failure is omitted"
+            );
+            assert_eq!(
+                binding_type(owner, "valid"),
+                Some(PrimTy::I32),
+                "an independent sibling binding remains available"
+            );
+        }
         assert_eq!(binding_type(mismatched, "result"), None);
         assert_eq!(
             binding_type(mismatched, "alias"),
