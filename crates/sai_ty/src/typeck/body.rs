@@ -2151,24 +2151,62 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
-            match primitive_bool_operand_result(operand_type) {
-                PrimitiveBoolOperandResult::Bool => {}
-                PrimitiveBoolOperandResult::TypeMismatch { found } => {
-                    self.errors.push(PrimitiveBodyError {
-                        node: operand.hir_id,
-                        kind: PrimitiveBodyErrorKind::TypeMismatch {
-                            expected: PrimTy::Bool,
-                            found,
-                        },
-                    });
-                }
-                PrimitiveBoolOperandResult::Unsupported => return Err(()),
-            }
+            self.check_logical_operand_type(operand, operand_type)?;
         }
 
         // Both `and` and `or` have Bool result type, including after an
         // operand mismatch, so downstream local and tail checks can recover.
         Ok(LocalType::Concrete(PrimTy::Bool))
+    }
+
+    fn check_direct_call_logical(
+        &mut self,
+        operator: BinOp,
+        left: &'hir Expr<'hir>,
+        right: &'hir Expr<'hir>,
+    ) -> Result<LocalType, ()> {
+        if !matches!(operator, BinOp::And | BinOp::Or) {
+            return Err(());
+        }
+
+        for operand in [left, right] {
+            let operand_type = match operand.kind {
+                ExprKind::Lit(Lit::Bool(_)) => {
+                    self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Bool));
+                    PrimTy::Bool
+                }
+                ExprKind::Path(_) => self
+                    .check_local_path(operand)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                    .ok_or(())?,
+                _ => return Err(()),
+            };
+            self.check_logical_operand_type(operand, operand_type)?;
+        }
+
+        Ok(LocalType::Concrete(PrimTy::Bool))
+    }
+
+    fn check_logical_operand_type(
+        &mut self,
+        operand: &'hir Expr<'hir>,
+        operand_type: PrimTy,
+    ) -> Result<(), ()> {
+        match primitive_bool_operand_result(operand_type) {
+            PrimitiveBoolOperandResult::Bool => {}
+            PrimitiveBoolOperandResult::TypeMismatch { found } => {
+                self.errors.push(PrimitiveBodyError {
+                    node: operand.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                        expected: PrimTy::Bool,
+                        found,
+                    },
+                });
+            }
+            PrimitiveBoolOperandResult::Unsupported => return Err(()),
+        }
+        Ok(())
     }
 
     fn concrete_local_type(&self, local_type: LocalType) -> Option<PrimTy> {
@@ -2445,7 +2483,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right)
                     if is_supported_direct_call_logical_operands(left, right) =>
                 {
-                    let local_type = self.check_logical(operator, left, right)?;
+                    let local_type = self.check_direct_call_logical(operator, left, right)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
@@ -4933,7 +4971,13 @@ fn is_supported_direct_call_comparison_operands(left: &Expr<'_>, right: &Expr<'_
 }
 
 fn is_supported_direct_call_logical_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
-    matches!(left.kind, ExprKind::Path(_)) && matches!(right.kind, ExprKind::Path(_))
+    let is_path_or_bool_literal = |operand: &Expr<'_>| {
+        matches!(
+            operand.kind,
+            ExprKind::Path(_) | ExprKind::Lit(Lit::Bool(_))
+        )
+    };
+    is_path_or_bool_literal(left) && is_path_or_bool_literal(right)
 }
 
 fn is_supported_direct_call_not_operand(operand: &Expr<'_>) -> bool {
