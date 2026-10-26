@@ -1,0 +1,141 @@
+use acme:railway-interlocking-auditor/model.{BlockOccupancy, RouteDefinition, RouteRequest}
+
+pub fn routes() -> Array<RouteDefinition, 5> {
+    [
+        RouteDefinition(
+            id: 101,
+            name: "Cedar East",
+            origin: "Cedar",
+            destination: "East Junction",
+            protected_blocks: ["CEDAR", "JUNCTION", "EAST-OVERLAP"],
+            turnout_id: "T1",
+            turnout_position: "NORMAL",
+        ),
+        RouteDefinition(
+            id: 102,
+            name: "West Yard",
+            origin: "West Gate",
+            destination: "Yard",
+            protected_blocks: ["WEST", "JUNCTION", "YARD-OVERLAP"],
+            turnout_id: "T1",
+            turnout_position: "REVERSE",
+        ),
+        RouteDefinition(
+            id: 103,
+            name: "River Spur",
+            origin: "River",
+            destination: "River Platform",
+            protected_blocks: ["RIVER", "JUNCTION", "RIVER-OVERLAP"],
+            turnout_id: "T2",
+            turnout_position: "NORMAL",
+        ),
+        RouteDefinition(
+            id: 104,
+            name: "Freight Bypass",
+            origin: "West Gate",
+            destination: "East Junction",
+            protected_blocks: ["WEST", "BYPASS", "EAST-OVERLAP"],
+            turnout_id: "T1",
+            turnout_position: "REVERSE",
+        ),
+        RouteDefinition(
+            id: 105,
+            name: "Harbor Spur",
+            origin: "South Gate",
+            destination: "Harbor",
+            protected_blocks: ["SOUTH", "HARBOR", "HARBOR-OVERLAP"],
+            turnout_id: "T2",
+            turnout_position: "REVERSE",
+        ),
+    ]
+}
+
+pub fn requests() -> Array<RouteRequest, 9> {
+    [
+        RouteRequest(
+            id: 3103,
+            train: "Local 8",
+            route_id: 101,
+            requested_start_slot: 4,
+            latest_start_slot: 6,
+            duration_slots: 2,
+            priority: 0,
+        ),
+        RouteRequest(
+            id: 3106,
+            train: "Freight 42",
+            route_id: 104,
+            requested_start_slot: 7,
+            latest_start_slot: 8,
+            duration_slots: 2,
+            priority: 1,
+        ),
+        RouteRequest(
+            id: 3101,
+            train: "Express 11",
+            route_id: 102,
+            requested_start_slot: 2,
+            latest_start_slot: 3,
+            duration_slots: 2,
+            priority: 0,
+        ),
+        RouteRequest(
+            id: 3105,
+            train: "Night local",
+            route_id: 101,
+            requested_start_slot: 6,
+            latest_start_slot: 10,
+            duration_slots: 2,
+            priority: 2,
+        ),
+        RouteRequest(
+            id: 3102,
+            train: "Local 5",
+            route_id: 101,
+            requested_start_slot: 2,
+            latest_start_slot: 3,
+            duration_slots: 2,
+            priority: 1,
+        ),
+        RouteRequest(
+            id: 3104,
+            train: "River shuttle",
+            route_id: 103,
+            requested_start_slot: 4,
+            latest_start_slot: 8,
+            duration_slots: 2,
+            priority: 1,
+        ),
+        RouteRequest(
+            id: 3108,
+            train: "Late special",
+            route_id: 103,
+            requested_start_slot: 15,
+            latest_start_slot: 15,
+            duration_slots: 2,
+            priority: 1,
+        ),
+        RouteRequest(
+            id: 3109,
+            train: "Harbor local",
+            route_id: 105,
+            requested_start_slot: 5,
+            latest_start_slot: 5,
+            duration_slots: 1,
+            priority: 0,
+        ),
+        RouteRequest(
+            id: 3107,
+            train: "Museum special",
+            route_id: 999,
+            requested_start_slot: 1,
+            latest_start_slot: 1,
+            duration_slots: 1,
+            priority: 0,
+        ),
+    ]
+}
+
+pub fn occupied_blocks() -> Array<BlockOccupancy, 1> {
+    [BlockOccupancy(block_id: "CEDAR", start_slot: 5, end_slot: 7)]
+}

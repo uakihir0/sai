@@ -1,0 +1,5 @@
+package acme:railway-interlocking-auditor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Audit fictional railway route requests against fixed interlocking constraints"

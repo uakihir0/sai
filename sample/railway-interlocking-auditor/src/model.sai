@@ -1,0 +1,73 @@
+pub const ROUTE_HORIZON_SLOTS: U32 = 16
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RouteOutcome {
+    Accepted
+    Held
+    Rejected
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RouteIssue {
+    DuplicateRequestId
+    UnknownRoute
+    InvalidWindow
+    ExistingBlockOccupancy
+    BlockReservationConflict
+    TurnoutAlignmentConflict
+    NoAvailableWindow
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RouteDefinition {
+    pub id: U32
+    pub name: Str
+    pub origin: Str
+    pub destination: Str
+    // All three blocks are reserved together; the last is the protected overlap.
+    pub protected_blocks: Array<Str, 3>
+    pub turnout_id: Str
+    pub turnout_position: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RouteRequest {
+    pub id: U32
+    pub train: Str
+    pub route_id: U32
+    pub requested_start_slot: U32
+    pub latest_start_slot: U32
+    pub duration_slots: U32
+    // Lower numeric value wins when requested start slots tie.
+    pub priority: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BlockOccupancy {
+    pub block_id: Str
+    pub start_slot: U32
+    pub end_slot: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RouteDecision {
+    pub request_id: U32
+    pub train: Str
+    pub route_id: U32
+    pub outcome: RouteOutcome
+    pub issue: Option<RouteIssue>
+    pub start_slot: Option<U32>
+    pub end_slot: Option<U32>
+    pub turnout_id: Option<Str>
+    pub turnout_position: Option<Str>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type InterlockingReport {
+    pub request_order: Array<Option<U32>, 9>
+    pub decisions: Array<Option<RouteDecision>, 9>
+    pub decision_count: USize
+    pub accepted_count: U32
+    pub held_count: U32
+    pub rejected_count: U32
+}

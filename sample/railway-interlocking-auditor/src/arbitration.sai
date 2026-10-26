@@ -1,0 +1,307 @@
+use acme:railway-interlocking-auditor/data
+use acme:railway-interlocking-auditor/model.{
+    BlockOccupancy
+    InterlockingReport
+    ROUTE_HORIZON_SLOTS
+    RouteDecision
+    RouteDefinition
+    RouteIssue
+    RouteOutcome
+    RouteRequest
+}
+
+fn precedes(
+    candidate: RouteRequest,
+    candidate_index: USize,
+    current: RouteRequest,
+    current_index: USize,
+) -> Bool {
+    if candidate.requested_start_slot != current.requested_start_slot {
+        candidate.requested_start_slot < current.requested_start_slot
+    } else if candidate.priority != current.priority {
+        candidate.priority < current.priority
+    } else if candidate.id != current.id {
+        candidate.id < current.id
+    } else {
+        candidate_index < current_index
+    }
+}
+
+fn ordered_indices(requests: Array<RouteRequest, 9>) -> Array<Option<USize>, 9> {
+    var order: Array<Option<USize>, 9> = Array<Option<USize>, 9>.filled(None)
+    var selected: Array<Bool, 9> = Array<Bool, 9>.filled(false)
+
+    for position in 0..requests.len() {
+        var best_index: Option<USize> = None
+        for index in 0..requests.len() {
+            if not selected[index] {
+                match best_index {
+                    Some(current_index) => {
+                        if precedes(
+                            requests[index],
+                            index,
+                            requests[current_index],
+                            current_index,
+                        ) {
+                            best_index = Some(index)
+                        }
+                    }
+                    None => {
+                        best_index = Some(index)
+                    }
+                }
+            }
+        }
+
+        match best_index {
+            Some(index) => {
+                order[position] = Some(index)
+                selected[index] = true
+            }
+            None => {}
+        }
+    }
+    order
+}
+
+fn has_duplicate_id(requests: Array<RouteRequest, 9>, index: USize) -> Bool {
+    var duplicate = false
+    for other_index in 0..requests.len() {
+        if other_index != index and requests[other_index].id == requests[index].id {
+            duplicate = true
+        }
+    }
+    duplicate
+}
+
+fn route_by_id(routes: Array<RouteDefinition, 5>, route_id: U32) -> Option<RouteDefinition> {
+    for route in routes {
+        if route.id == route_id {
+            return Some(route)
+        }
+    }
+    None
+}
+
+fn intervals_overlap(first_start: U32, first_end: U32, second_start: U32, second_end: U32) -> Bool {
+    first_start < second_end and second_start < first_end
+}
+
+fn shares_protected_block(first: RouteDefinition, second: RouteDefinition) -> Bool {
+    var shared = false
+    for first_block in first.protected_blocks {
+        for second_block in second.protected_blocks {
+            if first_block == second_block {
+                shared = true
+            }
+        }
+    }
+    shared
+}
+
+fn conflict_at(
+    route: RouteDefinition,
+    start_slot: U32,
+    end_slot: U32,
+    routes: Array<RouteDefinition, 5>,
+    occupancy: Array<BlockOccupancy, 1>,
+    decisions: Array<Option<RouteDecision>, 9>,
+    processed_count: USize,
+) -> Option<RouteIssue> {
+    for occupied in occupancy {
+        for protected_block in route.protected_blocks {
+            if (
+                protected_block == occupied.block_id
+                and intervals_overlap(start_slot, end_slot, occupied.start_slot, occupied.end_slot)
+            ) {
+                return Some(RouteIssue.ExistingBlockOccupancy)
+            }
+        }
+    }
+
+    for index in 0..processed_count {
+        match decisions[index] {
+            Some(existing) => {
+                if existing.outcome == RouteOutcome.Accepted {
+                    match (existing.start_slot, existing.end_slot) {
+                        (Some(existing_start), Some(existing_end)) => {
+                            if intervals_overlap(
+                                start_slot,
+                                end_slot,
+                                existing_start,
+                                existing_end,
+                            ) {
+                                match route_by_id(routes, existing.route_id) {
+                                    Some(existing_route) => {
+                                        if shares_protected_block(route, existing_route) {
+                                            return Some(RouteIssue.BlockReservationConflict)
+                                        }
+                                        if (
+                                            route.turnout_id == existing_route.turnout_id
+                                            and route.turnout_position
+                                                != existing_route.turnout_position
+                                        ) {
+                                            return Some(RouteIssue.TurnoutAlignmentConflict)
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+fn rejected(request: RouteRequest, issue: RouteIssue) -> RouteDecision {
+    RouteDecision(
+        request_id: request.id,
+        train: request.train,
+        route_id: request.route_id,
+        outcome: RouteOutcome.Rejected,
+        issue: Some(issue),
+        start_slot: None,
+        end_slot: None,
+        turnout_id: None,
+        turnout_position: None,
+    )
+}
+
+fn arbitrate_one(
+    request: RouteRequest,
+    routes: Array<RouteDefinition, 5>,
+    occupancy: Array<BlockOccupancy, 1>,
+    decisions: Array<Option<RouteDecision>, 9>,
+    processed_count: USize,
+) -> RouteDecision {
+    match route_by_id(routes, request.route_id) {
+        None => return rejected(request, RouteIssue.UnknownRoute)
+        Some(route) => {
+            if (
+                request.duration_slots == 0
+                or request.requested_start_slot > request.latest_start_slot
+            ) {
+                return rejected(request, RouteIssue.InvalidWindow)
+            }
+            if request.duration_slots > ROUTE_HORIZON_SLOTS {
+                return rejected(request, RouteIssue.InvalidWindow)
+            }
+            if request.latest_start_slot > ROUTE_HORIZON_SLOTS - request.duration_slots {
+                return rejected(request, RouteIssue.InvalidWindow)
+            }
+
+            var candidate_start = request.requested_start_slot
+            var first_issue: Option<RouteIssue> = None
+            var accepted_start: Option<U32> = None
+            while candidate_start <= request.latest_start_slot and accepted_start == None {
+                let candidate_end = candidate_start + request.duration_slots
+                match conflict_at(
+                    route,
+                    candidate_start,
+                    candidate_end,
+                    routes,
+                    occupancy,
+                    decisions,
+                    processed_count,
+                ) {
+                    Some(issue) => {
+                        if first_issue == None {
+                            first_issue = Some(issue)
+                        }
+                    }
+                    None => {
+                        accepted_start = Some(candidate_start)
+                    }
+                }
+                candidate_start += 1
+            }
+
+            match accepted_start {
+                Some(start_slot) => {
+                    RouteDecision(
+                        request_id: request.id,
+                        train: request.train,
+                        route_id: request.route_id,
+                        outcome: RouteOutcome.Accepted,
+                        issue: None,
+                        start_slot: Some(start_slot),
+                        end_slot: Some(start_slot + request.duration_slots),
+                        turnout_id: Some(route.turnout_id),
+                        turnout_position: Some(route.turnout_position),
+                    )
+                }
+                None => {
+                    let issue = match first_issue {
+                        Some(conflict) => conflict
+                        None => RouteIssue.NoAvailableWindow
+                    }
+                    RouteDecision(
+                        request_id: request.id,
+                        train: request.train,
+                        route_id: request.route_id,
+                        outcome: RouteOutcome.Held,
+                        issue: Some(issue),
+                        start_slot: None,
+                        end_slot: None,
+                        turnout_id: Some(route.turnout_id),
+                        turnout_position: Some(route.turnout_position),
+                    )
+                }
+            }
+        }
+    }
+}
+
+pub fn audit(
+    requests: Array<RouteRequest, 9>,
+    routes: Array<RouteDefinition, 5>,
+    occupancy: Array<BlockOccupancy, 1>,
+) -> InterlockingReport {
+    let order = ordered_indices(requests)
+    var request_order: Array<Option<U32>, 9> = Array<Option<U32>, 9>.filled(None)
+    var decisions: Array<Option<RouteDecision>, 9> = Array<Option<RouteDecision>, 9>.filled(None)
+    var accepted_count: U32 = 0
+    var held_count: U32 = 0
+    var rejected_count: U32 = 0
+
+    for position in 0..order.len() {
+        match order[position] {
+            Some(index) => {
+                let request = requests[index]
+                request_order[position] = Some(request.id)
+                let item = if has_duplicate_id(requests, index) {
+                    rejected(request, RouteIssue.DuplicateRequestId)
+                } else {
+                    arbitrate_one(request, routes, occupancy, decisions, position)
+                }
+                decisions[position] = Some(item)
+                if item.outcome == RouteOutcome.Accepted {
+                    accepted_count += 1
+                } else if item.outcome == RouteOutcome.Held {
+                    held_count += 1
+                } else {
+                    rejected_count += 1
+                }
+            }
+            None => {}
+        }
+    }
+
+    InterlockingReport(
+        request_order: request_order,
+        decisions: decisions,
+        decision_count: requests.len(),
+        accepted_count: accepted_count,
+        held_count: held_count,
+        rejected_count: rejected_count,
+    )
+}
+
+pub fn fixture_report() -> InterlockingReport {
+    audit(data.requests(), data.routes(), data.occupied_blocks())
+}
