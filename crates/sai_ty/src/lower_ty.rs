@@ -53,6 +53,15 @@ pub enum UnsupportedTy {
     ContextAfterFailure,
 }
 
+/// Intern a primitive resolver type in the caller's shared semantic type
+/// interner.
+///
+/// `PrimTy::Array` is a resolver prelude marker rather than a standalone
+/// semantic type, so it has no canonical `Ty`.
+pub fn intern_primitive_ty(interner: &TyInterner, primitive: PrimTy) -> Result<Ty, UnsupportedTy> {
+    primitive_ty_kind(primitive).map(|kind| interner.intern(kind))
+}
+
 /// Why a function signature is outside the current partial projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedFnSig {
@@ -1683,7 +1692,39 @@ mod tests {
             );
             let mut context = LowerTyContext::for_signature(&interner, owner, &paths);
             assert_eq!(lower_ty(&mut context, &hir_ty).unwrap().kind(), &expected);
+
+            let canonical = intern_primitive_ty(&interner, primitive)
+                .expect("every listed primitive has a canonical semantic type");
+            assert_eq!(canonical.kind(), &expected);
+            assert!(
+                canonical.ptr_eq(
+                    &intern_primitive_ty(&interner, primitive)
+                        .expect("repeated primitive interning succeeds")
+                ),
+                "primitive {primitive:?} is canonical in the supplied interner"
+            );
         }
+
+        let byte = intern_primitive_ty(&interner, PrimTy::Byte).unwrap();
+        let u8 = intern_primitive_ty(&interner, PrimTy::U8).unwrap();
+        let isize = intern_primitive_ty(&interner, PrimTy::ISize).unwrap();
+        let i64 = intern_primitive_ty(&interner, PrimTy::I64).unwrap();
+        let usize = intern_primitive_ty(&interner, PrimTy::USize).unwrap();
+        let u64 = intern_primitive_ty(&interner, PrimTy::U64).unwrap();
+        assert!(!byte.ptr_eq(&u8), "Byte is distinct from U8");
+        assert!(
+            !isize.ptr_eq(&i64),
+            "ISize keeps its abstract pointer-width type"
+        );
+        assert!(
+            !usize.ptr_eq(&u64),
+            "USize keeps its abstract pointer-width type"
+        );
+        assert_eq!(
+            intern_primitive_ty(&interner, PrimTy::Array),
+            Err(UnsupportedTy::Array),
+            "the resolver's Array marker has no standalone canonical Ty"
+        );
     }
 
     #[test]

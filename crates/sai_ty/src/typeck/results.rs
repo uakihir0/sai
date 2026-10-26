@@ -4,6 +4,7 @@
 //! the compiler implementation plan. They retain only concrete primitive
 //! facts that a supported checker has established.
 
+use crate::ty::{Ty, TyInterner};
 use sai_hir::{BindingId, HirId, OwnerId};
 use sai_resolve::prelude::PrimTy;
 use std::collections::HashMap;
@@ -15,22 +16,25 @@ pub struct ResultOwnerMismatch {
     pub found: OwnerId,
 }
 
-/// One owner's sparse primitive type facts.
+/// One owner's sparse primitive and canonical primitive type facts.
 ///
 /// `expression_types` is keyed by the exact owner-bearing HIR identity.
 /// `binding_types` is keyed by `BindingId`, which does not carry an owner;
 /// `binding_nodes` retains the exact HIR identity that witnessed each
-/// binding insertion.
+/// binding insertion. Canonical type maps are sparse mirrors derived only
+/// from those already-filtered primitive facts with a caller-supplied shared
+/// [`TyInterner`]; an unsupported primitive conversion remains absent.
 ///
 /// This is intentionally not the complete `TypeckResults`: it has no
-/// canonical `Ty`, no complete `node_types` table, and no type-dependent
-/// resolution tables.
+/// complete `node_types` table or type-dependent resolution tables.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartialTypeckResults {
     owner: OwnerId,
     expression_types: HashMap<HirId, PrimTy>,
     binding_types: HashMap<BindingId, PrimTy>,
     binding_nodes: HashMap<BindingId, HirId>,
+    canonical_expression_types: HashMap<HirId, Ty>,
+    canonical_binding_types: HashMap<BindingId, Ty>,
 }
 
 impl PartialTypeckResults {
@@ -62,6 +66,59 @@ impl PartialTypeckResults {
     /// Owner-bearing HIR nodes associated with the sparse binding facts.
     pub fn binding_nodes(&self) -> &HashMap<BindingId, HirId> {
         &self.binding_nodes
+    }
+
+    /// Canonical `Ty` for one expression with a supported primitive fact.
+    pub fn canonical_expression_type(&self, expression: HirId) -> Option<&Ty> {
+        self.canonical_expression_types.get(&expression)
+    }
+
+    /// Canonical `Ty` for one binding with a supported primitive fact.
+    pub fn canonical_binding_type(&self, binding: BindingId) -> Option<&Ty> {
+        self.canonical_binding_types.get(&binding)
+    }
+
+    /// Sparse canonical expression facts derived from the primitive map.
+    pub fn canonical_expression_types(&self) -> &HashMap<HirId, Ty> {
+        &self.canonical_expression_types
+    }
+
+    /// Sparse canonical binding facts derived from the primitive map.
+    pub fn canonical_binding_types(&self) -> &HashMap<BindingId, Ty> {
+        &self.canonical_binding_types
+    }
+
+    /// Derive canonical `Ty` facts for supported primitive facts using the
+    /// caller's session-wide interner.
+    ///
+    /// This runs after the body checker has filtered tainted facts. It never
+    /// creates a fact absent from the primitive maps, and conversion failures
+    /// are omitted without manufacturing an error type.
+    pub fn with_canonical_primitive_types(mut self, interner: &TyInterner) -> Self {
+        self.canonical_expression_types = self
+            .expression_types
+            .iter()
+            .filter_map(|(expression, primitive)| {
+                if expression.owner != self.owner {
+                    return None;
+                }
+                let ty = crate::lower_ty::intern_primitive_ty(interner, *primitive).ok()?;
+                Some((*expression, ty))
+            })
+            .collect();
+        self.canonical_binding_types = self
+            .binding_types
+            .iter()
+            .filter_map(|(binding, primitive)| {
+                let binding_node = self.binding_nodes.get(binding)?;
+                if binding_node.owner != self.owner {
+                    return None;
+                }
+                let ty = crate::lower_ty::intern_primitive_ty(interner, *primitive).ok()?;
+                Some((*binding, ty))
+            })
+            .collect();
+        self
     }
 }
 
@@ -142,6 +199,8 @@ impl PartialTypeckResultsBuilder {
             expression_types: self.expression_types,
             binding_types: self.binding_types,
             binding_nodes: self.binding_nodes,
+            canonical_expression_types: HashMap::new(),
+            canonical_binding_types: HashMap::new(),
         }
     }
 
@@ -171,6 +230,7 @@ pub enum PartialTypeckResultsBuildError {
 #[cfg(test)]
 mod tests {
     use super::{PartialTypeckResultsBuildError, PartialTypeckResultsBuilder, ResultOwnerMismatch};
+    use crate::ty::TyInterner;
     use sai_hir::{
         DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, OwnerId,
     };
@@ -271,6 +331,112 @@ mod tests {
                 previous: first_node,
                 found: second_node,
             })
+        );
+    }
+
+    #[test]
+    fn canonical_primitive_projection_is_sparse_and_uses_the_supplied_interner() {
+        use crate::ty::TyKind;
+
+        let (owner, other_owner) = owners();
+        let interner = TyInterner::new();
+        let same_i32 = hir_id(owner, 1);
+        let repeated_i32 = hir_id(owner, 2);
+        let byte = hir_id(owner, 3);
+        let u8 = hir_id(owner, 4);
+        let isize = hir_id(owner, 5);
+        let array = hir_id(owner, 6);
+        let i32_binding = BindingId::from_raw(0);
+        let array_binding = BindingId::from_raw(1);
+        let i32_binding_node = hir_id(owner, 7);
+        let array_binding_node = hir_id(owner, 8);
+        let mut builder = PartialTypeckResultsBuilder::new(owner);
+        for (expression, primitive) in [
+            (same_i32, PrimTy::I32),
+            (repeated_i32, PrimTy::I32),
+            (byte, PrimTy::Byte),
+            (u8, PrimTy::U8),
+            (isize, PrimTy::ISize),
+            (array, PrimTy::Array),
+        ] {
+            builder
+                .record_expression_type(expression, primitive)
+                .expect("same-owner primitive fact is accepted");
+        }
+        builder
+            .record_binding_type(i32_binding, i32_binding_node, PrimTy::I32)
+            .expect("binding keeps its exact declaration witness");
+        builder
+            .record_binding_type(array_binding, array_binding_node, PrimTy::Array)
+            .expect("unsupported conversion remains a primitive fact");
+        let results = builder.finish().with_canonical_primitive_types(&interner);
+
+        assert_eq!(results.expression_types().len(), 6);
+        assert_eq!(results.canonical_expression_types().len(), 5);
+        assert_eq!(results.binding_types().len(), 2);
+        assert_eq!(results.canonical_binding_types().len(), 1);
+        assert_eq!(
+            results.canonical_expression_type(array),
+            None,
+            "unsupported primitive conversions stay absent from canonical facts"
+        );
+        assert_eq!(results.canonical_binding_type(array_binding), None);
+        assert_eq!(results.binding_node(i32_binding), Some(i32_binding_node));
+        assert_eq!(
+            results.canonical_binding_type(i32_binding).unwrap().kind(),
+            &TyKind::Int(crate::ty::IntTy::I32)
+        );
+        assert!(
+            results
+                .canonical_expression_type(same_i32)
+                .unwrap()
+                .ptr_eq(results.canonical_expression_type(repeated_i32).unwrap()),
+            "equal primitive facts share a canonical handle"
+        );
+        assert!(matches!(
+            results.canonical_expression_type(byte).unwrap().kind(),
+            TyKind::Byte
+        ));
+        assert!(matches!(
+            results.canonical_expression_type(u8).unwrap().kind(),
+            TyKind::Uint(crate::ty::UintTy::U8)
+        ));
+        assert!(
+            !results
+                .canonical_expression_type(byte)
+                .unwrap()
+                .ptr_eq(results.canonical_expression_type(u8).unwrap())
+        );
+        assert!(matches!(
+            results.canonical_expression_type(isize).unwrap().kind(),
+            TyKind::Int(crate::ty::IntTy::ISize)
+        ));
+
+        let other_expression = hir_id(other_owner, 1);
+        let mut other_builder = PartialTypeckResultsBuilder::new(other_owner);
+        other_builder
+            .record_expression_type(other_expression, PrimTy::I32)
+            .expect("second owner keeps its own exact HIR ID");
+        let other_results = other_builder
+            .finish()
+            .with_canonical_primitive_types(&interner);
+        assert!(
+            results.canonical_expression_type(same_i32).unwrap().ptr_eq(
+                other_results
+                    .canonical_expression_type(other_expression)
+                    .unwrap()
+            ),
+            "different owners use the same supplied session interner"
+        );
+        assert!(
+            results
+                .canonical_expression_types()
+                .keys()
+                .all(|expression| expression.owner == owner)
+        );
+        assert!(
+            results.canonical_binding_types().contains_key(&i32_binding),
+            "canonical binding facts remain paired with the exact witnessed binding"
         );
     }
 }

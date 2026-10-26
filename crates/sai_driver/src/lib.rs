@@ -7434,6 +7434,7 @@ fn check_function_body_type(
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -7478,6 +7479,7 @@ fn check_function_body_type(
             locals,
             type_paths,
             direct_call_signatures,
+            semantic_types,
             symbols,
             None,
             None,
@@ -7852,6 +7854,7 @@ fn check_inherent_method_body_type(
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
+    semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -8041,6 +8044,7 @@ fn check_inherent_method_body_type(
         locals,
         type_paths,
         None,
+        semantic_types,
         symbols,
         Some(&self_field_projections),
         Some(&unknown_self_fields),
@@ -8405,6 +8409,7 @@ fn check_function_body_primitive_local_block(
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
@@ -8822,7 +8827,10 @@ fn check_function_body_primitive_local_block(
     else {
         return Ok(None);
     };
-    Ok(Some((diagnostics, type_results)))
+    Ok(Some((
+        diagnostics,
+        type_results.with_canonical_primitive_types(semantic_types),
+    )))
 }
 
 fn is_function_primitive_local_binary_operator(operator: BinOp) -> bool {
@@ -19983,6 +19991,7 @@ impl RootDatabase {
                                         &locals,
                                         resolved_type_paths,
                                         direct_call_signatures.as_ref(),
+                                        &self.semantic_types,
                                         &self.symbols,
                                         &inputs,
                                         snapshot,
@@ -29725,6 +29734,7 @@ impl RootDatabase {
                                             body,
                                             &locals,
                                             resolved_type_paths,
+                                            &self.semantic_types,
                                             &self.symbols,
                                             &inputs,
                                             snapshot,
@@ -30857,6 +30867,51 @@ mod tests {
         PackageFileEntry, PackageRelativePath, SnapshotFile, SourceFile, WitFilesSnapshot,
         WorkspaceSnapshot,
     };
+
+    fn assert_primitive_type_result_parity(
+        database: &RootDatabase,
+        results: &sai_ty::typeck::body::PrimitiveBodyTypeResults,
+    ) {
+        let partial = results.partial_results();
+        assert_eq!(
+            partial.canonical_expression_types().len(),
+            results.expression_types().len(),
+            "every supported expression primitive fact has one canonical fact"
+        );
+        assert_eq!(
+            partial.canonical_binding_types().len(),
+            results.binding_types().len(),
+            "every supported binding primitive fact has one canonical fact"
+        );
+        for (expression, primitive) in results.expression_types() {
+            let canonical = partial
+                .canonical_expression_type(*expression)
+                .expect("supported expression primitive has a canonical fact");
+            let expected =
+                sai_ty::lower_ty::intern_primitive_ty(&database.semantic_types, *primitive)
+                    .expect("published primitive types have canonical semantic types");
+            assert!(
+                canonical.ptr_eq(&expected),
+                "expression {expression:?} uses the RootDatabase interner"
+            );
+        }
+        for (binding, primitive) in results.binding_types() {
+            let binding_node = partial
+                .binding_node(*binding)
+                .expect("binding facts keep their exact HIR witness");
+            assert_eq!(binding_node.owner, results.owner());
+            let canonical = partial
+                .canonical_binding_type(*binding)
+                .expect("supported binding primitive has a canonical fact");
+            let expected =
+                sai_ty::lower_ty::intern_primitive_ty(&database.semantic_types, *primitive)
+                    .expect("published primitive types have canonical semantic types");
+            assert!(
+                canonical.ptr_eq(&expected),
+                "binding {binding:?} uses the RootDatabase interner"
+            );
+        }
+    }
 
     struct TestDirectory(std::path::PathBuf);
 
@@ -47324,6 +47379,20 @@ property "shared"() {}
             "    let callback = || input\n",
             "    input\n",
             "}\n",
+            "pub fn canonical_primitive_classes() -> Char {\n",
+            "    let signed8: I8 = 1\n",
+            "    let signed64: I64 = 2\n",
+            "    let unsigned8: U8 = 3\n",
+            "    let unsigned64: U64 = 4\n",
+            "    let pointer_signed: ISize = 5\n",
+            "    let pointer_unsigned: USize = 6\n",
+            "    let float32: F32 = 1.5\n",
+            "    let float64: F64 = 2.5\n",
+            "    let flag: Bool = true\n",
+            "    let byte: Byte = b'a'\n",
+            "    let character: Char = 'x'\n",
+            "    character\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -47339,12 +47408,13 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 3);
+        assert_eq!(resolved.owners().len(), 4);
         let typed_owner = &resolved.owners()[0];
         let typed_results = typed_owner
             .primitive_body_type_results()
             .expect("type-results projection has no owner error")
             .expect("the supported primitive body publishes its projection");
+        assert_primitive_type_result_parity(&database, typed_results);
         assert_eq!(typed_results.owner(), typed_owner.owner());
         let partial_results = typed_results.partial_results();
         assert_eq!(partial_results.owner(), typed_owner.owner());
@@ -47574,6 +47644,7 @@ property "shared"() {}
             .primitive_body_type_results()
             .expect("error results keep a valid owner projection")
             .expect("the supported body publishes facts alongside diagnostics");
+        assert_primitive_type_result_parity(&database, partial_results);
         assert_eq!(partial_results.owner(), partial_owner.owner());
         assert_eq!(
             partial_results.partial_results().binding_types(),
@@ -47663,6 +47734,50 @@ property "shared"() {}
             Some(sai_resolve::prelude::PrimTy::I16),
             "an independent valid sibling remains available with diagnostics"
         );
+        assert!(
+            partial_results
+                .partial_results()
+                .canonical_binding_type(binding_named("too_wide"))
+                .is_none()
+                && partial_results
+                    .partial_results()
+                    .canonical_binding_type(binding_named("too_wide_copy"))
+                    .is_none()
+                && partial_results
+                    .partial_results()
+                    .canonical_binding_type(binding_named("too_wide_copy_again"))
+                    .is_none()
+                && partial_results
+                    .partial_results()
+                    .canonical_binding_type(binding_named("too_wide_sum"))
+                    .is_none()
+                && partial_results
+                    .partial_results()
+                    .canonical_binding_type(binding_named("invalid"))
+                    .is_none(),
+            "canonical facts cannot restore error-tainted inferred bindings"
+        );
+        assert!(
+            partial_results
+                .partial_results()
+                .canonical_binding_type(binding_named("retained"))
+                .is_some(),
+            "an explicitly annotated binding remains canonical after initializer mismatch"
+        );
+        let typed_i16 = typed_results
+            .partial_results()
+            .canonical_expression_types()
+            .values()
+            .find(|ty| matches!(ty.kind(), sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I16)))
+            .expect("typed owner has an I16 expression fact");
+        let partial_i16 = partial_results
+            .partial_results()
+            .canonical_binding_type(binding_named("valid"))
+            .expect("another owner has a trusted I16 binding fact");
+        assert!(
+            typed_i16.ptr_eq(partial_i16),
+            "separate owners in one RootDatabase share canonical primitive handles"
+        );
         let FunctionBodyTypeCheck::Supported { diagnostics } = partial_owner
             .body_type_check()
             .expect("semantic errors stay in the existing body-check result")
@@ -47696,6 +47811,83 @@ property "shared"() {}
                 .expect("unsupported owner has no projection error"),
             None,
             "a closure body never leaks expression results into the parent owner"
+        );
+        let class_owner = &resolved.owners()[3];
+        let class_results = class_owner
+            .primitive_body_type_results()
+            .expect("primitive-class owner has no projection error")
+            .expect("primitive-class body publishes its supported projection");
+        assert_primitive_type_result_parity(&database, class_results);
+        let class_local_resolution = class_owner
+            .local_resolution()
+            .expect("primitive-class local results are available");
+        let class_locals = class_local_resolution
+            .as_ref()
+            .expect("primitive-class locals were resolved");
+        for (name, expected) in [
+            ("signed8", sai_resolve::prelude::PrimTy::I8),
+            ("signed64", sai_resolve::prelude::PrimTy::I64),
+            ("unsigned8", sai_resolve::prelude::PrimTy::U8),
+            ("unsigned64", sai_resolve::prelude::PrimTy::U64),
+            ("pointer_signed", sai_resolve::prelude::PrimTy::ISize),
+            ("pointer_unsigned", sai_resolve::prelude::PrimTy::USize),
+            ("float32", sai_resolve::prelude::PrimTy::F32),
+            ("float64", sai_resolve::prelude::PrimTy::F64),
+            ("flag", sai_resolve::prelude::PrimTy::Bool),
+            ("byte", sai_resolve::prelude::PrimTy::Byte),
+            ("character", sai_resolve::prelude::PrimTy::Char),
+        ] {
+            let binding = class_locals
+                .bindings
+                .iter()
+                .find_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved_name| resolved_name.as_ref() == name)
+                            .map(|_| *binding)
+                    })
+                })
+                .unwrap_or_else(|| panic!("primitive-class binding {name} exists"));
+            assert_eq!(
+                class_results.binding_type(binding),
+                Some(expected),
+                "{name}"
+            );
+            assert!(
+                class_results
+                    .partial_results()
+                    .canonical_binding_type(binding)
+                    .is_some(),
+                "{name} has a canonical sparse type"
+            );
+        }
+        let class_i8_binding = class_locals
+            .bindings
+            .iter()
+            .find_map(|(binding, local)| {
+                local.name.and_then(|symbol| {
+                    database
+                        .symbols
+                        .resolve(symbol)
+                        .ok()
+                        .filter(|resolved_name| resolved_name.as_ref() == "signed8")
+                        .map(|_| *binding)
+                })
+            })
+            .expect("primitive-class I8 binding exists");
+        assert!(
+            matches!(
+                class_results
+                    .partial_results()
+                    .canonical_binding_type(class_i8_binding)
+                    .expect("I8 has a canonical binding type")
+                    .kind(),
+                sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I8)
+            ),
+            "signed integer facts retain their exact canonical type"
         );
     }
 
@@ -47807,6 +47999,11 @@ property "shared"() {}
                 expected_codes,
                 "diagnostics for `{name}`"
             );
+            let type_results = owner
+                .primitive_body_type_results()
+                .expect("supported direct-call owner has no projection error")
+                .expect("supported direct-call owner publishes primitive facts");
+            assert_primitive_type_result_parity(&database, type_results);
             owner
         };
         let initializer = assert_supported("initializer", &[]);
@@ -64494,6 +64691,11 @@ property "shared"() {}
             diagnostics.is_empty(),
             "the valid primitive-local method has no type diagnostics: {diagnostics:?}"
         );
+        let type_results = method
+            .primitive_body_type_results()
+            .expect("method type projection has no owner error")
+            .expect("supported method body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, type_results);
         assert!(
             method
                 .local_resolution()
@@ -64613,6 +64815,7 @@ property "shared"() {}
             .primitive_body_type_results()
             .expect("unknown-field errors keep the partial projection")
             .expect("the method body publishes trustworthy independent results");
+        assert_primitive_type_result_parity(&database, type_results);
         let local_resolution = method
             .local_resolution()
             .expect("method locals remain available");
@@ -64648,6 +64851,13 @@ property "shared"() {}
                 None,
                 "unknown-field recovery taint propagates through aliases and operators: {name}"
             );
+            assert!(
+                type_results
+                    .partial_results()
+                    .canonical_binding_type(binding_named(name))
+                    .is_none(),
+                "tainted bindings cannot acquire canonical facts: {name}"
+            );
             let binding = binding_named(name);
             let dependent_paths = locals
                 .paths
@@ -64663,11 +64873,27 @@ property "shared"() {}
                     .all(|hir_id| type_results.expression_type(*hir_id).is_none()),
                 "tainted local path results are omitted by exact HIR ID: {name}"
             );
+            assert!(
+                dependent_paths.iter().all(|hir_id| {
+                    type_results
+                        .partial_results()
+                        .canonical_expression_type(*hir_id)
+                        .is_none()
+                }),
+                "tainted HIR paths cannot acquire canonical facts: {name}"
+            );
         }
         assert_eq!(
             type_results.binding_type(binding_named("name")),
             Some(sai_resolve::prelude::PrimTy::I32),
             "a valid sibling retains its concrete result beside the field error"
+        );
+        assert!(
+            type_results
+                .partial_results()
+                .canonical_binding_type(binding_named("name"))
+                .is_some(),
+            "a valid sibling keeps its canonical type beside field errors"
         );
     }
 
