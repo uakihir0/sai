@@ -2745,15 +2745,20 @@ owners and signatures permits forward, recursive and cross-file calls without
 using another owner's body results or falling back to a name lookup. Only
 non-generic synchronous signatures whose parameters and output are supported
 primitive types are eligible. Arguments must be positional literals or
-resolved local paths, except for the one nested-call level added by IR-956:
-an eligible direct call in an eligible call's argument may itself be checked
-when its own arguments are positional literals or resolved local paths.
-Both calls retain their exact owner `HirId` result facts. Arity errors are
-reported at their call; only each call's common argument prefix is
-type-checked, in source order, and each named argument is diagnosed at its
-name span. An inner call error or mismatch taints the enclosing call result
-and inferred local dependents; valid independent siblings remain available.
-An explicit local annotation remains authoritative for that binding. This
+resolved local paths, or one direct `+` node whose two operands are scalar
+literals or resolved preceding local paths. The addition shape is not
+recursive: nested operators and calls under an operator remain unsupported.
+IR-956 adds one nested-call level: an eligible direct call in an eligible
+call's argument may itself be checked, with the same leaf or one-addition
+argument shape. Calls cannot appear as addition operands, and the nested call
+cannot contain another call. Both calls and supported addition expressions
+retain their exact owner `HirId` result facts; additions use the existing
+arithmetic checker and its diagnostics. Arity errors are reported at their
+call; only each call's common argument prefix is type-checked, in source
+order, and each named argument is diagnosed at its name span. An inner call
+error, addition error, or mismatch taints the enclosing call result and
+inferred local dependents; valid independent siblings remain available. An
+explicit local annotation remains authoritative for that binding. This
 implementation slice does not change the CLI Stage 0 incomplete-check gate.
 Method/constructor/function-pointer/extern/WIT calls, generic or otherwise
 unsupported signatures, calls nested more than one argument level, calls
