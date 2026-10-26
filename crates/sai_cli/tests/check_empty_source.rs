@@ -18942,6 +18942,20 @@ fn comparison_arguments_to_direct_calls_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn logical_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn both_ready(left: Bool, right: Bool) -> Bool { identity_bool(left and right) }\n",
+        "pub fn either_ready(left: Bool, right: Bool) -> Bool { identity_bool(identity_bool(left or right)) }\n",
+        "fn identity_bool(value: Bool) -> Bool { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "a direct or one-level nested call with a logical argument",
+    );
+}
+
+#[test]
 fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
     let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);
