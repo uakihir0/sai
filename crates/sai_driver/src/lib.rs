@@ -9002,6 +9002,15 @@ fn is_supported_direct_call_argument_shape(
             locals,
             inputs,
         ),
+        ExprKind::Binary(BinOp::And | BinOp::Or, left, right) => {
+            is_supported_direct_call_logical_operands_shape(
+                left,
+                right,
+                preceding_bindings,
+                locals,
+                inputs,
+            )
+        }
         ExprKind::Call {
             callee,
             args,
@@ -9055,6 +9064,15 @@ fn is_supported_direct_call_arithmetic_argument_shape(
             locals,
             inputs,
         ),
+        ExprKind::Binary(BinOp::And | BinOp::Or, left, right) => {
+            is_supported_direct_call_logical_operands_shape(
+                left,
+                right,
+                preceding_bindings,
+                locals,
+                inputs,
+            )
+        }
         _ => is_supported_direct_call_leaf_argument_shape(
             expression,
             preceding_bindings,
@@ -9111,6 +9129,22 @@ fn is_supported_direct_call_comparison_operands_shape(
     is_comparison_leaf(left)
         && is_comparison_leaf(right)
         && (matches!(left.kind, ExprKind::Path(_)) || matches!(right.kind, ExprKind::Path(_)))
+}
+
+fn is_supported_direct_call_logical_operands_shape(
+    left: &HirExpr<'_>,
+    right: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    [left, right].into_iter().all(|operand| {
+        let ExprKind::Path(path) = operand.kind else {
+            return false;
+        };
+        resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding))
+    })
 }
 
 fn is_supported_direct_call_leaf_argument_shape(
@@ -48661,6 +48695,33 @@ property "shared"() {}
             "    apply_bool(1.5 < measurement)\n",
             "}\n",
             "pub fn nested_comparison_call(value: I32, limit: I32) -> Bool { apply_bool(apply_bool(value <= limit)) }\n",
+            "pub fn logical_and_call_argument(left: Bool, right: Bool) -> Bool { apply_bool(left and right) }\n",
+            "pub fn logical_or_call_argument(left: Bool, right: Bool) -> Bool { apply_bool(left or right) }\n",
+            "pub fn nested_logical_and_call_argument(left: Bool, right: Bool) -> Bool { apply_bool(apply_bool(left and right)) }\n",
+            "pub fn nested_logical_or_call_argument(left: Bool, right: Bool) -> Bool { apply_bool(apply_bool(left or right)) }\n",
+            "pub fn logical_local_paths_call_argument(left: Bool, right: Bool) -> Bool {\n",
+            "    let left_copy = left\n",
+            "    let right_copy = right\n",
+            "    apply_bool(left_copy and right_copy)\n",
+            "}\n",
+            "pub fn logical_operand_mismatch(left: Bool, right: I32) -> Bool {\n",
+            "    let result = apply_bool(left and right)\n",
+            "    let alias = result\n",
+            "    let valid = apply_bool(true)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn logical_two_operand_mismatch(left: I32, right: F32) -> Bool { apply_bool(left and right) }\n",
+            "pub fn logical_argument_parameter_mismatch(left: Bool, right: Bool) -> I32 {\n",
+            "    let result: I32 = apply(left and right)\n",
+            "    result\n",
+            "}\n",
+            "pub fn logical_call_argument_extra_ignored(left: Bool, right: Bool) -> I32 { apply(1, left and right) }\n",
+            "pub fn logical_forward_local_paths_unsupported(left: Bool, right: Bool) -> Bool {\n",
+            "    let result = apply_bool(left_copy and right_copy)\n",
+            "    let left_copy = left\n",
+            "    let right_copy = right\n",
+            "    result\n",
+            "}\n",
             "pub fn comparison_parameter_mismatch(value: I32, limit: I32) -> I32 { apply(value < limit) }\n",
             "pub fn comparison_operand_mismatch(value: I32, condition: Bool) -> Bool { apply_bool(value == condition) }\n",
             "pub fn comparison_literal_family_mismatch(value: I32) -> Bool { apply_bool(value < true) }\n",
@@ -48678,6 +48739,13 @@ property "shared"() {}
             "pub fn computed_comparison_operand_unsupported(value: I32, limit: I32) -> Bool { apply_bool((value + 1) < limit) }\n",
             "pub fn call_comparison_operand_unsupported(value: I32, limit: I32) -> Bool { apply_bool(add_one(value) < limit) }\n",
             "pub fn deep_comparison_call_unsupported(value: I32, limit: I32) -> Bool { apply_bool(apply_bool(apply_bool(value < limit))) }\n",
+            "pub fn logical_literal_operand_unsupported(left: Bool) -> Bool { apply_bool(left and true) }\n",
+            "pub fn logical_not_operand_unsupported(left: Bool) -> Bool { apply_bool(not left) }\n",
+            "pub fn logical_nested_expression_unsupported(left: Bool, right: Bool) -> Bool { apply_bool((left and right) or left) }\n",
+            "pub fn logical_arithmetic_operand_unsupported(left: I32, right: I32) -> Bool { apply_bool((left + right) and true) }\n",
+            "pub fn logical_comparison_operand_unsupported(left: I32, right: I32) -> Bool { apply_bool((left < right) and true) }\n",
+            "pub fn logical_call_operand_unsupported(left: Bool) -> Bool { apply_bool(apply_bool(left) and left) }\n",
+            "pub fn deep_logical_call_unsupported(left: Bool, right: Bool) -> Bool { apply_bool(apply_bool(apply_bool(left and right))) }\n",
             "pub fn unresolved_comparison_local_unsupported(limit: I32) -> Bool {\n",
             "    let inferred = 1\n",
             "    apply_bool(inferred < limit)\n",
@@ -48824,6 +48892,33 @@ property "shared"() {}
         let comparison_operators = assert_supported("comparison_operators", &[]);
         let comparison_literal_leaves = assert_supported("comparison_literal_leaves", &[]);
         let nested_comparison_call = assert_supported("nested_comparison_call", &[]);
+        let logical_and_call_argument = assert_supported("logical_and_call_argument", &[]);
+        let logical_or_call_argument = assert_supported("logical_or_call_argument", &[]);
+        let nested_logical_and_call_argument =
+            assert_supported("nested_logical_and_call_argument", &[]);
+        let nested_logical_or_call_argument =
+            assert_supported("nested_logical_or_call_argument", &[]);
+        let logical_local_paths_call_argument =
+            assert_supported("logical_local_paths_call_argument", &[]);
+        let logical_operand_mismatch = assert_supported(
+            "logical_operand_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let logical_two_operand_mismatch = assert_supported(
+            "logical_two_operand_mismatch",
+            &[
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+        );
+        let logical_argument_parameter_mismatch = assert_supported(
+            "logical_argument_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let logical_call_argument_extra_ignored = assert_supported(
+            "logical_call_argument_extra_ignored",
+            &[sai_diagnostics::Code::WrongArgumentCount],
+        );
         let comparison_parameter_mismatch = assert_supported(
             "comparison_parameter_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
@@ -48936,6 +49031,14 @@ property "shared"() {}
             "byte_literal_pair",
             "char_literal_pair",
             "remainder_call_argument",
+            "logical_forward_local_paths_unsupported",
+            "logical_literal_operand_unsupported",
+            "logical_not_operand_unsupported",
+            "logical_nested_expression_unsupported",
+            "logical_arithmetic_operand_unsupported",
+            "logical_comparison_operand_unsupported",
+            "logical_call_operand_unsupported",
+            "deep_logical_call_unsupported",
             "call_under_arithmetic_argument",
             "literal_pair_comparison_unsupported",
             "nested_comparison_unsupported",
@@ -49388,6 +49491,100 @@ property "shared"() {}
             ),
             Some(PrimTy::Bool)
         );
+        for (owner, function, expression) in [
+            (
+                logical_and_call_argument,
+                "pub fn logical_and_call_argument",
+                "left and right",
+            ),
+            (
+                logical_or_call_argument,
+                "pub fn logical_or_call_argument",
+                "left or right",
+            ),
+        ] {
+            let call = format!("apply_bool({expression})");
+            assert_eq!(
+                expression_type_at_range(owner, function, &call, 0, call.len()),
+                Some(PrimTy::Bool),
+                "a direct call with a logical argument retains its exact result in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    &call,
+                    "apply_bool(".len(),
+                    expression.len()
+                ),
+                Some(PrimTy::Bool),
+                "the logical argument retains its exact Bool fact in `{function}`"
+            );
+        }
+        for (owner, function, expression) in [
+            (
+                nested_logical_and_call_argument,
+                "pub fn nested_logical_and_call_argument",
+                "left and right",
+            ),
+            (
+                nested_logical_or_call_argument,
+                "pub fn nested_logical_or_call_argument",
+                "left or right",
+            ),
+        ] {
+            let call = format!("apply_bool(apply_bool({expression}))");
+            assert_eq!(
+                expression_type_at_range(owner, function, &call, 0, call.len()),
+                Some(PrimTy::Bool),
+                "one nested direct call with a logical argument retains its exact result in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    &call,
+                    "apply_bool(".len(),
+                    format!("apply_bool({expression})").len()
+                ),
+                Some(PrimTy::Bool),
+                "the nested direct-call result retains its exact fact in `{function}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    &call,
+                    "apply_bool(apply_bool(".len(),
+                    expression.len()
+                ),
+                Some(PrimTy::Bool),
+                "the logical expression retains its exact Bool fact in `{function}`"
+            );
+        }
+        let logical_local_call = "apply_bool(left_copy and right_copy)";
+        assert_eq!(
+            expression_type_at_range(
+                logical_local_paths_call_argument,
+                "pub fn logical_local_paths_call_argument",
+                logical_local_call,
+                "apply_bool(".len(),
+                "left_copy and right_copy".len()
+            ),
+            Some(PrimTy::Bool),
+            "a logical call argument over preceding local bindings retains its exact Bool fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                logical_call_argument_extra_ignored,
+                "pub fn logical_call_argument_extra_ignored",
+                "apply(1, left and right)",
+                "apply(1, ".len(),
+                "left and right".len()
+            ),
+            None,
+            "an unmatched logical argument publishes no expression type fact"
+        );
         let mismatched_comparison = "value < limit";
         assert_eq!(
             expression_type_at_range(
@@ -49583,6 +49780,196 @@ property "shared"() {}
             ),
             Some(PrimTy::I32),
             "a valid sibling call remains typed next to the comparison error"
+        );
+        let logical_mismatch_context = "apply_bool(left and right)";
+        let logical_expression = "left and right";
+        assert_eq!(
+            expression_type_at_range(
+                logical_operand_mismatch,
+                "pub fn logical_operand_mismatch",
+                logical_mismatch_context,
+                "apply_bool(".len(),
+                logical_expression.len()
+            ),
+            None,
+            "a mismatched logical operand omits the logical expression fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                logical_operand_mismatch,
+                "pub fn logical_operand_mismatch",
+                logical_mismatch_context,
+                0,
+                logical_mismatch_context.len()
+            ),
+            None,
+            "a mismatched logical operand taints the containing call fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                logical_operand_mismatch,
+                "pub fn logical_operand_mismatch",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "an inferred alias of a failed logical call remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                logical_operand_mismatch,
+                "pub fn logical_operand_mismatch",
+                "apply_bool(true)",
+                0,
+                "apply_bool(true)".len()
+            ),
+            Some(PrimTy::Bool),
+            "a valid sibling call remains typed next to the logical operand error"
+        );
+        let logical_diagnostics = match logical_operand_mismatch
+            .body_type_check()
+            .expect("logical operand mismatch has body diagnostics")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("logical operand mismatch remains a supported diagnostic")
+            }
+        };
+        assert_eq!(
+            logical_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch],
+            "logical operand mismatch reports the expected diagnostic code"
+        );
+        let logical_function_start = root
+            .find("pub fn logical_operand_mismatch")
+            .expect("logical operand mismatch function exists");
+        let logical_operand_start = logical_function_start
+            + root[logical_function_start..]
+                .find(logical_expression)
+                .expect("logical expression exists in the mismatch function")
+            + "left and ".len();
+        assert_eq!(
+            logical_diagnostics[0]
+                .primary()
+                .expect("logical operand mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(logical_operand_start as u32),
+                sai_diagnostics::TextSize::new((logical_operand_start + "right".len()) as u32,),
+            )
+            .expect("logical operand mismatch span is ordered")
+        );
+        let two_operand_diagnostics = match logical_two_operand_mismatch
+            .body_type_check()
+            .expect("two logical operand mismatches have body diagnostics")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("two logical operand mismatches remain supported diagnostics")
+            }
+        };
+        assert_eq!(
+            two_operand_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+            "both non-Bool operands are diagnosed"
+        );
+        let function_start = root
+            .find("pub fn logical_two_operand_mismatch")
+            .expect("two-operand mismatch function exists");
+        let expression_start = function_start
+            + root[function_start..]
+                .find("left and right")
+                .expect("the two-operand logical expression exists");
+        let expected_operand_ranges = [
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(expression_start as u32),
+                sai_diagnostics::TextSize::new((expression_start + "left".len()) as u32),
+            )
+            .expect("left logical operand span is ordered"),
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new((expression_start + "left and ".len()) as u32),
+                sai_diagnostics::TextSize::new((expression_start + "left and right".len()) as u32),
+            )
+            .expect("right logical operand span is ordered"),
+        ];
+        assert_eq!(
+            two_operand_diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("logical operand mismatch has a primary span")
+                        .span
+                        .range
+                })
+                .collect::<Vec<_>>(),
+            expected_operand_ranges,
+            "logical operand mismatches retain exact spans in written order"
+        );
+        let logical_parameter_context = "apply(left and right)";
+        let logical_parameter_expression = "left and right";
+        assert_eq!(
+            expression_type_at_range(
+                logical_argument_parameter_mismatch,
+                "pub fn logical_argument_parameter_mismatch",
+                logical_parameter_context,
+                "apply(".len(),
+                logical_parameter_expression.len()
+            ),
+            None,
+            "a Bool logical argument passed to an I32 parameter is not retained"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                logical_argument_parameter_mismatch,
+                "pub fn logical_argument_parameter_mismatch",
+                logical_parameter_context,
+                0,
+                logical_parameter_context.len()
+            ),
+            None,
+            "a direct call with a logical argument type mismatch is not retained"
+        );
+        let logical_parameter_diagnostics = match logical_argument_parameter_mismatch
+            .body_type_check()
+            .expect("logical call parameter mismatch has body diagnostics")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("logical call parameter mismatch remains supported")
+            }
+        };
+        let function_start = root
+            .find("pub fn logical_argument_parameter_mismatch")
+            .expect("logical parameter mismatch function exists");
+        let expression_start = function_start
+            + root[function_start..]
+                .find(logical_parameter_expression)
+                .expect("logical argument expression exists in the function");
+        assert_eq!(
+            logical_parameter_diagnostics[0]
+                .primary()
+                .expect("logical parameter mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(expression_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (expression_start + logical_parameter_expression.len()) as u32,
+                ),
+            )
+            .expect("logical parameter mismatch span is ordered")
         );
         let out_of_range_comparison = "value < 1e100";
         assert_eq!(
@@ -50419,6 +50806,26 @@ property "shared"() {}
             binding_type(comparison_taint_preserves_sibling, "valid"),
             Some(PrimTy::I32),
             "an independent direct-call sibling remains available beside a comparison error"
+        );
+        assert_eq!(
+            binding_type(logical_operand_mismatch, "result"),
+            None,
+            "a binding initialized by an operand-invalid logical call remains omitted"
+        );
+        assert_eq!(
+            binding_type(logical_operand_mismatch, "alias"),
+            None,
+            "an inferred alias of a logical operand error remains tainted"
+        );
+        assert_eq!(
+            binding_type(logical_operand_mismatch, "valid"),
+            Some(PrimTy::Bool),
+            "an independent logical-call sibling remains available beside the operand error"
+        );
+        assert_eq!(
+            binding_type(logical_argument_parameter_mismatch, "result"),
+            Some(PrimTy::I32),
+            "an explicit local annotation remains authoritative after a logical argument mismatch"
         );
         for owner in [
             nested_return_mismatch,
