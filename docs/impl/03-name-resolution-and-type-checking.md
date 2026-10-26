@@ -2960,10 +2960,11 @@ call position. Reuse `check_bitwise`'s shared integer-literal variable so the
 concrete call parameter constrains both operands, with the existing exact-literal,
 defaulting, and range behavior. This includes fixed integer bounds and the
 configured pointer-width bounds for `ISize` and `USize`; an out-of-range site
-retains its exact literal span and taints the operator and call. Keep signed
-literal pairs, Byte/Bool/Char/float pairs, additional mixed path/literal
-forms, computed/nested operators, deeper calls, and unsupported targets or
-signatures gated. Preserve exact facts, mismatch diagnostics, taint, valid
+retains its exact literal span and taints the operator and call. At this
+IR-969 boundary, keep signed literal pairs, Byte/Bool/Char/float pairs,
+additional mixed path/literal forms, computed/nested operators, deeper calls,
+and unsupported targets or signatures gated; IR-971 below admits directly
+folded signed pairs. Preserve exact facts, mismatch diagnostics, taint, valid
 siblings, and the CLI Stage 0 gate; add no bitwise lowering or runtime
 behavior.
 
@@ -2988,6 +2989,19 @@ Reject computed/nested operands,
 shifts, unary operators, unresolved/self/forward paths, deeper calls, or
 unsupported targets/signatures. Keep the CLI Stage 0 gate
 unchanged; this is typechecking-only and adds no lowering/runtime behavior.
+
+**IR-971 direct-call signed integer-literal bitwise pairs** extends IR-969 to
+accept a direct `Lit::Int` pair when either or both operands are negative
+(`negated: true`), at the root or existing one-level nested call argument
+position. Reuse `check_bitwise`'s shared integer-literal constraint so the
+callee's concrete integer parameter checks both operands, including
+sign-inclusive diagnostic spans and configured `ISize`/`USize` bounds. Keep
+the existing positive-pair behavior and exact operator/call facts; a range
+error suppresses tainted operator and call facts while preserving valid
+independent siblings. Reject arbitrary unary expressions, mixed path/literal
+shapes beyond IR-967/968, non-integer literal pairs, computed or nested
+operators, deeper calls, and unsupported targets/signatures. Preserve the
+CLI Stage 0 gate and do not add bitwise lowering/runtime behavior.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 

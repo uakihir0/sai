@@ -19095,8 +19095,8 @@ fn binary_bitwise_integer_literal_pairs_remain_behind_the_stage_gate() {
         "pub fn nested_bitwise_and_integer_literal_pair_argument() -> I32 { identity_i32(identity_i32(7 & 3)) }\n",
         "pub fn nested_bitwise_or_integer_literal_pair_argument() -> I32 { identity_i32(identity_i32(7 | 3)) }\n",
         "pub fn nested_bitwise_xor_integer_literal_pair_argument() -> I32 { identity_i32(identity_i32(7 ^ 3)) }\n",
-        "pub fn signed_left_integer_literal_pair_stays_gated() -> I32 { identity_i32(-1 & 3) }\n",
-        "pub fn signed_right_integer_literal_pair_stays_gated() -> I32 { identity_i32(7 | -3) }\n",
+        "pub fn unary_left_integer_literal_pair_stays_gated(value: I32) -> I32 { identity_i32(-value & 3) }\n",
+        "pub fn unary_right_integer_literal_pair_stays_gated(value: I32) -> I32 { identity_i32(7 | -value) }\n",
         "pub fn byte_literal_pair_stays_gated() -> Byte { identity_byte(b'a' ^ b'b') }\n",
         "pub fn bool_literal_pair_stays_gated() -> Bool { identity_bool(true & false) }\n",
         "pub fn char_literal_pair_stays_gated() -> Char { identity_char('a' | 'b') }\n",
@@ -19118,6 +19118,24 @@ fn binary_bitwise_integer_literal_pairs_remain_behind_the_stage_gate() {
     assert_check_stays_gated_without_syntax_errors(
         &output,
         "root and one-level nested direct calls with integer-literal bitwise pairs",
+    );
+}
+
+#[test]
+fn binary_bitwise_signed_integer_literal_pairs_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn signed_left_literal_pair_root() -> I32 { identity_i32(-7 & 3) }\n",
+        "pub fn signed_right_literal_pair_root() -> I32 { identity_i32(7 | -3) }\n",
+        "pub fn signed_pair_root() -> I32 { identity_i32(-7 ^ -3) }\n",
+        "pub fn signed_left_literal_pair_nested() -> I32 { identity_i32(identity_i32(-7 | 3)) }\n",
+        "pub fn signed_right_literal_pair_nested() -> I32 { identity_i32(identity_i32(7 ^ -3)) }\n",
+        "pub fn signed_pair_nested() -> I32 { identity_i32(identity_i32(-7 & -3)) }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct calls with directly folded signed integer-literal bitwise pairs",
     );
 }
 
