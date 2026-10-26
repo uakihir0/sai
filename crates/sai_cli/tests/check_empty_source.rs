@@ -2125,8 +2125,18 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         "enum NestedPayload { Single((I8,)) }\n",
         "enum InferredTuplePayload { Shape((I8, (Bool,), USize, (USize,))) }\n",
         "enum NestedShapeOrder { Shape((I8, ((Bool,),), (USize, USize))) }\n",
+        "enum LeafShapeOrder { Shape((I8, ((Bool,),), (USize, USize))) }\n",
+        "enum LeafShapePriority { Shape((Bool, (Byte,))) }\n",
+        "enum UnitLeafPayload { Shape(((), Bool)) }\n",
+        "enum TupleVsLeafPayload { Shape(((Bool,), (), (USize,))) }\n",
+        "enum UnsupportedLeafPayload { Shape((Bool, Byte, Char, USize)) }\n",
+        "enum UnresolvedLeafPayload { Shape((I8, Bool)) }\n",
+        "enum LeafInitializerPayload { Shape((Bool, (Byte,))) }\n",
+        "enum SupportedLeafPayload { Shape((I8, Bool, Byte, Char, ())) }\n",
         "type TupleAlias = (I8,)\n",
         "type NestedTupleAlias = (USize, USize)\n",
+        "type BoolAlias = Bool\n",
+        "type Widget { value: Bool }\n",
         "fn outer() {\n",
         "    let actual: (Bool, Byte) = (true, b'x')\n",
         "    InferredTuplePayload.Shape(actual)\n",
@@ -2143,16 +2153,64 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         "    let actual: (Bool, ((Bool, Bool),), (USize, USize, USize)) = (true, ((true, false),), (1, 2, 3))\n",
         "    NestedShapeOrder.Shape(actual)\n",
         "}\n",
+        "fn outer_leaf_mismatch() {\n",
+        "    let actual: (Bool, (Bool,), USize, (USize,)) = (true, (true,), 1, (2,))\n",
+        "    InferredTuplePayload.Shape(actual)\n",
+        "}\n",
+        "fn nested_leaf_mismatch() {\n",
+        "    let actual: (I8, (Byte,), USize, (USize,)) = (1, (b'x',), 2, (3,))\n",
+        "    InferredTuplePayload.Shape(actual)\n",
+        "}\n",
+        "fn nested_leaf_depth_first() {\n",
+        "    let actual: (I8, ((Byte,),), (Bool, USize)) = (1, ((b'x',),), (true, 2))\n",
+        "    LeafShapeOrder.Shape(actual)\n",
+        "}\n",
+        "fn nested_shape_precedes_leaf_mismatch() {\n",
+        "    let actual: (Char, (Byte, Byte)) = ('x', (b'a', b'b'))\n",
+        "    LeafShapePriority.Shape(actual)\n",
+        "}\n",
+        "fn unit_leaf_mismatch() {\n",
+        "    let actual: (Bool, Byte) = (true, b'x')\n",
+        "    UnitLeafPayload.Shape(actual)\n",
+        "}\n",
+        "fn supported_leaf_equal() {\n",
+        "    let actual: (I8, Bool, Byte, Char, ()) = (1, true, b'x', 'c', ())\n",
+        "    SupportedLeafPayload.Shape(actual)\n",
+        "}\n",
+        "fn tuple_vs_scalar_and_unit_exclusions() {\n",
+        "    let actual: (Bool, (Byte,), ()) = (true, (b'x',), ())\n",
+        "    TupleVsLeafPayload.Shape(actual)\n",
+        "}\n",
+        "fn unsupported_leaf_exclusions() {\n",
+        "    let actual: (BoolAlias, Str, Widget, (Bool,)) = (true, \"text\", true, (false,))\n",
+        "    UnsupportedLeafPayload.Shape(actual)\n",
+        "}\n",
+        "fn unresolved_leaf_then_supported_mismatch() {\n",
+        "    let actual: (MissingLeaf, Byte) = (true, b'x')\n",
+        "    UnresolvedLeafPayload.Shape(actual)\n",
+        "}\n",
+        "fn initializer_leaf_mismatch_uses_annotation() {\n",
+        "    let actual: (Byte, (Bool,)) = (true, (b'x',))\n",
+        "    LeafInitializerPayload.Shape(actual)\n",
+        "}\n",
+        "fn shadowed_leaf_mismatch(parameter: (I8,)) {\n",
+        "    let parameter: (Byte,) = (b'x',)\n",
+        "    NestedPayload.Single(parameter)\n",
+        "}\n",
+        "fn var_leaf_mismatch_sibling_order() {\n",
+        "    var actual: (Byte,) = (b'x',)\n",
+        "    InferredTuplePayload.Shape((1, actual, true, (3,)))\n",
+        "}\n",
         "fn nested_same_arity() {\n",
-        "    let actual: (Bool, (Char,), USize, (Char,)) = (true, ('x',), 1, ('y',))\n",
+        "    let actual: (I8, (Bool,), USize, (USize,)) = (1, (true,), 1, (2,))\n",
         "    InferredTuplePayload.Shape(actual)\n",
         "}\n",
         "fn nested_scalar_and_alias_exclusions() {\n",
-        "    let actual: (Bool, Bool, USize, NestedTupleAlias) = (true, true, 1, (2, 3))\n",
+        "    let actual: (I8, Bool, USize, NestedTupleAlias) = (1, true, 1, (2, 3))\n",
         "    InferredTuplePayload.Shape(actual)\n",
         "}\n",
         "fn nested_unit_exclusion() {\n",
-        "    let actual: (Bool, (), USize, (USize,)) = (true, (), 1, (2,))\n",
+        "    let actual: (I8, (), USize, (USize,)) = (1, (), 1, (2,))\n",
         "    InferredTuplePayload.Shape(actual)\n",
         "}\n",
         "fn nested_var() {\n",
@@ -2188,8 +2246,8 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        7,
-        "only direct or nested tuple-local arity mismatches and the eligible Bool sibling mismatch are reported:\n{stdout}"
+        18,
+        "only direct or nested tuple-local shape/leaf mismatches and eligible fixed-literal siblings are reported:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
@@ -2221,6 +2279,60 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
             "NestedShapeOrder.Shape(actual)",
             "actual",
             "expected tuple of arity 1, found tuple of arity 2",
+        ),
+        (
+            "outer_leaf_mismatch",
+            "InferredTuplePayload.Shape(actual)",
+            "actual",
+            "expected `I8`, found `Bool`",
+        ),
+        (
+            "nested_leaf_mismatch",
+            "InferredTuplePayload.Shape(actual)",
+            "actual",
+            "expected `Bool`, found `Byte`",
+        ),
+        (
+            "nested_leaf_depth_first",
+            "LeafShapeOrder.Shape(actual)",
+            "actual",
+            "expected `Bool`, found `Byte`",
+        ),
+        (
+            "nested_shape_precedes_leaf_mismatch",
+            "LeafShapePriority.Shape(actual)",
+            "actual",
+            "expected tuple of arity 1, found tuple of arity 2",
+        ),
+        (
+            "unit_leaf_mismatch",
+            "UnitLeafPayload.Shape(actual)",
+            "actual",
+            "expected `()`, found `Bool`",
+        ),
+        (
+            "unresolved_leaf_then_supported_mismatch",
+            "UnresolvedLeafPayload.Shape(actual)",
+            "actual",
+            "expected `Bool`, found `Byte`",
+        ),
+        (
+            "initializer_leaf_mismatch_uses_annotation",
+            "LeafInitializerPayload.Shape(actual)",
+            "actual",
+            "expected `Bool`, found `Byte`",
+        ),
+        (
+            "shadowed_leaf_mismatch",
+            "NestedPayload.Single(parameter)",
+            "parameter",
+            "expected `I8`, found `Byte`",
+        ),
+        (
+            "same_arity_element_mismatch",
+            "NestedPayload.Single(actual)",
+            "actual",
+            "expected `I8`, found `Char`",
         ),
         (
             "nested_var",
@@ -2281,7 +2393,45 @@ fn check_reports_tuple_expected_annotated_simple_tuple_local_arity_mismatches() 
         "the local path mismatch and eligible sibling diagnostic retain source order"
     );
 
+    let leaf_sibling_call = "InferredTuplePayload.Shape((1, actual, true, (3,)))";
+    let leaf_sibling_start = source
+        .find(leaf_sibling_call)
+        .expect("annotated tuple-local leaf sibling call exists");
+    let leaf_sibling_path_start =
+        leaf_sibling_start + leaf_sibling_call.find("actual").expect("local path exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `Byte`",
+        leaf_sibling_path_start,
+        leaf_sibling_path_start + "actual".len(),
+    );
+    let leaf_sibling_literal_start = leaf_sibling_start
+        + leaf_sibling_call
+            .find("true")
+            .expect("sibling literal exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `USize`, found a Bool literal",
+        leaf_sibling_literal_start,
+        leaf_sibling_literal_start + "true".len(),
+    );
+    let leaf_local_record = stdout
+        .find("\"message\":\"expected `Bool`, found `Byte`\"")
+        .expect("annotated tuple-local leaf mismatch record exists");
+    let leaf_sibling_record = stdout
+        .find("\"message\":\"expected `USize`, found a Bool literal\"")
+        .expect("leaf sibling literal mismatch record exists");
+    assert!(
+        leaf_local_record < leaf_sibling_record,
+        "the tuple-local leaf mismatch and eligible sibling diagnostic retain source order"
+    );
+
     for function in [
+        "supported_leaf_equal",
+        "tuple_vs_scalar_and_unit_exclusions",
+        "unsupported_leaf_exclusions",
         "nested_same_arity",
         "nested_scalar_and_alias_exclusions",
         "nested_unit_exclusion",
