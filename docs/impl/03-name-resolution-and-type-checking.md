@@ -847,9 +847,16 @@ depth-first source order.
 IR-947 runs after that complete shape check succeeds and compares corresponding
 directly resolved primitive/unit leaves in depth-first order, reporting only
 the first unequal pair over the full local-path span. The annotation remains
-authoritative and the initializer is ignored. Nonempty tuple-versus-scalar or
-unit nodes and alias, `Str`, nominal, or unresolved leaves remain excluded;
-skipping one unsupported pair does not suppress later supported leaves.
+authoritative and the initializer is ignored. Within tuple annotations,
+nonempty tuple-versus-scalar or unit nodes and alias, `Str`, nominal, or
+unresolved leaves remain excluded; skipping one unsupported pair does not
+suppress later supported leaves. IR-948 adds the separate case where a direct
+path names a simple outer-block `let` or `var` annotated exactly `()`: at a
+top-level or nested signature-backed nonempty tuple expectation reached by
+the existing tuple-argument walk, the declared unit type produces the existing
+tuple-versus-local-type mismatch. The initializer is ignored, while
+`UnitAlias`, parameters, tuple-pattern locals, nested-scope and `else`
+declarations, and unmatched extra arguments remain excluded.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -2645,11 +2652,16 @@ mismatch takes precedence over any leaf mismatch in that argument. When the
 shape walk passes, the driver compares corresponding direct primitive/unit
 leaves depth-first and reports the first unequal pair as
 `expected \`T\`, found \`U\`` over the full local-path span. Unit is compared
-as a supported leaf; a nonempty tuple paired with a scalar or unit remains
-excluded. Alias, `Str`, nominal, and unresolved annotation leaves are skipped
-individually, allowing a later supported leaf to be checked. The initializer
-is not read, sibling argument checks continue, unmatched extra arguments stay
-unchecked, and the CLI Stage 0 incomplete-check gate remains in place.
+as a supported leaf; within tuple annotations, a nonempty tuple paired with a
+scalar or unit remains excluded. Alias, `Str`, nominal, and unresolved
+annotation leaves are skipped individually, allowing a later supported leaf
+to be checked. IR-948 separately recognizes a direct unit annotation on a
+simple outer-block `let` or `var` local and reports a tuple-versus-unit
+mismatch at the complete path span, including when the nonempty expected tuple
+is reached inside an argument tuple. The annotation remains authoritative, so
+the initializer is not read. Sibling argument checks continue, unmatched extra
+arguments stay unchecked, and the CLI Stage 0 incomplete-check gate remains
+in place.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
