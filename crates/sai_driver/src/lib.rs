@@ -9288,7 +9288,7 @@ fn is_supported_direct_call_bitwise_operands_shape(
         return false;
     }
 
-    if matches!(right.kind, ExprKind::Lit(Lit::Int { .. })) {
+    if matches!(right.kind, ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_))) {
         return true;
     }
 
@@ -49110,6 +49110,11 @@ property "shared"() {}
             "    let valid = apply_byte(left)\n",
             "    valid\n",
             "}\n",
+            "pub fn bitwise_byte_call_parameter_mismatch(left: Byte) -> I32 {\n",
+            "    let result = apply_i32(left & b'a')\n",
+            "    let sibling = apply_byte(left ^ b'b')\n",
+            "    apply_i32(1)\n",
+            "}\n",
             "pub fn bitwise_argument_parameter_mismatch(left: I32, right: I32) -> Bool {\n",
             "    let result = apply_bool(left & right)\n",
             "    let alias = result\n",
@@ -49244,7 +49249,25 @@ property "shared"() {}
             "pub fn bitwise_char_integer_literal_out_of_range(left: Char) -> Char { identity_char(left & 9223372036854775808) }\n",
             "pub fn bitwise_char_integer_literal_below_range(left: Char) -> Char { identity_char(left ^ -9223372036854775809) }\n",
             "pub fn bitwise_literal_rhs_bool_unsupported(left: I32) -> I32 { apply_i32(left & true) }\n",
-            "pub fn bitwise_literal_rhs_byte_unsupported(left: I32) -> I32 { apply_i32(left & b'a') }\n",
+            "pub fn bitwise_literal_rhs_byte_string_unsupported(left: Byte) -> Byte { apply_byte(left & b\"ab\") }\n",
+            "pub fn bitwise_literal_rhs_computed_unsupported(left: Byte) -> Byte { apply_byte(left & (b'a' | b'b')) }\n",
+            "pub fn bitwise_literal_rhs_nested_unsupported(left: Byte) -> Byte { apply_byte((left & b'a') | left) }\n",
+            "pub fn bitwise_literal_rhs_unresolved_path_unsupported(left: Byte) -> Byte {\n",
+            "    let rhs = 1\n",
+            "    apply_byte(left & rhs)\n",
+            "}\n",
+            "pub fn bitwise_literal_rhs_self_path_unsupported(left: Byte) -> Byte {\n",
+            "    let rhs = apply_byte(left & rhs)\n",
+            "    rhs\n",
+            "}\n",
+            "pub fn bitwise_literal_rhs_forward_path_unsupported(left: Byte) -> Byte {\n",
+            "    let result = apply_byte(left & rhs)\n",
+            "    let rhs: Byte = left\n",
+            "    result\n",
+            "}\n",
+            "pub fn bitwise_literal_rhs_deep_call_unsupported(left: Byte) -> Byte { apply_byte(apply_byte(apply_byte(left & b'a'))) }\n",
+            "pub fn bitwise_literal_rhs_generic_target_unsupported(left: Byte) -> I32 { generic_fn(left & b'a') }\n",
+            "pub fn bitwise_literal_rhs_unsupported_signature(left: Byte) -> I32 { text_fn(left & b'a') }\n",
             "pub fn bitwise_literal_rhs_char_unsupported(left: I32) -> I32 { apply_i32(left & 'x') }\n",
             "pub fn bitwise_literal_rhs_float_unsupported(left: I32) -> I32 { apply_i32(left & 1.0) }\n",
             "pub fn bitwise_unresolved_integer_literal_path_unsupported(left: I32) -> I32 {\n",
@@ -49429,6 +49452,56 @@ property "shared"() {}
                 )
             })
             .collect::<Vec<_>>();
+        let mut bitwise_byte_literal_cases = Vec::new();
+        let mut generated_bitwise_byte_literal_cases = String::new();
+        for (left_name, callee, left_type) in bitwise_primitive_types.iter().copied() {
+            let suffix = left_name.to_ascii_lowercase();
+            for nested in [false, true] {
+                let position = if nested { "nested" } else { "root" };
+                let function_name = format!("bitwise_byte_rhs_{suffix}_{position}");
+                generated_bitwise_byte_literal_cases.push_str(&format!(
+                    "pub fn {function_name}(left: {left_name}) -> {left_name} {{\n"
+                ));
+                let mut diagnostic_index = 0;
+                for (value_name, operator, literal) in [
+                    ("and_value", "&", "b'a'"),
+                    ("or_value", "|", "b'b'"),
+                    ("xor_value", "^", "b'c'"),
+                ] {
+                    let operator_expression = format!("left {operator} {literal}");
+                    let direct_call = format!("{callee}({operator_expression})");
+                    let call = if nested {
+                        format!("{callee}({direct_call})")
+                    } else {
+                        direct_call
+                    };
+                    generated_bitwise_byte_literal_cases
+                        .push_str(&format!("    let {value_name} = {call}\n"));
+                    bitwise_byte_literal_cases.push((
+                        function_name.clone(),
+                        left_name.to_owned(),
+                        left_type,
+                        callee.to_owned(),
+                        nested,
+                        operator.to_owned(),
+                        literal.to_owned(),
+                        operator_expression,
+                        call,
+                        diagnostic_index,
+                    ));
+                    diagnostic_index += if matches!(left_name, "Bool" | "F32" | "F64") {
+                        2
+                    } else if left_name == "Byte" {
+                        0
+                    } else {
+                        1
+                    };
+                }
+                generated_bitwise_byte_literal_cases
+                    .push_str(&format!("    let valid = {callee}(left)\n    valid\n}}\n"));
+            }
+        }
+        root.push_str(&generated_bitwise_byte_literal_cases);
         let mut bitwise_rhs_cases = Vec::new();
         let mut generated_bitwise_cases = String::new();
         let rhs_parameters = bitwise_primitive_types
@@ -50082,6 +50155,11 @@ property "shared"() {}
             "bitwise_byte_rhs_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
+        let bitwise_byte_call_parameter_mismatch = assert_supported(
+            &database,
+            "bitwise_byte_call_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         let bitwise_argument_parameter_mismatch = assert_supported(
             &database,
             "bitwise_argument_parameter_mismatch",
@@ -50413,7 +50491,15 @@ property "shared"() {}
             "shift_unresolved_local_unsupported",
             "shift_unresolved_left_local_unsupported",
             "bitwise_literal_rhs_bool_unsupported",
-            "bitwise_literal_rhs_byte_unsupported",
+            "bitwise_literal_rhs_byte_string_unsupported",
+            "bitwise_literal_rhs_computed_unsupported",
+            "bitwise_literal_rhs_nested_unsupported",
+            "bitwise_literal_rhs_unresolved_path_unsupported",
+            "bitwise_literal_rhs_self_path_unsupported",
+            "bitwise_literal_rhs_forward_path_unsupported",
+            "bitwise_literal_rhs_deep_call_unsupported",
+            "bitwise_literal_rhs_generic_target_unsupported",
+            "bitwise_literal_rhs_unsupported_signature",
             "bitwise_literal_rhs_char_unsupported",
             "bitwise_literal_rhs_float_unsupported",
             "bitwise_unresolved_integer_literal_path_unsupported",
@@ -50609,6 +50695,369 @@ property "shared"() {}
                 );
                 typed_types.first().copied()
             };
+        assert_eq!(
+            bitwise_byte_literal_cases
+                .iter()
+                .map(|(function_name, ..)| function_name)
+                .collect::<HashSet<_>>()
+                .len(),
+            bitwise_byte_literal_cases.len() / 3,
+            "each generated Byte-literal case has one entry per bitwise operator"
+        );
+        let mut checked_byte_literal_functions = HashSet::new();
+        for (function_name, left_name, left_type, callee, nested, _, _, _, _, _) in
+            &bitwise_byte_literal_cases
+        {
+            if !checked_byte_literal_functions.insert(function_name.clone()) {
+                continue;
+            }
+            let function_cases = bitwise_byte_literal_cases
+                .iter()
+                .filter(|(name, ..)| name == function_name)
+                .collect::<Vec<_>>();
+            let one_operator_codes = if *left_name == "Byte" {
+                Vec::new()
+            } else if *left_name == "Char" {
+                vec![sai_diagnostics::Code::OperatorNotSupported]
+            } else if matches!(left_name.as_str(), "Bool" | "F32" | "F64") {
+                vec![
+                    sai_diagnostics::Code::TypeMismatch,
+                    sai_diagnostics::Code::OperatorNotSupported,
+                ]
+            } else {
+                vec![sai_diagnostics::Code::TypeMismatch]
+            };
+            let expected_codes = one_operator_codes
+                .iter()
+                .copied()
+                .cycle()
+                .take(one_operator_codes.len() * function_cases.len())
+                .collect::<Vec<_>>();
+            let owner = assert_supported(&database, function_name, &expected_codes);
+
+            for (
+                case_function,
+                case_left_name,
+                case_left_type,
+                case_callee,
+                case_nested,
+                operator,
+                literal,
+                operator_expression,
+                call,
+                diagnostic_index,
+            ) in function_cases
+            {
+                assert_eq!(case_function, function_name);
+                assert_eq!(case_left_name, left_name);
+                assert_eq!(case_left_type, left_type);
+                assert_eq!(case_callee, callee);
+                assert_eq!(case_nested, nested);
+
+                let operator_start = call
+                    .find(operator_expression)
+                    .expect("the generated Byte-literal operator occurs in the call");
+                let literal_start = operator_start + operator_expression.len() - literal.len();
+                let direct_call = format!("{callee}({operator_expression})");
+                let inner_call_start = call
+                    .find(&direct_call)
+                    .expect("the generated operator call occurs in its outer call");
+                let function = format!("pub fn {function_name}");
+                let operator_type = (left_name == "Byte").then_some(*left_type);
+                let literal_type = operator_type;
+
+                assert_eq!(
+                    expression_type_at_range(&mut database, owner, &function, call, 0, call.len()),
+                    operator_type,
+                    "{left_name} {operator} Byte at {} keeps only an untainted outer-call fact",
+                    if *nested {
+                        "nested position"
+                    } else {
+                        "root position"
+                    }
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        operator_start,
+                        operator_expression.len()
+                    ),
+                    operator_type,
+                    "the {left_name} {operator} Byte expression fact follows diagnostic taint"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        operator_start,
+                        "left".len()
+                    ),
+                    Some(*left_type),
+                    "the {left_name} left path fact survives the Byte-literal check"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        literal_start,
+                        literal.len()
+                    ),
+                    literal_type,
+                    "the Byte literal fact is published only after an exact Byte match"
+                );
+                if *nested {
+                    assert_eq!(
+                        expression_type_at_range(
+                            &mut database,
+                            owner,
+                            &function,
+                            call,
+                            inner_call_start,
+                            direct_call.len()
+                        ),
+                        operator_type,
+                        "the nested direct call carries the same exact result or taint"
+                    );
+                }
+                let sibling_call = format!("{callee}(left)");
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &sibling_call,
+                        0,
+                        sibling_call.len()
+                    ),
+                    Some(*left_type),
+                    "an independent valid {left_name} sibling survives {operator} Byte"
+                );
+
+                if *left_name == "Byte" {
+                    continue;
+                }
+                let diagnostics = match owner
+                    .body_type_check()
+                    .expect("the Byte-literal body result is available")
+                {
+                    FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                    FunctionBodyTypeCheck::Unsupported => {
+                        panic!("the {left_name} Byte-literal diagnostic remains supported")
+                    }
+                };
+                let (expected_codes, primary_offsets, messages) = if *left_name == "Char" {
+                    let trait_name = match operator.as_str() {
+                        "&" => "BitAnd",
+                        "|" => "BitOr",
+                        "^" => "BitXor",
+                        _ => unreachable!("only bitwise operators are generated"),
+                    };
+                    (
+                        vec![sai_diagnostics::Code::OperatorNotSupported],
+                        vec![(operator_start, operator_expression.len())],
+                        vec![format!(
+                            "operator `{operator}` has no `{trait_name}<Byte>` implementation for `Char`"
+                        )],
+                    )
+                } else if matches!(left_name.as_str(), "Bool" | "F32" | "F64") {
+                    (
+                        vec![
+                            sai_diagnostics::Code::TypeMismatch,
+                            sai_diagnostics::Code::OperatorNotSupported,
+                        ],
+                        vec![
+                            (literal_start, literal.len()),
+                            (operator_start, operator_expression.len()),
+                        ],
+                        vec![
+                            format!("expected `{left_name}`, found a byte literal"),
+                            format!("operator `{operator}` is not defined for `{left_name}`"),
+                        ],
+                    )
+                } else {
+                    (
+                        vec![sai_diagnostics::Code::TypeMismatch],
+                        vec![(literal_start, literal.len())],
+                        vec![format!("expected `{left_name}`, found a byte literal")],
+                    )
+                };
+                assert_eq!(
+                    diagnostics[*diagnostic_index..*diagnostic_index + expected_codes.len()]
+                        .iter()
+                        .map(|diagnostic| diagnostic.code)
+                        .collect::<Vec<_>>(),
+                    expected_codes,
+                    "{left_name} {operator} Byte diagnostics retain their established order"
+                );
+
+                let function_start = root
+                    .find(&function)
+                    .expect("the generated function exists in the source");
+                let function_end = root[function_start..]
+                    .find("\npub fn ")
+                    .map_or(root.len(), |offset| function_start + offset);
+                let function_text = &root[function_start..function_end];
+                let call_start = function_text
+                    .find(call)
+                    .expect("the generated direct-call expression occurs in its function");
+                for (index, ((offset, length), message)) in
+                    primary_offsets.into_iter().zip(messages).enumerate()
+                {
+                    let diagnostic = &diagnostics[*diagnostic_index + index];
+                    let expected_range = sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(
+                            (function_start + call_start + offset) as u32,
+                        ),
+                        sai_diagnostics::TextSize::new(
+                            (function_start + call_start + offset + length) as u32,
+                        ),
+                    )
+                    .expect("the diagnostic range is ordered");
+                    assert_eq!(
+                        diagnostic
+                            .primary()
+                            .expect("diagnostic has a primary span")
+                            .span
+                            .range,
+                        expected_range,
+                        "{left_name} {operator} Byte diagnostic points to its exact operand/expression span"
+                    );
+                    assert_eq!(
+                        diagnostic.message, message,
+                        "{left_name} {operator} Byte diagnostic preserves the established message"
+                    );
+                }
+            }
+        }
+        let byte_call_mismatch_function = "pub fn bitwise_byte_call_parameter_mismatch";
+        let byte_call_mismatch = "apply_i32(left & b'a')";
+        let byte_operator_mismatch = "left & b'a'";
+        let byte_literal_mismatch = "b'a'";
+        let byte_sibling_call = "apply_byte(left ^ b'b')";
+        let byte_sibling_operator = "left ^ b'b'";
+        let mismatch_function_start = root
+            .find(byte_call_mismatch_function)
+            .expect("the Byte call-parameter mismatch function exists");
+        let mismatch_function_text = &root[mismatch_function_start..];
+        let mismatch_operator_offset = mismatch_function_text
+            .find(byte_operator_mismatch)
+            .expect("the mismatched Byte operator exists in its function");
+        let mismatch_diagnostics = match bitwise_byte_call_parameter_mismatch
+            .body_type_check()
+            .expect("the Byte call-parameter mismatch body result is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("the Byte call-parameter mismatch remains in the supported slice")
+            }
+        };
+        let mismatch_diagnostic = &mismatch_diagnostics[0];
+        let mismatch_range = sai_diagnostics::TextRange::new(
+            sai_diagnostics::TextSize::new(
+                (mismatch_function_start + mismatch_operator_offset) as u32,
+            ),
+            sai_diagnostics::TextSize::new(
+                (mismatch_function_start + mismatch_operator_offset + byte_operator_mismatch.len())
+                    as u32,
+            ),
+        )
+        .expect("the call-parameter mismatch range is ordered");
+        assert_eq!(
+            mismatch_diagnostic.code,
+            sai_diagnostics::Code::TypeMismatch
+        );
+        assert_eq!(
+            mismatch_diagnostic
+                .primary()
+                .expect("the call-parameter mismatch has a primary span")
+                .span
+                .range,
+            mismatch_range,
+            "the call-parameter mismatch points to the complete bitwise argument"
+        );
+        assert_eq!(
+            mismatch_diagnostic.message, "expected `I32`, found `Byte`",
+            "the Byte result is mismatched against the callee parameter"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_byte_call_parameter_mismatch,
+                byte_call_mismatch_function,
+                byte_call_mismatch,
+                0,
+                byte_call_mismatch.len()
+            ),
+            None,
+            "the mismatched outer call fact is suppressed"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_byte_call_parameter_mismatch,
+                byte_call_mismatch_function,
+                byte_call_mismatch,
+                "apply_i32(".len(),
+                byte_operator_mismatch.len()
+            ),
+            None,
+            "the mismatched operator fact is suppressed"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_byte_call_parameter_mismatch,
+                byte_call_mismatch_function,
+                byte_call_mismatch,
+                "apply_i32(".len(),
+                "left".len()
+            ),
+            Some(PrimTy::Byte),
+            "the exact left-path fact survives the outer parameter mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_byte_call_parameter_mismatch,
+                byte_call_mismatch_function,
+                byte_call_mismatch,
+                "apply_i32(left & ".len(),
+                byte_literal_mismatch.len()
+            ),
+            Some(PrimTy::Byte),
+            "the successfully checked Byte literal fact survives the outer parameter mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_byte_call_parameter_mismatch,
+                byte_call_mismatch_function,
+                byte_sibling_call,
+                0,
+                byte_sibling_call.len()
+            ),
+            Some(PrimTy::Byte),
+            "an independent valid Byte sibling call remains typed"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_byte_call_parameter_mismatch,
+                byte_call_mismatch_function,
+                byte_sibling_call,
+                "apply_byte(".len(),
+                byte_sibling_operator.len()
+            ),
+            Some(PrimTy::Byte),
+            "an independent valid Byte sibling operator remains typed"
+        );
         assert_eq!(
             expression_type_at_range(
                 &mut database,
