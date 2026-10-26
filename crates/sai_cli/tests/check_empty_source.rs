@@ -18960,6 +18960,10 @@ fn unary_not_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn negate(value: Bool) -> Bool { identity_bool(not value) }\n",
         "pub fn nested_negate(value: Bool) -> Bool { identity_bool(identity_bool(not value)) }\n",
+        "pub fn negate_true() -> Bool { identity_bool(not true) }\n",
+        "pub fn negate_false() -> Bool { identity_bool(not false) }\n",
+        "pub fn nested_negate_true() -> Bool { identity_bool(identity_bool(not true)) }\n",
+        "pub fn nested_negate_false() -> Bool { identity_bool(identity_bool(not false)) }\n",
         "pub fn negate_local(value: Bool) -> Bool {\n",
         "    let copy = value\n",
         "    identity_bool(not copy)\n",
@@ -18969,7 +18973,7 @@ fn unary_not_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let output = run_check(source, "", &[], &[]);
     assert_check_stays_gated_without_syntax_errors(
         &output,
-        "a direct or one-level nested call with a unary-not path argument",
+        "a direct or one-level nested call with a unary-not path or Bool literal argument",
     );
 }
 
