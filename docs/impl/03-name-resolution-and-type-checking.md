@@ -3015,13 +3015,29 @@ already produced by that checker: the exact RHS path and operator/call
 results are available, but no separate left-literal fact is synthesized.
 If an enclosing call parameter mismatches the recovered `Byte` result, the
 operator and containing call facts are suppressed while the RHS path fact
-remains. Preserve valid sibling calls. Keep RHS literals (including a second
-byte literal), byte strings, computed or nested operands, unresolved/self/
-forward paths, and preceding numeric locals whose type remains unconstrained
-gated; those locals pass the shape check but must remain Unsupported without
-facts or diagnostics. Also reject deeper calls and unsupported targets/signatures.
-Preserve the CLI Stage 0 gate and add no lowering/runtime behavior. The
-recovery, fact, gate, and scope choices are **Review required**.
+remains. Preserve valid sibling calls. Keep integer, Bool, Char,
+floating-point, and byte-string RHS literals, computed or nested operands,
+unresolved/self/forward paths, and preceding numeric locals whose type remains
+unconstrained gated; those locals pass the shape check but must remain
+Unsupported without facts or diagnostics. IR-973 below admits only a direct
+Byte/Byte literal pair. Also reject deeper calls and unsupported
+targets/signatures. Preserve the CLI Stage 0 gate and add no lowering/runtime
+behavior. The recovery, fact, gate, and scope choices are **Review required**.
+
+**IR-973 direct-call bitwise Byte literal pairs** additionally admit two
+direct byte character literals as the operands of one `&`, `|`, or `^` at a
+root or existing one-level nested direct-call argument position. Reuse
+`check_bitwise` and the flat-local IR-788 behavior: both literals are concrete
+`Byte`, the operator result and matching call result are `Byte`, and no
+separate literal expression facts are synthesized. If the enclosing
+parameter is `I32`, report the existing `TYPE_MISMATCH` over the complete
+operator argument span; suppress that operator and call's facts while keeping
+the literal pair fact-free and preserving independent valid siblings. Reject
+mixed Byte/integer literal pairs in either order, other literal families,
+byte strings, computed or nested operators, deeper calls, generic targets,
+and unsupported signatures. Keep the CLI Stage 0 gate unchanged and add no
+bitwise lowering or runtime behavior. These shape, fact, mismatch, and gate
+decisions are **Review required**.
 
 - **Review required:** Check that the driver and body-checker gates agree for
   all three operators at root and one-level nested positions, with exact
