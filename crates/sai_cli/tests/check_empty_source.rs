@@ -19279,10 +19279,35 @@ fn binary_shift_byte_literal_lhs_integer_literal_rhs_remain_behind_the_stage_gat
 }
 
 #[test]
+fn binary_shift_integer_literal_lhs_path_arguments_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn root_left_shift(count: U32) -> I32 { identity_i32(1 << count) }\n",
+        "pub fn root_right_shift(count: U32) -> U32 { identity_u32(1 >> count) }\n",
+        "pub fn nested_left_shift(count: U32) -> I16 { identity_i16(identity_i16(-1 << count)) }\n",
+        "pub fn nested_right_shift(count: U32) -> U8 { identity_u8(identity_u8(1 >> count)) }\n",
+        "pub fn copied_count(source_count: U32) -> I32 {\n",
+        "    let count = source_count\n",
+        "    identity_i32(-1 << count)\n",
+        "}\n",
+        "pub fn shadowed_count(count: I16) -> I16 {\n",
+        "    let count: U32 = 4294967295\n",
+        "    identity_i16(1 >> count)\n",
+        "}\n",
+        "fn identity_i16(value: I16) -> I16 { value }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_u8(value: U8) -> U8 { value }\n",
+        "fn identity_u32(value: U32) -> U32 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct calls with integer-literal-left shifts",
+    );
+}
+
+#[test]
 fn unsupported_binary_shift_byte_literal_lhs_shapes_remain_behind_the_stage_gate() {
     let source = concat!(
-        "pub fn integer_lhs(count: U32) -> I32 { identity_i32(1 << count) }\n",
-        "pub fn integer_literal_lhs(count: U32) -> U32 { identity_u32(1 << count) }\n",
         "pub fn byte_literal_rhs() -> Byte { identity_byte(b'a' << b'b') }\n",
         "pub fn computed_rhs(count: U32) -> Byte { identity_byte(b'a' << (count + 1)) }\n",
         "pub fn computed_lhs(count: U32) -> Byte { identity_byte((b'a' | b'b') << count) }\n",
@@ -19307,6 +19332,32 @@ fn unsupported_binary_shift_byte_literal_lhs_shapes_remain_behind_the_stage_gate
     assert_check_stays_gated_without_syntax_errors(
         &output,
         "integer, literal-pair, computed, deep, generic, and unsupported-signature shift forms",
+    );
+}
+
+#[test]
+fn unsupported_binary_shift_integer_literal_lhs_path_shapes_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "const SHIFT_COUNT: U32 = 1\n",
+        "pub fn literal_pair(count: U32) -> I32 { identity_i32(1 << 2) }\n",
+        "pub fn computed_rhs(count: U32) -> I32 { identity_i32(1 << (count + 1)) }\n",
+        "pub fn computed_lhs(value: I32, count: U32) -> I32 { identity_i32((value + 1) << count) }\n",
+        "pub fn deep_nested(count: U32) -> I32 { identity_i32(identity_i32(identity_i32(1 << count))) }\n",
+        "pub fn generic_target(count: U32) -> I32 { generic_identity(1 << count) }\n",
+        "pub fn unsupported_signature(count: U32) -> I32 { text(1 << count) }\n",
+        "pub fn unresolved_count() -> I32 {\n",
+        "    let count = 1\n",
+        "    identity_i32(1 << count)\n",
+        "}\n",
+        "pub fn global_path() -> I32 { identity_i32(1 << SHIFT_COUNT) }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn generic_identity<T>(value: T) -> I32 { 0 }\n",
+        "fn text(value: Str) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "literal-pair, computed, deep, generic, unsupported-signature, unresolved, and nonlocal integer-left shift forms",
     );
 }
 

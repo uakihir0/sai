@@ -3450,6 +3450,56 @@ See spec/06 §§6.3.1, 6.3.3, 6.5.1, 6.8.2, 6.8.5 and spec/05 §5.16.2.
   range, and recovery assertions match the contract, and Stage 0 remains
   gated.
 
+**IR-983 direct-call shifts with an integer-literal LHS and eligible path RHS**
+extends the existing root or one-level nested positional direct-call shift
+shape to one direct integer literal on the left and one eligible plain local
+path on the right for `<<` and `>>`. Resolve the RHS to the exact `BindingId`
+of a parameter or preceding simple local; `check_shift` constrains the
+left-literal type from the callee's integer parameter and requires the path
+type to be `U32`. Preserve the existing mismatch at a concrete non-`U32`
+right path. Integer-left range errors use the inferred call-parameter type
+and retain the complete signed literal span. Keep literal/literal,
+  computed/unresolved/self/forward/nonlocal RHSs, computed LHSs, deeper calls,
+  generic targets, and unsupported signatures gated. Preserve call-target, signature,
+positional-prefix, recovery, taint, and sibling-fact behavior. A U32 count
+path remains a runtime value; do not add static shift-width diagnostics,
+lowering, or runtime semantics. Preserve the CLI Stage 0 gate. These shape,
+binding, inference, range, diagnostic, recovery, and runtime-boundary
+decisions are **Review required**. See spec/06 §§6.3.1, 6.5.1, 6.8.2, 6.8.5
+and spec/05 §§5.16.2, 5.16.5.
+
+- **Review required:** Challenge body-checker/driver gate parity for only
+  `(Lit::Int, eligible Path)` at root and one nested direct-call level. Verify
+  both operators and all ten integer primitive parameter types; exact call,
+  operator, literal, and U32 path facts; parameter, copied-local, and
+  same-name shadowed-local binding selection; and no static `ShiftOverflow`
+  for a U32 count above the LHS width. Check signed I8 and unsigned U8
+  left-literal range failures, full sign-inclusive spans, taint/fact
+  suppression, and independent sibling recovery. Verify a non-U32 count
+  reports the existing `TYPE_MISMATCH` at its path and recovers to a valid
+  sibling; verify a non-integer call parameter retains the existing argument
+  mismatch behavior. Reject integer literal pairs, computed operands,
+  unresolved/self/forward paths and nonlocal constant paths, deep calls, generic
+  targets, and unsupported signatures. Confirm Stage 0 remains gated and make
+  no lowering/runtime claim.
+- **Planned verification matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` with
+  generated root/nested `<<` and `>>` forms for all ten integer primitives,
+  exact expression facts, copy/shadow path cases, I8/U8 range diagnostics,
+  U32 path mismatch and call-parameter mismatch recovery, valid siblings, and
+  excluded shapes. Add separate accepted-shape and excluded-shape CLI
+  fixtures that remain behind Stage 0. Run only the pinned focused driver and
+  CLI tests, formatting, and diff checks, then obtain independent hostile
+  review before committing.
+- **Verification:** `mise exec rust@1.99.1 -- cargo test -p sai_driver --lib
+  --locked --offline primitive_body_type_results_include_exact_direct_function_calls`
+  passed (1 test); `mise exec rust@1.99.1 -- cargo test -p sai_cli --test
+  check_empty_source --locked --offline binary_shift_` passed (8 tests).
+  `mise exec rust@1.99.1 -- cargo fmt --all -- --check` and `git diff --check`
+  passed.
+- **Hostile review:** Independent read-only review found no actionable issues,
+  including review of the module-constant exclusion and the Stage 0 CLI fixture.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
