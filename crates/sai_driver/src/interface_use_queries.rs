@@ -7693,6 +7693,7 @@ fn owner_resolution_error_tag(error: &OwnerControlFlowResolutionError) -> u8 {
         OwnerControlFlowResolutionError::MissingInterfaceImplTarget(_) => 31,
         OwnerControlFlowResolutionError::InterfaceImplDiagnosticSourceMismatch { .. } => 32,
         OwnerControlFlowResolutionError::WorldElaboration(_) => 36,
+        OwnerControlFlowResolutionError::DuplicateFunctionSignatureOwnerDefId(_) => 42,
     }
 }
 

@@ -6729,7 +6729,36 @@ pub struct FunctionOwnerResolutions {
     member_scope_closure_fingerprint: Option<Fingerprint>,
     wit_view_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<FunctionOwnerResolution>,
+    function_signature_owners: HashMap<DefId, FunctionSignatureOwnerIndex>,
     session_token: SessionToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FunctionSignatureOwnerIndex {
+    Unique(usize),
+    Ambiguous,
+}
+
+fn index_function_signature_owners(
+    owners: &[FunctionOwnerResolution],
+    package: PackageId,
+) -> HashMap<DefId, FunctionSignatureOwnerIndex> {
+    let mut index = HashMap::new();
+    for (owner_index, owner) in owners.iter().enumerate() {
+        let def_id = owner.owner.def_id.to_def_id();
+        if def_id.package != package {
+            continue;
+        }
+        match index.entry(def_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(FunctionSignatureOwnerIndex::Unique(owner_index));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(FunctionSignatureOwnerIndex::Ambiguous);
+            }
+        }
+    }
+    index
 }
 
 impl FunctionOwnerResolutions {
@@ -6794,6 +6823,56 @@ impl FunctionOwnerResolutions {
         self.signature_projection_with_scopes(collection, None, None, owner)
     }
 
+    /// Returns the stored partial signature projection for an exact
+    /// top-level function definition in this package.
+    ///
+    /// This lookup reuses the projection produced for that function's owner;
+    /// it does not lower the signature again or search by name. The supplied
+    /// collection must match the provenance of these owner results.
+    pub fn signature_projection_for_def_id(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        def_id: DefId,
+    ) -> Result<Option<&FunctionSignatureProjection>, FunctionOwnerResolutionError> {
+        self.signature_projection_for_def_id_with_scopes(collection, None, None, def_id)
+    }
+
+    /// Returns the stored signature projection for an exact top-level
+    /// function definition after validating every active source-member and
+    /// WIT-view closure that contributed to its path resolution.
+    pub fn signature_projection_for_def_id_with_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+        def_id: DefId,
+    ) -> Result<Option<&FunctionSignatureProjection>, FunctionOwnerResolutionError> {
+        if !self.matches_signature_projection_provenance(collection, member_scopes, wit_view_scopes)
+        {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        let Some(owner_index) = self.function_signature_owners.get(&def_id) else {
+            return Ok(None);
+        };
+        let owner_index = match owner_index {
+            FunctionSignatureOwnerIndex::Unique(index) => *index,
+            FunctionSignatureOwnerIndex::Ambiguous => {
+                return Err(
+                    OwnerControlFlowResolutionError::DuplicateFunctionSignatureOwnerDefId(def_id),
+                );
+            }
+        };
+        let owner = self
+            .owners
+            .get(owner_index)
+            .expect("signature owner index is built from the same owner vector");
+        owner
+            .signature_projection
+            .as_ref()
+            .map(Some)
+            .map_err(Clone::clone)
+    }
+
     /// Returns a signature projection after checking every source-member and
     /// WIT-view closure used to produce it.
     pub fn signature_projection_with_scopes(
@@ -6803,6 +6882,26 @@ impl FunctionOwnerResolutions {
         wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
         owner: OwnerId,
     ) -> Result<Option<&FunctionSignatureProjection>, FunctionOwnerResolutionError> {
+        if !self.matches_signature_projection_provenance(collection, member_scopes, wit_view_scopes)
+        {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        let Some(owner) = self.owners.iter().find(|result| result.owner == owner) else {
+            return Ok(None);
+        };
+        owner
+            .signature_projection
+            .as_ref()
+            .map(Some)
+            .map_err(Clone::clone)
+    }
+
+    fn matches_signature_projection_provenance(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    ) -> bool {
         let matches_member_scopes = match member_scopes {
             Some(scopes) => self.matches_member_scopes(collection, scopes),
             None => {
@@ -6816,20 +6915,7 @@ impl FunctionOwnerResolutions {
                 self.matches_collection(collection) && self.wit_view_closure_fingerprint.is_none()
             }
         };
-        if !self.matches_collection(collection)
-            || !matches_member_scopes
-            || !matches_wit_view_scopes
-        {
-            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
-        }
-        let Some(owner) = self.owners.iter().find(|result| result.owner == owner) else {
-            return Ok(None);
-        };
-        owner
-            .signature_projection
-            .as_ref()
-            .map(Some)
-            .map_err(Clone::clone)
+        self.matches_collection(collection) && matches_member_scopes && matches_wit_view_scopes
     }
 
     /// Returns one function's direct enum-variant paths after checking the
@@ -11442,6 +11528,7 @@ pub enum OwnerControlFlowResolutionError {
     PackageId(PackageIdError),
     MissingDefPath(OwnerId),
     MissingTargetDefPath(DefId),
+    DuplicateFunctionSignatureOwnerDefId(DefId),
     MissingInterfaceImplTarget(DefId),
     WorldElaboration(sai_resolve::WorldElaborationError),
     ExportWorldQuery(ExportWorldQueryError),
@@ -20166,6 +20253,10 @@ impl RootDatabase {
                 .or_else(|| {
                     world_fields.and_then(|world_fields| world_fields.wit_view_closure_fingerprint)
                 }),
+            function_signature_owners: index_function_signature_owners(
+                &owners,
+                collection.module_tree.package,
+            ),
             owners,
             session_token: collection.session_token.clone(),
         })
@@ -42448,7 +42539,391 @@ property "shared"() {}
     }
 
     #[test]
+    fn function_signature_projection_lookup_uses_exact_def_ids_and_scope_provenance() {
+        let root = concat!(
+            "fn same() -> Bool {}\n",
+            "fn bounded<T: Copy>(value: T) -> T {}\n",
+            "type Marker {}\n",
+            "extern \"wasm\" module \"env\" { fn external() -> Bool }\n",
+        );
+        let child = "fn same() -> U8 {}\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        let (collection, member_scopes, wit_view_scopes, _) = collect_local_enum_query_inputs(
+            &mut database,
+            &module_tree,
+            &snapshot,
+            &target_cfg,
+            Phase1BuildContext::default(),
+            &graph,
+        );
+        let resolved = database
+            .resolve_function_owner_analyses_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("function signature projections resolve with both active closures");
+        let lookup = |def_id| {
+            resolved
+                .signature_projection_for_def_id_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    def_id,
+                )
+                .expect("matching collection and active closures guard the lookup")
+        };
 
+        let def_paths = database
+            .def_paths
+            .get(&collection.module_tree.package)
+            .expect("the package DefPath interner is available");
+        let function_owner_named = |name: &str| {
+            collection
+                .scopes
+                .function_owners
+                .iter()
+                .find(|descriptor| {
+                    def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| path.data().last().cloned())
+                        .is_some_and(|component| {
+                            matches!(
+                                component.data,
+                                DefPathData::ValueNs(symbol)
+                                    if database.symbols.resolve(symbol).ok().as_deref()
+                                        == Some(name)
+                            )
+                        })
+                })
+                .unwrap_or_else(|| panic!("function `{name}` has a collected owner"))
+        };
+        let same_owners = collection
+            .scopes
+            .function_owners
+            .iter()
+            .filter(|descriptor| {
+                def_paths
+                    .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                    .ok()
+                    .flatten()
+                    .and_then(|path| path.data().last().cloned())
+                    .is_some_and(|component| {
+                        matches!(
+                            component.data,
+                            DefPathData::ValueNs(symbol)
+                                if database.symbols.resolve(symbol).ok().as_deref()
+                                    == Some("same")
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            same_owners.len(),
+            2,
+            "same-spelled functions in different source modules retain distinct owners"
+        );
+        let same_def_ids = same_owners
+            .iter()
+            .map(|descriptor| descriptor.owner.def_id.to_def_id())
+            .collect::<Vec<_>>();
+        assert_ne!(same_def_ids[0], same_def_ids[1]);
+        for descriptor in &same_owners {
+            let by_exact_def_id = lookup(descriptor.owner.def_id.to_def_id());
+            let by_owner = resolved
+                .signature_projection_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    descriptor.owner,
+                )
+                .expect("matching owner identity and closures guard the lookup");
+            assert_eq!(
+                by_exact_def_id, by_owner,
+                "each complete DefId lookup matches its corresponding OwnerId projection"
+            );
+        }
+        let mut saw_bool = false;
+        let mut saw_u8 = false;
+        for def_id in &same_def_ids {
+            let FunctionSignatureProjection::Supported(signature) =
+                lookup(*def_id).expect("each exact same-named owner is indexed")
+            else {
+                panic!("concrete primitive signatures are supported");
+            };
+            saw_bool |= matches!(signature.output().kind(), sai_ty::ty::TyKind::Bool);
+            saw_u8 |= matches!(
+                signature.output().kind(),
+                sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+            );
+        }
+        assert!(saw_bool && saw_u8, "each module returns its own signature");
+
+        let bounded = function_owner_named("bounded").owner.def_id.to_def_id();
+        assert!(matches!(
+            lookup(bounded),
+            Some(FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::GenericParameters
+            ))
+        ));
+
+        let marker = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Struct)
+            .expect("the non-function top-level owner is collected")
+            .owner
+            .def_id
+            .to_def_id();
+        assert_eq!(lookup(marker), None, "non-function DefIds are not indexed");
+        let external = collection
+            .scopes
+            .extern_function_owners
+            .first()
+            .expect("the extern function is collected")
+            .owner
+            .def_id
+            .to_def_id();
+        assert_eq!(lookup(external), None, "extern functions are not indexed");
+
+        let same_package_unscoped =
+            DefId::from_foreign(collection.module_tree.package, same_def_ids[0].index);
+        let foreign_package = database
+            .intern_package("acme:unrelated#1")
+            .expect("foreign package identity interns");
+        let other_package_same_name = DefId::from_foreign(foreign_package, same_def_ids[0].index);
+        for absent in [same_package_unscoped, other_package_same_name] {
+            assert_eq!(lookup(absent), None, "complete DefId identity is required");
+            assert!(
+                matches!(
+                    resolved.signature_projection_for_def_id(&collection, absent),
+                    Err(OwnerControlFlowResolutionError::SnapshotMismatch),
+                ),
+                "omitting a closure used by the owner remains an error even for absent IDs"
+            );
+        }
+
+        let mut stale_member_scopes = member_scopes.clone();
+        stale_member_scopes.closure_fingerprint =
+            sai_stable_hash::Fingerprint::new(member_scopes.closure_fingerprint.raw() ^ 1);
+        assert!(matches!(
+            resolved.signature_projection_for_def_id_with_scopes(
+                &collection,
+                Some(&stale_member_scopes),
+                Some(&wit_view_scopes),
+                other_package_same_name,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+        ));
+        let mut stale_wit_view_scopes = wit_view_scopes.clone();
+        stale_wit_view_scopes.closure_fingerprint =
+            sai_stable_hash::Fingerprint::new(wit_view_scopes.closure_fingerprint.raw() ^ 1);
+        assert!(matches!(
+            resolved.signature_projection_for_def_id_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                Some(&stale_wit_view_scopes),
+                other_package_same_name,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+        ));
+
+        let changed_cfg =
+            target_cfg_for_check("wasm64-core").expect("the second target config is valid");
+        let changed_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &changed_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("same-snapshot collection with a different target succeeds");
+        assert!(
+            matches!(
+                resolved
+                    .signature_projection_for_def_id(&changed_collection, other_package_same_name),
+                Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+            ),
+            "provenance is checked before an absent DefId can return None"
+        );
+
+        let mut owner_error = resolved.clone();
+        let owner = same_owners[0].owner;
+        let owner_result = owner_error
+            .owners
+            .iter_mut()
+            .find(|result| result.owner == owner)
+            .expect("the exact signature owner result exists");
+        owner_result.signature_projection = Err(
+            OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+        );
+        assert!(
+            matches!(
+                owner_error.signature_projection_for_def_id_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    owner.def_id.to_def_id(),
+                ),
+                Err(OwnerControlFlowResolutionError::InvalidSourceLocation(found))
+                    if found == owner
+            ),
+            "an owner analysis error is not converted to absence"
+        );
+
+        let mut duplicate_owner_results = resolved.clone();
+        let duplicate_owner = duplicate_owner_results
+            .owners
+            .first()
+            .expect("at least one function owner exists")
+            .clone();
+        duplicate_owner_results.owners.push(duplicate_owner);
+        duplicate_owner_results.function_signature_owners = index_function_signature_owners(
+            &duplicate_owner_results.owners,
+            collection.module_tree.package,
+        );
+        let duplicated = duplicate_owner_results.owners[0].owner.def_id.to_def_id();
+        assert!(
+            matches!(
+                duplicate_owner_results.signature_projection_for_def_id_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    Some(&wit_view_scopes),
+                    duplicated,
+                ),
+                Err(OwnerControlFlowResolutionError::DuplicateFunctionSignatureOwnerDefId(found))
+                    if found == duplicated
+            ),
+            "duplicate exact DefId owners are rejected instead of silently overwriting"
+        );
+    }
+
+    #[test]
+    fn function_signature_projection_lookup_does_not_fall_back_across_packages() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", b"pub fn same() -> Bool {}\n")],
+        );
+        let (dependency_package, dependency_tree, dependency_files) = multi_package_fixture(
+            &mut database,
+            "acme:dep#1",
+            "acme:dep@1.0.0",
+            &[("lib.sai", b"pub fn same() -> U8 {}\n")],
+        );
+        snapshot_files.extend(dependency_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:dep#1", "acme:dep")],
+                ),
+                graph_node(
+                    "acme:dep#1",
+                    "acme:dep",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph))
+            .expect("the active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let root_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:root @ 1.0.0\nrequires { acme:dep @ ^1 }\n"[..]);
+        let dependency_manifest: Arc<[u8]> = Arc::from(&b"package acme:dep @ 1.0.0\n"[..]);
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &root_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("root package collection succeeds");
+        let dependency_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &dependency_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                dependency_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("dependency package collection succeeds");
+        assert_ne!(root_package, dependency_package);
+
+        let root_results = database
+            .resolve_function_owner_analyses(&root_collection, &root_tree, &snapshot)
+            .expect("root function owner analyses succeed");
+        let dependency_results = database
+            .resolve_function_owner_analyses(&dependency_collection, &dependency_tree, &snapshot)
+            .expect("dependency function owner analyses succeed");
+        let root_def = root_collection.scopes.function_owners[0]
+            .owner
+            .def_id
+            .to_def_id();
+        let dependency_def = dependency_collection.scopes.function_owners[0]
+            .owner
+            .def_id
+            .to_def_id();
+        assert_ne!(root_def, dependency_def);
+
+        let Some(FunctionSignatureProjection::Supported(root_signature)) = root_results
+            .signature_projection_for_def_id(&root_collection, root_def)
+            .expect("root exact signature lookup succeeds")
+        else {
+            panic!("the root package's primitive signature is supported");
+        };
+        assert!(matches!(
+            root_signature.output().kind(),
+            sai_ty::ty::TyKind::Bool
+        ));
+        assert_eq!(
+            root_results
+                .signature_projection_for_def_id(&root_collection, dependency_def)
+                .expect("foreign exact DefId lookup is guarded"),
+            None,
+            "a same-spelled dependency function is not selected by name"
+        );
+        let Some(FunctionSignatureProjection::Supported(dependency_signature)) = dependency_results
+            .signature_projection_for_def_id(&dependency_collection, dependency_def)
+            .expect("dependency exact signature lookup succeeds")
+        else {
+            panic!("the dependency package's primitive signature is supported");
+        };
+        assert!(matches!(
+            dependency_signature.output().kind(),
+            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+        ));
+    }
+
+    #[test]
     fn function_signature_projection_lowers_direct_local_aliases_with_type_parameters() {
         let root = concat!(
             "type Count = U32\n",
