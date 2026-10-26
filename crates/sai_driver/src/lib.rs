@@ -9772,13 +9772,25 @@ fn local_enum_variant_annotated_tuple_local_arity_mismatch(
     None
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalEnumVariantAnnotatedTupleLocalMismatch {
+    LeafType {
+        expected: ConstLiteralType,
+        actual: ConstLiteralType,
+    },
+    TupleAgainstScalar {
+        expected: ConstLiteralType,
+        actual_arity: usize,
+    },
+}
+
 fn local_enum_variant_annotated_tuple_local_leaf_mismatch(
     expected_type: &sai_ty::ty::Ty,
     annotation: &sai_hir::types::Ty<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
-) -> Option<(ConstLiteralType, ConstLiteralType)> {
+) -> Option<LocalEnumVariantAnnotatedTupleLocalMismatch> {
     let mut pending = vec![(expected_type, annotation)];
     while let Some((expected_type, annotation)) = pending.pop() {
         match (expected_type.kind(), annotation.kind) {
@@ -9801,7 +9813,23 @@ fn local_enum_variant_annotated_tuple_local_leaf_mismatch(
                 continue;
             }
             (sai_ty::ty::TyKind::Tuple(elements), _) if !elements.is_empty() => continue,
-            (_, sai_hir::types::TyKind::Tuple(elements)) if !elements.is_empty() => continue,
+            (_, sai_hir::types::TyKind::Tuple(elements)) if !elements.is_empty() => {
+                let Some(expected) = local_enum_variant_literal_type(expected_type) else {
+                    continue;
+                };
+                if matches!(
+                    expected,
+                    ConstLiteralType::Primitive(_) | ConstLiteralType::Unit
+                ) {
+                    return Some(
+                        LocalEnumVariantAnnotatedTupleLocalMismatch::TupleAgainstScalar {
+                            expected,
+                            actual_arity: elements.len(),
+                        },
+                    );
+                }
+                continue;
+            }
             _ => {}
         }
 
@@ -9825,7 +9853,10 @@ fn local_enum_variant_annotated_tuple_local_leaf_mismatch(
             continue;
         }
         if expected_leaf != actual_leaf {
-            return Some((expected_leaf, actual_leaf));
+            return Some(LocalEnumVariantAnnotatedTupleLocalMismatch::LeafType {
+                expected: expected_leaf,
+                actual: actual_leaf,
+            });
         }
     }
     None
@@ -10451,30 +10482,40 @@ fn check_local_enum_variant_literal_argument(
             continue;
         }
 
-        if let sai_ty::ty::TyKind::Tuple(expected_elements) = expected_type.kind()
-            && !expected_elements.is_empty()
-            && let Some(annotation) =
-                local_enum_variant_annotated_simple_tuple_local_annotation(value, body, locals)
-            && let Some((expected_leaf, actual_leaf)) =
-                local_enum_variant_annotated_tuple_local_leaf_mismatch(
-                    expected_type,
-                    annotation,
-                    type_paths,
-                    symbols,
-                    inputs,
-                )
+        if let Some(annotation) =
+            local_enum_variant_annotated_simple_tuple_local_annotation(value, body, locals)
+            && let Some(mismatch) = local_enum_variant_annotated_tuple_local_leaf_mismatch(
+                expected_type,
+                annotation,
+                type_paths,
+                symbols,
+                inputs,
+            )
         {
+            let message = match mismatch {
+                LocalEnumVariantAnnotatedTupleLocalMismatch::LeafType { expected, actual } => {
+                    format!(
+                        "expected `{}`, found `{}`",
+                        local_enum_variant_type_name(expected),
+                        local_enum_variant_type_name(actual)
+                    )
+                }
+                LocalEnumVariantAnnotatedTupleLocalMismatch::TupleAgainstScalar {
+                    expected,
+                    actual_arity,
+                } => format!(
+                    "expected `{}`, found tuple of arity {}",
+                    local_enum_variant_type_name(expected),
+                    actual_arity
+                ),
+            };
             diagnostics.push(const_literal_diagnostic(
                 owner,
                 inputs,
                 snapshot,
                 value.span,
                 sai_diagnostics::Code::TypeMismatch,
-                format!(
-                    "expected `{}`, found `{}`",
-                    local_enum_variant_type_name(expected_leaf),
-                    local_enum_variant_type_name(actual_leaf)
-                ),
+                message,
                 "type mismatch",
             )?);
             continue;
@@ -98487,6 +98528,21 @@ interface facade { use middle.{payload}; }"#;
             "fn nested_call_tuple_annotated_unit_var_mismatch() {\n    var actual: () = ()\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_tuple_annotated_unit_nested_mismatch() {\n    let actual: () = true\n    InferredTuplePayload.Shape((1, actual, 2, (3,)))\n}\n",
             "fn nested_call_tuple_annotated_unit_alias_exclusion() {\n    let actual: UnitAlias = ()\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_annotated_tuple_scalar_mismatch() {\n    let actual: (Bool, Byte) = (true,)\n    Payload.Pair(1, actual)\n}\n",
+            "fn nested_call_annotated_tuple_unit_mismatch() {\n    var actual: (Bool, Byte) = (true, b'x')\n    Payload.UnitPayload(actual)\n}\n",
+            "fn nested_call_annotated_tuple_usize_mismatch() {\n    let actual: (Bool, Byte) = (true, b'x')\n    Payload.Wide(actual)\n}\n",
+            "fn nested_call_annotated_tuple_scalar_shadowed_var_mismatch(actual: (USize,)) {\n    var actual: (Bool, Byte) = (true, b'x')\n    Payload.Pair(1, actual)\n}\n",
+            "fn nested_call_annotated_tuple_scalar_nested_mismatches() {\n    let scalar_actual: (Byte,) = (b'x',)\n    let unit_actual: (USize,) = (1,)\n    LeafShapePriority.Shape((scalar_actual, (b'x',)))\n    UnitLeafPayload.Shape((unit_actual, true))\n}\n",
+            "fn nested_call_annotated_tuple_scalar_first_depth_first_mismatch() {\n    let actual: ((Byte,), (Bool,)) = ((b'x',), (true,))\n    LeafShapePriority.Shape(actual)\n}\n",
+            "fn nested_call_annotated_tuple_scalar_shape_precedence() {\n    let actual: ((Byte, Byte), (Bool, Bool)) = ((b'x', b'y'), (true, false))\n    LeafShapePriority.Shape(actual)\n}\n",
+            "fn nested_call_annotated_tuple_scalar_sibling_order() {\n    let actual: (Bool, Byte) = (true, b'x')\n    LeafShapePriority.Shape((actual, (true,)))\n}\n",
+            "fn nested_call_annotated_tuple_scalar_alias_exclusion() {\n    let actual: TupleAlias = (1, 'x')\n    Payload.Pair(1, actual)\n}\n",
+            "fn nested_call_annotated_tuple_scalar_unit_annotation_exclusion() {\n    let actual: () = ()\n    Payload.Pair(actual, true)\n}\n",
+            "fn nested_call_annotated_tuple_scalar_unit_alias_exclusion() {\n    let actual: UnitAlias = ()\n    Payload.Pair(1, actual)\n}\n",
+            "fn nested_call_annotated_tuple_scalar_parameter_exclusion(actual: (Bool, Byte)) {\n    Payload.Pair(1, actual)\n}\n",
+            "fn nested_call_annotated_tuple_scalar_nested_scope_exclusion() {\n    {\n        let actual: (Bool, Byte) = (true, b'x')\n        Payload.Pair(1, actual)\n    }\n}\n",
+            "fn nested_call_annotated_tuple_scalar_else_exclusion() {\n    let actual: (Bool, Byte) = (true, b'x') else { return }\n    Payload.Pair(1, actual)\n}\n",
+            "fn nested_call_annotated_tuple_scalar_extra_exclusion() {\n    let actual: (Bool, Byte) = (true, b'x')\n    Payload.Pair(1, true, actual)\n}\n",
             "fn nested_call_tuple_annotated_nominal_exclusion() {\n    let actual: Widget = true\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_type_exclusion() {\n    let actual: (I8,) = (1,)\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_pattern_exclusion() {\n    let (actual, _): (Bool, Bool) = (true, false)\n    NestedPayload.Single(actual)\n}\n",
@@ -98536,7 +98592,7 @@ interface facade { use middle.{payload}; }"#;
             "fn nested_call_tuple_annotated_tuple_local_unit_leaf_mismatch() {\n    let actual: (Bool, Byte) = (true, b'x')\n    UnitLeafPayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_supported_leaves_equal() {\n    let actual: (I8, Bool, Byte, Char, ()) = (1, true, b'x', 'c', ())\n    SupportedLeafPayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_tuple_vs_scalar_unit_exclusions() {\n    let actual: (Bool, (Byte,), ()) = (true, (b'x',), ())\n    TupleVsLeafPayload.Shape(actual)\n}\n",
-            "fn nested_call_tuple_annotated_tuple_local_unsupported_leaf_exclusions() {\n    let actual: (BoolAlias, Str, Widget, (Bool,)) = (true, \"text\", true, (false,))\n    UnsupportedLeafPayload.Shape(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_local_unsupported_leaf_exclusions() {\n    let actual: (BoolAlias, Str, Widget, USize) = (true, \"text\", true, 1)\n    UnsupportedLeafPayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_unresolved_leaf_continues() {\n    let actual: (MissingLeaf, Byte) = (true, b'x')\n    UnresolvedLeafPayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_initializer_leaf_ignored() {\n    let actual: (Byte, (Bool,)) = (true, (b'x',))\n    LeafInitializerPayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_shadowed_leaf_mismatch(parameter: (I8,)) {\n    let parameter: (Byte,) = (b'x',)\n    NestedPayload.Single(parameter)\n}\n",
@@ -99151,6 +99207,12 @@ interface facade { use middle.{payload}; }"#;
             "nested_call_tuple_annotated_alias_exclusion",
             "nested_call_tuple_annotated_str_exclusion",
             "nested_call_tuple_annotated_unit_alias_exclusion",
+            "nested_call_annotated_tuple_scalar_alias_exclusion",
+            "nested_call_annotated_tuple_scalar_unit_annotation_exclusion",
+            "nested_call_annotated_tuple_scalar_unit_alias_exclusion",
+            "nested_call_annotated_tuple_scalar_parameter_exclusion",
+            "nested_call_annotated_tuple_scalar_nested_scope_exclusion",
+            "nested_call_annotated_tuple_scalar_else_exclusion",
             "nested_call_tuple_annotated_nominal_exclusion",
             "nested_call_tuple_annotated_tuple_type_exclusion",
             "tuple_call_inferred_fixed_locals_ok",
@@ -99213,6 +99275,33 @@ interface facade { use middle.{payload}; }"#;
                 paths_for(name).call_diagnostics()
             );
         }
+
+        let annotated_tuple_scalar_extra =
+            paths_for("nested_call_annotated_tuple_scalar_extra_exclusion");
+        assert_eq!(
+            annotated_tuple_scalar_extra
+                .call_diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WrongArgumentCount)
+                .count(),
+            1,
+            "the extra-argument case keeps its independent outer arity diagnostic: {:?}",
+            annotated_tuple_scalar_extra.call_diagnostics()
+        );
+        assert!(
+            annotated_tuple_scalar_extra
+                .call_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::TypeMismatch),
+            "an unmatched extra tuple-local argument receives no expected-scalar check"
+        );
+
+        let annotated_tuple_scalar_call = paths_for("nested_call_annotated_tuple_scalar_mismatch");
+        assert_eq!(
+            annotated_tuple_scalar_call.calls().len(),
+            1,
+            "the direct scalar-payload constructor call has a projected signature"
+        );
 
         for (name, expected_message) in [
             ("tuple_call_param_mismatch", "expected `U8`, found `Bool`"),
@@ -99354,6 +99443,34 @@ interface facade { use middle.{payload}; }"#;
                 "expected tuple of arity 1, found `()`",
             ),
             (
+                "nested_call_annotated_tuple_scalar_mismatch",
+                "expected `Bool`, found tuple of arity 2",
+            ),
+            (
+                "nested_call_annotated_tuple_unit_mismatch",
+                "expected `()`, found tuple of arity 2",
+            ),
+            (
+                "nested_call_annotated_tuple_usize_mismatch",
+                "expected `USize`, found tuple of arity 2",
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_shadowed_var_mismatch",
+                "expected `Bool`, found tuple of arity 2",
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_first_depth_first_mismatch",
+                "expected `Bool`, found tuple of arity 1",
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_shape_precedence",
+                "expected tuple of arity 1, found tuple of arity 2",
+            ),
+            (
+                "nested_call_tuple_annotated_tuple_local_tuple_vs_scalar_unit_exclusions",
+                "expected `()`, found tuple of arity 1",
+            ),
+            (
                 "nested_call_tuple_annotated_var_outer_mismatch",
                 "expected tuple of arity 1, found `Byte`",
             ),
@@ -99375,7 +99492,11 @@ interface facade { use middle.{payload}; }"#;
                 paths.call_diagnostics().len(),
                 1,
                 "{name}: {:?}",
-                paths.call_diagnostics()
+                paths
+                    .call_diagnostics()
+                    .iter()
+                    .map(|diagnostic| (diagnostic.code, diagnostic.message.as_str()))
+                    .collect::<Vec<_>>()
             );
             assert_eq!(
                 paths.call_diagnostics()[0].code,
@@ -99564,6 +99685,41 @@ interface facade { use middle.{payload}; }"#;
                 "nested_call_tuple_annotated_unit_nested_mismatch",
                 "InferredTuplePayload.Shape((1, actual, 2, (3,)))",
                 "InferredTuplePayload.Shape((1, ".len(),
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_mismatch",
+                "Payload.Pair(1, actual)",
+                "Payload.Pair(1, ".len(),
+            ),
+            (
+                "nested_call_annotated_tuple_unit_mismatch",
+                "Payload.UnitPayload(actual)",
+                "Payload.UnitPayload(".len(),
+            ),
+            (
+                "nested_call_annotated_tuple_usize_mismatch",
+                "Payload.Wide(actual)",
+                "Payload.Wide(".len(),
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_shadowed_var_mismatch",
+                "Payload.Pair(1, actual)",
+                "Payload.Pair(1, ".len(),
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_first_depth_first_mismatch",
+                "LeafShapePriority.Shape(actual)",
+                "LeafShapePriority.Shape(".len(),
+            ),
+            (
+                "nested_call_annotated_tuple_scalar_shape_precedence",
+                "LeafShapePriority.Shape(actual)",
+                "LeafShapePriority.Shape(".len(),
+            ),
+            (
+                "nested_call_tuple_annotated_tuple_local_tuple_vs_scalar_unit_exclusions",
+                "TupleVsLeafPayload.Shape(actual)",
+                "TupleVsLeafPayload.Shape(".len(),
             ),
             (
                 "nested_call_tuple_annotated_var_outer_mismatch",
@@ -100008,7 +100164,6 @@ interface facade { use middle.{payload}; }"#;
             "nested_call_tuple_annotated_tuple_local_nested_shape_scalar_alias_exclusions",
             "nested_call_tuple_annotated_tuple_local_nested_shape_unit_exclusion",
             "nested_call_tuple_annotated_tuple_local_supported_leaves_equal",
-            "nested_call_tuple_annotated_tuple_local_tuple_vs_scalar_unit_exclusions",
             "nested_call_tuple_annotated_tuple_local_unsupported_leaf_exclusions",
             "nested_call_tuple_annotated_tuple_local_alias_exclusion",
         ] {
@@ -100088,6 +100243,103 @@ interface facade { use middle.{payload}; }"#;
             annotated_tuple_local_sibling_mismatches[1],
             annotated_tuple_local_sibling_call_start
                 + "InferredTuplePayload.Shape((1, actual, ".len(),
+            "true".len(),
+        );
+
+        let annotated_tuple_local_nested_scalar =
+            paths_for("nested_call_annotated_tuple_scalar_nested_mismatches");
+        assert_eq!(
+            annotated_tuple_local_nested_scalar.calls().len(),
+            2,
+            "both direct constructor calls have projected signatures"
+        );
+        let nested_scalar_mismatches = annotated_tuple_local_nested_scalar
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            nested_scalar_mismatches
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected `Bool`, found tuple of arity 1",
+                "expected `()`, found tuple of arity 1",
+            ],
+            "nested scalar and unit expectations compare each direct tuple-local path"
+        );
+        assert_eq!(
+            nested_scalar_mismatches
+                .iter()
+                .map(|diagnostic| diagnostic_primary_text(diagnostic))
+                .collect::<Vec<_>>(),
+            ["scalar_actual", "unit_actual"]
+        );
+        let nested_scalar_function_start = root
+            .find("fn nested_call_annotated_tuple_scalar_nested_mismatches()")
+            .expect("nested scalar mismatch function exists");
+        let nested_scalar_call = "LeafShapePriority.Shape((scalar_actual, (b'x',)))";
+        let nested_scalar_call_start = nested_scalar_function_start
+            + root[nested_scalar_function_start..]
+                .find(nested_scalar_call)
+                .expect("nested scalar mismatch call exists");
+        assert_primary_span(
+            nested_scalar_mismatches[0],
+            nested_scalar_call_start + "LeafShapePriority.Shape((".len(),
+            "scalar_actual".len(),
+        );
+        assert_primary_span(
+            nested_scalar_mismatches[1],
+            nested_scalar_function_start
+                + root[nested_scalar_function_start..]
+                    .find("UnitLeafPayload.Shape((unit_actual, true))")
+                    .expect("nested unit mismatch call exists")
+                + "UnitLeafPayload.Shape((".len(),
+            "unit_actual".len(),
+        );
+
+        let annotated_tuple_local_scalar_sibling =
+            paths_for("nested_call_annotated_tuple_scalar_sibling_order");
+        let scalar_sibling_mismatches = annotated_tuple_local_scalar_sibling
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scalar_sibling_mismatches
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected `Bool`, found tuple of arity 2",
+                "expected `Byte`, found a Bool literal",
+            ],
+            "tuple-versus-scalar local mismatches preserve following tuple-sibling diagnostics"
+        );
+        assert_eq!(
+            scalar_sibling_mismatches
+                .iter()
+                .map(|diagnostic| diagnostic_primary_text(diagnostic))
+                .collect::<Vec<_>>(),
+            ["actual", "true"]
+        );
+        let scalar_sibling_function_start = root
+            .find("fn nested_call_annotated_tuple_scalar_sibling_order()")
+            .expect("scalar sibling-order function exists");
+        let scalar_sibling_call = "LeafShapePriority.Shape((actual, (true,)))";
+        let scalar_sibling_call_start = scalar_sibling_function_start
+            + root[scalar_sibling_function_start..]
+                .find(scalar_sibling_call)
+                .expect("scalar sibling-order call exists");
+        assert_primary_span(
+            scalar_sibling_mismatches[0],
+            scalar_sibling_call_start + "LeafShapePriority.Shape((".len(),
+            "actual".len(),
+        );
+        assert_primary_span(
+            scalar_sibling_mismatches[1],
+            scalar_sibling_call_start + "LeafShapePriority.Shape((actual, (".len(),
             "true".len(),
         );
 
