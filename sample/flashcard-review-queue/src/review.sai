@@ -1,0 +1,76 @@
+use acme:flashcard-review-queue/data
+use acme:flashcard-review-queue/model.{Card, Rating}
+
+pub fn is_due(card: Card, today: U32) -> Bool {
+    card.due_day <= today
+}
+
+pub fn due_count(today: U32) -> USize {
+    var count: USize = 0
+    for card in data.all() {
+        if is_due(card, today) {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn next_interval_days(card: Card, rating: Rating) -> U32 {
+    match rating {
+        Rating.Again => 1
+        Rating.Hard => {
+            if card.interval_days < 2 {
+                2
+            } else {
+                card.interval_days + 1
+            }
+        }
+        Rating.Good => {
+            if card.interval_days == 0 {
+                1
+            } else {
+                card.interval_days * 2
+            }
+        }
+        Rating.Easy => {
+            if card.interval_days < 2 {
+                3
+            } else {
+                card.interval_days * 3
+            }
+        }
+    }
+}
+
+pub fn apply(card: Card, rating: Rating, today: U32) -> Card {
+    let next_streak = match rating { Rating.Again => 0, _ => card.streak + 1 }
+    let interval_days = next_interval_days(card, rating)
+    Card(
+        id: card.id,
+        prompt: card.prompt,
+        answer: card.answer,
+        due_day: today + interval_days,
+        interval_days: interval_days,
+        streak: next_streak,
+    )
+}
+
+test "due cards include today but leave future cards queued" {
+    assert due_count(data.TODAY) == 3
+    assert is_due(data.all()[0], data.TODAY)
+    assert not is_due(data.all()[3], data.TODAY)
+}
+
+test "hard review extends the interval and successful streak" {
+    let updated = apply(data.all()[1], Rating.Hard, data.TODAY)
+    assert updated.interval_days == 8
+    assert updated.due_day == 20
+    assert updated.streak == 4
+}
+
+test "again resets the streak and schedules tomorrow" {
+    let updated = apply(data.all()[1], Rating.Again, data.TODAY)
+    assert updated.interval_days == 1
+    assert updated.due_day == 13
+    assert updated.streak == 0
+}

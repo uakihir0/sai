@@ -1,0 +1,27 @@
+use acme:flashcard-review-queue/report
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_due(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    let command = args[1].as_str()
+    if command == "due" {
+        report.print_due(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "preview" {
+        report.print_preview(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: flashcard-review-queue [due|preview]\n")
+    process.ExitCode.failure()
+}

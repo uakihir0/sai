@@ -25,6 +25,7 @@ source repository before a package resolver can fetch them.
 | Intermediate | [`greenhouse-freeze-alert`](greenhouse-freeze-alert/README.md) | Calibrate a signed tenths-of-a-degree sensor reading, then pass one direct helper call as an argument to another direct call. |
 | Intermediate | [`open-source-license-review`](open-source-license-review/README.md) | Review a fixed component inventory for evidence gaps, conflicts, policy exceptions, and unresolved release findings. |
 | Intermediate | [`reading-log`](reading-log/README.md) | Summarize a fixed book queue with status counts, page totals, and next-book selection. |
+| Intermediate | [`flashcard-review-queue`](flashcard-review-queue/README.md) | Extend reading logs with due-card selection and recall-based intervals for an active review loop. |
 | Intermediate | [`market-checkout`](market-checkout/README.md) | Review orders, aggregate repeated stock requests, and calculate discounts and tax. |
 | Intermediate | [`home-energy-bill-auditor`](home-energy-bill-auditor/README.md) | Compare flat and time-of-use tariffs with solar credits, demand charges, bounded integer arithmetic, and tax. |
 | Intermediate | [`library-loan-policy`](library-loan-policy/README.md) | Enforce checkout, hold, and renewal rules with records, enums, and `Result`. |
