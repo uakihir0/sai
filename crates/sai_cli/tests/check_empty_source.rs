@@ -18979,6 +18979,65 @@ fn remainder_path_pair_arguments_to_direct_calls_remain_behind_the_stage_gate() 
 }
 
 #[test]
+fn remainder_integer_literal_left_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn remainder_literal_left(right: I32) -> I32 { identity_i32(1 % right) }\n",
+        "pub fn nested_remainder_literal_left(right: I32) -> I32 {\n",
+        "    identity_i32(identity_i32(1 % right))\n",
+        "}\n",
+        "pub fn copied_remainder_literal_left(right: I32) -> I32 {\n",
+        "    let copied = right\n",
+        "    identity_i32(1 % copied)\n",
+        "}\n",
+        "pub fn shadowed_remainder_literal_left(right: I64) -> I16 {\n",
+        "    let right: I16 = 2\n",
+        "    identity_i16(1 % right)\n",
+        "}\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_i16(value: I16) -> I16 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct-call literal-left remainder arguments",
+    );
+}
+
+#[test]
+fn unsupported_remainder_integer_literal_left_path_shapes_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn literal_pair() -> I32 { identity_i32(1 % 2) }\n",
+        "pub fn float_literal(right: F32) -> F32 { identity_f32(1.0 % right) }\n",
+        "pub fn computed_left(right: I32) -> I32 { identity_i32((1 + 2) % right) }\n",
+        "pub fn computed_right(right: I32) -> I32 { identity_i32(1 % (right + 1)) }\n",
+        "pub fn unresolved_rhs() -> I32 { identity_i32(1 % missing) }\n",
+        "pub fn self_rhs() -> I32 {\n",
+        "    let result = identity_i32(1 % result)\n",
+        "    result\n",
+        "}\n",
+        "pub fn forward_rhs(right: I32) -> I32 {\n",
+        "    let result = identity_i32(1 % later)\n",
+        "    let later: I32 = right\n",
+        "    result\n",
+        "}\n",
+        "pub fn deep_nested(right: I32) -> I32 {\n",
+        "    identity_i32(identity_i32(identity_i32(1 % right)))\n",
+        "}\n",
+        "pub fn generic_target(right: I32) -> I32 { generic_identity(1 % right) }\n",
+        "pub fn unsupported_signature(right: I32) -> I32 { text(1 % right) }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_f32(value: F32) -> F32 { value }\n",
+        "fn generic_identity<T>(value: T) -> T { value }\n",
+        "fn text(value: String) -> String { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "literal pairs, float literals, computed/unresolved paths, deep/generic calls, and unsupported signatures",
+    );
+}
+
+#[test]
 fn unsupported_remainder_path_pair_shapes_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn computed_left(left: I32, right: I32) -> I32 { identity_i32((left + 1) % right) }\n",
