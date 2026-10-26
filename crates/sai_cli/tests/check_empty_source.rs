@@ -19224,6 +19224,41 @@ fn binary_shift_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn binary_shift_integer_literal_rhs_arguments_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn left_shift_argument(value: I8) -> I8 { identity_i8(value << 4294967295) }\n",
+        "pub fn nested_right_shift_argument(value: Byte) -> Byte { identity_byte(identity_byte(value >> 0)) }\n",
+        "fn identity_i8(value: I8) -> I8 { value }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct calls with integer-literal shift counts",
+    );
+}
+
+#[test]
+fn unsupported_binary_shift_integer_literal_rhs_shapes_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn computed_rhs(value: I32, count: U32) -> I32 { identity_i32(value << (count + 1)) }\n",
+        "pub fn literal_pair() -> I32 { identity_i32(1 << 2) }\n",
+        "pub fn computed_lhs(value: I32) -> I32 { identity_i32((value + 1) << 2) }\n",
+        "pub fn deep_nested(value: I32) -> I32 { identity_i32(identity_i32(identity_i32(value << 1))) }\n",
+        "pub fn generic_target(value: I32) -> I32 { generic_identity(value << 1) }\n",
+        "pub fn unsupported_signature(value: I32) -> I32 { text(value << 1) }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn generic_identity<T>(value: T) -> I32 { 0 }\n",
+        "fn text(value: Str) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "computed, literal-pair, deep, generic, and unsupported-signature shift forms",
+    );
+}
+
+#[test]
 fn binary_bitwise_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn bitwise_and_argument(left: I32, right: I32) -> I32 { identity_i32(left & right) }\n",
