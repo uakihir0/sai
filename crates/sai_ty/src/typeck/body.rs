@@ -4,6 +4,9 @@ use super::literal::{
     PrimitiveLiteralResult, check_primitive_literal, is_integer_primitive,
     supports_primitive_literal,
 };
+use super::results::{
+    PartialTypeckResults, PartialTypeckResultsBuildError, PartialTypeckResultsBuilder,
+};
 use sai_hir::body::Body;
 use sai_hir::expressions::{BinOp, Block, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use sai_hir::literals::Lit;
@@ -72,30 +75,40 @@ pub enum PrimitiveBodyCheck {
 /// owner; each `HirId` is also checked against this owner before insertion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrimitiveBodyTypeResults {
-    owner: OwnerId,
-    expression_types: HashMap<HirId, PrimTy>,
-    binding_types: HashMap<BindingId, PrimTy>,
+    partial_results: PartialTypeckResults,
 }
 
 impl PrimitiveBodyTypeResults {
+    fn from_partial_results(partial_results: PartialTypeckResults) -> Self {
+        Self { partial_results }
+    }
+
     pub const fn owner(&self) -> OwnerId {
-        self.owner
+        self.partial_results.owner()
     }
 
     pub fn expression_type(&self, expression: HirId) -> Option<PrimTy> {
-        self.expression_types.get(&expression).copied()
+        self.partial_results.expression_type(expression)
     }
 
     pub fn binding_type(&self, binding: BindingId) -> Option<PrimTy> {
-        self.binding_types.get(&binding).copied()
+        self.partial_results.binding_type(binding)
     }
 
     pub fn expression_types(&self) -> &HashMap<HirId, PrimTy> {
-        &self.expression_types
+        self.partial_results.expression_types()
     }
 
     pub fn binding_types(&self) -> &HashMap<BindingId, PrimTy> {
-        &self.binding_types
+        self.partial_results.binding_types()
+    }
+
+    /// The sparse owner-scoped facts underlying this compatibility view.
+    ///
+    /// The returned value remains primitive-only and does not satisfy the
+    /// complete `TypeckResults` contract.
+    pub fn partial_results(&self) -> &PartialTypeckResults {
+        &self.partial_results
     }
 }
 
@@ -242,6 +255,12 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
     if !supports_primitive_literal(input.return_type) {
         return PrimitiveBodyCheck::Unsupported;
     }
+    let binding_nodes = input
+        .body
+        .params
+        .iter()
+        .map(|parameter| (parameter.binding, parameter.hir_id))
+        .collect();
     let known_bindings: HashMap<BindingId, LocalType> = input
         .initial_bindings
         .iter()
@@ -259,6 +278,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         binding_type_candidates,
         binding_candidate_order: Vec::new(),
         binding_initializer_roots: HashMap::new(),
+        binding_nodes,
         annotated_bindings: HashSet::new(),
         trusted_bindings,
         expression_type_candidates: RefCell::new(HashMap::new()),
@@ -298,6 +318,7 @@ struct FnCtxt<'a, 'hir> {
     binding_type_candidates: HashMap<BindingId, LocalType>,
     binding_candidate_order: Vec<BindingId>,
     binding_initializer_roots: HashMap<BindingId, HirId>,
+    binding_nodes: HashMap<BindingId, HirId>,
     annotated_bindings: HashSet<BindingId>,
     trusted_bindings: HashSet<BindingId>,
     expression_type_candidates: RefCell<HashMap<HirId, LocalType>>,
@@ -362,7 +383,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 tainted_bindings.insert(*binding);
             }
         }
-        let expression_types = self
+        let expression_types: HashMap<HirId, PrimTy> = self
             .expression_type_candidates
             .borrow()
             .iter()
@@ -383,7 +404,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 Some((*expression_id, self.concrete_local_type(*local_type)?))
             })
             .collect();
-        let binding_types = self
+        let binding_types: HashMap<BindingId, PrimTy> = self
             .binding_type_candidates
             .iter()
             .filter_map(|(binding, local_type)| {
@@ -397,11 +418,33 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 Some((*binding, self.concrete_local_type(*local_type)?))
             })
             .collect();
-        PrimitiveBodyTypeResults {
-            owner,
-            expression_types,
-            binding_types,
+        let mut builder = PartialTypeckResultsBuilder::new(owner);
+        for (expression, ty) in expression_types {
+            builder
+                .record_expression_type(expression, ty)
+                .expect("the body checker filters expression results by exact owner");
         }
+        for (binding, ty) in binding_types {
+            let Some(binding_node) = self.binding_nodes.get(&binding).copied() else {
+                // BindingId carries no owner, so never publish its primitive
+                // type without an owner-checked parameter or pattern node.
+                continue;
+            };
+            match builder.record_binding_type(binding, binding_node, ty) {
+                Ok(()) => {}
+                Err(PartialTypeckResultsBuildError::OwnerMismatch(_)) => {
+                    // A binding HIR witness from another owner is not a fact
+                    // of this body's partial results.
+                    continue;
+                }
+                Err(PartialTypeckResultsBuildError::BindingNodeMismatch { .. }) => {
+                    // One owner-local binding index must identify one exact
+                    // parameter or pattern node.
+                    continue;
+                }
+            }
+        }
+        PrimitiveBodyTypeResults::from_partial_results(builder.finish())
     }
 
     fn record_expression_type(&self, expression: HirId, local_type: LocalType) {
@@ -467,6 +510,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         else {
             return Err(());
         };
+        self.binding_nodes.insert(binding, pat.hir_id);
 
         let annotation = match ty {
             Some(ty) => {
