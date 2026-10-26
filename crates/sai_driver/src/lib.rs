@@ -9292,19 +9292,20 @@ fn is_supported_direct_call_shift_operands_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
 ) -> bool {
-    let ExprKind::Path(path) = left.kind else {
-        return false;
+    let left_is_eligible_path = match left.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Lit(Lit::Byte(_)) => true,
+        _ => false,
     };
-    if !resolved_plain_local_path_binding(path, locals, inputs)
-        .is_some_and(|binding| preceding_bindings.contains(&binding))
-    {
+    if !left_is_eligible_path {
         return false;
     }
 
     match right.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
-        ExprKind::Lit(Lit::Int { .. }) => true,
+        ExprKind::Lit(Lit::Int { .. }) => matches!(left.kind, ExprKind::Path(_)),
         _ => false,
     }
 }
@@ -49277,10 +49278,48 @@ property "shared"() {}
             "pub fn shift_integer_literal_rhs_byte_unsupported(left: I32) -> I32 { apply_i32(left << b'x') }\n",
             "pub fn shift_integer_literal_rhs_char_unsupported(left: I32) -> I32 { apply_i32(left << 'x') }\n",
             "pub fn shift_integer_literal_rhs_float_unsupported(left: I32) -> I32 { apply_i32(left << 1.0) }\n",
-            "pub fn shift_byte_literal_lhs_unsupported(count: U32) -> Byte { apply_byte(b'a' << count) }\n",
+            "pub fn shift_byte_literal_lhs_root_left(count: U32) -> Byte { apply_byte(b'a' << count) }\n",
+            "pub fn shift_byte_literal_lhs_root_right(count: U32) -> Byte { apply_byte(b'a' >> count) }\n",
+            "pub fn shift_byte_literal_lhs_nested_left(count: U32) -> Byte { apply_byte(apply_byte(b'a' << count)) }\n",
+            "pub fn shift_byte_literal_lhs_nested_right(count: U32) -> Byte { apply_byte(apply_byte(b'a' >> count)) }\n",
+            "pub fn shift_byte_literal_lhs_local_copy(source_count: U32) -> Byte {\n",
+            "    let count = source_count\n",
+            "    apply_byte(b'a' >> count)\n",
+            "}\n",
+            "pub fn shift_byte_literal_lhs_shadowed_binding(count: I16) -> Byte {\n",
+            "    let count: U32 = 255\n",
+            "    apply_byte(b'a' << count)\n",
+            "}\n",
+            "pub fn shift_byte_literal_lhs_rhs_mismatch(bad_count: I16, good_count: U32) -> Byte {\n",
+            "    let failed = apply_byte(b'a' << bad_count)\n",
+            "    let alias = failed\n",
+            "    apply_byte(b'a' >> good_count)\n",
+            "}\n",
+            "pub fn shift_byte_literal_lhs_parameter_mismatch(count: U32) -> I32 { apply(b'a' << count) }\n",
             "pub fn shift_integer_literal_rhs_deep_nested_unsupported(left: I32) -> I32 { apply_i32(apply_i32(apply_i32(left << 1))) }\n",
             "pub fn shift_integer_literal_rhs_generic_target_unsupported(left: I32) -> I32 { generic_fn(left << 1) }\n",
             "pub fn shift_integer_literal_rhs_unsupported_signature(left: I32) -> I32 { text_fn(left << 1) }\n",
+            "pub fn shift_byte_literal_lhs_integer_literal_rhs_unsupported(count: U32) -> Byte { apply_byte(b'a' << 1) }\n",
+            "pub fn shift_integer_literal_lhs_path_rhs_unsupported(count: U32) -> U32 { apply_u32(1 << count) }\n",
+            "pub fn shift_byte_literal_lhs_byte_literal_rhs_unsupported() -> Byte { apply_byte(b'a' << b'b') }\n",
+            "pub fn shift_byte_literal_lhs_computed_rhs_unsupported(count: U32) -> Byte { apply_byte(b'a' << (count + 1)) }\n",
+            "pub fn shift_byte_literal_lhs_computed_left_unsupported(count: U32) -> Byte { apply_byte((b'a' | b'b') << count) }\n",
+            "pub fn shift_byte_literal_lhs_unresolved_count_unsupported() -> Byte {\n",
+            "    let count = 1\n",
+            "    apply_byte(b'a' << count)\n",
+            "}\n",
+            "pub fn shift_byte_literal_lhs_self_count_unsupported() -> Byte {\n",
+            "    let count: U32 = count\n",
+            "    apply_byte(b'a' << count)\n",
+            "}\n",
+            "pub fn shift_byte_literal_lhs_forward_count_unsupported(count: U32) -> Byte {\n",
+            "    let result = apply_byte(b'a' << later_count)\n",
+            "    let later_count: U32 = count\n",
+            "    result\n",
+            "}\n",
+            "pub fn shift_byte_literal_lhs_deep_nested_unsupported(count: U32) -> Byte { apply_byte(apply_byte(apply_byte(b'a' << count))) }\n",
+            "pub fn shift_byte_literal_lhs_generic_target_unsupported(count: U32) -> I32 { generic_fn(b'a' << count) }\n",
+            "pub fn shift_byte_literal_lhs_unsupported_signature(count: U32) -> I32 { text_fn(b'a' << count) }\n",
             "pub fn bitwise_i8_call_arguments(left: I8, right: I8) -> I8 {\n",
             "    let and_value = apply_i8(left & right)\n",
             "    let or_value = apply_i8(left | right)\n",
@@ -49453,7 +49492,6 @@ property "shared"() {}
             "pub fn bitwise_byte_integer_literal_unary_rhs_unsupported(value: I32) -> Byte { apply_byte(b'a' & -value) }\n",
             "pub fn bitwise_byte_integer_literal_computed_rhs_unsupported() -> Byte { apply_byte(b'a' | (1 + 2)) }\n",
             "pub fn bitwise_byte_integer_literal_nested_operator_unsupported() -> Byte { apply_byte(b'a' ^ (1 | 2)) }\n",
-            "pub fn bitwise_byte_integer_literal_other_operator_unsupported(value: I32) -> Byte { apply_byte(b'a' << value) }\n",
             "pub fn bitwise_byte_integer_literal_deep_call_unsupported() -> Byte { apply_byte(apply_byte(apply_byte(b'a' & 1))) }\n",
             "pub fn bitwise_byte_integer_literal_generic_target_unsupported() -> I32 { generic_fn(b'a' & 1) }\n",
             "pub fn bitwise_byte_integer_literal_unsupported_signature() -> I32 { text_fn(b'a' & 1) }\n",
@@ -51281,7 +51319,17 @@ property "shared"() {}
             "shift_integer_literal_rhs_byte_unsupported",
             "shift_integer_literal_rhs_char_unsupported",
             "shift_integer_literal_rhs_float_unsupported",
-            "shift_byte_literal_lhs_unsupported",
+            "shift_byte_literal_lhs_integer_literal_rhs_unsupported",
+            "shift_integer_literal_lhs_path_rhs_unsupported",
+            "shift_byte_literal_lhs_byte_literal_rhs_unsupported",
+            "shift_byte_literal_lhs_computed_rhs_unsupported",
+            "shift_byte_literal_lhs_computed_left_unsupported",
+            "shift_byte_literal_lhs_unresolved_count_unsupported",
+            "shift_byte_literal_lhs_self_count_unsupported",
+            "shift_byte_literal_lhs_forward_count_unsupported",
+            "shift_byte_literal_lhs_deep_nested_unsupported",
+            "shift_byte_literal_lhs_generic_target_unsupported",
+            "shift_byte_literal_lhs_unsupported_signature",
             "shift_integer_literal_rhs_deep_nested_unsupported",
             "shift_integer_literal_rhs_generic_target_unsupported",
             "shift_integer_literal_rhs_unsupported_signature",
@@ -51337,7 +51385,6 @@ property "shared"() {}
             "bitwise_byte_integer_literal_unary_rhs_unsupported",
             "bitwise_byte_integer_literal_computed_rhs_unsupported",
             "bitwise_byte_integer_literal_nested_operator_unsupported",
-            "bitwise_byte_integer_literal_other_operator_unsupported",
             "bitwise_byte_integer_literal_deep_call_unsupported",
             "bitwise_byte_integer_literal_generic_target_unsupported",
             "bitwise_byte_integer_literal_unsupported_signature",
@@ -51662,6 +51709,349 @@ property "shared"() {}
                 );
             }
         }
+
+        for (name, call, operator_expression, nested_call) in [
+            (
+                "shift_byte_literal_lhs_root_left",
+                "apply_byte(b'a' << count)",
+                "b'a' << count",
+                None,
+            ),
+            (
+                "shift_byte_literal_lhs_root_right",
+                "apply_byte(b'a' >> count)",
+                "b'a' >> count",
+                None,
+            ),
+            (
+                "shift_byte_literal_lhs_nested_left",
+                "apply_byte(apply_byte(b'a' << count))",
+                "b'a' << count",
+                Some("apply_byte(b'a' << count)"),
+            ),
+            (
+                "shift_byte_literal_lhs_nested_right",
+                "apply_byte(apply_byte(b'a' >> count))",
+                "b'a' >> count",
+                Some("apply_byte(b'a' >> count)"),
+            ),
+            (
+                "shift_byte_literal_lhs_local_copy",
+                "apply_byte(b'a' >> count)",
+                "b'a' >> count",
+                None,
+            ),
+            (
+                "shift_byte_literal_lhs_shadowed_binding",
+                "apply_byte(b'a' << count)",
+                "b'a' << count",
+                None,
+            ),
+        ] {
+            let owner = assert_supported(&database, name, &[]);
+            let function = format!("pub fn {name}");
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, call, 0, call.len(),),
+                Some(PrimTy::Byte),
+                "{name} publishes its exact direct-call result"
+            );
+            let operator_start = call
+                .find(operator_expression)
+                .expect("the Byte shift expression occurs in the direct call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start,
+                    operator_expression.len(),
+                ),
+                Some(PrimTy::Byte),
+                "{name} records the Byte shift result"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start,
+                    "b'a'".len(),
+                ),
+                None,
+                "{name} does not synthesize a separate Byte-literal fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start + operator_expression.len() - "count".len(),
+                    "count".len(),
+                ),
+                Some(PrimTy::U32),
+                "{name} resolves its count path to the exact U32 binding"
+            );
+            if let Some(nested_call) = nested_call {
+                let nested_start = call
+                    .find(nested_call)
+                    .expect("the one-level nested direct call occurs in the outer call");
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        nested_start,
+                        nested_call.len(),
+                    ),
+                    Some(PrimTy::Byte),
+                    "{name} records the inner direct-call result"
+                );
+            }
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("Byte-literal direct-call shift body check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{name} remains in the supported direct-call shift slice")
+                }
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "{name} does not add a static ShiftOverflow check for a Byte shift count path"
+            );
+        }
+
+        let shift_byte_literal_lhs_rhs_mismatch = assert_supported(
+            &database,
+            "shift_byte_literal_lhs_rhs_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let shift_byte_literal_lhs_rhs_mismatch_call = "apply_byte(b'a' << bad_count)";
+        let shift_byte_literal_lhs_rhs_mismatch_expression = "b'a' << bad_count";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_rhs_mismatch,
+                "pub fn shift_byte_literal_lhs_rhs_mismatch",
+                shift_byte_literal_lhs_rhs_mismatch_call,
+                0,
+                shift_byte_literal_lhs_rhs_mismatch_call.len(),
+            ),
+            None,
+            "a non-U32 RHS taints the containing Byte call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_rhs_mismatch,
+                "pub fn shift_byte_literal_lhs_rhs_mismatch",
+                shift_byte_literal_lhs_rhs_mismatch_call,
+                "apply_byte(".len(),
+                shift_byte_literal_lhs_rhs_mismatch_expression.len(),
+            ),
+            None,
+            "a non-U32 RHS suppresses the Byte shift fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_rhs_mismatch,
+                "pub fn shift_byte_literal_lhs_rhs_mismatch",
+                shift_byte_literal_lhs_rhs_mismatch_call,
+                "apply_byte(".len(),
+                "b'a'".len(),
+            ),
+            None,
+            "a rejected RHS does not create a Byte-literal fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_rhs_mismatch,
+                "pub fn shift_byte_literal_lhs_rhs_mismatch",
+                shift_byte_literal_lhs_rhs_mismatch_call,
+                "apply_byte(b'a' << ".len(),
+                "bad_count".len(),
+            ),
+            None,
+            "the mismatched count path fact is suppressed"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_rhs_mismatch,
+                "pub fn shift_byte_literal_lhs_rhs_mismatch",
+                "apply_byte(b'a' >> good_count)",
+                0,
+                "apply_byte(b'a' >> good_count)".len(),
+            ),
+            Some(PrimTy::Byte),
+            "a valid sibling Byte shift remains typed"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_rhs_mismatch,
+                "pub fn shift_byte_literal_lhs_rhs_mismatch",
+                "apply_byte(b'a' >> good_count)",
+                "apply_byte(b'a' >> ".len(),
+                "good_count".len(),
+            ),
+            Some(PrimTy::U32),
+            "the independent sibling's count path fact remains typed"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_rhs_mismatch,
+                "pub fn shift_byte_literal_lhs_rhs_mismatch",
+                "let alias = failed",
+                "let alias = ".len(),
+                "failed".len(),
+            ),
+            None,
+            "an alias of the failed Byte shift call remains tainted"
+        );
+        let shift_byte_literal_lhs_rhs_mismatch_diagnostics =
+            match shift_byte_literal_lhs_rhs_mismatch
+                .body_type_check()
+                .expect("the non-U32 Byte shift count has diagnostics")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("a non-U32 Byte shift count is a supported diagnostic")
+                }
+            };
+        assert_eq!(
+            shift_byte_literal_lhs_rhs_mismatch_diagnostics[0].message,
+            "expected `U32`, found `I16`"
+        );
+        let shift_byte_literal_lhs_rhs_mismatch_start = root
+            .find("pub fn shift_byte_literal_lhs_rhs_mismatch")
+            .expect("the Byte shift mismatch function exists");
+        let shift_byte_literal_lhs_rhs_mismatch_rhs_start =
+            shift_byte_literal_lhs_rhs_mismatch_start
+                + root[shift_byte_literal_lhs_rhs_mismatch_start..]
+                    .find(shift_byte_literal_lhs_rhs_mismatch_expression)
+                    .expect("the mismatched Byte shift exists")
+                + "b'a' << ".len();
+        assert_eq!(
+            shift_byte_literal_lhs_rhs_mismatch_diagnostics[0]
+                .primary()
+                .expect("the non-U32 path mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(
+                    shift_byte_literal_lhs_rhs_mismatch_rhs_start as u32,
+                ),
+                sai_diagnostics::TextSize::new(
+                    (shift_byte_literal_lhs_rhs_mismatch_rhs_start + "bad_count".len()) as u32,
+                ),
+            )
+            .expect("the mismatched RHS path span is ordered")
+        );
+
+        let shift_byte_literal_lhs_parameter_mismatch = assert_supported(
+            &database,
+            "shift_byte_literal_lhs_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let shift_byte_literal_lhs_parameter_mismatch_call = "apply(b'a' << count)";
+        let shift_byte_literal_lhs_parameter_mismatch_expression = "b'a' << count";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_parameter_mismatch,
+                "pub fn shift_byte_literal_lhs_parameter_mismatch",
+                shift_byte_literal_lhs_parameter_mismatch_call,
+                0,
+                shift_byte_literal_lhs_parameter_mismatch_call.len(),
+            ),
+            None,
+            "a Byte-to-I32 argument mismatch taints the containing call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_parameter_mismatch,
+                "pub fn shift_byte_literal_lhs_parameter_mismatch",
+                shift_byte_literal_lhs_parameter_mismatch_call,
+                "apply(".len(),
+                shift_byte_literal_lhs_parameter_mismatch_expression.len(),
+            ),
+            None,
+            "a Byte-to-I32 argument mismatch suppresses the shift fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_parameter_mismatch,
+                "pub fn shift_byte_literal_lhs_parameter_mismatch",
+                shift_byte_literal_lhs_parameter_mismatch_call,
+                "apply(b'a' << ".len(),
+                "count".len(),
+            ),
+            Some(PrimTy::U32),
+            "the U32 count path fact remains despite a call-parameter mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_byte_literal_lhs_parameter_mismatch,
+                "pub fn shift_byte_literal_lhs_parameter_mismatch",
+                shift_byte_literal_lhs_parameter_mismatch_call,
+                "apply(".len(),
+                "b'a'".len(),
+            ),
+            None,
+            "the call-parameter mismatch does not create a Byte-literal fact"
+        );
+        let shift_byte_literal_lhs_parameter_mismatch_diagnostics =
+            match shift_byte_literal_lhs_parameter_mismatch
+                .body_type_check()
+                .expect("the Byte-to-I32 argument mismatch has diagnostics")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("a Byte-to-I32 argument mismatch remains supported")
+                }
+            };
+        assert_eq!(
+            shift_byte_literal_lhs_parameter_mismatch_diagnostics[0].message,
+            "expected `I32`, found `Byte`"
+        );
+        let shift_byte_literal_lhs_parameter_mismatch_start = root
+            .find("pub fn shift_byte_literal_lhs_parameter_mismatch")
+            .expect("the Byte argument mismatch function exists");
+        let shift_byte_literal_lhs_parameter_mismatch_expression_start =
+            shift_byte_literal_lhs_parameter_mismatch_start
+                + root[shift_byte_literal_lhs_parameter_mismatch_start..]
+                    .find(shift_byte_literal_lhs_parameter_mismatch_expression)
+                    .expect("the mismatched Byte shift argument exists");
+        assert_eq!(
+            shift_byte_literal_lhs_parameter_mismatch_diagnostics[0]
+                .primary()
+                .expect("the Byte argument mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(
+                    shift_byte_literal_lhs_parameter_mismatch_expression_start as u32,
+                ),
+                sai_diagnostics::TextSize::new(
+                    (shift_byte_literal_lhs_parameter_mismatch_expression_start
+                        + shift_byte_literal_lhs_parameter_mismatch_expression.len())
+                        as u32,
+                ),
+            )
+            .expect("the mismatched Byte operator span is ordered")
+        );
 
         let bool_shift_call = "apply_bool(left << 4294967296)";
         let bool_shift_expression = "left << 4294967296";

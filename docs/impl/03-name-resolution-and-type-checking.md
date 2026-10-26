@@ -3338,6 +3338,66 @@ recovery, and static-versus-runtime boundaries are **Review required**.
   findings in gate parity, recovery, test coverage, Stage 0 scope, or the
   Review required records. The reviewer did not rerun tests.
 
+**IR-981 direct-call shifts with a Byte-literal LHS** extends the root or
+existing one-level nested positional direct-call shift form to one direct HIR
+Byte character literal on the left and one eligible plain path on the right
+for `<<` or `>>`. The RHS path must resolve by exact `BindingId` to an
+eligible parameter or preceding local. Reuse `check_shift`: the left operand
+is `Byte`, and a `U32` RHS path produces a `Byte` shift result. A concrete
+non-`U32` RHS path reports the existing `TYPE_MISMATCH` at that path and
+recovers the shift result to `Byte`. If the containing call expects a
+non-`Byte` parameter, report the existing argument mismatch over the
+operator-expression span. Preserve existing call-target, signature,
+positional-prefix, nesting, diagnostic, recovery, taint, and sibling-fact
+behavior. The Byte literal itself receives no separate expression fact.
+Do not add a static `ShiftOverflow` check for a count path, including a
+preceding `U32` local initialized with a value greater than the Byte width.
+Keep integer-literal LHSs, literal RHSs, computed or nested operands, deep
+calls, generic targets, and unsupported signatures gated. Preserve the CLI
+Stage 0 gate and add no lowering or runtime behavior. These shape, binding,
+diagnostic, fact, and static-versus-runtime boundaries are **Review required**.
+
+- **Review required:** Challenge driver/body-checker parity for only
+  `Lit::Byte`-left/path-right shifts at root and one nested call level. Verify
+  both operators, a U32 parameter and preceding local, including a same-name
+  U32 local shadowing a non-U32 parameter. Check the exact Byte operator and
+  call facts, U32 count-path fact, and absence of a separate literal fact.
+  Verify a concrete non-U32 count reports one `TYPE_MISMATCH` at the count
+  path, suppresses tainted operator/call and count-path facts, and leaves a
+  valid sibling typed. Verify a call-parameter mismatch spans the full
+  operator argument and retains the count path while suppressing the
+  operator/call. Confirm no static `ShiftOverflow` is emitted for a count
+  value above Byte width. Reject integer-literal LHSs, literal RHSs,
+  computed/unresolved/self/forward paths, deeper calls, generic targets, and
+  unsupported signatures. Keep Stage 0 gated and make no lowering/runtime
+  claim.
+- **Planned verification matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` with both
+  shift operators at root and one nested level, plus copied and shadowed U32
+  path cases, count-path mismatch diagnostics and recovery, call-parameter
+  mismatch taint, sibling facts, and all excluded shapes. Add separate CLI
+  Stage 0 fixtures for accepted Byte-literal-left/path-right shapes and
+  excluded shapes. Run only the pinned focused driver and CLI tests,
+  formatting, and diff checks; obtain independent hostile review before
+  commit.
+- **Verification:** With Rust 1.99.1, the focused
+  `primitive_body_type_results_include_exact_direct_function_calls` driver
+  test passed (1 test), and `cargo test -p sai_cli --test check_empty_source
+  --locked --offline binary_shift_byte_literal_lhs` passed (2 Stage 0 tests).
+  The driver assertions cover both operators at root and one nested level,
+  copied and shadowed count paths, a count of 255 without static
+  `ShiftOverflow`, exact non-U32 mismatch message/span and recovery, parameter
+  mismatch taint/span, and valid sibling facts. Exclusions cover integer
+  literal LHS/RHS, Byte literal RHS, computed, unresolved/self/forward, deep,
+  generic, and unsupported-signature shapes. `cargo fmt --all -- --check` and
+  `git diff --check` passed. Removed the obsolete pre-existing unsupported
+  fixture for `b'a' << path`, now covered by the positive regression.
+- **Hostile review:** Independent read-only review confirmed driver/body gate
+  parity, facts and recovery boundaries, Stage 0 coverage, and the review
+  record. The reviewer suggested removing the now-stale unsupported fixture;
+  it was removed, and the focused tests and formatting/diff checks passed
+  afterward. No actionable findings remain.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
