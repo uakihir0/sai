@@ -1,0 +1,83 @@
+use acme:care-transition-handoff-coordinator/data
+use acme:care-transition-handoff-coordinator/model.{
+    Action
+    CoordinationDecision
+    CoordinationPlan
+    DischargeCase
+}
+use acme:care-transition-handoff-coordinator/policy
+use acme:care-transition-handoff-coordinator/workflow
+
+fn next_case_index(cases: Array<DischargeCase, 6>, processed: Array<Bool, 6>) -> Option<USize> {
+    var selected: Option<USize> = None
+    var index: USize = 0
+
+    for case in cases {
+        if not processed[index] {
+            match selected {
+                Some(current_index) => {
+                    if policy.precedes(case, cases[current_index]) {
+                        selected = Some(index)
+                    }
+                }
+                None => {
+                    selected = Some(index)
+                }
+            }
+        }
+        index += 1
+    }
+    selected
+}
+
+pub fn coordinate() -> CoordinationPlan {
+    let cases = data.cases()
+    var processed = Array<Bool, 6>.filled(false)
+    var decisions = Array<CoordinationDecision, 6>.filled(data.empty_decision())
+    var service_order = Array<USize, 6>.filled(0)
+    var awaiting_team_count: USize = 0
+    var action_required_count: USize = 0
+    var ready_count: USize = 0
+    var processed_count: USize = 0
+
+    while processed_count < cases.len() {
+        match next_case_index(cases, processed) {
+            Some(index) => {
+                let case = cases[index]
+                let result = workflow.next_action(case)
+                processed[index] = true
+                decisions[index] = result
+                service_order[processed_count] = index
+                match result.action {
+                    Action.AwaitClinicalClearance | Action.AwaitHandoffResponse => {
+                        awaiting_team_count += 1
+                    }
+                    Action.RequestHandoff => {
+                        action_required_count += 1
+                    }
+                    Action.CorrectReturnedHandoff => {
+                        action_required_count += 1
+                    }
+                    Action.RefreshExpiredEvidence => {
+                        action_required_count += 1
+                    }
+                    Action.ReadyForDischargeDesk => {
+                        ready_count += 1
+                    }
+                }
+                processed_count += 1
+            }
+            None => {
+                processed_count = cases.len()
+            }
+        }
+    }
+
+    CoordinationPlan(
+        decisions: decisions,
+        service_order: service_order,
+        awaiting_team_count: awaiting_team_count,
+        action_required_count: action_required_count,
+        ready_count: ready_count,
+    )
+}

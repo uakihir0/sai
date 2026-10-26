@@ -1,0 +1,118 @@
+use acme:care-transition-handoff-coordinator/model.{
+    Action
+    CoordinationDecision
+    DischargeCase
+    Handoff
+    HandoffStatus
+    Team
+}
+
+pub fn fixture_minute() -> U32 {
+    600
+}
+
+fn handoff(
+    team: Team,
+    required: Bool,
+    status: HandoffStatus,
+    evidence_expires_minute: Option<U32>,
+) -> Handoff {
+    Handoff(
+        team: team,
+        required: required,
+        status: status,
+        evidence_expires_minute: evidence_expires_minute,
+    )
+}
+
+pub fn cases() -> Array<DischargeCase, 6> {
+    [
+        DischargeCase(
+            id: 203,
+            label: "West wing case",
+            priority: 2,
+            requested_departure_minute: 670,
+            clinical_clearance: true,
+            handoffs: [
+                handoff(Team.Pharmacy, true, HandoffStatus.Confirmed, Some(700)),
+                handoff(Team.Transport, true, HandoffStatus.Requested, None),
+                handoff(Team.HomeSupport, true, HandoffStatus.NotRequested, None),
+                handoff(Team.FollowUp, true, HandoffStatus.Confirmed, Some(700)),
+            ],
+        ),
+        DischargeCase(
+            id: 201,
+            label: "North wing case",
+            priority: 0,
+            requested_departure_minute: 650,
+            clinical_clearance: false,
+            handoffs: [
+                handoff(Team.Pharmacy, true, HandoffStatus.NotRequested, None),
+                handoff(Team.Transport, true, HandoffStatus.NotRequested, None),
+                handoff(Team.HomeSupport, true, HandoffStatus.NotRequested, None),
+                handoff(Team.FollowUp, true, HandoffStatus.NotRequested, None),
+            ],
+        ),
+        DischargeCase(
+            id: 205,
+            label: "Garden wing case",
+            priority: 2,
+            requested_departure_minute: 700,
+            clinical_clearance: true,
+            handoffs: [
+                handoff(Team.Pharmacy, true, HandoffStatus.Confirmed, Some(700)),
+                handoff(Team.Transport, false, HandoffStatus.Returned, None),
+                handoff(Team.HomeSupport, true, HandoffStatus.Confirmed, Some(700)),
+                handoff(Team.FollowUp, true, HandoffStatus.Confirmed, Some(700)),
+            ],
+        ),
+        DischargeCase(
+            id: 202,
+            label: "East wing case",
+            priority: 1,
+            requested_departure_minute: 650,
+            clinical_clearance: true,
+            handoffs: [
+                handoff(Team.Pharmacy, true, HandoffStatus.Returned, None),
+                handoff(Team.Transport, true, HandoffStatus.NotRequested, None),
+                handoff(Team.HomeSupport, true, HandoffStatus.NotRequested, None),
+                handoff(Team.FollowUp, true, HandoffStatus.NotRequested, None),
+            ],
+        ),
+        DischargeCase(
+            id: 204,
+            label: "South wing case",
+            priority: 1,
+            requested_departure_minute: 660,
+            clinical_clearance: true,
+            handoffs: [
+                handoff(Team.Pharmacy, true, HandoffStatus.Confirmed, Some(590)),
+                handoff(Team.Transport, true, HandoffStatus.NotRequested, None),
+                handoff(Team.HomeSupport, true, HandoffStatus.NotRequested, None),
+                handoff(Team.FollowUp, true, HandoffStatus.NotRequested, None),
+            ],
+        ),
+        DischargeCase(
+            id: 206,
+            label: "Garden annex case",
+            priority: 3,
+            requested_departure_minute: 720,
+            clinical_clearance: true,
+            handoffs: [
+                handoff(Team.Pharmacy, true, HandoffStatus.NotRequested, None),
+                handoff(Team.Transport, true, HandoffStatus.NotRequested, None),
+                handoff(Team.HomeSupport, false, HandoffStatus.NotRequested, None),
+                handoff(Team.FollowUp, true, HandoffStatus.NotRequested, None),
+            ],
+        ),
+    ]
+}
+
+pub fn empty_decision() -> CoordinationDecision {
+    CoordinationDecision(
+        case_id: 0,
+        action: Action.AwaitClinicalClearance,
+        owner: Team.Attending,
+        handoff_index: None,
+    )
+}

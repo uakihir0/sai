@@ -1,0 +1,6 @@
+package acme:care-transition-handoff-coordinator @ 0.1.0
+compiler ^0.1
+source "src"
+
+targets { wasm32-core }
+description "Coordinate fictional discharge readiness across administrative team handoffs"

@@ -1,0 +1,17 @@
+use acme:care-transition-handoff-coordinator/model.{DischargeCase}
+
+pub fn precedes(left: DischargeCase, right: DischargeCase) -> Bool {
+    if left.priority < right.priority {
+        return true
+    }
+    if left.priority > right.priority {
+        return false
+    }
+    if left.requested_departure_minute < right.requested_departure_minute {
+        return true
+    }
+    if left.requested_departure_minute > right.requested_departure_minute {
+        return false
+    }
+    left.id < right.id
+}

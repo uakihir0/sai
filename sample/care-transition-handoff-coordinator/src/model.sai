@@ -1,0 +1,66 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Team {
+    Attending
+    Pharmacy
+    Transport
+    HomeSupport
+    FollowUp
+    DischargeDesk
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HandoffStatus {
+    NotRequested
+    Requested
+    Returned
+    Confirmed
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Action {
+    AwaitClinicalClearance
+    RequestHandoff
+    AwaitHandoffResponse
+    CorrectReturnedHandoff
+    RefreshExpiredEvidence
+    ReadyForDischargeDesk
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Handoff {
+    pub team: Team
+    pub required: Bool
+    pub status: HandoffStatus
+    pub evidence_expires_minute: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DischargeCase {
+    pub id: U32
+    pub label: Str
+    // Lower numbers represent an externally supplied higher priority.
+    pub priority: U32
+    pub requested_departure_minute: U32
+    // This is supplied by the attending team; the coordinator does not infer it.
+    pub clinical_clearance: Bool
+    // The fixed gate order is pharmacy, transport, home support, follow-up.
+    pub handoffs: Array<Handoff, 4>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CoordinationDecision {
+    pub case_id: U32
+    pub action: Action
+    pub owner: Team
+    pub handoff_index: Option<USize>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CoordinationPlan {
+    // Decisions retain the index of the corresponding data.cases() entry.
+    pub decisions: Array<CoordinationDecision, 6>
+    pub service_order: Array<USize, 6>
+    pub awaiting_team_count: USize
+    pub action_required_count: USize
+    pub ready_count: USize
+}
