@@ -2914,11 +2914,15 @@ only `OPERATOR_NOT_SUPPORTED`.
 with no synthetic mismatch, whether the RHS type matches or differs.
 Preserve existing source spans/order, recovery, exact operator and call
 facts, taint, valid sibling facts, and common positional-prefix behavior at
-each call level. Reject literals, unresolved numeric paths, aliases,
-self/forward references, computed or nested bitwise operands, `~` or shift
-operands, calls as bitwise operands, deeper call nesting, and unsupported
-direct-call targets or signatures. Logical `and`/`or` remain unchanged. Do
-not add bitwise lowering or runtime behavior; keep the CLI Stage 0 gate
+each call level. Each operand path must resolve by exact `BindingId` to an
+eligible parameter or preceding simple local with a concrete supported
+primitive type; a direct-copy local such as `let lhs = left` is eligible.
+Reject literals, unresolved numeric paths, self/forward references, computed
+or nested bitwise operands, `~` or shift operands, calls as bitwise operands,
+deeper call nesting, and unsupported direct-call targets or signatures.
+Paths that do not satisfy the exact binding and concrete-type checks receive
+no general alias or coercion behavior. Logical `and`/`or` remain unchanged.
+Do not add bitwise lowering or runtime behavior; keep the CLI Stage 0 gate
 unchanged.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
