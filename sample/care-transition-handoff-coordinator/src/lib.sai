@@ -1,6 +1,14 @@
 use acme:care-transition-handoff-coordinator/coordinator
 use acme:care-transition-handoff-coordinator/data
-use acme:care-transition-handoff-coordinator/model.{Action, CoordinationPlan, Team}
+use acme:care-transition-handoff-coordinator/model.{
+    Action
+    CoordinationPlan
+    DischargeCase
+    Handoff
+    HandoffStatus
+    Team
+}
+use acme:care-transition-handoff-coordinator/workflow
 
 pub fn fixture_plan() -> CoordinationPlan {
     coordinator.coordinate()
@@ -36,6 +44,46 @@ test "a current pharmacy confirmation advances to a pending transport handoff" {
     assert plan.decisions[0].action == Action.AwaitHandoffResponse
     assert plan.decisions[0].owner == Team.Transport
     assert plan.decisions[0].handoff_index == Some(1)
+}
+
+test "a required confirmation without an expiry must be refreshed" {
+    let case = DischargeCase(
+        id: 207,
+        label: "Missing expiry case",
+        priority: 0,
+        requested_departure_minute: 640,
+        clinical_clearance: true,
+        handoffs: [
+            Handoff(
+                team: Team.Pharmacy,
+                required: true,
+                status: HandoffStatus.Confirmed,
+                evidence_expires_minute: None,
+            ),
+            Handoff(
+                team: Team.Transport,
+                required: true,
+                status: HandoffStatus.NotRequested,
+                evidence_expires_minute: None,
+            ),
+            Handoff(
+                team: Team.HomeSupport,
+                required: true,
+                status: HandoffStatus.NotRequested,
+                evidence_expires_minute: None,
+            ),
+            Handoff(
+                team: Team.FollowUp,
+                required: true,
+                status: HandoffStatus.NotRequested,
+                evidence_expires_minute: None,
+            ),
+        ],
+    )
+    let result = workflow.next_action(case)
+    assert result.action == Action.RefreshExpiredEvidence
+    assert result.owner == Team.Pharmacy
+    assert result.handoff_index == Some(0)
 }
 
 test "optional returned handoffs do not block discharge desk readiness" {

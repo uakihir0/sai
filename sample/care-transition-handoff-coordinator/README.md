@@ -50,7 +50,8 @@ handoffs all pass is routed to the discharge desk.
 - `workflow.sai` checks clinician clearance, walks the handoff sequence, and
   routes the first unresolved gate to its owning team.
 - `coordinator.sai` processes cases in priority order and aggregates outcomes.
-- `report.sai` renders a readable case-by-case report.
+- `report.sai` summarizes the first case in priority order in one readable
+  sentence.
 - `lib.sai` exposes the fixture plan and source-level regression cases.
 
 The sample illustrates multiple modules, records and enums, fixed arrays,
@@ -78,6 +79,10 @@ deterministic, but may not reflect a facility's actual parallel workflow.
 - A confirmation remains current through its recorded expiration minute;
   only a later fixture minute makes it stale. This inclusive boundary is a
   modeling assumption, not a facility evidence-retention policy.
+- A required confirmation without an expiry is treated as stale and routed
+  back to its owning team for refresh. This conservative fallback avoids
+  trusting evidence with unknown freshness, but should be reviewed against
+  the intended teaching policy.
 - A handoff marked optional is skipped regardless of its stored status.
   Confirm that the caller, rather than this coordinator, is the authority
   that determines whether a component is required.
