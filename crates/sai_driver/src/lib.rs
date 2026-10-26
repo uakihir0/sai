@@ -9580,14 +9580,14 @@ fn local_enum_variant_parameter_primitive(
     }
 }
 
-fn local_enum_variant_annotated_local_primitive(
+fn local_enum_variant_annotated_local_type(
     value: &HirExpr<'_>,
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
-) -> Option<sai_resolve::prelude::PrimTy> {
+) -> Option<ConstLiteralType> {
     let ExprKind::Path(path) = value.kind else {
         return None;
     };
@@ -9647,8 +9647,24 @@ fn local_enum_variant_annotated_local_primitive(
     }
 
     match resolve_function_direct_type(*annotated_type?, type_paths, symbols, inputs)? {
-        FunctionDirectType::Primitive(primitive) => Some(primitive),
-        FunctionDirectType::Str | FunctionDirectType::Unit => None,
+        FunctionDirectType::Primitive(primitive) => Some(ConstLiteralType::Primitive(primitive)),
+        FunctionDirectType::Unit => Some(ConstLiteralType::Unit),
+        FunctionDirectType::Str => None,
+    }
+}
+
+fn local_enum_variant_annotated_local_primitive(
+    value: &HirExpr<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<sai_resolve::prelude::PrimTy> {
+    match local_enum_variant_annotated_local_type(value, body, locals, type_paths, symbols, inputs)?
+    {
+        ConstLiteralType::Primitive(primitive) => Some(primitive),
+        ConstLiteralType::Str | ConstLiteralType::Unit => None,
     }
 }
 
@@ -10459,6 +10475,24 @@ fn check_local_enum_variant_literal_argument(
                     local_enum_variant_type_name(expected_leaf),
                     local_enum_variant_type_name(actual_leaf)
                 ),
+                "type mismatch",
+            )?);
+            continue;
+        }
+
+        if let sai_ty::ty::TyKind::Tuple(expected_elements) = expected_type.kind()
+            && !expected_elements.is_empty()
+            && let Some(ConstLiteralType::Unit) = local_enum_variant_annotated_local_type(
+                value, body, locals, type_paths, symbols, inputs,
+            )
+        {
+            diagnostics.push(const_literal_diagnostic(
+                owner,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                expected_tuple_local_type_mismatch(expected_elements.len(), ConstLiteralType::Unit),
                 "type mismatch",
             )?);
             continue;
@@ -98449,7 +98483,10 @@ interface facade { use middle.{payload}; }"#;
             "fn nested_call_tuple_annotated_else_exclusion() {\n    let actual: Bool = 'x' else { return }\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_tuple_annotated_alias_exclusion() {\n    let actual: BoolAlias = true\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_tuple_annotated_str_exclusion() {\n    let actual: Str = \"text\"\n    NestedPayload.Single(actual)\n}\n",
-            "fn nested_call_tuple_annotated_unit_exclusion() {\n    let actual: () = ()\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_unit_mismatch() {\n    let actual: () = true\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_unit_var_mismatch() {\n    var actual: () = ()\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_unit_nested_mismatch() {\n    let actual: () = true\n    InferredTuplePayload.Shape((1, actual, 2, (3,)))\n}\n",
+            "fn nested_call_tuple_annotated_unit_alias_exclusion() {\n    let actual: UnitAlias = ()\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_tuple_annotated_nominal_exclusion() {\n    let actual: Widget = true\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_type_exclusion() {\n    let actual: (I8,) = (1,)\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_pattern_exclusion() {\n    let (actual, _): (Bool, Bool) = (true, false)\n    NestedPayload.Single(actual)\n}\n",
@@ -98510,7 +98547,6 @@ interface facade { use middle.{payload}; }"#;
             "fn nested_call_tuple_annotated_tuple_local_nested_arity_mismatch() {\n    var actual: (Bool, Bool) = (true, false)\n    InferredTuplePayload.Shape((1, actual, true, (3,)))\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_shadow_mismatch(actual: (Bool,)) {\n    let actual: (Bool, Bool) = (true, false)\n    InferredTuplePayload.Shape(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_same_arity() {\n    let actual: (Char,) = ('x',)\n    NestedPayload.Single(actual)\n}\n",
-            "fn nested_call_tuple_annotated_tuple_local_unit_exclusion() {\n    let actual: () = ()\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_alias_exclusion() {\n    let actual: TupleAlias = (1, 'x')\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_tuple_annotated_tuple_local_extra_exclusion() {\n    let extra: (Bool, Bool) = (true, false)\n    NestedPayload.Single((1,), extra)\n}\n",
             "fn nested_call_annotated_mismatch() {\n    let actual: USize = 2\n    NestedPayload.Nested(((actual, 'x'), ((), 2)))\n}\n",
@@ -99114,7 +99150,7 @@ interface facade { use middle.{payload}; }"#;
             "nested_call_tuple_annotated_else_exclusion",
             "nested_call_tuple_annotated_alias_exclusion",
             "nested_call_tuple_annotated_str_exclusion",
-            "nested_call_tuple_annotated_unit_exclusion",
+            "nested_call_tuple_annotated_unit_alias_exclusion",
             "nested_call_tuple_annotated_nominal_exclusion",
             "nested_call_tuple_annotated_tuple_type_exclusion",
             "tuple_call_inferred_fixed_locals_ok",
@@ -99304,6 +99340,18 @@ interface facade { use middle.{payload}; }"#;
             (
                 "nested_call_tuple_annotated_let_outer_mismatch",
                 "expected tuple of arity 1, found `Bool`",
+            ),
+            (
+                "nested_call_tuple_annotated_unit_mismatch",
+                "expected tuple of arity 1, found `()`",
+            ),
+            (
+                "nested_call_tuple_annotated_unit_var_mismatch",
+                "expected tuple of arity 1, found `()`",
+            ),
+            (
+                "nested_call_tuple_annotated_unit_nested_mismatch",
+                "expected tuple of arity 1, found `()`",
             ),
             (
                 "nested_call_tuple_annotated_var_outer_mismatch",
@@ -99501,6 +99549,21 @@ interface facade { use middle.{payload}; }"#;
                 "nested_call_tuple_annotated_let_outer_mismatch",
                 "NestedPayload.Single(actual)",
                 "NestedPayload.Single(".len(),
+            ),
+            (
+                "nested_call_tuple_annotated_unit_mismatch",
+                "NestedPayload.Single(actual)",
+                "NestedPayload.Single(".len(),
+            ),
+            (
+                "nested_call_tuple_annotated_unit_var_mismatch",
+                "NestedPayload.Single(actual)",
+                "NestedPayload.Single(".len(),
+            ),
+            (
+                "nested_call_tuple_annotated_unit_nested_mismatch",
+                "InferredTuplePayload.Shape((1, actual, 2, (3,)))",
+                "InferredTuplePayload.Shape((1, ".len(),
             ),
             (
                 "nested_call_tuple_annotated_var_outer_mismatch",
@@ -99947,7 +100010,6 @@ interface facade { use middle.{payload}; }"#;
             "nested_call_tuple_annotated_tuple_local_supported_leaves_equal",
             "nested_call_tuple_annotated_tuple_local_tuple_vs_scalar_unit_exclusions",
             "nested_call_tuple_annotated_tuple_local_unsupported_leaf_exclusions",
-            "nested_call_tuple_annotated_tuple_local_unit_exclusion",
             "nested_call_tuple_annotated_tuple_local_alias_exclusion",
         ] {
             assert!(
