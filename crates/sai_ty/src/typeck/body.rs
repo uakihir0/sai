@@ -2473,6 +2473,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
+                ExprKind::Binary(
+                    operator @ (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor),
+                    left,
+                    right,
+                ) if is_supported_direct_call_bitwise_operands(left, right) => {
+                    let local_type =
+                        self.check_bitwise(operator, left, right, argument.expr.hir_id)?;
+                    self.record_expression_type(argument.expr.hir_id, local_type);
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
                 ExprKind::Unary(UnOp::Not, operand)
                     if is_supported_direct_call_not_operand(operand) =>
                 {
@@ -4997,6 +5007,10 @@ fn is_supported_direct_call_logical_operands(left: &Expr<'_>, right: &Expr<'_>) 
 }
 
 fn is_supported_direct_call_shift_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
+    matches!(left.kind, ExprKind::Path(_)) && matches!(right.kind, ExprKind::Path(_))
+}
+
+fn is_supported_direct_call_bitwise_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
     matches!(left.kind, ExprKind::Path(_)) && matches!(right.kind, ExprKind::Path(_))
 }
 
