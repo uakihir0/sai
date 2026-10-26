@@ -18890,3 +18890,39 @@ fn primitive_const_success_stays_limited_to_the_default_unlocked_check() {
         assert_check_stays_gated(&output, context);
     }
 }
+
+#[test]
+fn direct_function_calls_remain_behind_the_current_cli_stage_gate() {
+    let source = concat!(
+        "pub fn direct_call(value: I32) -> I32 { identity(value) }\n",
+        "pub fn identity(value: I32) -> I32 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(&output, "direct function call");
+}
+
+#[test]
+fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
+    let source = "pub fn recurse(value: I32) -> I32 { recurse(value) }\n";
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(&output, "direct self-recursive function");
+}
+
+#[test]
+fn unsupported_direct_function_call_targets_remain_gated() {
+    let source = concat!(
+        "pub fn generic_call() -> I32 { generic_fn(1) }\n",
+        "pub fn string_call() -> I32 { text_fn(\"text\") }\n",
+        "pub fn shadowed_call(apply: I32) -> I32 { apply(1) }\n",
+        "pub fn apply(value: I32) -> I32 { value }\n",
+        "pub fn generic_fn<T>(value: T) -> I32 { 0 }\n",
+        "pub fn text_fn(value: Str) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(&output, "unsupported direct function calls");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "unsupported direct calls stay behind the existing gate:\n{stdout}"
+    );
+}

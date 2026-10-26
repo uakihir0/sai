@@ -2033,6 +2033,7 @@ fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize>
 
 fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     use sai_syntax::ast::AstNode as _;
+    use sai_syntax::ast::CallExpr;
 
     let Some(parsed) = sai_fmt::parse_source(source).ok() else {
         return false;
@@ -2056,6 +2057,10 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     };
     items.next().is_none()
         && function.attrs().next().is_none()
+        && !function
+            .syntax()
+            .descendants()
+            .any(|node| CallExpr::can_cast(node.kind()))
         && function
             .visibility()
             .is_some_and(|visibility| visibility.pub_token().is_some())
