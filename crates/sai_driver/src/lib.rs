@@ -9274,7 +9274,12 @@ fn is_supported_direct_call_bitwise_operands_shape(
     }
 
     if matches!(left.kind, ExprKind::Lit(Lit::Byte(_))) {
-        if matches!(right.kind, ExprKind::Lit(Lit::Byte(_) | Lit::Int { .. })) {
+        if matches!(
+            right.kind,
+            ExprKind::Lit(
+                Lit::Byte(_) | Lit::Int { .. } | Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. }
+            )
+        ) {
             return true;
         }
         let ExprKind::Path(path) = right.kind else {
@@ -49166,6 +49171,35 @@ property "shared"() {}
             "    let xor_value = apply_byte(apply_byte(b'f' ^ -6))\n",
             "    apply_byte(valid)\n",
             "}\n",
+            "pub fn bitwise_byte_scalar_literal_rhs_root(valid: Byte) -> Byte {\n",
+            "    let and_bool = apply_byte(b'a' & true)\n",
+            "    let and_char = apply_byte(b'a' & 'x')\n",
+            "    let and_float = apply_byte(b'a' & 1.0)\n",
+            "    let or_bool = apply_byte(b'a' | false)\n",
+            "    let or_char = apply_byte(b'a' | 'y')\n",
+            "    let or_float = apply_byte(b'a' | 2.0)\n",
+            "    let xor_bool = apply_byte(b'a' ^ true)\n",
+            "    let xor_char = apply_byte(b'a' ^ 'z')\n",
+            "    let xor_float = apply_byte(b'a' ^ 3.0)\n",
+            "    apply_byte(b'b' ^ valid)\n",
+            "}\n",
+            "pub fn bitwise_byte_scalar_literal_rhs_nested(valid: Byte) -> Byte {\n",
+            "    let and_bool = apply_byte(apply_byte(b'a' & true))\n",
+            "    let and_char = apply_byte(apply_byte(b'a' & 'x'))\n",
+            "    let and_float = apply_byte(apply_byte(b'a' & 1.0))\n",
+            "    let or_bool = apply_byte(apply_byte(b'a' | false))\n",
+            "    let or_char = apply_byte(apply_byte(b'a' | 'y'))\n",
+            "    let or_float = apply_byte(apply_byte(b'a' | 2.0))\n",
+            "    let xor_bool = apply_byte(apply_byte(b'a' ^ true))\n",
+            "    let xor_char = apply_byte(apply_byte(b'a' ^ 'z'))\n",
+            "    let xor_float = apply_byte(apply_byte(b'a' ^ 3.0))\n",
+            "    apply_byte(apply_byte(b'b' ^ valid))\n",
+            "}\n",
+            "pub fn bitwise_byte_scalar_literal_rhs_computed_unsupported() -> Byte { apply_byte(b'a' & (true or false)) }\n",
+            "pub fn bitwise_byte_scalar_literal_rhs_nested_operator_unsupported() -> Byte { apply_byte(b'a' & (1.0 | 2.0)) }\n",
+            "pub fn bitwise_byte_scalar_literal_rhs_deep_call_unsupported() -> Byte { apply_byte(apply_byte(apply_byte(b'a' & true))) }\n",
+            "pub fn bitwise_byte_scalar_literal_rhs_generic_target_unsupported() -> I32 { generic_fn(b'a' ^ false) }\n",
+            "pub fn bitwise_byte_scalar_literal_rhs_unsupported_signature() -> I32 { text_fn(b'a' | 'b') }\n",
             "pub fn bitwise_byte_integer_literal_unary_rhs_unsupported(value: I32) -> Byte { apply_byte(b'a' & -value) }\n",
             "pub fn bitwise_byte_integer_literal_computed_rhs_unsupported() -> Byte { apply_byte(b'a' | (1 + 2)) }\n",
             "pub fn bitwise_byte_integer_literal_nested_operator_unsupported() -> Byte { apply_byte(b'a' ^ (1 | 2)) }\n",
@@ -49294,9 +49328,6 @@ property "shared"() {}
             "pub fn bitwise_integer_literal_left_call_path_unsupported(right: I32) -> I32 { apply_i32(1 & add_one(right)) }\n",
             "pub fn bitwise_integer_literal_left_other_operator_unsupported(right: I32) -> I32 { apply_i32(1 << right) }\n",
             "pub fn bitwise_integer_literal_left_deep_call_unsupported(right: I32) -> I32 { apply_i32(apply_i32(apply_i32(1 & right))) }\n",
-            "pub fn bitwise_byte_literal_rhs_bool_unsupported(right: Byte) -> Byte { apply_byte(b'x' & true) }\n",
-            "pub fn bitwise_byte_literal_rhs_char_unsupported(right: Byte) -> Byte { apply_byte(b'x' & 'a') }\n",
-            "pub fn bitwise_byte_literal_rhs_float_unsupported(right: Byte) -> Byte { apply_byte(b'x' & 1.0) }\n",
             "pub fn bitwise_byte_literal_rhs_byte_string_unsupported(right: Byte) -> Byte { apply_byte(b'x' & b\"ab\") }\n",
             "pub fn bitwise_byte_literal_rhs_computed_unsupported(right: Byte) -> Byte { apply_byte(b'x' & (right + 1)) }\n",
             "pub fn bitwise_byte_literal_rhs_nested_operator_unsupported(right: Byte) -> Byte { apply_byte(b'x' & (right ^ right)) }\n",
@@ -50349,6 +50380,36 @@ property "shared"() {}
                 sai_diagnostics::Code::TypeMismatch,
             ],
         );
+        let bitwise_byte_scalar_literal_rhs_root = assert_supported(
+            &database,
+            "bitwise_byte_scalar_literal_rhs_root",
+            &[
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+        );
+        let bitwise_byte_scalar_literal_rhs_nested = assert_supported(
+            &database,
+            "bitwise_byte_scalar_literal_rhs_nested",
+            &[
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+        );
         let nested_bitwise_call_argument =
             assert_supported(&database, "nested_bitwise_call_argument", &[]);
         let nested_bitwise_and_call_argument =
@@ -50747,9 +50808,11 @@ property "shared"() {}
             "bitwise_integer_literal_left_call_path_unsupported",
             "bitwise_integer_literal_left_other_operator_unsupported",
             "bitwise_integer_literal_left_deep_call_unsupported",
-            "bitwise_byte_literal_rhs_bool_unsupported",
-            "bitwise_byte_literal_rhs_char_unsupported",
-            "bitwise_byte_literal_rhs_float_unsupported",
+            "bitwise_byte_scalar_literal_rhs_computed_unsupported",
+            "bitwise_byte_scalar_literal_rhs_nested_operator_unsupported",
+            "bitwise_byte_scalar_literal_rhs_deep_call_unsupported",
+            "bitwise_byte_scalar_literal_rhs_generic_target_unsupported",
+            "bitwise_byte_scalar_literal_rhs_unsupported_signature",
             "bitwise_byte_literal_rhs_byte_string_unsupported",
             "bitwise_byte_literal_rhs_computed_unsupported",
             "bitwise_byte_literal_rhs_nested_operator_unsupported",
@@ -56017,6 +56080,218 @@ property "shared"() {}
             Some(PrimTy::Byte),
             "the independent valid Byte sibling operator remains typed after an RHS mismatch"
         );
+
+        let byte_scalar_literal_rhs_cases = [
+            ("&", "true", "a Bool literal"),
+            ("&", "'x'", "a character literal"),
+            ("&", "1.0", "a floating-point literal"),
+            ("|", "false", "a Bool literal"),
+            ("|", "'y'", "a character literal"),
+            ("|", "2.0", "a floating-point literal"),
+            ("^", "true", "a Bool literal"),
+            ("^", "'z'", "a character literal"),
+            ("^", "3.0", "a floating-point literal"),
+        ];
+        for (owner, function, nested) in [
+            (
+                bitwise_byte_scalar_literal_rhs_root,
+                "pub fn bitwise_byte_scalar_literal_rhs_root",
+                false,
+            ),
+            (
+                bitwise_byte_scalar_literal_rhs_nested,
+                "pub fn bitwise_byte_scalar_literal_rhs_nested",
+                true,
+            ),
+        ] {
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("Byte scalar-literal RHS body is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("Byte scalar-literal RHS mismatch remains diagnostic-supported")
+                }
+            };
+            assert_eq!(
+                diagnostics.len(),
+                byte_scalar_literal_rhs_cases.len(),
+                "all direct scalar RHS cases report exactly one diagnostic"
+            );
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                vec![sai_diagnostics::Code::TypeMismatch; byte_scalar_literal_rhs_cases.len()],
+                "mismatched Bool, Char, and float leaves add no range or unsupported-operator diagnostics"
+            );
+
+            for (index, (operator, rhs, found)) in byte_scalar_literal_rhs_cases.iter().enumerate()
+            {
+                let operator_expression = format!("b'a' {operator} {rhs}");
+                let call = if nested {
+                    format!("apply_byte(apply_byte({operator_expression}))")
+                } else {
+                    format!("apply_byte({operator_expression})")
+                };
+                assert_eq!(
+                    diagnostics[index].message,
+                    format!("expected `Byte`, found {found}"),
+                    "the direct {operator} RHS reports the established expected-Byte mismatch"
+                );
+
+                let function_start = root
+                    .find(function)
+                    .unwrap_or_else(|| panic!("function source `{function}` exists"));
+                let function_end = root[function_start..]
+                    .find("\npub fn ")
+                    .map_or(root.len(), |offset| function_start + offset);
+                let function_text = &root[function_start..function_end];
+                let call_start = function_text
+                    .find(&call)
+                    .expect("the scalar-literal call exists in its function");
+                let operator_start = call
+                    .find(&operator_expression)
+                    .expect("the scalar-literal operator exists in its call");
+                let rhs_start =
+                    function_start + call_start + operator_start + operator_expression.len()
+                        - rhs.len();
+                assert_eq!(
+                    diagnostics[index]
+                        .primary()
+                        .expect("the direct scalar RHS mismatch has a primary span")
+                        .span
+                        .range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(rhs_start as u32),
+                        sai_diagnostics::TextSize::new((rhs_start + rhs.len()) as u32),
+                    )
+                    .expect("the exact direct scalar RHS span is ordered"),
+                    "the {found} mismatch spans only its literal"
+                );
+
+                assert_eq!(
+                    expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
+                    None,
+                    "the mismatched {found} taints the containing call"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &call,
+                        operator_start,
+                        operator_expression.len()
+                    ),
+                    None,
+                    "the mismatched {found} suppresses the Byte operator fact"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &call,
+                        operator_start,
+                        "b'a'".len()
+                    ),
+                    None,
+                    "the Byte literal LHS does not receive a standalone fact"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &call,
+                        operator_start + operator_expression.len() - rhs.len(),
+                        rhs.len()
+                    ),
+                    None,
+                    "the mismatched {found} does not receive a fabricated Byte fact"
+                );
+
+                if nested {
+                    let nested_call_start = "apply_byte(".len();
+                    let nested_call_len = call.len() - nested_call_start - 1;
+                    assert_eq!(
+                        expression_type_at_range(
+                            &mut database,
+                            owner,
+                            function,
+                            &call,
+                            nested_call_start,
+                            nested_call_len
+                        ),
+                        None,
+                        "the mismatched {found} taints the inner call as well"
+                    );
+                }
+            }
+
+            let sibling_call = if nested {
+                "apply_byte(apply_byte(b'b' ^ valid))"
+            } else {
+                "apply_byte(b'b' ^ valid)"
+            };
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    sibling_call,
+                    0,
+                    sibling_call.len()
+                ),
+                Some(PrimTy::Byte),
+                "an independent valid Byte sibling retains its call fact"
+            );
+            if nested {
+                let inner_call_start = "apply_byte(".len();
+                let inner_call_len = sibling_call.len() - inner_call_start - 1;
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        sibling_call,
+                        inner_call_start,
+                        inner_call_len
+                    ),
+                    Some(PrimTy::Byte),
+                    "the valid nested Byte sibling retains its inner call fact"
+                );
+            }
+            let sibling_operator_start = sibling_call
+                .find("b'b' ^ valid")
+                .expect("the valid sibling operator exists");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    sibling_call,
+                    sibling_operator_start,
+                    "b'b' ^ valid".len()
+                ),
+                Some(PrimTy::Byte),
+                "an independent valid Byte sibling retains its operator fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    sibling_call,
+                    sibling_operator_start + "b'b' ^ ".len(),
+                    "valid".len()
+                ),
+                Some(PrimTy::Byte),
+                "the valid sibling retains the exact RHS path fact"
+            );
+        }
 
         let byte_literal_parameter_call = "apply_i32(b'a' & right)";
         let byte_literal_parameter_operator = "b'a' & right";
