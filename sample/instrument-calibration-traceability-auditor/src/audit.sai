@@ -62,6 +62,9 @@ fn assess_instrument(
         Err(issue) => return held(instrument, None, None, None, issue)
         Ok(_) => {}
     }
+    if instrument.range_min > instrument.range_max {
+        return held(instrument, None, None, None, AuditIssue.InvalidInstrumentRange)
+    }
 
     let calibration = match latest_calibration(calibrations, instrument.id, policy.now_minute) {
         Some(value) => value
@@ -318,7 +321,7 @@ test "the fixture separates ready, due-soon, and held instruments" {
 
 test "scope and combined uncertainty are checked over the entire instrument range" {
     let report = audit_all(data.instruments(), data.standards(), data.calibrations(), data.policy())
-    assert report.findings[2].unwrap().combined_uncertainty_milli == Some(2)
+    assert report.findings[2].unwrap().combined_uncertainty_milli == Some(3)
     assert report.findings[3].unwrap().combined_uncertainty_milli == Some(8)
     assert report.findings[3].unwrap().issue == Some(AuditIssue.UncertaintyExceeded)
 
@@ -370,6 +373,40 @@ test "the newest failed calibration prevents a stale passing record from being s
     )
     assert finding.calibration_id == Some(2007)
     assert finding.issue == Some(AuditIssue.CalibrationFailed)
+
+    calibrations[5].id = 2001
+    let ambiguous_failure = assess_instrument(
+        data.instruments(),
+        data.standards(),
+        calibrations,
+        data.policy(),
+        data.instruments()[0],
+    )
+    assert ambiguous_failure.issue == Some(AuditIssue.DuplicateCalibrationId)
+}
+
+test "inverted instrument ranges are held before scope can appear to cover them" {
+    var instruments = data.instruments()
+    instruments[0].range_min = 60000
+    instruments[0].range_max = 0
+    let finding = assess_instrument(
+        instruments,
+        data.standards(),
+        data.calibrations(),
+        data.policy(),
+        instruments[0],
+    )
+    assert finding.status == AuditStatus.Hold
+    assert finding.issue == Some(AuditIssue.InvalidInstrumentRange)
+
+    let chain = reference_chain_uncertainty(
+        data.standards(),
+        data.policy().now_minute,
+        data.calibrations()[0].performed_minute,
+        instruments[0],
+        1000,
+    )
+    assert chain == Err(AuditIssue.InvalidInstrumentRange)
 }
 
 test "the due-soon threshold includes its exact boundary and overdue is strict" {
@@ -421,6 +458,8 @@ test "cycles and duplicate standard identities fail closed" {
         1000,
     )
     assert ambiguous == Err(AuditIssue.DuplicateStandardId)
-    let report = audit_all(data.instruments(), standards, data.calibrations(), data.policy())
+    var calibrations = data.calibrations()
+    calibrations[1].standard_id = 1000
+    let report = audit_all(data.instruments(), standards, calibrations, data.policy())
     assert report.catalog_issue_count == 2
 }

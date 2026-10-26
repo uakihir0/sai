@@ -13,6 +13,10 @@ pub fn reference_chain_uncertainty(
     instrument: Instrument,
     starting_standard_id: U32,
 ) -> Result<U32, AuditIssue> {
+    if instrument.range_min > instrument.range_max {
+        return Err(AuditIssue.InvalidInstrumentRange)
+    }
+
     var visited = Array<Option<U32>, 5>.filled(None)
     var depth: USize = 0
     var combined_uncertainty: U32 = 0

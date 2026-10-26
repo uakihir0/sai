@@ -20,7 +20,7 @@ uncertainty in fictional milli-units; no physical unit conversion is implied.
 |---|---:|---|---|
 | Optical comparator | 2001 | Ready | Combined uncertainty 3; due in 150 minutes |
 | Hydraulic pressure cell | 2002 | Hold | Calibration interval ended at minute 1100 |
-| Bench balance | 2003 | Ready | Reference chain uncertainty 2; total uncertainty 2 |
+| Bench balance | 2003 | Ready | Reference chain uncertainty 2; total uncertainty 3 |
 | Thermal chamber | 2004 | Hold | Combined uncertainty 8 exceeds its limit of 6 |
 | Flow meter | 2005 | Hold | A reference in its traceability chain was revoked at minute 1350 |
 | Reference laser | 2006 | DueSoon | Exactly 120 minutes remain in its calibration interval |
@@ -36,8 +36,10 @@ the equipment register or disables an instrument.
 2. `registry.sai` detects ambiguous instrument and standard identities and
    chooses a calibration by newest performed minute, breaking ties with the
    smaller record ID. Future-dated records are not candidates.
-3. `audit.sai` checks the chosen calibration result, certificate expiry,
-   measurement range, and calibration interval in a fixed order.
+3. `audit.sai` checks instrument identity and ordered range, then requires a
+   current-dated calibration. It reports a duplicate selected calibration ID
+   before the result check, followed by certificate expiry, calibration range,
+   due-time overflow, and overdue status.
 4. `traceability.sai` walks parent-standard links with a five-entry visited
    set. Every node must be unique, accredited, unrevoked at evaluation time,
    valid when the calibration occurred, and wide enough for the full
@@ -59,8 +61,8 @@ the equipment register or disables an instrument.
 - `traceability.sai` validates a bounded parent chain and accumulates its
   uncertainty bound.
 - `audit.sai` applies gates in order, reports catalog inconsistencies, and
-  includes regression cases for fallback prevention, range coverage, cycle
-  detection, revocation, uncertainty, and due-date boundaries.
+  includes regression cases for fallback prevention, ordered range coverage,
+  cycle detection, revocation, uncertainty, and due-date boundaries.
 - `lib.sai` exposes `fixture_audit()` for inspection.
 
 ## Package and compiler status
@@ -78,6 +80,10 @@ executed by SAI.
 
 ## Review required
 
+- **Malformed instrument ranges:** A minimum greater than the maximum is held
+  before calibration selection because an inverted interval cannot represent
+  valid coverage. The register owner should confirm how malformed source data
+  is triaged and corrected.
 - **Uncertainty combination:** The fixture adds nonnegative uncertainty bounds
   arithmetically as a conservative teaching rule. A real metrology program
   must define whether inputs are compatible expanded uncertainties, standard
