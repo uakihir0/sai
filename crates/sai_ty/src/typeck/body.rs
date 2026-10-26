@@ -7,6 +7,7 @@ use super::literal::{
 use super::results::{
     PartialTypeckResults, PartialTypeckResultsBuildError, PartialTypeckResultsBuilder,
 };
+use crate::ty::TyInterner;
 use sai_hir::body::Body;
 use sai_hir::expressions::{BinOp, Block, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use sai_hir::literals::Lit;
@@ -81,6 +82,19 @@ pub struct PrimitiveBodyTypeResults {
 impl PrimitiveBodyTypeResults {
     fn from_partial_results(partial_results: PartialTypeckResults) -> Self {
         Self { partial_results }
+    }
+
+    /// Add sparse canonical primitive type facts using the session's shared
+    /// semantic interner.
+    ///
+    /// The underlying primitive facts are already taint-filtered. This only
+    /// derives canonical types for those exact facts and cannot restore an
+    /// omitted expression or binding.
+    pub fn with_canonical_primitive_types(mut self, interner: &TyInterner) -> Self {
+        self.partial_results = self
+            .partial_results
+            .with_canonical_primitive_types(interner);
+        self
     }
 
     pub const fn owner(&self) -> OwnerId {

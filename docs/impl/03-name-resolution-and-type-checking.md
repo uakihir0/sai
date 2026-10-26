@@ -103,6 +103,9 @@ body shapes accepted by the bounded primitive-local checker. This is a partial
 projection of concrete facts, not the complete `typeck(owner)` result or
 `TypeckResults`; unsupported bodies return no projection, and diagnostic
 recovery does not change the body's existing acceptance status or diagnostics.
+The projection retains its primitive compatibility maps and adds sparse
+canonical `Ty` maps only for those same trustworthy primitive expression and
+binding facts, interned through the `RootDatabase` session interner.
 
 A construct of a higher stage than the toolchain implements is reported as `FEATURE_NOT_IMPLEMENTED` (spec/01 §1.4.5): f-strings, `async` and attributes of a later stage by [impl/02](02-frontend-ast-hir.md) (§2.9.11, §2.9.15, §2.10.2), and the type-system constructs of the table in §3.14.4 (including those only recognizable after resolution, such as a `use` of a declared dependency or a refined alias) by this chapter at the location given there (N-E-39).
 
@@ -3401,8 +3404,12 @@ owner-aware driver. The builder rejects expression IDs and binding witnesses
 whose `HirId.owner` differs from its owner. Because `BindingId` is only an
 owner-local index, each binding fact must be paired with the exact parameter
 or binding-pattern `HirId` from that body; the checker obtains this pair from
-the current body's HIR before insertion. The stored primitive facts remain
-`PrimTy` values and do not pretend to populate canonical `Ty`-valued
+the current body's HIR before insertion. The compatibility maps remain
+`PrimTy` values. IR-954 adds separately named sparse canonical expression and
+binding maps derived only after primitive facts have been filtered for taint,
+using the session-wide `RootDatabase.semantic_types` interner. An unsupported
+conversion, such as the resolver's `PrimTy::Array` marker, leaves that
+canonical entry absent. These maps do not populate canonical `Ty`-valued
 `node_types` or any other complete-result table. IR-952 adds checked output
 facts for the exact supported direct calls described in §3.7.12; a call with
 an arity or argument error and its inferred dependents are omitted. This
