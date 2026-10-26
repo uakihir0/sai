@@ -1,0 +1,61 @@
+use acme:digital-archive-preservation-planner/model.{
+    Action
+    ArchiveItem
+    Finding
+    FixityState
+    FormatRisk
+    PreservationPermission
+}
+
+pub const MAX_REPLICATION_TASKS_PER_ITEM: U32 = 4
+
+pub fn finding(item: ArchiveItem, minimum_copy_domains: U32) -> Option<Finding> {
+    if item.fixity == FixityState.Missing {
+        return Some(Finding.FixityNotRecorded)
+    }
+    if item.fixity == FixityState.Mismatch {
+        return Some(Finding.FixityMismatch)
+    }
+    if item.independent_copy_domains == 0 {
+        return Some(Finding.NoVerifiedCopy)
+    }
+    if item.permission == PreservationPermission.Pending {
+        return Some(Finding.PermissionPending)
+    }
+    if item.permission == PreservationPermission.Denied {
+        return Some(Finding.PermissionDenied)
+    }
+    if item.format_risk != FormatRisk.Obsolete {
+        if item.independent_copy_domains < minimum_copy_domains {
+            let missing_replica_count = minimum_copy_domains - item.independent_copy_domains
+            if missing_replica_count > MAX_REPLICATION_TASKS_PER_ITEM {
+                return Some(Finding.ReplicationShortfallExceedsBound)
+            }
+        }
+    }
+    None
+}
+
+pub fn required_action(item: ArchiveItem, minimum_copy_domains: U32) -> Option<Action> {
+    if item.format_risk == FormatRisk.Obsolete {
+        if item.migration_path_certified {
+            Some(Action.Migrate)
+        } else {
+            None
+        }
+    } else if item.independent_copy_domains < minimum_copy_domains {
+        Some(Action.Replicate)
+    } else {
+        None
+    }
+}
+
+pub fn risk_rank(item: ArchiveItem) -> U32 {
+    if item.format_risk == FormatRisk.Obsolete {
+        0
+    } else if item.format_risk == FormatRisk.Watch {
+        1
+    } else {
+        2
+    }
+}

@@ -1,0 +1,173 @@
+use acme:digital-archive-preservation-planner/model.{
+    Action
+    Candidate
+    Finding
+    FormatRisk
+    ItemPlan
+    Outcome
+    PlanInput
+    PlanReport
+}
+use acme:digital-archive-preservation-planner/preflight
+use acme:digital-archive-preservation-planner/queue
+
+fn bytes_for_tasks(size_bytes: U32, task_count: U32, available_bytes: U32) -> Option<U32> {
+    var total_bytes: U32 = 0
+    for _ in 0..task_count {
+        if size_bytes > available_bytes - total_bytes {
+            return None
+        }
+        total_bytes += size_bytes
+    }
+    Some(total_bytes)
+}
+
+pub fn plan(input: PlanInput) -> PlanReport {
+    var items: Array<Option<ItemPlan>, 8> = Array<Option<ItemPlan>, 8>.filled(None)
+    var candidates: Array<Option<Candidate>, 8> = Array<Option<Candidate>, 8>.filled(None)
+    var candidate_count: USize = 0
+    var migrations_scheduled: U32 = 0
+    var replications_scheduled: U32 = 0
+    var migration_bytes: U32 = 0
+    var replication_bytes: U32 = 0
+    var held_count: USize = 0
+    var deferred_count: USize = 0
+    var current_count: USize = 0
+
+    for index in 0..input.item_count {
+        let item = input.items[index].unwrap()
+        let issue = preflight.finding(item, input.minimum_copy_domains)
+        if issue.is_some() {
+            items[index] = Some(
+                ItemPlan(
+                    record_id: item.record_id,
+                    outcome: Outcome.Held,
+                    action: None,
+                    finding: issue,
+                    size_bytes: item.size_bytes,
+                    task_count: 0,
+                ),
+            )
+            held_count += 1
+        } else {
+            let action = preflight.required_action(item, input.minimum_copy_domains)
+            if action.is_some() {
+                let selected_action = action.unwrap()
+                var task_count: U32 = 1
+                if selected_action == Action.Replicate {
+                    task_count = input.minimum_copy_domains - item.independent_copy_domains
+                }
+                candidates[candidate_count] = Some(
+                    Candidate(
+                        input_index: index,
+                        record_id: item.record_id,
+                        size_bytes: item.size_bytes,
+                        risk_rank: preflight.risk_rank(item),
+                        independent_copy_domains: item.independent_copy_domains,
+                        task_count: task_count,
+                        action: selected_action,
+                    ),
+                )
+                candidate_count += 1
+            } else if item.format_risk == FormatRisk.Obsolete {
+                items[index] = Some(
+                    ItemPlan(
+                        record_id: item.record_id,
+                        outcome: Outcome.Held,
+                        action: Some(Action.Migrate),
+                        finding: Some(Finding.MigrationPathUncertified),
+                        size_bytes: item.size_bytes,
+                        task_count: 1,
+                    ),
+                )
+                held_count += 1
+            } else {
+                items[index] = Some(
+                    ItemPlan(
+                        record_id: item.record_id,
+                        outcome: Outcome.Current,
+                        action: None,
+                        finding: None,
+                        size_bytes: item.size_bytes,
+                        task_count: 0,
+                    ),
+                )
+                current_count += 1
+            }
+        }
+    }
+
+    let ordered = queue.ordered(candidates, candidate_count)
+    var remaining_migration_bytes = input.migration_byte_budget
+    var remaining_replication_bytes = input.replication_byte_budget
+    for index in 0..candidate_count {
+        let candidate = ordered[index].unwrap()
+        var outcome = Outcome.Scheduled
+        var finding: Option<Finding> = None
+        if candidate.action == Action.Migrate {
+            if candidate.task_count > input.migration_task_limit - migrations_scheduled {
+                outcome = Outcome.Deferred
+                finding = Some(Finding.MigrationTaskLimitReached)
+            } else {
+                let required_bytes = bytes_for_tasks(
+                    candidate.size_bytes,
+                    candidate.task_count,
+                    remaining_migration_bytes,
+                )
+                if required_bytes.is_some() {
+                    let scheduled_bytes = required_bytes.unwrap()
+                    migrations_scheduled += candidate.task_count
+                    migration_bytes += scheduled_bytes
+                    remaining_migration_bytes -= scheduled_bytes
+                } else {
+                    outcome = Outcome.Deferred
+                    finding = Some(Finding.MigrationByteBudgetExceeded)
+                }
+            }
+        } else if candidate.task_count > input.replication_task_limit - replications_scheduled {
+            outcome = Outcome.Deferred
+            finding = Some(Finding.ReplicationTaskLimitReached)
+        } else {
+            let required_bytes = bytes_for_tasks(
+                candidate.size_bytes,
+                candidate.task_count,
+                remaining_replication_bytes,
+            )
+            if required_bytes.is_some() {
+                let scheduled_bytes = required_bytes.unwrap()
+                replications_scheduled += candidate.task_count
+                replication_bytes += scheduled_bytes
+                remaining_replication_bytes -= scheduled_bytes
+            } else {
+                outcome = Outcome.Deferred
+                finding = Some(Finding.ReplicationByteBudgetExceeded)
+            }
+        }
+
+        if outcome == Outcome.Deferred {
+            deferred_count += 1
+        }
+        items[candidate.input_index] = Some(
+            ItemPlan(
+                record_id: candidate.record_id,
+                outcome: outcome,
+                action: Some(candidate.action),
+                finding: finding,
+                size_bytes: candidate.size_bytes,
+                task_count: candidate.task_count,
+            ),
+        )
+    }
+
+    PlanReport(
+        items: items,
+        item_count: input.item_count,
+        migrations_scheduled: migrations_scheduled,
+        replications_scheduled: replications_scheduled,
+        migration_bytes: migration_bytes,
+        replication_bytes: replication_bytes,
+        held_count: held_count,
+        deferred_count: deferred_count,
+        current_count: current_count,
+    )
+}
