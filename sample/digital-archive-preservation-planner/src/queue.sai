@@ -1,0 +1,32 @@
+use acme:digital-archive-preservation-planner/model.{Candidate}
+
+fn precedes(left: Candidate, right: Candidate) -> Bool {
+    if left.risk_rank != right.risk_rank {
+        left.risk_rank < right.risk_rank
+    } else if left.independent_copy_domains != right.independent_copy_domains {
+        left.independent_copy_domains < right.independent_copy_domains
+    } else {
+        left.record_id < right.record_id
+    }
+}
+
+pub fn ordered(candidates: Array<Option<Candidate>, 8>, candidate_count: USize) -> Array<
+    Option<Candidate>,
+    8,
+> {
+    var result = candidates
+    for index in 1..candidate_count {
+        let candidate = result[index].unwrap()
+        var cursor = index
+        while cursor > 0 {
+            if precedes(candidate, result[cursor - 1].unwrap()) {
+                result[cursor] = result[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        result[cursor] = Some(candidate)
+    }
+    result
+}

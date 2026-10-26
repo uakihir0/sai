@@ -1,0 +1,164 @@
+use acme:digital-archive-preservation-planner/fixtures
+use acme:digital-archive-preservation-planner/model.{
+    Action
+    ArchiveItem
+    Finding
+    FixityState
+    FormatRisk
+    Outcome
+    PlanReport
+    PreservationPermission
+}
+use acme:digital-archive-preservation-planner/planner
+use acme:digital-archive-preservation-planner/preflight
+
+pub fn sample_plan() -> PlanReport {
+    planner.plan(fixtures.sample_input())
+}
+
+test "the planner preserves source order while scheduling ranked work within separate budgets" {
+    let report = sample_plan()
+    assert report.item_count == 8
+    assert report.migrations_scheduled == 1
+    assert report.replications_scheduled == 2
+    assert report.migration_bytes == 190
+    assert report.replication_bytes == 220
+    assert report.held_count == 2
+    assert report.deferred_count == 2
+    assert report.current_count == 1
+
+    assert report.items[0].unwrap().record_id == 4202
+    assert report.items[0].unwrap().action == Some(Action.Migrate)
+    assert report.items[0].unwrap().outcome == Outcome.Deferred
+    assert report.items[0].unwrap().finding == Some(Finding.MigrationByteBudgetExceeded)
+
+    assert report.items[1].unwrap().record_id == 4208
+    assert report.items[1].unwrap().action == Some(Action.Migrate)
+    assert report.items[1].unwrap().outcome == Outcome.Scheduled
+
+    assert report.items[2].unwrap().record_id == 4205
+    assert report.items[2].unwrap().action == Some(Action.Replicate)
+    assert report.items[2].unwrap().outcome == Outcome.Deferred
+    assert report.items[2].unwrap().finding == Some(Finding.ReplicationByteBudgetExceeded)
+
+    assert report.items[3].unwrap().record_id == 4201
+    assert report.items[3].unwrap().outcome == Outcome.Current
+
+    assert report.items[6].unwrap().record_id == 4203
+    assert report.items[6].unwrap().action == Some(Action.Replicate)
+    assert report.items[6].unwrap().outcome == Outcome.Scheduled
+
+    assert report.items[7].unwrap().record_id == 4204
+    assert report.items[7].unwrap().action == Some(Action.Replicate)
+    assert report.items[7].unwrap().outcome == Outcome.Scheduled
+}
+
+test "fixity and permission findings hold an object before it can enter the work queue" {
+    let report = sample_plan()
+    assert report.items[4].unwrap().outcome == Outcome.Held
+    assert report.items[4].unwrap().finding == Some(Finding.FixityMismatch)
+    assert report.items[5].unwrap().outcome == Outcome.Held
+    assert report.items[5].unwrap().finding == Some(Finding.PermissionPending)
+}
+
+test "preflight reports the first missing, failed, or absent-copy evidence condition" {
+    let missing_fixity = ArchiveItem(
+        record_id: 1,
+        title: "Missing fixity record",
+        size_bytes: 10,
+        format_risk: FormatRisk.Obsolete,
+        fixity: FixityState.Missing,
+        permission: PreservationPermission.Denied,
+        migration_path_certified: false,
+        independent_copy_domains: 0,
+    )
+    assert preflight.finding(missing_fixity, 2) == Some(Finding.FixityNotRecorded)
+
+    let no_copy = ArchiveItem(
+        record_id: 2,
+        title: "No independently verified copy",
+        size_bytes: 10,
+        format_risk: FormatRisk.Stable,
+        fixity: FixityState.Verified,
+        permission: PreservationPermission.Approved,
+        migration_path_certified: false,
+        independent_copy_domains: 0,
+    )
+    assert preflight.finding(no_copy, 2) == Some(Finding.NoVerifiedCopy)
+
+    let denied = ArchiveItem(
+        record_id: 3,
+        title: "Denied preservation permission",
+        size_bytes: 10,
+        format_risk: FormatRisk.Stable,
+        fixity: FixityState.Verified,
+        permission: PreservationPermission.Denied,
+        migration_path_certified: false,
+        independent_copy_domains: 1,
+    )
+    assert preflight.finding(denied, 2) == Some(Finding.PermissionDenied)
+}
+
+test "obsolete files without a certified migration path are held without fallback replication" {
+    var input = fixtures.sample_input()
+    input.items[1] = Some(
+        ArchiveItem(
+            record_id: 4208,
+            title: "Harbor oral history master",
+            size_bytes: 190,
+            format_risk: FormatRisk.Obsolete,
+            fixity: FixityState.Verified,
+            permission: PreservationPermission.Approved,
+            migration_path_certified: false,
+            independent_copy_domains: 1,
+        ),
+    )
+    let report = planner.plan(input)
+    assert report.items[1].unwrap().outcome == Outcome.Held
+    assert report.items[1].unwrap().action == Some(Action.Migrate)
+    assert report.items[1].unwrap().finding == Some(Finding.MigrationPathUncertified)
+}
+
+test "migration and replication task limits are enforced independently" {
+    var input = fixtures.sample_input()
+    input.migration_task_limit = 0
+    input.replication_task_limit = 1
+    let report = planner.plan(input)
+    assert report.migrations_scheduled == 0
+    assert report.replications_scheduled == 1
+    assert report.migration_bytes == 0
+    assert report.replication_bytes == 130
+    assert report.items[0].unwrap().finding == Some(Finding.MigrationTaskLimitReached)
+    assert report.items[7].unwrap().record_id == 4204
+    assert report.items[7].unwrap().outcome == Outcome.Scheduled
+    assert report.items[2].unwrap().finding == Some(Finding.ReplicationTaskLimitReached)
+    assert report.items[6].unwrap().finding == Some(Finding.ReplicationTaskLimitReached)
+}
+
+test "a two-domain copy shortfall is budgeted as two all-or-nothing replica tasks" {
+    var input = fixtures.sample_input()
+    input.minimum_copy_domains = 3
+    input.replication_byte_budget = 180
+    input.replication_task_limit = 2
+    let report = planner.plan(input)
+
+    assert report.items[6].unwrap().record_id == 4203
+    assert report.items[6].unwrap().outcome == Outcome.Scheduled
+    assert report.items[6].unwrap().action == Some(Action.Replicate)
+    assert report.items[6].unwrap().task_count == 2
+    assert report.replications_scheduled == 2
+    assert report.replication_bytes == 180
+    assert report.items[2].unwrap().task_count == 2
+    assert report.items[2].unwrap().outcome == Outcome.Deferred
+    assert report.items[2].unwrap().finding == Some(Finding.ReplicationByteBudgetExceeded)
+}
+
+test "replication gaps above the fixed per-item bound are held explicitly" {
+    var input = fixtures.sample_input()
+    input.minimum_copy_domains = 10
+    let report = planner.plan(input)
+
+    assert report.items[6].unwrap().record_id == 4203
+    assert report.items[6].unwrap().outcome == Outcome.Held
+    assert report.items[6].unwrap().finding == Some(Finding.ReplicationShortfallExceedsBound)
+}

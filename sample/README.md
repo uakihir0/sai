@@ -111,6 +111,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`instrument-calibration-traceability-auditor`](instrument-calibration-traceability-auditor/README.md) | Check calibration windows and instrument scope while tracing reference-standard chains for accreditation, recall, range, and conservative uncertainty. |
 | Advanced | [`drinking-water-incident-coordinator`](drinking-water-incident-coordinator/README.md) | Coordinate fictional drinking-water incidents from qualified sensor and lab evidence through affected-zone advisories, alternate supply, and recovery checks. |
 | Advanced | [`research-data-release-auditor`](research-data-release-auditor/README.md) | Gate research dataset releases on source lineage, contributor consent, disclosure risk, integrity, retention, embargoes, legal holds, and parent decisions. |
+| Advanced | [`digital-archive-preservation-planner`](digital-archive-preservation-planner/README.md) | Prioritize fixed-fixture digital archive migrations and replicas under fixity, permission, independent-copy, byte-budget, and task-limit rules. |
 
 ## Longer walkthroughs
 
@@ -127,6 +128,9 @@ source repository before a package resolver can fetch them.
 - [`care-transition-handoff-coordinator`](care-transition-handoff-coordinator/README.md)
   routes each fictional case's first unresolved required handoff to its owning
   team while keeping clinical clearance outside the coordinator's authority.
+- [`digital-archive-preservation-planner`](digital-archive-preservation-planner/README.md)
+  validates preservation evidence, ranks migrations and replicas, and fits
+  work to separate byte and task budgets while retaining catalog order.
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or

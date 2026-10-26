@@ -1,0 +1,116 @@
+use acme:digital-archive-preservation-planner/model.{
+    ArchiveItem
+    FixityState
+    FormatRisk
+    PlanInput
+    PreservationPermission
+}
+
+pub fn sample_input() -> PlanInput {
+    PlanInput(
+        items: [
+            Some(
+                ArchiveItem(
+                    record_id: 4202,
+                    title: "North inlet field recording",
+                    size_bytes: 280,
+                    format_risk: FormatRisk.Obsolete,
+                    fixity: FixityState.Verified,
+                    permission: PreservationPermission.Approved,
+                    migration_path_certified: true,
+                    independent_copy_domains: 2,
+                ),
+            ),
+            Some(
+                ArchiveItem(
+                    record_id: 4208,
+                    title: "Harbor oral history master",
+                    size_bytes: 190,
+                    format_risk: FormatRisk.Obsolete,
+                    fixity: FixityState.Verified,
+                    permission: PreservationPermission.Approved,
+                    migration_path_certified: true,
+                    independent_copy_domains: 1,
+                ),
+            ),
+            Some(
+                ArchiveItem(
+                    record_id: 4205,
+                    title: "Canal survey image sequence",
+                    size_bytes: 240,
+                    format_risk: FormatRisk.Watch,
+                    fixity: FixityState.Verified,
+                    permission: PreservationPermission.Approved,
+                    migration_path_certified: false,
+                    independent_copy_domains: 1,
+                ),
+            ),
+            Some(
+                ArchiveItem(
+                    record_id: 4201,
+                    title: "Reading room policy scan",
+                    size_bytes: 70,
+                    format_risk: FormatRisk.Stable,
+                    fixity: FixityState.Verified,
+                    permission: PreservationPermission.Approved,
+                    migration_path_certified: false,
+                    independent_copy_domains: 2,
+                ),
+            ),
+            Some(
+                ArchiveItem(
+                    record_id: 4207,
+                    title: "Tide gauge export",
+                    size_bytes: 200,
+                    format_risk: FormatRisk.Obsolete,
+                    fixity: FixityState.Mismatch,
+                    permission: PreservationPermission.Approved,
+                    migration_path_certified: true,
+                    independent_copy_domains: 1,
+                ),
+            ),
+            Some(
+                ArchiveItem(
+                    record_id: 4206,
+                    title: "Restricted harbor interview",
+                    size_bytes: 150,
+                    format_risk: FormatRisk.Watch,
+                    fixity: FixityState.Verified,
+                    permission: PreservationPermission.Pending,
+                    migration_path_certified: false,
+                    independent_copy_domains: 1,
+                ),
+            ),
+            Some(
+                ArchiveItem(
+                    record_id: 4203,
+                    title: "Pier inspection photographs",
+                    size_bytes: 90,
+                    format_risk: FormatRisk.Stable,
+                    fixity: FixityState.Verified,
+                    permission: PreservationPermission.Approved,
+                    migration_path_certified: false,
+                    independent_copy_domains: 1,
+                ),
+            ),
+            Some(
+                ArchiveItem(
+                    record_id: 4204,
+                    title: "Breakwater maintenance log",
+                    size_bytes: 130,
+                    format_risk: FormatRisk.Watch,
+                    fixity: FixityState.Verified,
+                    permission: PreservationPermission.Approved,
+                    migration_path_certified: false,
+                    independent_copy_domains: 1,
+                ),
+            ),
+        ],
+        item_count: 8,
+        minimum_copy_domains: 2,
+        migration_byte_budget: 300,
+        replication_byte_budget: 220,
+        migration_task_limit: 2,
+        replication_task_limit: 2,
+    )
+}
