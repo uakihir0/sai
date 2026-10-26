@@ -9292,13 +9292,21 @@ fn is_supported_direct_call_shift_operands_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
 ) -> bool {
-    [left, right].into_iter().all(|operand| {
-        let ExprKind::Path(path) = operand.kind else {
-            return false;
-        };
-        resolved_plain_local_path_binding(path, locals, inputs)
-            .is_some_and(|binding| preceding_bindings.contains(&binding))
-    })
+    let ExprKind::Path(path) = left.kind else {
+        return false;
+    };
+    if !resolved_plain_local_path_binding(path, locals, inputs)
+        .is_some_and(|binding| preceding_bindings.contains(&binding))
+    {
+        return false;
+    }
+
+    match right.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Lit(Lit::Int { .. }) => true,
+        _ => false,
+    }
 }
 
 fn is_supported_direct_call_bitwise_operands_shape(
@@ -49234,7 +49242,6 @@ property "shared"() {}
             "    let valid = identity_char(left)\n",
             "    valid\n",
             "}\n",
-            "pub fn shift_literal_unsupported(left: I32, count: U32) -> I32 { apply_i32(left << 1) }\n",
             "pub fn shift_left_literal_unsupported(count: U32) -> I32 { apply_i32(1 << count) }\n",
             "pub fn shift_computed_operand_unsupported(left: I32, count: U32) -> I32 { apply_i32(left << (count + 1)) }\n",
             "pub fn shift_call_operand_unsupported(left: I32, count: U32) -> I32 { apply_i32(left << add_one(count)) }\n",
@@ -49256,6 +49263,24 @@ property "shared"() {}
             "    apply(value << count)\n",
             "}\n",
             "pub fn shift_extra_ignored(left: I32) -> I32 { apply_i32(left, left << 1) }\n",
+            "pub fn shift_bool_literal_rhs_out_of_range(left: Bool) -> Bool {\n",
+            "    let result = apply_bool(left << 4294967296)\n",
+            "    let alias = result\n",
+            "    let valid = apply_bool(left)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn shift_integer_literal_pair_unsupported() -> I32 { apply_i32(1 << 2) }\n",
+            "pub fn shift_integer_literal_rhs_computed_lhs_unsupported(left: I32) -> I32 { apply_i32((left + 1) << 2) }\n",
+            "pub fn shift_integer_literal_rhs_computed_unsupported(left: I32, count: U32) -> I32 { apply_i32(left << (count + 1)) }\n",
+            "pub fn shift_integer_literal_rhs_unary_computed_unsupported(left: I32, count: U32) -> I32 { apply_i32(left << -count) }\n",
+            "pub fn shift_integer_literal_rhs_bool_unsupported(left: I32) -> I32 { apply_i32(left << true) }\n",
+            "pub fn shift_integer_literal_rhs_byte_unsupported(left: I32) -> I32 { apply_i32(left << b'x') }\n",
+            "pub fn shift_integer_literal_rhs_char_unsupported(left: I32) -> I32 { apply_i32(left << 'x') }\n",
+            "pub fn shift_integer_literal_rhs_float_unsupported(left: I32) -> I32 { apply_i32(left << 1.0) }\n",
+            "pub fn shift_byte_literal_lhs_unsupported(count: U32) -> Byte { apply_byte(b'a' << count) }\n",
+            "pub fn shift_integer_literal_rhs_deep_nested_unsupported(left: I32) -> I32 { apply_i32(apply_i32(apply_i32(left << 1))) }\n",
+            "pub fn shift_integer_literal_rhs_generic_target_unsupported(left: I32) -> I32 { generic_fn(left << 1) }\n",
+            "pub fn shift_integer_literal_rhs_unsupported_signature(left: I32) -> I32 { text_fn(left << 1) }\n",
             "pub fn bitwise_i8_call_arguments(left: I8, right: I8) -> I8 {\n",
             "    let and_value = apply_i8(left & right)\n",
             "    let or_value = apply_i8(left | right)\n",
@@ -50097,10 +50122,60 @@ property "shared"() {}
                 "pub fn bitwise_integer_literal_out_of_range_{suffix}_{side}(left: {left_name}) -> {left_name} {{ {callee}(left & {literal}) }}\n"
             ));
         }
+        let mut generated_shift_literal_rhs_cases = String::new();
+        let mut shift_literal_rhs_cases = Vec::new();
+        for (left_type, callee, type_name) in [
+            ("I8", "apply_i8", "i8"),
+            ("I16", "apply_i16", "i16"),
+            ("I32", "apply_i32", "i32"),
+            ("I64", "apply_i64", "i64"),
+            ("ISize", "apply_isize", "isize"),
+            ("U8", "apply_u8", "u8"),
+            ("U16", "apply_u16", "u16"),
+            ("U32", "apply_u32", "u32"),
+            ("U64", "apply_u64", "u64"),
+            ("USize", "apply_usize", "usize"),
+            ("Byte", "apply_byte", "byte"),
+        ] {
+            for (operator, operator_name) in [("<<", "left"), (">>", "right")] {
+                for (nested, position) in [(false, "root"), (true, "nested")] {
+                    for (literal_name, literal, in_range) in [
+                        ("zero", "0", true),
+                        ("u32_max", "4294967295", true),
+                        ("negative_one", "-1", false),
+                        ("u32_max_plus_one", "4294967296", false),
+                    ] {
+                        let name = format!(
+                            "direct_call_shift_literal_rhs_{position}_{type_name}_{operator_name}_{literal_name}"
+                        );
+                        let operator_expression = format!("left {operator} {literal}");
+                        let inner_call = format!("{callee}({operator_expression})");
+                        let call = if nested {
+                            format!("{callee}({inner_call})")
+                        } else {
+                            inner_call.clone()
+                        };
+                        generated_shift_literal_rhs_cases.push_str(&format!(
+                            "pub fn {name}(left: {left_type}) -> {left_type} {{ {call} }}\n"
+                        ));
+                        shift_literal_rhs_cases.push((
+                            name,
+                            nested,
+                            left_type,
+                            callee,
+                            operator_expression,
+                            literal,
+                            in_range,
+                        ));
+                    }
+                }
+            }
+        }
         root.push_str(&generated_bitwise_integer_literal_cases);
         root.push_str(&generated_bitwise_integer_literal_left_cases);
         root.push_str(&generated_bitwise_integer_literal_pair_cases);
         root.push_str(&generated_bitwise_signed_integer_literal_pair_cases);
+        root.push_str(&generated_shift_literal_rhs_cases);
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
@@ -50663,6 +50738,14 @@ property "shared"() {}
             "shift_right_type_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
+        let shift_bool_literal_rhs_out_of_range = assert_supported(
+            &database,
+            "shift_bool_literal_rhs_out_of_range",
+            &[
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+        );
         let shift_extra_ignored = assert_supported(
             &database,
             "shift_extra_ignored",
@@ -51182,7 +51265,6 @@ property "shared"() {}
             "bitnot_call_operand_unsupported",
             "bitnot_forward_local_path_unsupported",
             "bitnot_deep_nested_call_unsupported",
-            "shift_literal_unsupported",
             "shift_left_literal_unsupported",
             "shift_computed_operand_unsupported",
             "shift_call_operand_unsupported",
@@ -51191,6 +51273,18 @@ property "shared"() {}
             "shift_deep_nested_call_unsupported",
             "shift_unresolved_local_unsupported",
             "shift_unresolved_left_local_unsupported",
+            "shift_integer_literal_pair_unsupported",
+            "shift_integer_literal_rhs_computed_lhs_unsupported",
+            "shift_integer_literal_rhs_computed_unsupported",
+            "shift_integer_literal_rhs_unary_computed_unsupported",
+            "shift_integer_literal_rhs_bool_unsupported",
+            "shift_integer_literal_rhs_byte_unsupported",
+            "shift_integer_literal_rhs_char_unsupported",
+            "shift_integer_literal_rhs_float_unsupported",
+            "shift_byte_literal_lhs_unsupported",
+            "shift_integer_literal_rhs_deep_nested_unsupported",
+            "shift_integer_literal_rhs_generic_target_unsupported",
+            "shift_integer_literal_rhs_unsupported_signature",
             "bitwise_literal_rhs_bool_unsupported",
             "bitwise_literal_rhs_byte_string_unsupported",
             "bitwise_literal_rhs_computed_unsupported",
@@ -51422,6 +51516,284 @@ property "shared"() {}
                 );
                 typed_types.first().copied()
             };
+        for (name, nested, left_type, callee, operator_expression, literal, in_range) in
+            &shift_literal_rhs_cases
+        {
+            let owner = assert_supported(
+                &database,
+                name,
+                if *in_range {
+                    &[]
+                } else {
+                    &[sai_diagnostics::Code::LiteralOutOfRange]
+                },
+            );
+            let primitive = match *left_type {
+                "I8" => PrimTy::I8,
+                "I16" => PrimTy::I16,
+                "I32" => PrimTy::I32,
+                "I64" => PrimTy::I64,
+                "ISize" => PrimTy::ISize,
+                "U8" => PrimTy::U8,
+                "U16" => PrimTy::U16,
+                "U32" => PrimTy::U32,
+                "U64" => PrimTy::U64,
+                "USize" => PrimTy::USize,
+                "Byte" => PrimTy::Byte,
+                _ => unreachable!("the generated shift matrix uses supported shift LHS types"),
+            };
+            let inner_call = format!("{callee}({operator_expression})");
+            let call = if *nested {
+                format!("{callee}({inner_call})")
+            } else {
+                inner_call.clone()
+            };
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &format!("pub fn {name}"),
+                    &call,
+                    0,
+                    call.len(),
+                ),
+                in_range.then_some(primitive),
+                "the {name} direct call is typed exactly when its U32 literal is in range"
+            );
+            if *nested {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &format!("pub fn {name}"),
+                        &call,
+                        call.find(&inner_call)
+                            .expect("the one-level nested call occurs in its outer call"),
+                        inner_call.len(),
+                    ),
+                    in_range.then_some(primitive),
+                    "the {name} nested call inherits literal-range taint"
+                );
+            }
+
+            let operator_start = call
+                .find(operator_expression)
+                .expect("the shift expression occurs in the direct call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &format!("pub fn {name}"),
+                    &call,
+                    operator_start,
+                    operator_expression.len(),
+                ),
+                in_range.then_some(primitive),
+                "the {name} shift result is suppressed only when the literal is out of range"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &format!("pub fn {name}"),
+                    &call,
+                    operator_start,
+                    "left".len(),
+                ),
+                Some(primitive),
+                "the {name} left path fact survives RHS literal checking"
+            );
+            let literal_start = operator_expression
+                .rfind(literal)
+                .expect("the U32 count literal occurs in the shift");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &format!("pub fn {name}"),
+                    &call,
+                    operator_start + literal_start,
+                    literal.len(),
+                ),
+                in_range.then_some(PrimTy::U32),
+                "the {name} RHS literal is checked as U32 and suppressed on range failure"
+            );
+
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("direct-call shift literal body check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("the {name} supported direct-call shift shape remains checked")
+                }
+            };
+            if *in_range {
+                assert!(
+                    diagnostics.is_empty(),
+                    "in-range shift literal {literal} is accepted for {left_type} without static shift-count overflow"
+                );
+            } else {
+                assert_eq!(
+                    diagnostics[0]
+                        .primary()
+                        .expect("out-of-range U32 literal has a primary span")
+                        .span
+                        .range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(
+                            (root.find(&format!("pub fn {name}")).unwrap()
+                                + root[root.find(&format!("pub fn {name}")).unwrap()..]
+                                    .find(operator_expression)
+                                    .expect("the exact shift source exists")
+                                + literal_start) as u32,
+                        ),
+                        sai_diagnostics::TextSize::new(
+                            (root.find(&format!("pub fn {name}")).unwrap()
+                                + root[root.find(&format!("pub fn {name}")).unwrap()..]
+                                    .find(operator_expression)
+                                    .expect("the exact shift source exists")
+                                + literal_start
+                                + literal.len()) as u32,
+                        ),
+                    )
+                    .expect("out-of-range U32 literal span is ordered"),
+                    "the {name} range diagnostic covers the exact literal token"
+                );
+            }
+        }
+
+        let bool_shift_call = "apply_bool(left << 4294967296)";
+        let bool_shift_expression = "left << 4294967296";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_bool_literal_rhs_out_of_range,
+                "pub fn shift_bool_literal_rhs_out_of_range",
+                bool_shift_call,
+                0,
+                bool_shift_call.len(),
+            ),
+            None,
+            "an unsupported left type and an out-of-range count taint the containing call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_bool_literal_rhs_out_of_range,
+                "pub fn shift_bool_literal_rhs_out_of_range",
+                bool_shift_call,
+                "apply_bool(".len(),
+                bool_shift_expression.len(),
+            ),
+            None,
+            "an unsupported left type and range error suppress the shift fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_bool_literal_rhs_out_of_range,
+                "pub fn shift_bool_literal_rhs_out_of_range",
+                bool_shift_call,
+                "apply_bool(".len(),
+                "left".len(),
+            ),
+            Some(PrimTy::Bool),
+            "the unsupported shift's left path fact remains available"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_bool_literal_rhs_out_of_range,
+                "pub fn shift_bool_literal_rhs_out_of_range",
+                bool_shift_call,
+                "apply_bool(left << ".len(),
+                "4294967296".len(),
+            ),
+            None,
+            "the out-of-range U32 literal fact is suppressed"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_bool_literal_rhs_out_of_range,
+                "pub fn shift_bool_literal_rhs_out_of_range",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len(),
+            ),
+            None,
+            "an inferred alias of the failed call remains tainted"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                shift_bool_literal_rhs_out_of_range,
+                "pub fn shift_bool_literal_rhs_out_of_range",
+                "apply_bool(left)",
+                0,
+                "apply_bool(left)".len(),
+            ),
+            Some(PrimTy::Bool),
+            "a valid sibling call remains typed after the two shift diagnostics"
+        );
+        let bool_shift_diagnostics = match shift_bool_literal_rhs_out_of_range
+            .body_type_check()
+            .expect("unsupported-left shift with a range error remains checked")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("unsupported left type and count range preserve diagnostic recovery")
+            }
+        };
+        assert_eq!(
+            bool_shift_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+            "the count range diagnostic precedes the unsupported-left diagnostic"
+        );
+        let bool_shift_function_start = root
+            .find("pub fn shift_bool_literal_rhs_out_of_range")
+            .expect("the unsupported-left fixture exists");
+        let bool_literal_start = bool_shift_function_start
+            + root[bool_shift_function_start..]
+                .find("4294967296")
+                .expect("the out-of-range count literal exists");
+        let bool_operator_start = bool_shift_function_start
+            + root[bool_shift_function_start..]
+                .find(bool_shift_expression)
+                .expect("the unsupported shift expression exists");
+        assert_eq!(
+            bool_shift_diagnostics[0]
+                .primary()
+                .expect("literal range error has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(bool_literal_start as u32),
+                sai_diagnostics::TextSize::new((bool_literal_start + "4294967296".len()) as u32,),
+            )
+            .expect("the unsupported-left literal span is ordered")
+        );
+        assert_eq!(
+            bool_shift_diagnostics[1]
+                .primary()
+                .expect("unsupported operator error has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(bool_operator_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (bool_operator_start + bool_shift_expression.len()) as u32,
+                ),
+            )
+            .expect("the unsupported-left operator span is ordered")
+        );
         for (name, nested, operator, expression, left_literal, right_literal) in
             &bitwise_signed_literal_pair_cases
         {
