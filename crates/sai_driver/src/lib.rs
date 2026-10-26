@@ -49051,6 +49051,12 @@ property "shared"() {}
             "pub fn nested_bitwise_call_argument(left: I32, right: I32) -> I32 {\n",
             "    apply_i32(apply_i32(left ^ right))\n",
             "}\n",
+            "pub fn nested_bitwise_and_call_argument(left: I32, right: I32) -> I32 {\n",
+            "    apply_i32(apply_i32(left & right))\n",
+            "}\n",
+            "pub fn nested_bitwise_or_call_argument(left: I32, right: I32) -> I32 {\n",
+            "    apply_i32(apply_i32(left | right))\n",
+            "}\n",
             "pub fn bitwise_local_paths_call_argument(left: I32, right: I32) -> I32 {\n",
             "    let lhs = left\n",
             "    let rhs = right\n",
@@ -49074,6 +49080,12 @@ property "shared"() {}
             "    let result = apply_byte(left ^ right)\n",
             "    let alias = result\n",
             "    let valid = apply_byte(left)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn bitwise_argument_parameter_mismatch(left: I32, right: I32) -> Bool {\n",
+            "    let result = apply_bool(left & right)\n",
+            "    let alias = result\n",
+            "    let valid = apply_bool(true)\n",
             "    valid\n",
             "}\n",
             "pub fn bitwise_bool_matching_unsupported(left: Bool, right: Bool) -> Bool {\n",
@@ -49123,6 +49135,13 @@ property "shared"() {}
             "pub fn bitwise_unresolved_local_unsupported(left: I32) -> I32 {\n",
             "    let right = 1\n",
             "    apply_i32(left & right)\n",
+            "}\n",
+            "pub fn bitwise_char_unresolved_rhs_unsupported(left: Char) -> Char {\n",
+            "    let rhs = 1\n",
+            "    identity_char(left & rhs)\n",
+            "}\n",
+            "pub fn bitwise_char_unresolved_rhs_sibling(left: Char) -> Char {\n",
+            "    identity_char(left)\n",
             "}\n",
             "pub fn bitwise_generic_target_unsupported(left: I32, right: I32) -> I32 { generic_fn(left & right) }\n",
             "pub fn bitwise_deep_nested_call_unsupported(left: I32, right: I32) -> I32 {\n",
@@ -49596,6 +49615,10 @@ property "shared"() {}
         let bitwise_usize_call_arguments = assert_supported("bitwise_usize_call_arguments", &[]);
         let bitwise_byte_call_arguments = assert_supported("bitwise_byte_call_arguments", &[]);
         let nested_bitwise_call_argument = assert_supported("nested_bitwise_call_argument", &[]);
+        let nested_bitwise_and_call_argument =
+            assert_supported("nested_bitwise_and_call_argument", &[]);
+        let nested_bitwise_or_call_argument =
+            assert_supported("nested_bitwise_or_call_argument", &[]);
         let bitwise_local_paths_call_argument =
             assert_supported("bitwise_local_paths_call_argument", &[]);
         let bitwise_shadowed_binding = assert_supported("bitwise_shadowed_binding", &[]);
@@ -49611,6 +49634,12 @@ property "shared"() {}
             "bitwise_byte_rhs_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
+        let bitwise_argument_parameter_mismatch = assert_supported(
+            "bitwise_argument_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_char_unresolved_rhs_sibling =
+            assert_supported("bitwise_char_unresolved_rhs_sibling", &[]);
         let bitwise_bool_matching_unsupported = assert_supported(
             "bitwise_bool_matching_unsupported",
             &[sai_diagnostics::Code::OperatorNotSupported],
@@ -49831,6 +49860,7 @@ property "shared"() {}
             "bitwise_call_operand_unsupported",
             "bitwise_forward_local_unsupported",
             "bitwise_unresolved_local_unsupported",
+            "bitwise_char_unresolved_rhs_unsupported",
             "bitwise_generic_target_unsupported",
             "bitwise_deep_nested_call_unsupported",
             "not_nested_operand_unsupported",
@@ -49858,7 +49888,7 @@ property "shared"() {}
                         .expect("owner body check is available"),
                     FunctionBodyTypeCheck::Unsupported
                 ),
-                "unsupported direct-call target `{name}` remains behind the feature gate"
+                "unsupported direct-call shape `{name}` remains behind the feature gate without diagnostics"
             );
             assert_eq!(
                 owner_named(&database, &resolved, name)
@@ -51560,40 +51590,60 @@ property "shared"() {}
                 );
             }
         }
-        let nested_bitwise_context = "apply_i32(apply_i32(left ^ right))";
-        assert_eq!(
-            expression_type_at_range(
+        for (owner, function, operator) in [
+            (
+                nested_bitwise_and_call_argument,
+                "pub fn nested_bitwise_and_call_argument",
+                "&",
+            ),
+            (
+                nested_bitwise_or_call_argument,
+                "pub fn nested_bitwise_or_call_argument",
+                "|",
+            ),
+            (
                 nested_bitwise_call_argument,
                 "pub fn nested_bitwise_call_argument",
-                nested_bitwise_context,
-                0,
-                nested_bitwise_context.len()
+                "^",
             ),
-            Some(PrimTy::I32),
-            "the root direct call retains its exact return type"
-        );
-        assert_eq!(
-            expression_type_at_range(
-                nested_bitwise_call_argument,
-                "pub fn nested_bitwise_call_argument",
-                nested_bitwise_context,
-                "apply_i32(".len(),
-                "apply_i32(left ^ right)".len()
-            ),
-            Some(PrimTy::I32),
-            "the one-level nested direct call retains its exact return type"
-        );
-        assert_eq!(
-            expression_type_at_range(
-                nested_bitwise_call_argument,
-                "pub fn nested_bitwise_call_argument",
-                nested_bitwise_context,
-                "apply_i32(apply_i32(".len(),
-                "left ^ right".len()
-            ),
-            Some(PrimTy::I32),
-            "the nested direct call records its bitwise argument"
-        );
+        ] {
+            let nested_bitwise_context = format!("apply_i32(apply_i32(left {operator} right))");
+            let nested_call = format!("apply_i32(left {operator} right)");
+            let operator_expression = format!("left {operator} right");
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    &nested_bitwise_context,
+                    0,
+                    nested_bitwise_context.len()
+                ),
+                Some(PrimTy::I32),
+                "the root direct call retains its exact return type for `{operator}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    &nested_bitwise_context,
+                    "apply_i32(".len(),
+                    nested_call.len()
+                ),
+                Some(PrimTy::I32),
+                "the one-level nested direct call retains its exact return type for `{operator}`"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    owner,
+                    function,
+                    &nested_bitwise_context,
+                    "apply_i32(apply_i32(".len(),
+                    operator_expression.len()
+                ),
+                Some(PrimTy::I32),
+                "the nested direct call records its `{operator}` argument"
+            );
+        }
         let local_bitwise_context = "apply_i32(lhs & rhs)";
         assert_eq!(
             expression_type_at_range(
@@ -51604,7 +51654,42 @@ property "shared"() {}
                 "lhs & rhs".len()
             ),
             Some(PrimTy::I32),
-            "both operands may resolve to exact preceding local paths"
+            "direct-copy locals are eligible exact preceding local paths"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitwise_local_paths_call_argument,
+                "pub fn bitwise_local_paths_call_argument",
+                local_bitwise_context,
+                "apply_i32(".len(),
+                "lhs".len()
+            ),
+            Some(PrimTy::I32),
+            "the left direct-copy local resolves to its own exact binding"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitwise_local_paths_call_argument,
+                "pub fn bitwise_local_paths_call_argument",
+                local_bitwise_context,
+                local_bitwise_context
+                    .find("rhs")
+                    .expect("the RHS path exists"),
+                "rhs".len()
+            ),
+            Some(PrimTy::I32),
+            "the right direct-copy local resolves to its own exact binding"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitwise_char_unresolved_rhs_sibling,
+                "pub fn bitwise_char_unresolved_rhs_sibling",
+                "identity_char(left)",
+                0,
+                "identity_char(left)".len()
+            ),
+            Some(PrimTy::Char),
+            "a valid independent sibling call retains its fact"
         );
         let shadowed_bitwise_context = "apply_i8(value | other)";
         assert_eq!(
@@ -51779,6 +51864,121 @@ property "shared"() {}
             "apply_byte(left)",
         );
         drop(assert_bitwise_rhs_mismatch);
+
+        let annotated_bitwise_call = "apply_bool(left & right)";
+        let annotated_bitwise_expression = "left & right";
+        let annotated_bitwise_start = annotated_bitwise_call
+            .find(annotated_bitwise_expression)
+            .expect("the annotated bitwise expression occurs in the call");
+        assert_eq!(
+            expression_type_at_range(
+                bitwise_argument_parameter_mismatch,
+                "pub fn bitwise_argument_parameter_mismatch",
+                annotated_bitwise_call,
+                annotated_bitwise_start,
+                annotated_bitwise_expression.len()
+            ),
+            None,
+            "the parameter mismatch suppresses the exact bitwise expression fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitwise_argument_parameter_mismatch,
+                "pub fn bitwise_argument_parameter_mismatch",
+                annotated_bitwise_call,
+                0,
+                annotated_bitwise_call.len()
+            ),
+            None,
+            "the parameter mismatch taints the containing call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitwise_argument_parameter_mismatch,
+                "pub fn bitwise_argument_parameter_mismatch",
+                annotated_bitwise_call,
+                annotated_bitwise_start,
+                "left".len()
+            ),
+            Some(PrimTy::I32),
+            "the left operand fact survives the parameter mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitwise_argument_parameter_mismatch,
+                "pub fn bitwise_argument_parameter_mismatch",
+                annotated_bitwise_call,
+                annotated_bitwise_start + annotated_bitwise_expression.len() - "right".len(),
+                "right".len()
+            ),
+            Some(PrimTy::I32),
+            "the right operand fact survives the parameter mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitwise_argument_parameter_mismatch,
+                "pub fn bitwise_argument_parameter_mismatch",
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "the parameter mismatch suppresses dependent alias facts"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                bitwise_argument_parameter_mismatch,
+                "pub fn bitwise_argument_parameter_mismatch",
+                "apply_bool(true)",
+                0,
+                "apply_bool(true)".len()
+            ),
+            Some(PrimTy::Bool),
+            "an independent valid sibling call remains typed"
+        );
+        let annotated_bitwise_diagnostics = match bitwise_argument_parameter_mismatch
+            .body_type_check()
+            .expect("the bitwise argument parameter mismatch has a diagnostic")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("the bitwise argument parameter mismatch remains diagnostic-supported")
+            }
+        };
+        assert_eq!(
+            annotated_bitwise_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch],
+            "the argument parameter mismatch produces one ordered diagnostic"
+        );
+        assert_eq!(
+            annotated_bitwise_diagnostics[0].message, "expected `Bool`, found `I32`",
+            "the argument parameter mismatch retains left-expression type recovery"
+        );
+        let annotated_bitwise_function_start = root
+            .find("pub fn bitwise_argument_parameter_mismatch")
+            .expect("the bitwise argument parameter mismatch function exists");
+        let annotated_bitwise_source_start = annotated_bitwise_function_start
+            + root[annotated_bitwise_function_start..]
+                .find(annotated_bitwise_expression)
+                .expect("the bitwise expression occurs in its function");
+        assert_eq!(
+            annotated_bitwise_diagnostics[0]
+                .primary()
+                .expect("the bitwise parameter mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(annotated_bitwise_source_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (annotated_bitwise_source_start + annotated_bitwise_expression.len()) as u32,
+                ),
+            )
+            .expect("the full annotated bitwise span is ordered"),
+            "the parameter mismatch covers the complete bitwise argument in checker order"
+        );
 
         let mut assert_matching_unsupported_bitwise =
             |owner: &FunctionOwnerResolution,
