@@ -17,6 +17,10 @@ degree Celsius. For example, `15` means `1.5 °C`, and `-4` means `-0.4 °C`.
 The offset is added to the raw reading. The warning is inclusive: a calibrated
 reading exactly equal to the threshold triggers an alert.
 
+The caller must keep `raw_tenths + offset_tenths` within the `I32` range.
+Ordinary integer addition panics with `Overflow(Add)` when the sum is out of
+range; this sample does not validate or saturate sensor values.
+
 | Raw (0.1 °C) | Offset (0.1 °C) | Threshold (0.1 °C) | Calibrated (0.1 °C) | Freeze alert |
 |---:|---:|---:|---:|:---|
 | 18 | -3 | 15 | 15 | Yes, at the threshold |
