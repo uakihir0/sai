@@ -47346,11 +47346,30 @@ property "shared"() {}
             .expect("type-results projection has no owner error")
             .expect("the supported primitive body publishes its projection");
         assert_eq!(typed_results.owner(), typed_owner.owner());
+        let partial_results = typed_results.partial_results();
+        assert_eq!(partial_results.owner(), typed_owner.owner());
+        assert_eq!(
+            partial_results.expression_types(),
+            typed_results.expression_types(),
+            "the compatibility view and partial owner result expose the same expression facts"
+        );
+        assert_eq!(
+            partial_results.binding_types(),
+            typed_results.binding_types(),
+            "the compatibility view and partial owner result expose the same binding facts"
+        );
         assert!(
             typed_results
                 .expression_types()
                 .keys()
                 .all(|hir_id| hir_id.owner == typed_owner.owner())
+        );
+        assert!(
+            partial_results
+                .binding_nodes()
+                .values()
+                .all(|hir_id| hir_id.owner == typed_owner.owner()),
+            "every BindingId fact has an exact HIR witness from this owner"
         );
         for (name, expected) in [
             ("input", sai_resolve::prelude::PrimTy::I16),
@@ -47382,6 +47401,10 @@ property "shared"() {}
                 typed_results.binding_type(binding),
                 Some(expected),
                 "{name}"
+            );
+            assert!(
+                partial_results.binding_node(binding).is_some(),
+                "{name} has an owner-checked parameter or pattern HIR witness"
             );
         }
         assert!(
@@ -47436,7 +47459,7 @@ property "shared"() {}
             &database.symbols,
             &def_paths,
         );
-        let (_, source_map) = lower_top_level_owner(
+        let (typed_hir_owner, source_map) = lower_top_level_owner(
             typed_descriptor,
             &typed_path,
             &typed_inputs.filtered_item_tree,
@@ -47444,6 +47467,35 @@ property "shared"() {}
             &lowering_context,
         )
         .expect("the selected function lowers to HIR");
+        let typed_body = typed_hir_owner
+            .body
+            .expect("the selected function has a lowered body");
+        assert_eq!(typed_body.owner, typed_owner.owner());
+        for parameter in typed_body.params {
+            assert_eq!(
+                partial_results.binding_node(parameter.binding),
+                Some(parameter.hir_id),
+                "parameter BindingId is paired with its exact BodyParam HIR ID"
+            );
+        }
+        let ExprKind::Block(typed_block) = typed_body.value.kind else {
+            panic!("the selected function body lowers to a block");
+        };
+        for statement in typed_block.stmts {
+            let StmtKind::Let { pat, .. } = statement.kind else {
+                continue;
+            };
+            let PatKind::Binding { binding, .. } = pat.kind else {
+                continue;
+            };
+            if partial_results.binding_type(binding).is_some() {
+                assert_eq!(
+                    partial_results.binding_node(binding),
+                    Some(pat.hir_id),
+                    "local BindingId is paired with its exact binding-pattern HIR ID"
+                );
+            }
+        }
         let assert_type_at_text = |start: usize, text: &str, expected| {
             let start = start as u32;
             let range = sai_diagnostics::TextRange::new(
@@ -47523,6 +47575,19 @@ property "shared"() {}
             .expect("error results keep a valid owner projection")
             .expect("the supported body publishes facts alongside diagnostics");
         assert_eq!(partial_results.owner(), partial_owner.owner());
+        assert_eq!(
+            partial_results.partial_results().binding_types(),
+            partial_results.binding_types(),
+            "partial facts preserve the existing BindingId compatibility view"
+        );
+        assert!(
+            partial_results
+                .partial_results()
+                .binding_nodes()
+                .values()
+                .all(|hir_id| hir_id.owner == partial_owner.owner()),
+            "diagnostic recovery never attaches a BindingId to another owner"
+        );
         let partial_local_resolution = partial_owner
             .local_resolution()
             .expect("partial owner local results are available");
@@ -47802,11 +47867,28 @@ property "shared"() {}
                     .expect("owner projection has no resolution error")
                     .expect("supported owner publishes primitive results");
                 assert_eq!(results.owner(), owner.owner());
+                let partial_results = results.partial_results();
+                assert_eq!(
+                    partial_results.expression_types(),
+                    results.expression_types(),
+                    "the partial result retains all compatibility expression facts"
+                );
+                assert_eq!(
+                    partial_results.binding_types(),
+                    results.binding_types(),
+                    "the partial result retains all compatibility binding facts"
+                );
                 assert!(
-                    results
+                    partial_results
                         .expression_types()
                         .keys()
                         .all(|hir_id| { hir_id.owner == owner.owner() })
+                );
+                assert!(
+                    partial_results
+                        .binding_nodes()
+                        .values()
+                        .all(|hir_id| hir_id.owner == owner.owner())
                 );
                 let descriptor = *collection
                     .scopes
