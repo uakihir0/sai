@@ -1,0 +1,5 @@
+package acme:ipv4-subnet-planner @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Plan aligned IPv4 subnet allocations from a bounded /24 pool"

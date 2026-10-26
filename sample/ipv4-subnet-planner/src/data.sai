@@ -1,0 +1,18 @@
+use acme:ipv4-subnet-planner/model.{Request}
+
+pub fn requests() -> Array<Request, 12> {
+    [
+        Request(request_id: 40, name: "Visitor Wi-Fi", hosts: 5),
+        Request(request_id: 10, name: "Application servers", hosts: 20),
+        Request(request_id: 30, name: "Badge readers", hosts: 5),
+        Request(request_id: 2, name: "Office devices", hosts: 40),
+        Request(request_id: 7, name: "Printers", hosts: 10),
+        Request(request_id: 1, name: "Test lab", hosts: 70),
+        Request(request_id: 50, name: "Duplicate network A", hosts: 4),
+        Request(request_id: 50, name: "Duplicate network B", hosts: 6),
+        Request(request_id: 8, name: "Empty request", hosts: 0),
+        Request(request_id: 9, name: "Oversized lab", hosts: 255),
+        Request(request_id: 11, name: "Cameras", hosts: 5),
+        Request(request_id: 20, name: "Wi-Fi access points", hosts: 5),
+    ]
+}

@@ -1,0 +1,267 @@
+use acme:ipv4-subnet-planner/model.{Allocation, POOL_CAPACITY, Plan, RejectionReason, Request}
+use acme:ipv4-subnet-planner/validation
+
+fn allocation_fits_pool(allocation: Allocation) -> Bool {
+    if allocation.network_offset > POOL_CAPACITY or allocation.address_count > POOL_CAPACITY {
+        return false
+    }
+    allocation.address_count <= POOL_CAPACITY - allocation.network_offset
+}
+
+fn allocation_is_valid(request: Request, allocation: Allocation) -> Bool {
+    let expected_size = validation.required_block_size(request.hosts)
+    if expected_size != Some(allocation.address_count) {
+        return false
+    }
+    if not allocation_fits_pool(allocation) {
+        return false
+    }
+    if allocation.address_count < 4 or allocation.network_offset % allocation.address_count != 0 {
+        return false
+    }
+
+    let end_offset = allocation.network_offset + allocation.address_count
+    (
+        Some(allocation.prefix_length) == validation.prefix_for_block(allocation.address_count)
+        and allocation.first_host_offset == allocation.network_offset + 1
+        and allocation.last_host_offset == end_offset - 2
+        and allocation.broadcast_offset == end_offset - 1
+        and request.hosts <= allocation.address_count - 2
+    )
+}
+
+fn overlaps(first: Allocation, second: Allocation) -> Bool {
+    if not allocation_fits_pool(first) or not allocation_fits_pool(second) {
+        return false
+    }
+    let first_end = first.network_offset + first.address_count
+    let second_end = second.network_offset + second.address_count
+    first.network_offset < second_end and second.network_offset < first_end
+}
+
+fn valid_request_index(requests: Array<Request, 12>, request_id: U32) -> Option<USize> {
+    var found: Option<USize> = None
+    for index in 0..requests.len() {
+        if requests[index].request_id == request_id {
+            match validation.rejection_reason(requests, index) {
+                Some(_) => return None
+                None => {
+                    match found {
+                        Some(_) => return None
+                        None => {
+                            found = Some(index)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+fn allocation_order_is_valid(requests: Array<Request, 12>, plan: Plan) -> Bool {
+    if plan.allocation_order_count > requests.len() {
+        return false
+    }
+
+    var eligible_count: USize = 0
+    for index in 0..requests.len() {
+        if validation.rejection_reason(requests, index) == None {
+            eligible_count += 1
+            var occurrence_count: USize = 0
+            for order_index in 0..plan.allocation_order_count {
+                if plan.allocation_order[order_index] == Some(requests[index].request_id) {
+                    occurrence_count += 1
+                }
+            }
+            if occurrence_count != 1 {
+                return false
+            }
+        }
+    }
+    if eligible_count != plan.allocation_order_count {
+        return false
+    }
+
+    for order_index in 0..plan.allocation_order_count {
+        let request_id = match plan.allocation_order[order_index] {
+            Some(value) => value
+            None => return false
+        }
+        let request_index = match valid_request_index(requests, request_id) {
+            Some(value) => value
+            None => return false
+        }
+        if order_index > 0 {
+            let previous_id = plan.allocation_order[order_index - 1].unwrap()
+            let previous_index = valid_request_index(requests, previous_id).unwrap()
+            let previous_size =
+                validation.required_block_size(requests[previous_index].hosts).unwrap()
+            let request_size =
+                validation.required_block_size(requests[request_index].hosts).unwrap()
+            if (
+                previous_size < request_size
+                or (previous_size == request_size and previous_id >= request_id)
+            ) {
+                return false
+            }
+        }
+    }
+
+    for order_index in plan.allocation_order_count..plan.allocation_order.len() {
+        if plan.allocation_order[order_index] != None {
+            return false
+        }
+    }
+
+    var cursor: U32 = 0
+    for order_index in 0..plan.allocation_order_count {
+        let request_id = plan.allocation_order[order_index].unwrap()
+        let request_index = valid_request_index(requests, request_id).unwrap()
+        let request = requests[request_index]
+        let address_count = validation.required_block_size(request.hosts).unwrap()
+        let remainder = cursor % address_count
+        var network_offset = cursor
+        if remainder != 0 {
+            network_offset += address_count - remainder
+        }
+        let end_offset = network_offset + address_count
+        let decision = plan.decisions[request_index].unwrap()
+
+        if end_offset > POOL_CAPACITY {
+            if (
+                decision.allocation != None
+                or decision.rejection != Some(RejectionReason.PoolExhausted)
+            ) {
+                return false
+            }
+        } else {
+            let expected = Allocation(
+                network_offset: network_offset,
+                first_host_offset: network_offset + 1,
+                last_host_offset: end_offset - 2,
+                broadcast_offset: end_offset - 1,
+                address_count: address_count,
+                prefix_length: validation.prefix_for_block(address_count).unwrap(),
+            )
+            if decision.allocation != Some(expected) or decision.rejection != None {
+                return false
+            }
+            cursor = end_offset
+        }
+    }
+    true
+}
+
+pub fn is_valid(requests: Array<Request, 12>, plan: Plan) -> Bool {
+    if plan.decision_count != requests.len() {
+        return false
+    }
+
+    var allocated_count: USize = 0
+    var rejected_count: USize = 0
+    var high_water_offset: U32 = 0
+
+    for index in 0..requests.len() {
+        let request = requests[index]
+        let decision = match plan.decisions[index] { Some(value) => value, None => return false }
+        if (
+            decision.request_id != request.request_id
+            or decision.name != request.name
+            or decision.requested_hosts != request.hosts
+        ) {
+            return false
+        }
+
+        match (
+            validation.rejection_reason(requests, index),
+            decision.allocation,
+            decision.rejection,
+        ) {
+            (Some(expected), None, Some(actual)) => {
+                if expected != actual {
+                    return false
+                }
+                rejected_count += 1
+            }
+            (None, Some(allocation), None) => {
+                if not allocation_is_valid(request, allocation) {
+                    return false
+                }
+                allocated_count += 1
+                let end_offset = allocation.network_offset + allocation.address_count
+                if end_offset > high_water_offset {
+                    high_water_offset = end_offset
+                }
+            }
+            (None, None, Some(RejectionReason.PoolExhausted)) => {
+                rejected_count += 1
+            }
+            _ => return false
+        }
+    }
+
+    if not allocation_order_is_valid(requests, plan) {
+        return false
+    }
+
+    if (
+        allocated_count != plan.allocated_count
+        or rejected_count != plan.rejected_count
+        or high_water_offset != plan.high_water_offset
+        or allocated_count + rejected_count != requests.len()
+    ) {
+        return false
+    }
+
+    for first_index in 0..requests.len() {
+        let first = plan.decisions[first_index].unwrap()
+        match first.allocation {
+            Some(first_allocation) => {
+                for second_index in first_index + 1..requests.len() {
+                    let second = plan.decisions[second_index].unwrap()
+                    match second.allocation {
+                        Some(second_allocation) => {
+                            if overlaps(first_allocation, second_allocation) {
+                                return false
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    true
+}
+
+test "overlap detection respects half-open subnet ranges" {
+    let first = Allocation(
+        network_offset: 240,
+        first_host_offset: 241,
+        last_host_offset: 246,
+        broadcast_offset: 247,
+        address_count: 8,
+        prefix_length: 29,
+    )
+    let overlapping = Allocation(
+        network_offset: 240,
+        first_host_offset: 241,
+        last_host_offset: 246,
+        broadcast_offset: 247,
+        address_count: 8,
+        prefix_length: 29,
+    )
+    let adjacent = Allocation(
+        network_offset: 248,
+        first_host_offset: 249,
+        last_host_offset: 254,
+        broadcast_offset: 255,
+        address_count: 8,
+        prefix_length: 29,
+    )
+
+    assert overlaps(first, overlapping)
+    assert not overlaps(first, adjacent)
+}

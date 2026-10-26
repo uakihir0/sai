@@ -1,0 +1,34 @@
+use acme:ipv4-subnet-planner/model.{Request}
+use acme:ipv4-subnet-planner/validation
+
+fn comes_before(requests: Array<Request, 12>, left_index: USize, right_index: USize) -> Bool {
+    let left_size = validation.required_block_size(requests[left_index].hosts).unwrap()
+    let right_size = validation.required_block_size(requests[right_index].hosts).unwrap()
+    if left_size != right_size {
+        return left_size > right_size
+    }
+    requests[left_index].request_id < requests[right_index].request_id
+}
+
+pub fn sort_candidates(
+    requests: Array<Request, 12>,
+    candidates: Array<Option<USize>, 12>,
+    candidate_count: USize,
+) -> Array<Option<USize>, 12> {
+    var ordered = candidates
+    for position in 0..candidate_count {
+        let current_index = ordered[position].unwrap()
+        var insertion = position
+        while insertion > 0 {
+            let previous_index = ordered[insertion - 1].unwrap()
+            if comes_before(requests, current_index, previous_index) {
+                ordered[insertion] = Some(previous_index)
+                insertion -= 1
+            } else {
+                break
+            }
+        }
+        ordered[insertion] = Some(current_index)
+    }
+    ordered
+}
