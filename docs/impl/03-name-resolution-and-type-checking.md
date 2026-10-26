@@ -98,6 +98,12 @@ This chapter relies on the following properties of the query system of [impl/01]
 | 4 | Resources, interfaces and worlds (§3.3.2, §3.6.4), and the SAI views of WIT, interface implementations, world references and flags types of [16](16-interfaces-and-wit.md). |
 | 5 | `async fn`, `async` blocks, `.await`, `for await` (§3.7.11). |
 
+The current owner-aware driver also exposes `PrimitiveBodyTypeResults` for the
+body shapes accepted by the bounded primitive-local checker. This is a partial
+projection of concrete facts, not the complete `typeck(owner)` result or
+`TypeckResults`; unsupported bodies return no projection, and diagnostic
+recovery does not change the body's existing acceptance status or diagnostics.
+
 A construct of a higher stage than the toolchain implements is reported as `FEATURE_NOT_IMPLEMENTED` (spec/01 §1.4.5): f-strings, `async` and attributes of a later stage by [impl/02](02-frontend-ast-hir.md) (§2.9.11, §2.9.15, §2.10.2), and the type-system constructs of the table in §3.14.4 (including those only recognizable after resolution, such as a `use` of a declared dependency or a refined alias) by this chapter at the location given there (N-E-39).
 
 ## 3.2 The module tree
@@ -2705,6 +2711,25 @@ follows the lexical block and local-resolution boundaries in spec/06 §6.11.1
 and spec/04 §§4.5.1 and 4.7.2; tuple-variant argument checks remain under
 spec/06 §6.18.2. The CLI Stage 0 incomplete-check gate is unchanged.
 
+**IR-951 primitive body type results.** For a body accepted by
+`check_primitive_local_block_body`, the owner-aware driver exposes a
+`PrimitiveBodyTypeResults` projection with concrete supported primitive
+expression types keyed by exact `HirId` and binding types keyed by
+`BindingId`, together with the exact `OwnerId`. It records only facts resolved
+by this checker: supported parameters, trustworthy local declarations and
+paths, accepted primitive literals, operators and the checked tail. It does
+not infer from unsupported expressions or cross closure-body boundaries.
+Unresolved and error-tainted expression facts are omitted; a body may still
+publish valid expressions and bindings next to diagnostics on other nodes.
+Taint also follows exact local-path dependencies through inferred aliases and
+supported operator operands, including diagnostics deferred until literal
+defaulting. An inferred binding whose initializer is diagnostic-tainted is
+omitted, while an explicitly annotated binding retains its declared type even
+when its initializer mismatches. Unsupported body shapes publish no
+projection.
+This result is not `TypeckResults::node_types`, does not provide a complete
+`TypeckResults`, and does not change diagnostics or source-acceptance gates.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
@@ -3340,6 +3365,16 @@ A toolchain whose implemented stage range does not include the stage of a constr
 An erroneous `unsafe extern "C"` block makes the calls of its functions `{error}`-typed, so the feature `extern-c` is reported once per block and not per call. Raw pointers and `sai:core/mem` are library items (spec/12 §12.1.4) and are gated by their paths, as below. Attributes, `@derive` among them, are gated by their own stage with the feature `attribute @name` (spec/15 §15.2.4 step 2, [impl/02](02-frontend-ast-hir.md) §2.10.2), and library items by theirs with their canonical path (spec/16 §16.1.6), not by this table. A Stage 0 program may use `Option` and `Result` with inferred arguments (spec/05 §5.20). A construct that uses a lang item of a later stage is reported at its first token with the path of that item (spec/16 §16.1.6): before Stage 2, a `for` loop is reported with `sai:core/iter.IntoIterator` and a range expression with the path of its range type. The solver, the method probe and the impls of `sai:core` and `sai:alloc` are present at every stage, because the library items of Stage 1 are declared with them; the table only restricts what the program itself may declare.
 
 ## 3.15 `TypeckResults`
+
+The current compiler may also expose a separate
+`PrimitiveBodyTypeResults` value on owner-resolution results. That map is
+deliberately narrower than the complete tables below: it contains only
+concrete supported primitive facts from the existing primitive-local body
+checker, with expression keys checked against its `OwnerId`. It coexists with
+diagnostics for independent nodes, drops tainted or unresolved facts, and
+keeps a written local annotation as the binding type after an initializer
+mismatch. It does not populate `node_types` or satisfy the complete
+`TypeckResults` contract.
 
 ### 3.15.1 Contents
 

@@ -2511,6 +2511,10 @@ pub struct FunctionOwnerResolution {
     resolution: Result<LabelResolution, FunctionOwnerResolutionError>,
     local_resolution: Result<Option<LocalResolution>, FunctionOwnerResolutionError>,
     body_type_check: Result<FunctionBodyTypeCheck, FunctionOwnerResolutionError>,
+    primitive_body_type_results: Result<
+        Option<sai_ty::typeck::body::PrimitiveBodyTypeResults>,
+        FunctionOwnerResolutionError,
+    >,
     signature_projection: Result<FunctionSignatureProjection, FunctionOwnerResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, FunctionOwnerResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, FunctionOwnerResolutionError>,
@@ -2822,6 +2826,20 @@ impl FunctionOwnerResolution {
     /// `Unsupported` keeps the owner behind the caller's feature gate.
     pub fn body_type_check(&self) -> Result<&FunctionBodyTypeCheck, &FunctionOwnerResolutionError> {
         self.body_type_check.as_ref()
+    }
+
+    /// Returns the bounded primitive-local expression and binding types
+    /// produced for this exact owner. `None` means the existing body checker
+    /// did not accept this owner's body shape.
+    pub fn primitive_body_type_results(
+        &self,
+    ) -> Result<
+        Option<&sai_ty::typeck::body::PrimitiveBodyTypeResults>,
+        &FunctionOwnerResolutionError,
+    > {
+        self.primitive_body_type_results
+            .as_ref()
+            .map(Option::as_ref)
     }
 
     /// Returns module-scope path results for names not resolved as locals or
@@ -6238,6 +6256,10 @@ pub struct TraitImplMemberTestOnlyResolution {
     owner: OwnerId,
     kind: TraitImplMemberKind,
     body_type_check: Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError>,
+    primitive_body_type_results: Result<
+        Option<sai_ty::typeck::body::PrimitiveBodyTypeResults>,
+        OwnerControlFlowResolutionError,
+    >,
     type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
@@ -6273,6 +6295,19 @@ impl TraitImplMemberTestOnlyResolution {
         &self,
     ) -> Result<&FunctionBodyTypeCheck, &OwnerControlFlowResolutionError> {
         self.body_type_check.as_ref()
+    }
+
+    /// Returns bounded primitive-local body facts for this exact associated
+    /// method owner. `None` means the body checker did not accept the body.
+    pub fn primitive_body_type_results(
+        &self,
+    ) -> Result<
+        Option<&sai_ty::typeck::body::PrimitiveBodyTypeResults>,
+        &OwnerControlFlowResolutionError,
+    > {
+        self.primitive_body_type_results
+            .as_ref()
+            .map(Option::as_ref)
     }
 
     pub fn type_path_resolution(
@@ -7402,6 +7437,7 @@ fn check_function_body_type(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    primitive_type_results: &mut Option<sai_ty::typeck::body::PrimitiveBodyTypeResults>,
 ) -> Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError> {
     if !owner.raw_attrs.is_empty() || !body.contracts.is_empty() || !body.invariant_preds.is_empty()
     {
@@ -7434,9 +7470,10 @@ fn check_function_body_type(
         return Ok(FunctionBodyTypeCheck::Unsupported);
     }
     if sig.params.len() == body.params.len() {
-        if let Some(diagnostics) = check_function_body_primitive_local_block(
+        if let Some((diagnostics, type_results)) = check_function_body_primitive_local_block(
             owner, sig, body, locals, type_paths, symbols, None, None, inputs, snapshot, target_cfg,
         )? {
+            *primitive_type_results = Some(type_results);
             return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
         }
     }
@@ -7807,6 +7844,7 @@ fn check_inherent_method_body_type(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    primitive_type_results: &mut Option<sai_ty::typeck::body::PrimitiveBodyTypeResults>,
 ) -> Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError> {
     if !impl_owner.raw_attrs.is_empty()
         || !method_owner.raw_attrs.is_empty()
@@ -7984,7 +8022,7 @@ fn check_inherent_method_body_type(
         params: explicit_body_params,
         ..*body
     };
-    if let Some(type_diagnostics) = check_function_body_primitive_local_block(
+    if let Some((type_diagnostics, type_results)) = check_function_body_primitive_local_block(
         method_owner,
         explicit_sig,
         &explicit_body,
@@ -7998,6 +8036,7 @@ fn check_inherent_method_body_type(
         target_cfg,
     )? {
         diagnostics.extend(type_diagnostics);
+        *primitive_type_results = Some(type_results);
         Ok(FunctionBodyTypeCheck::Supported { diagnostics })
     } else {
         Ok(FunctionBodyTypeCheck::Unsupported)
@@ -8358,7 +8397,13 @@ fn check_function_body_primitive_local_block(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
-) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+) -> Result<
+    Option<(
+        Vec<Diagnostic>,
+        sai_ty::typeck::body::PrimitiveBodyTypeResults,
+    )>,
+    OwnerControlFlowResolutionError,
+> {
     let mut initial_bindings = HashMap::new();
     if sig.params.len() != body.params.len() {
         return Ok(None);
@@ -8703,11 +8748,20 @@ fn check_function_body_primitive_local_block(
             pointer_width: target_cfg.pointer_width(),
         },
     );
-    let sai_ty::typeck::body::PrimitiveBodyCheck::Supported { errors } = check else {
+    let sai_ty::typeck::body::PrimitiveBodyCheck::Supported {
+        errors,
+        type_results,
+    } = check
+    else {
         return Ok(None);
     };
 
-    primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)
+    let Some(diagnostics) =
+        primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((diagnostics, type_results)))
 }
 
 fn is_function_primitive_local_binary_operator(operator: BinOp) -> bool {
@@ -19259,6 +19313,7 @@ impl RootDatabase {
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
                                 body_type_check: Err(error.clone()),
+                                primitive_body_type_results: Err(error.clone()),
                                 signature_projection: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
@@ -19285,6 +19340,7 @@ impl RootDatabase {
                 let mut lowering_diagnostics = Vec::new();
                 let mut local_resolution = None;
                 let mut body_type_check = None;
+                let mut primitive_body_type_results = None;
                 let mut signature_projection = None;
                 let mut module_resolution = None;
                 let mut type_path_resolution = None;
@@ -19540,6 +19596,7 @@ impl RootDatabase {
                                         &inputs,
                                         snapshot,
                                         &collection.target_cfg,
+                                        &mut primitive_body_type_results,
                                     )?);
                                     let mut module_paths = match &module_scope {
                                         Ok(module_scope) => Ok(resolve_owner_module_paths(
@@ -19654,6 +19711,10 @@ impl RootDatabase {
                         .clone()
                         .map(|_| FunctionBodyTypeCheck::Unsupported)
                 });
+                let primitive_body_type_results = match primitive_body_type_results {
+                    Some(results) => Ok(Some(results)),
+                    None => resolution.clone().map(|_| None),
+                };
                 let signature_projection = signature_projection.unwrap_or_else(|| {
                     resolution.clone().map(|_| {
                         FunctionSignatureProjection::Unsupported(
@@ -19688,6 +19749,7 @@ impl RootDatabase {
                     resolution,
                     local_resolution,
                     body_type_check,
+                    primitive_body_type_results,
                     signature_projection,
                     module_resolution,
                     type_path_resolution,
@@ -29152,6 +29214,7 @@ impl RootDatabase {
                     let mut lowering_diagnostics = Vec::new();
                     let mut type_path_resolution = None;
                     let mut body_type_check = Ok(FunctionBodyTypeCheck::Unsupported);
+                    let mut primitive_body_type_results = None;
                     let member_analysis: Result<
                         (
                             OwnerTestOnlyPathResolution,
@@ -29283,6 +29346,7 @@ impl RootDatabase {
                                             &inputs,
                                             snapshot,
                                             &collection.target_cfg,
+                                            &mut primitive_body_type_results,
                                         )
                                     } else {
                                         Ok(FunctionBodyTypeCheck::Unsupported)
@@ -29372,11 +29436,16 @@ impl RootDatabase {
                             Err(error),
                         ),
                     };
+                    let primitive_body_type_results = match primitive_body_type_results {
+                        Some(results) => Ok(Some(results)),
+                        None => body_type_check.clone().map(|_| None),
+                    };
                     members.push(TraitImplMemberTestOnlyResolution {
                         parent_owner: descriptor.owner,
                         owner: member_owner,
                         kind,
                         body_type_check,
+                        primitive_body_type_results,
                         type_path_resolution,
                         module_path_diagnostics: Ok(None),
                         test_only_path_resolution,
@@ -46847,6 +46916,342 @@ property "shared"() {}
     }
 
     #[test]
+    fn primitive_body_type_results_are_owner_scoped_and_keep_trustworthy_facts() {
+        let root = concat!(
+            "pub fn typed_results(input: I16) -> Bool {\n",
+            "    let annotated: I16 = 7\n",
+            "    let inferred = annotated\n",
+            "    let sum = inferred + 1\n",
+            "    let flipped = ~b'a'\n",
+            "    let compared = sum > inferred\n",
+            "    compared\n",
+            "}\n",
+            "pub fn partial_results(input: I16) -> I16 {\n",
+            "    let retained: I16 = true\n",
+            "    let too_wide = 9223372036854775808\n",
+            "    let force_too_wide_type: I64 = too_wide\n",
+            "    let too_wide_copy = too_wide\n",
+            "    let too_wide_copy_again = too_wide_copy\n",
+            "    let too_wide_sum = too_wide_copy_again + 1\n",
+            "    let invalid = input == true\n",
+            "    let valid = input\n",
+            "    valid\n",
+            "}\n",
+            "pub fn closure_boundary(input: I16) -> I16 {\n",
+            "    let callback = || input\n",
+            "    input\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 3);
+        let typed_owner = &resolved.owners()[0];
+        let typed_results = typed_owner
+            .primitive_body_type_results()
+            .expect("type-results projection has no owner error")
+            .expect("the supported primitive body publishes its projection");
+        assert_eq!(typed_results.owner(), typed_owner.owner());
+        assert!(
+            typed_results
+                .expression_types()
+                .keys()
+                .all(|hir_id| hir_id.owner == typed_owner.owner())
+        );
+        for (name, expected) in [
+            ("input", sai_resolve::prelude::PrimTy::I16),
+            ("annotated", sai_resolve::prelude::PrimTy::I16),
+            ("inferred", sai_resolve::prelude::PrimTy::I16),
+            ("sum", sai_resolve::prelude::PrimTy::I16),
+            ("flipped", sai_resolve::prelude::PrimTy::Byte),
+            ("compared", sai_resolve::prelude::PrimTy::Bool),
+        ] {
+            let binding = typed_owner
+                .local_resolution()
+                .expect("local results belong to the owner")
+                .as_ref()
+                .expect("locals were resolved")
+                .bindings
+                .iter()
+                .find_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved_name| resolved_name.as_ref() == name)
+                            .map(|_| *binding)
+                    })
+                })
+                .unwrap_or_else(|| panic!("binding {name} exists"));
+            assert_eq!(
+                typed_results.binding_type(binding),
+                Some(expected),
+                "{name}"
+            );
+        }
+        assert!(
+            typed_results
+                .expression_types()
+                .values()
+                .filter(|ty| **ty == sai_resolve::prelude::PrimTy::Bool)
+                .count()
+                >= 2,
+            "comparison and return-tail Bool expressions retain their exact HIR results"
+        );
+        assert!(
+            typed_results
+                .expression_types()
+                .values()
+                .any(|ty| *ty == sai_resolve::prelude::PrimTy::I16),
+            "annotated literals, primitive arithmetic, and local paths retain I16 results"
+        );
+        assert!(
+            matches!(
+                typed_owner.body_type_check().expect("body result is available"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "the projection must not change diagnostics for a valid body"
+        );
+
+        let typed_descriptor = *collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.owner == typed_owner.owner())
+            .expect("the selected function has an exact top-level descriptor");
+        let typed_inputs = database
+            .current_owner_inputs(&snapshot, typed_descriptor.file, &collection.target_cfg)
+            .expect("the selected owner inputs are current");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&typed_owner.owner().def_id.package())
+                .expect("the owner package has a definition-path interner"),
+        );
+        let typed_path = def_paths
+            .resolve_def_id(typed_owner.owner().def_id.to_def_id())
+            .expect("the exact owner path resolves")
+            .expect("the exact owner path exists");
+        let arena = HirArena::new();
+        let lowering_context = HirLoweringContext::new(
+            &typed_inputs.ast_ids,
+            &snapshot,
+            &typed_inputs.root,
+            &arena,
+            &database.symbols,
+            &def_paths,
+        );
+        let (_, source_map) = lower_top_level_owner(
+            typed_descriptor,
+            &typed_path,
+            &typed_inputs.filtered_item_tree,
+            &typed_inputs.retained_item_kinds,
+            &lowering_context,
+        )
+        .expect("the selected function lowers to HIR");
+        let assert_type_at_text = |start: usize, text: &str, expected| {
+            let start = start as u32;
+            let range = sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(start),
+                sai_diagnostics::TextSize::new(start + text.len() as u32),
+            )
+            .expect("the source expression range is ordered");
+            let hir_ids = source_map
+                .node_to_syntax()
+                .iter_enumerated()
+                .filter_map(|(local_id, pointer)| {
+                    (pointer.text_range() == range).then_some(sai_hir::HirId {
+                        owner: typed_owner.owner(),
+                        local_id,
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !hir_ids.is_empty(),
+                "source expression {text:?} maps to an exact HIR node"
+            );
+            let typed_ids = hir_ids
+                .iter()
+                .filter(|hir_id| typed_results.expression_type(**hir_id) == Some(expected))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                typed_ids.len(),
+                1,
+                "source expression {text:?} has one exact HIR result of {expected:?}: {hir_ids:?}"
+            );
+        };
+        let literal_start = root
+            .find("= 7")
+            .expect("the annotated primitive literal exists")
+            + "= ".len();
+        assert_type_at_text(literal_start, "7", sai_resolve::prelude::PrimTy::I16);
+        let path_start = root
+            .find("let inferred = annotated")
+            .expect("the inferred local path initializer exists")
+            + "let inferred = ".len();
+        assert_type_at_text(path_start, "annotated", sai_resolve::prelude::PrimTy::I16);
+        let arithmetic_start = root
+            .find("inferred + 1")
+            .expect("the primitive arithmetic expression exists");
+        assert_type_at_text(
+            arithmetic_start,
+            "inferred + 1",
+            sai_resolve::prelude::PrimTy::I16,
+        );
+        let bitnot_start = root
+            .find("~b'a'")
+            .expect("the Byte unary expression exists");
+        assert_type_at_text(bitnot_start, "~b'a'", sai_resolve::prelude::PrimTy::Byte);
+        let bitnot_literal_start = root.find("b'a'").expect("the Byte literal operand exists");
+        assert_type_at_text(
+            bitnot_literal_start,
+            "b'a'",
+            sai_resolve::prelude::PrimTy::Byte,
+        );
+        let comparison_start = root
+            .find("sum > inferred")
+            .expect("the primitive comparison expression exists");
+        assert_type_at_text(
+            comparison_start,
+            "sum > inferred",
+            sai_resolve::prelude::PrimTy::Bool,
+        );
+        let tail_start = root
+            .find("    compared\n")
+            .expect("the return tail path exists")
+            + "    ".len();
+        assert_type_at_text(tail_start, "compared", sai_resolve::prelude::PrimTy::Bool);
+
+        let partial_owner = &resolved.owners()[1];
+        let partial_results = partial_owner
+            .primitive_body_type_results()
+            .expect("error results keep a valid owner projection")
+            .expect("the supported body publishes facts alongside diagnostics");
+        assert_eq!(partial_results.owner(), partial_owner.owner());
+        let partial_local_resolution = partial_owner
+            .local_resolution()
+            .expect("partial owner local results are available");
+        let partial_locals = partial_local_resolution
+            .as_ref()
+            .expect("partial owner locals were resolved");
+        let binding_named = |expected_name: &str| {
+            partial_locals
+                .bindings
+                .iter()
+                .find_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved_name| resolved_name.as_ref() == expected_name)
+                            .map(|_| *binding)
+                    })
+                })
+                .unwrap_or_else(|| panic!("binding {expected_name} exists"))
+        };
+        assert_eq!(
+            partial_results.binding_type(binding_named("retained")),
+            Some(sai_resolve::prelude::PrimTy::I16),
+            "an explicit declaration remains trustworthy after an initializer mismatch"
+        );
+        assert_eq!(
+            partial_results.binding_type(binding_named("too_wide")),
+            None,
+            "an inferred binding with a deferred literal error is omitted"
+        );
+        assert_eq!(
+            partial_results.binding_type(binding_named("force_too_wide_type")),
+            Some(sai_resolve::prelude::PrimTy::I64),
+            "an explicit annotation remains trustworthy when constraining an overflowing source"
+        );
+        for name in ["too_wide_copy", "too_wide_copy_again", "too_wide_sum"] {
+            assert_eq!(
+                partial_results.binding_type(binding_named(name)),
+                None,
+                "deferred literal taint propagates through inferred aliases and operators: {name}"
+            );
+        }
+        for name in ["too_wide", "too_wide_copy", "too_wide_copy_again"] {
+            let binding = binding_named(name);
+            let dependent_paths = partial_locals
+                .paths
+                .iter()
+                .filter_map(|(hir_id, resolution)| {
+                    (resolution.base == sai_resolve::package_scopes::Res::Local(binding))
+                        .then_some(*hir_id)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !dependent_paths.is_empty(),
+                "at least one exact local path resolves to {name}"
+            );
+            assert!(
+                dependent_paths
+                    .iter()
+                    .all(|hir_id| { partial_results.expression_type(*hir_id).is_none() }),
+                "tainted binding paths are omitted by their exact HIR IDs: {name}"
+            );
+        }
+        assert_eq!(
+            partial_results.binding_type(binding_named("invalid")),
+            None,
+            "an inferred binding whose initializer reports a child mismatch is omitted"
+        );
+        assert_eq!(
+            partial_results.binding_type(binding_named("valid")),
+            Some(sai_resolve::prelude::PrimTy::I16),
+            "an independent valid sibling remains available with diagnostics"
+        );
+        let FunctionBodyTypeCheck::Supported { diagnostics } = partial_owner
+            .body_type_check()
+            .expect("semantic errors stay in the existing body-check result")
+        else {
+            panic!("supported errors must not turn the body into an unsupported gate");
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::TypeMismatch,
+            ]
+        );
+
+        assert!(
+            matches!(
+                resolved.owners()[2]
+                    .body_type_check()
+                    .expect("closure owner body result is available"),
+                FunctionBodyTypeCheck::Unsupported
+            ),
+            "the closure initializer remains outside the existing body-check slice"
+        );
+        assert_eq!(
+            resolved.owners()[2]
+                .primitive_body_type_results()
+                .expect("unsupported owner has no projection error"),
+            None,
+            "a closure body never leaks expression results into the parent owner"
+        );
+    }
+
+    #[test]
     fn function_body_type_check_accepts_flat_local_bitwise_paths() {
         let integer_types = [
             "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
@@ -63202,7 +63607,13 @@ property "shared"() {}
             "type User { name: I32 }\n",
             "impl User {\n",
             "  pub fn read_name(self: borrow Self) -> I32 {\n",
-            "    let name = self.naem\n",
+            "    let error_literal = 1 + self.naem\n",
+            "    let copied_literal_error = error_literal\n",
+            "    let copied_literal_error_again = copied_literal_error\n",
+            "    let error_source = self.naem\n",
+            "    let copied_error = error_source\n",
+            "    let propagated = copied_error + 1\n",
+            "    let name = self.name\n",
             "    name\n",
             "  }\n",
             "}\n",
@@ -63250,8 +63661,73 @@ property "shared"() {}
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
             panic!("a direct unknown self-field initializer should be checked: {check:#?}");
         };
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
+            "{diagnostics:#?}"
+        );
+        let type_results = method
+            .primitive_body_type_results()
+            .expect("unknown-field errors keep the partial projection")
+            .expect("the method body publishes trustworthy independent results");
+        let local_resolution = method
+            .local_resolution()
+            .expect("method locals remain available");
+        let locals = local_resolution
+            .as_ref()
+            .expect("the method body has resolved locals");
+        let binding_named = |expected_name: &str| {
+            locals
+                .bindings
+                .iter()
+                .find_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved_name| resolved_name.as_ref() == expected_name)
+                            .map(|_| *binding)
+                    })
+                })
+                .unwrap_or_else(|| panic!("binding {expected_name} exists"))
+        };
+        for name in [
+            "error_literal",
+            "copied_literal_error",
+            "copied_literal_error_again",
+            "error_source",
+            "copied_error",
+            "propagated",
+        ] {
+            assert_eq!(
+                type_results.binding_type(binding_named(name)),
+                None,
+                "unknown-field recovery taint propagates through aliases and operators: {name}"
+            );
+            let binding = binding_named(name);
+            let dependent_paths = locals
+                .paths
+                .iter()
+                .filter_map(|(hir_id, resolution)| {
+                    (resolution.base == sai_resolve::package_scopes::Res::Local(binding))
+                        .then_some(*hir_id)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                dependent_paths
+                    .iter()
+                    .all(|hir_id| type_results.expression_type(*hir_id).is_none()),
+                "tainted local path results are omitted by exact HIR ID: {name}"
+            );
+        }
+        assert_eq!(
+            type_results.binding_type(binding_named("name")),
+            Some(sai_resolve::prelude::PrimTy::I32),
+            "a valid sibling retains its concrete result beside the field error"
+        );
     }
 
     #[test]
