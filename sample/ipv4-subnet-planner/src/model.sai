@@ -1,0 +1,49 @@
+pub const POOL_CAPACITY: U32 = 256
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RejectionReason {
+    DuplicateRequestId
+    EmptyHostRequest
+    TooManyHosts
+    PoolExhausted
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Request {
+    pub request_id: U32
+    pub name: Str
+    pub hosts: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Allocation {
+    pub network_offset: U32
+    pub first_host_offset: U32
+    pub last_host_offset: U32
+    pub broadcast_offset: U32
+    pub address_count: U32
+    pub prefix_length: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Decision {
+    pub request_id: U32
+    pub name: Str
+    pub requested_hosts: U32
+    pub allocation: Option<Allocation>
+    pub rejection: Option<RejectionReason>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Plan {
+    // Decisions stay in input order, even though allocation uses a sorted order.
+    pub decisions: Array<Option<Decision>, 12>
+    // Valid requests in allocation order, including those rejected for capacity.
+    pub allocation_order: Array<Option<U32>, 12>
+    pub allocation_order_count: USize
+    pub decision_count: USize
+    pub allocated_count: USize
+    pub rejected_count: USize
+    // Exclusive end offset of the last allocated block.
+    pub high_water_offset: U32
+}

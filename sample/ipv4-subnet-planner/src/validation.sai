@@ -1,0 +1,56 @@
+use acme:ipv4-subnet-planner/model.{RejectionReason, Request}
+
+pub fn required_block_size(hosts: U32) -> Option<U32> {
+    if hosts == 0 or hosts > 254 {
+        return None
+    }
+
+    // This example reserves network and broadcast addresses in every block.
+    var size: U32 = 4
+    let addresses_needed = hosts + 2
+    while size < addresses_needed {
+        size *= 2
+    }
+    Some(size)
+}
+
+pub fn prefix_for_block(size: U32) -> Option<U32> {
+    if size < 4 or size > 256 {
+        return None
+    }
+
+    var prefix: U32 = 32
+    var remaining = size
+    while remaining > 1 {
+        if remaining % 2 != 0 {
+            return None
+        }
+        remaining /= 2
+        prefix -= 1
+    }
+    Some(prefix)
+}
+
+pub fn duplicate_request_id(requests: Array<Request, 12>, index: USize) -> Bool {
+    for other_index in 0..requests.len() {
+        if other_index != index and requests[other_index].request_id == requests[index].request_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn rejection_reason(requests: Array<Request, 12>, index: USize) -> Option<RejectionReason> {
+    if duplicate_request_id(requests, index) {
+        return Some(RejectionReason.DuplicateRequestId)
+    }
+
+    let hosts = requests[index].hosts
+    if hosts == 0 {
+        return Some(RejectionReason.EmptyHostRequest)
+    }
+    if hosts > 254 {
+        return Some(RejectionReason.TooManyHosts)
+    }
+    None
+}

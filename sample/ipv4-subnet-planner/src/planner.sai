@@ -1,0 +1,95 @@
+use acme:ipv4-subnet-planner/model.{
+    Allocation
+    Decision
+    POOL_CAPACITY
+    Plan
+    RejectionReason
+    Request
+}
+use acme:ipv4-subnet-planner/ordering
+use acme:ipv4-subnet-planner/validation
+
+pub fn build_plan(requests: Array<Request, 12>) -> Plan {
+    var decisions = Array<Option<Decision>, 12>.filled(None)
+    var candidates = Array<Option<USize>, 12>.filled(None)
+    var candidate_count: USize = 0
+    var rejected_count: USize = 0
+
+    for index in 0..requests.len() {
+        let request = requests[index]
+        var decision = Decision(
+            request_id: request.request_id,
+            name: request.name,
+            requested_hosts: request.hosts,
+            allocation: None,
+            rejection: None,
+        )
+        match validation.rejection_reason(requests, index) {
+            Some(reason) => {
+                decision.rejection = Some(reason)
+                rejected_count += 1
+            }
+            None => {
+                candidates[candidate_count] = Some(index)
+                candidate_count += 1
+            }
+        }
+        decisions[index] = Some(decision)
+    }
+
+    let ordered = ordering.sort_candidates(requests, candidates, candidate_count)
+    var allocation_order = Array<Option<U32>, 12>.filled(None)
+    for order_index in 0..candidate_count {
+        let request_index = ordered[order_index].unwrap()
+        allocation_order[order_index] = Some(requests[request_index].request_id)
+    }
+
+    var cursor: U32 = 0
+    var allocated_count: USize = 0
+    var high_water_offset: U32 = 0
+
+    for order_index in 0..candidate_count {
+        let request_index = ordered[order_index].unwrap()
+        let request = requests[request_index]
+        let address_count = validation.required_block_size(request.hosts).unwrap()
+        let remainder = cursor % address_count
+        var network_offset = cursor
+        if remainder != 0 {
+            network_offset += address_count - remainder
+        }
+        let end_offset = network_offset + address_count
+        var decision = decisions[request_index].unwrap()
+
+        if end_offset > POOL_CAPACITY {
+            decision.rejection = Some(RejectionReason.PoolExhausted)
+            rejected_count += 1
+        } else {
+            decision.allocation = Some(
+                Allocation(
+                    network_offset: network_offset,
+                    first_host_offset: network_offset + 1,
+                    last_host_offset: end_offset - 2,
+                    broadcast_offset: end_offset - 1,
+                    address_count: address_count,
+                    prefix_length: validation.prefix_for_block(address_count).unwrap(),
+                ),
+            )
+            allocated_count += 1
+            cursor = end_offset
+            if end_offset > high_water_offset {
+                high_water_offset = end_offset
+            }
+        }
+        decisions[request_index] = Some(decision)
+    }
+
+    Plan(
+        decisions: decisions,
+        allocation_order: allocation_order,
+        allocation_order_count: candidate_count,
+        decision_count: requests.len(),
+        allocated_count: allocated_count,
+        rejected_count: rejected_count,
+        high_water_offset: high_water_offset,
+    )
+}

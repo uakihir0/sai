@@ -1,0 +1,102 @@
+use acme:ipv4-subnet-planner/audit
+use acme:ipv4-subnet-planner/data
+use acme:ipv4-subnet-planner/model.{Allocation, Plan, RejectionReason}
+use acme:ipv4-subnet-planner/planner
+use acme:ipv4-subnet-planner/validation
+
+pub fn fixture_plan() -> Plan {
+    planner.build_plan(data.requests())
+}
+
+test "the fixture returns an audited plan with deterministic aligned blocks" {
+    let requests = data.requests()
+    let plan = planner.build_plan(requests)
+    let repeated_plan = planner.build_plan(requests)
+
+    assert audit.is_valid(requests, plan)
+    assert plan == repeated_plan
+    assert plan.decision_count == 12
+    assert plan.allocation_order_count == 8
+    assert plan.allocation_order[0] == Some(1)
+    assert plan.allocation_order[1] == Some(2)
+    assert plan.allocation_order[2] == Some(10)
+    assert plan.allocation_order[3] == Some(7)
+    assert plan.allocation_order[4] == Some(11)
+    assert plan.allocation_order[5] == Some(20)
+    assert plan.allocation_order[6] == Some(30)
+    assert plan.allocation_order[7] == Some(40)
+    assert plan.allocated_count == 6
+    assert plan.rejected_count == 6
+    assert plan.high_water_offset == 256
+
+    let lab = plan.decisions[5].unwrap().allocation.unwrap()
+    assert (
+        lab
+        == Allocation(
+            network_offset: 0,
+            first_host_offset: 1,
+            last_host_offset: 126,
+            broadcast_offset: 127,
+            address_count: 128,
+            prefix_length: 25,
+        )
+    )
+    let office = plan.decisions[3].unwrap().allocation.unwrap()
+    assert office.network_offset == 128
+    assert office.prefix_length == 26
+    let apps = plan.decisions[1].unwrap().allocation.unwrap()
+    assert apps.network_offset == 192
+    assert apps.prefix_length == 27
+    let printers = plan.decisions[4].unwrap().allocation.unwrap()
+    assert printers.network_offset == 224
+    assert printers.prefix_length == 28
+    let cameras = plan.decisions[10].unwrap().allocation.unwrap()
+    let access_points = plan.decisions[11].unwrap().allocation.unwrap()
+    assert cameras.network_offset == 240
+    assert access_points.network_offset == 248
+    assert cameras.prefix_length == 29
+    assert access_points.prefix_length == 29
+}
+
+test "duplicate IDs fail closed for every matching request" {
+    let plan = fixture_plan()
+    assert plan.decisions[6].unwrap().rejection == Some(RejectionReason.DuplicateRequestId)
+    assert plan.decisions[7].unwrap().rejection == Some(RejectionReason.DuplicateRequestId)
+}
+
+test "invalid host counts and exhausted capacity have explicit outcomes" {
+    let plan = fixture_plan()
+    assert plan.decisions[8].unwrap().rejection == Some(RejectionReason.EmptyHostRequest)
+    assert plan.decisions[9].unwrap().rejection == Some(RejectionReason.TooManyHosts)
+    assert plan.decisions[0].unwrap().rejection == Some(RejectionReason.PoolExhausted)
+    assert plan.decisions[2].unwrap().rejection == Some(RejectionReason.PoolExhausted)
+}
+
+test "block sizing reserves network and broadcast and rounds up to a power of two" {
+    assert validation.required_block_size(1) == Some(4)
+    assert validation.required_block_size(5) == Some(8)
+    assert validation.required_block_size(254) == Some(256)
+    assert validation.required_block_size(0) == None
+    assert validation.required_block_size(255) == None
+    assert validation.prefix_for_block(8) == Some(29)
+    assert validation.prefix_for_block(6) == None
+    assert validation.prefix_for_block(2) == None
+}
+
+test "the audit rejects a noncanonical overlapping plan" {
+    let requests = data.requests()
+    var plan = planner.build_plan(requests)
+    var decision = plan.decisions[10].unwrap()
+    decision.allocation = Some(
+        Allocation(
+            network_offset: 248,
+            first_host_offset: 249,
+            last_host_offset: 254,
+            broadcast_offset: 255,
+            address_count: 8,
+            prefix_length: 29,
+        ),
+    )
+    plan.decisions[10] = Some(decision)
+    assert not audit.is_valid(requests, plan)
+}
