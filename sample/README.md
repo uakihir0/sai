@@ -105,6 +105,8 @@ source repository before a package resolver can fetch them.
 | Advanced | [`key-rotation-readiness-auditor`](key-rotation-readiness-auditor/README.md) | Audit fictional service-key rotations for lifetime coverage, migration evidence freshness, escrow separation, overlap windows, and in-plan dependency order. |
 | Advanced | [`battery-recycling-chain-auditor`](battery-recycling-chain-auditor/README.md) | Audit fictional battery returns through custody, transport permits and quotas, assay quality, available material, destination licenses, and mass balance. |
 | Advanced | [`instrument-calibration-traceability-auditor`](instrument-calibration-traceability-auditor/README.md) | Check calibration windows and instrument scope while tracing reference-standard chains for accreditation, recall, range, and conservative uncertainty. |
+| Advanced | [`drinking-water-incident-coordinator`](drinking-water-incident-coordinator/README.md) | Coordinate fictional drinking-water incidents from qualified sensor and lab evidence through affected-zone advisories, alternate supply, and recovery checks. |
+| Advanced | [`research-data-release-auditor`](research-data-release-auditor/README.md) | Gate research dataset releases on source lineage, contributor consent, disclosure risk, integrity, retention, embargoes, legal holds, and parent decisions. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
