@@ -3003,6 +3003,47 @@ shapes beyond IR-967/968, non-integer literal pairs, computed or nested
 operators, deeper calls, and unsupported targets/signatures. Preserve the
 CLI Stage 0 gate and do not add bitwise lowering/runtime behavior.
 
+**IR-972 direct-call bitwise `Byte` literal LHS** additionally admits one
+direct byte character literal on the left of `&`, `|`, or `^` when the right
+operand is an eligible exact-binding path, at the root or existing one-level
+nested call argument position. A `Byte` RHS path succeeds with a concrete
+`Byte` result; another supported primitive RHS path reports
+`TYPE_MISMATCH` at that exact path and recovers the operator result to
+`Byte`, matching the flat-local IR-787 checker; this operand error suppresses
+operator/call and mismatched-path facts. The successful fact set is the one
+already produced by that checker: the exact RHS path and operator/call
+results are available, but no separate left-literal fact is synthesized.
+If an enclosing call parameter mismatches the recovered `Byte` result, the
+operator and containing call facts are suppressed while the RHS path fact
+remains. Preserve valid sibling calls. Keep RHS literals (including a second
+byte literal), byte strings, computed or nested operands, unresolved/self/
+forward paths, and preceding numeric locals whose type remains unconstrained
+gated; those locals pass the shape check but must remain Unsupported without
+facts or diagnostics. Also reject deeper calls and unsupported targets/signatures.
+Preserve the CLI Stage 0 gate and add no lowering/runtime behavior. The
+recovery, fact, gate, and scope choices are **Review required**.
+
+- **Review required:** Check that the driver and body-checker gates agree for
+  all three operators at root and one-level nested positions, with exact
+  `BindingId` resolution for parameter and preceding-local RHS paths.
+  Verify Byte success facts, a non-Byte concrete RHS mismatch at the RHS path
+  with Byte recovery and the established fact set, plus call-parameter
+  mismatch taint with the RHS fact and independent sibling preserved. Reject
+  literal, byte-string, computed/nested, unresolved/self/forward, preceding
+  unconstrained numeric locals, deep-call, generic-target, and unsupported-
+  signature forms. Assert the unconstrained local remains Unsupported with no
+  facts or diagnostics. Keep Stage 0 gated and make no lowering/runtime claim.
+- **Planned test matrix:** Cover `&`, `|`, and `^` at root and one nested
+  call level, plus a direct preceding-local RHS. Assert the Byte operator,
+  outer/nested call, and RHS path facts; the exact RHS mismatch code, message,
+  span, Byte recovery, and facts; the outer call-parameter mismatch span and
+  taint with retained RHS-path and sibling facts; and rejection of literal
+  RHSs, byte strings, computed/nested RHS expressions, unresolved, self, or
+  forward paths, and an unannotated numeric local that remains Unsupported
+  without facts or diagnostics; also reject deeper calls, generic targets, and
+  unsupported signatures. Run focused driver and CLI Stage 0 tests, formatting,
+  and diff checks.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:

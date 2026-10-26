@@ -9273,6 +9273,14 @@ fn is_supported_direct_call_bitwise_operands_shape(
             .is_some_and(|binding| preceding_bindings.contains(&binding));
     }
 
+    if matches!(left.kind, ExprKind::Lit(Lit::Byte(_))) {
+        let ExprKind::Path(path) = right.kind else {
+            return false;
+        };
+        return resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding));
+    }
+
     let ExprKind::Path(path) = left.kind else {
         return false;
     };
@@ -49070,6 +49078,20 @@ property "shared"() {}
             "    let or_value = apply_byte(left | right)\n",
             "    apply_byte(left ^ right)\n",
             "}\n",
+            "pub fn bitwise_byte_literal_left_root(right: Byte) -> Byte {\n",
+            "    let and_value = apply_byte(b'a' & right)\n",
+            "    let or_value = apply_byte(b'b' | right)\n",
+            "    apply_byte(b'c' ^ right)\n",
+            "}\n",
+            "pub fn bitwise_byte_literal_left_nested(right: Byte) -> Byte {\n",
+            "    let and_value = apply_byte(apply_byte(b'a' & right))\n",
+            "    let or_value = apply_byte(apply_byte(b'b' | right))\n",
+            "    apply_byte(apply_byte(b'c' ^ right))\n",
+            "}\n",
+            "pub fn bitwise_byte_literal_left_local(right: Byte) -> Byte {\n",
+            "    let prior: Byte = right\n",
+            "    apply_byte(b'a' ^ prior)\n",
+            "}\n",
             "pub fn nested_bitwise_call_argument(left: I32, right: I32) -> I32 {\n",
             "    apply_i32(apply_i32(left ^ right))\n",
             "}\n",
@@ -49102,6 +49124,17 @@ property "shared"() {}
             "    let result = apply_byte(left ^ right)\n",
             "    let alias = result\n",
             "    let valid = apply_byte(left)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn bitwise_byte_literal_left_rhs_mismatch(right: I32, valid: Byte) -> Byte {\n",
+            "    let result = apply_byte(b'a' & right)\n",
+            "    let alias = result\n",
+            "    apply_byte(b'b' ^ valid)\n",
+            "}\n",
+            "pub fn bitwise_byte_literal_left_parameter_mismatch(right: Byte) -> Byte {\n",
+            "    let result = apply_i32(b'a' & right)\n",
+            "    let alias = result\n",
+            "    let valid = apply_byte(b'b' ^ right)\n",
             "    valid\n",
             "}\n",
             "pub fn bitwise_byte_call_parameter_mismatch(left: Byte) -> I32 {\n",
@@ -49219,7 +49252,30 @@ property "shared"() {}
             "pub fn bitwise_integer_literal_left_call_path_unsupported(right: I32) -> I32 { apply_i32(1 & add_one(right)) }\n",
             "pub fn bitwise_integer_literal_left_other_operator_unsupported(right: I32) -> I32 { apply_i32(1 << right) }\n",
             "pub fn bitwise_integer_literal_left_deep_call_unsupported(right: I32) -> I32 { apply_i32(apply_i32(apply_i32(1 & right))) }\n",
-            "pub fn bitwise_byte_literal_left_path_unsupported(right: Byte) -> Byte { apply_byte(b'x' & right) }\n",
+            "pub fn bitwise_byte_literal_rhs_bool_unsupported(right: Byte) -> Byte { apply_byte(b'x' & true) }\n",
+            "pub fn bitwise_byte_literal_rhs_integer_unsupported(right: Byte) -> Byte { apply_byte(b'x' & 1) }\n",
+            "pub fn bitwise_byte_literal_rhs_char_unsupported(right: Byte) -> Byte { apply_byte(b'x' & 'a') }\n",
+            "pub fn bitwise_byte_literal_rhs_float_unsupported(right: Byte) -> Byte { apply_byte(b'x' & 1.0) }\n",
+            "pub fn bitwise_byte_literal_rhs_byte_string_unsupported(right: Byte) -> Byte { apply_byte(b'x' & b\"ab\") }\n",
+            "pub fn bitwise_byte_literal_rhs_computed_unsupported(right: Byte) -> Byte { apply_byte(b'x' & (right + 1)) }\n",
+            "pub fn bitwise_byte_literal_rhs_nested_operator_unsupported(right: Byte) -> Byte { apply_byte(b'x' & (right ^ right)) }\n",
+            "pub fn bitwise_byte_literal_rhs_unresolved_unsupported() -> Byte { apply_byte(b'x' & missing) }\n",
+            "pub fn bitwise_byte_literal_rhs_unresolved_numeric_local_unsupported() -> Byte {\n",
+            "    let right = 1\n",
+            "    apply_byte(b'x' & right)\n",
+            "}\n",
+            "pub fn bitwise_byte_literal_rhs_self_unsupported(right: Byte) -> Byte {\n",
+            "    let result = apply_byte(b'x' & result)\n",
+            "    result\n",
+            "}\n",
+            "pub fn bitwise_byte_literal_rhs_forward_unsupported(right: Byte) -> Byte {\n",
+            "    let result = apply_byte(b'x' & later)\n",
+            "    let later: Byte = right\n",
+            "    result\n",
+            "}\n",
+            "pub fn bitwise_byte_literal_deep_call_unsupported(right: Byte) -> Byte { apply_byte(apply_byte(apply_byte(b'x' & right))) }\n",
+            "pub fn bitwise_byte_literal_generic_target_unsupported(right: Byte) -> I32 { generic_fn(b'x' & right) }\n",
+            "pub fn bitwise_byte_literal_unsupported_signature(right: Byte) -> I32 { text_fn(b'x' & right) }\n",
             "pub fn bitwise_bool_literal_left_path_unsupported(right: Bool) -> Bool { apply_bool(false | right) }\n",
             "pub fn bitwise_char_literal_left_path_unsupported(right: Char) -> Char { identity_char('x' ^ right) }\n",
             "pub fn bitwise_float_literal_left_path_unsupported(right: F32) -> F32 { float_fn(1.0 & right) }\n",
@@ -50220,6 +50276,12 @@ property "shared"() {}
             assert_supported(&database, "bitwise_usize_call_arguments", &[]);
         let bitwise_byte_call_arguments =
             assert_supported(&database, "bitwise_byte_call_arguments", &[]);
+        let bitwise_byte_literal_left_root =
+            assert_supported(&database, "bitwise_byte_literal_left_root", &[]);
+        let bitwise_byte_literal_left_nested =
+            assert_supported(&database, "bitwise_byte_literal_left_nested", &[]);
+        let bitwise_byte_literal_left_local =
+            assert_supported(&database, "bitwise_byte_literal_left_local", &[]);
         let nested_bitwise_call_argument =
             assert_supported(&database, "nested_bitwise_call_argument", &[]);
         let nested_bitwise_and_call_argument =
@@ -50242,6 +50304,16 @@ property "shared"() {}
         let bitwise_byte_rhs_mismatch = assert_supported(
             &database,
             "bitwise_byte_rhs_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_byte_literal_left_rhs_mismatch = assert_supported(
+            &database,
+            "bitwise_byte_literal_left_rhs_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let bitwise_byte_literal_left_parameter_mismatch = assert_supported(
+            &database,
+            "bitwise_byte_literal_left_parameter_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let bitwise_byte_call_parameter_mismatch = assert_supported(
@@ -50608,7 +50680,20 @@ property "shared"() {}
             "bitwise_integer_literal_left_call_path_unsupported",
             "bitwise_integer_literal_left_other_operator_unsupported",
             "bitwise_integer_literal_left_deep_call_unsupported",
-            "bitwise_byte_literal_left_path_unsupported",
+            "bitwise_byte_literal_rhs_bool_unsupported",
+            "bitwise_byte_literal_rhs_integer_unsupported",
+            "bitwise_byte_literal_rhs_char_unsupported",
+            "bitwise_byte_literal_rhs_float_unsupported",
+            "bitwise_byte_literal_rhs_byte_string_unsupported",
+            "bitwise_byte_literal_rhs_computed_unsupported",
+            "bitwise_byte_literal_rhs_nested_operator_unsupported",
+            "bitwise_byte_literal_rhs_unresolved_unsupported",
+            "bitwise_byte_literal_rhs_unresolved_numeric_local_unsupported",
+            "bitwise_byte_literal_rhs_self_unsupported",
+            "bitwise_byte_literal_rhs_forward_unsupported",
+            "bitwise_byte_literal_deep_call_unsupported",
+            "bitwise_byte_literal_generic_target_unsupported",
+            "bitwise_byte_literal_unsupported_signature",
             "bitwise_bool_literal_left_path_unsupported",
             "bitwise_char_literal_left_path_unsupported",
             "bitwise_float_literal_left_path_unsupported",
@@ -55071,6 +55156,103 @@ property "shared"() {}
                 );
             }
         }
+        for (owner, function, nested) in [
+            (
+                bitwise_byte_literal_left_root,
+                "pub fn bitwise_byte_literal_left_root",
+                false,
+            ),
+            (
+                bitwise_byte_literal_left_nested,
+                "pub fn bitwise_byte_literal_left_nested",
+                true,
+            ),
+        ] {
+            for (operator, byte) in [("&", 'a'), ("|", 'b'), ("^", 'c')] {
+                let literal = format!("b'{byte}'");
+                let operator_expression = format!("{literal} {operator} right");
+                let inner_call = format!("apply_byte({operator_expression})");
+                let call = if nested {
+                    format!("apply_byte({inner_call})")
+                } else {
+                    inner_call.clone()
+                };
+                let operator_start = call
+                    .find(&operator_expression)
+                    .expect("the Byte-literal-left operator is in its call");
+                let right_start = operator_start + operator_expression.len() - "right".len();
+                assert_eq!(
+                    expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
+                    Some(PrimTy::Byte),
+                    "the Byte-literal-left `{operator}` call is typed at the {} position",
+                    if nested { "nested" } else { "root" }
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &call,
+                        operator_start,
+                        operator_expression.len()
+                    ),
+                    Some(PrimTy::Byte),
+                    "the Byte-literal-left `{operator}` operator fact is preserved"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &call,
+                        operator_start,
+                        literal.len()
+                    ),
+                    None,
+                    "Byte-literal-left checking does not synthesize a separate literal fact for `{operator}`"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &call,
+                        right_start,
+                        "right".len()
+                    ),
+                    Some(PrimTy::Byte),
+                    "the eligible concrete RHS path fact is preserved for `{operator}`"
+                );
+                if nested {
+                    assert_eq!(
+                        expression_type_at_range(
+                            &mut database,
+                            owner,
+                            function,
+                            &call,
+                            call.find(&inner_call)
+                                .expect("nested call contains its inner direct call"),
+                            inner_call.len()
+                        ),
+                        Some(PrimTy::Byte),
+                        "the nested inner direct call fact is preserved for `{operator}`"
+                    );
+                }
+            }
+        }
+        let byte_literal_local_call = "apply_byte(b'a' ^ prior)";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                bitwise_byte_literal_left_local,
+                "pub fn bitwise_byte_literal_left_local",
+                byte_literal_local_call,
+                0,
+                byte_literal_local_call.len()
+            ),
+            Some(PrimTy::Byte),
+            "an eligible preceding local path can constrain a Byte literal left operand"
+        );
         for (owner, function, operator) in [
             (
                 nested_bitwise_and_call_argument,
@@ -55374,6 +55556,271 @@ property "shared"() {}
             "apply_byte(left)",
         );
         drop(assert_bitwise_rhs_mismatch);
+
+        let byte_literal_rhs_mismatch_call = "apply_byte(b'a' & right)";
+        let byte_literal_rhs_mismatch_operator = "b'a' & right";
+        let byte_literal_rhs_mismatch_owner = bitwise_byte_literal_left_rhs_mismatch;
+        let byte_literal_rhs_mismatch_function = "pub fn bitwise_byte_literal_left_rhs_mismatch";
+        let byte_literal_rhs_diagnostics = match byte_literal_rhs_mismatch_owner
+            .body_type_check()
+            .expect("Byte-literal-left RHS mismatch body is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("Byte-literal-left RHS mismatch remains a supported diagnostic")
+            }
+        };
+        assert_eq!(
+            byte_literal_rhs_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch]
+        );
+        assert_eq!(
+            byte_literal_rhs_diagnostics[0].message,
+            "expected `Byte`, found `I32`"
+        );
+        let byte_literal_rhs_function_start = root
+            .find(byte_literal_rhs_mismatch_function)
+            .expect("Byte-literal-left RHS mismatch function exists");
+        let byte_literal_rhs_function_text = &root[byte_literal_rhs_function_start..];
+        let byte_literal_rhs_operator_start = byte_literal_rhs_function_start
+            + byte_literal_rhs_function_text
+                .find(byte_literal_rhs_mismatch_operator)
+                .expect("Byte-literal-left RHS mismatch operator exists");
+        let byte_literal_rhs_start = byte_literal_rhs_operator_start
+            + byte_literal_rhs_mismatch_operator.len()
+            - "right".len();
+        assert_eq!(
+            byte_literal_rhs_diagnostics[0]
+                .primary()
+                .expect("Byte-literal-left RHS mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(byte_literal_rhs_start as u32),
+                sai_diagnostics::TextSize::new((byte_literal_rhs_start + "right".len()) as u32),
+            )
+            .expect("Byte-literal-left RHS mismatch span is ordered")
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_rhs_mismatch_owner,
+                byte_literal_rhs_mismatch_function,
+                byte_literal_rhs_mismatch_call,
+                0,
+                byte_literal_rhs_mismatch_call.len()
+            ),
+            None,
+            "a non-Byte concrete RHS mismatch taints its direct call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_rhs_mismatch_owner,
+                byte_literal_rhs_mismatch_function,
+                byte_literal_rhs_mismatch_call,
+                "apply_byte(".len(),
+                byte_literal_rhs_mismatch_operator.len()
+            ),
+            None,
+            "a non-Byte concrete RHS mismatch suppresses the operator fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_rhs_mismatch_owner,
+                byte_literal_rhs_mismatch_function,
+                byte_literal_rhs_mismatch_call,
+                "apply_byte(".len(),
+                "b'a'".len()
+            ),
+            None,
+            "the established Byte-literal-left path does not publish a separate literal fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_rhs_mismatch_owner,
+                byte_literal_rhs_mismatch_function,
+                byte_literal_rhs_mismatch_call,
+                "apply_byte(b'a' & ".len(),
+                "right".len()
+            ),
+            None,
+            "the mismatched RHS path fact is suppressed"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_rhs_mismatch_owner,
+                byte_literal_rhs_mismatch_function,
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "an alias of the mismatched call remains tainted"
+        );
+        let byte_literal_rhs_sibling_call = "apply_byte(b'b' ^ valid)";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_rhs_mismatch_owner,
+                byte_literal_rhs_mismatch_function,
+                byte_literal_rhs_sibling_call,
+                0,
+                byte_literal_rhs_sibling_call.len()
+            ),
+            Some(PrimTy::Byte),
+            "an independent valid Byte sibling remains typed after an RHS mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_rhs_mismatch_owner,
+                byte_literal_rhs_mismatch_function,
+                byte_literal_rhs_sibling_call,
+                "apply_byte(".len(),
+                "b'b' ^ valid".len()
+            ),
+            Some(PrimTy::Byte),
+            "the independent valid Byte sibling operator remains typed after an RHS mismatch"
+        );
+
+        let byte_literal_parameter_call = "apply_i32(b'a' & right)";
+        let byte_literal_parameter_operator = "b'a' & right";
+        let byte_literal_parameter_function = "pub fn bitwise_byte_literal_left_parameter_mismatch";
+        let byte_literal_parameter_mismatch_owner = bitwise_byte_literal_left_parameter_mismatch;
+        let byte_literal_parameter_diagnostics = match byte_literal_parameter_mismatch_owner
+            .body_type_check()
+            .expect("Byte-literal-left call-parameter mismatch body is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("Byte-literal-left parameter mismatch remains supported")
+            }
+        };
+        assert_eq!(
+            byte_literal_parameter_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch]
+        );
+        assert_eq!(
+            byte_literal_parameter_diagnostics[0].message,
+            "expected `I32`, found `Byte`"
+        );
+        let byte_literal_parameter_function_start = root
+            .find(byte_literal_parameter_function)
+            .expect("Byte-literal-left call-parameter mismatch function exists");
+        let byte_literal_parameter_expression_start = byte_literal_parameter_function_start
+            + root[byte_literal_parameter_function_start..]
+                .find(byte_literal_parameter_operator)
+                .expect("Byte-literal-left call-parameter mismatch operator exists");
+        assert_eq!(
+            byte_literal_parameter_diagnostics[0]
+                .primary()
+                .expect("call-parameter mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(byte_literal_parameter_expression_start as u32,),
+                sai_diagnostics::TextSize::new(
+                    (byte_literal_parameter_expression_start
+                        + byte_literal_parameter_operator.len()) as u32,
+                ),
+            )
+            .expect("Byte-literal-left parameter mismatch span is ordered")
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_parameter_mismatch_owner,
+                byte_literal_parameter_function,
+                byte_literal_parameter_call,
+                0,
+                byte_literal_parameter_call.len()
+            ),
+            None,
+            "an outer parameter mismatch suppresses the containing direct-call fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_parameter_mismatch_owner,
+                byte_literal_parameter_function,
+                byte_literal_parameter_call,
+                "apply_i32(".len(),
+                byte_literal_parameter_operator.len()
+            ),
+            None,
+            "an outer parameter mismatch suppresses the Byte bitwise result fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_parameter_mismatch_owner,
+                byte_literal_parameter_function,
+                byte_literal_parameter_call,
+                "apply_i32(".len(),
+                "b'a'".len()
+            ),
+            None,
+            "the established Byte-literal-left path does not publish a separate literal fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_parameter_mismatch_owner,
+                byte_literal_parameter_function,
+                byte_literal_parameter_call,
+                "apply_i32(b'a' & ".len(),
+                "right".len()
+            ),
+            Some(PrimTy::Byte),
+            "the concrete Byte RHS path fact survives an outer parameter mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_parameter_mismatch_owner,
+                byte_literal_parameter_function,
+                "let alias = result",
+                "let alias = ".len(),
+                "result".len()
+            ),
+            None,
+            "an inferred alias remains tainted after the parameter mismatch"
+        );
+        let byte_literal_parameter_sibling_call = "apply_byte(b'b' ^ right)";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_parameter_mismatch_owner,
+                byte_literal_parameter_function,
+                byte_literal_parameter_sibling_call,
+                0,
+                byte_literal_parameter_sibling_call.len()
+            ),
+            Some(PrimTy::Byte),
+            "an independent valid Byte sibling remains typed after a parameter mismatch"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_literal_parameter_mismatch_owner,
+                byte_literal_parameter_function,
+                byte_literal_parameter_sibling_call,
+                "apply_byte(".len(),
+                "b'b' ^ right".len()
+            ),
+            Some(PrimTy::Byte),
+            "the independent valid Byte sibling operator remains typed after a parameter mismatch"
+        );
 
         let annotated_bitwise_call = "apply_bool(left & right)";
         let annotated_bitwise_expression = "left & right";
