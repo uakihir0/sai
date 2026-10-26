@@ -728,34 +728,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             _ => return Err(()),
                         }
                     } else {
-                        let operand_type = self
-                            .check_local_path(operand)
-                            .ok()
-                            .and_then(|local_type| self.concrete_local_type(local_type))
-                            .filter(|primitive| supports_primitive_literal(*primitive))
-                            .ok_or(())?;
-                        if !is_bitwise_primitive(operand_type) {
-                            self.errors.push(PrimitiveBodyError {
-                                node: init.hir_id,
-                                kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
-                                    operator: UnOp::BitNot,
-                                    operand: operand_type,
-                                },
-                            });
-                        }
+                        let local_type = self.check_bitwise_not_path(operand, init.hir_id)?;
                         if let Some(expected) = annotation {
-                            if expected != operand_type {
-                                self.errors.push(PrimitiveBodyError {
-                                    node: init.hir_id,
-                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                        expected,
-                                        found: operand_type,
-                                    },
-                                });
-                            }
+                            self.check_annotated_path(local_type, expected, init.hir_id)?;
                             LocalType::Concrete(expected)
                         } else {
-                            LocalType::Concrete(operand_type)
+                            local_type
                         }
                     }
                 }
@@ -2494,10 +2472,40 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
+                ExprKind::Unary(UnOp::BitNot, operand)
+                    if is_supported_direct_call_bitwise_not_operand(operand) =>
+                {
+                    let local_type = self.check_bitwise_not_path(operand, argument.expr.hir_id)?;
+                    self.record_expression_type(argument.expr.hir_id, local_type);
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
                 _ => return Err(()),
             }
         }
         Ok(LocalType::Concrete(signature.output))
+    }
+
+    fn check_bitwise_not_path(
+        &mut self,
+        operand: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<LocalType, ()> {
+        let operand_type = self
+            .check_local_path(operand)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+        if !is_bitwise_primitive(operand_type) {
+            self.errors.push(PrimitiveBodyError {
+                node: expression,
+                kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                    operator: UnOp::BitNot,
+                    operand: operand_type,
+                },
+            });
+        }
+        Ok(LocalType::Concrete(operand_type))
     }
 
     fn check_logical_not(&mut self, operand: &'hir Expr<'hir>) -> Result<LocalType, ()> {
@@ -4985,6 +4993,10 @@ fn is_supported_direct_call_not_operand(operand: &Expr<'_>) -> bool {
         operand.kind,
         ExprKind::Path(_) | ExprKind::Lit(Lit::Bool(_))
     )
+}
+
+fn is_supported_direct_call_bitwise_not_operand(operand: &Expr<'_>) -> bool {
+    matches!(operand.kind, ExprKind::Path(_))
 }
 
 fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
