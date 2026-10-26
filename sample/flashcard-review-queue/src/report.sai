@@ -1,0 +1,31 @@
+use acme:flashcard-review-queue/data
+use acme:flashcard-review-queue/model.{Rating}
+use acme:flashcard-review-queue/review
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+pub fn print_due(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let cards = data.all()
+    out.write_str(
+        f"Due cards ({review.due_count(data.TODAY)}/{cards.len()}) — day {data.TODAY}\n".as_str(),
+    )
+    for card in cards {
+        if review.is_due(card, data.TODAY) {
+            out.write_str(
+                f"#{card.id} {card.prompt} — {card.answer} (due day {card.due_day})\n".as_str(),
+            )
+        }
+    }
+}
+
+pub fn print_preview(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let updated = review.apply(data.all()[1], Rating.Hard, data.TODAY)
+    out.write_str(f"Review example: #{updated.id} {updated.prompt} — hard\n".as_str())
+    out.write_str(
+        f"interval: 7 -> {updated.interval_days} days; next review: day {updated.due_day}; streak {updated.streak}\n".as_str(),
+    )
+}

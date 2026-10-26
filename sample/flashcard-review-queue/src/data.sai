@@ -1,0 +1,19 @@
+use acme:flashcard-review-queue/model.{Card}
+
+pub const TODAY: U32 = 12
+
+pub fn all() -> Array<Card, 4> {
+    [
+        Card(
+            id: 101,
+            prompt: "ありがとう",
+            answer: "thank you",
+            due_day: 12,
+            interval_days: 3,
+            streak: 2,
+        ),
+        Card(id: 102, prompt: "駅", answer: "station", due_day: 10, interval_days: 7, streak: 3),
+        Card(id: 103, prompt: "あさ", answer: "morning", due_day: 12, interval_days: 1, streak: 0),
+        Card(id: 104, prompt: "ゆき", answer: "snow", due_day: 14, interval_days: 14, streak: 4),
+    ]
+}
