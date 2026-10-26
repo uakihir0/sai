@@ -9274,7 +9274,7 @@ fn is_supported_direct_call_bitwise_operands_shape(
     }
 
     if matches!(left.kind, ExprKind::Lit(Lit::Byte(_))) {
-        if matches!(right.kind, ExprKind::Lit(Lit::Byte(_))) {
+        if matches!(right.kind, ExprKind::Lit(Lit::Byte(_) | Lit::Int { .. })) {
             return true;
         }
         let ExprKind::Path(path) = right.kind else {
@@ -49154,7 +49154,25 @@ property "shared"() {}
             "    let mismatched = apply_i32(b'a' & b'b')\n",
             "    apply_byte(b'c' ^ valid)\n",
             "}\n",
-            "pub fn bitwise_byte_integer_literal_pair_unsupported() -> Byte { apply_byte(b'a' & 1) }\n",
+            "pub fn bitwise_byte_integer_literal_root(valid: Byte) -> Byte {\n",
+            "    let and_value = apply_byte(b'a' & 1)\n",
+            "    let or_value = apply_byte(b'b' | -2)\n",
+            "    let xor_value = apply_byte(b'c' ^ 3)\n",
+            "    apply_byte(valid)\n",
+            "}\n",
+            "pub fn bitwise_byte_integer_literal_nested(valid: Byte) -> Byte {\n",
+            "    let and_value = apply_byte(apply_byte(b'd' & -4))\n",
+            "    let or_value = apply_byte(apply_byte(b'e' | 5))\n",
+            "    let xor_value = apply_byte(apply_byte(b'f' ^ -6))\n",
+            "    apply_byte(valid)\n",
+            "}\n",
+            "pub fn bitwise_byte_integer_literal_unary_rhs_unsupported(value: I32) -> Byte { apply_byte(b'a' & -value) }\n",
+            "pub fn bitwise_byte_integer_literal_computed_rhs_unsupported() -> Byte { apply_byte(b'a' | (1 + 2)) }\n",
+            "pub fn bitwise_byte_integer_literal_nested_operator_unsupported() -> Byte { apply_byte(b'a' ^ (1 | 2)) }\n",
+            "pub fn bitwise_byte_integer_literal_other_operator_unsupported(value: I32) -> Byte { apply_byte(b'a' << value) }\n",
+            "pub fn bitwise_byte_integer_literal_deep_call_unsupported() -> Byte { apply_byte(apply_byte(apply_byte(b'a' & 1))) }\n",
+            "pub fn bitwise_byte_integer_literal_generic_target_unsupported() -> I32 { generic_fn(b'a' & 1) }\n",
+            "pub fn bitwise_byte_integer_literal_unsupported_signature() -> I32 { text_fn(b'a' & 1) }\n",
             "pub fn bitwise_integer_byte_literal_pair_unsupported() -> I32 { apply_i32(1 | b'a') }\n",
             "pub fn bitwise_byte_literal_pair_computed_unsupported() -> Byte { apply_byte((b'a' & b'b') ^ b'c') }\n",
             "pub fn bitwise_byte_literal_pair_nested_operator_unsupported() -> Byte { apply_byte(b'a' & (b'b' | b'c')) }\n",
@@ -49277,7 +49295,6 @@ property "shared"() {}
             "pub fn bitwise_integer_literal_left_other_operator_unsupported(right: I32) -> I32 { apply_i32(1 << right) }\n",
             "pub fn bitwise_integer_literal_left_deep_call_unsupported(right: I32) -> I32 { apply_i32(apply_i32(apply_i32(1 & right))) }\n",
             "pub fn bitwise_byte_literal_rhs_bool_unsupported(right: Byte) -> Byte { apply_byte(b'x' & true) }\n",
-            "pub fn bitwise_byte_literal_rhs_integer_unsupported(right: Byte) -> Byte { apply_byte(b'x' & 1) }\n",
             "pub fn bitwise_byte_literal_rhs_char_unsupported(right: Byte) -> Byte { apply_byte(b'x' & 'a') }\n",
             "pub fn bitwise_byte_literal_rhs_float_unsupported(right: Byte) -> Byte { apply_byte(b'x' & 1.0) }\n",
             "pub fn bitwise_byte_literal_rhs_byte_string_unsupported(right: Byte) -> Byte { apply_byte(b'x' & b\"ab\") }\n",
@@ -50314,6 +50331,24 @@ property "shared"() {}
             "bitwise_byte_literal_pair_parameter_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
+        let bitwise_byte_integer_literal_root = assert_supported(
+            &database,
+            "bitwise_byte_integer_literal_root",
+            &[
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+        );
+        let bitwise_byte_integer_literal_nested = assert_supported(
+            &database,
+            "bitwise_byte_integer_literal_nested",
+            &[
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+        );
         let nested_bitwise_call_argument =
             assert_supported(&database, "nested_bitwise_call_argument", &[]);
         let nested_bitwise_and_call_argument =
@@ -50713,7 +50748,6 @@ property "shared"() {}
             "bitwise_integer_literal_left_other_operator_unsupported",
             "bitwise_integer_literal_left_deep_call_unsupported",
             "bitwise_byte_literal_rhs_bool_unsupported",
-            "bitwise_byte_literal_rhs_integer_unsupported",
             "bitwise_byte_literal_rhs_char_unsupported",
             "bitwise_byte_literal_rhs_float_unsupported",
             "bitwise_byte_literal_rhs_byte_string_unsupported",
@@ -50731,7 +50765,13 @@ property "shared"() {}
             "bitwise_float_literal_left_path_unsupported",
             "bitwise_integer_literal_pair_unary_left_unsupported",
             "bitwise_integer_literal_pair_unary_right_unsupported",
-            "bitwise_byte_integer_literal_pair_unsupported",
+            "bitwise_byte_integer_literal_unary_rhs_unsupported",
+            "bitwise_byte_integer_literal_computed_rhs_unsupported",
+            "bitwise_byte_integer_literal_nested_operator_unsupported",
+            "bitwise_byte_integer_literal_other_operator_unsupported",
+            "bitwise_byte_integer_literal_deep_call_unsupported",
+            "bitwise_byte_integer_literal_generic_target_unsupported",
+            "bitwise_byte_integer_literal_unsupported_signature",
             "bitwise_integer_byte_literal_pair_unsupported",
             "bitwise_byte_literal_pair_computed_unsupported",
             "bitwise_byte_literal_pair_nested_operator_unsupported",
@@ -53157,6 +53197,167 @@ property "shared"() {}
             Some(PrimTy::Byte),
             "the valid Byte sibling survives an integer-literal mismatch"
         );
+
+        for (owner, function, cases, nested) in [
+            (
+                bitwise_byte_integer_literal_root,
+                "pub fn bitwise_byte_integer_literal_root",
+                vec![
+                    ("apply_byte(b'a' & 1)", "b'a' & 1", "1", None),
+                    ("apply_byte(b'b' | -2)", "b'b' | -2", "-2", None),
+                    ("apply_byte(b'c' ^ 3)", "b'c' ^ 3", "3", None),
+                ],
+                false,
+            ),
+            (
+                bitwise_byte_integer_literal_nested,
+                "pub fn bitwise_byte_integer_literal_nested",
+                vec![
+                    (
+                        "apply_byte(apply_byte(b'd' & -4))",
+                        "b'd' & -4",
+                        "-4",
+                        Some("apply_byte(b'd' & -4)"),
+                    ),
+                    (
+                        "apply_byte(apply_byte(b'e' | 5))",
+                        "b'e' | 5",
+                        "5",
+                        Some("apply_byte(b'e' | 5)"),
+                    ),
+                    (
+                        "apply_byte(apply_byte(b'f' ^ -6))",
+                        "b'f' ^ -6",
+                        "-6",
+                        Some("apply_byte(b'f' ^ -6)"),
+                    ),
+                ],
+                true,
+            ),
+        ] {
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("Byte/integer literal direct-call body is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("Byte/integer literal direct-call mismatch remains supported")
+                }
+            };
+            assert_eq!(
+                diagnostics.len(),
+                cases.len(),
+                "each direct Byte/integer literal operator reports only its literal mismatch"
+            );
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>(),
+                ["expected `Byte`, found an integer literal"; 3],
+                "each mismatch reuses the existing Byte annotation diagnostic"
+            );
+            let function_start = root.find(function).expect("the test function exists");
+
+            for (diagnostic, (call, operator_expression, literal, inner_call)) in
+                diagnostics.iter().zip(cases)
+            {
+                assert_eq!(
+                    nested,
+                    inner_call.is_some(),
+                    "the fixture uses the requested root or one-level nested call depth"
+                );
+                assert_eq!(
+                    diagnostic.code,
+                    sai_diagnostics::Code::TypeMismatch,
+                    "the integer literal reports its existing Byte type mismatch"
+                );
+                let literal_start = function_start
+                    + root[function_start..]
+                        .find(literal)
+                        .expect("the signed or unsigned literal occurs in the function");
+                assert_eq!(
+                    diagnostic
+                        .primary()
+                        .expect("literal type mismatch has a primary span")
+                        .span
+                        .range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(literal_start as u32),
+                        sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                    )
+                    .expect("the integer literal mismatch span is ordered"),
+                    "the mismatch span covers the entire integer literal, including a minus sign"
+                );
+
+                let operator_start = call
+                    .find(operator_expression)
+                    .expect("the direct bitwise operator occurs in its call");
+                let literal_offset = operator_start
+                    + operator_expression
+                        .find(literal)
+                        .expect("the integer literal occurs in the operator");
+                assert_eq!(
+                    expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
+                    None,
+                    "a literal mismatch taints the containing call"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        call,
+                        operator_start,
+                        operator_expression.len()
+                    ),
+                    None,
+                    "a literal mismatch suppresses the operator fact"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        call,
+                        literal_offset,
+                        literal.len()
+                    ),
+                    None,
+                    "a mismatched integer literal receives no Byte fact"
+                );
+                if let Some(inner_call) = inner_call {
+                    let inner_start = call
+                        .find(inner_call)
+                        .expect("the one-level inner call occurs in the outer call");
+                    assert_eq!(
+                        expression_type_at_range(
+                            &mut database,
+                            owner,
+                            function,
+                            call,
+                            inner_start,
+                            inner_call.len()
+                        ),
+                        None,
+                        "the diagnostic taints the inner direct call"
+                    );
+                }
+            }
+
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    "apply_byte(valid)",
+                    0,
+                    "apply_byte(valid)".len()
+                ),
+                Some(PrimTy::Byte),
+                "Byte recovery keeps the containing body supported and preserves a valid sibling"
+            );
+        }
 
         let bitwise_char_literal_call = "identity_char(left ^ 1)";
         let bitwise_char_literal_expression = "left ^ 1";

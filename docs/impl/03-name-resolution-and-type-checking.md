@@ -3015,12 +3015,13 @@ already produced by that checker: the exact RHS path and operator/call
 results are available, but no separate left-literal fact is synthesized.
 If an enclosing call parameter mismatches the recovered `Byte` result, the
 operator and containing call facts are suppressed while the RHS path fact
-remains. Preserve valid sibling calls. Keep integer, Bool, Char,
-floating-point, and byte-string RHS literals, computed or nested operands,
+remains. Preserve valid sibling calls. Keep Bool, Char, floating-point, and
+byte-string RHS literals, computed or nested operands,
 unresolved/self/forward paths, and preceding numeric locals whose type remains
 unconstrained gated; those locals pass the shape check but must remain
-Unsupported without facts or diagnostics. IR-973 below admits only a direct
-Byte/Byte literal pair. Also reject deeper calls and unsupported
+Unsupported without facts or diagnostics. IR-973 below admits a direct
+Byte/Byte literal pair, and IR-974 below admits a direct integer-literal RHS
+with the existing Byte literal mismatch and recovery. Also reject deeper calls and unsupported
 targets/signatures. Preserve the CLI Stage 0 gate and add no lowering/runtime
 behavior. The recovery, fact, gate, and scope choices are **Review required**.
 
@@ -3032,12 +3033,31 @@ root or existing one-level nested direct-call argument position. Reuse
 separate literal expression facts are synthesized. If the enclosing
 parameter is `I32`, report the existing `TYPE_MISMATCH` over the complete
 operator argument span; suppress that operator and call's facts while keeping
-the literal pair fact-free and preserving independent valid siblings. Reject
-mixed Byte/integer literal pairs in either order, other literal families,
-byte strings, computed or nested operators, deeper calls, generic targets,
-and unsupported signatures. Keep the CLI Stage 0 gate unchanged and add no
-bitwise lowering or runtime behavior. These shape, fact, mismatch, and gate
-decisions are **Review required**.
+the literal pair fact-free and preserving independent valid siblings. At this
+step, reject mixed Byte/integer literal pairs in either order, other literal
+families, byte strings, computed or nested operators, deeper calls, generic
+targets, and unsupported signatures. IR-974 below adds only direct
+Byte-left/integer-right pairs, with the existing Byte literal mismatch and
+recovery; the reverse order remains unsupported. Keep the CLI Stage 0 gate
+unchanged and add no bitwise lowering or runtime behavior. These shape, fact,
+mismatch, and gate decisions are **Review required**.
+
+**IR-974 direct-call bitwise integer RHS on a Byte literal LHS** additionally
+admits a direct integer literal, including an HIR-folded negative integer
+literal, on the right of a direct Byte character literal for exactly one `&`,
+`|`, or `^` at the root or existing one-level nested direct-call argument
+position. Reuse `check_bitwise` and `check_annotated_literal`: the integer
+literal is checked as `Byte`, so the existing literal `TYPE_MISMATCH` covers
+the complete integer source span (including a folded minus sign), and the
+operator recovers as `Byte`. The operand diagnostic taints the operator and
+containing call facts, and the mismatched literal receives no fabricated
+`Byte` fact; independent valid siblings remain typed. Since an integer literal
+does not have `Byte` type, this is a diagnostic-recovery shape, not a
+successful mixed-type operation. Reject arbitrary unary expressions, other
+RHS literal kinds, integer-left/Byte-right pairs, computed or nested
+operators, deeper calls, and generic or unsupported-signature targets. Keep
+the CLI Stage 0 gate unchanged and add no lowering/runtime behavior. These
+shape, recovery, span, fact, and gate choices are **Review required**.
 
 - **Review required:** Check that the driver and body-checker gates agree for
   all three operators at root and one-level nested positions, with exact
