@@ -19215,7 +19215,6 @@ fn binary_bitwise_byte_literal_lhs_path_arguments_remain_behind_the_stage_gate()
         "    let right = 1\n",
         "    identity_byte(b'a' & right)\n",
         "}\n",
-        "pub fn byte_literal_lhs_byte_pair_stays_gated() -> Byte { identity_byte(b'a' & b'b') }\n",
         "pub fn byte_literal_lhs_integer_rhs_stays_gated() -> Byte { identity_byte(b'a' | 1) }\n",
         "pub fn byte_literal_lhs_computed_rhs_stays_gated(right: Byte) -> Byte { identity_byte(b'a' ^ (right | b'b')) }\n",
         "pub fn byte_literal_lhs_deep_call_stays_gated(right: Byte) -> Byte { identity_byte(identity_byte(identity_byte(b'a' & right))) }\n",
@@ -19225,6 +19224,38 @@ fn binary_bitwise_byte_literal_lhs_path_arguments_remain_behind_the_stage_gate()
     assert_check_stays_gated_without_syntax_errors(
         &output,
         "root and one-level nested direct calls with Byte-literal-left bitwise path operands",
+    );
+}
+
+#[test]
+fn binary_bitwise_byte_literal_pairs_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn byte_literal_pair_root() -> Byte {\n",
+        "    let and_value = identity_byte(b'a' & b'b')\n",
+        "    let or_value = identity_byte(b'c' | b'd')\n",
+        "    identity_byte(b'e' ^ b'f')\n",
+        "}\n",
+        "pub fn byte_literal_pair_nested() -> Byte {\n",
+        "    let and_value = identity_byte(identity_byte(b'a' & b'b'))\n",
+        "    let or_value = identity_byte(identity_byte(b'c' | b'd'))\n",
+        "    identity_byte(identity_byte(b'e' ^ b'f'))\n",
+        "}\n",
+        "pub fn mixed_byte_integer_left_pair_stays_gated() -> Byte { identity_byte(b'a' & 1) }\n",
+        "pub fn mixed_integer_byte_right_pair_stays_gated() -> I32 { identity_i32(1 | b'a') }\n",
+        "pub fn computed_byte_pair_stays_gated() -> Byte { identity_byte((b'a' & b'b') ^ b'c') }\n",
+        "pub fn nested_byte_operator_pair_stays_gated() -> Byte { identity_byte(b'a' & (b'b' | b'c')) }\n",
+        "pub fn deep_byte_pair_call_stays_gated() -> Byte { identity_byte(identity_byte(identity_byte(b'a' & b'b'))) }\n",
+        "pub fn generic_byte_pair_target_stays_gated() -> I32 { generic_identity(b'a' ^ b'b') }\n",
+        "pub fn unsupported_byte_pair_signature_stays_gated() -> I32 { text_fn(b'a' | b'b') }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn generic_identity<T>(value: T) -> I32 { 0 }\n",
+        "fn text_fn(value: Str) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "Byte/Byte literal pairs plus unsupported mixed and computed direct-call shapes",
     );
 }
 

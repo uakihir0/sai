@@ -9274,6 +9274,9 @@ fn is_supported_direct_call_bitwise_operands_shape(
     }
 
     if matches!(left.kind, ExprKind::Lit(Lit::Byte(_))) {
+        if matches!(right.kind, ExprKind::Lit(Lit::Byte(_))) {
+            return true;
+        }
         let ExprKind::Path(path) = right.kind else {
             return false;
         };
@@ -49137,6 +49140,27 @@ property "shared"() {}
             "    let valid = apply_byte(b'b' ^ right)\n",
             "    valid\n",
             "}\n",
+            "pub fn bitwise_byte_literal_pair_root() -> Byte {\n",
+            "    let and_value = apply_byte(b'a' & b'b')\n",
+            "    let or_value = apply_byte(b'c' | b'd')\n",
+            "    apply_byte(b'e' ^ b'f')\n",
+            "}\n",
+            "pub fn bitwise_byte_literal_pair_nested() -> Byte {\n",
+            "    let and_value = apply_byte(apply_byte(b'a' & b'b'))\n",
+            "    let or_value = apply_byte(apply_byte(b'c' | b'd'))\n",
+            "    apply_byte(apply_byte(b'e' ^ b'f'))\n",
+            "}\n",
+            "pub fn bitwise_byte_literal_pair_parameter_mismatch(valid: Byte) -> Byte {\n",
+            "    let mismatched = apply_i32(b'a' & b'b')\n",
+            "    apply_byte(b'c' ^ valid)\n",
+            "}\n",
+            "pub fn bitwise_byte_integer_literal_pair_unsupported() -> Byte { apply_byte(b'a' & 1) }\n",
+            "pub fn bitwise_integer_byte_literal_pair_unsupported() -> I32 { apply_i32(1 | b'a') }\n",
+            "pub fn bitwise_byte_literal_pair_computed_unsupported() -> Byte { apply_byte((b'a' & b'b') ^ b'c') }\n",
+            "pub fn bitwise_byte_literal_pair_nested_operator_unsupported() -> Byte { apply_byte(b'a' & (b'b' | b'c')) }\n",
+            "pub fn bitwise_byte_literal_pair_deep_call_unsupported() -> Byte { apply_byte(apply_byte(apply_byte(b'a' & b'b'))) }\n",
+            "pub fn bitwise_byte_literal_pair_generic_target_unsupported() -> I32 { generic_fn(b'a' ^ b'b') }\n",
+            "pub fn bitwise_byte_literal_pair_unsupported_signature() -> I32 { text_fn(b'a' | b'b') }\n",
             "pub fn bitwise_byte_call_parameter_mismatch(left: Byte) -> I32 {\n",
             "    let result = apply_i32(left & b'a')\n",
             "    let sibling = apply_byte(left ^ b'b')\n",
@@ -49281,7 +49305,6 @@ property "shared"() {}
             "pub fn bitwise_float_literal_left_path_unsupported(right: F32) -> F32 { float_fn(1.0 & right) }\n",
             "pub fn bitwise_integer_literal_pair_unary_left_unsupported(value: I32) -> I32 { apply_i32(-value & 2) }\n",
             "pub fn bitwise_integer_literal_pair_unary_right_unsupported(value: I32) -> I32 { apply_i32(1 | -value) }\n",
-            "pub fn bitwise_byte_literal_pair_unsupported() -> Byte { apply_byte(b'a' & b'b') }\n",
             "pub fn bitwise_bool_literal_pair_unsupported() -> Bool { apply_bool(true | false) }\n",
             "pub fn bitwise_char_literal_pair_unsupported() -> Char { identity_char('a' ^ 'b') }\n",
             "pub fn bitwise_float_literal_pair_unsupported() -> F32 { float_fn(1.0 & 2.0) }\n",
@@ -50282,6 +50305,15 @@ property "shared"() {}
             assert_supported(&database, "bitwise_byte_literal_left_nested", &[]);
         let bitwise_byte_literal_left_local =
             assert_supported(&database, "bitwise_byte_literal_left_local", &[]);
+        let bitwise_byte_literal_pair_root =
+            assert_supported(&database, "bitwise_byte_literal_pair_root", &[]);
+        let bitwise_byte_literal_pair_nested =
+            assert_supported(&database, "bitwise_byte_literal_pair_nested", &[]);
+        let bitwise_byte_literal_pair_parameter_mismatch = assert_supported(
+            &database,
+            "bitwise_byte_literal_pair_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         let nested_bitwise_call_argument =
             assert_supported(&database, "nested_bitwise_call_argument", &[]);
         let nested_bitwise_and_call_argument =
@@ -50699,7 +50731,13 @@ property "shared"() {}
             "bitwise_float_literal_left_path_unsupported",
             "bitwise_integer_literal_pair_unary_left_unsupported",
             "bitwise_integer_literal_pair_unary_right_unsupported",
-            "bitwise_byte_literal_pair_unsupported",
+            "bitwise_byte_integer_literal_pair_unsupported",
+            "bitwise_integer_byte_literal_pair_unsupported",
+            "bitwise_byte_literal_pair_computed_unsupported",
+            "bitwise_byte_literal_pair_nested_operator_unsupported",
+            "bitwise_byte_literal_pair_deep_call_unsupported",
+            "bitwise_byte_literal_pair_generic_target_unsupported",
+            "bitwise_byte_literal_pair_unsupported_signature",
             "bitwise_bool_literal_pair_unsupported",
             "bitwise_char_literal_pair_unsupported",
             "bitwise_float_literal_pair_unsupported",
@@ -55240,6 +55278,95 @@ property "shared"() {}
                 }
             }
         }
+        for (owner, function, nested) in [
+            (
+                bitwise_byte_literal_pair_root,
+                "pub fn bitwise_byte_literal_pair_root",
+                false,
+            ),
+            (
+                bitwise_byte_literal_pair_nested,
+                "pub fn bitwise_byte_literal_pair_nested",
+                true,
+            ),
+        ] {
+            for (operator, left, right) in [
+                ("&", "b'a'", "b'b'"),
+                ("|", "b'c'", "b'd'"),
+                ("^", "b'e'", "b'f'"),
+            ] {
+                let operator_expression = format!("{left} {operator} {right}");
+                let inner_call = format!("apply_byte({operator_expression})");
+                let call = if nested {
+                    format!("apply_byte({inner_call})")
+                } else {
+                    inner_call.clone()
+                };
+                let operator_start = call
+                    .find(&operator_expression)
+                    .expect("the Byte literal pair is in its call");
+                let right_start = operator_start + left.len() + 1 + operator.len() + 1;
+                assert_eq!(
+                    expression_type_at_range(&mut database, owner, function, &call, 0, call.len()),
+                    Some(PrimTy::Byte),
+                    "the Byte/Byte `{operator}` call has a Byte result at the {} position",
+                    if nested { "nested" } else { "root" }
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &call,
+                        operator_start,
+                        operator_expression.len()
+                    ),
+                    Some(PrimTy::Byte),
+                    "the Byte/Byte `{operator}` operator fact is preserved"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &call,
+                        operator_start,
+                        left.len()
+                    ),
+                    None,
+                    "Byte/Byte checking does not synthesize a separate left literal fact"
+                );
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        &call,
+                        right_start,
+                        right.len()
+                    ),
+                    None,
+                    "Byte/Byte checking does not synthesize a separate right literal fact"
+                );
+                if nested {
+                    let inner_start = call
+                        .find(&inner_call)
+                        .expect("the outer call contains its inner direct call");
+                    assert_eq!(
+                        expression_type_at_range(
+                            &mut database,
+                            owner,
+                            function,
+                            &call,
+                            inner_start,
+                            inner_call.len()
+                        ),
+                        Some(PrimTy::Byte),
+                        "the inner direct call fact is preserved for Byte/Byte `{operator}`"
+                    );
+                }
+            }
+        }
         let byte_literal_local_call = "apply_byte(b'a' ^ prior)";
         assert_eq!(
             expression_type_at_range(
@@ -55820,6 +55947,138 @@ property "shared"() {}
             ),
             Some(PrimTy::Byte),
             "the independent valid Byte sibling operator remains typed after a parameter mismatch"
+        );
+
+        let byte_pair_parameter_call = "apply_i32(b'a' & b'b')";
+        let byte_pair_parameter_argument = "b'a' & b'b'";
+        let byte_pair_parameter_function = "pub fn bitwise_byte_literal_pair_parameter_mismatch";
+        let byte_pair_parameter_owner = bitwise_byte_literal_pair_parameter_mismatch;
+        let byte_pair_parameter_diagnostics = match byte_pair_parameter_owner
+            .body_type_check()
+            .expect("Byte-pair call-parameter mismatch body is available")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("Byte-pair call-parameter mismatch remains supported")
+            }
+        };
+        assert_eq!(
+            byte_pair_parameter_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch]
+        );
+        assert_eq!(
+            byte_pair_parameter_diagnostics[0].message,
+            "expected `I32`, found `Byte`"
+        );
+        let byte_pair_parameter_function_start = root
+            .find(byte_pair_parameter_function)
+            .expect("Byte-pair call-parameter mismatch function exists");
+        let byte_pair_parameter_argument_start = byte_pair_parameter_function_start
+            + root[byte_pair_parameter_function_start..]
+                .find(byte_pair_parameter_argument)
+                .expect("Byte-pair argument occurs in the mismatch function");
+        assert_eq!(
+            byte_pair_parameter_diagnostics[0]
+                .primary()
+                .expect("Byte-pair parameter mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(byte_pair_parameter_argument_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (byte_pair_parameter_argument_start + byte_pair_parameter_argument.len())
+                        as u32,
+                ),
+            )
+            .expect("Byte-pair argument span is ordered")
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_pair_parameter_owner,
+                byte_pair_parameter_function,
+                byte_pair_parameter_call,
+                0,
+                byte_pair_parameter_call.len()
+            ),
+            None,
+            "an outer I32-parameter mismatch suppresses the containing call fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_pair_parameter_owner,
+                byte_pair_parameter_function,
+                byte_pair_parameter_call,
+                "apply_i32(".len(),
+                byte_pair_parameter_argument.len()
+            ),
+            None,
+            "the mismatched outer call suppresses the Byte/Byte operator fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_pair_parameter_owner,
+                byte_pair_parameter_function,
+                byte_pair_parameter_call,
+                "apply_i32(".len(),
+                "b'a'".len()
+            ),
+            None,
+            "the mismatched Byte pair does not publish a separate left literal fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_pair_parameter_owner,
+                byte_pair_parameter_function,
+                byte_pair_parameter_call,
+                "apply_i32(b'a' & ".len(),
+                "b'b'".len()
+            ),
+            None,
+            "the mismatched Byte pair does not publish a separate right literal fact"
+        );
+        let byte_pair_parameter_sibling = "apply_byte(b'c' ^ valid)";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_pair_parameter_owner,
+                byte_pair_parameter_function,
+                byte_pair_parameter_sibling,
+                0,
+                byte_pair_parameter_sibling.len()
+            ),
+            Some(PrimTy::Byte),
+            "an independent valid Byte sibling retains its call fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_pair_parameter_owner,
+                byte_pair_parameter_function,
+                byte_pair_parameter_sibling,
+                "apply_byte(".len(),
+                "b'c' ^ valid".len()
+            ),
+            Some(PrimTy::Byte),
+            "an independent valid Byte sibling retains its operator fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                byte_pair_parameter_owner,
+                byte_pair_parameter_function,
+                byte_pair_parameter_sibling,
+                "apply_byte(b'c' ^ ".len(),
+                "valid".len()
+            ),
+            Some(PrimTy::Byte),
+            "the sibling's resolved Byte path fact remains available"
         );
 
         let annotated_bitwise_call = "apply_bool(left & right)";
