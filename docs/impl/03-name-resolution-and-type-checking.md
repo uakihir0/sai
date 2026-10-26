@@ -2828,6 +2828,25 @@ short-circuit behavior, direct-call target/signature restrictions, common
 prefix and nesting rules, and the CLI Stage 0 gate. Other literal kinds,
 `not` or any nested/chained logical expression, computed or call operands,
 unsupported calls or signatures, and deeper call nesting remain unsupported.
+**IR-964 unary bitwise NOT call arguments** add exactly one unary `~` node as
+an immediate positional argument to an eligible direct call or its existing
+one-level nested call. Its operand must be a plain, one-segment,
+non-generic path resolving by exact `BindingId` to an eligible function
+parameter or a local declared before the expression, with a concrete type
+already known to the body checker. Reuse the IR-779 unary `BitNot` checker:
+all ten integer primitive types and `Byte` are supported, and a successful
+expression keeps the operand type under its exact owner `HirId`. `Bool`,
+`Char`, `F32`, and `F64` retain the existing `OPERATOR_NOT_SUPPORTED`
+diagnostic. A numeric-literal-origin local whose type is still unresolved,
+such as `let value = 1; apply(~value)`, is `Unsupported`; the call parameter
+does not infer the local's type for this projection. Operand/operator or
+expected-parameter errors taint the containing call and inferred local
+dependents; retain valid independent siblings and publish only untainted
+facts. Keep direct-call target/signature, common-prefix, nested-call-depth,
+and CLI Stage 0 gates unchanged. Literals, repeated `~`, other unary or
+compound operands, calls as operands, unsupported calls or signatures, and
+deeper call nesting remain unsupported; this type-checking projection adds no
+bitwise lowering or runtime behavior.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
