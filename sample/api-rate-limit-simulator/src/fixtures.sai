@@ -1,0 +1,24 @@
+use acme:api-rate-limit-simulator/model.{ClientBucket, Request, Scenario}
+
+pub fn scenario() -> Scenario {
+    Scenario(
+        clients: [
+            ClientBucket(client_id: 101, window_start_seconds: 0, admitted_count: 0),
+            ClientBucket(client_id: 202, window_start_seconds: 0, admitted_count: 0),
+        ],
+        requests: [
+            Request(request_id: 9001, client_id: 101, at_seconds: 0),
+            Request(request_id: 9002, client_id: 202, at_seconds: 0),
+            Request(request_id: 9003, client_id: 101, at_seconds: 3),
+            Request(request_id: 9004, client_id: 101, at_seconds: 9),
+            Request(request_id: 9005, client_id: 202, at_seconds: 9),
+            Request(request_id: 9006, client_id: 101, at_seconds: 10),
+            Request(request_id: 9007, client_id: 202, at_seconds: 10),
+            Request(request_id: 9008, client_id: 101, at_seconds: 11),
+            Request(request_id: 9009, client_id: 101, at_seconds: 19),
+            Request(request_id: 9010, client_id: 202, at_seconds: 19),
+            Request(request_id: 9011, client_id: 101, at_seconds: 20),
+            Request(request_id: 9012, client_id: 303, at_seconds: 20),
+        ],
+    )
+}

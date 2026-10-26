@@ -112,6 +112,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`drinking-water-incident-coordinator`](drinking-water-incident-coordinator/README.md) | Coordinate fictional drinking-water incidents from qualified sensor and lab evidence through affected-zone advisories, alternate supply, and recovery checks. |
 | Advanced | [`research-data-release-auditor`](research-data-release-auditor/README.md) | Gate research dataset releases on source lineage, contributor consent, disclosure risk, integrity, retention, embargoes, legal holds, and parent decisions. |
 | Advanced | [`digital-archive-preservation-planner`](digital-archive-preservation-planner/README.md) | Prioritize fixed-fixture digital archive migrations and replicas under fixity, permission, independent-copy, byte-budget, and task-limit rules. |
+| Advanced | [`api-rate-limit-simulator`](api-rate-limit-simulator/README.md) | Replay per-client API requests against independent fixed-window limits, including exact-boundary resets, retry times, and unknown clients. |
 
 ## Longer walkthroughs
 
