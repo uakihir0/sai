@@ -19213,6 +19213,8 @@ fn unary_bitwise_not_path_arguments_to_direct_calls_remain_behind_the_stage_gate
 fn unary_bitwise_not_literal_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn integer_root() -> I8 { identity_i8(~1) }\n",
+        "pub fn integer_negative_minimum() -> I8 { identity_i8(~-128) }\n",
+        "pub fn integer_negative_out_of_range() -> I8 { identity_i8(~-129) }\n",
         "pub fn integer_nested() -> U16 { identity_u16(identity_u16(~1)) }\n",
         "pub fn byte_root() -> Byte { identity_byte(~b'a') }\n",
         "pub fn byte_nested() -> Byte { identity_byte(identity_byte(~b'b')) }\n",
