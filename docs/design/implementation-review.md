@@ -4,6 +4,14 @@
 
 ## Open for review
 
+### Sample projects (2026-10-27): add richer source examples
+
+- **Decision:** Add two project-shaped examples beyond Hello World: a robust sensor-statistics lab using median/MAD with bounded arithmetic, and a typed bytecode verifier using a bounded control-flow worklist and stack-join checks. Keep deterministic fixtures and document their current compiler-stage limits.
+- **Reason:** These examples exercise realistic algorithms, explicit edge-case policies, control-flow analysis, and recovery while the compiler still lacks stages needed to claim they build and run. The greeting sample remains a conventional “Hello, world!” program.
+- **Boundary and judgment:** Present the new samples as source projects; state that `sai check` reports the documented Stage 0 and `@derive` gates. Do not imply runtime correctness or executable output. The selected domains, bounded arithmetic policy, verifier worklist/join model, and feature-gate wording are **Review required**.
+- **Review required:** Check that the sample algorithms and fixtures are internally consistent, arithmetic bounds prevent overflow, verifier propagation terminates and rejects incompatible joins, and the catalog links remain accurate. Revisit executable claims when the required compiler stages land.
+- **Verification:** Both sample folders pass `sai fmt --check`; all 117 relative catalog links resolve; `sai check` reports only documented stage gates. Independent hostile reviews found no actionable sample issues. The full workspace test passed in CI on Ubuntu, Windows, and macOS.
+
 ### IR-001: Build the reference implementation incrementally from Stage 0
 
 - **Decision:** Start with source locations and diagnostics, then implement the Stage 0 frontend and tools in dependency order. Do not create placeholder crates for later phases before they have a concrete implementation.
