@@ -1,0 +1,88 @@
+use acme:robust-statistics-lab/analyzer
+use acme:robust-statistics-lab/fixtures
+use acme:robust-statistics-lab/model.{AnalysisError, AnalysisReport, BatchSummary, Outlier}
+use acme:robust-statistics-lab/policy
+use acme:robust-statistics-lab/statistics
+
+pub fn fixture_report() -> AnalysisReport {
+    analyzer.analyze(fixtures.batches()).unwrap()
+}
+
+fn summary_at(report: AnalysisReport, index: USize) -> BatchSummary {
+    report.summaries[index].unwrap()
+}
+
+fn outlier_at(report: AnalysisReport, index: USize) -> Outlier {
+    report.outliers[index].unwrap()
+}
+
+test "median and MAD resist one extreme measurement" {
+    let report = fixture_report()
+    let north = summary_at(report, 0)
+
+    assert report.batch_count == 3
+    assert report.measurement_count == 27
+    assert report.outlier_count == 2
+    assert north.median == 12
+    assert north.median_absolute_deviation == 2
+    assert north.outlier_threshold == 8
+    assert north.outlier_count == 1
+
+    let flagged = outlier_at(report, 0)
+    assert flagged.sensor_id == 10
+    assert flagged.reading_index == 8
+    assert flagged.observed == 100
+    assert flagged.absolute_deviation == 88
+}
+
+test "ordinary variation inside the robust threshold is not flagged" {
+    let report = fixture_report()
+    let riverside = summary_at(report, 1)
+
+    assert riverside.median == 20
+    assert riverside.median_absolute_deviation == 1
+    assert riverside.outlier_threshold == 4
+    assert riverside.outlier_count == 0
+}
+
+test "zero MAD falls back to flagging readings different from the median" {
+    let report = fixture_report()
+    let market = summary_at(report, 2)
+
+    assert market.median == 7
+    assert market.median_absolute_deviation == 0
+    assert market.outlier_threshold == 0
+    assert market.outlier_count == 1
+
+    let flagged = outlier_at(report, 1)
+    assert flagged.sensor_id == 30
+    assert flagged.reading_index == 8
+    assert flagged.observed == 20
+}
+
+test "median sorts a copy and does not reorder the input" {
+    let values = [9, 10, 10, 11, 12, 12, 13, 14, 100]
+    assert statistics.median(values) == 12
+    assert values[0] == 9
+    assert values[8] == 100
+}
+
+test "the absolute difference helper is symmetric" {
+    assert policy.absolute_difference(5, 9) == 4
+    assert policy.absolute_difference(9, 5) == 4
+}
+
+test "threshold multiplication rejects values outside the safe range" {
+    assert policy.threshold_for(policy.MAX_SAFE_MAD) == Ok(4294967292)
+    assert (
+        policy.threshold_for(policy.MAX_SAFE_MAD + 1)
+        == Err(AnalysisError.ThresholdOutOfRange(1073741824))
+    )
+}
+
+test "out-of-range input is rejected before threshold arithmetic" {
+    var batches = fixtures.batches()
+    batches[0].readings[8] = policy.MAX_READING + 1
+
+    assert analyzer.analyze(batches) == Err(AnalysisError.ReadingOutOfRange(1000001))
+}

@@ -1,0 +1,52 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MeasurementBatch {
+    pub sensor_id: U32
+    pub sensor_name: Str
+    // Exactly nine bounded integer readings, in source order.
+    pub readings: Array<U32, 9>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum AnalysisError {
+    ReadingOutOfRange(U32)
+    ThresholdOutOfRange(U32)
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BatchSummary {
+    pub sensor_id: U32
+    pub sensor_name: Str
+    pub reading_count: USize
+    pub median: U32
+    pub median_absolute_deviation: U32
+    pub outlier_threshold: U32
+    pub outlier_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Outlier {
+    pub sensor_id: U32
+    pub sensor_name: Str
+    pub reading_index: USize
+    pub observed: U32
+    pub median: U32
+    pub absolute_deviation: U32
+    pub median_absolute_deviation: U32
+    pub threshold: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BatchAnalysis {
+    pub summary: BatchSummary
+    pub outliers: Array<Option<Outlier>, 9>
+    pub outlier_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AnalysisReport {
+    pub summaries: Array<Option<BatchSummary>, 3>
+    pub outliers: Array<Option<Outlier>, 27>
+    pub batch_count: USize
+    pub measurement_count: USize
+    pub outlier_count: USize
+}

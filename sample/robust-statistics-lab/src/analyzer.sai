@@ -1,0 +1,42 @@
+use acme:robust-statistics-lab/model.{
+    AnalysisError
+    AnalysisReport
+    BatchSummary
+    MeasurementBatch
+    Outlier
+}
+use acme:robust-statistics-lab/statistics
+
+pub fn analyze(batches: Array<MeasurementBatch, 3>) -> Result<AnalysisReport, AnalysisError> {
+    var summaries = Array<Option<BatchSummary>, 3>.filled(None)
+    var outliers = Array<Option<Outlier>, 27>.filled(None)
+    var outlier_count: USize = 0
+
+    for batch_index in 0..batches.len() {
+        let batch_result = match statistics.analyze_batch(batches[batch_index]) {
+            Ok(result) => result
+            Err(error) => return Err(error)
+        }
+        summaries[batch_index] = Some(batch_result.summary)
+
+        for index in 0..batch_result.outlier_count {
+            match batch_result.outliers[index] {
+                Some(outlier) => {
+                    outliers[outlier_count] = Some(outlier)
+                    outlier_count += 1
+                }
+                None => {}
+            }
+        }
+    }
+
+    Ok(
+        AnalysisReport(
+            summaries: summaries,
+            outliers: outliers,
+            batch_count: batches.len(),
+            measurement_count: batches.len() * 9,
+            outlier_count: outlier_count,
+        ),
+    )
+}

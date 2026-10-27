@@ -1,0 +1,100 @@
+use acme:robust-statistics-lab/model.{
+    AnalysisError
+    BatchAnalysis
+    BatchSummary
+    MeasurementBatch
+    Outlier
+}
+use acme:robust-statistics-lab/policy
+
+pub fn sort_readings(values: Array<U32, 9>) -> Array<U32, 9> {
+    var sorted = values
+
+    for index in 1..sorted.len() {
+        let value = sorted[index]
+        var insertion = index
+
+        while insertion > 0 {
+            let previous = insertion - 1
+            if sorted[previous] > value {
+                sorted[insertion] = sorted[previous]
+                insertion -= 1
+            } else {
+                break
+            }
+        }
+
+        sorted[insertion] = value
+    }
+
+    sorted
+}
+
+pub fn median(values: Array<U32, 9>) -> U32 {
+    let sorted = sort_readings(values)
+    sorted[sorted.len() / 2]
+}
+
+pub fn median_absolute_deviation(values: Array<U32, 9>, center: U32) -> U32 {
+    var deviations = Array<U32, 9>.filled(0)
+
+    for index in 0..values.len() {
+        deviations[index] = policy.absolute_difference(values[index], center)
+    }
+
+    median(deviations)
+}
+
+pub fn analyze_batch(batch: MeasurementBatch) -> Result<BatchAnalysis, AnalysisError> {
+    for observed in batch.readings {
+        if observed > policy.MAX_READING {
+            return Err(AnalysisError.ReadingOutOfRange(observed))
+        }
+    }
+
+    let center = median(batch.readings)
+    let mad = median_absolute_deviation(batch.readings, center)
+    let threshold = match policy.threshold_for(mad) {
+        Ok(value) => value
+        Err(error) => return Err(error)
+    }
+    var outliers = Array<Option<Outlier>, 9>.filled(None)
+    var outlier_count: USize = 0
+
+    for index in 0..batch.readings.len() {
+        let observed = batch.readings[index]
+        let deviation = policy.absolute_difference(observed, center)
+
+        if deviation > threshold {
+            outliers[outlier_count] = Some(
+                Outlier(
+                    sensor_id: batch.sensor_id,
+                    sensor_name: batch.sensor_name,
+                    reading_index: index,
+                    observed: observed,
+                    median: center,
+                    absolute_deviation: deviation,
+                    median_absolute_deviation: mad,
+                    threshold: threshold,
+                ),
+            )
+            outlier_count += 1
+        }
+    }
+
+    Ok(
+        BatchAnalysis(
+            summary: BatchSummary(
+                sensor_id: batch.sensor_id,
+                sensor_name: batch.sensor_name,
+                reading_count: batch.readings.len(),
+                median: center,
+                median_absolute_deviation: mad,
+                outlier_threshold: threshold,
+                outlier_count: outlier_count,
+            ),
+            outliers: outliers,
+            outlier_count: outlier_count,
+        ),
+    )
+}
