@@ -1,0 +1,265 @@
+use acme:bounded-bytecode-verifier/model.{
+    AbstractStack
+    BytecodeProgram
+    IncomingState
+    Instruction
+    MAX_INSTRUCTION_COUNT
+    MAX_STACK_DEPTH
+    ValueKind
+    VerificationSummary
+    VerifyError
+    VerifyErrorKind
+    Worklist
+}
+
+fn issue(kind: VerifyErrorKind, pc: USize) -> VerifyError {
+    VerifyError(
+        kind: kind,
+        instruction_index: pc,
+        first_predecessor: None,
+        second_predecessor: None,
+    )
+}
+
+fn join_issue(pc: USize, first: USize, second: USize) -> VerifyError {
+    VerifyError(
+        kind: VerifyErrorKind.InconsistentStackAtJoin,
+        instruction_index: pc,
+        first_predecessor: Some(first),
+        second_predecessor: Some(second),
+    )
+}
+
+fn empty_stack() -> AbstractStack {
+    AbstractStack(kinds: Array<Option<ValueKind>, MAX_STACK_DEPTH>.filled(None), depth: 0)
+}
+
+fn stacks_equal(left: AbstractStack, right: AbstractStack) -> Bool {
+    if left.depth != right.depth {
+        return false
+    }
+    for index in 0..left.depth {
+        if left.kinds[index] != right.kinds[index] {
+            return false
+        }
+    }
+    true
+}
+
+fn push(stack: AbstractStack, kind: ValueKind, pc: USize) -> Result<AbstractStack, VerifyError> {
+    if stack.depth >= MAX_STACK_DEPTH {
+        return Err(issue(VerifyErrorKind.StackLimitExceeded, pc))
+    }
+    var updated = stack
+    updated.kinds[updated.depth] = Some(kind)
+    updated.depth += 1
+    Ok(updated)
+}
+
+fn pop(stack: AbstractStack, expected: ValueKind, pc: USize) -> Result<AbstractStack, VerifyError> {
+    if stack.depth == 0 {
+        return Err(issue(VerifyErrorKind.StackUnderflow, pc))
+    }
+    let index = stack.depth - 1
+    let actual = match stack.kinds[index] {
+        Some(kind) => kind
+        None => return Err(issue(VerifyErrorKind.InvalidAbstractState, pc))
+    }
+    if actual != expected {
+        return Err(issue(VerifyErrorKind.StackTypeMismatch, pc))
+    }
+    var updated = stack
+    updated.kinds[index] = None
+    updated.depth -= 1
+    Ok(updated)
+}
+
+fn verify_return(stack: AbstractStack, expected: ValueKind, pc: USize) -> Result<(), VerifyError> {
+    if stack.depth == 0 {
+        return Err(issue(VerifyErrorKind.StackUnderflow, pc))
+    }
+    if stack.depth != 1 {
+        return Err(issue(VerifyErrorKind.ReturnStackShape, pc))
+    }
+    match stack.kinds[0] {
+        Some(actual) => {
+            if actual != expected {
+                return Err(issue(VerifyErrorKind.ReturnTypeMismatch, pc))
+            }
+        }
+        None => return Err(issue(VerifyErrorKind.InvalidAbstractState, pc))
+    }
+    Ok(())
+}
+
+fn add_edge(
+    worklist: Worklist,
+    program_length: USize,
+    target: USize,
+    stack: AbstractStack,
+    from: USize,
+) -> Result<Worklist, VerifyError> {
+    if target >= program_length {
+        return Err(issue(VerifyErrorKind.InvalidBranchTarget, from))
+    }
+    match worklist.incoming[target] {
+        Some(previous) => {
+            if stacks_equal(previous.stack, stack) {
+                Ok(worklist)
+            } else {
+                Err(join_issue(target, previous.predecessor, from))
+            }
+        }
+        None => {
+            if worklist.instruction_count >= MAX_INSTRUCTION_COUNT {
+                return Err(issue(VerifyErrorKind.ProgramTooLarge, from))
+            }
+            var updated = worklist
+            updated.incoming[target] = Some(IncomingState(stack: stack, predecessor: from))
+            updated.instructions[updated.instruction_count] = Some(target)
+            updated.instruction_count += 1
+            Ok(updated)
+        }
+    }
+}
+
+pub fn verify(program: BytecodeProgram) -> Result<VerificationSummary, VerifyError> {
+    if program.instruction_count == 0 {
+        return Err(issue(VerifyErrorKind.EmptyProgram, 0))
+    }
+    if program.instruction_count > program.instructions.len() {
+        return Err(issue(VerifyErrorKind.ProgramTooLarge, program.instructions.len()))
+    }
+
+    var worklist = Worklist(
+        incoming: Array<Option<IncomingState>, MAX_INSTRUCTION_COUNT>.filled(None),
+        instructions: Array<Option<USize>, MAX_INSTRUCTION_COUNT>.filled(None),
+        instruction_count: 1,
+    )
+    worklist.incoming[0] = Some(IncomingState(stack: empty_stack(), predecessor: 0))
+    worklist.instructions[0] = Some(0)
+
+    var cursor: USize = 0
+    var maximum_depth: USize = 0
+    while cursor < worklist.instruction_count {
+        let pc = match worklist.instructions[cursor] {
+            Some(index) => index
+            None => return Err(issue(VerifyErrorKind.InvalidAbstractState, cursor))
+        }
+        let entry = match worklist.incoming[pc] {
+            Some(incoming) => incoming
+            None => return Err(issue(VerifyErrorKind.InvalidAbstractState, pc))
+        }
+        let instruction = match program.instructions[pc] {
+            Some(value) => value
+            None => return Err(issue(VerifyErrorKind.MissingInstruction, pc))
+        }
+
+        var stack = entry.stack
+        if stack.depth > maximum_depth {
+            maximum_depth = stack.depth
+        }
+        var has_fallthrough = true
+        match instruction {
+            Instruction.PushI32(_) => {
+                stack = match push(stack, ValueKind.I32, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+            }
+            Instruction.PushBool(_) => {
+                stack = match push(stack, ValueKind.Bool, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+            }
+            Instruction.AddI32 => {
+                stack = match pop(stack, ValueKind.I32, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+                stack = match pop(stack, ValueKind.I32, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+                stack = match push(stack, ValueKind.I32, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+            }
+            Instruction.LessI32 | Instruction.EqualI32 => {
+                stack = match pop(stack, ValueKind.I32, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+                stack = match pop(stack, ValueKind.I32, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+                stack = match push(stack, ValueKind.Bool, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+            }
+            Instruction.Jump(target) => {
+                has_fallthrough = false
+                worklist = match add_edge(worklist, program.instruction_count, target, stack, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+            }
+            Instruction.JumpIfFalse(target) => {
+                stack = match pop(stack, ValueKind.Bool, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+                worklist = match add_edge(worklist, program.instruction_count, target, stack, pc) {
+                    Ok(updated) => updated
+                    Err(problem) => return Err(problem)
+                }
+            }
+            Instruction.ReturnI32 => {
+                if program.return_kind != ValueKind.I32 {
+                    return Err(issue(VerifyErrorKind.ReturnTypeMismatch, pc))
+                }
+                match verify_return(stack, ValueKind.I32, pc) {
+                    Ok(()) => {}
+                    Err(problem) => return Err(problem)
+                }
+                has_fallthrough = false
+            }
+            Instruction.ReturnBool => {
+                if program.return_kind != ValueKind.Bool {
+                    return Err(issue(VerifyErrorKind.ReturnTypeMismatch, pc))
+                }
+                match verify_return(stack, ValueKind.Bool, pc) {
+                    Ok(()) => {}
+                    Err(problem) => return Err(problem)
+                }
+                has_fallthrough = false
+            }
+        }
+
+        if stack.depth > maximum_depth {
+            maximum_depth = stack.depth
+        }
+        if has_fallthrough {
+            let next = pc + 1
+            if next >= program.instruction_count {
+                return Err(issue(VerifyErrorKind.FallthroughPastEnd, pc))
+            }
+            worklist = match add_edge(worklist, program.instruction_count, next, stack, pc) {
+                Ok(updated) => updated
+                Err(problem) => return Err(problem)
+            }
+        }
+        cursor += 1
+    }
+
+    Ok(
+        VerificationSummary(
+            reachable_instruction_count: worklist.instruction_count,
+            maximum_stack_depth: maximum_depth,
+        ),
+    )
+}
