@@ -9198,11 +9198,12 @@ fn is_supported_direct_call_bitwise_not_argument_shape(
     let ExprKind::Unary(UnOp::BitNot, operand) = expression.kind else {
         return false;
     };
-    let ExprKind::Path(path) = operand.kind else {
-        return false;
-    };
-    resolved_plain_local_path_binding(path, locals, inputs)
-        .is_some_and(|binding| preceding_bindings.contains(&binding))
+    match operand.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)) => true,
+        _ => false,
+    }
 }
 
 fn is_supported_direct_call_neg_argument_shape(
@@ -49208,6 +49209,9 @@ property "shared"() {}
             "    let valid = apply(1)\n",
             "    valid\n",
             "}\n",
+            "pub fn bitnot_bool_literal_call_argument_unsupported() -> Bool { apply_bool(~true) }\n",
+            "pub fn bitnot_char_literal_call_argument_unsupported() -> Char { identity_char(~'x') }\n",
+            "pub fn bitnot_float_literal_call_argument_unsupported() -> F32 { float_fn(~1.0) }\n",
             "pub fn bitnot_double_float_operator_not_supported(value: F64) -> F64 {\n",
             "    let result = double_fn(~value)\n",
             "    let alias = result\n",
@@ -49215,8 +49219,24 @@ property "shared"() {}
             "    valid\n",
             "}\n",
             "pub fn bitnot_generic_target(value: I32) -> I32 { generic_fn(~value) }\n",
-            "pub fn bitnot_integer_literal_call_argument_unsupported() -> I32 { apply(~1) }\n",
-            "pub fn bitnot_byte_literal_call_argument_unsupported() -> Byte { apply_byte(~b'x') }\n",
+            "pub fn bitnot_integer_literal_expected_type_mismatch() -> Bool {\n",
+            "    let failed = apply_bool(~1)\n",
+            "    let alias = failed\n",
+            "    let valid = apply_bool(false)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn bitnot_byte_literal_expected_type_mismatch() -> I32 {\n",
+            "    let failed = apply_i32(~b'x')\n",
+            "    let alias = failed\n",
+            "    let valid = apply_i32(~1)\n",
+            "    valid\n",
+            "}\n",
+            "pub fn bitnot_integer_literal_out_of_range() -> I8 {\n",
+            "    let failed = apply_i8(~128)\n",
+            "    let alias = failed\n",
+            "    let valid = apply_i8(~1)\n",
+            "    valid\n",
+            "}\n",
             "pub fn bitnot_double_operand_unsupported(value: I32) -> I32 { apply(~~value) }\n",
             "pub fn bitnot_computed_operand_unsupported(value: I32) -> I32 { apply(~(value + 1)) }\n",
             "pub fn bitnot_call_operand_unsupported(value: I32) -> I32 { apply(~apply(value)) }\n",
@@ -50099,6 +50119,58 @@ property "shared"() {}
                 )
             })
             .collect::<Vec<_>>();
+        let mut direct_bitnot_literal_cases = Vec::new();
+        let mut generated_direct_bitnot_literal_cases = String::new();
+        for (primitive_name, callee, primitive) in bitwise_integer_literal_types.iter().copied() {
+            let suffix = primitive_name.to_ascii_lowercase();
+            for (nested, position) in [(false, "root"), (true, "nested")] {
+                let name = format!("direct_bitnot_integer_literal_{suffix}_{position}");
+                let unary_expression = "~1".to_owned();
+                let inner_call = format!("{callee}({unary_expression})");
+                let call = if nested {
+                    format!("{callee}({inner_call})")
+                } else {
+                    inner_call.clone()
+                };
+                generated_direct_bitnot_literal_cases.push_str(&format!(
+                    "pub fn {name}() -> {primitive_name} {{ {call} }}\n"
+                ));
+                direct_bitnot_literal_cases.push((
+                    name,
+                    nested,
+                    primitive_name.to_owned(),
+                    callee.to_owned(),
+                    primitive,
+                    unary_expression,
+                    "1".to_owned(),
+                    call,
+                    inner_call,
+                ));
+            }
+        }
+        for (nested, position) in [(false, "root"), (true, "nested")] {
+            let name = format!("direct_bitnot_byte_literal_{position}");
+            let unary_expression = "~b'x'".to_owned();
+            let inner_call = format!("apply_byte({unary_expression})");
+            let call = if nested {
+                format!("apply_byte({inner_call})")
+            } else {
+                inner_call.clone()
+            };
+            generated_direct_bitnot_literal_cases
+                .push_str(&format!("pub fn {name}() -> Byte {{ {call} }}\n"));
+            direct_bitnot_literal_cases.push((
+                name,
+                nested,
+                "Byte".to_owned(),
+                "apply_byte".to_owned(),
+                PrimTy::Byte,
+                unary_expression,
+                "b'x'".to_owned(),
+                call,
+                inner_call,
+            ));
+        }
         let mut bitwise_byte_literal_cases = Vec::new();
         let mut generated_bitwise_byte_literal_cases = String::new();
         for (left_name, callee, left_type) in bitwise_primitive_types.iter().copied() {
@@ -50808,6 +50880,7 @@ property "shared"() {}
         root.push_str(&generated_scalar_shift_literal_lhs_cases);
         root.push_str(&generated_byte_literal_shift_rhs_cases);
         root.push_str(&generated_direct_neg_path_cases);
+        root.push_str(&generated_direct_bitnot_literal_cases);
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
@@ -51918,8 +51991,9 @@ property "shared"() {}
             "logical_float_literal_operand_unsupported",
             "not_integer_literal_call_argument_unsupported",
             "not_character_literal_call_argument_unsupported",
-            "bitnot_integer_literal_call_argument_unsupported",
-            "bitnot_byte_literal_call_argument_unsupported",
+            "bitnot_bool_literal_call_argument_unsupported",
+            "bitnot_char_literal_call_argument_unsupported",
+            "bitnot_float_literal_call_argument_unsupported",
             "bitnot_unresolved_numeric_local_unsupported",
             "bitnot_generic_target",
             "bitnot_double_operand_unsupported",
@@ -60100,6 +60174,217 @@ property "shared"() {}
                     "{name} spans the complete unary expression"
                 );
             }
+        }
+        for (
+            name,
+            nested,
+            _primitive_name,
+            _callee,
+            primitive,
+            unary_expression,
+            operand,
+            call,
+            inner_call,
+        ) in &direct_bitnot_literal_cases
+        {
+            let function = format!("pub fn {name}");
+            let owner = owner_named(&database, &resolved, name);
+            let unary_start = call
+                .find(unary_expression)
+                .expect("the generated unary bit-not literal is in its call");
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, call, 0, call.len()),
+                Some(*primitive),
+                "{name} publishes the exact call result type"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    unary_start,
+                    unary_expression.len(),
+                ),
+                Some(*primitive),
+                "{name} publishes the unary bit-not expression fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    unary_start + 1,
+                    operand.len(),
+                ),
+                Some(*primitive),
+                "{name} infers the literal from the parameter type"
+            );
+            if *nested {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        call.find(inner_call)
+                            .expect("the generated inner call is nested in the outer call"),
+                        inner_call.len(),
+                    ),
+                    Some(*primitive),
+                    "{name} preserves the nested call fact"
+                );
+            }
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("supported direct bit-not literal has a body result")
+            else {
+                panic!("{name} is within the supported direct-call shape");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "{name} has no bit-not literal diagnostics: {diagnostics:?}"
+            );
+        }
+        for (
+            name,
+            call,
+            unary_expression,
+            operand,
+            sibling_call,
+            sibling_type,
+            diagnostic_code,
+            diagnostic_message,
+            diagnostic_span,
+            operand_type,
+        ) in [
+            (
+                "bitnot_integer_literal_expected_type_mismatch",
+                "apply_bool(~1)",
+                "~1",
+                "1",
+                "apply_bool(false)",
+                PrimTy::Bool,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `Bool`, found an integer literal",
+                "1",
+                None,
+            ),
+            (
+                "bitnot_byte_literal_expected_type_mismatch",
+                "apply_i32(~b'x')",
+                "~b'x'",
+                "b'x'",
+                "apply_i32(~1)",
+                PrimTy::I32,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `I32`, found `Byte`",
+                "~b'x'",
+                Some(PrimTy::Byte),
+            ),
+            (
+                "bitnot_integer_literal_out_of_range",
+                "apply_i8(~128)",
+                "~128",
+                "128",
+                "apply_i8(~1)",
+                PrimTy::I8,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "integer literal is out of range for `I8`",
+                "128",
+                None,
+            ),
+        ] {
+            let function = format!("pub fn {name}");
+            let owner = owner_named(&database, &resolved, name);
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, call, 0, call.len()),
+                None,
+                "{name} suppresses the call fact after its literal error"
+            );
+            let unary_start = call
+                .find(unary_expression)
+                .expect("the unary bit-not literal occurs in the failing call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    unary_start,
+                    unary_expression.len(),
+                ),
+                None,
+                "{name} suppresses the tainted unary expression fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    unary_start + 1,
+                    operand.len(),
+                ),
+                operand_type,
+                "{name} preserves a valid Byte literal operand fact when present"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    "let alias = failed",
+                    "let alias = ".len(),
+                    "failed".len(),
+                ),
+                None,
+                "{name} does not infer an alias from its tainted call"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    sibling_call,
+                    0,
+                    sibling_call.len(),
+                ),
+                Some(sibling_type),
+                "{name} preserves the independent valid sibling"
+            );
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("supported direct bit-not literal reports a semantic diagnostic")
+            else {
+                panic!("{name} remains a supported direct-call shape");
+            };
+            assert_eq!(diagnostics.len(), 1, "{name}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code, diagnostic_code, "{name}");
+            assert_eq!(diagnostics[0].message, diagnostic_message, "{name}");
+            let function_start = root
+                .find(&function)
+                .unwrap_or_else(|| panic!("function source `{function}` exists"));
+            let source_span_start = function_start
+                + root[function_start..]
+                    .find(diagnostic_span)
+                    .unwrap_or_else(|| panic!("{name} has the expected primary span"));
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("the literal diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(source_span_start as u32),
+                    sai_diagnostics::TextSize::new(
+                        (source_span_start + diagnostic_span.len()) as u32,
+                    ),
+                )
+                .expect("the literal diagnostic span is ordered"),
+                "{name} highlights the exact literal or unary argument"
+            );
         }
         for (owner, function, call, expression, operand, primitive) in [
             (

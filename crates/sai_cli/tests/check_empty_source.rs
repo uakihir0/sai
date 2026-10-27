@@ -19210,6 +19210,39 @@ fn unary_bitwise_not_path_arguments_to_direct_calls_remain_behind_the_stage_gate
 }
 
 #[test]
+fn unary_bitwise_not_literal_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn integer_root() -> I8 { identity_i8(~1) }\n",
+        "pub fn integer_nested() -> U16 { identity_u16(identity_u16(~1)) }\n",
+        "pub fn byte_root() -> Byte { identity_byte(~b'a') }\n",
+        "pub fn byte_nested() -> Byte { identity_byte(identity_byte(~b'b')) }\n",
+        "pub fn bool_literal(value: Bool) -> Bool { identity_bool(~true) }\n",
+        "pub fn char_literal() -> Char { identity_char(~'x') }\n",
+        "pub fn float_literal() -> F32 { identity_f32(~1.0) }\n",
+        "pub fn double_bitnot() -> I32 { identity_i32(~~1) }\n",
+        "pub fn computed_operand(value: I32) -> I32 { identity_i32(~(value + 1)) }\n",
+        "pub fn call_operand(value: I32) -> I32 { identity_i32(~identity_i32(value)) }\n",
+        "pub fn deep_nested() -> I32 {\n",
+        "    identity_i32(identity_i32(identity_i32(~1)))\n",
+        "}\n",
+        "pub fn generic_target() -> I32 { generic_identity(~1) }\n",
+        "fn identity_i8(value: I8) -> I8 { value }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_u16(value: U16) -> U16 { value }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+        "fn identity_bool(value: Bool) -> Bool { value }\n",
+        "fn identity_char(value: Char) -> Char { value }\n",
+        "fn identity_f32(value: F32) -> F32 { value }\n",
+        "fn generic_identity<T>(value: T) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root or one-level nested direct calls with unary bit-not integer or Byte literal arguments",
+    );
+}
+
+#[test]
 fn unary_neg_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn signed_root(value: I8) -> I8 { identity_i8(-value) }\n",
