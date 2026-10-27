@@ -9296,12 +9296,7 @@ fn is_supported_direct_call_shift_operands_shape(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Byte(_)) => true,
-        ExprKind::Lit(Lit::Int { .. }) => {
-            matches!(
-                right.kind,
-                ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })
-            )
-        }
+        ExprKind::Lit(Lit::Int { .. }) => true,
         _ => false,
     };
     if !left_shape_is_supported {
@@ -9312,6 +9307,7 @@ fn is_supported_direct_call_shift_operands_shape(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Int { .. }) => true,
+        ExprKind::Lit(Lit::Byte(_)) => matches!(left.kind, ExprKind::Lit(Lit::Int { .. })),
         _ => false,
     }
 }
@@ -49281,6 +49277,10 @@ property "shared"() {}
             "pub fn shift_integer_literal_rhs_unary_computed_unsupported(left: I32, count: U32) -> I32 { apply_i32(left << -count) }\n",
             "pub fn shift_integer_literal_rhs_bool_unsupported(left: I32) -> I32 { apply_i32(left << true) }\n",
             "pub fn shift_integer_literal_rhs_byte_unsupported(left: I32) -> I32 { apply_i32(left << b'x') }\n",
+            "pub fn shift_integer_byte_rhs_local_initializer_unsupported() -> I32 {\n",
+            "    let result = 1 << b'x'\n",
+            "    result\n",
+            "}\n",
             "pub fn shift_integer_literal_rhs_char_unsupported(left: I32) -> I32 { apply_i32(left << 'x') }\n",
             "pub fn shift_integer_literal_rhs_float_unsupported(left: I32) -> I32 { apply_i32(left << 1.0) }\n",
             "pub fn shift_byte_literal_lhs_root_left(count: U32) -> Byte { apply_byte(b'a' << count) }\n",
@@ -50250,6 +50250,8 @@ property "shared"() {}
         let mut byte_shift_literal_rhs_cases = Vec::new();
         let mut generated_integer_shift_literal_pair_cases = String::new();
         let mut integer_shift_literal_pair_cases = Vec::new();
+        let mut generated_integer_byte_shift_literal_cases = String::new();
+        let mut integer_byte_shift_literal_cases = Vec::new();
         for (left_type, callee, type_name) in [
             ("I8", "apply_i8", "i8"),
             ("I16", "apply_i16", "i16"),
@@ -50415,6 +50417,46 @@ property "shared"() {}
                 }
             }
         }
+        for (left_type, callee, type_name, primitive) in [
+            ("I8", "apply_i8", "i8", PrimTy::I8),
+            ("I16", "apply_i16", "i16", PrimTy::I16),
+            ("I32", "apply_i32", "i32", PrimTy::I32),
+            ("I64", "apply_i64", "i64", PrimTy::I64),
+            ("ISize", "apply_isize", "isize", PrimTy::ISize),
+            ("U8", "apply_u8", "u8", PrimTy::U8),
+            ("U16", "apply_u16", "u16", PrimTy::U16),
+            ("U32", "apply_u32", "u32", PrimTy::U32),
+            ("U64", "apply_u64", "u64", PrimTy::U64),
+            ("USize", "apply_usize", "usize", PrimTy::USize),
+        ] {
+            for (operator, operator_name) in [("<<", "left"), (">>", "right")] {
+                for (nested, position) in [(false, "root"), (true, "nested")] {
+                    let name = format!(
+                        "direct_call_shift_integer_byte_rhs_{position}_{type_name}_{operator_name}"
+                    );
+                    let operator_expression = format!("1 {operator} b'a'");
+                    let inner_call = format!("{callee}({operator_expression})");
+                    let call = if nested {
+                        format!("{callee}({inner_call})")
+                    } else {
+                        inner_call.clone()
+                    };
+                    let sibling_call = format!("{callee}(2 {operator} 0)");
+                    generated_integer_byte_shift_literal_cases.push_str(&format!(
+                        "pub fn {name}() -> {left_type} {{\n    let failed = {call}\n    let alias = failed\n    {sibling_call}\n}}\n"
+                    ));
+                    integer_byte_shift_literal_cases.push((
+                        name,
+                        nested,
+                        primitive,
+                        operator_expression,
+                        call,
+                        inner_call,
+                        sibling_call,
+                    ));
+                }
+            }
+        }
         root.push_str(&generated_bitwise_integer_literal_cases);
         root.push_str(&generated_bitwise_integer_literal_left_cases);
         root.push_str(&generated_bitwise_integer_literal_pair_cases);
@@ -50423,6 +50465,7 @@ property "shared"() {}
         root.push_str(&generated_shift_literal_lhs_path_cases);
         root.push_str(&generated_byte_shift_literal_rhs_cases);
         root.push_str(&generated_integer_shift_literal_pair_cases);
+        root.push_str(&generated_integer_byte_shift_literal_cases);
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
@@ -51524,6 +51567,7 @@ property "shared"() {}
             "shift_integer_literal_rhs_unary_computed_unsupported",
             "shift_integer_literal_rhs_bool_unsupported",
             "shift_integer_literal_rhs_byte_unsupported",
+            "shift_integer_byte_rhs_local_initializer_unsupported",
             "shift_integer_literal_rhs_char_unsupported",
             "shift_integer_literal_rhs_float_unsupported",
             "shift_integer_literal_lhs_path_rhs_computed_unsupported",
@@ -52278,6 +52322,138 @@ property "shared"() {}
                     "{name} diagnoses the entire RHS token, including a negative sign"
                 );
             }
+        }
+
+        for (name, nested, primitive, operator_expression, call, inner_call, sibling_call) in
+            &integer_byte_shift_literal_cases
+        {
+            let owner = assert_supported(&database, name, &[sai_diagnostics::Code::TypeMismatch]);
+            let function = format!("pub fn {name}");
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, call, 0, call.len()),
+                None,
+                "{name} suppresses the tainted direct-call fact"
+            );
+            if *nested {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        call.find(inner_call)
+                            .expect("the one-level nested call occurs in the outer call"),
+                        inner_call.len(),
+                    ),
+                    None,
+                    "{name} suppresses the tainted nested-call fact"
+                );
+            }
+
+            let operator_start = call
+                .find(operator_expression)
+                .expect("the integer/Byte shift is present in the direct call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start,
+                    operator_expression.len(),
+                ),
+                None,
+                "{name} suppresses the tainted shift result"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start,
+                    "1".len(),
+                ),
+                Some(*primitive),
+                "{name} infers the integer LHS from the direct-call parameter"
+            );
+            let byte_literal_start = operator_expression
+                .find("b'a'")
+                .expect("the RHS is the direct Byte character literal");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start + byte_literal_start,
+                    "b'a'".len(),
+                ),
+                None,
+                "{name} does not publish a fact for the mismatched Byte literal"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    "let alias = failed",
+                    "let alias = ".len(),
+                    "failed".len(),
+                ),
+                None,
+                "{name} propagates taint to an alias of the failed call"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    sibling_call,
+                    0,
+                    sibling_call.len(),
+                ),
+                Some(*primitive),
+                "{name} preserves the independent valid sibling call"
+            );
+
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("integer/Byte direct-call shift body check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{name} remains inside the bounded direct-call shift gate")
+                }
+            };
+            assert_eq!(
+                diagnostics[0].message, "expected `U32`, found a byte literal",
+                "{name} reports the U32 shift-count constraint for a Byte literal"
+            );
+            let function_start = root
+                .find(&function)
+                .expect("the generated integer/Byte shift function occurs in the test root");
+            let source_operator_start = function_start
+                + root[function_start..]
+                    .find(operator_expression)
+                    .expect("the generated integer/Byte shift occurs in the source");
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("the Byte-literal type mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(
+                        (source_operator_start + byte_literal_start) as u32,
+                    ),
+                    sai_diagnostics::TextSize::new(
+                        (source_operator_start + byte_literal_start + "b'a'".len()) as u32,
+                    ),
+                )
+                .expect("the Byte literal span is ordered"),
+                "{name} diagnoses the complete Byte literal"
+            );
         }
 
         for (

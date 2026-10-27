@@ -644,7 +644,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             result
                         }
                     } else if matches!(operator, BinOp::Shl | BinOp::Shr) {
-                        let result = self.check_shift(operator, left, right, init.hir_id)?;
+                        let result = self.check_shift(operator, left, right, init.hir_id, false)?;
                         if let Some(expected) = annotation {
                             self.check_annotated_path(result, expected, init.hir_id)?;
                             LocalType::Concrete(expected)
@@ -1931,6 +1931,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         left: &'hir Expr<'hir>,
         right: &'hir Expr<'hir>,
         expression: HirId,
+        allow_byte_rhs_mismatch: bool,
     ) -> Result<LocalType, ()> {
         let left_type = if let ExprKind::Lit(literal) = left.kind {
             let Some(kind) = primitive_literal_kind(literal) else {
@@ -1957,15 +1958,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
 
         if let ExprKind::Lit(literal) = right.kind {
-            if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
+            let Some(kind) = primitive_literal_kind(literal) else {
+                return Err(());
+            };
+            if kind != PrimitiveLiteralKind::Integer
+                && !(allow_byte_rhs_mismatch && kind == PrimitiveLiteralKind::Byte)
+            {
                 return Err(());
             }
-            self.check_annotated_literal(
-                PrimTy::U32,
-                literal,
-                PrimitiveLiteralKind::Integer,
-                right.hir_id,
-            );
+            self.check_annotated_literal(PrimTy::U32, literal, kind, right.hir_id);
         } else {
             let right_type = self
                 .check_local_path(right)
@@ -2476,7 +2477,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     if is_supported_direct_call_shift_operands(left, right) =>
                 {
                     let local_type =
-                        self.check_shift(operator, left, right, argument.expr.hir_id)?;
+                        self.check_shift(operator, left, right, argument.expr.hir_id, true)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
@@ -5034,6 +5035,7 @@ fn is_supported_direct_call_shift_operands(left: &Expr<'_>, right: &Expr<'_>) ->
         (ExprKind::Lit(Lit::Int { .. }), ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })) => {
             true
         }
+        (ExprKind::Lit(Lit::Int { .. }), ExprKind::Lit(Lit::Byte(_))) => true,
         _ => false,
     }
 }
