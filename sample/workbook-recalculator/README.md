@@ -20,17 +20,18 @@ cycle, unsigned overflow, and division by zero.
 | 40 | Tax percent | `15` |
 | 50 | Tax base | `3000` (`Gross * Tax percent`) |
 | 60 | Tax | `30` (`Tax base / 100`) |
-| 100 | Net | `170` (`Gross - Tax`) |
+| 100 | Percent base | `100` |
+| 101 | Net | `170` (`Gross - Tax`) |
 | 80 | Missing input | `MissingReference` (cell 999 does not exist) |
 | 81 | Missing downstream | `BlockedByError`, first blocked by cell 80 |
 | 90, 91 | Cycle A, Cycle B | `Cycle` |
 | 92 | Cycle downstream | `BlockedByCycle`, first blocked by cell 90 |
 | 93 | Overflow | `ArithmeticRangeError` (`U32_MAX + 8`) |
 | 95 | Overflow downstream | `BlockedByError`, first blocked by cell 93 |
-| 96 | Divide by zero | `DivisionByZero` (`0 / 8`) |
+| 96 | Divide by zero | `DivisionByZero` (`8 / 0`) |
 | 97 | Division downstream | `BlockedByError`, first blocked by cell 96 |
 
-The stable formula evaluation order is `20, 50, 93, 96, 60, 100`. Cells 93
+The stable formula evaluation order is `20, 50, 93, 96, 60, 101`. Cells 93
 and 96 appear in the order because their operands were available and their
 formulas were attempted, even though each attempt produced an arithmetic
 error. Formulas waiting on a result are skipped until a later pass.
@@ -41,7 +42,7 @@ error. Formulas waiting on a result are skipped until a later pass.
    IDs, and empty slots beyond the declared length.
 2. Mark literals as ready. A formula with either unknown reference receives
    `MissingReference` and is excluded from dependency-cycle analysis.
-3. Build a fixed 18-by-18 formula dependency matrix and compute its transitive
+3. Build a fixed 19-by-19 formula dependency matrix and compute its transitive
    closure. A cell that reaches itself belongs to a cycle; a formula that
    reaches a cycle member is instead `BlockedByCycle`.
 4. Scan formulas in workbook slot order. Evaluate a formula once both inputs
@@ -51,9 +52,10 @@ error. Formulas waiting on a result are skipped until a later pass.
    references block only their dependants; unrelated formulas still finish.
 
 The closure distinguishes a member of a cycle from a formula merely waiting
-on one. For an error with multiple bad inputs, the left input takes precedence;
-for a formula blocked by multiple cycle members, the first member in workbook
-slot order is recorded. These rules keep reports deterministic.
+on one. When both inputs fail, the left input takes precedence; a pending left
+input keeps the formula pending until that input resolves. For a formula blocked
+by multiple cycle members, the first member in workbook slot order is recorded.
+These rules keep reports deterministic.
 
 ## Project structure
 
@@ -84,7 +86,7 @@ slot order is recorded. These rules keep reports deterministic.
   Integer division truncates toward zero; the tax fixture avoids a fractional
   result, but this arithmetic policy should be revisited before using the
   example for money.
-- The workbook capacity is 18 cells and each formula has exactly two inputs.
+- The workbook capacity is 19 cells and each formula has exactly two inputs.
   There are no blank cells within the declared range, text values, ranges,
   recalculation edits, floating point, or user-entered formulas.
 - Fixture results and formula order are hand-checked. The source assertions
