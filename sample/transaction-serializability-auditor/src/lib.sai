@@ -1,0 +1,192 @@
+use acme:transaction-serializability-auditor/analyzer
+use acme:transaction-serializability-auditor/fixtures
+use acme:transaction-serializability-auditor/history
+use acme:transaction-serializability-auditor/history.{ValidatedHistory}
+use acme:transaction-serializability-auditor/model.{
+    AuditReport
+    AuditStatus
+    EventKind
+    History
+    MAX_CYCLE_LENGTH
+    MAX_HISTORY_EVENTS
+    MAX_PRECEDENCE_EDGES
+    MAX_TRANSACTIONS
+    PrecedenceEdge
+}
+use acme:transaction-serializability-auditor/precedence
+
+pub fn audit_fixture() -> analyzer.AuditReport {
+    analyzer.audit(fixtures.serializable_interleaving())
+}
+
+fn invalid_report_is_empty(report: AuditReport) -> Bool {
+    (
+        report.status == AuditStatus.InvalidHistory
+        and report.transaction_count == 0
+        and report.transaction_ids == Array<Option<U32>, MAX_TRANSACTIONS>.filled(None)
+        and report.precedence_edge_count == 0
+        and report.precedence_edges
+            == Array<Option<PrecedenceEdge>, MAX_PRECEDENCE_EDGES>.filled(None)
+        and report.serial_order_count == 0
+        and report.serial_order == Array<Option<U32>, MAX_TRANSACTIONS>.filled(None)
+        and report.cycle_length == 0
+        and report.cycle_transactions == Array<Option<U32>, MAX_CYCLE_LENGTH>.filled(None)
+    )
+}
+
+fn invalid_history_fails_closed(history_value: History) -> Bool {
+    invalid_report_is_empty(analyzer.audit(history_value))
+}
+
+test "the interleaved acyclic history returns the lowest-ID topological order" {
+    let report = audit_fixture()
+
+    assert report.status == AuditStatus.Serializable
+    assert report.transaction_count == 3
+    assert report.precedence_edge_count == 2
+    assert report.precedence_edges[0].unwrap().before_transaction_id == 20
+    assert report.precedence_edges[0].unwrap().after_transaction_id == 10
+    assert report.precedence_edges[0].unwrap().item_id == 1
+    assert report.precedence_edges[1].unwrap().before_transaction_id == 30
+    assert report.precedence_edges[1].unwrap().after_transaction_id == 10
+    assert report.serial_order_count == 3
+    assert report.serial_order[0] == Some(20)
+    assert report.serial_order[1] == Some(30)
+    assert report.serial_order[2] == Some(10)
+    assert report.cycle_length == 0
+}
+
+test "a conflicting cycle includes a stable closed transaction witness" {
+    let first = analyzer.audit(fixtures.cyclic_interleaving())
+    let second = analyzer.audit(fixtures.cyclic_interleaving())
+
+    assert first.status == AuditStatus.ConflictCycle
+    assert first.precedence_edge_count == 2
+    assert first.precedence_edges[0].unwrap().before_transaction_id == 11
+    assert first.precedence_edges[0].unwrap().after_transaction_id == 22
+    assert first.precedence_edges[0].unwrap().item_id == 1
+    assert first.precedence_edges[0].unwrap().before_position == 0
+    assert first.precedence_edges[0].unwrap().after_position == 3
+    assert first.precedence_edges[1].unwrap().before_transaction_id == 22
+    assert first.precedence_edges[1].unwrap().after_transaction_id == 11
+    assert first.precedence_edges[1].unwrap().item_id == 2
+    assert first.cycle_length == 3
+    assert first.cycle_transactions[0] == Some(11)
+    assert first.cycle_transactions[1] == Some(22)
+    assert first.cycle_transactions[2] == Some(11)
+    assert first == second
+    assert first.serial_order_count == 0
+}
+
+test "the maximum-size cycle witness preserves every transaction in order" {
+    let report = analyzer.audit(fixtures.four_transaction_cycle())
+
+    assert report.status == AuditStatus.ConflictCycle
+    assert report.precedence_edge_count == 4
+    assert report.cycle_length == 5
+    assert report.cycle_transactions[0] == Some(11)
+    assert report.cycle_transactions[1] == Some(22)
+    assert report.cycle_transactions[2] == Some(33)
+    assert report.cycle_transactions[3] == Some(44)
+    assert report.cycle_transactions[4] == Some(11)
+}
+
+test "read-read pairs do not create precedence edges" {
+    let report = analyzer.audit(fixtures.read_read_only())
+
+    assert report.status == AuditStatus.Serializable
+    assert report.precedence_edge_count == 0
+    assert report.serial_order_count == 2
+    assert report.serial_order[0] == Some(7)
+    assert report.serial_order[1] == Some(9)
+}
+
+test "write-write pairs add one directional edge" {
+    let report = analyzer.audit(fixtures.write_write_pair())
+
+    assert report.status == AuditStatus.Serializable
+    assert report.precedence_edge_count == 1
+    assert report.precedence_edges[0].unwrap().before_transaction_id == 5
+    assert report.precedence_edges[0].unwrap().after_transaction_id == 3
+    assert report.precedence_edges[0].unwrap().item_id == 4
+    assert report.serial_order[0] == Some(5)
+    assert report.serial_order[1] == Some(3)
+}
+
+test "an operation after commit fails closed without a partial graph" {
+    assert invalid_history_fails_closed(fixtures.operation_after_commit())
+}
+
+test "a missing slot inside the declared history fails closed" {
+    var history_value = fixtures.serializable_interleaving()
+    history_value.events[1] = None
+    assert invalid_history_fails_closed(history_value)
+}
+
+test "zero IDs, missing commits, duplicate commits, and occupied padding fail closed" {
+    var zero_transaction_id = fixtures.read_read_only()
+    zero_transaction_id.events[0] = Some(history.event(0, EventKind.Read, 3))
+    assert invalid_history_fails_closed(zero_transaction_id)
+
+    var zero_item_id = fixtures.read_read_only()
+    zero_item_id.events[0] = Some(history.event(7, EventKind.Read, 0))
+    assert invalid_history_fails_closed(zero_item_id)
+
+    var missing_commit = fixtures.read_read_only()
+    missing_commit.events[3] = None
+    missing_commit.event_count = 3
+    assert invalid_history_fails_closed(missing_commit)
+
+    var duplicate_commit = fixtures.read_read_only()
+    duplicate_commit =
+        history.push(duplicate_commit, history.event(7, EventKind.Commit, 0)).unwrap()
+    assert invalid_history_fails_closed(duplicate_commit)
+
+    var occupied_padding = fixtures.read_read_only()
+    occupied_padding.event_count = 3
+    assert invalid_history_fails_closed(occupied_padding)
+}
+
+test "event and transaction capacity overflow fail closed" {
+    var too_many_events = history.empty()
+    too_many_events.event_count = MAX_HISTORY_EVENTS + 1
+    assert invalid_history_fails_closed(too_many_events)
+
+    var too_many_transactions = history.empty()
+    too_many_transactions =
+        history.push(too_many_transactions, history.event(1, EventKind.Read, 1)).unwrap()
+    too_many_transactions =
+        history.push(too_many_transactions, history.event(1, EventKind.Commit, 0)).unwrap()
+    too_many_transactions =
+        history.push(too_many_transactions, history.event(2, EventKind.Read, 2)).unwrap()
+    too_many_transactions =
+        history.push(too_many_transactions, history.event(2, EventKind.Commit, 0)).unwrap()
+    too_many_transactions =
+        history.push(too_many_transactions, history.event(3, EventKind.Read, 3)).unwrap()
+    too_many_transactions =
+        history.push(too_many_transactions, history.event(3, EventKind.Commit, 0)).unwrap()
+    too_many_transactions =
+        history.push(too_many_transactions, history.event(4, EventKind.Read, 4)).unwrap()
+    too_many_transactions =
+        history.push(too_many_transactions, history.event(4, EventKind.Commit, 0)).unwrap()
+    too_many_transactions =
+        history.push(too_many_transactions, history.event(5, EventKind.Read, 5)).unwrap()
+    too_many_transactions =
+        history.push(too_many_transactions, history.event(5, EventKind.Commit, 0)).unwrap()
+    assert invalid_history_fails_closed(too_many_transactions)
+}
+
+test "the public graph builder rejects oversized and forged validation data" {
+    let valid_history = fixtures.read_read_only()
+    let validated = history.validate(valid_history).unwrap()
+
+    var oversized_history = valid_history
+    oversized_history.event_count = MAX_HISTORY_EVENTS + 1
+    assert precedence.build(oversized_history, validated) == None
+
+    let forged = ValidatedHistory(
+        transaction_ids: Array<Option<U32>, MAX_TRANSACTIONS>.filled(None),
+        transaction_count: MAX_TRANSACTIONS + 1,
+    )
+    assert precedence.build(valid_history, forged) == None
+}

@@ -1,0 +1,54 @@
+pub const MAX_TRANSACTIONS: USize = 4
+pub const MAX_HISTORY_EVENTS: USize = 20
+pub const MAX_PRECEDENCE_EDGES: USize = MAX_TRANSACTIONS * (MAX_TRANSACTIONS - 1)
+pub const MAX_CYCLE_LENGTH: USize = MAX_TRANSACTIONS + 1
+pub const MAX_GRAPH_CELLS: USize = MAX_TRANSACTIONS * MAX_TRANSACTIONS
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum EventKind {
+    Read
+    Write
+    Commit
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type HistoryEvent {
+    pub transaction_id: U32
+    pub kind: EventKind
+    pub item_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type History {
+    pub events: Array<Option<HistoryEvent>, MAX_HISTORY_EVENTS>
+    pub event_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PrecedenceEdge {
+    pub before_transaction_id: U32
+    pub after_transaction_id: U32
+    pub item_id: U32
+    pub before_position: USize
+    pub after_position: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum AuditStatus {
+    Serializable
+    ConflictCycle
+    InvalidHistory
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditReport {
+    pub status: AuditStatus
+    pub transaction_ids: Array<Option<U32>, MAX_TRANSACTIONS>
+    pub transaction_count: USize
+    pub precedence_edges: Array<Option<PrecedenceEdge>, MAX_PRECEDENCE_EDGES>
+    pub precedence_edge_count: USize
+    pub serial_order: Array<Option<U32>, MAX_TRANSACTIONS>
+    pub serial_order_count: USize
+    pub cycle_transactions: Array<Option<U32>, MAX_CYCLE_LENGTH>
+    pub cycle_length: USize
+}
