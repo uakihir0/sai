@@ -1,0 +1,22 @@
+use acme:robust-statistics-lab/model
+
+pub const BATCH_SIZE: USize = 9
+pub const MAX_READING: U32 = 1000000
+pub const MAD_MULTIPLIER: U32 = 4
+pub const MAX_SAFE_MAD: U32 = 1073741823
+
+pub fn absolute_difference(left: U32, right: U32) -> U32 {
+    if left >= right {
+        left - right
+    } else {
+        right - left
+    }
+}
+
+pub fn threshold_for(median_absolute_deviation: U32) -> Result<U32, model.AnalysisError> {
+    if median_absolute_deviation > MAX_SAFE_MAD {
+        Err(model.AnalysisError.ThresholdOutOfRange(median_absolute_deviation))
+    } else {
+        Ok(median_absolute_deviation * MAD_MULTIPLIER)
+    }
+}
