@@ -1,0 +1,13 @@
+pub const MAX_QUERIES: USize = 16
+pub const MAX_QUERY_TIME_SECONDS: U32 = 1000
+pub const MAX_RECORD_TTL_SECONDS: U32 = 100
+pub const NEGATIVE_TTL_SECONDS: U32 = 6
+pub const MAX_CNAME_HOPS: USize = 4
+
+pub fn minimum(left: U32, right: U32) -> U32 {
+    if left < right {
+        left
+    } else {
+        right
+    }
+}

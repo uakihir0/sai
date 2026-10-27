@@ -1,0 +1,116 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum DnsName {
+    Alpha
+    Www
+    Beta
+    Docs
+    Edge
+    Empty
+    LoopA
+    LoopB
+    Missing
+    Unlisted
+    LongA
+    LongB
+    LongC
+    LongD
+    LongE
+    LongF
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RecordKind {
+    Address
+    CanonicalName
+    NoData
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ResponseKind {
+    Positive
+    NxDomain
+    NoData
+    AliasLoop
+    AliasHopLimit
+    InvalidTime
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DnsRecord {
+    pub owner: DnsName
+    pub kind: RecordKind
+    // Address IDs map to documentation-only IPv4 addresses in the README.
+    pub address_id: U32
+    // Used only for CanonicalName records.
+    pub target: DnsName
+    pub ttl_seconds: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DnsQuestion {
+    pub query_id: U32
+    pub name: DnsName
+    // Seconds since the start of the fixture's monotonic clock.
+    pub at_seconds: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Resolution {
+    pub kind: ResponseKind
+    pub address_id: U32
+    pub canonical_name: DnsName
+    // Effective TTL across every CNAME and terminal/negative answer.
+    pub ttl_seconds: U32
+    pub cname_hop_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CacheEntry {
+    // The cache is keyed by the original A question name.
+    pub name: DnsName
+    pub kind: ResponseKind
+    pub address_id: U32
+    pub canonical_name: DnsName
+    pub expires_at_seconds: U32
+    // Monotonic query-array position; equal-time queries still have stable order.
+    pub last_used_order: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CacheState {
+    pub entries: Array<Option<CacheEntry>, 4>
+    pub entry_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type QueryDecision {
+    pub query_id: U32
+    pub name: DnsName
+    pub at_seconds: U32
+    pub kind: ResponseKind
+    pub address_id: U32
+    pub canonical_name: DnsName
+    pub cache_hit: Bool
+    // Zero means this response was not cached.
+    pub expires_at_seconds: U32
+    pub evicted_name: Option<DnsName>
+    pub cache_entry_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ResolverReport {
+    pub decisions: Array<Option<QueryDecision>, 16>
+    pub valid_query_count: USize
+    pub positive_count: USize
+    pub nxdomain_count: USize
+    pub nodata_count: USize
+    pub alias_loop_count: USize
+    pub alias_hop_limit_count: USize
+    pub invalid_time_count: USize
+    pub cache_hit_count: USize
+    pub cache_miss_count: USize
+    pub eviction_count: USize
+    pub final_cache: CacheState
+    pub final_time_seconds: U32
+    pub has_valid_time: Bool
+}

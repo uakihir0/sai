@@ -1,0 +1,84 @@
+use acme:bounded-dns-cache-resolver/model.{DnsName, DnsRecord, RecordKind, Resolution, ResponseKind}
+use acme:bounded-dns-cache-resolver/policy
+use acme:bounded-dns-cache-resolver/zone
+
+fn result(
+    kind: ResponseKind,
+    address_id: U32,
+    canonical_name: DnsName,
+    ttl_seconds: U32,
+    hops: USize,
+) -> Resolution {
+    Resolution(
+        kind: kind,
+        address_id: address_id,
+        canonical_name: canonical_name,
+        ttl_seconds: ttl_seconds,
+        cname_hop_count: hops,
+    )
+}
+
+fn contains(visited: Array<Option<DnsName>, 5>, visited_count: USize, name: DnsName) -> Bool {
+    for index in 0..visited_count {
+        match visited[index] {
+            Some(seen) => {
+                if seen == name {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn negative(kind: ResponseKind, name: DnsName, ttl_so_far: U32, hops: USize) -> Resolution {
+    result(kind, 0, name, policy.minimum(ttl_so_far, policy.NEGATIVE_TTL_SECONDS), hops)
+}
+
+pub fn resolve(name: DnsName) -> Resolution {
+    let records = zone.records()
+    var current = name
+    var visited: Array<Option<DnsName>, 5> = Array<Option<DnsName>, 5>.filled(None)
+    visited[0] = Some(name)
+    var visited_count: USize = 1
+    var hops: USize = 0
+    var ttl_so_far = policy.MAX_RECORD_TTL_SECONDS
+
+    while true {
+        match zone.find(records, current) {
+            None => return negative(ResponseKind.NxDomain, current, ttl_so_far, hops)
+            Some(record) => {
+                match record.kind {
+                    RecordKind.Address => {
+                        return result(
+                            ResponseKind.Positive,
+                            record.address_id,
+                            current,
+                            policy.minimum(ttl_so_far, record.ttl_seconds),
+                            hops,
+                        )
+                    }
+                    RecordKind.NoData => {
+                        return negative(ResponseKind.NoData, current, ttl_so_far, hops)
+                    }
+                    RecordKind.CanonicalName => {
+                        if hops >= policy.MAX_CNAME_HOPS {
+                            return result(ResponseKind.AliasHopLimit, 0, current, 0, hops)
+                        }
+                        if contains(visited, visited_count, record.target) {
+                            return result(ResponseKind.AliasLoop, 0, current, 0, hops)
+                        }
+                        ttl_so_far = policy.minimum(ttl_so_far, record.ttl_seconds)
+                        current = record.target
+                        visited[visited_count] = Some(current)
+                        visited_count += 1
+                        hops += 1
+                    }
+                }
+            }
+        }
+    }
+
+    result(ResponseKind.AliasHopLimit, 0, current, 0, hops)
+}

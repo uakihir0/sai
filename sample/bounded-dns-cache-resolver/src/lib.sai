@@ -1,0 +1,111 @@
+use acme:bounded-dns-cache-resolver/fixtures
+use acme:bounded-dns-cache-resolver/model.{DnsName, DnsQuestion, QueryDecision, ResponseKind}
+use acme:bounded-dns-cache-resolver/resolver
+
+pub use acme:bounded-dns-cache-resolver/engine.{fixture_report, simulate}
+
+fn row(index: USize) -> QueryDecision {
+    fixture_report().decisions[index].unwrap()
+}
+
+test "CNAME and terminal TTLs combine and positive cache hits keep the original expiry" {
+    let report = fixture_report()
+    assert row(0).kind == ResponseKind.Positive
+    assert row(0).address_id == 101
+    assert row(0).canonical_name == DnsName.Alpha
+    assert row(0).expires_at_seconds == 8
+    assert row(1).cache_hit
+    assert row(1).expires_at_seconds == 8
+    assert row(5).cache_hit
+    assert row(5).expires_at_seconds == 8
+    assert row(8).kind == ResponseKind.Positive
+    assert not row(8).cache_hit
+    assert row(8).expires_at_seconds == 16
+}
+
+test "negative responses are cached and expire at the exact exclusive boundary" {
+    let report = fixture_report()
+    assert row(3).kind == ResponseKind.NxDomain
+    assert row(3).expires_at_seconds == 9
+    assert row(7).cache_hit
+    assert row(7).kind == ResponseKind.NxDomain
+    assert row(9).kind == ResponseKind.NxDomain
+    assert not row(9).cache_hit
+    assert row(9).expires_at_seconds == 15
+    assert row(14).cache_hit
+    assert row(14).kind == ResponseKind.NxDomain
+    assert row(15).kind == ResponseKind.NxDomain
+    assert not row(15).cache_hit
+    assert row(15).expires_at_seconds == 24
+}
+
+test "NoData is distinct from NxDomain and can be negatively cached" {
+    var questions = fixtures.questions()
+    questions[5] = DnsQuestion(query_id: 6, name: DnsName.Empty, at_seconds: 5)
+    let report = simulate(questions)
+    assert report.decisions[4].unwrap().kind == ResponseKind.NoData
+    assert report.decisions[4].unwrap().expires_at_seconds == 10
+    assert report.decisions[5].unwrap().kind == ResponseKind.NoData
+    assert report.decisions[5].unwrap().cache_hit
+    assert report.nodata_count == 2
+}
+
+test "CNAME cycles fail closed and are not cached" {
+    let report = fixture_report()
+    assert row(12).kind == ResponseKind.AliasLoop
+    assert not row(12).cache_hit
+    assert row(12).expires_at_seconds == 0
+    assert row(12).cache_entry_count == 4
+    assert report.alias_loop_count == 1
+}
+
+test "the four-entry cache evicts the least recently used name with stable ties" {
+    let report = fixture_report()
+    assert report.eviction_count == 2
+    assert row(6).evicted_name == Some(DnsName.Beta)
+    assert row(13).evicted_name == Some(DnsName.Www)
+    assert report.final_cache.entry_count == 1
+}
+
+test "CNAME traversal stops before following an edge beyond the hop bound" {
+    let resolution = resolver.resolve(DnsName.LongA)
+    assert resolution.kind == ResponseKind.AliasHopLimit
+    assert resolution.cname_hop_count == 4
+    assert resolution.ttl_seconds == 0
+}
+
+test "the fixture audit has stable outcome and cache counts" {
+    let report = fixture_report()
+    assert report.valid_query_count == 16
+    assert report.positive_count == 8
+    assert report.nxdomain_count == 6
+    assert report.nodata_count == 1
+    assert report.alias_loop_count == 1
+    assert report.alias_hop_limit_count == 0
+    assert report.cache_hit_count == 4
+    assert report.cache_miss_count == 12
+    assert report.invalid_time_count == 0
+    assert report.final_time_seconds == 18
+    assert report.has_valid_time
+}
+
+test "a time reversal is reported without advancing the cache clock" {
+    var questions = fixtures.questions()
+    questions[2].at_seconds = 0
+    let report = simulate(questions)
+    assert report.invalid_time_count == 1
+    assert report.decisions[2].unwrap().kind == ResponseKind.InvalidTime
+    assert report.valid_query_count == 15
+    assert report.final_time_seconds == 18
+    assert report.decisions[0].unwrap().kind == ResponseKind.Positive
+}
+
+test "an out-of-range timestamp does not poison later valid queries" {
+    var questions = fixtures.questions()
+    questions[0].at_seconds = 1001
+    questions[1].at_seconds = 1
+    let report = simulate(questions)
+    assert report.invalid_time_count == 1
+    assert report.decisions[0].unwrap().kind == ResponseKind.InvalidTime
+    assert report.decisions[1].unwrap().kind == ResponseKind.Positive
+}

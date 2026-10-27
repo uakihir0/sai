@@ -1,0 +1,113 @@
+use acme:bounded-dns-cache-resolver/model.{DnsName, DnsRecord, RecordKind}
+
+pub fn records() -> Array<DnsRecord, 14> {
+    [
+        DnsRecord(
+            owner: DnsName.Alpha,
+            kind: RecordKind.Address,
+            address_id: 101,
+            target: DnsName.Alpha,
+            ttl_seconds: 8,
+        ),
+        DnsRecord(
+            owner: DnsName.Www,
+            kind: RecordKind.CanonicalName,
+            address_id: 0,
+            target: DnsName.Alpha,
+            ttl_seconds: 12,
+        ),
+        DnsRecord(
+            owner: DnsName.Beta,
+            kind: RecordKind.Address,
+            address_id: 202,
+            target: DnsName.Beta,
+            ttl_seconds: 5,
+        ),
+        DnsRecord(
+            owner: DnsName.Docs,
+            kind: RecordKind.CanonicalName,
+            address_id: 0,
+            target: DnsName.Edge,
+            ttl_seconds: 4,
+        ),
+        DnsRecord(
+            owner: DnsName.Edge,
+            kind: RecordKind.Address,
+            address_id: 303,
+            target: DnsName.Edge,
+            ttl_seconds: 10,
+        ),
+        DnsRecord(
+            owner: DnsName.Empty,
+            kind: RecordKind.NoData,
+            address_id: 0,
+            target: DnsName.Empty,
+            ttl_seconds: 0,
+        ),
+        DnsRecord(
+            owner: DnsName.LoopA,
+            kind: RecordKind.CanonicalName,
+            address_id: 0,
+            target: DnsName.LoopB,
+            ttl_seconds: 20,
+        ),
+        DnsRecord(
+            owner: DnsName.LoopB,
+            kind: RecordKind.CanonicalName,
+            address_id: 0,
+            target: DnsName.LoopA,
+            ttl_seconds: 20,
+        ),
+        DnsRecord(
+            owner: DnsName.LongA,
+            kind: RecordKind.CanonicalName,
+            address_id: 0,
+            target: DnsName.LongB,
+            ttl_seconds: 20,
+        ),
+        DnsRecord(
+            owner: DnsName.LongB,
+            kind: RecordKind.CanonicalName,
+            address_id: 0,
+            target: DnsName.LongC,
+            ttl_seconds: 20,
+        ),
+        DnsRecord(
+            owner: DnsName.LongC,
+            kind: RecordKind.CanonicalName,
+            address_id: 0,
+            target: DnsName.LongD,
+            ttl_seconds: 20,
+        ),
+        DnsRecord(
+            owner: DnsName.LongD,
+            kind: RecordKind.CanonicalName,
+            address_id: 0,
+            target: DnsName.LongE,
+            ttl_seconds: 20,
+        ),
+        DnsRecord(
+            owner: DnsName.LongE,
+            kind: RecordKind.CanonicalName,
+            address_id: 0,
+            target: DnsName.LongF,
+            ttl_seconds: 20,
+        ),
+        DnsRecord(
+            owner: DnsName.LongF,
+            kind: RecordKind.Address,
+            address_id: 404,
+            target: DnsName.LongF,
+            ttl_seconds: 20,
+        ),
+    ]
+}
+
+pub fn find(records: Array<DnsRecord, 14>, name: DnsName) -> Option<DnsRecord> {
+    for index in 0..records.len() {
+        if records[index].owner == name {
+            return Some(records[index])
+        }
+    }
+    None
+}
