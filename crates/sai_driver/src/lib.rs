@@ -65912,12 +65912,12 @@ property "shared"() {}
             "    let later: I32 = value\n",
             "    result\n",
             "}\n",
-            "pub fn excluded_unresolved_integer_local() -> I64 {\n",
+            "pub fn inferred_integer_local() -> I64 {\n",
             "    let source = 1\n",
             "    let result = -source\n",
             "    result\n",
             "}\n",
-            "pub fn excluded_unresolved_float_local() -> F64 {\n",
+            "pub fn inferred_float_local() -> F64 {\n",
             "    let source = 1.0\n",
             "    let result = -source\n",
             "    result\n",
@@ -66272,6 +66272,24 @@ property "shared"() {}
             Some(PrimTy::I8)
         );
 
+        for (name, ty) in [
+            ("inferred_integer_local", PrimTy::I64),
+            ("inferred_float_local", PrimTy::F64),
+        ] {
+            let owner = owner_named(name);
+            assert!(
+                diagnostics(owner).is_empty(),
+                "deferred Neg for defaulted local literal `{name}` is accepted"
+            );
+            for local in ["source", "result"] {
+                assert_eq!(
+                    results(owner).binding_type(binding_named(owner, local, BindingKind::Let)),
+                    Some(ty),
+                    "{name}/{local} resolves to the default type"
+                );
+            }
+        }
+
         for name in [
             "excluded_computed",
             "excluded_call",
@@ -66279,8 +66297,6 @@ property "shared"() {}
             "excluded_global",
             "excluded_self",
             "excluded_forward",
-            "excluded_unresolved_integer_local",
-            "excluded_unresolved_float_local",
             "excluded_unresolved",
             "excluded_nested_block",
             "excluded_mutable_source",
