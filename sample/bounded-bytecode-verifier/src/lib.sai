@@ -1,0 +1,101 @@
+use acme:bounded-bytecode-verifier/fixtures
+use acme:bounded-bytecode-verifier/model.{VerificationSummary, VerifyError, VerifyErrorKind}
+use acme:bounded-bytecode-verifier/verifier
+
+pub fn verify_branch_fixture() -> Result<VerificationSummary, VerifyError> {
+    verifier.verify(fixtures.balanced_branch())
+}
+
+test "both arms of a conditional branch merge with the same typed stack" {
+    match verify_branch_fixture() {
+        Ok(summary) => {
+            assert summary.reachable_instruction_count == 8
+            assert summary.maximum_stack_depth == 2
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "a join rejects branches with different stack shapes" {
+    let result = verifier.verify(fixtures.inconsistent_join())
+    match result {
+        Ok(_) => {
+            assert false
+        }
+        Err(problem) => {
+            assert problem.kind == VerifyErrorKind.InconsistentStackAtJoin
+            assert problem.instruction_index == 5
+            assert problem.first_predecessor == Some(4)
+            assert problem.second_predecessor == Some(3)
+        }
+    }
+}
+
+test "a join also rejects different value kinds at the same depth" {
+    let result = verifier.verify(fixtures.kind_inconsistent_join())
+    match result {
+        Ok(_) => {
+            assert false
+        }
+        Err(problem) => {
+            assert problem.kind == VerifyErrorKind.InconsistentStackAtJoin
+            assert problem.instruction_index == 5
+            assert problem.first_predecessor == Some(4)
+            assert problem.second_predecessor == Some(3)
+        }
+    }
+}
+
+test "a consistent infinite loop is accepted without a reachable return" {
+    let result = verifier.verify(fixtures.consistent_loop())
+    match result {
+        Ok(summary) => {
+            assert summary.reachable_instruction_count == 1
+            assert summary.maximum_stack_depth == 0
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "integer arithmetic rejects a boolean operand" {
+    let result = verifier.verify(fixtures.wrong_operand_kind())
+    match result {
+        Ok(_) => {
+            assert false
+        }
+        Err(problem) => {
+            assert problem.kind == VerifyErrorKind.StackTypeMismatch
+            assert problem.instruction_index == 1
+        }
+    }
+}
+
+test "branches cannot target the end or beyond the instruction stream" {
+    let result = verifier.verify(fixtures.invalid_branch())
+    match result {
+        Ok(_) => {
+            assert false
+        }
+        Err(problem) => {
+            assert problem.kind == VerifyErrorKind.InvalidBranchTarget
+            assert problem.instruction_index == 0
+        }
+    }
+}
+
+test "a reachable path cannot fall off the end" {
+    let result = verifier.verify(fixtures.missing_return())
+    match result {
+        Ok(_) => {
+            assert false
+        }
+        Err(problem) => {
+            assert problem.kind == VerifyErrorKind.FallthroughPastEnd
+            assert problem.instruction_index == 0
+        }
+    }
+}

@@ -1,0 +1,69 @@
+use acme:bounded-bytecode-verifier/model.{
+    BytecodeProgram
+    Instruction
+    MAX_INSTRUCTION_COUNT
+    ValueKind
+}
+
+pub fn balanced_branch() -> BytecodeProgram {
+    var instructions = Array<Option<Instruction>, MAX_INSTRUCTION_COUNT>.filled(None)
+    instructions[0] = Some(Instruction.PushI32(3))
+    instructions[1] = Some(Instruction.PushI32(7))
+    instructions[2] = Some(Instruction.LessI32)
+    instructions[3] = Some(Instruction.JumpIfFalse(6))
+    instructions[4] = Some(Instruction.PushI32(42))
+    instructions[5] = Some(Instruction.Jump(7))
+    instructions[6] = Some(Instruction.PushI32(0))
+    instructions[7] = Some(Instruction.ReturnI32)
+    BytecodeProgram(instructions: instructions, instruction_count: 8, return_kind: ValueKind.I32)
+}
+
+pub fn inconsistent_join() -> BytecodeProgram {
+    var instructions = Array<Option<Instruction>, MAX_INSTRUCTION_COUNT>.filled(None)
+    instructions[0] = Some(Instruction.PushBool(true))
+    instructions[1] = Some(Instruction.JumpIfFalse(4))
+    instructions[2] = Some(Instruction.PushI32(1))
+    instructions[3] = Some(Instruction.Jump(5))
+    instructions[4] = Some(Instruction.Jump(5))
+    instructions[5] = Some(Instruction.PushI32(2))
+    instructions[6] = Some(Instruction.ReturnI32)
+    BytecodeProgram(instructions: instructions, instruction_count: 7, return_kind: ValueKind.I32)
+}
+
+pub fn kind_inconsistent_join() -> BytecodeProgram {
+    var instructions = Array<Option<Instruction>, MAX_INSTRUCTION_COUNT>.filled(None)
+    instructions[0] = Some(Instruction.PushBool(true))
+    instructions[1] = Some(Instruction.JumpIfFalse(4))
+    instructions[2] = Some(Instruction.PushI32(1))
+    instructions[3] = Some(Instruction.Jump(5))
+    instructions[4] = Some(Instruction.PushBool(false))
+    instructions[5] = Some(Instruction.PushI32(2))
+    instructions[6] = Some(Instruction.ReturnI32)
+    BytecodeProgram(instructions: instructions, instruction_count: 7, return_kind: ValueKind.I32)
+}
+
+pub fn consistent_loop() -> BytecodeProgram {
+    var instructions = Array<Option<Instruction>, MAX_INSTRUCTION_COUNT>.filled(None)
+    instructions[0] = Some(Instruction.Jump(0))
+    BytecodeProgram(instructions: instructions, instruction_count: 1, return_kind: ValueKind.I32)
+}
+
+pub fn wrong_operand_kind() -> BytecodeProgram {
+    var instructions = Array<Option<Instruction>, MAX_INSTRUCTION_COUNT>.filled(None)
+    instructions[0] = Some(Instruction.PushBool(true))
+    instructions[1] = Some(Instruction.AddI32)
+    instructions[2] = Some(Instruction.ReturnI32)
+    BytecodeProgram(instructions: instructions, instruction_count: 3, return_kind: ValueKind.I32)
+}
+
+pub fn invalid_branch() -> BytecodeProgram {
+    var instructions = Array<Option<Instruction>, MAX_INSTRUCTION_COUNT>.filled(None)
+    instructions[0] = Some(Instruction.Jump(9))
+    BytecodeProgram(instructions: instructions, instruction_count: 1, return_kind: ValueKind.I32)
+}
+
+pub fn missing_return() -> BytecodeProgram {
+    var instructions = Array<Option<Instruction>, MAX_INSTRUCTION_COUNT>.filled(None)
+    instructions[0] = Some(Instruction.PushI32(1))
+    BytecodeProgram(instructions: instructions, instruction_count: 1, return_kind: ValueKind.I32)
+}

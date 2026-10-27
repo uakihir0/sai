@@ -1,0 +1,77 @@
+pub const MAX_INSTRUCTION_COUNT: USize = 24
+pub const MAX_STACK_DEPTH: USize = 8
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ValueKind {
+    I32
+    Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Instruction {
+    PushI32(U32)
+    PushBool(Bool)
+    AddI32
+    LessI32
+    EqualI32
+    Jump(USize)
+    JumpIfFalse(USize)
+    ReturnI32
+    ReturnBool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BytecodeProgram {
+    pub instructions: Array<Option<Instruction>, MAX_INSTRUCTION_COUNT>
+    pub instruction_count: USize
+    pub return_kind: ValueKind
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum VerifyErrorKind {
+    EmptyProgram
+    ProgramTooLarge
+    MissingInstruction
+    InvalidBranchTarget
+    StackUnderflow
+    StackTypeMismatch
+    StackLimitExceeded
+    InconsistentStackAtJoin
+    FallthroughPastEnd
+    ReturnStackShape
+    ReturnTypeMismatch
+    InvalidAbstractState
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type VerifyError {
+    pub kind: VerifyErrorKind
+    pub instruction_index: USize
+    pub first_predecessor: Option<USize>
+    pub second_predecessor: Option<USize>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AbstractStack {
+    pub kinds: Array<Option<ValueKind>, MAX_STACK_DEPTH>
+    pub depth: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type IncomingState {
+    pub stack: AbstractStack
+    pub predecessor: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Worklist {
+    pub incoming: Array<Option<IncomingState>, MAX_INSTRUCTION_COUNT>
+    pub instructions: Array<Option<USize>, MAX_INSTRUCTION_COUNT>
+    pub instruction_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type VerificationSummary {
+    pub reachable_instruction_count: USize
+    pub maximum_stack_depth: USize
+}
