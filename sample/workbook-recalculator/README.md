@@ -55,7 +55,10 @@ The closure distinguishes a member of a cycle from a formula merely waiting
 on one. When both inputs fail, the left input takes precedence; a pending left
 input keeps the formula pending until that input resolves. For a formula blocked
 by multiple cycle members, the first member in workbook slot order is recorded.
-These rules keep reports deterministic.
+These rules keep reports deterministic. Public helpers also fail closed when
+called without prior validation: `index_of` returns `None` for an oversized
+cell count, `transitive_closure` returns an empty graph, and `reaches` returns
+`false` for either out-of-range index.
 
 ## Project structure
 

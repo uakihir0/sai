@@ -1,5 +1,14 @@
 use acme:workbook-recalculator/fixtures
-use acme:workbook-recalculator/model.{CellResult, CellStatus, RecalcReport, WorkbookError}
+use acme:workbook-recalculator/formula/graph
+use acme:workbook-recalculator/lookup
+use acme:workbook-recalculator/model.{
+    CellResult
+    CellStatus
+    MAX_CELLS
+    MAX_GRAPH_CELLS
+    RecalcReport
+    WorkbookError
+}
 use acme:workbook-recalculator/recalculate
 
 pub fn fixture_report() -> RecalcReport {
@@ -74,4 +83,17 @@ test "duplicate cell identifiers reject the workbook before calculation" {
         recalculate.recalculate(fixtures.duplicate_id_workbook())
         == Err(WorkbookError.DuplicateCellId(10))
     )
+}
+
+test "public lookup and graph helpers stay in bounds on malformed inputs" {
+    var malformed = fixtures.workbook()
+    malformed.cell_count = MAX_CELLS + 1
+
+    assert lookup.index_of(malformed, 10) == None
+    assert (graph.transitive_closure(malformed) == Array<Bool, MAX_GRAPH_CELLS>.filled(false))
+
+    let reachability = graph.transitive_closure(fixtures.workbook())
+    assert not graph.reaches(reachability, MAX_CELLS, 0)
+    assert not graph.reaches(reachability, 0, MAX_CELLS)
+    assert not graph.is_cycle_member(reachability, MAX_CELLS)
 }
