@@ -1,0 +1,218 @@
+use acme:transaction-serializability-auditor/history
+use acme:transaction-serializability-auditor/history.{ValidatedHistory}
+use acme:transaction-serializability-auditor/model.{
+    AuditReport
+    AuditStatus
+    History
+    MAX_CYCLE_LENGTH
+    MAX_PRECEDENCE_EDGES
+    MAX_TRANSACTIONS
+    PrecedenceEdge
+}
+use acme:transaction-serializability-auditor/precedence
+use acme:transaction-serializability-auditor/precedence.{PrecedenceGraph}
+
+@derive(Copy, Clone, PartialEq, Eq)
+type Cycle {
+    transactions: Array<Option<U32>, MAX_CYCLE_LENGTH>
+    length: USize
+}
+
+fn empty_report(status: AuditStatus) -> AuditReport {
+    AuditReport(
+        status: status,
+        transaction_ids: Array<Option<U32>, MAX_TRANSACTIONS>.filled(None),
+        transaction_count: 0,
+        precedence_edges: Array<Option<PrecedenceEdge>, MAX_PRECEDENCE_EDGES>.filled(None),
+        precedence_edge_count: 0,
+        serial_order: Array<Option<U32>, MAX_TRANSACTIONS>.filled(None),
+        serial_order_count: 0,
+        cycle_transactions: Array<Option<U32>, MAX_CYCLE_LENGTH>.filled(None),
+        cycle_length: 0,
+    )
+}
+
+fn cell_index(from: USize, to: USize) -> USize {
+    from * MAX_TRANSACTIONS + to
+}
+
+fn is_ready(
+    graph: PrecedenceGraph,
+    candidate: USize,
+    transaction_count: USize,
+    emitted: Array<Bool, MAX_TRANSACTIONS>,
+) -> Bool {
+    for predecessor in 0..transaction_count {
+        if graph.adjacent[cell_index(predecessor, candidate)] and not emitted[predecessor] {
+            return false
+        }
+    }
+    true
+}
+
+fn topological_order(graph: PrecedenceGraph, validated: ValidatedHistory) -> Option<
+    Array<Option<U32>, MAX_TRANSACTIONS>,
+> {
+    var emitted = Array<Bool, MAX_TRANSACTIONS>.filled(false)
+    var order = Array<Option<U32>, MAX_TRANSACTIONS>.filled(None)
+    var order_count: USize = 0
+
+    while order_count < validated.transaction_count {
+        var selected: Option<USize> = None
+        for index in 0..validated.transaction_count {
+            if not emitted[index] and is_ready(graph, index, validated.transaction_count, emitted) {
+                match selected {
+                    Some(selected_index) => {
+                        if (
+                            validated.transaction_ids[index].unwrap()
+                            < validated.transaction_ids[selected_index].unwrap()
+                        ) {
+                            selected = Some(index)
+                        }
+                    }
+                    None => {
+                        selected = Some(index)
+                    }
+                }
+            }
+        }
+        match selected {
+            Some(index) => {
+                emitted[index] = true
+                order[order_count] = validated.transaction_ids[index]
+                order_count += 1
+            }
+            None => return None
+        }
+    }
+    Some(order)
+}
+
+fn edge_exists(graph: PrecedenceGraph, from: USize, to: USize) -> Bool {
+    graph.adjacent[cell_index(from, to)]
+}
+
+fn cycle_from_edge(
+    graph: PrecedenceGraph,
+    start: USize,
+    first_neighbor: USize,
+    transaction_count: USize,
+    transaction_ids: Array<Option<U32>, MAX_TRANSACTIONS>,
+) -> Option<Cycle> {
+    var visited = Array<Bool, MAX_TRANSACTIONS>.filled(false)
+    var predecessor = Array<Option<USize>, MAX_TRANSACTIONS>.filled(None)
+    var queue = Array<USize, MAX_TRANSACTIONS>.filled(0)
+    visited[first_neighbor] = true
+    queue[0] = first_neighbor
+    var head: USize = 0
+    var tail: USize = 1
+
+    while head < tail {
+        let current = queue[head]
+        head += 1
+        for next in 0..transaction_count {
+            if not edge_exists(graph, current, next) {
+                continue
+            }
+            if next == start {
+                var reversed_path = Array<USize, MAX_TRANSACTIONS>.filled(0)
+                var reversed_length: USize = 1
+                reversed_path[0] = current
+                var cursor = current
+                while cursor != first_neighbor {
+                    cursor = match predecessor[cursor] {
+                        Some(previous) => previous
+                        None => return None
+                    }
+                    if reversed_length >= MAX_TRANSACTIONS {
+                        return None
+                    }
+                    reversed_path[reversed_length] = cursor
+                    reversed_length += 1
+                }
+
+                var cycle_transactions = Array<Option<U32>, MAX_CYCLE_LENGTH>.filled(None)
+                var cycle_length: USize = 0
+                cycle_transactions[cycle_length] = transaction_ids[start]
+                cycle_length += 1
+                for path_index in 0..reversed_length {
+                    let transaction_index = reversed_path[reversed_length - path_index - 1]
+                    cycle_transactions[cycle_length] = transaction_ids[transaction_index]
+                    cycle_length += 1
+                }
+                cycle_transactions[cycle_length] = transaction_ids[start]
+                cycle_length += 1
+                return Some(Cycle(transactions: cycle_transactions, length: cycle_length))
+            }
+            if not visited[next] {
+                visited[next] = true
+                predecessor[next] = Some(current)
+                if tail >= MAX_TRANSACTIONS {
+                    return None
+                }
+                queue[tail] = next
+                tail += 1
+            }
+        }
+    }
+    None
+}
+
+fn find_cycle(graph: PrecedenceGraph, validated: ValidatedHistory) -> Option<Cycle> {
+    for start in 0..validated.transaction_count {
+        for first_neighbor in 0..validated.transaction_count {
+            if edge_exists(graph, start, first_neighbor) {
+                match cycle_from_edge(
+                    graph,
+                    start,
+                    first_neighbor,
+                    validated.transaction_count,
+                    validated.transaction_ids,
+                ) { Some(cycle) => return Some(cycle), None => {} }
+            }
+        }
+    }
+    None
+}
+
+fn report_graph(
+    status: AuditStatus,
+    validated: ValidatedHistory,
+    graph: PrecedenceGraph,
+) -> AuditReport {
+    var report = empty_report(status)
+    report.transaction_ids = validated.transaction_ids
+    report.transaction_count = validated.transaction_count
+    report.precedence_edges = graph.edges
+    report.precedence_edge_count = graph.edge_count
+    report
+}
+
+pub fn audit(history_value: History) -> AuditReport {
+    let validated = match history.validate(history_value) {
+        Some(value) => value
+        None => return empty_report(AuditStatus.InvalidHistory)
+    }
+    let graph = match precedence.build(history_value, validated) {
+        Some(value) => value
+        None => return empty_report(AuditStatus.InvalidHistory)
+    }
+    match topological_order(graph, validated) {
+        Some(order) => {
+            var report = report_graph(AuditStatus.Serializable, validated, graph)
+            report.serial_order = order
+            report.serial_order_count = validated.transaction_count
+            report
+        }
+        None => {
+            let cycle = match find_cycle(graph, validated) {
+                Some(value) => value
+                None => return empty_report(AuditStatus.InvalidHistory)
+            }
+            var report = report_graph(AuditStatus.ConflictCycle, validated, graph)
+            report.cycle_transactions = cycle.transactions
+            report.cycle_length = cycle.length
+            report
+        }
+    }
+}

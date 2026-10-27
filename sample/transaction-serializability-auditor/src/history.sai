@@ -1,0 +1,121 @@
+use acme:transaction-serializability-auditor/model.{
+    EventKind
+    History
+    HistoryEvent
+    MAX_HISTORY_EVENTS
+    MAX_TRANSACTIONS
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ValidatedHistory {
+    pub transaction_ids: Array<Option<U32>, MAX_TRANSACTIONS>
+    pub transaction_count: USize
+}
+
+pub fn empty() -> History {
+    History(events: Array<Option<HistoryEvent>, MAX_HISTORY_EVENTS>.filled(None), event_count: 0)
+}
+
+pub fn event(transaction_id: U32, kind: EventKind, item_id: U32) -> HistoryEvent {
+    HistoryEvent(transaction_id: transaction_id, kind: kind, item_id: item_id)
+}
+
+pub fn push(history: History, next_event: HistoryEvent) -> Option<History> {
+    if history.event_count >= MAX_HISTORY_EVENTS {
+        return None
+    }
+    if history.events[history.event_count] != None {
+        return None
+    }
+    var updated = history
+    updated.events[updated.event_count] = Some(next_event)
+    updated.event_count += 1
+    Some(updated)
+}
+
+fn transaction_index(
+    transaction_ids: Array<Option<U32>, MAX_TRANSACTIONS>,
+    transaction_count: USize,
+    transaction_id: U32,
+) -> Option<USize> {
+    for index in 0..transaction_count {
+        if transaction_ids[index] == Some(transaction_id) {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn validate(history: History) -> Option<ValidatedHistory> {
+    if history.event_count == 0 or history.event_count > MAX_HISTORY_EVENTS {
+        return None
+    }
+    for index in history.event_count..MAX_HISTORY_EVENTS {
+        if history.events[index] != None {
+            return None
+        }
+    }
+
+    var transaction_ids = Array<Option<U32>, MAX_TRANSACTIONS>.filled(None)
+    var transaction_count: USize = 0
+    var operation_counts = Array<USize, MAX_TRANSACTIONS>.filled(0)
+    var committed = Array<Bool, MAX_TRANSACTIONS>.filled(false)
+
+    for position in 0..history.event_count {
+        let current = match history.events[position] { Some(value) => value, None => return None }
+        if current.transaction_id == 0 {
+            return None
+        }
+
+        let transaction = match transaction_index(
+            transaction_ids,
+            transaction_count,
+            current.transaction_id,
+        ) {
+            Some(index) => index
+            None => {
+                if transaction_count >= MAX_TRANSACTIONS {
+                    return None
+                }
+                transaction_ids[transaction_count] = Some(current.transaction_id)
+                transaction_count += 1
+                transaction_count - 1
+            }
+        }
+
+        match current.kind {
+            EventKind.Read | EventKind.Write => {
+                if current.item_id == 0 or committed[transaction] {
+                    return None
+                }
+                operation_counts[transaction] += 1
+            }
+            EventKind.Commit => {
+                if (
+                    current.item_id != 0
+                    or committed[transaction]
+                    or operation_counts[transaction] == 0
+                ) {
+                    return None
+                }
+                committed[transaction] = true
+            }
+        }
+    }
+
+    if transaction_count == 0 {
+        return None
+    }
+    for index in 0..transaction_count {
+        if not committed[index] {
+            return None
+        }
+    }
+    for index in transaction_count..MAX_TRANSACTIONS {
+        if transaction_ids[index] != None {
+            return None
+        }
+    }
+
+    Some(ValidatedHistory(transaction_ids: transaction_ids, transaction_count: transaction_count))
+}

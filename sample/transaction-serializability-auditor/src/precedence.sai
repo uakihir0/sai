@@ -1,0 +1,114 @@
+use acme:transaction-serializability-auditor/history
+use acme:transaction-serializability-auditor/history.{ValidatedHistory}
+use acme:transaction-serializability-auditor/model.{
+    EventKind
+    History
+    MAX_GRAPH_CELLS
+    MAX_PRECEDENCE_EDGES
+    MAX_TRANSACTIONS
+    PrecedenceEdge
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PrecedenceGraph {
+    pub adjacent: Array<Bool, MAX_GRAPH_CELLS>
+    pub edges: Array<Option<PrecedenceEdge>, MAX_PRECEDENCE_EDGES>
+    pub edge_count: USize
+}
+
+pub fn empty() -> PrecedenceGraph {
+    PrecedenceGraph(
+        adjacent: Array<Bool, MAX_GRAPH_CELLS>.filled(false),
+        edges: Array<Option<PrecedenceEdge>, MAX_PRECEDENCE_EDGES>.filled(None),
+        edge_count: 0,
+    )
+}
+
+fn cell_index(from: USize, to: USize) -> USize {
+    from * MAX_TRANSACTIONS + to
+}
+
+fn transaction_index(
+    transaction_ids: Array<Option<U32>, MAX_TRANSACTIONS>,
+    transaction_count: USize,
+    transaction_id: U32,
+) -> Option<USize> {
+    for index in 0..transaction_count {
+        if transaction_ids[index] == Some(transaction_id) {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn conflicts(first: EventKind, second: EventKind) -> Bool {
+    (
+        (first == EventKind.Read and second == EventKind.Write)
+        or (first == EventKind.Write and second == EventKind.Read)
+        or (first == EventKind.Write and second == EventKind.Write)
+    )
+}
+
+pub fn build(history_value: History, validated: ValidatedHistory) -> Option<PrecedenceGraph> {
+    let expected = match history.validate(history_value) {
+        Some(value) => value
+        None => return None
+    }
+    if expected != validated {
+        return None
+    }
+
+    var graph = empty()
+    for before_position in 0..history_value.event_count {
+        let before = match history_value.events[before_position] {
+            Some(value) => value
+            None => return None
+        }
+        if before.kind == EventKind.Commit {
+            continue
+        }
+        for after_position in (before_position + 1)..history_value.event_count {
+            let after = match history_value.events[after_position] {
+                Some(value) => value
+                None => return None
+            }
+            if (
+                after.kind == EventKind.Commit
+                or before.transaction_id == after.transaction_id
+                or before.item_id != after.item_id
+                or not conflicts(before.kind, after.kind)
+            ) {
+                continue
+            }
+
+            let before_transaction = match transaction_index(
+                validated.transaction_ids,
+                validated.transaction_count,
+                before.transaction_id,
+            ) { Some(index) => index, None => return None }
+            let after_transaction = match transaction_index(
+                validated.transaction_ids,
+                validated.transaction_count,
+                after.transaction_id,
+            ) { Some(index) => index, None => return None }
+            let cell = cell_index(before_transaction, after_transaction)
+            if not graph.adjacent[cell] {
+                if graph.edge_count >= MAX_PRECEDENCE_EDGES {
+                    return None
+                }
+                graph.adjacent[cell] = true
+                graph.edges[graph.edge_count] = Some(
+                    PrecedenceEdge(
+                        before_transaction_id: before.transaction_id,
+                        after_transaction_id: after.transaction_id,
+                        item_id: before.item_id,
+                        before_position: before_position,
+                        after_position: after_position,
+                    ),
+                )
+                graph.edge_count += 1
+            }
+        }
+    }
+    Some(graph)
+}

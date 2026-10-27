@@ -1,0 +1,68 @@
+use acme:transaction-serializability-auditor/history
+use acme:transaction-serializability-auditor/model.{EventKind, History}
+
+pub fn serializable_interleaving() -> History {
+    var events = history.empty()
+    events = history.push(events, history.event(20, EventKind.Read, 1)).unwrap()
+    events = history.push(events, history.event(10, EventKind.Write, 1)).unwrap()
+    events = history.push(events, history.event(30, EventKind.Read, 2)).unwrap()
+    events = history.push(events, history.event(10, EventKind.Write, 2)).unwrap()
+    events = history.push(events, history.event(20, EventKind.Commit, 0)).unwrap()
+    events = history.push(events, history.event(10, EventKind.Commit, 0)).unwrap()
+    events = history.push(events, history.event(30, EventKind.Commit, 0)).unwrap()
+    events
+}
+
+pub fn cyclic_interleaving() -> History {
+    var events = history.empty()
+    events = history.push(events, history.event(11, EventKind.Read, 1)).unwrap()
+    events = history.push(events, history.event(22, EventKind.Read, 2)).unwrap()
+    events = history.push(events, history.event(11, EventKind.Write, 2)).unwrap()
+    events = history.push(events, history.event(22, EventKind.Write, 1)).unwrap()
+    events = history.push(events, history.event(11, EventKind.Commit, 0)).unwrap()
+    events = history.push(events, history.event(22, EventKind.Commit, 0)).unwrap()
+    events
+}
+
+pub fn four_transaction_cycle() -> History {
+    var events = history.empty()
+    events = history.push(events, history.event(11, EventKind.Read, 1)).unwrap()
+    events = history.push(events, history.event(22, EventKind.Read, 2)).unwrap()
+    events = history.push(events, history.event(33, EventKind.Read, 3)).unwrap()
+    events = history.push(events, history.event(44, EventKind.Read, 4)).unwrap()
+    events = history.push(events, history.event(22, EventKind.Write, 1)).unwrap()
+    events = history.push(events, history.event(33, EventKind.Write, 2)).unwrap()
+    events = history.push(events, history.event(44, EventKind.Write, 3)).unwrap()
+    events = history.push(events, history.event(11, EventKind.Write, 4)).unwrap()
+    events = history.push(events, history.event(11, EventKind.Commit, 0)).unwrap()
+    events = history.push(events, history.event(22, EventKind.Commit, 0)).unwrap()
+    events = history.push(events, history.event(33, EventKind.Commit, 0)).unwrap()
+    events = history.push(events, history.event(44, EventKind.Commit, 0)).unwrap()
+    events
+}
+
+pub fn read_read_only() -> History {
+    var events = history.empty()
+    events = history.push(events, history.event(7, EventKind.Read, 3)).unwrap()
+    events = history.push(events, history.event(9, EventKind.Read, 3)).unwrap()
+    events = history.push(events, history.event(7, EventKind.Commit, 0)).unwrap()
+    events = history.push(events, history.event(9, EventKind.Commit, 0)).unwrap()
+    events
+}
+
+pub fn write_write_pair() -> History {
+    var events = history.empty()
+    events = history.push(events, history.event(5, EventKind.Write, 4)).unwrap()
+    events = history.push(events, history.event(3, EventKind.Write, 4)).unwrap()
+    events = history.push(events, history.event(5, EventKind.Commit, 0)).unwrap()
+    events = history.push(events, history.event(3, EventKind.Commit, 0)).unwrap()
+    events
+}
+
+pub fn operation_after_commit() -> History {
+    var events = history.empty()
+    events = history.push(events, history.event(11, EventKind.Write, 1)).unwrap()
+    events = history.push(events, history.event(11, EventKind.Commit, 0)).unwrap()
+    events = history.push(events, history.event(11, EventKind.Read, 1)).unwrap()
+    events
+}
