@@ -19366,9 +19366,26 @@ fn binary_shift_integer_literal_byte_rhs_arguments_remain_behind_the_stage_gate(
 }
 
 #[test]
+fn binary_shift_byte_literal_rhs_arguments_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn root_path_left_shift(value: I32) -> I32 { identity_i32(value << b'a') }\n",
+        "pub fn root_byte_path_right_shift(value: Byte) -> Byte { identity_byte(value >> b'z') }\n",
+        "pub fn nested_path_left_shift(value: I16) -> I16 { identity_i16(identity_i16(value << b'b')) }\n",
+        "pub fn nested_byte_literal_right_shift() -> Byte { identity_byte(identity_byte(b'a' >> b'c')) }\n",
+        "fn identity_i16(value: I16) -> I16 { value }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct calls with Byte-literal shift counts",
+    );
+}
+
+#[test]
 fn unsupported_binary_shift_byte_literal_lhs_shapes_remain_behind_the_stage_gate() {
     let source = concat!(
-        "pub fn byte_literal_rhs() -> Byte { identity_byte(b'a' << b'b') }\n",
         "pub fn computed_rhs(count: U32) -> Byte { identity_byte(b'a' << (count + 1)) }\n",
         "pub fn computed_lhs(count: U32) -> Byte { identity_byte((b'a' | b'b') << count) }\n",
         "pub fn deep_nested(count: U32) -> Byte { identity_byte(identity_byte(identity_byte(b'a' << count))) }\n",
@@ -19391,7 +19408,7 @@ fn unsupported_binary_shift_byte_literal_lhs_shapes_remain_behind_the_stage_gate
     let output = run_check(source, "", &[], &[]);
     assert_check_stays_gated_without_syntax_errors(
         &output,
-        "integer, literal-pair, computed, deep, generic, and unsupported-signature shift forms",
+        "computed, unresolved, self-referential, deep, generic, and unsupported-signature shifts",
     );
 }
 
