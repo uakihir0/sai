@@ -9296,7 +9296,12 @@ fn is_supported_direct_call_shift_operands_shape(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Byte(_)) => true,
-        ExprKind::Lit(Lit::Int { .. }) => matches!(right.kind, ExprKind::Path(_)),
+        ExprKind::Lit(Lit::Int { .. }) => {
+            matches!(
+                right.kind,
+                ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })
+            )
+        }
         _ => false,
     };
     if !left_shape_is_supported {
@@ -49271,7 +49276,6 @@ property "shared"() {}
             "    let valid = apply_bool(left)\n",
             "    valid\n",
             "}\n",
-            "pub fn shift_integer_literal_pair_unsupported() -> I32 { apply_i32(1 << 2) }\n",
             "pub fn shift_integer_literal_rhs_computed_lhs_unsupported(left: I32) -> I32 { apply_i32((left + 1) << 2) }\n",
             "pub fn shift_integer_literal_rhs_computed_unsupported(left: I32, count: U32) -> I32 { apply_i32(left << (count + 1)) }\n",
             "pub fn shift_integer_literal_rhs_unary_computed_unsupported(left: I32, count: U32) -> I32 { apply_i32(left << -count) }\n",
@@ -49324,6 +49328,39 @@ property "shared"() {}
             "    let failed = apply_u8(-1 >> count)\n",
             "    let alias = failed\n",
             "    apply_u8(255 << count)\n",
+            "}\n",
+            "pub fn shift_integer_literal_pair_signed_range_recovery() -> I8 {\n",
+            "    let failed = apply_i8(-129 << 0)\n",
+            "    let alias = failed\n",
+            "    apply_i8(127 >> 0)\n",
+            "}\n",
+            "pub fn shift_integer_literal_pair_unsigned_range_recovery() -> U8 {\n",
+            "    let failed = apply_u8(-1 >> 0)\n",
+            "    let alias = failed\n",
+            "    apply_u8(255 << 0)\n",
+            "}\n",
+            "pub fn shift_integer_literal_pair_isize_max() -> ISize {\n",
+            "    let checked = apply_isize(-2147483648 << 0)\n",
+            "    apply_isize(1 << 0)\n",
+            "}\n",
+            "pub fn shift_integer_literal_pair_isize_overflow() -> ISize {\n",
+            "    let failed = apply_isize(2147483648 << 0)\n",
+            "    let alias = failed\n",
+            "    apply_isize(1 << 0)\n",
+            "}\n",
+            "pub fn shift_integer_literal_pair_usize_max() -> USize {\n",
+            "    let checked = apply_usize(4294967295 >> 0)\n",
+            "    apply_usize(1 >> 0)\n",
+            "}\n",
+            "pub fn shift_integer_literal_pair_usize_overflow() -> USize {\n",
+            "    let failed = apply_usize(4294967296 >> 0)\n",
+            "    let alias = failed\n",
+            "    apply_usize(1 >> 0)\n",
+            "}\n",
+            "pub fn shift_integer_literal_pair_parameter_mismatch() -> I32 {\n",
+            "    let failed = apply_bool(1 << 0)\n",
+            "    let alias = failed\n",
+            "    apply_i32(2 >> 0)\n",
             "}\n",
             "pub fn shift_integer_literal_rhs_deep_nested_unsupported(left: I32) -> I32 { apply_i32(apply_i32(apply_i32(left << 1))) }\n",
             "pub fn shift_integer_literal_rhs_generic_target_unsupported(left: I32) -> I32 { generic_fn(left << 1) }\n",
@@ -50211,6 +50248,8 @@ property "shared"() {}
         let mut shift_literal_lhs_path_cases = Vec::new();
         let mut generated_byte_shift_literal_rhs_cases = String::new();
         let mut byte_shift_literal_rhs_cases = Vec::new();
+        let mut generated_integer_shift_literal_pair_cases = String::new();
+        let mut integer_shift_literal_pair_cases = Vec::new();
         for (left_type, callee, type_name) in [
             ("I8", "apply_i8", "i8"),
             ("I16", "apply_i16", "i16"),
@@ -50326,6 +50365,56 @@ property "shared"() {}
                 }
             }
         }
+        for (left_type, callee, type_name, primitive) in [
+            ("I8", "apply_i8", "i8", PrimTy::I8),
+            ("I16", "apply_i16", "i16", PrimTy::I16),
+            ("I32", "apply_i32", "i32", PrimTy::I32),
+            ("I64", "apply_i64", "i64", PrimTy::I64),
+            ("ISize", "apply_isize", "isize", PrimTy::ISize),
+            ("U8", "apply_u8", "u8", PrimTy::U8),
+            ("U16", "apply_u16", "u16", PrimTy::U16),
+            ("U32", "apply_u32", "u32", PrimTy::U32),
+            ("U64", "apply_u64", "u64", PrimTy::U64),
+            ("USize", "apply_usize", "usize", PrimTy::USize),
+        ] {
+            for (operator, operator_name) in [("<<", "left"), (">>", "right")] {
+                for (nested, position) in [(false, "root"), (true, "nested")] {
+                    for (literal_name, literal, in_range) in [
+                        ("zero", "0", true),
+                        ("u32_max", "4294967295", true),
+                        ("negative_one", "-1", false),
+                        ("u32_max_plus_one", "4294967296", false),
+                    ] {
+                        let name = format!(
+                            "direct_call_shift_integer_literal_pair_{position}_{type_name}_{operator_name}_{literal_name}"
+                        );
+                        let operator_expression = format!("1 {operator} {literal}");
+                        let inner_call = format!("{callee}({operator_expression})");
+                        let call = if nested {
+                            format!("{callee}({inner_call})")
+                        } else {
+                            inner_call.clone()
+                        };
+                        let sibling_expression = format!("1 {operator} 0");
+                        let sibling_call = format!("{callee}({sibling_expression})");
+                        generated_integer_shift_literal_pair_cases.push_str(&format!(
+                            "pub fn {name}() -> {left_type} {{\n    let failed = {call}\n    {sibling_call}\n}}\n"
+                        ));
+                        integer_shift_literal_pair_cases.push((
+                            name,
+                            nested,
+                            primitive,
+                            operator_expression,
+                            literal,
+                            in_range,
+                            call,
+                            inner_call,
+                            sibling_call,
+                        ));
+                    }
+                }
+            }
+        }
         root.push_str(&generated_bitwise_integer_literal_cases);
         root.push_str(&generated_bitwise_integer_literal_left_cases);
         root.push_str(&generated_bitwise_integer_literal_pair_cases);
@@ -50333,6 +50422,7 @@ property "shared"() {}
         root.push_str(&generated_shift_literal_rhs_cases);
         root.push_str(&generated_shift_literal_lhs_path_cases);
         root.push_str(&generated_byte_shift_literal_rhs_cases);
+        root.push_str(&generated_integer_shift_literal_pair_cases);
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
@@ -51429,7 +51519,6 @@ property "shared"() {}
             "shift_deep_nested_call_unsupported",
             "shift_unresolved_local_unsupported",
             "shift_unresolved_left_local_unsupported",
-            "shift_integer_literal_pair_unsupported",
             "shift_integer_literal_rhs_computed_lhs_unsupported",
             "shift_integer_literal_rhs_computed_unsupported",
             "shift_integer_literal_rhs_unary_computed_unsupported",
@@ -52042,6 +52131,432 @@ property "shared"() {}
                 "{name} accepts U32 path counts without a static shift-width diagnostic"
             );
         }
+
+        for (
+            name,
+            nested,
+            primitive,
+            operator_expression,
+            literal,
+            in_range,
+            call,
+            inner_call,
+            sibling_call,
+        ) in &integer_shift_literal_pair_cases
+        {
+            let expected_codes = if *in_range {
+                &[][..]
+            } else {
+                &[sai_diagnostics::Code::LiteralOutOfRange][..]
+            };
+            let owner = assert_supported(&database, name, expected_codes);
+            let function = format!("pub fn {name}");
+            let call_type = (*in_range).then_some(*primitive);
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, call, 0, call.len(),),
+                call_type,
+                "{name} publishes a call fact only when both integer literals are in range"
+            );
+            if *nested {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        call.find(inner_call)
+                            .expect("the direct shift call is nested one level"),
+                        inner_call.len(),
+                    ),
+                    call_type,
+                    "{name} propagates literal range taint through the nested call"
+                );
+            }
+
+            let operator_start = call
+                .find(operator_expression)
+                .expect("the literal-pair shift occurs in the direct call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start,
+                    operator_expression.len(),
+                ),
+                call_type,
+                "{name} publishes the operator fact only when the count is in range"
+            );
+            let left_literal_start = operator_expression
+                .find("1 ")
+                .expect("the direct integer literal is the LHS");
+            if *in_range {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        operator_start + left_literal_start,
+                        "1".len(),
+                    ),
+                    Some(*primitive),
+                    "{name} constrains the left literal from the call parameter"
+                );
+            }
+            let count_start = operator_expression
+                .rfind(literal)
+                .expect("the direct integer literal is the RHS");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start + count_start,
+                    literal.len(),
+                ),
+                (*in_range).then_some(PrimTy::U32),
+                "{name} checks the count as U32 and taints an out-of-range RHS literal"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    sibling_call,
+                    0,
+                    sibling_call.len(),
+                ),
+                Some(*primitive),
+                "{name} keeps an independent valid shift-call sibling typed"
+            );
+
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("integer-literal shift-pair body check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{name} remains inside the bounded direct-call shift gate")
+                }
+            };
+            if *in_range {
+                assert!(
+                    diagnostics.is_empty(),
+                    "{name} accepts count {literal} without a static shift-width diagnostic"
+                );
+            } else {
+                assert_eq!(
+                    diagnostics.len(),
+                    1,
+                    "{name} reports only the RHS range error"
+                );
+                let function_start = root
+                    .find(&function)
+                    .expect("the generated literal-pair function is in the test root");
+                let source_operator_start = function_start
+                    + root[function_start..]
+                        .find(operator_expression)
+                        .expect("the literal-pair shift occurs in the source");
+                assert_eq!(
+                    diagnostics[0]
+                        .primary()
+                        .expect("out-of-range RHS literal has a primary span")
+                        .span
+                        .range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(
+                            (source_operator_start + count_start) as u32,
+                        ),
+                        sai_diagnostics::TextSize::new(
+                            (source_operator_start + count_start + literal.len()) as u32,
+                        ),
+                    )
+                    .expect("the out-of-range literal span is ordered"),
+                    "{name} diagnoses the entire RHS token, including a negative sign"
+                );
+            }
+        }
+
+        for (
+            name,
+            call,
+            operator_expression,
+            left_literal,
+            right_literal,
+            primitive,
+            in_range,
+            sibling_call,
+        ) in [
+            (
+                "shift_integer_literal_pair_signed_range_recovery",
+                "apply_i8(-129 << 0)",
+                "-129 << 0",
+                "-129",
+                "0",
+                PrimTy::I8,
+                false,
+                "apply_i8(127 >> 0)",
+            ),
+            (
+                "shift_integer_literal_pair_unsigned_range_recovery",
+                "apply_u8(-1 >> 0)",
+                "-1 >> 0",
+                "-1",
+                "0",
+                PrimTy::U8,
+                false,
+                "apply_u8(255 << 0)",
+            ),
+            (
+                "shift_integer_literal_pair_isize_max",
+                "apply_isize(-2147483648 << 0)",
+                "-2147483648 << 0",
+                "-2147483648",
+                "0",
+                PrimTy::ISize,
+                true,
+                "apply_isize(1 << 0)",
+            ),
+            (
+                "shift_integer_literal_pair_isize_overflow",
+                "apply_isize(2147483648 << 0)",
+                "2147483648 << 0",
+                "2147483648",
+                "0",
+                PrimTy::ISize,
+                false,
+                "apply_isize(1 << 0)",
+            ),
+            (
+                "shift_integer_literal_pair_usize_max",
+                "apply_usize(4294967295 >> 0)",
+                "4294967295 >> 0",
+                "4294967295",
+                "0",
+                PrimTy::USize,
+                true,
+                "apply_usize(1 >> 0)",
+            ),
+            (
+                "shift_integer_literal_pair_usize_overflow",
+                "apply_usize(4294967296 >> 0)",
+                "4294967296 >> 0",
+                "4294967296",
+                "0",
+                PrimTy::USize,
+                false,
+                "apply_usize(1 >> 0)",
+            ),
+        ] {
+            let expected_codes = if in_range {
+                &[][..]
+            } else {
+                &[sai_diagnostics::Code::LiteralOutOfRange][..]
+            };
+            let owner = assert_supported(&database, name, expected_codes);
+            let function = format!("pub fn {name}");
+            let expected_type = in_range.then_some(primitive);
+            let operator_start = call
+                .find(operator_expression)
+                .expect("the selected literal-pair operator occurs in the call");
+            let left_literal_start = operator_expression
+                .find(left_literal)
+                .expect("the selected left integer literal occurs in the operator");
+            let right_literal_start = operator_expression
+                .rfind(right_literal)
+                .expect("the selected right integer literal occurs in the operator");
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, call, 0, call.len(),),
+                expected_type,
+                "{name} recovers or taints the direct call from the left-literal range"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start,
+                    operator_expression.len(),
+                ),
+                expected_type,
+                "{name} recovers or taints the shift expression"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start + left_literal_start,
+                    left_literal.len(),
+                ),
+                expected_type,
+                "{name} selects and range-checks the left literal type"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start + right_literal_start,
+                    right_literal.len(),
+                ),
+                Some(PrimTy::U32),
+                "{name} retains the valid U32 RHS literal fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    sibling_call,
+                    0,
+                    sibling_call.len(),
+                ),
+                Some(primitive),
+                "{name} preserves the independent valid shift-call sibling"
+            );
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("the selected integer-literal range body check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{name} remains a supported literal-pair shift shape")
+                }
+            };
+            if in_range {
+                assert!(
+                    diagnostics.is_empty(),
+                    "{name} accepts the wasm32 pointer-width boundary without static shift diagnostics"
+                );
+            } else {
+                assert_eq!(diagnostics.len(), 1);
+                let function_start = root
+                    .find(&function)
+                    .expect("the selected literal-pair source function exists");
+                let source_operator_start = function_start
+                    + root[function_start..]
+                        .find(operator_expression)
+                        .expect("the selected literal-pair operator occurs in the source");
+                assert_eq!(
+                    diagnostics[0]
+                        .primary()
+                        .expect("the literal range diagnostic has a primary span")
+                        .span
+                        .range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(
+                            (source_operator_start + left_literal_start) as u32,
+                        ),
+                        sai_diagnostics::TextSize::new(
+                            (source_operator_start + left_literal_start + left_literal.len())
+                                as u32,
+                        ),
+                    )
+                    .expect("the complete signed literal span is ordered"),
+                    "{name} diagnoses the full left literal, including its sign"
+                );
+            }
+        }
+
+        let integer_shift_pair_parameter_mismatch = assert_supported(
+            &database,
+            "shift_integer_literal_pair_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let integer_shift_pair_mismatch_function =
+            "pub fn shift_integer_literal_pair_parameter_mismatch";
+        let integer_shift_pair_mismatch_call = "apply_bool(1 << 0)";
+        let integer_shift_pair_mismatch_operator = "1 << 0";
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                integer_shift_pair_parameter_mismatch,
+                integer_shift_pair_mismatch_function,
+                integer_shift_pair_mismatch_call,
+                0,
+                integer_shift_pair_mismatch_call.len(),
+            ),
+            None,
+            "a non-integer parameter mismatch taints the literal-pair call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                integer_shift_pair_parameter_mismatch,
+                integer_shift_pair_mismatch_function,
+                integer_shift_pair_mismatch_call,
+                "apply_bool(".len(),
+                integer_shift_pair_mismatch_operator.len(),
+            ),
+            None,
+            "a non-integer parameter mismatch suppresses the shift fact"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                integer_shift_pair_parameter_mismatch,
+                integer_shift_pair_mismatch_function,
+                integer_shift_pair_mismatch_call,
+                "apply_bool(1 << ".len(),
+                "0".len(),
+            ),
+            Some(PrimTy::U32),
+            "the right literal remains checked as a U32 count"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                integer_shift_pair_parameter_mismatch,
+                integer_shift_pair_mismatch_function,
+                "apply_i32(2 >> 0)",
+                0,
+                "apply_i32(2 >> 0)".len(),
+            ),
+            Some(PrimTy::I32),
+            "a valid sibling remains typed after the parameter mismatch"
+        );
+        let integer_shift_pair_mismatch_diagnostics = match integer_shift_pair_parameter_mismatch
+            .body_type_check()
+            .expect("the literal-pair parameter mismatch is checked")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+            FunctionBodyTypeCheck::Unsupported => {
+                panic!("the literal-pair call parameter mismatch remains supported")
+            }
+        };
+        assert_eq!(integer_shift_pair_mismatch_diagnostics.len(), 1);
+        assert_eq!(
+            integer_shift_pair_mismatch_diagnostics[0].message,
+            "expected `Bool`, found an integer literal"
+        );
+        let mismatch_function_start = root
+            .find(integer_shift_pair_mismatch_function)
+            .expect("the literal-pair parameter mismatch function exists");
+        let mismatch_operator_start = mismatch_function_start
+            + root[mismatch_function_start..]
+                .find(integer_shift_pair_mismatch_operator)
+                .expect("the rejected literal-pair shift occurs in the source");
+        assert_eq!(
+            integer_shift_pair_mismatch_diagnostics[0]
+                .primary()
+                .expect("the parameter mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(mismatch_operator_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (mismatch_operator_start + integer_shift_pair_mismatch_operator.len()) as u32,
+                ),
+            )
+            .expect("the entire mismatched shift span is ordered")
+        );
 
         for (name, call, operator_expression, literal, primitive, out_of_range, sibling_call) in [
             (

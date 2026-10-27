@@ -5031,7 +5031,9 @@ fn is_supported_direct_call_shift_operands(left: &Expr<'_>, right: &Expr<'_>) ->
     match (left.kind, right.kind) {
         (ExprKind::Path(_), ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })) => true,
         (ExprKind::Lit(Lit::Byte(_)), ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })) => true,
-        (ExprKind::Lit(Lit::Int { .. }), ExprKind::Path(_)) => true,
+        (ExprKind::Lit(Lit::Int { .. }), ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })) => {
+            true
+        }
         _ => false,
     }
 }

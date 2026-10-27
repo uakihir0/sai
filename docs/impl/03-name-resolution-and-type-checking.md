@@ -3500,6 +3500,64 @@ and spec/05 §§5.16.2, 5.16.5.
 - **Hostile review:** Independent read-only review found no actionable issues,
   including review of the module-constant exclusion and the Stage 0 CLI fixture.
 
+**IR-984 direct-call shifts with an integer-literal pair** additionally admits
+exactly two direct integer literals as the operands of one `<<` or `>>` at
+the existing root or one-level nested positional direct-call argument
+positions. Reuse `check_shift`: the enclosing call parameter constrains the
+left literal to one of the ten integer primitives, while the right literal is
+checked as `U32`. Preserve target-specific literal bounds and full
+sign-inclusive diagnostic spans. Do not evaluate the shift, lower it, or
+diagnose a shift count based on the width of the left type. Keep Byte literals,
+computed expressions, deeper calls, generic targets, and unsupported
+signatures gated; in particular, `Lit::Int` with `Lit::Byte` remains
+unsupported, while the already-supported `Lit::Byte` with `Lit::Int` form is
+preserved. Preserve the CLI Stage 0 gate and the established taint, recovery,
+and sibling-fact behavior. These shape, inference, range, recovery, and
+runtime-boundary decisions are **Review required**. See spec/06 §§6.3.1,
+6.5.1, 6.8.2, 6.8.5 and spec/05 §§5.16.2, 5.16.5.
+
+- **Review required:** Challenge driver/body-checker parity for only
+  `(Lit::Int, Lit::Int)` at root and one nested direct-call level. Check both
+  shift operators and every integer primitive parameter type; `0` and
+  `U32::MAX` must type-check even when the count is wider than the left type,
+  with no static `ShiftOverflow`. Check `-1` and `U32::MAX + 1` as RHS
+  `LITERAL_OUT_OF_RANGE` errors over the complete signed or unsigned token,
+  including taint of the operator/call and recovery to a valid sibling.
+  Check out-of-range left literals against the call-selected primitive type,
+  including I8, U8, and 32-bit ISize/USize boundaries, preserving complete
+  spans and sibling recovery. Verify a non-integer call parameter reports the
+  existing argument mismatch and suppresses tainted facts. Reject
+  integer/Byte mixed pairs in this direction, computed and nested operands,
+  deeper calls, generic targets, and unsupported signatures. Confirm Stage 0
+  remains gated and no runtime/lowering behavior is claimed.
+- **Planned verification matrix:** Generate root and nested direct-call cases
+  for all ten integer parameter types, both operators, and RHS values `0`,
+  `4294967295`, `-1`, and `4294967296`; assert exact call/operator/literal
+  facts, complete RHS diagnostic ranges, taint, and independent sibling
+  facts. Add signed and unsigned left-range recovery cases, wasm32 ISize/USize
+  boundaries, and a non-integer parameter mismatch. Keep explicit exclusions
+  for computed, mixed Byte/integer, deep, generic, and unsupported-signature
+  shapes. Add a CLI Stage 0 fixture for the root/nested pair shapes while
+  retaining the prior separate negative-shape gate. Run focused driver and CLI
+  filters, pinned formatting, and diff checks, then obtain independent hostile
+  review.
+- **Verification:** With pinned Rust 1.99.1,
+  `cargo test -p sai_driver --lib --locked --offline primitive_body_type_results_include_exact_direct_function_calls`
+  passed (1 test; 160 generated type/operator/position/count cases, plus
+  left-range and call-mismatch recovery). The CLI
+  `cargo test -p sai_cli --test check_empty_source --locked --offline binary_shift_`
+  filter passed (9 tests), including the accepted-shape fixture and existing
+  excluded-shape fixtures. `cargo fmt --all -- --check` and `git diff --check`
+  passed.
+- **Hostile review:** Independent read-only review found no actionable
+  correctness or scope findings. The reviewer confirmed driver/body-checker
+  gate parity, the Int/Byte exclusion, Stage 0 gating, and the range, taint,
+  and sibling-recovery coverage. The reviewer noted the 160-case driver
+  regression takes 86.39 seconds and suggested grouping cases by function as
+  an optional P3 optimization. The full matrix is retained because this step
+  explicitly covers all integer types, operators, positions, and RHS
+  boundaries; no correctness fix or follow-up review was required.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
