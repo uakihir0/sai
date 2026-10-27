@@ -8994,6 +8994,12 @@ fn is_supported_direct_call_argument_shape(
             locals,
             inputs,
         ),
+        ExprKind::Unary(UnOp::Neg, _) => is_supported_direct_call_neg_argument_shape(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+        ),
         ExprKind::Binary(BinOp::Rem, left, right) => {
             is_supported_direct_call_remainder_argument_shape(
                 left,
@@ -9151,6 +9157,12 @@ fn is_supported_direct_call_arithmetic_argument_shape(
             locals,
             inputs,
         ),
+        ExprKind::Unary(UnOp::Neg, _) => is_supported_direct_call_neg_argument_shape(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+        ),
         _ => is_supported_direct_call_leaf_argument_shape(
             expression,
             preceding_bindings,
@@ -9184,6 +9196,22 @@ fn is_supported_direct_call_bitwise_not_argument_shape(
     inputs: &CurrentOwnerInputs,
 ) -> bool {
     let ExprKind::Unary(UnOp::BitNot, operand) = expression.kind else {
+        return false;
+    };
+    let ExprKind::Path(path) = operand.kind else {
+        return false;
+    };
+    resolved_plain_local_path_binding(path, locals, inputs)
+        .is_some_and(|binding| preceding_bindings.contains(&binding))
+}
+
+fn is_supported_direct_call_neg_argument_shape(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let ExprKind::Unary(UnOp::Neg, operand) = expression.kind else {
         return false;
     };
     let ExprKind::Path(path) = operand.kind else {
@@ -9566,6 +9594,7 @@ fn primitive_body_errors_to_diagnostics(
             }
             PrimitiveBodyErrorKind::UnaryOperatorNotSupported { operator, operand } => {
                 let (operator_text, trait_name) = match operator {
+                    UnOp::Neg => ("-", "Neg"),
                     UnOp::BitNot => ("~", "BitNot"),
                     _ => return Ok(None),
                 };
@@ -49199,6 +49228,56 @@ property "shared"() {}
             "pub fn bitnot_deep_nested_call_unsupported(value: I32) -> I32 {\n",
             "    apply(apply(apply(~value)))\n",
             "}\n",
+            "pub fn direct_neg_local_root(value: I32) -> I32 {\n",
+            "    let copy = value\n",
+            "    apply_i32(-copy)\n",
+            "}\n",
+            "pub fn direct_neg_local_nested(value: I32) -> I32 {\n",
+            "    let copy = value\n",
+            "    apply_i32(apply_i32(-copy))\n",
+            "}\n",
+            "pub fn direct_neg_shadowed_local(value: I8) -> I32 {\n",
+            "    let value: I32 = 1\n",
+            "    apply_i32(-value)\n",
+            "}\n",
+            "pub fn direct_neg_parameter_mismatch(value: I32) -> I32 {\n",
+            "    let failed = apply_bool(-value)\n",
+            "    let alias = failed\n",
+            "    apply_i32(value)\n",
+            "}\n",
+            "pub fn direct_neg_nested_parameter_mismatch(value: I32) -> I32 {\n",
+            "    let failed = apply_bool(apply_bool(-value))\n",
+            "    let alias = failed\n",
+            "    apply_i32(value)\n",
+            "}\n",
+            "pub fn direct_neg_folded_literal_remains_supported() -> I32 { apply_i32(-1) }\n",
+            "pub fn direct_neg_double_operand_unsupported(value: I32) -> I32 { apply_i32(- -value) }\n",
+            "pub fn direct_neg_computed_operand_unsupported(value: I32) -> I32 { apply_i32(-(value + 1)) }\n",
+            "pub fn direct_neg_call_operand_unsupported(value: I32) -> I32 { apply_i32(-apply_i32(value)) }\n",
+            "pub fn direct_neg_unresolved_path_unsupported() -> I32 { apply_i32(-missing) }\n",
+            "pub fn direct_neg_self_path_unsupported() -> I32 {\n",
+            "    let result = apply_i32(-result)\n",
+            "    result\n",
+            "}\n",
+            "pub fn direct_neg_forward_path_unsupported(value: I32) -> I32 {\n",
+            "    let result = apply_i32(-later)\n",
+            "    let later = value\n",
+            "    result\n",
+            "}\n",
+            "pub fn direct_neg_unresolved_numeric_local_unsupported() -> I32 {\n",
+            "    let copy = 1\n",
+            "    apply_i32(-copy)\n",
+            "}\n",
+            "pub fn direct_neg_global_path_unsupported() -> I32 { apply_i32(-SHIFT_COUNT) }\n",
+            "pub fn direct_neg_local_initializer_unsupported(value: I32) -> I32 {\n",
+            "    let negative = -value\n",
+            "    apply_i32(negative)\n",
+            "}\n",
+            "pub fn direct_neg_deep_nested_call_unsupported(value: I32) -> I32 {\n",
+            "    apply_i32(apply_i32(apply_i32(-value)))\n",
+            "}\n",
+            "pub fn direct_neg_generic_target_unsupported(value: I32) -> I32 { generic_fn(-value) }\n",
+            "pub fn direct_neg_unsupported_signature_unsupported(value: I32) -> I32 { text_fn(-value) }\n",
             "pub fn shift_i8_call_argument(left: I8, count: U32) -> I8 { apply_i8(left << count) }\n",
             "pub fn shift_i16_call_argument(left: I16, count: U32) -> I16 { apply_i16(left >> count) }\n",
             "pub fn shift_i32_call_argument(left: I32, count: U32) -> I32 { apply_i32(left << count) }\n",
@@ -49958,6 +50037,49 @@ property "shared"() {}
             ("F32", "float_fn", PrimTy::F32),
             ("F64", "apply_double", PrimTy::F64),
         ];
+        let mut direct_neg_path_cases = Vec::new();
+        let mut generated_direct_neg_path_cases = String::new();
+        for (primitive_name, callee, primitive) in bitwise_primitive_types.iter().copied() {
+            let suffix = primitive_name.to_ascii_lowercase();
+            let supported = matches!(
+                primitive,
+                PrimTy::I8
+                    | PrimTy::I16
+                    | PrimTy::I32
+                    | PrimTy::I64
+                    | PrimTy::ISize
+                    | PrimTy::F32
+                    | PrimTy::F64
+            );
+            for (nested, position) in [(false, "root"), (true, "nested")] {
+                let name = format!("direct_neg_path_{suffix}_{position}");
+                let inner_call = format!("{callee}(-value)");
+                let call = if nested {
+                    format!("{callee}({inner_call})")
+                } else {
+                    inner_call.clone()
+                };
+                if supported {
+                    generated_direct_neg_path_cases.push_str(&format!(
+                        "pub fn {name}(value: {primitive_name}) -> {primitive_name} {{ {call} }}\n"
+                    ));
+                } else {
+                    generated_direct_neg_path_cases.push_str(&format!(
+                        "pub fn {name}(value: {primitive_name}) -> {primitive_name} {{\n    let failed = {call}\n    let alias = failed\n    let valid = {callee}(value)\n    valid\n}}\n"
+                    ));
+                }
+                direct_neg_path_cases.push((
+                    name,
+                    nested,
+                    primitive_name.to_owned(),
+                    callee.to_owned(),
+                    primitive,
+                    call,
+                    inner_call,
+                    supported,
+                ));
+            }
+        }
         let bitwise_integer_literal_types = bitwise_primitive_types
             .iter()
             .copied()
@@ -50685,6 +50807,7 @@ property "shared"() {}
         root.push_str(&generated_scalar_shift_literal_rhs_cases);
         root.push_str(&generated_scalar_shift_literal_lhs_cases);
         root.push_str(&generated_byte_literal_shift_rhs_cases);
+        root.push_str(&generated_direct_neg_path_cases);
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
@@ -50791,6 +50914,17 @@ property "shared"() {}
                 assert_primitive_type_result_parity(database, type_results);
                 owner
             };
+        for (name, _, _, _, _, _, _, supported) in &direct_neg_path_cases {
+            assert_supported(
+                &database,
+                name,
+                if *supported {
+                    &[]
+                } else {
+                    &[sai_diagnostics::Code::OperatorNotSupported]
+                },
+            );
+        }
         assert_supported(&database, "bitwise_integer_literal_unsupported", &[]);
         let bitwise_literal_left_argument =
             assert_supported(&database, "bitwise_literal_left_argument", &[]);
@@ -51223,6 +51357,25 @@ property "shared"() {}
             &database,
             "bitnot_double_float_operator_not_supported",
             &[sai_diagnostics::Code::OperatorNotSupported],
+        );
+        let direct_neg_local_root = assert_supported(&database, "direct_neg_local_root", &[]);
+        let direct_neg_local_nested = assert_supported(&database, "direct_neg_local_nested", &[]);
+        let direct_neg_shadowed_local =
+            assert_supported(&database, "direct_neg_shadowed_local", &[]);
+        let direct_neg_parameter_mismatch = assert_supported(
+            &database,
+            "direct_neg_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let direct_neg_nested_parameter_mismatch = assert_supported(
+            &database,
+            "direct_neg_nested_parameter_mismatch",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        let direct_neg_folded_literal_remains_supported = assert_supported(
+            &database,
+            "direct_neg_folded_literal_remains_supported",
+            &[],
         );
         let shift_i8_call_argument = assert_supported(&database, "shift_i8_call_argument", &[]);
         let shift_i16_call_argument = assert_supported(&database, "shift_i16_call_argument", &[]);
@@ -51774,6 +51927,18 @@ property "shared"() {}
             "bitnot_call_operand_unsupported",
             "bitnot_forward_local_path_unsupported",
             "bitnot_deep_nested_call_unsupported",
+            "direct_neg_double_operand_unsupported",
+            "direct_neg_computed_operand_unsupported",
+            "direct_neg_call_operand_unsupported",
+            "direct_neg_unresolved_path_unsupported",
+            "direct_neg_self_path_unsupported",
+            "direct_neg_forward_path_unsupported",
+            "direct_neg_unresolved_numeric_local_unsupported",
+            "direct_neg_global_path_unsupported",
+            "direct_neg_local_initializer_unsupported",
+            "direct_neg_deep_nested_call_unsupported",
+            "direct_neg_generic_target_unsupported",
+            "direct_neg_unsupported_signature_unsupported",
             "shift_computed_operand_unsupported",
             "shift_call_operand_unsupported",
             "shift_generic_target_unsupported",
@@ -59811,6 +59976,300 @@ property "shared"() {}
                 );
             }
         }
+        for (name, nested, primitive_name, callee, primitive, call, inner_call, supported) in
+            &direct_neg_path_cases
+        {
+            let function = format!("pub fn {name}");
+            let owner = owner_named(&database, &resolved, name);
+            let operator_start = call
+                .find("-value")
+                .expect("the generated unary-neg path is in its call");
+            let expected = supported.then_some(*primitive);
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, call, 0, call.len(),),
+                expected,
+                "{name} publishes the call fact only when unary negation is supported"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start,
+                    "-value".len(),
+                ),
+                expected,
+                "{name} publishes the unary expression fact only when it is valid"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start + 1,
+                    "value".len(),
+                ),
+                Some(*primitive),
+                "{name} retains the exact parameter path fact under its unary parent"
+            );
+            if *nested {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        call.find(inner_call)
+                            .expect("the exact inner call is nested in the direct call"),
+                        inner_call.len(),
+                    ),
+                    expected,
+                    "{name} propagates the operator result or taint through the nested call"
+                );
+            }
+            if !supported {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        "let alias = failed",
+                        "let alias = ".len(),
+                        "failed".len(),
+                    ),
+                    None,
+                    "{name} does not infer an alias from its tainted call"
+                );
+                let sibling_call = format!("{callee}(value)");
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        &sibling_call,
+                        0,
+                        sibling_call.len(),
+                    ),
+                    Some(*primitive),
+                    "{name} preserves the independent valid call sibling"
+                );
+                let diagnostics = match owner
+                    .body_type_check()
+                    .expect("unsupported primitive negation has body diagnostics")
+                {
+                    FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                    FunctionBodyTypeCheck::Unsupported => {
+                        panic!("{name} remains a supported unsupported-operator diagnostic")
+                    }
+                };
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.code)
+                        .collect::<Vec<_>>(),
+                    [sai_diagnostics::Code::OperatorNotSupported],
+                    "{name} reports exactly OPERATOR_NOT_SUPPORTED"
+                );
+                assert_eq!(
+                    diagnostics[0].message,
+                    format!("operator `-` has no `Neg` implementation for `{primitive_name}`"),
+                    "{name} uses the specification's Neg diagnostic"
+                );
+                let function_start = root
+                    .find(&function)
+                    .expect("the generated function is in the test source");
+                let source_operator_start = function_start
+                    + root[function_start..]
+                        .find("-value")
+                        .expect("the unary-neg operand is in the generated function");
+                assert_eq!(
+                    diagnostics[0]
+                        .primary()
+                        .expect("the unsupported Neg diagnostic has a primary span")
+                        .span
+                        .range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(source_operator_start as u32),
+                        sai_diagnostics::TextSize::new(
+                            (source_operator_start + "-value".len()) as u32,
+                        ),
+                    )
+                    .expect("the Neg diagnostic span is ordered"),
+                    "{name} spans the complete unary expression"
+                );
+            }
+        }
+        for (owner, function, call, expression, operand, primitive) in [
+            (
+                direct_neg_local_root,
+                "pub fn direct_neg_local_root",
+                "apply_i32(-copy)",
+                "-copy",
+                "copy",
+                PrimTy::I32,
+            ),
+            (
+                direct_neg_local_nested,
+                "pub fn direct_neg_local_nested",
+                "apply_i32(apply_i32(-copy))",
+                "-copy",
+                "copy",
+                PrimTy::I32,
+            ),
+            (
+                direct_neg_shadowed_local,
+                "pub fn direct_neg_shadowed_local",
+                "apply_i32(-value)",
+                "-value",
+                "value",
+                PrimTy::I32,
+            ),
+        ] {
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
+                Some(primitive),
+                "{function} resolves the selected preceding BindingId"
+            );
+            let expression_start = call
+                .find(expression)
+                .expect("the unary expression occurs in the call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    expression_start,
+                    expression.len(),
+                ),
+                Some(primitive),
+                "{function} types unary negation over a preceding local"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    expression_start + 1,
+                    operand.len(),
+                ),
+                Some(primitive),
+                "{function} retains the resolved local path type"
+            );
+        }
+        for (owner, function, call, inner_call) in [
+            (
+                direct_neg_parameter_mismatch,
+                "pub fn direct_neg_parameter_mismatch",
+                "apply_bool(-value)",
+                None,
+            ),
+            (
+                direct_neg_nested_parameter_mismatch,
+                "pub fn direct_neg_nested_parameter_mismatch",
+                "apply_bool(apply_bool(-value))",
+                Some("apply_bool(-value)"),
+            ),
+        ] {
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, function, call, 0, call.len()),
+                None,
+                "{function} suppresses the call fact after an argument mismatch"
+            );
+            let operator_start = call
+                .find("-value")
+                .expect("the mismatched unary expression occurs in its call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    operator_start,
+                    "-value".len(),
+                ),
+                None,
+                "{function} suppresses the mismatched unary expression fact"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    call,
+                    operator_start + 1,
+                    "value".len(),
+                ),
+                Some(PrimTy::I32),
+                "{function} retains the valid operand path fact"
+            );
+            if let Some(inner_call) = inner_call {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        function,
+                        call,
+                        call.find(inner_call)
+                            .expect("the inner call appears in the nested mismatch"),
+                        inner_call.len(),
+                    ),
+                    None,
+                    "{function} propagates mismatch taint through the nested call"
+                );
+            }
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    "let alias = failed",
+                    "let alias = ".len(),
+                    "failed".len(),
+                ),
+                None,
+                "{function} taints an alias of the mismatched call"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    function,
+                    "apply_i32(value)",
+                    0,
+                    "apply_i32(value)".len(),
+                ),
+                Some(PrimTy::I32),
+                "{function} preserves an independent valid sibling"
+            );
+        }
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                direct_neg_folded_literal_remains_supported,
+                "pub fn direct_neg_folded_literal_remains_supported",
+                "apply_i32(-1)",
+                0,
+                "apply_i32(-1)".len(),
+            ),
+            Some(PrimTy::I32),
+            "a folded negative integer literal keeps its existing direct-call behavior"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                direct_neg_folded_literal_remains_supported,
+                "pub fn direct_neg_folded_literal_remains_supported",
+                "apply_i32(-1)",
+                "apply_i32(".len(),
+                "-1".len(),
+            ),
+            Some(PrimTy::I32),
+            "a folded negative integer literal is not treated as the Neg operator"
+        );
         for (owner, function, call, primitive, operator_expression) in [
             (
                 shift_i8_call_argument,

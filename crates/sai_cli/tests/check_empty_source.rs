@@ -19210,6 +19210,47 @@ fn unary_bitwise_not_path_arguments_to_direct_calls_remain_behind_the_stage_gate
 }
 
 #[test]
+fn unary_neg_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn signed_root(value: I8) -> I8 { identity_i8(-value) }\n",
+        "pub fn signed_nested(value: I32) -> I32 { identity_i32(identity_i32(-value)) }\n",
+        "pub fn signed_local(value: I64) -> I64 {\n",
+        "    let copy = value\n",
+        "    identity_i64(-copy)\n",
+        "}\n",
+        "pub fn float_root(value: F32) -> F32 { identity_f32(-value) }\n",
+        "pub fn double_nested(value: F64) -> F64 { identity_f64(identity_f64(-value)) }\n",
+        "pub fn unsigned_root(value: U32) -> U32 { identity_u32(-value) }\n",
+        "pub fn byte_nested(value: Byte) -> Byte { identity_byte(identity_byte(-value)) }\n",
+        "pub fn char_root(value: Char) -> Char { identity_char(-value) }\n",
+        "pub fn bool_nested(value: Bool) -> Bool { identity_bool(identity_bool(-value)) }\n",
+        "pub fn folded_negative_literal() -> I32 { identity_i32(-1) }\n",
+        "pub fn double_negation(value: I32) -> I32 { identity_i32(- -value) }\n",
+        "pub fn computed_operand(value: I32) -> I32 { identity_i32(-(value + 1)) }\n",
+        "pub fn call_operand(value: I32) -> I32 { identity_i32(-identity_i32(value)) }\n",
+        "pub fn deep_nested(value: I32) -> I32 {\n",
+        "    identity_i32(identity_i32(identity_i32(-value)))\n",
+        "}\n",
+        "pub fn generic_target(value: I32) -> I32 { generic_identity(-value) }\n",
+        "fn identity_i8(value: I8) -> I8 { value }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_i64(value: I64) -> I64 { value }\n",
+        "fn identity_f32(value: F32) -> F32 { value }\n",
+        "fn identity_f64(value: F64) -> F64 { value }\n",
+        "fn identity_u32(value: U32) -> U32 { value }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+        "fn identity_char(value: Char) -> Char { value }\n",
+        "fn identity_bool(value: Bool) -> Bool { value }\n",
+        "fn generic_identity<T>(value: T) -> I32 { 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "unary-neg path arguments at root and one nested direct-call level",
+    );
+}
+
+#[test]
 fn binary_shift_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn left_shift_argument(value: I32, count: U32) -> I32 { identity_i32(value << count) }\n",

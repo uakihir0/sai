@@ -2503,6 +2503,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
+                ExprKind::Unary(UnOp::Neg, operand)
+                    if is_supported_direct_call_neg_operand(operand) =>
+                {
+                    let local_type =
+                        self.check_direct_call_neg_path(operand, argument.expr.hir_id)?;
+                    self.record_expression_type(argument.expr.hir_id, local_type);
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
                 _ => return Err(()),
             }
         }
@@ -2525,6 +2533,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 node: expression,
                 kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
                     operator: UnOp::BitNot,
+                    operand: operand_type,
+                },
+            });
+        }
+        Ok(LocalType::Concrete(operand_type))
+    }
+
+    fn check_direct_call_neg_path(
+        &mut self,
+        operand: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<LocalType, ()> {
+        let operand_type = self
+            .check_local_path(operand)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+        if !is_neg_primitive(operand_type) {
+            self.errors.push(PrimitiveBodyError {
+                node: expression,
+                kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                    operator: UnOp::Neg,
                     operand: operand_type,
                 },
             });
@@ -3976,6 +4007,19 @@ const fn is_bitwise_primitive(primitive: PrimTy) -> bool {
     is_integer_primitive(primitive) || matches!(primitive, PrimTy::Byte)
 }
 
+const fn is_neg_primitive(primitive: PrimTy) -> bool {
+    matches!(
+        primitive,
+        PrimTy::I8
+            | PrimTy::I16
+            | PrimTy::I32
+            | PrimTy::I64
+            | PrimTy::ISize
+            | PrimTy::F32
+            | PrimTy::F64
+    )
+}
+
 const fn is_arithmetic_primitive(primitive: PrimTy) -> bool {
     is_integer_primitive(primitive) || matches!(primitive, PrimTy::F32 | PrimTy::F64)
 }
@@ -5093,6 +5137,10 @@ fn is_supported_direct_call_not_operand(operand: &Expr<'_>) -> bool {
 }
 
 fn is_supported_direct_call_bitwise_not_operand(operand: &Expr<'_>) -> bool {
+    matches!(operand.kind, ExprKind::Path(_))
+}
+
+fn is_supported_direct_call_neg_operand(operand: &Expr<'_>) -> bool {
     matches!(operand.kind, ExprKind::Path(_))
 }
 
