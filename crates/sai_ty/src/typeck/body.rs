@@ -685,6 +685,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                     result
                 }
+                ExprKind::Unary(UnOp::Neg, operand) => {
+                    let result = self.check_direct_call_neg_path(operand, init.hir_id)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(result, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        result
+                    }
+                }
                 ExprKind::Unary(UnOp::BitNot, operand) => {
                     if let ExprKind::Lit(literal) = operand.kind {
                         match primitive_literal_kind(literal) {
