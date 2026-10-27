@@ -236,6 +236,12 @@ struct PendingOperatorTraitSite {
     diagnostic_index: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingNegTraitSite {
+    expression: HirId,
+    diagnostic_index: usize,
+}
+
 #[derive(Clone, Debug)]
 struct LiteralVariable<'hir> {
     literal: Lit<'hir>,
@@ -244,6 +250,7 @@ struct LiteralVariable<'hir> {
     additional_site: Option<LiteralSite<'hir>>,
     resolved: Option<PrimTy>,
     pending_operator_traits: Vec<PendingOperatorTraitSite>,
+    pending_neg_traits: Vec<PendingNegTraitSite>,
 }
 
 /// Check a flat sequence of immutable primitive locals and a local-path tail.
@@ -686,7 +693,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     result
                 }
                 ExprKind::Unary(UnOp::Neg, operand) => {
-                    let result = self.check_direct_call_neg_path(operand, init.hir_id)?;
+                    let result = self.check_local_initializer_neg_path(operand, init.hir_id)?;
                     if let Some(expected) = annotation {
                         self.check_annotated_path(result, expected, init.hir_id)?;
                         LocalType::Concrete(expected)
@@ -2253,6 +2260,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     additional_site: None,
                     resolved: None,
                     pending_operator_traits: Vec::new(),
+                    pending_neg_traits: Vec::new(),
                 });
                 LocalType::LiteralVariable(id)
             }
@@ -2589,6 +2597,52 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .check_local_path(operand)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+        if !is_neg_primitive(operand_type) {
+            self.errors.push(PrimitiveBodyError {
+                node: expression,
+                kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                    operator: UnOp::Neg,
+                    operand: operand_type,
+                },
+            });
+        }
+        Ok(LocalType::Concrete(operand_type))
+    }
+
+    fn check_local_initializer_neg_path(
+        &mut self,
+        operand: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<LocalType, ()> {
+        let source_type = self.check_local_path(operand)?;
+        if let LocalType::LiteralVariable(id) = source_type {
+            let eligible_literal_path = self.is_eligible_unannotated_literal_path(operand);
+            if eligible_literal_path
+                && self.literal_variables.get(id).is_some_and(|variable| {
+                    matches!(
+                        variable.kind,
+                        PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                    ) && variable.resolved.is_none()
+                })
+            {
+                let diagnostic_index = self.errors.len() + self.pending_operator_trait_count;
+                self.pending_operator_trait_count += 1;
+                self.literal_variables
+                    .get_mut(id)
+                    .ok_or(())?
+                    .pending_neg_traits
+                    .push(PendingNegTraitSite {
+                        expression,
+                        diagnostic_index,
+                    });
+                return Ok(source_type);
+            }
+        }
+
+        let operand_type = self
+            .concrete_local_type(source_type)
             .filter(|primitive| supports_primitive_literal(*primitive))
             .ok_or(())?;
         if !is_neg_primitive(operand_type) {
@@ -3544,6 +3598,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         )
                     },
                 ));
+                deferred_operator_errors.extend(
+                    variable
+                        .pending_neg_traits
+                        .iter()
+                        .filter(|_| !is_neg_primitive(right))
+                        .map(|site| {
+                            (
+                                site.diagnostic_index,
+                                PrimitiveBodyError {
+                                    node: site.expression,
+                                    kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                                        operator: UnOp::Neg,
+                                        operand: right,
+                                    },
+                                },
+                            )
+                        }),
+                );
             }
         }
         self.errors.extend(deferred_errors);
