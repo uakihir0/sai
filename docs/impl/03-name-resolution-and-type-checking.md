@@ -3730,6 +3730,24 @@ recovery, and stage-boundary choices are **Review required**. See spec/06
   tests, formatting, and diff checks; obtain independent hostile review
   before commit.
 
+**IR-990 flat-local unary negation of resolved paths** extends the bounded
+primitive local-initializer checker to one `-source` form, where `source` is a
+single plain path resolving by `BindingId` to a preceding immutable parameter
+or local whose primitive type is already concrete at that initializer. An
+unannotated numeric local whose literal type is still unresolved at the unary
+initializer remains gated; this slice does not add deferred `Neg` inference.
+It reuses IR-988's `Neg` primitive set and diagnostic: signed integer types,
+`F32`, and `F64` produce the operand type; unsigned integer types, `Byte`,
+`Char`, and `Bool` report `OPERATOR_NOT_SUPPORTED`. Annotated mismatches retain
+the declared binding type, taint the unary expression fact, and preserve the
+operand path fact. Folded negative literals continue through the existing
+literal path. Mutable bindings, globals, self/forward/unresolved paths,
+computed/call operands, double negation, and deeper blocks remain outside the
+checker slice. CLI Stage 0 remains gated, and this work adds no lowering or
+runtime behavior. These shape, binding, recovery/fact, and stage boundary
+decisions are **Review required**. See spec/06 §§6.8.6 and 6.8.10 and [the
+IR-990 implementation review](../design/implementation-review.md#ir-990-2026-10-27-flat-local-unary-negation-of-resolved-paths).
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
