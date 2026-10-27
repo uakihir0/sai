@@ -41,6 +41,10 @@ fn add_formula_edges(
 
 pub fn transitive_closure(workbook: Workbook) -> Array<Bool, MAX_GRAPH_CELLS> {
     var graph = Array<Bool, MAX_GRAPH_CELLS>.filled(false)
+    if workbook.cell_count > MAX_CELLS {
+        return graph
+    }
+
     for from in 0..workbook.cell_count {
         match workbook.cells[from] {
             Some(cell) => match cell.expression {
@@ -68,6 +72,9 @@ pub fn transitive_closure(workbook: Workbook) -> Array<Bool, MAX_GRAPH_CELLS> {
 }
 
 pub fn reaches(graph: Array<Bool, MAX_GRAPH_CELLS>, from: USize, to: USize) -> Bool {
+    if from >= MAX_CELLS or to >= MAX_CELLS {
+        return false
+    }
     graph[graph_index(from, to)]
 }
 

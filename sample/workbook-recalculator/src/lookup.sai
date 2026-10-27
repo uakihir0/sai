@@ -1,6 +1,10 @@
 use acme:workbook-recalculator/model.{Cell, MAX_CELLS, Workbook, WorkbookError}
 
 pub fn index_of(workbook: Workbook, id: U32) -> Option<USize> {
+    if workbook.cell_count > MAX_CELLS {
+        return None
+    }
+
     for index in 0..workbook.cell_count {
         match workbook.cells[index] {
             Some(cell) => {
