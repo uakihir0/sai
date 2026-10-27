@@ -1,0 +1,77 @@
+use acme:workbook-recalculator/fixtures
+use acme:workbook-recalculator/model.{CellResult, CellStatus, RecalcReport, WorkbookError}
+use acme:workbook-recalculator/recalculate
+
+pub fn fixture_report() -> RecalcReport {
+    recalculate.recalculate(fixtures.workbook()).unwrap()
+}
+
+fn result_at(report: RecalcReport, index: USize) -> CellResult {
+    report.cells[index].unwrap()
+}
+
+test "the workbook recalculates dependencies in stable topological passes" {
+    let report = fixture_report()
+
+    assert report.formula_order_count == 6
+    assert report.formula_order[0] == Some(20)
+    assert report.formula_order[1] == Some(50)
+    assert report.formula_order[2] == Some(93)
+    assert report.formula_order[3] == Some(96)
+    assert report.formula_order[4] == Some(60)
+    assert report.formula_order[5] == Some(100)
+
+    assert result_at(report, 0).value == Some(170)
+    assert result_at(report, 1).value == Some(30)
+    assert result_at(report, 2).value == Some(200)
+    assert result_at(report, 5).value == Some(3000)
+}
+
+test "a missing cell reference is reported and blocks its dependants" {
+    let report = fixture_report()
+    let missing = result_at(report, 7)
+    let dependent = result_at(report, 17)
+
+    assert missing.id == 80
+    assert missing.status == CellStatus.MissingReference
+    assert missing.value == None
+    assert dependent.id == 81
+    assert dependent.status == CellStatus.BlockedByError
+    assert dependent.blocked_by == Some(80)
+}
+
+test "cycles are distinguished from downstream cells blocked by a cycle" {
+    let report = fixture_report()
+    let first = result_at(report, 8)
+    let second = result_at(report, 9)
+    let downstream = result_at(report, 10)
+
+    assert first.status == CellStatus.Cycle
+    assert second.status == CellStatus.Cycle
+    assert downstream.status == CellStatus.BlockedByCycle
+    assert downstream.blocked_by == Some(90)
+}
+
+test "arithmetic failures stay local and their dependants are blocked" {
+    let report = fixture_report()
+    let overflow = result_at(report, 11)
+    let overflow_dependent = result_at(report, 13)
+    let division = result_at(report, 14)
+    let division_dependent = result_at(report, 16)
+
+    assert overflow.id == 93
+    assert overflow.status == CellStatus.ArithmeticRangeError
+    assert overflow_dependent.status == CellStatus.BlockedByError
+    assert overflow_dependent.blocked_by == Some(93)
+    assert division.status == CellStatus.DivisionByZero
+    assert division_dependent.status == CellStatus.BlockedByError
+    assert division_dependent.blocked_by == Some(96)
+    assert result_at(report, 0).value == Some(170)
+}
+
+test "duplicate cell identifiers reject the workbook before calculation" {
+    assert (
+        recalculate.recalculate(fixtures.duplicate_id_workbook())
+        == Err(WorkbookError.DuplicateCellId(10))
+    )
+}

@@ -1,0 +1,45 @@
+use acme:workbook-recalculator/model.{Cell, MAX_CELLS, Workbook, WorkbookError}
+
+pub fn index_of(workbook: Workbook, id: U32) -> Option<USize> {
+    for index in 0..workbook.cell_count {
+        match workbook.cells[index] {
+            Some(cell) => {
+                if cell.id == id {
+                    return Some(index)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+pub fn validate(workbook: Workbook) -> Result<(), WorkbookError> {
+    if workbook.cell_count > MAX_CELLS {
+        return Err(WorkbookError.TooManyCells(workbook.cell_count))
+    }
+
+    for index in 0..workbook.cell_count {
+        let cell = match workbook.cells[index] {
+            Some(value) => value
+            None => return Err(WorkbookError.MissingCell(index))
+        }
+        for prior_index in 0..index {
+            match workbook.cells[prior_index] {
+                Some(prior) => {
+                    if prior.id == cell.id {
+                        return Err(WorkbookError.DuplicateCellId(cell.id))
+                    }
+                }
+                None => return Err(WorkbookError.MissingCell(prior_index))
+            }
+        }
+    }
+
+    for index in workbook.cell_count..MAX_CELLS {
+        if workbook.cells[index].is_some() {
+            return Err(WorkbookError.UnexpectedTrailingCell(index))
+        }
+    }
+    Ok(())
+}
