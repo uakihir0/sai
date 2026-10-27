@@ -3595,6 +3595,40 @@ spec/06 §§6.5.1, 6.8.2, 6.8.5 and spec/05 §§5.16.2, 5.16.5.
   local-initializer `1 << b'x'` regression gated while enabling the direct-call
   argument diagnostic.
 
+**IR-986 direct-call shifts with scalar non-integer literal RHS counts**
+admits direct Bool, Char, and floating-point RHS literals at the existing root
+or one-level nested positional direct-call shift argument locations for `<<`
+and `>>`, after supported path, integer-literal, and Byte-literal LHSs. Reuse
+the expected-`U32` scalar-literal check so the existing literal-specific
+`TYPE_MISMATCH` diagnostic points at the complete count literal. Taint the
+shift and containing call, retain valid path and integer-literal LHS facts,
+do not synthesize a standalone Byte-literal fact, and preserve an independent
+valid sibling. Keep strings and byte strings, computed operands, deeper calls,
+generic targets, unsupported signatures, and local-initializer forms gated.
+Preserve integer and Byte count behavior, Stage 0, and make no
+lowering/runtime claim. These shape, diagnostic, recovery, fact, and
+stage-boundary choices are **Review required**. See spec/06 §§6.5.1, 6.8.2,
+6.8.5 and spec/05 §§5.16.2, 5.16.5.
+
+- **Review required:** Independently challenge exact driver/body-checker
+  parity for direct Bool, Char, and floating-point shift-count literals on
+  path, integer-literal, and Byte-literal LHSs at root and one nested call
+  level. Check both shift operators, exact mismatch code/message and complete
+  literal spans, retained path/integer-literal facts, the absent Byte-literal
+  fact, suppressed RHS/operator/call/alias facts, and independent sibling
+  recovery. Reject strings, byte strings, computed operands, local
+  initializers, deeper calls, generic targets, and unsupported signatures.
+  Confirm Stage 0 remains gated and no lowering/runtime behavior is claimed.
+- **Planned verification matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` over
+  Bool, Char, and floating-point counts for both operators at root and nested
+  positions with path, integer-literal, and Byte-literal LHSs. Assert exact
+  message/span, diagnostic count, LHS/RHS/operator/call/alias facts, and
+  sibling recovery. Add a CLI Stage 0 fixture for representative literal-LHS
+  root/nested shapes; retain explicit local-initializer and unsupported-shape
+  regressions. Run the pinned focused driver and CLI filters, formatting, and
+  diff checks, then request hostile review.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:

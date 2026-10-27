@@ -1931,7 +1931,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         left: &'hir Expr<'hir>,
         right: &'hir Expr<'hir>,
         expression: HirId,
-        allow_byte_rhs_mismatch: bool,
+        allow_non_integer_rhs_mismatch: bool,
     ) -> Result<LocalType, ()> {
         let left_type = if let ExprKind::Lit(literal) = left.kind {
             let Some(kind) = primitive_literal_kind(literal) else {
@@ -1961,9 +1961,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             let Some(kind) = primitive_literal_kind(literal) else {
                 return Err(());
             };
-            if kind != PrimitiveLiteralKind::Integer
-                && !(allow_byte_rhs_mismatch && kind == PrimitiveLiteralKind::Byte)
-            {
+            if kind != PrimitiveLiteralKind::Integer && !allow_non_integer_rhs_mismatch {
                 return Err(());
             }
             self.check_annotated_literal(PrimTy::U32, literal, kind, right.hir_id);
@@ -5030,12 +5028,23 @@ fn is_supported_direct_call_logical_operands(left: &Expr<'_>, right: &Expr<'_>) 
 
 fn is_supported_direct_call_shift_operands(left: &Expr<'_>, right: &Expr<'_>) -> bool {
     match (left.kind, right.kind) {
-        (ExprKind::Path(_), ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })) => true,
-        (ExprKind::Lit(Lit::Byte(_)), ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })) => true,
-        (ExprKind::Lit(Lit::Int { .. }), ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. })) => {
-            true
-        }
-        (ExprKind::Lit(Lit::Int { .. }), ExprKind::Lit(Lit::Byte(_))) => true,
+        (
+            ExprKind::Path(_),
+            ExprKind::Path(_)
+            | ExprKind::Lit(Lit::Int { .. } | Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. }),
+        ) => true,
+        (
+            ExprKind::Lit(Lit::Byte(_)),
+            ExprKind::Path(_)
+            | ExprKind::Lit(Lit::Int { .. } | Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. }),
+        ) => true,
+        (
+            ExprKind::Lit(Lit::Int { .. }),
+            ExprKind::Path(_)
+            | ExprKind::Lit(
+                Lit::Int { .. } | Lit::Byte(_) | Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. },
+            ),
+        ) => true,
         _ => false,
     }
 }

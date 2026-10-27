@@ -19239,6 +19239,28 @@ fn binary_shift_integer_literal_rhs_arguments_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn binary_shift_scalar_literal_rhs_arguments_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn root_left_bool(left: I32) -> I32 { identity_i32(left << true) }\n",
+        "pub fn root_right_char(left: I32) -> I32 { identity_i32(left >> 'x') }\n",
+        "pub fn nested_left_float(left: I32) -> I32 { identity_i32(identity_i32(left << 1.0)) }\n",
+        "pub fn nested_right_float(left: I32) -> I32 { identity_i32(identity_i32(left >> -2.5)) }\n",
+        "pub fn nested_right_bool(left: I32) -> I32 { identity_i32(identity_i32(left >> false)) }\n",
+        "pub fn root_integer_left_bool() -> I32 { identity_i32(1 << true) }\n",
+        "pub fn nested_integer_right_char() -> I32 { identity_i32(identity_i32(1 >> 'x')) }\n",
+        "pub fn root_byte_left_float() -> Byte { identity_byte(b'a' << -2.5) }\n",
+        "pub fn nested_byte_right_bool() -> Byte { identity_byte(identity_byte(b'a' >> true)) }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_byte(value: Byte) -> Byte { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "root and one-level nested direct-call shifts with scalar-literal counts",
+    );
+}
+
+#[test]
 fn binary_shift_byte_literal_lhs_path_arguments_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn root_left_shift(count: U32) -> Byte { identity_byte(b'a' << count) }\n",
