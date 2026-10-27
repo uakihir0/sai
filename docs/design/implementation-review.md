@@ -8965,6 +8965,14 @@
   operator, position, and RHS-boundary coverage in this slice; no code fix was
   required, so no follow-up review was necessary.
 
+### IR-992 (2026-10-27): normalize f-string format specifiers
+
+- **Decision:** Add a pure type-checker helper that maps an optional HIR `FmtSpec` into its closed `FormatSpec` value and required marker-trait category. `None` maps to `Plain`/`Format`; `debug` maps to `Debug`/`Format`; `hex`, `upper_hex`, `bin`, and `oct` map to `FormatInt`; `exp` maps to `FormatFloat`; `zpad(N)` maps to `FormatInt`; `prec(N)` maps to `FormatFloat`; and `pad(N)`/`left(N)` map to `FormatPad`.
+- **Reason:** Spec/16 §16.14.3 defines the source-name-to-value-and-trait table. Unknown names are decided before argument validation under rule 1, while rule 2 requires arguments only for `zpad`, `prec`, `pad`, and `left`, with the inclusive integer range `0..=65535`.
+- **Boundary and review judgment:** Preserve diagnostic distinctions: an unknown name (including an unresolved HIR name symbol) maps to `UNKNOWN_FORMAT_SPEC`; a known name with a missing required argument, unexpected forbidden argument, or argument above 65535 maps to `FORMAT_SPEC_ARGUMENT`. The helper accepts exactly 0 and 65535 for each of the four parameterized forms and rejects 65536. It only normalizes the HIR specifier and returns the trait category; it does not check an operand's `Format` or marker-trait obligations, decide whether a specifier obligation is suppressed after `FORMAT_NOT_IMPLEMENTED`, emit diagnostics, typecheck interpolation expressions, or populate `TypeckResults`. These name precedence, argument boundary, category, and responsibility boundaries are **Review required**.
+- **Review required:** Challenge every specifier/value/trait pairing, all four required-argument forms and their `0`, `65535`, and `65536` boundaries, all six forbidden-argument forms, and the separate unknown-name / argument-error diagnostic codes. Verify an unknown name with an argument remains `UNKNOWN_FORMAT_SPEC` and an unresolved name symbol follows the same mapping. Confirm this helper remains pure and that later integration owns diagnostic ordering, base `Format` obligation handling, expression typing, and result-map population.
+- **Planned verification matrix:** Run unit tests in `sai_ty::typeck::format` for no specifier, every known mapping, lower and upper accepted bounds, each missing argument, each unexpected argument, each out-of-range argument, and unknown names with/without an argument. Run pinned Rust 1.99.1 formatting and diff checks.
+
 ### IR-986 (2026-10-27): diagnose scalar non-integer shift-count literals in direct calls
 
 - **Decision:** Extend the existing root and one-level nested direct-call shift forms to accept direct `Bool`, `Char`, and floating-point literals as RHS counts. Reuse `check_shift`'s `U32` expected-literal check to report `TYPE_MISMATCH`.
