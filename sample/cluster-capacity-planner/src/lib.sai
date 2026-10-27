@@ -1,0 +1,195 @@
+use acme:cluster-capacity-planner/data
+use acme:cluster-capacity-planner/model.{CapacityPlan, HoldReason, PlanError, ReplicaOutcome}
+use acme:cluster-capacity-planner/planner
+use acme:cluster-capacity-planner/report
+use sai:process
+
+pub fn monday_plan() -> Result<CapacityPlan, PlanError> {
+    planner.plan_capacity(data.monday_morning())
+}
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    report.print_monday_plan(borrow mut out)
+    process.ExitCode.success()
+}
+
+test "critical replicas use best fit while retaining node safety reserves" {
+    match monday_plan() {
+        Ok(plan) => {
+            assert plan.decision_count == 12
+            assert plan.placed_count == 8
+            assert plan.held_count == 4
+            assert plan.remaining_cpu_millis[0] == 0
+            assert plan.remaining_memory_mib[0] == 3000
+            assert plan.remaining_cpu_millis[1] == 0
+            assert plan.remaining_memory_mib[1] == 3000
+            assert plan.remaining_cpu_millis[2] == 1000
+            assert plan.remaining_memory_mib[2] == 4000
+            assert plan.remaining_cpu_millis[3] == 4000
+            assert plan.remaining_memory_mib[3] == 16000
+            assert plan.remaining_cpu_millis[4] == 4000
+            assert plan.remaining_memory_mib[4] == 16000
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "best fit placements and service ordering are deterministic" {
+    match monday_plan() {
+        Ok(plan) => {
+            match plan.decisions[0] {
+                Some(decision) => {
+                    assert decision.service_id == 100
+                    assert decision.replica_index == 1
+                    match decision.outcome {
+                        ReplicaOutcome.Placed(node_id) => {
+                            assert node_id == 103
+                        }
+                        _ => {
+                            assert false
+                        }
+                    }
+                }
+                None => {
+                    assert false
+                }
+            }
+            assert plan.decisions[1].unwrap().service_id == 100
+            assert plan.decisions[1].unwrap().replica_index == 2
+            assert plan.decisions[1].unwrap().outcome == ReplicaOutcome.Placed(101)
+            assert plan.decisions[2].unwrap().service_id == 100
+            assert plan.decisions[2].unwrap().replica_index == 3
+            assert plan.decisions[2].unwrap().outcome == ReplicaOutcome.Placed(102)
+            match plan.decisions[3] {
+                Some(decision) => {
+                    assert decision.service_id == 450
+                    match decision.outcome {
+                        ReplicaOutcome.Placed(node_id) => {
+                            assert node_id == 201
+                        }
+                        _ => {
+                            assert false
+                        }
+                    }
+                }
+                None => {
+                    assert false
+                }
+            }
+            match plan.decisions[5] {
+                Some(decision) => {
+                    assert decision.service_id == 200
+                    match decision.outcome {
+                        ReplicaOutcome.Placed(node_id) => {
+                            assert node_id == 101
+                        }
+                        _ => {
+                            assert false
+                        }
+                    }
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "capacity, zone-spread, and missing-pool holds remain distinct" {
+    match monday_plan() {
+        Ok(plan) => {
+            var capacity_holds: USize = 0
+            var spread_holds: USize = 0
+            var pool_holds: USize = 0
+            for decision_option in plan.decisions {
+                match decision_option {
+                    Some(decision) => {
+                        match decision.outcome {
+                            ReplicaOutcome.Placed(_) => {}
+                            ReplicaOutcome.Held(HoldReason.CapacityExhausted) => {
+                                capacity_holds += 1
+                            }
+                            ReplicaOutcome.Held(HoldReason.ReplicaSpreadLimit) => {
+                                spread_holds += 1
+                            }
+                            ReplicaOutcome.Held(HoldReason.NoCompatiblePool) => {
+                                pool_holds += 1
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            assert capacity_holds == 2
+            assert spread_holds == 1
+            assert pool_holds == 1
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "memory headroom independently blocks a CPU-feasible replica" {
+    var low_general_memory = data.monday_morning()
+    low_general_memory.nodes[0].memory_capacity_mib = 3000
+    low_general_memory.nodes[1].memory_capacity_mib = 3000
+    low_general_memory.nodes[2].memory_capacity_mib = 3000
+
+    match planner.plan_capacity(low_general_memory) {
+        Ok(plan) => {
+            assert plan.remaining_cpu_millis[0] == 7000
+            assert plan.remaining_memory_mib[0] == 1000
+            match plan.decisions[0] {
+                Some(decision) => {
+                    assert decision.service_id == 100
+                    assert (decision.outcome == ReplicaOutcome.Held(HoldReason.CapacityExhausted))
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "invalid duplicate identifiers and resource bounds stop planning" {
+    var duplicate_node = data.monday_morning()
+    duplicate_node.nodes[1].id = duplicate_node.nodes[0].id
+    assert (planner.plan_capacity(duplicate_node) == Err(PlanError.DuplicateNodeId(101)))
+
+    var duplicate_service = data.monday_morning()
+    duplicate_service.services[1].id = duplicate_service.services[0].id
+    assert (planner.plan_capacity(duplicate_service) == Err(PlanError.DuplicateServiceId(300)))
+
+    var invalid_reserve = data.monday_morning()
+    invalid_reserve.nodes[0].reserved_cpu_millis = 9000
+    assert (planner.plan_capacity(invalid_reserve) == Err(PlanError.CpuReserveExceedsCapacity(101)))
+
+    var invalid_memory_reserve = data.monday_morning()
+    invalid_memory_reserve.nodes[0].reserved_memory_mib = 17000
+    assert (
+        planner.plan_capacity(invalid_memory_reserve)
+        == Err(PlanError.MemoryReserveExceedsCapacity(101))
+    )
+
+    var empty_demand = data.monday_morning()
+    empty_demand.services[0].memory_mib_per_replica = 0
+    assert (planner.plan_capacity(empty_demand) == Err(PlanError.EmptyResourceDemand(300)))
+
+    var invalid_replicas = data.monday_morning()
+    invalid_replicas.services[0].replica_count = 5
+    assert (planner.plan_capacity(invalid_replicas) == Err(PlanError.InvalidReplicaCount(300)))
+}

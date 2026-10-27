@@ -1,0 +1,85 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum NodePool {
+    General
+    Accelerator
+    MemoryOptimized
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Priority {
+    Critical
+    High
+    Standard
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    NoCompatiblePool
+    CapacityExhausted
+    ReplicaSpreadLimit
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReplicaOutcome {
+    Placed(U32)
+    Held(HoldReason)
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ComputeNode {
+    pub id: U32
+    pub name: Str
+    pub pool: NodePool
+    pub zone: U8
+    pub cpu_capacity_millis: U32
+    pub memory_capacity_mib: U32
+    pub reserved_cpu_millis: U32
+    pub reserved_memory_mib: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ServiceDemand {
+    pub id: U32
+    pub name: Str
+    pub pool: NodePool
+    pub priority: Priority
+    pub replica_count: USize
+    pub cpu_millis_per_replica: U32
+    pub memory_mib_per_replica: U32
+    pub spread_across_zones: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Cluster {
+    pub nodes: Array<ComputeNode, 5>
+    pub services: Array<ServiceDemand, 6>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReplicaDecision {
+    pub service_id: U32
+    pub service_name: Str
+    pub replica_index: USize
+    pub priority: Priority
+    pub outcome: ReplicaOutcome
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CapacityPlan {
+    pub decisions: Array<Option<ReplicaDecision>, 24>
+    pub decision_count: USize
+    pub remaining_cpu_millis: Array<U32, 5>
+    pub remaining_memory_mib: Array<U32, 5>
+    pub placed_count: USize
+    pub held_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PlanError {
+    DuplicateNodeId(U32)
+    DuplicateServiceId(U32)
+    CpuReserveExceedsCapacity(U32)
+    MemoryReserveExceedsCapacity(U32)
+    InvalidReplicaCount(U32)
+    EmptyResourceDemand(U32)
+}

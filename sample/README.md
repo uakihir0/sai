@@ -123,6 +123,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`bounded-dns-cache-resolver`](bounded-dns-cache-resolver/README.md) | Resolve fixed DNS records through bounded CNAME chains and a positive/negative TTL cache with deterministic LRU eviction. |
 | Advanced | [`robust-statistics-lab`](robust-statistics-lab/README.md) | Summarize fixed sensor batches with median and median absolute deviation, bounded arithmetic, and an explicit zero-MAD outlier policy. |
 | Advanced | [`bounded-bytecode-verifier`](bounded-bytecode-verifier/README.md) | Verify typed operand stacks across bounded control flow, including branch targets, stack-shape and value-kind joins, and return paths. |
+| Advanced | [`cluster-capacity-planner`](cluster-capacity-planner/README.md) | Place fixed service replicas across node pools under CPU and memory headroom, safety reserves, deterministic priority, best fit, and failure-zone spread rules. |
 
 ## Longer walkthroughs
 
@@ -148,6 +149,9 @@ source repository before a package resolver can fetch them.
 - [`bounded-bytecode-verifier`](bounded-bytecode-verifier/README.md)
   propagates typed abstract stacks through a FIFO control-flow worklist and
   checks branch joins and return shapes.
+- [`cluster-capacity-planner`](cluster-capacity-planner/README.md)
+  places priority-ordered service replicas under two-dimensional capacity,
+  reserved headroom, pool eligibility, and zone-spread constraints.
 - [`robust-statistics-lab`](robust-statistics-lab/README.md)
   compares median/MAD summaries with an explicit threshold and zero-MAD policy
   for a small fixed sensor dataset.
