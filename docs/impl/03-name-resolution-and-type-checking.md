@@ -3788,6 +3788,44 @@ Stage 0. (5) Run pinned Rust 1.99.1 focused tests, formatting and diff checks,
 then obtain independent hostile review and address actionable findings before
 committing. The gate does not expand to runtime or lowering.
 
+**IR-993 deferred unary bitwise-not of flat integer literal locals** extends
+the local `~source` initializer form when `source` is a preceding immutable
+local with unresolved direct integer-literal provenance, or a simple
+unannotated plain-path alias of that literal. The BitNot result shares the
+source literal inference variable, so an existing annotation, function-tail
+expectation, or default resolves the original variable and preserves range
+checking at the source-literal span. Integer literals can resolve only to
+integer primitives, for which BitNot is implemented; this successful form
+therefore reserves no deferred operator-diagnostic position. A result
+produced by deferred BitNot, including plain-path copies, is not
+literal-origin and cannot become a later deferred BitNot source, even after
+another use resolves the shared variable. Existing concrete
+integer/Byte path behavior is unchanged. Floating-point literal paths and
+unresolved computed-literal paths remain outside the deferred form; direct
+call and compound expressions are not accepted as unary operands. Mutable,
+global, self/forward/unresolved sources, and deeper scopes remain outside the
+deferred form. CLI Stage 0 stays gated, and this slice adds no lowering or
+runtime behavior. The inference, source-span, lineage, shape, and stage-boundary
+decisions are **Review required**. See spec/06 §6.8.6, spec/16 §16.6.1, and [the IR-993
+implementation review](../design/implementation-review.md#ir-993-2026-10-27-deferred-bitwise-not-of-flat-integer-literal-locals).
+
+**IR-993 implementation plan.** (1) Return the existing unresolved
+integer-literal variable for a qualifying `~source` initializer; because that
+variable can resolve only to an integer primitive and each such primitive
+implements `BitNot`, do not reserve a deferred diagnostic slot. (2) Restrict
+this route to the existing direct integer-literal and simple unannotated alias
+BindingId provenance; preserve existing concrete path checks. (3) Track
+deferred-BitNot result bindings and their simple path copies so later
+constraints cannot make them eligible as another `~` source. (4) Resolve and
+range-check the shared source literal after annotation/tail resolution and
+defaulting without moving its diagnostic from the literal span. (5) Add driver
+regressions for default, annotation, tail inference, simple aliases,
+result-lineage exclusion, diagnostic ordering, range spans and excluded
+shapes; add a CLI regression proving Stage 0 remains closed. (6) Run the
+pinned Rust 1.99.1 focused tests, formatting and diff checks, then obtain
+independent hostile review and record its outcome before committing. This is
+type-checking only; no lowering or runtime behavior is added.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
