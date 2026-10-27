@@ -3558,6 +3558,43 @@ runtime-boundary decisions are **Review required**. See spec/06 §§6.3.1,
   explicitly covers all integer types, operators, positions, and RHS
   boundaries; no correctness fix or follow-up review was required.
 
+**IR-985 direct-call shifts with an integer-literal LHS and Byte-literal RHS**
+admits exactly `(Lit::Int, Lit::Byte)` at the existing root or one-level
+nested positional direct-call argument positions for `<<` and `>>`. Reuse
+`check_shift` to constrain the left integer literal from the callee's integer
+parameter and check the Byte literal against `U32`. The RHS is invalid by
+contract and must produce the existing `TYPE_MISMATCH` diagnostic
+`expected \`U32\`, found a byte literal` over the complete RHS literal. Keep
+the operator and containing call tainted, retain the inferred left-literal
+fact and independent valid sibling, and do not publish a fact for the
+mismatched Byte literal. Preserve the existing direct-call target, signature,
+positional-prefix, and nesting limits. Keep Byte/Byte, path/Byte,
+computed/deeper operands, generic targets, and unsupported signatures gated.
+Preserve Stage 0 and make no lowering/runtime claim. These shape, mismatch,
+recovery, fact, and stage-boundary decisions are **Review required**. See
+spec/06 §§6.5.1, 6.8.2, 6.8.5 and spec/05 §§5.16.2, 5.16.5.
+
+- **Review required:** Challenge parity between the driver and body-checker
+  gates for only `(Lit::Int, Lit::Byte)` direct-call arguments. Verify both
+  operators at root and one nested level for all ten integer parameter types.
+  Check the exact `TYPE_MISMATCH` message and full Byte-literal span,
+  call/operator taint, call-selected left-literal fact, absence of an RHS
+  literal fact, alias taint, and recovery of a valid sibling. Reject Byte/Byte
+  and path/Byte forms, local-initializer forms, computed or deeper operands,
+  deeper calls, generic targets, and unsupported signatures. Confirm the CLI
+  Stage 0 gate and make no lowering/runtime claim.
+- **Planned verification matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` with all
+  ten integer types × both operators × root/nested positions. Assert the
+  single mismatch diagnostic and exact RHS span, expression facts and taint,
+  and valid sibling recovery. Retain explicit driver exclusions for other
+  literal/path combinations and add an accepted-shape CLI Stage 0 fixture
+  while keeping computed, deep, generic, and unsupported-signature fixtures
+  gated. Run the pinned focused driver and CLI filters, formatting, and diff
+  checks, then obtain independent hostile review before commit. Keep a
+  local-initializer `1 << b'x'` regression gated while enabling the direct-call
+  argument diagnostic.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
