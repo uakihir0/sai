@@ -118,6 +118,11 @@ source repository before a package resolver can fetch them.
 | Advanced | [`digital-archive-preservation-planner`](digital-archive-preservation-planner/README.md) | Prioritize fixed-fixture digital archive migrations and replicas under fixity, permission, independent-copy, byte-budget, and task-limit rules. |
 | Advanced | [`api-rate-limit-simulator`](api-rate-limit-simulator/README.md) | Replay per-client API requests against independent fixed-window limits, including exact-boundary resets, retry times, and unknown clients. |
 | Advanced | [`resilience-drill-planner`](resilience-drill-planner/README.md) | Plan fictional tabletop drills by recalculated marginal failure-scenario coverage under readiness, team-cap, time-budget, and drill-count limits. |
+| Advanced | [`transaction-serializability-auditor`](transaction-serializability-auditor/README.md) | Analyze bounded read/write histories, build a precedence graph, and report a deterministic serial order or cycle witness. |
+| Advanced | [`carbon-aware-compute-window-planner`](carbon-aware-compute-window-planner/README.md) | Schedule bounded compute jobs across regional windows with deadline, locality, capacity, and carbon-budget constraints; hold uncertain inputs for review. |
+| Advanced | [`bounded-dns-cache-resolver`](bounded-dns-cache-resolver/README.md) | Resolve fixed DNS records through bounded CNAME chains and a positive/negative TTL cache with deterministic LRU eviction. |
+| Advanced | [`robust-statistics-lab`](robust-statistics-lab/README.md) | Summarize fixed sensor batches with median and median absolute deviation, bounded arithmetic, and an explicit zero-MAD outlier policy. |
+| Advanced | [`bounded-bytecode-verifier`](bounded-bytecode-verifier/README.md) | Verify typed operand stacks across bounded control flow, including branch targets, stack-shape and value-kind joins, and return paths. |
 
 ## Longer walkthroughs
 
@@ -137,6 +142,15 @@ source repository before a package resolver can fetch them.
 - [`digital-archive-preservation-planner`](digital-archive-preservation-planner/README.md)
   validates preservation evidence, ranks migrations and replicas, and fits
   work to separate byte and task budgets while retaining catalog order.
+- [`transaction-serializability-auditor`](transaction-serializability-auditor/README.md)
+  builds a precedence graph from a bounded history and returns a stable cycle
+  witness when no serial order exists.
+- [`bounded-bytecode-verifier`](bounded-bytecode-verifier/README.md)
+  propagates typed abstract stacks through a FIFO control-flow worklist and
+  checks branch joins and return shapes.
+- [`robust-statistics-lab`](robust-statistics-lab/README.md)
+  compares median/MAD summaries with an explicit threshold and zero-MAD policy
+  for a small fixed sensor dataset.
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
