@@ -9308,6 +9308,7 @@ fn is_supported_direct_call_shift_operands_shape(
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Int { .. }) => true,
         ExprKind::Lit(Lit::Byte(_)) => matches!(left.kind, ExprKind::Lit(Lit::Int { .. })),
+        ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. }) => true,
         _ => false,
     }
 }
@@ -49275,14 +49276,17 @@ property "shared"() {}
             "pub fn shift_integer_literal_rhs_computed_lhs_unsupported(left: I32) -> I32 { apply_i32((left + 1) << 2) }\n",
             "pub fn shift_integer_literal_rhs_computed_unsupported(left: I32, count: U32) -> I32 { apply_i32(left << (count + 1)) }\n",
             "pub fn shift_integer_literal_rhs_unary_computed_unsupported(left: I32, count: U32) -> I32 { apply_i32(left << -count) }\n",
-            "pub fn shift_integer_literal_rhs_bool_unsupported(left: I32) -> I32 { apply_i32(left << true) }\n",
             "pub fn shift_integer_literal_rhs_byte_unsupported(left: I32) -> I32 { apply_i32(left << b'x') }\n",
             "pub fn shift_integer_byte_rhs_local_initializer_unsupported() -> I32 {\n",
             "    let result = 1 << b'x'\n",
             "    result\n",
             "}\n",
-            "pub fn shift_integer_literal_rhs_char_unsupported(left: I32) -> I32 { apply_i32(left << 'x') }\n",
-            "pub fn shift_integer_literal_rhs_float_unsupported(left: I32) -> I32 { apply_i32(left << 1.0) }\n",
+            "pub fn shift_scalar_literal_rhs_local_initializer_unsupported() -> I32 {\n",
+            "    let bool_shift = 1 << true\n",
+            "    let char_shift = 1 << 'x'\n",
+            "    let float_shift = 1 << 1.0\n",
+            "    1\n",
+            "}\n",
             "pub fn shift_byte_literal_lhs_root_left(count: U32) -> Byte { apply_byte(b'a' << count) }\n",
             "pub fn shift_byte_literal_lhs_root_right(count: U32) -> Byte { apply_byte(b'a' >> count) }\n",
             "pub fn shift_byte_literal_lhs_nested_left(count: U32) -> Byte { apply_byte(apply_byte(b'a' << count)) }\n",
@@ -50252,6 +50256,10 @@ property "shared"() {}
         let mut integer_shift_literal_pair_cases = Vec::new();
         let mut generated_integer_byte_shift_literal_cases = String::new();
         let mut integer_byte_shift_literal_cases = Vec::new();
+        let mut generated_scalar_shift_literal_rhs_cases = String::new();
+        let mut scalar_shift_literal_rhs_cases = Vec::new();
+        let mut generated_scalar_shift_literal_lhs_cases = String::new();
+        let mut scalar_shift_literal_lhs_cases = Vec::new();
         for (left_type, callee, type_name) in [
             ("I8", "apply_i8", "i8"),
             ("I16", "apply_i16", "i16"),
@@ -50457,6 +50465,118 @@ property "shared"() {}
                 }
             }
         }
+        for (literal_name, literal, expected_message) in [
+            ("bool_true", "true", "expected `U32`, found a Bool literal"),
+            (
+                "bool_false",
+                "false",
+                "expected `U32`, found a Bool literal",
+            ),
+            (
+                "character",
+                "'x'",
+                "expected `U32`, found a character literal",
+            ),
+            (
+                "float_positive",
+                "1.0",
+                "expected `U32`, found a floating-point literal",
+            ),
+            (
+                "float_negative",
+                "-2.5",
+                "expected `U32`, found a floating-point literal",
+            ),
+        ] {
+            for (operator, operator_name) in [("<<", "left"), (">>", "right")] {
+                for (nested, position) in [(false, "root"), (true, "nested")] {
+                    let name = format!(
+                        "direct_call_shift_scalar_literal_rhs_{position}_{operator_name}_{literal_name}"
+                    );
+                    let operator_expression = format!("left {operator} {literal}");
+                    let inner_call = format!("apply_i32({operator_expression})");
+                    let call = if nested {
+                        format!("apply_i32({inner_call})")
+                    } else {
+                        inner_call.clone()
+                    };
+                    let sibling_call = format!("apply_i32(left {operator} 0)");
+                    generated_scalar_shift_literal_rhs_cases.push_str(&format!(
+                        "pub fn {name}(left: I32) -> I32 {{\n    let failed = {call}\n    let alias = failed\n    {sibling_call}\n}}\n"
+                    ));
+                    scalar_shift_literal_rhs_cases.push((
+                        name,
+                        nested,
+                        operator_expression,
+                        literal,
+                        expected_message,
+                        call,
+                        inner_call,
+                        sibling_call,
+                    ));
+                }
+            }
+        }
+        for (left_name, left_literal, callee, primitive) in [
+            (
+                "integer",
+                "1",
+                "apply_i32",
+                sai_resolve::prelude::PrimTy::I32,
+            ),
+            (
+                "byte",
+                "b'a'",
+                "apply_byte",
+                sai_resolve::prelude::PrimTy::Byte,
+            ),
+        ] {
+            for (literal_name, literal, expected_message) in [
+                ("bool", "true", "expected `U32`, found a Bool literal"),
+                (
+                    "character",
+                    "'x'",
+                    "expected `U32`, found a character literal",
+                ),
+                (
+                    "float",
+                    "-2.5",
+                    "expected `U32`, found a floating-point literal",
+                ),
+            ] {
+                for (operator, operator_name) in [("<<", "left"), (">>", "right")] {
+                    for (nested, position) in [(false, "root"), (true, "nested")] {
+                        let name = format!(
+                            "direct_call_shift_scalar_literal_rhs_{left_name}_lhs_{position}_{operator_name}_{literal_name}"
+                        );
+                        let operator_expression = format!("{left_literal} {operator} {literal}");
+                        let inner_call = format!("{callee}({operator_expression})");
+                        let call = if nested {
+                            format!("{callee}({inner_call})")
+                        } else {
+                            inner_call.clone()
+                        };
+                        let sibling_call = format!("{callee}({left_literal} {operator} 0)");
+                        generated_scalar_shift_literal_lhs_cases.push_str(&format!(
+                            "pub fn {name}() -> {} {{\n    let failed = {call}\n    let alias = failed\n    {sibling_call}\n}}\n",
+                            if left_name == "byte" { "Byte" } else { "I32" }
+                        ));
+                        scalar_shift_literal_lhs_cases.push((
+                            name,
+                            nested,
+                            left_literal,
+                            operator_expression,
+                            literal,
+                            expected_message,
+                            call,
+                            inner_call,
+                            sibling_call,
+                            primitive,
+                        ));
+                    }
+                }
+            }
+        }
         root.push_str(&generated_bitwise_integer_literal_cases);
         root.push_str(&generated_bitwise_integer_literal_left_cases);
         root.push_str(&generated_bitwise_integer_literal_pair_cases);
@@ -50466,6 +50586,8 @@ property "shared"() {}
         root.push_str(&generated_byte_shift_literal_rhs_cases);
         root.push_str(&generated_integer_shift_literal_pair_cases);
         root.push_str(&generated_integer_byte_shift_literal_cases);
+        root.push_str(&generated_scalar_shift_literal_rhs_cases);
+        root.push_str(&generated_scalar_shift_literal_lhs_cases);
         let child = concat!(
             "pub fn apply(value: I32) -> I32 { value }\n",
             "pub fn apply_pair(first: I32, second: I32) -> I32 { first }\n",
@@ -51565,11 +51687,9 @@ property "shared"() {}
             "shift_integer_literal_rhs_computed_lhs_unsupported",
             "shift_integer_literal_rhs_computed_unsupported",
             "shift_integer_literal_rhs_unary_computed_unsupported",
-            "shift_integer_literal_rhs_bool_unsupported",
             "shift_integer_literal_rhs_byte_unsupported",
             "shift_integer_byte_rhs_local_initializer_unsupported",
-            "shift_integer_literal_rhs_char_unsupported",
-            "shift_integer_literal_rhs_float_unsupported",
+            "shift_scalar_literal_rhs_local_initializer_unsupported",
             "shift_integer_literal_lhs_path_rhs_computed_unsupported",
             "shift_integer_literal_lhs_computed_path_rhs_unsupported",
             "shift_integer_literal_lhs_deep_nested_unsupported",
@@ -52453,6 +52573,299 @@ property "shared"() {}
                 )
                 .expect("the Byte literal span is ordered"),
                 "{name} diagnoses the complete Byte literal"
+            );
+        }
+
+        for (
+            name,
+            nested,
+            operator_expression,
+            right_literal,
+            expected_message,
+            call,
+            inner_call,
+            sibling_call,
+        ) in &scalar_shift_literal_rhs_cases
+        {
+            let owner = assert_supported(&database, name, &[sai_diagnostics::Code::TypeMismatch]);
+            let function = format!("pub fn {name}");
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, call, 0, call.len()),
+                None,
+                "{name} suppresses the tainted direct-call fact"
+            );
+            if *nested {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        call.find(inner_call)
+                            .expect("the one-level nested call occurs in the outer call"),
+                        inner_call.len(),
+                    ),
+                    None,
+                    "{name} suppresses the tainted nested-call fact"
+                );
+            }
+
+            let operator_start = call
+                .find(operator_expression)
+                .expect("the scalar-literal shift occurs in the direct call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start,
+                    operator_expression.len(),
+                ),
+                None,
+                "{name} suppresses the tainted shift result"
+            );
+            let left_start = operator_expression
+                .find("left")
+                .expect("the left operand is a direct path");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start + left_start,
+                    "left".len(),
+                ),
+                Some(sai_resolve::prelude::PrimTy::I32),
+                "{name} retains the valid left-path fact"
+            );
+            let literal_start = operator_expression
+                .rfind(right_literal)
+                .expect("the mismatched scalar literal is the shift count");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start + literal_start,
+                    right_literal.len(),
+                ),
+                None,
+                "{name} does not publish a fact for the mismatched RHS literal"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    "let alias = failed",
+                    "let alias = ".len(),
+                    "failed".len(),
+                ),
+                None,
+                "{name} propagates taint to an alias of the failed call"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    sibling_call,
+                    0,
+                    sibling_call.len(),
+                ),
+                Some(sai_resolve::prelude::PrimTy::I32),
+                "{name} preserves the independent valid sibling call"
+            );
+
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("scalar-literal shift body check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{name} remains inside the bounded direct-call shift gate")
+                }
+            };
+            assert_eq!(diagnostics.len(), 1, "{name} reports one RHS mismatch");
+            assert_eq!(
+                diagnostics[0].message, *expected_message,
+                "{name} reports the literal-specific U32 shift-count mismatch"
+            );
+            let function_start = root
+                .find(&function)
+                .expect("the generated scalar-literal function occurs in the test root");
+            let source_operator_start = function_start
+                + root[function_start..]
+                    .find(operator_expression)
+                    .expect("the generated scalar-literal shift occurs in the source");
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("the scalar-literal type mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new((source_operator_start + literal_start) as u32,),
+                    sai_diagnostics::TextSize::new(
+                        (source_operator_start + literal_start + right_literal.len()) as u32,
+                    ),
+                )
+                .expect("the scalar literal span is ordered"),
+                "{name} diagnoses the complete RHS literal"
+            );
+        }
+
+        for (
+            name,
+            nested,
+            left_literal,
+            operator_expression,
+            right_literal,
+            expected_message,
+            call,
+            inner_call,
+            sibling_call,
+            primitive,
+        ) in &scalar_shift_literal_lhs_cases
+        {
+            let owner = assert_supported(&database, name, &[sai_diagnostics::Code::TypeMismatch]);
+            let function = format!("pub fn {name}");
+            assert_eq!(
+                expression_type_at_range(&mut database, owner, &function, call, 0, call.len()),
+                None,
+                "{name} suppresses the tainted direct-call fact"
+            );
+            if *nested {
+                assert_eq!(
+                    expression_type_at_range(
+                        &mut database,
+                        owner,
+                        &function,
+                        call,
+                        call.find(inner_call)
+                            .expect("the one-level nested call occurs in the outer call"),
+                        inner_call.len(),
+                    ),
+                    None,
+                    "{name} suppresses the tainted nested-call fact"
+                );
+            }
+
+            let operator_start = call
+                .find(operator_expression)
+                .expect("the scalar-literal shift occurs in the direct call");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start,
+                    operator_expression.len(),
+                ),
+                None,
+                "{name} suppresses the tainted shift result"
+            );
+            let left_literal_start = operator_expression
+                .find(left_literal)
+                .expect("the selected literal occurs on the left");
+            let expected_left_fact = if *left_literal == "b'a'" {
+                None
+            } else {
+                Some(*primitive)
+            };
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start + left_literal_start,
+                    left_literal.len(),
+                ),
+                expected_left_fact,
+                "{name} preserves the integer-literal fact and does not synthesize a Byte-literal fact"
+            );
+            let right_literal_start = operator_expression
+                .rfind(right_literal)
+                .expect("the mismatched scalar literal is the shift count");
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    call,
+                    operator_start + right_literal_start,
+                    right_literal.len(),
+                ),
+                None,
+                "{name} does not publish a fact for the mismatched RHS literal"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    "let alias = failed",
+                    "let alias = ".len(),
+                    "failed".len(),
+                ),
+                None,
+                "{name} propagates taint to an alias of the failed call"
+            );
+            assert_eq!(
+                expression_type_at_range(
+                    &mut database,
+                    owner,
+                    &function,
+                    sibling_call,
+                    0,
+                    sibling_call.len(),
+                ),
+                Some(*primitive),
+                "{name} preserves the independent valid sibling call"
+            );
+
+            let diagnostics = match owner
+                .body_type_check()
+                .expect("scalar-literal shift body check is available")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => diagnostics,
+                FunctionBodyTypeCheck::Unsupported => {
+                    panic!("{name} remains inside the bounded direct-call shift gate")
+                }
+            };
+            assert_eq!(diagnostics.len(), 1, "{name} reports one RHS mismatch");
+            assert_eq!(
+                diagnostics[0].message, *expected_message,
+                "{name} reports the literal-specific U32 shift-count mismatch"
+            );
+            let function_start = root
+                .find(&function)
+                .expect("the generated scalar-literal function occurs in the test root");
+            let source_operator_start = function_start
+                + root[function_start..]
+                    .find(operator_expression)
+                    .expect("the generated scalar-literal shift occurs in the source");
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("the scalar-literal type mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(
+                        (source_operator_start + right_literal_start) as u32,
+                    ),
+                    sai_diagnostics::TextSize::new(
+                        (source_operator_start + right_literal_start + right_literal.len()) as u32,
+                    ),
+                )
+                .expect("the scalar literal span is ordered"),
+                "{name} diagnoses the complete RHS literal"
             );
         }
 
