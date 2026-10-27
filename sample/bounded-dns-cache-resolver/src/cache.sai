@@ -1,0 +1,74 @@
+use acme:bounded-dns-cache-resolver/model.{CacheEntry, CacheState, DnsName}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type InsertResult {
+    pub cache: CacheState
+    pub evicted_name: Option<DnsName>
+}
+
+pub fn empty() -> CacheState {
+    CacheState(entries: Array<Option<CacheEntry>, 4>.filled(None), entry_count: 0)
+}
+
+pub fn expire(cache: CacheState, now_seconds: U32) -> CacheState {
+    var updated = cache
+    for index in 0..updated.entries.len() {
+        match updated.entries[index] {
+            Some(entry) => {
+                if entry.expires_at_seconds <= now_seconds {
+                    updated.entries[index] = None
+                    updated.entry_count -= 1
+                }
+            }
+            None => {}
+        }
+    }
+    updated
+}
+
+pub fn find(cache: CacheState, name: DnsName) -> Option<USize> {
+    for index in 0..cache.entries.len() {
+        match cache.entries[index] {
+            Some(entry) => {
+                if entry.name == name {
+                    return Some(index)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+pub fn insert(cache: CacheState, entry: CacheEntry) -> InsertResult {
+    var updated = cache
+    var free_index: Option<USize> = None
+    for index in 0..updated.entries.len() {
+        if updated.entries[index].is_none() {
+            free_index = Some(index)
+            break
+        }
+    }
+
+    match free_index {
+        Some(index) => {
+            updated.entries[index] = Some(entry)
+            updated.entry_count += 1
+            InsertResult(cache: updated, evicted_name: None)
+        }
+        None => {
+            var oldest_index: USize = 0
+            var oldest_order = updated.entries[0].unwrap().last_used_order
+            for index in 1..updated.entries.len() {
+                let candidate_order = updated.entries[index].unwrap().last_used_order
+                if candidate_order < oldest_order {
+                    oldest_index = index
+                    oldest_order = candidate_order
+                }
+            }
+            let evicted_name = updated.entries[oldest_index].unwrap().name
+            updated.entries[oldest_index] = Some(entry)
+            InsertResult(cache: updated, evicted_name: Some(evicted_name))
+        }
+    }
+}

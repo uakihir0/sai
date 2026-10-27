@@ -1,0 +1,177 @@
+use acme:bounded-dns-cache-resolver/cache
+use acme:bounded-dns-cache-resolver/fixtures
+use acme:bounded-dns-cache-resolver/model.{
+    CacheEntry
+    CacheState
+    DnsName
+    DnsQuestion
+    QueryDecision
+    Resolution
+    ResolverReport
+    ResponseKind
+}
+use acme:bounded-dns-cache-resolver/policy
+use acme:bounded-dns-cache-resolver/resolver
+
+fn decision(
+    question: DnsQuestion,
+    kind: ResponseKind,
+    address_id: U32,
+    canonical_name: DnsName,
+    cache_hit: Bool,
+    expires_at_seconds: U32,
+    evicted_name: Option<DnsName>,
+    cache_count: USize,
+) -> QueryDecision {
+    QueryDecision(
+        query_id: question.query_id,
+        name: question.name,
+        at_seconds: question.at_seconds,
+        kind: kind,
+        address_id: address_id,
+        canonical_name: canonical_name,
+        cache_hit: cache_hit,
+        expires_at_seconds: expires_at_seconds,
+        evicted_name: evicted_name,
+        cache_entry_count: cache_count,
+    )
+}
+
+fn from_resolution(question: DnsQuestion, resolution: Resolution) -> QueryDecision {
+    QueryDecision(
+        query_id: question.query_id,
+        name: question.name,
+        at_seconds: question.at_seconds,
+        kind: resolution.kind,
+        address_id: resolution.address_id,
+        canonical_name: resolution.canonical_name,
+        cache_hit: false,
+        expires_at_seconds: 0,
+        evicted_name: None,
+        cache_entry_count: 0,
+    )
+}
+
+fn can_cache(resolution: Resolution) -> Bool {
+    (
+        resolution.ttl_seconds > 0
+        and (
+            resolution.kind == ResponseKind.Positive
+            or resolution.kind == ResponseKind.NxDomain
+            or resolution.kind == ResponseKind.NoData
+        )
+    )
+}
+
+fn update_count(report: ResolverReport, kind: ResponseKind) -> ResolverReport {
+    var updated = report
+    if kind == ResponseKind.Positive {
+        updated.positive_count += 1
+    } else if kind == ResponseKind.NxDomain {
+        updated.nxdomain_count += 1
+    } else if kind == ResponseKind.NoData {
+        updated.nodata_count += 1
+    } else if kind == ResponseKind.AliasLoop {
+        updated.alias_loop_count += 1
+    } else if kind == ResponseKind.AliasHopLimit {
+        updated.alias_hop_limit_count += 1
+    } else if kind == ResponseKind.InvalidTime {
+        updated.invalid_time_count += 1
+    }
+    updated
+}
+
+fn invalid_decision(question: DnsQuestion, cache_count: USize) -> QueryDecision {
+    decision(question, ResponseKind.InvalidTime, 0, question.name, false, 0, None, cache_count)
+}
+
+pub fn simulate(questions: Array<DnsQuestion, 16>) -> ResolverReport {
+    var report = ResolverReport(
+        decisions: Array<Option<QueryDecision>, 16>.filled(None),
+        valid_query_count: 0,
+        positive_count: 0,
+        nxdomain_count: 0,
+        nodata_count: 0,
+        alias_loop_count: 0,
+        alias_hop_limit_count: 0,
+        invalid_time_count: 0,
+        cache_hit_count: 0,
+        cache_miss_count: 0,
+        eviction_count: 0,
+        final_cache: cache.empty(),
+        final_time_seconds: 0,
+        has_valid_time: false,
+    )
+    var state: CacheState = report.final_cache
+
+    for query_index in 0..policy.MAX_QUERIES {
+        let question = questions[query_index]
+        let out_of_range = question.at_seconds > policy.MAX_QUERY_TIME_SECONDS
+        let reversed = report.has_valid_time and question.at_seconds < report.final_time_seconds
+        if out_of_range or reversed {
+            report.decisions[query_index] = Some(invalid_decision(question, state.entry_count))
+            report = update_count(report, ResponseKind.InvalidTime)
+        } else {
+            report.valid_query_count += 1
+            report.final_time_seconds = question.at_seconds
+            report.has_valid_time = true
+            state = cache.expire(state, question.at_seconds)
+            match cache.find(state, question.name) {
+                Some(entry_index) => {
+                    var entry = state.entries[entry_index].unwrap()
+                    entry.last_used_order = query_index + 1
+                    state.entries[entry_index] = Some(entry)
+                    report.decisions[query_index] = Some(
+                        decision(
+                            question,
+                            entry.kind,
+                            entry.address_id,
+                            entry.canonical_name,
+                            true,
+                            entry.expires_at_seconds,
+                            None,
+                            state.entry_count,
+                        ),
+                    )
+                    report.cache_hit_count += 1
+                    report = update_count(report, entry.kind)
+                }
+                None => {
+                    report.cache_miss_count += 1
+                    let resolution = resolver.resolve(question.name)
+                    var outcome = from_resolution(question, resolution)
+                    report = update_count(report, resolution.kind)
+                    if can_cache(resolution) {
+                        let expires_at = question.at_seconds + resolution.ttl_seconds
+                        let entry = CacheEntry(
+                            name: question.name,
+                            kind: resolution.kind,
+                            address_id: resolution.address_id,
+                            canonical_name: resolution.canonical_name,
+                            expires_at_seconds: expires_at,
+                            last_used_order: query_index + 1,
+                        )
+                        let inserted = cache.insert(state, entry)
+                        state = inserted.cache
+                        outcome.expires_at_seconds = expires_at
+                        outcome.evicted_name = inserted.evicted_name
+                        outcome.cache_entry_count = state.entry_count
+                        if inserted.evicted_name.is_some() {
+                            report.eviction_count += 1
+                        }
+                    } else {
+                        outcome.cache_entry_count = state.entry_count
+                    }
+                    report.decisions[query_index] = Some(outcome)
+                }
+            }
+        }
+    }
+
+    report.final_cache = state
+    report
+}
+
+pub fn fixture_report() -> ResolverReport {
+    simulate(fixtures.questions())
+}

@@ -1,0 +1,23 @@
+use acme:bounded-dns-cache-resolver/model.{DnsName, DnsQuestion}
+use acme:bounded-dns-cache-resolver/policy
+
+pub fn questions() -> Array<DnsQuestion, 16> {
+    [
+        DnsQuestion(query_id: 1, name: DnsName.Www, at_seconds: 0),
+        DnsQuestion(query_id: 2, name: DnsName.Www, at_seconds: 1),
+        DnsQuestion(query_id: 3, name: DnsName.Beta, at_seconds: 2),
+        DnsQuestion(query_id: 4, name: DnsName.Missing, at_seconds: 3),
+        DnsQuestion(query_id: 5, name: DnsName.Empty, at_seconds: 4),
+        DnsQuestion(query_id: 6, name: DnsName.Www, at_seconds: 5),
+        DnsQuestion(query_id: 7, name: DnsName.Docs, at_seconds: 6),
+        DnsQuestion(query_id: 8, name: DnsName.Missing, at_seconds: 7),
+        DnsQuestion(query_id: 9, name: DnsName.Www, at_seconds: 8),
+        DnsQuestion(query_id: 10, name: DnsName.Missing, at_seconds: 9),
+        DnsQuestion(query_id: 11, name: DnsName.Alpha, at_seconds: 10),
+        DnsQuestion(query_id: 12, name: DnsName.Docs, at_seconds: 10),
+        DnsQuestion(query_id: 13, name: DnsName.LoopA, at_seconds: 11),
+        DnsQuestion(query_id: 14, name: DnsName.Unlisted, at_seconds: 12),
+        DnsQuestion(query_id: 15, name: DnsName.Unlisted, at_seconds: 13),
+        DnsQuestion(query_id: 16, name: DnsName.Unlisted, at_seconds: 18),
+    ]
+}
