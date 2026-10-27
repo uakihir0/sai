@@ -50931,7 +50931,7 @@ property "shared"() {}
             "    let value: U32 = 1\n",
             "    apply_u32(~value)\n",
             "}\n",
-            "pub fn bitnot_unresolved_numeric_local_unsupported() -> I32 {\n",
+            "pub fn bitnot_direct_integer_literal_local_call_argument() -> I32 {\n",
             "    let value = 1\n",
             "    apply(~value)\n",
             "}\n",
@@ -53163,6 +53163,11 @@ property "shared"() {}
             assert_supported(&database, "bitnot_unsigned_call_argument", &[]);
         let bitnot_shadowed_unsigned_call_argument =
             assert_supported(&database, "bitnot_shadowed_unsigned_call_argument", &[]);
+        let _bitnot_direct_integer_literal_local_call_argument = assert_supported(
+            &database,
+            "bitnot_direct_integer_literal_local_call_argument",
+            &[],
+        );
         let nested_bitnot_call_argument =
             assert_supported(&database, "nested_bitnot_call_argument", &[]);
         let bitnot_parameter_mismatch = assert_supported(
@@ -53755,7 +53760,6 @@ property "shared"() {}
             "bitnot_bool_literal_call_argument_unsupported",
             "bitnot_char_literal_call_argument_unsupported",
             "bitnot_float_literal_call_argument_unsupported",
-            "bitnot_unresolved_numeric_local_unsupported",
             "bitnot_generic_target",
             "bitnot_double_operand_unsupported",
             "bitnot_computed_operand_unsupported",
