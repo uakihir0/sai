@@ -2499,7 +2499,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 ExprKind::Unary(UnOp::BitNot, operand)
                     if is_supported_direct_call_bitwise_not_operand(operand) =>
                 {
-                    let local_type = self.check_bitwise_not_path(operand, argument.expr.hir_id)?;
+                    let local_type = match operand.kind {
+                        ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)) => {
+                            self.check_direct_call_bitwise_not_literal(operand, *expected)?
+                        }
+                        _ => self.check_bitwise_not_path(operand, argument.expr.hir_id)?,
+                    };
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
@@ -2538,6 +2543,32 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             });
         }
         Ok(LocalType::Concrete(operand_type))
+    }
+
+    fn check_direct_call_bitwise_not_literal(
+        &mut self,
+        operand: &'hir Expr<'hir>,
+        expected: PrimTy,
+    ) -> Result<LocalType, ()> {
+        let ExprKind::Lit(literal) = operand.kind else {
+            return Err(());
+        };
+        match primitive_literal_kind(literal) {
+            Some(PrimitiveLiteralKind::Integer) => {
+                self.check_annotated_literal(
+                    expected,
+                    literal,
+                    PrimitiveLiteralKind::Integer,
+                    operand.hir_id,
+                );
+                Ok(LocalType::Concrete(expected))
+            }
+            Some(PrimitiveLiteralKind::Byte) => {
+                self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Byte));
+                Ok(LocalType::Concrete(PrimTy::Byte))
+            }
+            _ => Err(()),
+        }
     }
 
     fn check_direct_call_neg_path(
@@ -5137,7 +5168,10 @@ fn is_supported_direct_call_not_operand(operand: &Expr<'_>) -> bool {
 }
 
 fn is_supported_direct_call_bitwise_not_operand(operand: &Expr<'_>) -> bool {
-    matches!(operand.kind, ExprKind::Path(_))
+    matches!(
+        operand.kind,
+        ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_))
+    )
 }
 
 fn is_supported_direct_call_neg_operand(operand: &Expr<'_>) -> bool {

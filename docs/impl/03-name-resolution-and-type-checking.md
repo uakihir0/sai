@@ -3695,6 +3695,41 @@ are **Review required**. See spec/06 §§6.5.1, 6.8.6, and 6.8.10.
   1.99.1 focused driver and CLI tests, formatting, and diff checks, then
   obtain independent hostile review before commit.
 
+**IR-989 direct-call unary bitwise NOT of literals** admits exactly one unary
+`~` directly over an integer or `Byte` literal as a positional argument at the
+existing root or one-level nested direct-call locations. Infer integer
+literal types from the callee parameter and use the existing annotated-literal
+range check; retain a `Byte` literal's `Byte` type. Preserve the existing
+`BitNot` type set, report argument mismatches through the current literal or
+path diagnostic path, suppress tainted unary/call/alias facts, and keep
+independent valid siblings typed. Keep `Bool`, `Char`, and floating-point
+literals, double `~`, computed/call operands, deeper calls, generic targets,
+unsupported signatures, and unsupported literal pairings gated. Leave local
+initializer behavior unchanged. Preserve CLI Stage 0; this does not add
+lowering or runtime evaluation. These inference, shape, diagnostic, fact,
+recovery, and stage-boundary choices are **Review required**. See spec/06
+§§6.5.1, 6.8.6, and 6.8.10.
+
+- **Review required:** Challenge driver/body-checker parity for integer and
+  `Byte` literal operands at root and one nested call level. Cover all ten
+  integer types and `Byte`; verify parameter-directed inference, integer
+  range diagnostics, exact result/literal facts, literal mismatch diagnostics
+  and spans, call and alias taint, and independent sibling recovery. Reject
+  `Bool`, `Char`, and floating-point literals, double `~`, computed/call
+  operands, deeper calls, generic targets, unsupported signatures, and other
+  unsupported shapes. Confirm local initializer behavior is unchanged, the
+  CLI Stage 0 gate remains closed, and no lowering/runtime behavior is
+  claimed.
+- **Planned verification matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` over all
+  ten integer types × root/nested positions, plus `Byte` literal root/nested
+  forms, including `I8` range failure and integer/Byte argument mismatches.
+  Assert exact call, unary, and operand facts, diagnostics and spans, taint,
+  and sibling recovery. Add a CLI Stage 0 fixture for representative accepted
+  and excluded literal shapes. Run pinned Rust 1.99.1 focused driver and CLI
+  tests, formatting, and diff checks; obtain independent hostile review
+  before commit.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
