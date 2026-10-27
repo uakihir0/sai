@@ -19,7 +19,7 @@ test "the workbook recalculates dependencies in stable topological passes" {
     assert report.formula_order[2] == Some(93)
     assert report.formula_order[3] == Some(96)
     assert report.formula_order[4] == Some(60)
-    assert report.formula_order[5] == Some(100)
+    assert report.formula_order[5] == Some(101)
 
     assert result_at(report, 0).value == Some(170)
     assert result_at(report, 1).value == Some(30)
@@ -30,7 +30,7 @@ test "the workbook recalculates dependencies in stable topological passes" {
 test "a missing cell reference is reported and blocks its dependants" {
     let report = fixture_report()
     let missing = result_at(report, 7)
-    let dependent = result_at(report, 17)
+    let dependent = result_at(report, 18)
 
     assert missing.id == 80
     assert missing.status == CellStatus.MissingReference

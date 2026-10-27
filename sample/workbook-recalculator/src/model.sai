@@ -1,4 +1,4 @@
-pub const MAX_CELLS: USize = 18
+pub const MAX_CELLS: USize = 19
 pub const MAX_GRAPH_CELLS: USize = MAX_CELLS * MAX_CELLS
 
 pub type CellId = U32

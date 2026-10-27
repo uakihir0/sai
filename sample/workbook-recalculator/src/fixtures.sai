@@ -21,7 +21,7 @@ fn formula(id: U32, label: Str, left: U32, operator: FormulaOperator, right: U32
 
 pub fn workbook() -> Workbook {
     var cells = Array<Option<Cell>, MAX_CELLS>.filled(None)
-    cells[0] = Some(formula(100, "Net", 20, FormulaOperator.Subtract, 60))
+    cells[0] = Some(formula(101, "Net", 20, FormulaOperator.Subtract, 60))
     cells[1] = Some(formula(60, "Tax", 50, FormulaOperator.Divide, 100))
     cells[2] = Some(formula(20, "Gross", 10, FormulaOperator.Multiply, 11))
     cells[3] = Some(literal(10, "Hours", 8))
@@ -35,11 +35,12 @@ pub fn workbook() -> Workbook {
     cells[11] = Some(formula(93, "Overflow", 94, FormulaOperator.Add, 10))
     cells[12] = Some(literal(94, "Largest U32", 4294967295))
     cells[13] = Some(formula(95, "Overflow downstream", 93, FormulaOperator.Add, 10))
-    cells[14] = Some(formula(96, "Divide by zero", 30, FormulaOperator.Divide, 10))
+    cells[14] = Some(formula(96, "Divide by zero", 10, FormulaOperator.Divide, 30))
     cells[15] = Some(literal(30, "Zero", 0))
     cells[16] = Some(formula(97, "Division downstream", 96, FormulaOperator.Add, 10))
-    cells[17] = Some(formula(81, "Missing downstream", 80, FormulaOperator.Add, 10))
-    Workbook(cells: cells, cell_count: 18)
+    cells[17] = Some(literal(100, "Percent base", 100))
+    cells[18] = Some(formula(81, "Missing downstream", 80, FormulaOperator.Add, 10))
+    Workbook(cells: cells, cell_count: 19)
 }
 
 pub fn duplicate_id_workbook() -> Workbook {
