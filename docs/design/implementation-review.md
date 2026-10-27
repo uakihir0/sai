@@ -8922,3 +8922,27 @@
 - **Planned verification matrix:** Extend the focused direct-call driver regression over all ten integer primitive parameter types and both operators at root/nested positions; assert exact facts, I8/U8 out-of-range spans, mismatch diagnostics and recovery, and exclusions. Add accepted and rejected shape CLI fixtures that both prove Stage 0 stays gated. Run only pinned Rust focused driver/CLI filters, `cargo fmt --all -- --check`, and `git diff --check`; obtain independent hostile review.
 - **Verification:** The pinned driver filter passed (1 test), the CLI `binary_shift_` filter passed (8 tests), `cargo fmt --all -- --check` passed, and `git diff --check` passed.
 - **Hostile review:** Independent read-only hostile review, including a follow-up review of the module-constant exclusion, found no actionable issues. The reviewer confirmed that `SHIFT_COUNT` resolves as a module constant and is rejected by the eligible-local `BindingId` gate; the CLI fixture preserves Stage 0.
+
+### IR-984 (2026-10-27): allow integer-literal shift pairs in direct-call arguments
+
+- **Decision:** Extend only the existing root or one-level nested positional direct-call argument shape to admit exactly `(Lit::Int, Lit::Int)` for `<<` and `>>`. Reuse `check_shift`, constrain the left literal from the callee's integer parameter, and check the right literal as `U32`.
+- **Reason:** Both direct integer-literal leaves are already handled by `check_shift`; the right-hand count already uses the established U32 literal range diagnostics, and the left-hand literal already receives its type from the expected type. The missing capability is the matching driver and body-checker shape gates.
+- **Failure boundary and judgment:** Apply the call-selected bounds of all ten integer primitives, including configured wasm32 pointer-width types. In-range `0` and `U32::MAX` type-check even when the count exceeds the left operand width; this step does not evaluate the shift or add a static `ShiftOverflow`. Diagnose RHS `-1` and `4294967296` over each complete source literal span, suppress tainted shift/call facts, and preserve a valid sibling. Preserve left-literal range errors and the existing non-integer call-parameter mismatch recovery. Admit only integer-literal pairs at root or one nested positional call level. Keep integer/Byte in this order, computed operands, deeper calls, generic targets, and unsupported signatures gated; retain the prior supported Byte-literal-left/integer-literal-right form. Preserve Stage 0 and make no lowering/runtime claim. These shape, inference, range, recovery, and runtime-boundary decisions are **Review required**.
+- **Review required:** Challenge driver/body-checker parity for exactly `(Lit::Int, Lit::Int)` with both shift operators at root and one nested call level. Verify successful facts across all ten integer parameters with RHS `0` and `U32::MAX`, including no width-based diagnostic. Verify the `-1` and `U32::MAX + 1` RHS range code and complete span, operator/call taint, and independent sibling recovery. Check signed and unsigned left-literal range boundaries, including 32-bit ISize/USize, and non-integer parameter mismatch recovery. Reject mixed Byte/integer pairs in the unsupported direction, computed operands, deeper calls, generic targets, and unsupported signatures. Confirm the CLI Stage 0 gate and ensure no shift evaluation or runtime behavior is implied.
+- **Planned verification matrix:** Generate 10 integer types × 2 operators × root/nested positions × 4 RHS boundaries (`0`, `U32::MAX`, `-1`, `U32::MAX + 1`) in the focused driver regression. Assert call, operator, left-literal and U32-count facts; exact diagnostic codes/spans; taint; sibling facts; and no static `ShiftOverflow` on valid `U32::MAX`. Add I8/U8 and wasm32 ISize/USize left-range recovery, a non-integer parameter mismatch, and explicit exclusions for `1 << b'a'`, computed, deep, generic, and unsupported-signature forms. Add a separate accepted-shape CLI fixture proving Stage 0 remains unchanged. Run the pinned focused driver/CLI filters, formatting, and diff checks, then obtain an independent hostile review and address any actionable findings before commit.
+- **Verification:** With pinned Rust 1.99.1,
+  `cargo test -p sai_driver --lib --locked --offline primitive_body_type_results_include_exact_direct_function_calls`
+  passed (1 test; 160 generated integer-type/operator/position/RHS-boundary
+  cases plus left-range and call-mismatch recovery). The
+  `cargo test -p sai_cli --test check_empty_source --locked --offline binary_shift_`
+  filter passed (9 tests). `cargo fmt --all -- --check` and
+  `git diff --check` passed.
+- **Hostile review:** Independent read-only hostile review found no actionable
+  correctness or scope findings. It confirmed both gates agree, path RHS
+  binding checks remain exact, the unsupported Int/Byte direction and Stage 0
+  remain gated, and range/taint/sibling recovery and the review records are
+  covered. The review noted the focused driver test takes 86.39 seconds with
+  160 generated cases and offered grouping by function as an optional P3
+  optimization. I retained the matrix to keep the requested full type,
+  operator, position, and RHS-boundary coverage in this slice; no code fix was
+  required, so no follow-up review was necessary.
