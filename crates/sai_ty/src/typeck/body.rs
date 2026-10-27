@@ -268,7 +268,8 @@ struct LiteralVariable<'hir> {
 /// addition, subtraction, multiplication, division, remainder, bitwise, and
 /// wrapping-arithmetic pairs, preserving both literal sites on the shared
 /// inference variable.
-/// Unary `~` accepts direct integer/Byte literals and concrete integer/Byte paths.
+/// Unary `~` accepts direct integer/Byte literals, concrete integer/Byte
+/// paths, and unresolved direct integer-literal paths with simple aliases.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -317,6 +318,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         direct_unannotated_float_literals: HashSet::new(),
         unannotated_float_literal_aliases: HashSet::new(),
         deferred_neg_result_bindings: HashSet::new(),
+        deferred_bitnot_result_bindings: HashSet::new(),
         pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
         errors: Vec::new(),
@@ -358,6 +360,7 @@ struct FnCtxt<'a, 'hir> {
     direct_unannotated_float_literals: HashSet<BindingId>,
     unannotated_float_literal_aliases: HashSet<BindingId>,
     deferred_neg_result_bindings: HashSet<BindingId>,
+    deferred_bitnot_result_bindings: HashSet<BindingId>,
     pending_operator_trait_count: usize,
     literal_variables: Vec<LiteralVariable<'hir>>,
     errors: Vec<PrimitiveBodyError>,
@@ -550,6 +553,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
         let errors_before_initializer = self.errors.len();
         let mut initializer_is_deferred_neg_result = false;
+        let mut initializer_is_deferred_bitnot_result = false;
         let local_type = if self.expression_has_unknown_field_error(init) {
             self.check_error_tainted_expression(init)?;
             if let Some(id) = self.error_tainted_literal_variable(init) {
@@ -749,7 +753,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             _ => return Err(()),
                         }
                     } else {
-                        let local_type = self.check_bitwise_not_path(operand, init.hir_id)?;
+                        let (local_type, is_deferred_bitnot_result) =
+                            self.check_local_initializer_bitwise_not_path(operand, init.hir_id)?;
+                        initializer_is_deferred_bitnot_result = is_deferred_bitnot_result;
                         if let Some(expected) = annotation {
                             self.check_annotated_path(local_type, expected, init.hir_id)?;
                             LocalType::Concrete(expected)
@@ -764,6 +770,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
         if initializer_is_deferred_neg_result {
             self.deferred_neg_result_bindings.insert(binding);
+        }
+        if initializer_is_deferred_bitnot_result {
+            self.deferred_bitnot_result_bindings.insert(binding);
         }
 
         if annotation.is_none()
@@ -1014,6 +1023,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if let Some(source_binding) = self.plain_local_path_binding(init) {
             if self.deferred_neg_result_bindings.contains(&source_binding) {
                 self.deferred_neg_result_bindings.insert(binding);
+            }
+            if self
+                .deferred_bitnot_result_bindings
+                .contains(&source_binding)
+            {
+                self.deferred_bitnot_result_bindings.insert(binding);
             }
 
             let source_has_resolved_computed_literal_provenance = self
@@ -2667,6 +2682,50 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 node: expression,
                 kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
                     operator: UnOp::Neg,
+                    operand: operand_type,
+                },
+            });
+        }
+        Ok((LocalType::Concrete(operand_type), false))
+    }
+
+    fn check_local_initializer_bitwise_not_path(
+        &mut self,
+        operand: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<(LocalType, bool), ()> {
+        let source_type = self.check_local_path(operand)?;
+        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+        if self
+            .deferred_bitnot_result_bindings
+            .contains(&source_binding)
+        {
+            return Err(());
+        }
+        if let LocalType::LiteralVariable(id) = source_type {
+            let eligible_literal_path = self.is_eligible_unannotated_literal_path(operand);
+            if eligible_literal_path
+                && self.literal_variables.get(id).is_some_and(|variable| {
+                    variable.kind == PrimitiveLiteralKind::Integer && variable.resolved.is_none()
+                })
+            {
+                // An unresolved integer literal can resolve only to one of
+                // the integer primitives, and every such primitive
+                // implements BitNot. Share its variable with the result
+                // without reserving a deferred diagnostic slot.
+                return Ok((source_type, true));
+            }
+        }
+
+        let operand_type = self
+            .concrete_local_type(source_type)
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+        if !is_bitwise_primitive(operand_type) {
+            self.errors.push(PrimitiveBodyError {
+                node: expression,
+                kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                    operator: UnOp::BitNot,
                     operand: operand_type,
                 },
             });

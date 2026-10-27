@@ -49476,6 +49476,574 @@ property "shared"() {}
     }
 
     #[test]
+    fn primitive_body_type_results_defer_bitwise_not_of_flat_integer_literals() {
+        use sai_resolve::package_scopes::{PathRes, Res};
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub fn default_integer() -> I64 {\n",
+            "    let source = 7\n",
+            "    let result = ~source\n",
+            "    result\n",
+            "}\n",
+            "pub fn annotated_alias() -> I32 {\n",
+            "    let source = 7\n",
+            "    let copy = source\n",
+            "    let result: I32 = ~copy\n",
+            "    result\n",
+            "}\n",
+            "pub fn tail_inferred_alias() -> I16 {\n",
+            "    let source = 7\n",
+            "    let copy = source\n",
+            "    let result = ~copy\n",
+            "    result\n",
+            "}\n",
+            "pub fn tail_inferred_unsigned() -> U8 {\n",
+            "    let source = 7\n",
+            "    let result = ~source\n",
+            "    result\n",
+            "}\n",
+            "pub fn deferred_bitnot_diagnostic_order() -> Bool {\n",
+            "    let source = 1\n",
+            "    let successful = ~source\n",
+            "    let failed_trait = 'a' & source\n",
+            "    let bool_value = true\n",
+            "    let failed_bitnot = ~bool_value\n",
+            "    let done = false\n",
+            "    done\n",
+            "}\n",
+            "pub fn concrete_integer_path(value: I32) -> I32 {\n",
+            "    let result = ~value\n",
+            "    result\n",
+            "}\n",
+            "pub fn concrete_byte_path(value: Byte) -> Byte {\n",
+            "    let result = ~value\n",
+            "    result\n",
+            "}\n",
+            "pub fn positive_i64_boundary() -> I64 {\n",
+            "    let source = 9223372036854775808\n",
+            "    let result = ~source\n",
+            "    result\n",
+            "}\n",
+            "pub fn bitnot_result_not_a_source() -> I32 {\n",
+            "    let source = 1\n",
+            "    let result = ~source\n",
+            "    let second = ~result\n",
+            "    second\n",
+            "}\n",
+            "pub fn bitnot_result_alias_not_a_source() -> I32 {\n",
+            "    let source = 1\n",
+            "    let first = ~source\n",
+            "    let copy = first\n",
+            "    let constrain: I32 = source\n",
+            "    let second = ~copy\n",
+            "    second\n",
+            "}\n",
+            "pub fn float_literal_source() -> I32 {\n",
+            "    let source = 1.5\n",
+            "    let result = ~source\n",
+            "    0\n",
+            "}\n",
+            "pub fn computed_literal_source() -> I32 {\n",
+            "    let source = 1 + 2\n",
+            "    let result = ~source\n",
+            "    0\n",
+            "}\n",
+            "pub fn direct_call_operand() -> I32 {\n",
+            "    let result = ~identity_i32(1)\n",
+            "    result\n",
+            "}\n",
+            "pub fn compound_operand(source: I32) -> I32 {\n",
+            "    let result = ~(source + 1)\n",
+            "    result\n",
+            "}\n",
+            "pub fn mutable_source() -> I32 {\n",
+            "    var source = 1\n",
+            "    let result = ~source\n",
+            "    result\n",
+            "}\n",
+            "const GLOBAL: I32 = 1\n",
+            "pub fn global_source() -> I32 {\n",
+            "    let result = ~GLOBAL\n",
+            "    result\n",
+            "}\n",
+            "pub fn forward_source() -> I32 {\n",
+            "    let result = ~source\n",
+            "    let source = 1\n",
+            "    result\n",
+            "}\n",
+            "pub fn deep_nested_source() -> I32 {\n",
+            "    let source = 1\n",
+            "    let result = {\n",
+            "        let copy = source\n",
+            "        ~copy\n",
+            "    }\n",
+            "    result\n",
+            "}\n",
+            "fn identity_i32(value: I32) -> I32 { value }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{name}` is present"))
+        }
+        fn binding_named(
+            database: &RootDatabase,
+            owner: &FunctionOwnerResolution,
+            name: &str,
+        ) -> Vec<sai_hir::BindingId> {
+            owner
+                .local_resolution()
+                .expect("local results belong to this owner")
+                .expect("owner locals were resolved")
+                .bindings
+                .iter()
+                .filter_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved| resolved.as_ref() == name)
+                            .map(|_| *binding)
+                    })
+                })
+                .collect::<Vec<_>>()
+        }
+        fn assert_supported<'a>(
+            database: &RootDatabase,
+            owner: &'a FunctionOwnerResolution,
+            name: &str,
+            expected: PrimTy,
+            expected_diagnostic_messages: &[&str],
+            locals: &[&str],
+        ) -> &'a sai_ty::typeck::body::PrimitiveBodyTypeResults {
+            let FunctionBodyTypeCheck::Supported { diagnostics } =
+                owner.body_type_check().expect("body check is available")
+            else {
+                panic!("function `{name}` remains in the flat-body checker slice");
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>(),
+                expected_diagnostic_messages,
+                "diagnostics for `{name}`: {diagnostics:?}"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("supported owner has no projection error")
+                .expect("supported owner publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+            for local in locals {
+                let bindings = binding_named(database, owner, local);
+                let [binding] = bindings.as_slice() else {
+                    panic!("{name}: exactly one `{local}` binding exists");
+                };
+                assert_eq!(
+                    results.binding_type(*binding),
+                    Some(expected),
+                    "{name}/{local}"
+                );
+            }
+            results
+        }
+
+        let diagnostic_order_owner =
+            owner_named(&database, &resolved, "deferred_bitnot_diagnostic_order");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: ordered_diagnostics,
+        } = diagnostic_order_owner
+            .body_type_check()
+            .expect("diagnostic-order body check is available")
+        else {
+            panic!("diagnostic ordering remains within the supported body slice");
+        };
+        assert_eq!(
+            ordered_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+                "operator `~` has no `BitNot` implementation for `Bool`",
+            ],
+            "the deferred Char trait diagnostic precedes the later immediate Bool BitNot diagnostic"
+        );
+
+        let diagnostic_order_descriptor = *collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.owner == diagnostic_order_owner.owner())
+            .expect("diagnostic-order function has a top-level descriptor");
+        let diagnostic_order_inputs = database
+            .current_owner_inputs(
+                &snapshot,
+                diagnostic_order_descriptor.file,
+                &collection.target_cfg,
+            )
+            .expect("diagnostic-order owner inputs are current");
+        let diagnostic_order_def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&diagnostic_order_owner.owner().def_id.package())
+                .expect("diagnostic-order package has a definition-path interner"),
+        );
+        let diagnostic_order_arena = HirArena::new();
+        let diagnostic_order_lowering_context = HirLoweringContext::new(
+            &diagnostic_order_inputs.ast_ids,
+            &snapshot,
+            &diagnostic_order_inputs.root,
+            &diagnostic_order_arena,
+            &database.symbols,
+            &diagnostic_order_def_paths,
+        );
+        let (diagnostic_order_hir_owner, _) = lower_top_level_owner(
+            diagnostic_order_descriptor,
+            &diagnostic_order_def_paths
+                .resolve_def_id(diagnostic_order_owner.owner().def_id.to_def_id())
+                .expect("diagnostic-order owner path resolves")
+                .expect("diagnostic-order owner path exists"),
+            &diagnostic_order_inputs.filtered_item_tree,
+            &diagnostic_order_inputs.retained_item_kinds,
+            &diagnostic_order_lowering_context,
+        )
+        .expect("diagnostic-order function lowers");
+        let diagnostic_order_body = diagnostic_order_hir_owner
+            .body
+            .expect("diagnostic-order function has a body");
+        let diagnostic_order_local_resolution = diagnostic_order_owner
+            .local_resolution()
+            .expect("diagnostic-order local resolution belongs to the owner")
+            .expect("diagnostic-order function has local resolution");
+        let diagnostic_order_local_paths = diagnostic_order_local_resolution
+            .paths
+            .iter()
+            .filter_map(|(hir_id, resolution)| match resolution.base {
+                Res::Local(binding)
+                    if resolution.resolved_segments == 1 && resolution.segment_count == 1 =>
+                {
+                    Some((*hir_id, binding))
+                }
+                _ => None,
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let diagnostic_order_check = sai_ty::typeck::body::check_primitive_local_block_body(
+            sai_ty::typeck::body::PrimitiveBodyInput {
+                body: diagnostic_order_body,
+                return_type: PrimTy::Bool,
+                initial_bindings: &std::collections::HashMap::new(),
+                primitive_types: &std::collections::HashMap::new(),
+                self_field_projections: None,
+                unknown_self_fields: None,
+                local_paths: &diagnostic_order_local_paths,
+                call_signatures: None,
+                symbols: &database.symbols,
+                pointer_width: target_cfg.pointer_width(),
+            },
+        );
+        let sai_ty::typeck::body::PrimitiveBodyCheck::Supported {
+            errors: diagnostic_order_errors,
+            ..
+        } = diagnostic_order_check
+        else {
+            panic!("diagnostic-order fixture is accepted by the primitive body checker");
+        };
+        assert_eq!(
+            diagnostic_order_errors
+                .iter()
+                .map(|error| error.kind)
+                .collect::<Vec<_>>(),
+            [
+                sai_ty::typeck::body::PrimitiveBodyErrorKind::DeferredOperatorTraitNotSupported {
+                    operator: sai_hir::expressions::BinOp::BitAnd,
+                    left: PrimTy::Char,
+                    right: PrimTy::I64,
+                },
+                sai_ty::typeck::body::PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                    operator: sai_hir::expressions::UnOp::BitNot,
+                    operand: PrimTy::Bool,
+                },
+            ],
+            "body-checker errors retain source order when a successful integer BitNot precedes both errors"
+        );
+
+        let default_owner = owner_named(&database, &resolved, "default_integer");
+        assert_supported(
+            &database,
+            default_owner,
+            "default_integer",
+            PrimTy::I64,
+            &[],
+            &["source", "result"],
+        );
+        let annotated_owner = owner_named(&database, &resolved, "annotated_alias");
+        assert_supported(
+            &database,
+            annotated_owner,
+            "annotated_alias",
+            PrimTy::I32,
+            &[],
+            &["source", "copy", "result"],
+        );
+        let tail_owner = owner_named(&database, &resolved, "tail_inferred_alias");
+        let tail_results = assert_supported(
+            &database,
+            tail_owner,
+            "tail_inferred_alias",
+            PrimTy::I16,
+            &[],
+            &["source", "copy", "result"],
+        );
+        assert_supported(
+            &database,
+            owner_named(&database, &resolved, "concrete_integer_path"),
+            "concrete_integer_path",
+            PrimTy::I32,
+            &[],
+            &["value", "result"],
+        );
+        assert_supported(
+            &database,
+            owner_named(&database, &resolved, "tail_inferred_unsigned"),
+            "tail_inferred_unsigned",
+            PrimTy::U8,
+            &[],
+            &["source", "result"],
+        );
+        assert_supported(
+            &database,
+            owner_named(&database, &resolved, "concrete_byte_path"),
+            "concrete_byte_path",
+            PrimTy::Byte,
+            &[],
+            &["value", "result"],
+        );
+        assert!(
+            tail_results.expression_types().len() >= 5,
+            "the direct source literal, alias, BitNot operand and result, and tail retain facts"
+        );
+        let descriptor = *collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.owner == tail_owner.owner())
+            .expect("the tail-inferred function has a top-level descriptor");
+        let owner_inputs = database
+            .current_owner_inputs(&snapshot, descriptor.file, &collection.target_cfg)
+            .expect("tail-inferred owner inputs are current");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&tail_owner.owner().def_id.package())
+                .expect("the tail-inferred owner package has a definition-path interner"),
+        );
+        let arena = HirArena::new();
+        let lowering_context = HirLoweringContext::new(
+            &owner_inputs.ast_ids,
+            &snapshot,
+            &owner_inputs.root,
+            &arena,
+            &database.symbols,
+            &def_paths,
+        );
+        let (hir_owner, source_map) = lower_top_level_owner(
+            descriptor,
+            &def_paths
+                .resolve_def_id(tail_owner.owner().def_id.to_def_id())
+                .expect("tail-inferred owner path resolves")
+                .expect("tail-inferred owner path exists"),
+            &owner_inputs.filtered_item_tree,
+            &owner_inputs.retained_item_kinds,
+            &lowering_context,
+        )
+        .expect("tail-inferred owner lowers");
+        assert_eq!(hir_owner.id, tail_owner.owner());
+        let tail_function_start = root
+            .find("pub fn tail_inferred_alias")
+            .expect("the tail-inferred function exists");
+        let unary_start = root[tail_function_start..]
+            .find("~copy")
+            .map(|offset| tail_function_start + offset)
+            .expect("the tail-inferred BitNot initializer exists");
+        let ids_at_range = |start: usize, len: usize| {
+            let range = sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(start as u32),
+                sai_diagnostics::TextSize::new((start + len) as u32),
+            )
+            .expect("the expression span is ordered");
+            source_map
+                .node_to_syntax()
+                .iter_enumerated()
+                .filter_map(|(local_id, pointer)| {
+                    (pointer.text_range() == range).then_some(sai_hir::HirId {
+                        owner: tail_owner.owner(),
+                        local_id,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let unary_ids = ids_at_range(unary_start, "~copy".len());
+        let [unary_id] = unary_ids.as_slice() else {
+            panic!("the tail-inferred unary expression has one exact HIR node");
+        };
+        let operand_ids = ids_at_range(unary_start + 1, "copy".len());
+        assert!(
+            !operand_ids.is_empty(),
+            "the BitNot source path has exact HIR node(s)"
+        );
+        assert_eq!(
+            tail_results.expression_type(*unary_id),
+            Some(PrimTy::I16),
+            "the deferred BitNot result retains its function-tail-constrained fact"
+        );
+        let local_paths = tail_owner
+            .local_resolution()
+            .expect("tail-inferred locals are available")
+            .expect("tail-inferred owner has locals");
+        let copy_bindings = binding_named(&database, tail_owner, "copy");
+        let [copy_binding] = copy_bindings.as_slice() else {
+            panic!("the simple integer literal alias has one exact BindingId");
+        };
+        assert!(
+            operand_ids.iter().any(|operand_id| {
+                matches!(
+                    local_paths.paths.get(operand_id),
+                    Some(PathRes {
+                        base: Res::Local(binding),
+                        resolved_segments: 1,
+                        segment_count: 1,
+                    }) if binding == copy_binding
+                )
+            }),
+            "the exact BitNot source path keeps its simple-alias BindingId"
+        );
+        assert_eq!(
+            operand_ids
+                .iter()
+                .filter(|operand_id| tail_results.expression_type(**operand_id) == Some(PrimTy::I16))
+                .count(),
+            1,
+            "the exact source span retains one function-tail-constrained expression fact"
+        );
+        let boundary_owner = owner_named(&database, &resolved, "positive_i64_boundary");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: boundary_diagnostics,
+        } = boundary_owner
+            .body_type_check()
+            .expect("boundary body check is available")
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            boundary_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["integer literal is out of range for `I64`"]
+        );
+        let boundary_results = boundary_owner
+            .primitive_body_type_results()
+            .expect("boundary results are available")
+            .expect("boundary body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, boundary_results);
+        let boundary_literal_start = root
+            .find("let source = 9223372036854775808")
+            .expect("the source integer literal exists")
+            + "let source = ".len();
+        assert_eq!(
+            boundary_diagnostics[0]
+                .primary()
+                .expect("the literal range diagnostic has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(boundary_literal_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (boundary_literal_start + "9223372036854775808".len()) as u32
+                ),
+            )
+            .expect("the source literal span is ordered")
+        );
+
+        for name in [
+            "bitnot_result_not_a_source",
+            "bitnot_result_alias_not_a_source",
+            "float_literal_source",
+            "computed_literal_source",
+            "direct_call_operand",
+            "compound_operand",
+            "mutable_source",
+            "global_source",
+            "forward_source",
+            "deep_nested_source",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner.body_type_check().expect("body check is available"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "excluded shape `{name}` remains behind the body checker gate"
+            );
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("owner projection query succeeds")
+                    .is_none(),
+                "excluded shape `{name}` remains outside the primitive local checker"
+            );
+        }
+
+        assert!(
+            tail_results
+                .expression_types()
+                .values()
+                .all(|ty| *ty == PrimTy::I16),
+            "all tail-inferred initializer, path, unary, and tail facts share the inferred type"
+        );
+    }
+
+    #[test]
     fn primitive_body_type_results_include_exact_direct_function_calls() {
         use sai_resolve::prelude::PrimTy;
 
