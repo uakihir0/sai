@@ -1,0 +1,75 @@
+pub const MAX_CELLS: USize = 18
+pub const MAX_GRAPH_CELLS: USize = MAX_CELLS * MAX_CELLS
+
+pub type CellId = U32
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum FormulaOperator {
+    Add
+    Subtract
+    Multiply
+    Divide
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Formula {
+    pub left: CellId
+    pub operator: FormulaOperator
+    pub right: CellId
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CellExpression {
+    Literal(U32)
+    Formula(Formula)
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Cell {
+    pub id: CellId
+    pub label: Str
+    pub expression: CellExpression
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Workbook {
+    pub cells: Array<Option<Cell>, MAX_CELLS>
+    pub cell_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum WorkbookError {
+    TooManyCells(USize)
+    MissingCell(USize)
+    DuplicateCellId(CellId)
+    UnexpectedTrailingCell(USize)
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CellStatus {
+    Unused
+    Pending
+    Ready
+    MissingReference
+    Cycle
+    BlockedByCycle
+    ArithmeticRangeError
+    DivisionByZero
+    BlockedByError
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CellResult {
+    pub id: CellId
+    pub label: Str
+    pub status: CellStatus
+    pub value: Option<U32>
+    pub blocked_by: Option<CellId>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RecalcReport {
+    pub cells: Array<Option<CellResult>, MAX_CELLS>
+    pub formula_order: Array<Option<CellId>, MAX_CELLS>
+    pub formula_count: USize
+}
