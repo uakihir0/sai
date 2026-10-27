@@ -124,6 +124,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`robust-statistics-lab`](robust-statistics-lab/README.md) | Summarize fixed sensor batches with median and median absolute deviation, bounded arithmetic, and an explicit zero-MAD outlier policy. |
 | Advanced | [`bounded-bytecode-verifier`](bounded-bytecode-verifier/README.md) | Verify typed operand stacks across bounded control flow, including branch targets, stack-shape and value-kind joins, and return paths. |
 | Advanced | [`cluster-capacity-planner`](cluster-capacity-planner/README.md) | Place fixed service replicas across node pools under CPU and memory headroom, safety reserves, deterministic priority, best fit, and failure-zone spread rules. |
+| Advanced | [`workbook-recalculator`](workbook-recalculator/README.md) | Recalculate a fixed workbook with dependency passes, cycle detection, stable formula order, and local error propagation. |
 
 ## Longer walkthroughs
 
@@ -155,6 +156,9 @@ source repository before a package resolver can fetch them.
 - [`robust-statistics-lab`](robust-statistics-lab/README.md)
   compares median/MAD summaries with an explicit threshold and zero-MAD policy
   for a small fixed sensor dataset.
+- [`workbook-recalculator`](workbook-recalculator/README.md)
+  evaluates bounded formula dependencies, detects cycles, and reports errors
+  without blocking unrelated cells.
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
