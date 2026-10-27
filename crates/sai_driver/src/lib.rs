@@ -8718,6 +8718,18 @@ fn check_function_body_primitive_local_block(
                     return Ok(None);
                 }
             }
+            ExprKind::Unary(UnOp::Neg, operand) => {
+                let ExprKind::Path(path) = operand.kind else {
+                    return Ok(None);
+                };
+                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
+                else {
+                    return Ok(None);
+                };
+                if !preceding_bindings.contains(&source_binding) {
+                    return Ok(None);
+                }
+            }
             ExprKind::Unary(UnOp::BitNot, operand) => {
                 if !is_direct_function_integer_literal(operand)
                     && !matches!(operand.kind, ExprKind::Lit(Lit::Byte(_)))
@@ -49289,7 +49301,7 @@ property "shared"() {}
             "    apply_i32(-copy)\n",
             "}\n",
             "pub fn direct_neg_global_path_unsupported() -> I32 { apply_i32(-SHIFT_COUNT) }\n",
-            "pub fn direct_neg_local_initializer_unsupported(value: I32) -> I32 {\n",
+            "pub fn direct_neg_local_initializer(value: I32) -> I32 {\n",
             "    let negative = -value\n",
             "    apply_i32(negative)\n",
             "}\n",
@@ -51455,6 +51467,8 @@ property "shared"() {}
             "direct_neg_folded_literal_remains_supported",
             &[],
         );
+        let direct_neg_local_initializer =
+            assert_supported(&database, "direct_neg_local_initializer", &[]);
         let shift_i8_call_argument = assert_supported(&database, "shift_i8_call_argument", &[]);
         let shift_i16_call_argument = assert_supported(&database, "shift_i16_call_argument", &[]);
         let shift_i32_call_argument = assert_supported(&database, "shift_i32_call_argument", &[]);
@@ -52014,7 +52028,6 @@ property "shared"() {}
             "direct_neg_forward_path_unsupported",
             "direct_neg_unresolved_numeric_local_unsupported",
             "direct_neg_global_path_unsupported",
-            "direct_neg_local_initializer_unsupported",
             "direct_neg_deep_nested_call_unsupported",
             "direct_neg_generic_target_unsupported",
             "direct_neg_unsupported_signature_unsupported",
@@ -60539,6 +60552,42 @@ property "shared"() {}
         assert_eq!(
             expression_type_at_range(
                 &mut database,
+                direct_neg_local_initializer,
+                "pub fn direct_neg_local_initializer",
+                "let negative = -value",
+                "let negative = ".len(),
+                "-value".len(),
+            ),
+            Some(PrimTy::I32),
+            "a flat local negation keeps its exact unary expression type"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                direct_neg_local_initializer,
+                "pub fn direct_neg_local_initializer",
+                "let negative = -value",
+                "let negative = -".len(),
+                "value".len(),
+            ),
+            Some(PrimTy::I32),
+            "a flat local negation retains its source path type"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                direct_neg_local_initializer,
+                "pub fn direct_neg_local_initializer",
+                "apply_i32(negative)",
+                0,
+                "apply_i32(negative)".len(),
+            ),
+            Some(PrimTy::I32),
+            "a local negation result flows into an existing direct call"
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
                 direct_neg_folded_literal_remains_supported,
                 "pub fn direct_neg_folded_literal_remains_supported",
                 "apply_i32(-1)",
@@ -65103,6 +65152,505 @@ property "shared"() {}
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {:?} (index {index}) unexpectedly failed the supported body slice: {check:?}",
                 owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_supports_flat_local_negation_of_resolved_paths() {
+        use sai_resolve::owner::BindingKind;
+        use sai_resolve::package_scopes::Res;
+        use sai_resolve::prelude::PrimTy;
+
+        fn results(
+            owner: &FunctionOwnerResolution,
+        ) -> &sai_ty::typeck::body::PrimitiveBodyTypeResults {
+            owner
+                .primitive_body_type_results()
+                .expect("owner primitive body results have no resolution error")
+                .expect("supported body owner keeps a partial projection")
+        }
+
+        fn diagnostics(owner: &FunctionOwnerResolution) -> &[Diagnostic] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("owner body type check has no resolution error")
+            else {
+                panic!("expected supported primitive local body");
+            };
+            diagnostics
+        }
+
+        fn local_resolution(owner: &FunctionOwnerResolution) -> &LocalResolution {
+            owner
+                .local_resolution()
+                .expect("owner local resolution has no error")
+                .expect("owner local resolution exists")
+        }
+
+        let supported = [
+            ("I8", "i8", PrimTy::I8),
+            ("I16", "i16", PrimTy::I16),
+            ("I32", "i32", PrimTy::I32),
+            ("I64", "i64", PrimTy::I64),
+            ("ISize", "isize", PrimTy::ISize),
+            ("F32", "f32", PrimTy::F32),
+            ("F64", "f64", PrimTy::F64),
+        ];
+        let unsupported = [
+            ("U8", "u8", PrimTy::U8),
+            ("U16", "u16", PrimTy::U16),
+            ("U32", "u32", PrimTy::U32),
+            ("U64", "u64", PrimTy::U64),
+            ("USize", "usize", PrimTy::USize),
+            ("Byte", "byte", PrimTy::Byte),
+            ("Char", "char", PrimTy::Char),
+            ("Bool", "bool", PrimTy::Bool),
+        ];
+        let mut root = String::from("const GLOBAL: I32 = 1\n");
+        for (primitive, name, _) in supported {
+            root.push_str(&format!(
+                "pub fn supported_{name}(value: {primitive}) -> {primitive} {{\n    let result = -value\n    result\n}}\n"
+            ));
+        }
+        for (primitive, name, _) in unsupported {
+            root.push_str(&format!(
+                "pub fn unsupported_{name}(value: {primitive}) -> {primitive} {{\n    let result = -value\n    let alias = result\n    let valid = value\n    valid\n}}\n"
+            ));
+        }
+        root.push_str(concat!(
+            "pub fn local_source(value: I32) -> I32 {\n",
+            "    let copy = value\n",
+            "    let result = -copy\n",
+            "    result\n",
+            "}\n",
+            "pub fn shadowed_source(value: I64) -> I16 {\n",
+            "    let value: I16 = 7\n",
+            "    let result = -value\n",
+            "    result\n",
+            "}\n",
+            "pub fn annotated_mismatch(value: I32) -> I32 {\n",
+            "    let result: F64 = -value\n",
+            "    let inferred = result\n",
+            "    let valid = value\n",
+            "    valid\n",
+            "}\n",
+            "pub fn annotated_unsupported(value: U32) -> I32 {\n",
+            "    let result: I32 = -value\n",
+            "    let valid: I32 = 1\n",
+            "    valid\n",
+            "}\n",
+            "pub fn folded_negative_literal() -> I8 {\n",
+            "    let result: I8 = -128\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_computed(value: I32) -> I32 {\n",
+            "    let result = -(value + 1)\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_call(value: I32) -> I32 {\n",
+            "    let result = -identity(value)\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_double(value: I32) -> I32 {\n",
+            "    let result = - -value\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_global() -> I32 {\n",
+            "    let result = -GLOBAL\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_self(value: I32) -> I32 {\n",
+            "    let result = -result\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_forward(value: I32) -> I32 {\n",
+            "    let result = -later\n",
+            "    let later: I32 = value\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_unresolved_integer_local() -> I64 {\n",
+            "    let source = 1\n",
+            "    let result = -source\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_unresolved_float_local() -> F64 {\n",
+            "    let source = 1.0\n",
+            "    let result = -source\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_unresolved() -> I32 {\n",
+            "    let result = -missing\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_nested_block(value: I32) -> I32 {\n",
+            "    let result = { let copy = -value; copy }\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_mutable_source(value: I32) -> I32 {\n",
+            "    var source: I32 = value\n",
+            "    let result = -source\n",
+            "    result\n",
+            "}\n",
+            "pub fn excluded_mutable_parameter(var value: I32) -> I32 {\n",
+            "    let result = -value\n",
+            "    result\n",
+            "}\n",
+            "pub fn identity(value: I32) -> I32 { value }\n",
+        ));
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        let def_paths = database
+            .def_paths
+            .get(&collection.module_tree.package)
+            .expect("local definition paths exist");
+        let mut owners_by_name = HashMap::new();
+        for descriptor in &collection.scopes.function_owners {
+            let Some(name) = def_paths
+                .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                .ok()
+                .flatten()
+                .and_then(|path| path.data().last().cloned())
+                .and_then(|component| match component.data {
+                    DefPathData::ValueNs(symbol) => database
+                        .symbols
+                        .resolve(symbol)
+                        .ok()
+                        .map(|name| name.to_string()),
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            let owner = resolved
+                .owners()
+                .iter()
+                .find(|owner| owner.owner() == descriptor.owner)
+                .expect("each function descriptor has a resolved owner");
+            owners_by_name.insert(name, owner);
+        }
+        let owner_named = |name: &str| {
+            *owners_by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("function `{name}` has a resolved owner"))
+        };
+        let binding_named = |owner: &FunctionOwnerResolution, name: &str, kind: BindingKind| {
+            local_resolution(owner)
+                .bindings
+                .iter()
+                .find_map(|(binding, local)| {
+                    (local.kind == kind
+                        && local.name.is_some_and(|symbol| {
+                            database
+                                .symbols
+                                .resolve(symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        }))
+                    .then_some(*binding)
+                })
+                .unwrap_or_else(|| panic!("{kind:?} binding `{name}` exists"))
+        };
+        let assert_span = |diagnostic: &Diagnostic, function: &str, expression: &str| {
+            let function_start = root
+                .find(&format!("pub fn {function}"))
+                .unwrap_or_else(|| panic!("function `{function}` exists"));
+            let expression_start = function_start
+                + root[function_start..]
+                    .find(expression)
+                    .unwrap_or_else(|| panic!("expression `{expression}` exists in `{function}`"));
+            let expected = sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(expression_start as u32),
+                sai_diagnostics::TextSize::new((expression_start + expression.len()) as u32),
+            )
+            .expect("source expression range is ordered");
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("diagnostic has a primary source span")
+                    .span
+                    .range,
+                expected,
+                "diagnostic for `{function}` spans `{expression}`"
+            );
+        };
+
+        assert_eq!(resolved.owners().len(), 7 + 8 + 2 + 2 + 1 + 12 + 1);
+        for (primitive, name, expected) in supported {
+            let owner = owner_named(&format!("supported_{name}"));
+            assert!(
+                diagnostics(owner).is_empty(),
+                "supported Neg primitive {primitive} has no diagnostics"
+            );
+            let binding = binding_named(owner, "result", BindingKind::Let);
+            assert_eq!(
+                results(owner).binding_type(binding),
+                Some(expected),
+                "flat local negation retains the exact {primitive} result type"
+            );
+            let locals = local_resolution(owner);
+            assert!(
+                results(owner).expression_types().len() == locals.paths.len() + 1,
+                "supported {primitive} unary initializer publishes its expression fact"
+            );
+            assert_primitive_type_result_parity(&database, results(owner));
+        }
+
+        for (primitive, name, expected_operand) in unsupported {
+            let function = format!("unsupported_{name}");
+            let owner = owner_named(&function);
+            let diagnostics = diagnostics(owner);
+            assert_eq!(diagnostics.len(), 1, "{function} has one Neg diagnostic");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::OperatorNotSupported,
+                "{function} reports the existing unsupported-operator code"
+            );
+            assert_eq!(
+                diagnostics[0].message,
+                format!("operator `-` has no `Neg` implementation for `{primitive}`"),
+                "{function} reports the existing Neg diagnostic"
+            );
+            assert_span(&diagnostics[0], &function, "-value");
+            let local_resolution = local_resolution(owner);
+            let source = binding_named(owner, "value", BindingKind::Param);
+            let operand_path_count = local_resolution
+                .paths
+                .values()
+                .filter(|resolution| {
+                    matches!(resolution.base, Res::Local(binding) if binding == source)
+                })
+                .count();
+            let expression_types = results(owner).expression_types();
+            assert!(
+                operand_path_count == 2
+                    && expression_types.len() == local_resolution.paths.len() - 1
+                    && expression_types
+                        .values()
+                        .all(|primitive| *primitive == expected_operand),
+                "{function} retains its operand and sibling path facts while suppressing the alias and unary result"
+            );
+            for local in ["result", "alias"] {
+                assert_eq!(
+                    results(owner).binding_type(binding_named(owner, local, BindingKind::Let)),
+                    None,
+                    "{function} does not publish tainted `{local}`"
+                );
+            }
+            assert_eq!(
+                results(owner).binding_type(binding_named(owner, "valid", BindingKind::Let)),
+                Some(expected_operand),
+                "{function} recovers an independent valid sibling"
+            );
+            assert_primitive_type_result_parity(&database, results(owner));
+        }
+
+        let local_source = owner_named("local_source");
+        let local_copy = binding_named(local_source, "copy", BindingKind::Let);
+        let local_result = binding_named(local_source, "result", BindingKind::Let);
+        assert_eq!(
+            results(local_source).binding_type(local_result),
+            Some(PrimTy::I32)
+        );
+        let local_paths = &local_resolution(local_source).paths;
+        assert_eq!(
+            local_paths
+                .values()
+                .filter(|resolution| {
+                    matches!(resolution.base, Res::Local(binding) if binding == local_copy)
+                })
+                .count(),
+            1,
+            "the unary operand resolves to the exact preceding copy BindingId"
+        );
+        assert_eq!(
+            results(local_source).expression_types().len(),
+            local_paths.len() + 1,
+            "the local-path operand fact and the unary result fact are retained"
+        );
+
+        let shadowed_source = owner_named("shadowed_source");
+        let shadowed_parameter = binding_named(shadowed_source, "value", BindingKind::Param);
+        let shadowed_local = binding_named(shadowed_source, "value", BindingKind::Let);
+        assert_ne!(shadowed_parameter, shadowed_local);
+        assert_eq!(
+            results(shadowed_source).binding_type(binding_named(
+                shadowed_source,
+                "result",
+                BindingKind::Let
+            )),
+            Some(PrimTy::I16),
+            "the same-name initializer resolves the nearer local binding"
+        );
+        let shadowed_paths = &local_resolution(shadowed_source).paths;
+        assert_eq!(
+            shadowed_paths
+                .iter()
+                .filter(|(_, resolution)| {
+                    matches!(resolution.base, Res::Local(binding) if binding == shadowed_local)
+                })
+                .count(),
+            1,
+            "the unary operand resolves through the shadowing local's BindingId"
+        );
+        assert!(
+            shadowed_paths
+                .values()
+                .all(|resolution| !matches!(resolution.base, Res::Local(binding) if binding == shadowed_parameter)),
+            "no same-name path in this body resolves to the shadowed parameter"
+        );
+
+        let annotated_mismatch = owner_named("annotated_mismatch");
+        let mismatch_diagnostics = diagnostics(annotated_mismatch);
+        assert_eq!(mismatch_diagnostics.len(), 1);
+        assert_eq!(
+            mismatch_diagnostics[0].code,
+            sai_diagnostics::Code::TypeMismatch
+        );
+        assert_eq!(
+            mismatch_diagnostics[0].message,
+            "expected `F64`, found `I32`"
+        );
+        assert_span(&mismatch_diagnostics[0], "annotated_mismatch", "-value");
+        assert_eq!(
+            results(annotated_mismatch).binding_type(binding_named(
+                annotated_mismatch,
+                "result",
+                BindingKind::Let,
+            )),
+            Some(PrimTy::F64),
+            "the explicit annotation remains authoritative after the mismatch"
+        );
+        assert_eq!(
+            results(annotated_mismatch).binding_type(binding_named(
+                annotated_mismatch,
+                "inferred",
+                BindingKind::Let,
+            )),
+            Some(PrimTy::F64),
+            "a path copied from the annotated binding uses its declared type"
+        );
+        assert_eq!(
+            results(annotated_mismatch).binding_type(binding_named(
+                annotated_mismatch,
+                "valid",
+                BindingKind::Let,
+            )),
+            Some(PrimTy::I32)
+        );
+        let mismatch_locals = local_resolution(annotated_mismatch);
+        assert!(
+            results(annotated_mismatch).expression_types().len() == mismatch_locals.paths.len(),
+            "the annotated mismatch suppresses the unary expression fact"
+        );
+        let mismatch_source = binding_named(annotated_mismatch, "value", BindingKind::Param);
+        assert_eq!(
+            mismatch_locals
+                .paths
+                .values()
+                .filter(|resolution| {
+                    matches!(resolution.base, Res::Local(binding) if binding == mismatch_source)
+                })
+                .count(),
+            2,
+            "the unary operand and independent sibling resolve to the parameter BindingId"
+        );
+        assert_eq!(
+            results(annotated_mismatch)
+                .expression_types()
+                .values()
+                .filter(|primitive| **primitive == PrimTy::I32)
+                .count(),
+            3,
+            "the mismatched unary result is tainted while its operand and siblings remain typed"
+        );
+
+        let annotated_unsupported = owner_named("annotated_unsupported");
+        let annotated_diagnostics = diagnostics(annotated_unsupported);
+        assert_eq!(
+            annotated_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::OperatorNotSupported,
+                sai_diagnostics::Code::TypeMismatch,
+            ]
+        );
+        assert_eq!(
+            annotated_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "operator `-` has no `Neg` implementation for `U32`",
+                "expected `I32`, found `U32`",
+            ]
+        );
+        assert_span(&annotated_diagnostics[0], "annotated_unsupported", "-value");
+        assert_span(&annotated_diagnostics[1], "annotated_unsupported", "-value");
+        assert_eq!(
+            results(annotated_unsupported).binding_type(binding_named(
+                annotated_unsupported,
+                "result",
+                BindingKind::Let,
+            )),
+            Some(PrimTy::I32),
+            "the annotation is retained after both the operator and type diagnostics"
+        );
+        assert_eq!(
+            results(annotated_unsupported).binding_type(binding_named(
+                annotated_unsupported,
+                "valid",
+                BindingKind::Let,
+            )),
+            Some(PrimTy::I32)
+        );
+
+        let folded = owner_named("folded_negative_literal");
+        assert!(
+            diagnostics(folded).is_empty(),
+            "a folded negative literal stays on the existing literal path"
+        );
+        assert_eq!(
+            results(folded).binding_type(binding_named(folded, "result", BindingKind::Let)),
+            Some(PrimTy::I8)
+        );
+
+        for name in [
+            "excluded_computed",
+            "excluded_call",
+            "excluded_double",
+            "excluded_global",
+            "excluded_self",
+            "excluded_forward",
+            "excluded_unresolved_integer_local",
+            "excluded_unresolved_float_local",
+            "excluded_unresolved",
+            "excluded_nested_block",
+            "excluded_mutable_source",
+            "excluded_mutable_parameter",
+        ] {
+            assert!(
+                matches!(
+                    owner_named(name)
+                        .body_type_check()
+                        .expect("excluded owner has no body-check resolution error"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "excluded form `{name}` remains outside the body-checker slice"
             );
         }
     }

@@ -19286,6 +19286,44 @@ fn unary_neg_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn unary_neg_path_local_initializers_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "const GLOBAL: I32 = 1\n",
+        "pub fn flat_local(value: I32) -> I32 {\n",
+        "    let result = -value\n",
+        "    result\n",
+        "}\n",
+        "pub fn copied_local(value: F32) -> F32 {\n",
+        "    let copy = value\n",
+        "    let result = -copy\n",
+        "    result\n",
+        "}\n",
+        "pub fn computed(value: I32) -> I32 {\n",
+        "    let result = -(value + 1)\n",
+        "    result\n",
+        "}\n",
+        "pub fn double_negation(value: I32) -> I32 {\n",
+        "    let result = - -value\n",
+        "    result\n",
+        "}\n",
+        "pub fn global_source() -> I32 {\n",
+        "    let result = -GLOBAL\n",
+        "    result\n",
+        "}\n",
+        "pub fn unresolved_numeric_local() -> I64 {\n",
+        "    let source = 1\n",
+        "    let result = -source\n",
+        "    result\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "flat-local unary-neg initializers and excluded forms",
+    );
+}
+
+#[test]
 fn binary_shift_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn left_shift_argument(value: I32, count: U32) -> I32 { identity_i32(value << count) }\n",
