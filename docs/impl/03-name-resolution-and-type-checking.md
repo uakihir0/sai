@@ -3748,6 +3748,38 @@ runtime behavior. These shape, binding, recovery/fact, and stage boundary
 decisions are **Review required**. See spec/06 §§6.8.6 and 6.8.10 and [the
 IR-990 implementation review](../design/implementation-review.md#ir-990-2026-10-27-flat-local-unary-negation-of-resolved-paths).
 
+**IR-991 deferred unary negation of a flat local literal** extends that
+initializer form when `source` is a preceding immutable local whose unresolved
+type comes from a direct integer or floating-point literal, or a simple
+unannotated plain-path alias of one. The unary result shares the source literal
+inference variable, so the existing local annotation and function-tail
+expectation constrain both uses; absent a constraint, integer and float
+variables still default to `I64` and `F64`. The `Neg` primitive check is
+deferred until that variable resolves: signed integers and `F32`/`F64` are
+accepted, while a variable constrained to an unsigned integer reports the
+existing `OPERATOR_NOT_SUPPORTED` diagnostic. Negating a path does not fold or
+rewrite its source literal: a positive `2^63` source therefore still reports
+`LITERAL_OUT_OF_RANGE` when the source defaults to `I64`. Computed/call and
+compound literal origins, mutable/global/self/forward sources, double or nested
+negation, and deeper scopes remain gated. CLI Stage 0 stays unchanged, and no
+lowering or runtime behavior is added. These inference, source-preservation,
+shape, recovery/fact, and stage-boundary decisions are **Review required**. See
+spec/06 §§6.8.6 and 6.8.10 and [the IR-991 implementation review](../design/implementation-review.md#ir-991-2026-10-27-deferred-unary-negation-of-flat-local-literals).
+
+**IR-991 implementation plan.** (1) Add a deferred `Neg` site attached to the
+source literal variable and reuse that variable as the initializer result.
+(2) Permit only the exact earlier immutable plain-path binding already tracked
+as direct or simple-alias integer/float literal provenance; do not propagate
+that provenance to the negated result. (3) Resolve `Neg` after annotations,
+tail constraints, and defaulting, retaining the existing unary diagnostic and
+expression taint behavior for unsupported unsigned types. (4) Add driver
+regressions for defaults, annotation/tail inference, BindingId/provenance,
+exact expression facts, unsigned rejection and sibling recovery, and the
+positive `I64` boundary; add CLI regressions proving these forms remain behind
+Stage 0. (5) Run pinned Rust 1.99.1 focused tests, formatting and diff checks,
+then obtain independent hostile review and address actionable findings before
+committing. The gate does not expand to runtime or lowering.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
