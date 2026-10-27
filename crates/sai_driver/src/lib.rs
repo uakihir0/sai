@@ -49231,10 +49231,10 @@ property "shared"() {}
             "    let valid = apply_i32(~1)\n",
             "    valid\n",
             "}\n",
-            "pub fn bitnot_integer_literal_out_of_range() -> I8 {\n",
-            "    let failed = apply_i8(~128)\n",
+            "pub fn bitnot_negative_integer_literal_out_of_range() -> I8 {\n",
+            "    let failed = apply_i8(~-129)\n",
             "    let alias = failed\n",
-            "    let valid = apply_i8(~1)\n",
+            "    let valid = apply_i8(~-128)\n",
             "    valid\n",
             "}\n",
             "pub fn bitnot_double_operand_unsupported(value: I32) -> I32 { apply(~~value) }\n",
@@ -50125,7 +50125,12 @@ property "shared"() {}
             let suffix = primitive_name.to_ascii_lowercase();
             for (nested, position) in [(false, "root"), (true, "nested")] {
                 let name = format!("direct_bitnot_integer_literal_{suffix}_{position}");
-                let unary_expression = "~1".to_owned();
+                let operand = if primitive == PrimTy::I8 && !nested {
+                    "-128"
+                } else {
+                    "1"
+                };
+                let unary_expression = format!("~{operand}");
                 let inner_call = format!("{callee}({unary_expression})");
                 let call = if nested {
                     format!("{callee}({inner_call})")
@@ -50142,7 +50147,7 @@ property "shared"() {}
                     callee.to_owned(),
                     primitive,
                     unary_expression,
-                    "1".to_owned(),
+                    operand.to_owned(),
                     call,
                     inner_call,
                 ));
@@ -60284,15 +60289,15 @@ property "shared"() {}
                 Some(PrimTy::Byte),
             ),
             (
-                "bitnot_integer_literal_out_of_range",
-                "apply_i8(~128)",
-                "~128",
-                "128",
-                "apply_i8(~1)",
+                "bitnot_negative_integer_literal_out_of_range",
+                "apply_i8(~-129)",
+                "~-129",
+                "-129",
+                "apply_i8(~-128)",
                 PrimTy::I8,
                 sai_diagnostics::Code::LiteralOutOfRange,
                 "integer literal is out of range for `I8`",
-                "128",
+                "-129",
                 None,
             ),
         ] {
