@@ -3826,6 +3826,44 @@ pinned Rust 1.99.1 focused tests, formatting and diff checks, then obtain
 independent hostile review and record its outcome before committing. This is
 type-checking only; no lowering or runtime behavior is added.
 
+**IR-994 deferred unary bitwise-not call arguments from direct integer locals**
+extends only the root or existing one-level nested direct-call argument form
+`callee(~source)`. `source` must be an earlier immutable local whose
+`BindingId` has unresolved direct integer-literal provenance; an alias,
+computed origin, parameter, mutable local, or forward/self reference does not
+qualify. The `BitNot` result reuses the source literal's existing inference
+variable, and the concrete integer parameter of the resolved callee supplies
+its type. This keeps source-literal range checking at the original literal
+span. All ten integer parameter types are covered, including target-width
+`ISize` and `USize`; `Byte` paths keep their existing concrete-type behavior.
+Preserve the exact operand-path resolution, unary-operator fact, call fact,
+diagnostic taint and recovery, and independent sibling facts. A non-integer
+parameter cannot resolve the integer literal and follows the existing literal
+type-mismatch recovery. Do not admit simple literal aliases or widen any
+call-target, signature, argument-prefix, or nesting gates. CLI Stage 0 remains
+closed, and this type-checking slice adds no lowering or runtime behavior.
+These provenance, inference, source-span, recovery, call-shape, and stage
+boundary choices are **Review required**. See spec/06 §§6.3.1, 6.5.1 and
+6.8.6 and spec/16 §16.6.1.
+
+**IR-994 implementation plan.** (1) In the existing direct-call `~path`
+checker, recognize only an unresolved integer `LiteralVariable` attached to
+the exact earlier `BindingId` already recorded as a direct unannotated integer
+literal local. Return that same variable as the operator result so the
+existing concrete call-parameter expectation resolves it; keep the current
+concrete integer/Byte path behavior. (2) Leave simple aliases, computed
+origins and all other unsupported sources gated, with no provenance
+propagation or deferred operator diagnostic site. (3) Add driver coverage for
+all ten integer parameter types, root and one-level nested positions, exact
+binding/operator/call facts, source-literal range spans, incompatible
+non-integer expectations at the `~source` coercion-site span, sibling recovery,
+and alias exclusion. (4) Add a
+CLI regression proving both admitted driver shapes and the excluded alias
+shape remain behind Stage 0. (5) Run the pinned Rust 1.99.1 focused driver and
+CLI tests, formatting and diff checks; obtain independent hostile review,
+address actionable findings, and record the final review before committing.
+This does not expand general call checking or runtime/lowering behavior.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
