@@ -1,0 +1,117 @@
+pub const MAX_JOBS: USize = 10
+pub const MAX_REGIONS: USize = 3
+pub const MAX_SLOTS: USize = 4
+pub const MAX_REPLICAS: USize = 14
+pub const MAX_GRID_CELLS: USize = 12
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PlanIssue {
+    ZeroJobId
+    DuplicateJobId
+    InvalidJobWindow
+    ZeroDemand
+    ZeroDatasetId
+    ZeroRegionId
+    DuplicateRegionId
+    ZeroReplicaDatasetId
+    UnknownReplicaRegion
+    DuplicateReplica
+    UnknownGridRegion
+    InvalidGridSlot
+    DuplicateGridCell
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    NoAllowedRegion
+    DatasetUnavailable
+    DatasetOutsideAllowedRegions
+    DeadlineTooShort
+    GridDataMissing
+    CarbonIntensityUnknown
+    CapacityUnknown
+    CapacityExceeded
+    EmissionsOverflow
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum DecisionState {
+    Scheduled
+    Held
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Job {
+    pub id: U32
+    pub name: Str
+    pub priority: U32
+    // A job uses this many consecutive one-hour slots.
+    pub runtime_slots: USize
+    // Teaching fixture compute units are kW for one-hour slots.
+    pub demand_kw: U32
+    // One-based inclusive final slot; a job ending in slot 4 has deadline 4.
+    pub deadline_slot: USize
+    pub dataset_id: U32
+    // Indexes follow the region catalog's declaration order.
+    pub allowed_regions: Array<Bool, MAX_REGIONS>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Region {
+    pub id: U32
+    pub name: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DatasetReplica {
+    pub dataset_id: U32
+    pub region_id: U32
+    pub ready: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type GridCell {
+    pub region_id: U32
+    // Zero-based slot index into the fixed four-slot horizon.
+    pub slot: USize
+    // None means the grid feed has no verified intensity for this cell.
+    pub carbon_intensity_g_per_kwh: Option<U32>
+    // None means usable capacity is not known for this cell.
+    pub capacity_kw: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Decision {
+    pub job_id: U32
+    pub state: DecisionState
+    pub region_id: Option<U32>
+    pub start_slot: Option<USize>
+    pub runtime_slots: USize
+    // Candidate windows omitted because grid fields were missing or unknown.
+    pub unverified_window_count: USize
+    pub emissions_g_co2e: Option<U32>
+    pub hold_reason: Option<HoldReason>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PlanReport {
+    // Decisions stay in input order; scheduled_order records dispatch order.
+    pub decisions: Array<Option<Decision>, MAX_JOBS>
+    pub scheduled_order: Array<Option<U32>, MAX_JOBS>
+    pub scheduled_count: USize
+    pub held_count: USize
+    pub total_emissions_g_co2e: U32
+    // Flat index is region declaration index * MAX_SLOTS + zero-based slot.
+    pub reserved_kw_by_cell: Array<U32, MAX_GRID_CELLS>
+    pub issue: Option<PlanIssue>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PlanSummary {
+    pub scheduled_count: USize
+    pub held_count: USize
+    pub total_emissions_g_co2e: U32
+    pub unverified_window_count: USize
+    pub uncertainty_hold_count: USize
+    pub capacity_hold_count: USize
+}

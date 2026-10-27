@@ -1,0 +1,180 @@
+use acme:carbon-aware-compute-window-planner/data
+use acme:carbon-aware-compute-window-planner/model as model.{DecisionState, HoldReason, PlanIssue}
+use acme:carbon-aware-compute-window-planner/planner
+use acme:carbon-aware-compute-window-planner/report
+use sai:core/num.{U32_MAX}
+
+pub fn fixture_report() -> model.PlanReport {
+    planner.plan(data.jobs(), data.regions(), data.replicas(), data.grid_cells())
+}
+
+pub fn fixture_summary() -> model.PlanSummary {
+    report.summarize(fixture_report())
+}
+
+test "fixture schedules data-local jobs into low-carbon contiguous windows" {
+    let plan = fixture_report()
+    assert plan.issue == None
+    assert plan.scheduled_count == 6
+    assert plan.held_count == 4
+    assert plan.total_emissions_g_co2e == 2050
+
+    let customer_export = plan.decisions[0].unwrap()
+    assert customer_export.state == DecisionState.Scheduled
+    assert customer_export.region_id == Some(10)
+    assert customer_export.start_slot == Some(1)
+    assert customer_export.emissions_g_co2e == Some(240)
+
+    let release_tests = plan.decisions[1].unwrap()
+    assert release_tests.region_id == Some(20)
+    assert release_tests.start_slot == Some(0)
+    assert release_tests.emissions_g_co2e == Some(100)
+
+    let model_retraining = plan.decisions[2].unwrap()
+    assert model_retraining.region_id == Some(20)
+    assert model_retraining.start_slot == Some(0)
+    assert model_retraining.runtime_slots == 2
+    assert model_retraining.emissions_g_co2e == Some(360)
+
+    let catalog_build = plan.decisions[3].unwrap()
+    assert catalog_build.region_id == Some(30)
+    assert catalog_build.start_slot == Some(3)
+    assert catalog_build.unverified_window_count == 1
+    assert catalog_build.emissions_g_co2e == Some(240)
+
+    let embedding_backfill = plan.decisions[4].unwrap()
+    assert embedding_backfill.region_id == Some(10)
+    assert embedding_backfill.start_slot == Some(1)
+    assert embedding_backfill.runtime_slots == 2
+    assert embedding_backfill.emissions_g_co2e == Some(360)
+
+    let audit_scan = plan.decisions[5].unwrap()
+    assert audit_scan.region_id == Some(30)
+    assert audit_scan.start_slot == Some(2)
+    assert audit_scan.unverified_window_count == 1
+    assert audit_scan.emissions_g_co2e == Some(750)
+
+    assert plan.scheduled_order[0] == Some(201)
+    assert plan.scheduled_order[1] == Some(202)
+    assert plan.scheduled_order[2] == Some(206)
+    assert plan.scheduled_order[3] == Some(203)
+    assert plan.scheduled_order[4] == Some(204)
+    assert plan.scheduled_order[5] == Some(205)
+}
+
+test "holds distinguish prohibited locality, missing data, deadlines, capacity, and uncertainty" {
+    let plan = fixture_report()
+    assert plan.decisions[6].unwrap().hold_reason == Some(HoldReason.DatasetOutsideAllowedRegions)
+    assert plan.decisions[7].unwrap().hold_reason == Some(HoldReason.CapacityExceeded)
+    assert plan.decisions[8].unwrap().hold_reason == Some(HoldReason.DeadlineTooShort)
+    assert plan.decisions[9].unwrap().hold_reason == Some(HoldReason.CarbonIntensityUnknown)
+    assert plan.decisions[9].unwrap().unverified_window_count == 1
+
+    var replicas = data.replicas()
+    replicas[0].dataset_id = 999
+    let missing = planner.plan(data.jobs(), data.regions(), replicas, data.grid_cells())
+    assert missing.issue == None
+    assert missing.decisions[0].unwrap().hold_reason == Some(HoldReason.DatasetUnavailable)
+}
+
+test "unknown grid capacity is not treated as available capacity" {
+    var cells = data.grid_cells()
+    cells[8] = Some(
+        model.GridCell(
+            region_id: 30,
+            slot: 0,
+            carbon_intensity_g_per_kwh: Some(50),
+            capacity_kw: None,
+        ),
+    )
+    let plan = planner.plan(data.jobs(), data.regions(), data.replicas(), cells)
+    assert plan.issue == None
+    assert plan.decisions[9].unwrap().state == DecisionState.Held
+    assert plan.decisions[9].unwrap().hold_reason == Some(HoldReason.CapacityUnknown)
+    assert plan.decisions[9].unwrap().unverified_window_count == 1
+}
+
+test "known capacity failure takes precedence over unknown carbon in that window" {
+    var cells = data.grid_cells()
+    cells[8] = Some(
+        model.GridCell(
+            region_id: 30,
+            slot: 0,
+            carbon_intensity_g_per_kwh: None,
+            capacity_kw: Some(0),
+        ),
+    )
+    let plan = planner.plan(data.jobs(), data.regions(), data.replicas(), cells)
+    assert plan.issue == None
+    assert plan.decisions[9].unwrap().state == DecisionState.Held
+    assert plan.decisions[9].unwrap().hold_reason == Some(HoldReason.CapacityExceeded)
+    assert plan.decisions[9].unwrap().unverified_window_count == 0
+}
+
+test "a missing grid cell remains an explicit hold instead of a guessed schedule" {
+    var cells = data.grid_cells()
+    cells[8] = None
+    let plan = planner.plan(data.jobs(), data.regions(), data.replicas(), cells)
+    assert plan.issue == None
+    assert plan.decisions[9].unwrap().hold_reason == Some(HoldReason.GridDataMissing)
+    assert plan.decisions[9].unwrap().unverified_window_count == 1
+}
+
+test "duplicate grid rows reject the entire plan before reserving capacity" {
+    var cells = data.grid_cells()
+    cells[9] = cells[8]
+    let plan = planner.plan(data.jobs(), data.regions(), data.replicas(), cells)
+    assert plan.issue == Some(PlanIssue.DuplicateGridCell)
+    assert plan.scheduled_count == 0
+    assert plan.decisions[0] == None
+    assert plan.reserved_kw_by_cell[1] == 0
+}
+
+test "duplicate job identities reject the entire plan" {
+    var jobs = data.jobs()
+    jobs[1].id = jobs[0].id
+    let plan = planner.plan(jobs, data.regions(), data.replicas(), data.grid_cells())
+    assert plan.issue == Some(PlanIssue.DuplicateJobId)
+    assert plan.scheduled_count == 0
+    assert plan.held_count == 0
+    assert plan.decisions[0] == None
+}
+
+test "emissions multiplication overflow is held without capacity reservation" {
+    var jobs = data.jobs()
+    jobs[9].demand_kw = 2
+    var cells = data.grid_cells()
+    cells[8] = Some(
+        model.GridCell(
+            region_id: 30,
+            slot: 0,
+            carbon_intensity_g_per_kwh: Some(U32_MAX),
+            capacity_kw: Some(8),
+        ),
+    )
+    let plan = planner.plan(jobs, data.regions(), data.replicas(), cells)
+    assert plan.issue == None
+    assert plan.decisions[9].unwrap().state == DecisionState.Held
+    assert plan.decisions[9].unwrap().hold_reason == Some(HoldReason.EmissionsOverflow)
+    assert plan.reserved_kw_by_cell[8] == 0
+}
+
+test "summary counts scheduled emissions, capacity holds, and uncertain holds" {
+    let summary = fixture_summary()
+    assert summary.scheduled_count == 6
+    assert summary.held_count == 4
+    assert summary.total_emissions_g_co2e == 2050
+    assert summary.unverified_window_count == 3
+    assert summary.uncertainty_hold_count == 1
+    assert summary.capacity_hold_count == 1
+}
+
+test "reserved capacity respects each selected region and slot limit" {
+    let plan = fixture_report()
+    assert plan.reserved_kw_by_cell[1] == 5
+    assert plan.reserved_kw_by_cell[2] == 2
+    assert plan.reserved_kw_by_cell[4] == 5
+    assert plan.reserved_kw_by_cell[5] == 3
+    assert plan.reserved_kw_by_cell[10] == 5
+    assert plan.reserved_kw_by_cell[11] == 2
+}

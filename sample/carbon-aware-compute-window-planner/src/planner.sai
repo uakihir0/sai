@@ -1,0 +1,500 @@
+use acme:carbon-aware-compute-window-planner/model.{
+    DatasetReplica
+    Decision
+    DecisionState
+    GridCell
+    HoldReason
+    Job
+    MAX_GRID_CELLS
+    MAX_JOBS
+    MAX_REGIONS
+    MAX_REPLICAS
+    MAX_SLOTS
+    PlanIssue
+    PlanReport
+    Region
+}
+use sai:core/num.{U32_MAX}
+
+@derive(Copy, Clone, PartialEq, Eq)
+type Candidate {
+    region_index: USize
+    region_id: U32
+    start_slot: USize
+    emissions_g_co2e: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+type JobResult {
+    candidate: Option<Candidate>
+    hold_reason: Option<HoldReason>
+    unverified_window_count: USize
+}
+
+pub fn plan(
+    jobs: Array<Job, MAX_JOBS>,
+    regions: Array<Region, MAX_REGIONS>,
+    replicas: Array<DatasetReplica, MAX_REPLICAS>,
+    cells: Array<Option<GridCell>, MAX_GRID_CELLS>,
+) -> PlanReport {
+    match validate(jobs, regions, replicas, cells) {
+        Some(issue) => return empty_report(Some(issue))
+        None => {}
+    }
+
+    var report = empty_report(None)
+    var planned: Array<Bool, MAX_JOBS> = Array<Bool, MAX_JOBS>.filled(false)
+
+    for _ in 0..MAX_JOBS {
+        var next_job: Option<USize> = None
+        for job_index in 0..MAX_JOBS {
+            if not planned[job_index] {
+                match next_job {
+                    None => {
+                        next_job = Some(job_index)
+                    }
+                    Some(current_index) => {
+                        if comes_before(jobs[job_index], jobs[current_index]) {
+                            next_job = Some(job_index)
+                        }
+                    }
+                }
+            }
+        }
+
+        let job_index = next_job.unwrap()
+        let job = jobs[job_index]
+        planned[job_index] = true
+        let result = choose_window(job, regions, replicas, cells, report.reserved_kw_by_cell)
+
+        match result.candidate {
+            Some(candidate) => {
+                if candidate.emissions_g_co2e > U32_MAX - report.total_emissions_g_co2e {
+                    report.decisions[job_index] = Some(
+                        Decision(
+                            job_id: job.id,
+                            state: DecisionState.Held,
+                            region_id: None,
+                            start_slot: None,
+                            runtime_slots: job.runtime_slots,
+                            unverified_window_count: result.unverified_window_count,
+                            emissions_g_co2e: None,
+                            hold_reason: Some(HoldReason.EmissionsOverflow),
+                        ),
+                    )
+                    report.held_count += 1
+                } else {
+                    for offset in 0..job.runtime_slots {
+                        let flat_index =
+                            candidate.region_index * MAX_SLOTS + candidate.start_slot + offset
+                        report.reserved_kw_by_cell[flat_index] += job.demand_kw
+                    }
+                    report.decisions[job_index] = Some(
+                        Decision(
+                            job_id: job.id,
+                            state: DecisionState.Scheduled,
+                            region_id: Some(candidate.region_id),
+                            start_slot: Some(candidate.start_slot),
+                            runtime_slots: job.runtime_slots,
+                            unverified_window_count: result.unverified_window_count,
+                            emissions_g_co2e: Some(candidate.emissions_g_co2e),
+                            hold_reason: None,
+                        ),
+                    )
+                    report.scheduled_order[report.scheduled_count] = Some(job.id)
+                    report.scheduled_count += 1
+                    report.total_emissions_g_co2e += candidate.emissions_g_co2e
+                }
+            }
+            None => {
+                report.decisions[job_index] = Some(
+                    Decision(
+                        job_id: job.id,
+                        state: DecisionState.Held,
+                        region_id: None,
+                        start_slot: None,
+                        runtime_slots: job.runtime_slots,
+                        unverified_window_count: result.unverified_window_count,
+                        emissions_g_co2e: None,
+                        hold_reason: result.hold_reason,
+                    ),
+                )
+                report.held_count += 1
+            }
+        }
+    }
+
+    report
+}
+
+fn empty_report(issue: Option<PlanIssue>) -> PlanReport {
+    PlanReport(
+        decisions: Array<Option<Decision>, MAX_JOBS>.filled(None),
+        scheduled_order: Array<Option<U32>, MAX_JOBS>.filled(None),
+        scheduled_count: 0,
+        held_count: 0,
+        total_emissions_g_co2e: 0,
+        reserved_kw_by_cell: Array<U32, MAX_GRID_CELLS>.filled(0),
+        issue: issue,
+    )
+}
+
+fn validate(
+    jobs: Array<Job, MAX_JOBS>,
+    regions: Array<Region, MAX_REGIONS>,
+    replicas: Array<DatasetReplica, MAX_REPLICAS>,
+    cells: Array<Option<GridCell>, MAX_GRID_CELLS>,
+) -> Option<PlanIssue> {
+    for index in 0..MAX_JOBS {
+        let job = jobs[index]
+        if job.id == 0 {
+            return Some(PlanIssue.ZeroJobId)
+        }
+        for prior_index in 0..index {
+            if jobs[prior_index].id == job.id {
+                return Some(PlanIssue.DuplicateJobId)
+            }
+        }
+        if (
+            job.runtime_slots == 0
+            or job.runtime_slots > MAX_SLOTS
+            or job.deadline_slot == 0
+            or job.deadline_slot > MAX_SLOTS
+        ) {
+            return Some(PlanIssue.InvalidJobWindow)
+        }
+        if job.demand_kw == 0 {
+            return Some(PlanIssue.ZeroDemand)
+        }
+        if job.dataset_id == 0 {
+            return Some(PlanIssue.ZeroDatasetId)
+        }
+    }
+
+    for index in 0..MAX_REGIONS {
+        let region = regions[index]
+        if region.id == 0 {
+            return Some(PlanIssue.ZeroRegionId)
+        }
+        for prior_index in 0..index {
+            if regions[prior_index].id == region.id {
+                return Some(PlanIssue.DuplicateRegionId)
+            }
+        }
+    }
+
+    for index in 0..replicas.len() {
+        let replica = replicas[index]
+        if replica.dataset_id == 0 {
+            return Some(PlanIssue.ZeroReplicaDatasetId)
+        }
+        if region_index(regions, replica.region_id) == None {
+            return Some(PlanIssue.UnknownReplicaRegion)
+        }
+        for prior_index in 0..index {
+            if (
+                replicas[prior_index].dataset_id == replica.dataset_id
+                and replicas[prior_index].region_id == replica.region_id
+            ) {
+                return Some(PlanIssue.DuplicateReplica)
+            }
+        }
+    }
+
+    for index in 0..MAX_GRID_CELLS {
+        match cells[index] {
+            Some(cell) => {
+                if region_index(regions, cell.region_id) == None {
+                    return Some(PlanIssue.UnknownGridRegion)
+                }
+                if cell.slot >= MAX_SLOTS {
+                    return Some(PlanIssue.InvalidGridSlot)
+                }
+                for prior_index in 0..index {
+                    match cells[prior_index] {
+                        Some(prior_cell) => {
+                            if (
+                                prior_cell.region_id == cell.region_id
+                                and prior_cell.slot == cell.slot
+                            ) {
+                                return Some(PlanIssue.DuplicateGridCell)
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+fn region_index(regions: Array<Region, MAX_REGIONS>, region_id: U32) -> Option<USize> {
+    for index in 0..MAX_REGIONS {
+        if regions[index].id == region_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn find_cell(cells: Array<Option<GridCell>, MAX_GRID_CELLS>, region_id: U32, slot: USize) -> Option<
+    GridCell,
+> {
+    for cell_option in cells {
+        match cell_option {
+            Some(cell) => {
+                if cell.region_id == region_id and cell.slot == slot {
+                    return Some(cell)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+fn has_ready_replica(
+    replicas: Array<DatasetReplica, MAX_REPLICAS>,
+    dataset_id: U32,
+    region_id: U32,
+) -> Bool {
+    for replica in replicas {
+        if replica.dataset_id == dataset_id and replica.region_id == region_id and replica.ready {
+            return true
+        }
+    }
+    false
+}
+
+fn comes_before(left: Job, right: Job) -> Bool {
+    if left.deadline_slot != right.deadline_slot {
+        return left.deadline_slot < right.deadline_slot
+    }
+    if left.priority != right.priority {
+        return left.priority > right.priority
+    }
+    left.id < right.id
+}
+
+fn choose_window(
+    job: Job,
+    regions: Array<Region, MAX_REGIONS>,
+    replicas: Array<DatasetReplica, MAX_REPLICAS>,
+    cells: Array<Option<GridCell>, MAX_GRID_CELLS>,
+    used_kw: Array<U32, MAX_GRID_CELLS>,
+) -> JobResult {
+    var allowed_region_count: USize = 0
+    for index in 0..MAX_REGIONS {
+        if job.allowed_regions[index] {
+            allowed_region_count += 1
+        }
+    }
+    if allowed_region_count == 0 {
+        return JobResult(
+            candidate: None,
+            hold_reason: Some(HoldReason.NoAllowedRegion),
+            unverified_window_count: 0,
+        )
+    }
+
+    var any_ready_replica = false
+    var ready_replica_in_allowed_region = false
+    for replica in replicas {
+        if replica.dataset_id == job.dataset_id and replica.ready {
+            any_ready_replica = true
+            match region_index(regions, replica.region_id) {
+                Some(index) => {
+                    if job.allowed_regions[index] {
+                        ready_replica_in_allowed_region = true
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    if not any_ready_replica {
+        return JobResult(
+            candidate: None,
+            hold_reason: Some(HoldReason.DatasetUnavailable),
+            unverified_window_count: 0,
+        )
+    }
+    if not ready_replica_in_allowed_region {
+        return JobResult(
+            candidate: None,
+            hold_reason: Some(HoldReason.DatasetOutsideAllowedRegions),
+            unverified_window_count: 0,
+        )
+    }
+    if job.runtime_slots > job.deadline_slot {
+        return JobResult(
+            candidate: None,
+            hold_reason: Some(HoldReason.DeadlineTooShort),
+            unverified_window_count: 0,
+        )
+    }
+
+    var best: Option<Candidate> = None
+    var saw_missing_grid = false
+    var saw_unknown_carbon = false
+    var saw_unknown_capacity = false
+    var saw_capacity_exceeded = false
+    var saw_emissions_overflow = false
+    var unverified_window_count: USize = 0
+
+    for region_index_value in 0..MAX_REGIONS {
+        let region = regions[region_index_value]
+        if (
+            job.allowed_regions[region_index_value]
+            and has_ready_replica(replicas, job.dataset_id, region.id)
+        ) {
+            let start_limit = job.deadline_slot - job.runtime_slots + 1
+            for start_slot in 0..start_limit {
+                var window_valid = true
+                var window_emissions: U32 = 0
+                var window_missing_grid = false
+                var window_unknown_carbon = false
+                var window_unknown_capacity = false
+                var window_capacity_exceeded = false
+                var window_emissions_overflow = false
+                for offset in 0..job.runtime_slots {
+                    let slot = start_slot + offset
+                    match find_cell(cells, region.id, slot) {
+                        Some(cell) => {
+                            match cell.capacity_kw {
+                                Some(capacity_kw) => {
+                                    let used_index = region_index_value * MAX_SLOTS + slot
+                                    if used_kw[used_index] > capacity_kw {
+                                        window_capacity_exceeded = true
+                                        window_valid = false
+                                    } else if job.demand_kw > capacity_kw - used_kw[used_index] {
+                                        window_capacity_exceeded = true
+                                        window_valid = false
+                                    }
+                                }
+                                None => {
+                                    window_unknown_capacity = true
+                                    window_valid = false
+                                }
+                            }
+                            match cell.carbon_intensity_g_per_kwh {
+                                Some(intensity) => {
+                                    if intensity > 0 and job.demand_kw > U32_MAX / intensity {
+                                        window_emissions_overflow = true
+                                        window_valid = false
+                                    } else {
+                                        let slot_emissions = intensity * job.demand_kw
+                                        if slot_emissions > U32_MAX - window_emissions {
+                                            window_emissions_overflow = true
+                                            window_valid = false
+                                        } else {
+                                            window_emissions += slot_emissions
+                                        }
+                                    }
+                                }
+                                None => {
+                                    window_unknown_carbon = true
+                                    window_valid = false
+                                }
+                            }
+                        }
+                        None => {
+                            window_missing_grid = true
+                            window_valid = false
+                        }
+                    }
+                }
+
+                if window_valid {
+                    let candidate = Candidate(
+                        region_index: region_index_value,
+                        region_id: region.id,
+                        start_slot: start_slot,
+                        emissions_g_co2e: window_emissions,
+                    )
+                    match best {
+                        None => {
+                            best = Some(candidate)
+                        }
+                        Some(current) => {
+                            if is_better(candidate, current) {
+                                best = Some(candidate)
+                            }
+                        }
+                    }
+                } else if not window_capacity_exceeded and not window_emissions_overflow {
+                    // An uncertainty matters only when no known blocker already
+                    // proves this particular window unusable.
+                    saw_missing_grid = saw_missing_grid or window_missing_grid
+                    saw_unknown_carbon = saw_unknown_carbon or window_unknown_carbon
+                    saw_unknown_capacity = saw_unknown_capacity or window_unknown_capacity
+                    if window_missing_grid or window_unknown_carbon or window_unknown_capacity {
+                        unverified_window_count += 1
+                    }
+                } else {
+                    saw_capacity_exceeded = saw_capacity_exceeded or window_capacity_exceeded
+                    saw_emissions_overflow = saw_emissions_overflow or window_emissions_overflow
+                }
+            }
+        }
+    }
+
+    match best {
+        Some(candidate) => JobResult(
+            candidate: Some(candidate),
+            hold_reason: None,
+            unverified_window_count: unverified_window_count,
+        )
+        None => {
+            if saw_missing_grid {
+                JobResult(
+                    candidate: None,
+                    hold_reason: Some(HoldReason.GridDataMissing),
+                    unverified_window_count: unverified_window_count,
+                )
+            } else if saw_unknown_carbon {
+                JobResult(
+                    candidate: None,
+                    hold_reason: Some(HoldReason.CarbonIntensityUnknown),
+                    unverified_window_count: unverified_window_count,
+                )
+            } else if saw_unknown_capacity {
+                JobResult(
+                    candidate: None,
+                    hold_reason: Some(HoldReason.CapacityUnknown),
+                    unverified_window_count: unverified_window_count,
+                )
+            } else if saw_capacity_exceeded {
+                JobResult(
+                    candidate: None,
+                    hold_reason: Some(HoldReason.CapacityExceeded),
+                    unverified_window_count: unverified_window_count,
+                )
+            } else if saw_emissions_overflow {
+                JobResult(
+                    candidate: None,
+                    hold_reason: Some(HoldReason.EmissionsOverflow),
+                    unverified_window_count: unverified_window_count,
+                )
+            } else {
+                JobResult(
+                    candidate: None,
+                    hold_reason: Some(HoldReason.CapacityExceeded),
+                    unverified_window_count: unverified_window_count,
+                )
+            }
+        }
+    }
+}
+
+fn is_better(left: Candidate, right: Candidate) -> Bool {
+    if left.emissions_g_co2e != right.emissions_g_co2e {
+        return left.emissions_g_co2e < right.emissions_g_co2e
+    }
+    if left.start_slot != right.start_slot {
+        return left.start_slot < right.start_slot
+    }
+    left.region_id < right.region_id
+}

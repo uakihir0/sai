@@ -1,0 +1,5 @@
+package acme:carbon-aware-compute-window-planner @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Schedule fixed compute jobs against regional carbon, data locality, deadlines, and hourly capacity"
