@@ -1,0 +1,268 @@
+use acme:workbook-recalculator/formula
+use acme:workbook-recalculator/formula/graph
+use acme:workbook-recalculator/lookup
+use acme:workbook-recalculator/model.{
+    CellExpression
+    CellResult
+    CellStatus
+    Formula
+    MAX_CELLS
+    MAX_GRAPH_CELLS
+    RecalcReport
+    Workbook
+    WorkbookError
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+type Progress {
+    statuses: Array<CellStatus, MAX_CELLS>
+    values: Array<Option<U32>, MAX_CELLS>
+    blocked_by: Array<Option<U32>, MAX_CELLS>
+    formula_order: Array<Option<U32>, MAX_CELLS>
+    formula_order_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+enum OperandValue {
+    Ready(U32)
+    Waiting
+    Failed
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+enum FormulaInputs {
+    Ready(U32, U32)
+    Waiting
+    Blocked(U32)
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+type PassResult {
+    progress: Progress
+    changed: Bool
+}
+
+fn empty_progress() -> Progress {
+    Progress(
+        statuses: Array<CellStatus, MAX_CELLS>.filled(CellStatus.Unused),
+        values: Array<Option<U32>, MAX_CELLS>.filled(None),
+        blocked_by: Array<Option<U32>, MAX_CELLS>.filled(None),
+        formula_order: Array<Option<U32>, MAX_CELLS>.filled(None),
+        formula_order_count: 0,
+    )
+}
+
+fn initialize(workbook: Workbook) -> Progress {
+    var progress = empty_progress()
+    for index in 0..workbook.cell_count {
+        match workbook.cells[index] {
+            Some(cell) => match cell.expression {
+                CellExpression.Literal(value) => {
+                    progress.statuses[index] = CellStatus.Ready
+                    progress.values[index] = Some(value)
+                }
+                CellExpression.Formula(_) => {
+                    progress.statuses[index] = CellStatus.Pending
+                }
+            }
+            None => {}
+        }
+    }
+    progress
+}
+
+fn cell_value(workbook: Workbook, id: U32, progress: Progress) -> OperandValue {
+    match lookup.index_of(workbook, id) {
+        Some(index) => match progress.statuses[index] {
+            CellStatus.Ready => match progress.values[index] {
+                Some(value) => OperandValue.Ready(value)
+                None => OperandValue.Waiting
+            }
+            CellStatus.Pending => OperandValue.Waiting
+            _ => OperandValue.Failed
+        }
+        None => OperandValue.Failed
+    }
+}
+
+fn resolve_inputs(workbook: Workbook, formula_value: Formula, progress: Progress) -> FormulaInputs {
+    let left = cell_value(workbook, formula_value.left, progress)
+    let right = cell_value(workbook, formula_value.right, progress)
+    match left {
+        OperandValue.Failed => FormulaInputs.Blocked(formula_value.left)
+        OperandValue.Ready(left_value) => match right {
+            OperandValue.Ready(right_value) => FormulaInputs.Ready(left_value, right_value)
+            OperandValue.Failed => FormulaInputs.Blocked(formula_value.right)
+            OperandValue.Waiting => FormulaInputs.Waiting
+        }
+        OperandValue.Waiting => FormulaInputs.Waiting
+    }
+}
+
+fn mark_missing_references(workbook: Workbook, var progress: Progress) -> Progress {
+    for index in 0..workbook.cell_count {
+        match workbook.cells[index] {
+            Some(cell) => match cell.expression {
+                CellExpression.Formula(formula_value) => {
+                    if (
+                        lookup.index_of(workbook, formula_value.left).is_none()
+                        or lookup.index_of(workbook, formula_value.right).is_none()
+                    ) {
+                        progress.statuses[index] = CellStatus.MissingReference
+                    }
+                }
+                CellExpression.Literal(_) => {}
+            }
+            None => {}
+        }
+    }
+    progress
+}
+
+fn mark_cycles(
+    workbook: Workbook,
+    reachability: Array<Bool, MAX_GRAPH_CELLS>,
+    var progress: Progress,
+) -> Progress {
+    for index in 0..workbook.cell_count {
+        if (
+            progress.statuses[index] == CellStatus.Pending
+            and graph.is_cycle_member(reachability, index)
+        ) {
+            progress.statuses[index] = CellStatus.Cycle
+        }
+    }
+
+    for index in 0..workbook.cell_count {
+        if progress.statuses[index] == CellStatus.Pending {
+            var cycle_cell: Option<USize> = None
+            for cycle_index in 0..workbook.cell_count {
+                if (
+                    progress.statuses[cycle_index] == CellStatus.Cycle
+                    and graph.reaches(reachability, index, cycle_index)
+                ) {
+                    match cycle_cell {
+                        Some(_) => {}
+                        None => {
+                            cycle_cell = Some(cycle_index)
+                        }
+                    }
+                }
+            }
+            match cycle_cell {
+                Some(cycle_index) => {
+                    let cycle_id = workbook.cells[cycle_index].unwrap().id
+                    progress.statuses[index] = CellStatus.BlockedByCycle
+                    progress.blocked_by[index] = Some(cycle_id)
+                }
+                None => {}
+            }
+        }
+    }
+    progress
+}
+
+fn update_formula(
+    index: USize,
+    cell_id: U32,
+    formula_value: Formula,
+    workbook: Workbook,
+    var progress: Progress,
+) -> PassResult {
+    var result = PassResult(progress: progress, changed: false)
+    match resolve_inputs(workbook, formula_value, result.progress) {
+        FormulaInputs.Waiting => {}
+        FormulaInputs.Blocked(dependency_id) => {
+            result.progress.statuses[index] = CellStatus.BlockedByError
+            result.progress.blocked_by[index] = Some(dependency_id)
+            result.changed = true
+        }
+        FormulaInputs.Ready(left, right) => {
+            result.progress.formula_order[result.progress.formula_order_count] = Some(cell_id)
+            result.progress.formula_order_count += 1
+            match formula.evaluate(formula_value, left, right) {
+                Ok(value) => {
+                    result.progress.statuses[index] = CellStatus.Ready
+                    result.progress.values[index] = Some(value)
+                }
+                Err(formula.FormulaError.ArithmeticRangeError) => {
+                    result.progress.statuses[index] = CellStatus.ArithmeticRangeError
+                }
+                Err(formula.FormulaError.DivisionByZero) => {
+                    result.progress.statuses[index] = CellStatus.DivisionByZero
+                }
+            }
+            result.changed = true
+        }
+    }
+    result
+}
+
+fn recalculate_pass(workbook: Workbook, var progress: Progress) -> PassResult {
+    var pass = PassResult(progress: progress, changed: false)
+    for index in 0..workbook.cell_count {
+        if pass.progress.statuses[index] == CellStatus.Pending {
+            let cell = workbook.cells[index].unwrap()
+            match cell.expression {
+                CellExpression.Formula(formula_value) => {
+                    let updated =
+                        update_formula(index, cell.id, formula_value, workbook, pass.progress)
+                    pass.progress = updated.progress
+                    if updated.changed {
+                        pass.changed = true
+                    }
+                }
+                CellExpression.Literal(_) => {}
+            }
+        }
+    }
+    pass
+}
+
+fn report(workbook: Workbook, progress: Progress) -> RecalcReport {
+    var results = Array<Option<CellResult>, MAX_CELLS>.filled(None)
+    for index in 0..workbook.cell_count {
+        let cell = workbook.cells[index].unwrap()
+        results[index] = Some(
+            CellResult(
+                id: cell.id,
+                label: cell.label,
+                status: progress.statuses[index],
+                value: progress.values[index],
+                blocked_by: progress.blocked_by[index],
+            ),
+        )
+    }
+    RecalcReport(
+        cells: results,
+        formula_order: progress.formula_order,
+        formula_order_count: progress.formula_order_count,
+    )
+}
+
+pub fn recalculate(workbook: Workbook) -> Result<RecalcReport, WorkbookError> {
+    match lookup.validate(workbook) { Err(problem) => return Err(problem), Ok(()) => {} }
+
+    var progress = initialize(workbook)
+    progress = mark_missing_references(workbook, progress)
+    let reachability = graph.transitive_closure(workbook)
+    progress = mark_cycles(workbook, reachability, progress)
+
+    var pass_count: USize = 0
+    var settled = false
+    while pass_count < workbook.cell_count and not settled {
+        let pass = recalculate_pass(workbook, progress)
+        progress = pass.progress
+        if not pass.changed {
+            settled = true
+        }
+        pass_count += 1
+    }
+
+    for index in 0..workbook.cell_count {
+        if progress.statuses[index] == CellStatus.Pending {
+            progress.statuses[index] = CellStatus.BlockedByError
+        }
+    }
+    Ok(report(workbook, progress))
+}

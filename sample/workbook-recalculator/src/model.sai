@@ -71,5 +71,5 @@ pub type CellResult {
 pub type RecalcReport {
     pub cells: Array<Option<CellResult>, MAX_CELLS>
     pub formula_order: Array<Option<CellId>, MAX_CELLS>
-    pub formula_count: USize
+    pub formula_order_count: USize
 }

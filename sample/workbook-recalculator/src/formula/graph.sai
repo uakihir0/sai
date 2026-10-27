@@ -1,0 +1,76 @@
+use acme:workbook-recalculator/lookup
+use acme:workbook-recalculator/model.{CellExpression, Formula, MAX_CELLS, MAX_GRAPH_CELLS, Workbook}
+
+fn graph_index(from: USize, to: USize) -> USize {
+    from * MAX_CELLS + to
+}
+
+fn add_edge(
+    workbook: Workbook,
+    var graph: Array<Bool, MAX_GRAPH_CELLS>,
+    from: USize,
+    id: U32,
+) -> Array<Bool, MAX_GRAPH_CELLS> {
+    match lookup.index_of(workbook, id) {
+        Some(to) => {
+            graph[graph_index(from, to)] = true
+            graph
+        }
+        None => graph
+    }
+}
+
+fn add_formula_edges(
+    workbook: Workbook,
+    var graph: Array<Bool, MAX_GRAPH_CELLS>,
+    from: USize,
+    formula: Formula,
+) -> Array<Bool, MAX_GRAPH_CELLS> {
+    match lookup.index_of(workbook, formula.left) {
+        Some(_) => match lookup.index_of(workbook, formula.right) {
+            Some(_) => {
+                graph = add_edge(workbook, graph, from, formula.left)
+                graph = add_edge(workbook, graph, from, formula.right)
+                graph
+            }
+            None => graph
+        }
+        None => graph
+    }
+}
+
+pub fn transitive_closure(workbook: Workbook) -> Array<Bool, MAX_GRAPH_CELLS> {
+    var graph = Array<Bool, MAX_GRAPH_CELLS>.filled(false)
+    for from in 0..workbook.cell_count {
+        match workbook.cells[from] {
+            Some(cell) => match cell.expression {
+                CellExpression.Formula(formula) => {
+                    graph = add_formula_edges(workbook, graph, from, formula)
+                }
+                CellExpression.Literal(_) => {}
+            }
+            None => {}
+        }
+    }
+
+    for through in 0..workbook.cell_count {
+        for from in 0..workbook.cell_count {
+            if graph[graph_index(from, through)] {
+                for to in 0..workbook.cell_count {
+                    if graph[graph_index(through, to)] {
+                        graph[graph_index(from, to)] = true
+                    }
+                }
+            }
+        }
+    }
+    graph
+}
+
+pub fn reaches(graph: Array<Bool, MAX_GRAPH_CELLS>, from: USize, to: USize) -> Bool {
+    graph[graph_index(from, to)]
+}
+
+pub fn is_cycle_member(graph: Array<Bool, MAX_GRAPH_CELLS>, index: USize) -> Bool {
+    reaches(graph, index, index)
+}
