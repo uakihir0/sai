@@ -3662,6 +3662,39 @@ and stage-boundary decisions are **Review required**. See spec/06 §§6.5.1,
   forms, then run pinned driver/CLI filters, formatting, and diff checks before
   independent hostile review.
 
+**IR-988 direct-call unary negation of resolved paths** admits only one
+unary `-` directly over a plain local path as a positional argument at the
+existing root or one-level nested direct-call locations. The path must resolve
+by `BindingId` to a preceding parameter or simple local. Signed integers,
+`F32`, and `F64` retain the operand type. Unsigned integers, `Byte`, `Char`,
+and `Bool` report `OPERATOR_NOT_SUPPORTED` using the existing `Neg`
+diagnostic. Preserve operand path facts, suppress tainted unary/call/alias
+facts, and keep independent valid siblings typed. Keep folded negative
+integer literals on their existing literal path. Leave computed or non-path
+operands, double negation, unresolved/self/forward/global paths, deeper calls,
+generic targets, unsupported signatures, and local-initializer negation
+gated. Preserve CLI Stage 0; this does not add lowering or runtime evaluation.
+These shape, binding, diagnostic, fact, recovery, and stage-boundary choices
+are **Review required**. See spec/06 §§6.5.1, 6.8.6, and 6.8.10.
+
+- **Review required:** Challenge driver/body-checker parity for the exact
+  unary-neg path form at root and one nested call level. Cover all five signed
+  integer types, `F32`/`F64`, all five unsigned integer types, `Byte`, `Char`,
+  and `Bool`; verify exact result types, `OPERATOR_NOT_SUPPORTED` and `Neg`
+  messages, operand fact retention, unary/call/alias taint, and valid sibling
+  recovery. Also verify preceding local and shadowed `BindingId` selection,
+  argument mismatch propagation, and folded negative integer literals.
+  Reject non-path, computed, double, unresolved/self/forward/global, local
+  initializer, deep, generic, and unsupported-signature cases. Confirm the
+  CLI Stage 0 gate and make no lowering/runtime claim.
+- **Planned verification matrix:** Extend
+  `primitive_body_type_results_include_exact_direct_function_calls` across
+  every primitive type at root and nested positions, with exact facts,
+  diagnostics, spans, and mismatch/recovery assertions. Add representative
+  accepted and excluded shapes to the CLI Stage 0 fixture. Run pinned Rust
+  1.99.1 focused driver and CLI tests, formatting, and diff checks, then
+  obtain independent hostile review before commit.
+
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
 **Calls.** `Call { callee, args }` that is not a construction and not a method call (§3.9) is checked by spec/06 §6.5.1:
