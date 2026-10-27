@@ -1,0 +1,244 @@
+use acme:carbon-aware-compute-window-planner/model.{
+    DatasetReplica
+    GridCell
+    Job
+    MAX_GRID_CELLS
+    MAX_JOBS
+    MAX_REGIONS
+    MAX_REPLICAS
+    Region
+}
+
+pub fn regions() -> Array<Region, MAX_REGIONS> {
+    [
+        Region(id: 10, name: "north-hub"),
+        Region(id: 20, name: "south-hub"),
+        Region(id: 30, name: "east-hub"),
+    ]
+}
+
+pub fn jobs() -> Array<Job, MAX_JOBS> {
+    [
+        Job(
+            id: 201,
+            name: "secure-customer-export",
+            priority: 100,
+            runtime_slots: 1,
+            demand_kw: 3,
+            deadline_slot: 2,
+            dataset_id: 501,
+            allowed_regions: [true, false, false],
+        ),
+        Job(
+            id: 202,
+            name: "release-test-suite",
+            priority: 100,
+            runtime_slots: 1,
+            demand_kw: 2,
+            deadline_slot: 3,
+            dataset_id: 502,
+            allowed_regions: [true, true, false],
+        ),
+        Job(
+            id: 203,
+            name: "model-retraining",
+            priority: 90,
+            runtime_slots: 2,
+            demand_kw: 3,
+            deadline_slot: 4,
+            dataset_id: 503,
+            allowed_regions: [true, true, false],
+        ),
+        Job(
+            id: 204,
+            name: "catalog-snapshot-build",
+            priority: 80,
+            runtime_slots: 1,
+            demand_kw: 2,
+            deadline_slot: 4,
+            dataset_id: 504,
+            allowed_regions: [false, false, true],
+        ),
+        Job(
+            id: 205,
+            name: "embedding-backfill",
+            priority: 70,
+            runtime_slots: 2,
+            demand_kw: 2,
+            deadline_slot: 4,
+            dataset_id: 505,
+            allowed_regions: [true, true, false],
+        ),
+        Job(
+            id: 206,
+            name: "audit-dataset-scan",
+            priority: 60,
+            runtime_slots: 1,
+            demand_kw: 5,
+            deadline_slot: 3,
+            dataset_id: 506,
+            allowed_regions: [false, false, true],
+        ),
+        Job(
+            id: 207,
+            name: "regional-telemetry-repair",
+            priority: 50,
+            runtime_slots: 1,
+            demand_kw: 1,
+            deadline_slot: 4,
+            dataset_id: 507,
+            allowed_regions: [true, false, true],
+        ),
+        Job(
+            id: 208,
+            name: "market-stress-simulation",
+            priority: 40,
+            runtime_slots: 1,
+            demand_kw: 6,
+            deadline_slot: 4,
+            dataset_id: 508,
+            allowed_regions: [false, true, false],
+        ),
+        Job(
+            id: 209,
+            name: "weekend-analytics-refresh",
+            priority: 5,
+            runtime_slots: 3,
+            demand_kw: 1,
+            deadline_slot: 2,
+            dataset_id: 509,
+            allowed_regions: [true, true, true],
+        ),
+        Job(
+            id: 210,
+            name: "sensor-validation-replay",
+            priority: 25,
+            runtime_slots: 1,
+            demand_kw: 1,
+            deadline_slot: 1,
+            dataset_id: 510,
+            allowed_regions: [false, false, true],
+        ),
+    ]
+}
+
+// Dataset 507 is ready but outside that job's allowed regions.
+pub fn replicas() -> Array<DatasetReplica, MAX_REPLICAS> {
+    [
+        DatasetReplica(dataset_id: 501, region_id: 10, ready: true),
+        DatasetReplica(dataset_id: 502, region_id: 10, ready: true),
+        DatasetReplica(dataset_id: 502, region_id: 20, ready: true),
+        DatasetReplica(dataset_id: 503, region_id: 10, ready: true),
+        DatasetReplica(dataset_id: 503, region_id: 20, ready: true),
+        DatasetReplica(dataset_id: 504, region_id: 30, ready: true),
+        DatasetReplica(dataset_id: 505, region_id: 10, ready: true),
+        DatasetReplica(dataset_id: 505, region_id: 20, ready: true),
+        DatasetReplica(dataset_id: 506, region_id: 30, ready: true),
+        DatasetReplica(dataset_id: 507, region_id: 20, ready: true),
+        DatasetReplica(dataset_id: 508, region_id: 20, ready: true),
+        DatasetReplica(dataset_id: 509, region_id: 10, ready: true),
+        DatasetReplica(dataset_id: 509, region_id: 20, ready: true),
+        DatasetReplica(dataset_id: 510, region_id: 30, ready: true),
+    ]
+}
+
+pub fn grid_cells() -> Array<Option<GridCell>, MAX_GRID_CELLS> {
+    [
+        Some(
+            GridCell(
+                region_id: 10,
+                slot: 0,
+                carbon_intensity_g_per_kwh: Some(300),
+                capacity_kw: Some(8),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 10,
+                slot: 1,
+                carbon_intensity_g_per_kwh: Some(80),
+                capacity_kw: Some(8),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 10,
+                slot: 2,
+                carbon_intensity_g_per_kwh: Some(100),
+                capacity_kw: Some(8),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 10,
+                slot: 3,
+                carbon_intensity_g_per_kwh: Some(200),
+                capacity_kw: Some(8),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 20,
+                slot: 0,
+                carbon_intensity_g_per_kwh: Some(50),
+                capacity_kw: Some(5),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 20,
+                slot: 1,
+                carbon_intensity_g_per_kwh: Some(70),
+                capacity_kw: Some(5),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 20,
+                slot: 2,
+                carbon_intensity_g_per_kwh: Some(400),
+                capacity_kw: Some(5),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 20,
+                slot: 3,
+                carbon_intensity_g_per_kwh: Some(80),
+                capacity_kw: Some(5),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 30,
+                slot: 0,
+                carbon_intensity_g_per_kwh: None,
+                capacity_kw: Some(8),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 30,
+                slot: 1,
+                carbon_intensity_g_per_kwh: Some(180),
+                capacity_kw: Some(8),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 30,
+                slot: 2,
+                carbon_intensity_g_per_kwh: Some(150),
+                capacity_kw: Some(8),
+            ),
+        ),
+        Some(
+            GridCell(
+                region_id: 30,
+                slot: 3,
+                carbon_intensity_g_per_kwh: Some(120),
+                capacity_kw: Some(8),
+            ),
+        ),
+    ]
+}

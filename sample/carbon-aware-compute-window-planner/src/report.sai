@@ -1,0 +1,46 @@
+use acme:carbon-aware-compute-window-planner/model.{
+    DecisionState
+    HoldReason
+    PlanReport
+    PlanSummary
+}
+
+pub fn summarize(report: PlanReport) -> PlanSummary {
+    var uncertainty_hold_count: USize = 0
+    var capacity_hold_count: USize = 0
+    var unverified_window_count: USize = 0
+    for decision_option in report.decisions {
+        match decision_option {
+            Some(decision) => {
+                unverified_window_count += decision.unverified_window_count
+                if decision.state == DecisionState.Held {
+                    match decision.hold_reason {
+                        Some(HoldReason.GridDataMissing) => {
+                            uncertainty_hold_count += 1
+                        }
+                        Some(HoldReason.CarbonIntensityUnknown) => {
+                            uncertainty_hold_count += 1
+                        }
+                        Some(HoldReason.CapacityUnknown) => {
+                            uncertainty_hold_count += 1
+                        }
+                        Some(HoldReason.CapacityExceeded) => {
+                            capacity_hold_count += 1
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    PlanSummary(
+        scheduled_count: report.scheduled_count,
+        held_count: report.held_count,
+        total_emissions_g_co2e: report.total_emissions_g_co2e,
+        unverified_window_count: unverified_window_count,
+        uncertainty_hold_count: uncertainty_hold_count,
+        capacity_hold_count: capacity_hold_count,
+    )
+}
