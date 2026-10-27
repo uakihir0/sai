@@ -5031,11 +5031,13 @@ fn is_supported_direct_call_shift_operands(left: &Expr<'_>, right: &Expr<'_>) ->
         (
             ExprKind::Path(_),
             ExprKind::Path(_)
+            | ExprKind::Lit(Lit::Byte(_))
             | ExprKind::Lit(Lit::Int { .. } | Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. }),
         ) => true,
         (
             ExprKind::Lit(Lit::Byte(_)),
             ExprKind::Path(_)
+            | ExprKind::Lit(Lit::Byte(_))
             | ExprKind::Lit(Lit::Int { .. } | Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. }),
         ) => true,
         (
