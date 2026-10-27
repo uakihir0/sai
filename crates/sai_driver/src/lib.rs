@@ -48925,6 +48925,21 @@ property "shared"() {}
             "    let second = -result\n",
             "    second\n",
             "}\n",
+            "pub fn negated_result_later_constraint() -> I32 {\n",
+            "    let source = 1\n",
+            "    let first = -source\n",
+            "    let constrain: I32 = source\n",
+            "    let second = -first\n",
+            "    second\n",
+            "}\n",
+            "pub fn negated_result_alias_later_constraint() -> I32 {\n",
+            "    let source = 1\n",
+            "    let first = -source\n",
+            "    let copy = first\n",
+            "    let constrain: I32 = source\n",
+            "    let second = -copy\n",
+            "    second\n",
+            "}\n",
             "pub fn mutable_source() -> I32 {\n",
             "    var source = 1\n",
             "    let result = -source\n",
@@ -49163,6 +49178,17 @@ property "shared"() {}
                     "an unsupported inferred unary result is tainted"
                 );
             }
+            if name == "unsigned_annotation" {
+                let result_bindings = binding_named(&database, owner, "result");
+                let [result] = result_bindings.as_slice() else {
+                    panic!("the annotated result binding exists");
+                };
+                assert_eq!(
+                    results.binding_type(*result),
+                    Some(PrimTy::U8),
+                    "an annotated result binding retains its declared recovery type"
+                );
+            }
         }
 
         let (range_and_negation_owner, _) = assert_supported(
@@ -49248,6 +49274,75 @@ property "shared"() {}
                 ),
             )
             .expect("the boundary literal span is ordered")
+        );
+
+        let unsigned_owner = owner_named(&database, &resolved, "unsigned_annotation");
+        let unsigned_descriptor = *collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.owner == unsigned_owner.owner())
+            .expect("the unsigned function has a top-level descriptor");
+        let unsigned_inputs = database
+            .current_owner_inputs(&snapshot, unsigned_descriptor.file, &collection.target_cfg)
+            .expect("unsigned owner inputs are current");
+        let unsigned_def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&unsigned_owner.owner().def_id.package())
+                .expect("the unsigned owner package has a definition-path interner"),
+        );
+        let unsigned_arena = HirArena::new();
+        let unsigned_lowering_context = HirLoweringContext::new(
+            &unsigned_inputs.ast_ids,
+            &snapshot,
+            &unsigned_inputs.root,
+            &unsigned_arena,
+            &database.symbols,
+            &unsigned_def_paths,
+        );
+        let (unsigned_hir_owner, unsigned_source_map) = lower_top_level_owner(
+            unsigned_descriptor,
+            &unsigned_def_paths
+                .resolve_def_id(unsigned_owner.owner().def_id.to_def_id())
+                .expect("the unsigned owner path resolves")
+                .expect("the unsigned owner path exists"),
+            &unsigned_inputs.filtered_item_tree,
+            &unsigned_inputs.retained_item_kinds,
+            &unsigned_lowering_context,
+        )
+        .expect("the unsigned owner lowers");
+        assert_eq!(unsigned_hir_owner.id, unsigned_owner.owner());
+        let unsigned_unary_start = root
+            .find("let result: U8 = -source")
+            .expect("the annotated unsigned unary initializer exists")
+            + "let result: U8 = ".len();
+        let unsigned_unary_range = sai_diagnostics::TextRange::new(
+            sai_diagnostics::TextSize::new(unsigned_unary_start as u32),
+            sai_diagnostics::TextSize::new((unsigned_unary_start + "-source".len()) as u32),
+        )
+        .expect("the annotated unsigned unary span is ordered");
+        let unsigned_unary_ids = unsigned_source_map
+            .node_to_syntax()
+            .iter_enumerated()
+            .filter_map(|(local_id, pointer)| {
+                (pointer.text_range() == unsigned_unary_range).then_some(sai_hir::HirId {
+                    owner: unsigned_owner.owner(),
+                    local_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        let [unsigned_unary_id] = unsigned_unary_ids.as_slice() else {
+            panic!("the annotated unsigned initializer has one exact unary HIR node");
+        };
+        assert_eq!(
+            unsigned_owner
+                .primitive_body_type_results()
+                .expect("unsigned results are available")
+                .expect("unsigned body publishes partial results")
+                .expression_type(*unsigned_unary_id),
+            None,
+            "the unsupported unary expression is tainted even though its annotated binding keeps U8"
         );
 
         let annotated_owner = owner_named(&database, &resolved, "annotated_i32");
@@ -49355,12 +49450,21 @@ property "shared"() {}
             "compound_source",
             "double_negation",
             "negated_result_alias",
+            "negated_result_later_constraint",
+            "negated_result_alias_later_constraint",
             "mutable_source",
             "deep_nested_source",
             "forward_source",
             "global_source",
         ] {
             let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner.body_type_check().expect("body check is available"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "excluded shape `{name}` remains behind the body checker gate"
+            );
             assert!(
                 owner
                     .primitive_body_type_results()

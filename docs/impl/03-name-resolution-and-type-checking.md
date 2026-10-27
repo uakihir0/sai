@@ -3757,11 +3757,15 @@ expectation constrain both uses; absent a constraint, integer and float
 variables still default to `I64` and `F64`. The `Neg` primitive check is
 deferred until that variable resolves: signed integers and `F32`/`F64` are
 accepted, while a variable constrained to an unsigned integer reports the
-existing `OPERATOR_NOT_SUPPORTED` diagnostic. Negating a path does not fold or
-rewrite its source literal: a positive `2^63` source therefore still reports
-`LITERAL_OUT_OF_RANGE` when the source defaults to `I64`. Computed/call and
-compound literal origins, mutable/global/self/forward sources, double or nested
-negation, and deeper scopes remain gated. CLI Stage 0 stays unchanged, and no
+existing `OPERATOR_NOT_SUPPORTED` diagnostic. The unary expression fact is
+omitted on that error; an inferred result binding is also omitted, while an
+annotated result binding retains its declared type. A result produced by this
+deferred form, including a plain-path copy, remains ineligible for a later
+local negation even if another use resolves the shared literal variable.
+Negating a path does not fold or rewrite its source literal: a positive `2^63`
+source therefore still reports `LITERAL_OUT_OF_RANGE` when the source defaults
+to `I64`. Computed/call and compound literal origins,
+mutable/global/self/forward sources, double or nested negation, and deeper scopes remain gated. CLI Stage 0 stays unchanged, and no
 lowering or runtime behavior is added. These inference, source-preservation,
 shape, recovery/fact, and stage-boundary decisions are **Review required**. See
 spec/06 §§6.8.6 and 6.8.10 and [the IR-991 implementation review](../design/implementation-review.md#ir-991-2026-10-27-deferred-unary-negation-of-flat-local-literals).
@@ -3774,7 +3778,9 @@ source literal variable and reuse that variable as the initializer result.
 as direct or simple-alias integer/float literal provenance; do not propagate
 that provenance to the negated result. (3) Resolve `Neg` after annotations,
 tail constraints, and defaulting, retaining the existing unary diagnostic and
-expression taint behavior for unsupported unsigned types. (4) Add driver
+expression taint behavior for unsupported unsigned types; separately guard
+deferred-negation result bindings and their plain-path copies against later
+`Neg` uses. (4) Add driver
 regressions for defaults, annotation/tail inference, BindingId/provenance,
 exact expression facts, unsigned rejection and sibling recovery, and the
 positive `I64` boundary; add CLI regressions proving these forms remain behind

@@ -316,6 +316,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         unannotated_integer_bitwise_pair_paths: HashSet::new(),
         direct_unannotated_float_literals: HashSet::new(),
         unannotated_float_literal_aliases: HashSet::new(),
+        deferred_neg_result_bindings: HashSet::new(),
         pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
         errors: Vec::new(),
@@ -356,6 +357,7 @@ struct FnCtxt<'a, 'hir> {
     unannotated_integer_bitwise_pair_paths: HashSet<BindingId>,
     direct_unannotated_float_literals: HashSet<BindingId>,
     unannotated_float_literal_aliases: HashSet<BindingId>,
+    deferred_neg_result_bindings: HashSet<BindingId>,
     pending_operator_trait_count: usize,
     literal_variables: Vec<LiteralVariable<'hir>>,
     errors: Vec<PrimitiveBodyError>,
@@ -547,6 +549,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
 
         let errors_before_initializer = self.errors.len();
+        let mut initializer_is_deferred_neg_result = false;
         let local_type = if self.expression_has_unknown_field_error(init) {
             self.check_error_tainted_expression(init)?;
             if let Some(id) = self.error_tainted_literal_variable(init) {
@@ -693,7 +696,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     result
                 }
                 ExprKind::Unary(UnOp::Neg, operand) => {
-                    let result = self.check_local_initializer_neg_path(operand, init.hir_id)?;
+                    let (result, is_deferred_neg_result) =
+                        self.check_local_initializer_neg_path(operand, init.hir_id)?;
+                    initializer_is_deferred_neg_result = is_deferred_neg_result;
                     if let Some(expected) = annotation {
                         self.check_annotated_path(result, expected, init.hir_id)?;
                         LocalType::Concrete(expected)
@@ -756,6 +761,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 _ => return Err(()),
             }
         };
+
+        if initializer_is_deferred_neg_result {
+            self.deferred_neg_result_bindings.insert(binding);
+        }
 
         if annotation.is_none()
             && matches!(
@@ -1003,6 +1012,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.trusted_bindings.insert(binding);
         }
         if let Some(source_binding) = self.plain_local_path_binding(init) {
+            if self.deferred_neg_result_bindings.contains(&source_binding) {
+                self.deferred_neg_result_bindings.insert(binding);
+            }
+
             let source_has_resolved_computed_literal_provenance = self
                 .resolved_computed_literal_paths
                 .contains(&source_binding);
@@ -2615,8 +2628,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         &mut self,
         operand: &'hir Expr<'hir>,
         expression: HirId,
-    ) -> Result<LocalType, ()> {
+    ) -> Result<(LocalType, bool), ()> {
         let source_type = self.check_local_path(operand)?;
+        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+        if self.deferred_neg_result_bindings.contains(&source_binding) {
+            return Err(());
+        }
         if let LocalType::LiteralVariable(id) = source_type {
             let eligible_literal_path = self.is_eligible_unannotated_literal_path(operand);
             if eligible_literal_path
@@ -2637,7 +2654,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         expression,
                         diagnostic_index,
                     });
-                return Ok(source_type);
+                return Ok((source_type, true));
             }
         }
 
@@ -2654,7 +2671,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 },
             });
         }
-        Ok(LocalType::Concrete(operand_type))
+        Ok((LocalType::Concrete(operand_type), false))
     }
 
     fn check_logical_not(&mut self, operand: &'hir Expr<'hir>) -> Result<LocalType, ()> {
