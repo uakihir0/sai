@@ -1,0 +1,128 @@
+use acme:cluster-capacity-planner/data
+use acme:cluster-capacity-planner/model.{
+    CapacityPlan
+    HoldReason
+    PlanError
+    Priority
+    ReplicaDecision
+    ReplicaOutcome
+}
+use acme:cluster-capacity-planner/planner
+use sai:process.{Stdout}
+
+fn priority_name(priority: Priority) -> Str {
+    match priority {
+        Priority.Critical => "critical"
+        Priority.High => "high"
+        Priority.Standard => "standard"
+    }
+}
+
+fn print_decision(out: borrow mut Stdout, decision: ReplicaDecision)
+    effects { stdio.write, alloc }
+{
+    let priority = priority_name(decision.priority)
+    out.write_str(
+        f"  {priority} #{decision.service_id} {decision.service_name} replica {decision.replica_index}: ".as_str(),
+    )
+    match decision.outcome {
+        ReplicaOutcome.Placed(node_id) => {
+            let cluster = data.monday_morning()
+            var node_name: Str = "unknown node"
+            for node in cluster.nodes {
+                if node.id == node_id {
+                    node_name = node.name
+                }
+            }
+            out.write_str(f"placed on {node_name} (node {node_id})\n".as_str())
+        }
+        ReplicaOutcome.Held(HoldReason.NoCompatiblePool) => {
+            out.write_str("held — no node in the required pool\n")
+        }
+        ReplicaOutcome.Held(HoldReason.CapacityExhausted) => {
+            out.write_str("held — CPU or memory headroom is exhausted\n")
+        }
+        ReplicaOutcome.Held(HoldReason.ReplicaSpreadLimit) => {
+            out.write_str("held — no unused zone has enough remaining capacity\n")
+        }
+    }
+}
+
+fn print_capacity(out: borrow mut Stdout, plan: CapacityPlan)
+    effects { stdio.write, alloc }
+{
+    let cluster = data.monday_morning()
+    out.write_str("\nNode headroom after placements (reserves remain unavailable):\n")
+    for node_index in 0..cluster.nodes.len() {
+        let node = cluster.nodes[node_index]
+        let available_cpu = node.cpu_capacity_millis - node.reserved_cpu_millis
+        let available_memory = node.memory_capacity_mib - node.reserved_memory_mib
+        let used_cpu = available_cpu - plan.remaining_cpu_millis[node_index]
+        let used_memory = available_memory - plan.remaining_memory_mib[node_index]
+        out.write_str(
+            f"  {node.name}: {used_cpu}/{available_cpu} CPU-millis, {used_memory}/{available_memory} MiB\n".as_str(),
+        )
+    }
+}
+
+fn print_plan(out: borrow mut Stdout, plan: CapacityPlan)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Edge cluster capacity plan — Monday morning fixture\n")
+    out.write_str(
+        "Policy: priority then service ID; best fit by remaining CPU, memory, and node ID; replicas spread across zones when requested.\n\n",
+    )
+    for decision_index in 0..plan.decision_count {
+        match plan.decisions[decision_index] {
+            Some(decision) => print_decision(borrow mut out, decision)
+            None => {}
+        }
+    }
+    out.write_str(
+        f"\nResult: {plan.placed_count} replicas placed, {plan.held_count} held for review.\n".as_str(),
+    )
+    print_capacity(borrow mut out, plan)
+    out.write_str(
+        "\nThis is a deterministic planning suggestion; it does not reserve cluster resources.\n",
+    )
+}
+
+fn print_invalid_plan(out: borrow mut Stdout, error: PlanError)
+    effects { stdio.write, alloc }
+{
+    match error {
+        PlanError.DuplicateNodeId(node_id) => {
+            out.write_str(f"Plan rejected: duplicate node ID {node_id}\n".as_str())
+        }
+        PlanError.DuplicateServiceId(service_id) => {
+            out.write_str(f"Plan rejected: duplicate service ID {service_id}\n".as_str())
+        }
+        PlanError.CpuReserveExceedsCapacity(node_id) => {
+            out.write_str(f"Plan rejected: node {node_id} CPU reserve exceeds capacity\n".as_str())
+        }
+        PlanError.MemoryReserveExceedsCapacity(node_id) => {
+            out.write_str(
+                f"Plan rejected: node {node_id} memory reserve exceeds capacity\n".as_str(),
+            )
+        }
+        PlanError.InvalidReplicaCount(service_id) => {
+            out.write_str(
+                f"Plan rejected: service {service_id} must request 1–4 replicas\n".as_str(),
+            )
+        }
+        PlanError.EmptyResourceDemand(service_id) => {
+            out.write_str(
+                f"Plan rejected: service {service_id} has a zero CPU or memory request\n".as_str(),
+            )
+        }
+    }
+}
+
+pub fn print_monday_plan(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    match planner.plan_capacity(data.monday_morning()) {
+        Ok(plan) => print_plan(borrow mut out, plan)
+        Err(problem) => print_invalid_plan(borrow mut out, problem)
+    }
+}

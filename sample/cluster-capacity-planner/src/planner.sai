@@ -1,0 +1,324 @@
+use acme:cluster-capacity-planner/model.{
+    CapacityPlan
+    Cluster
+    HoldReason
+    PlanError
+    Priority
+    ReplicaDecision
+    ReplicaOutcome
+    ServiceDemand
+}
+
+fn priority_rank(priority: Priority) -> U8 {
+    match priority { Priority.Critical => 3, Priority.High => 2, Priority.Standard => 1 }
+}
+
+fn service_precedes(candidate: ServiceDemand, current: ServiceDemand) -> Bool {
+    let candidate_rank = priority_rank(candidate.priority)
+    let current_rank = priority_rank(current.priority)
+    candidate_rank > current_rank or (candidate_rank == current_rank and candidate.id < current.id)
+}
+
+fn validate(cluster: Cluster) -> Result<(), PlanError> {
+    for node_index in 0..cluster.nodes.len() {
+        let node = cluster.nodes[node_index]
+        if node.reserved_cpu_millis > node.cpu_capacity_millis {
+            return Err(PlanError.CpuReserveExceedsCapacity(node.id))
+        }
+        if node.reserved_memory_mib > node.memory_capacity_mib {
+            return Err(PlanError.MemoryReserveExceedsCapacity(node.id))
+        }
+        for prior_index in 0..node_index {
+            if cluster.nodes[prior_index].id == node.id {
+                return Err(PlanError.DuplicateNodeId(node.id))
+            }
+        }
+    }
+
+    for service_index in 0..cluster.services.len() {
+        let service = cluster.services[service_index]
+        if service.replica_count == 0 or service.replica_count > 4 {
+            return Err(PlanError.InvalidReplicaCount(service.id))
+        }
+        if service.cpu_millis_per_replica == 0 or service.memory_mib_per_replica == 0 {
+            return Err(PlanError.EmptyResourceDemand(service.id))
+        }
+        for prior_index in 0..service_index {
+            if cluster.services[prior_index].id == service.id {
+                return Err(PlanError.DuplicateServiceId(service.id))
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn fits(
+    node_index: USize,
+    service: ServiceDemand,
+    remaining_cpu_millis: Array<U32, 5>,
+    remaining_memory_mib: Array<U32, 5>,
+) -> Bool {
+    (
+        remaining_cpu_millis[node_index] >= service.cpu_millis_per_replica
+        and remaining_memory_mib[node_index] >= service.memory_mib_per_replica
+    )
+}
+
+fn has_capacity_candidate(
+    cluster: Cluster,
+    service: ServiceDemand,
+    remaining_cpu_millis: Array<U32, 5>,
+    remaining_memory_mib: Array<U32, 5>,
+) -> Bool {
+    var found = false
+    for node_index in 0..cluster.nodes.len() {
+        if (
+            cluster.nodes[node_index].pool == service.pool
+            and fits(node_index, service, remaining_cpu_millis, remaining_memory_mib)
+        ) {
+            found = true
+        }
+    }
+    found
+}
+
+fn zone_is_unused(used_zones: Array<Option<U8>, 4>, zone: U8) -> Bool {
+    var unused = true
+    for used_zone in used_zones {
+        match used_zone {
+            Some(previous) => {
+                if previous == zone {
+                    unused = false
+                }
+            }
+            None => {}
+        }
+    }
+    unused
+}
+
+fn node_is_better_fit(
+    cluster: Cluster,
+    service: ServiceDemand,
+    candidate_index: USize,
+    current_index: USize,
+    remaining_cpu_millis: Array<U32, 5>,
+    remaining_memory_mib: Array<U32, 5>,
+) -> Bool {
+    let candidate_cpu_after = remaining_cpu_millis[candidate_index] - service.cpu_millis_per_replica
+    let current_cpu_after = remaining_cpu_millis[current_index] - service.cpu_millis_per_replica
+    let candidate_memory_after =
+        remaining_memory_mib[candidate_index] - service.memory_mib_per_replica
+    let current_memory_after = remaining_memory_mib[current_index] - service.memory_mib_per_replica
+    (
+        candidate_cpu_after < current_cpu_after
+        or (
+            candidate_cpu_after == current_cpu_after
+            and (
+                candidate_memory_after < current_memory_after
+                or (
+                    candidate_memory_after == current_memory_after
+                    and cluster.nodes[candidate_index].id < cluster.nodes[current_index].id
+                )
+            )
+        )
+    )
+}
+
+fn choose_node(
+    cluster: Cluster,
+    service: ServiceDemand,
+    used_zones: Array<Option<U8>, 4>,
+    remaining_cpu_millis: Array<U32, 5>,
+    remaining_memory_mib: Array<U32, 5>,
+) -> Option<USize> {
+    var best: Option<USize> = None
+    for candidate_index in 0..cluster.nodes.len() {
+        let node = cluster.nodes[candidate_index]
+        if (
+            node.pool == service.pool
+            and fits(candidate_index, service, remaining_cpu_millis, remaining_memory_mib)
+            and (not service.spread_across_zones or zone_is_unused(used_zones, node.zone))
+        ) {
+            match best {
+                Some(current_index) => {
+                    if node_is_better_fit(
+                        cluster,
+                        service,
+                        candidate_index,
+                        current_index,
+                        remaining_cpu_millis,
+                        remaining_memory_mib,
+                    ) {
+                        best = Some(candidate_index)
+                    }
+                }
+                None => {
+                    best = Some(candidate_index)
+                }
+            }
+        }
+    }
+    best
+}
+
+fn hold_reason(
+    cluster: Cluster,
+    service: ServiceDemand,
+    remaining_cpu_millis: Array<U32, 5>,
+    remaining_memory_mib: Array<U32, 5>,
+) -> HoldReason {
+    var has_pool = false
+    for node in cluster.nodes {
+        if node.pool == service.pool {
+            has_pool = true
+        }
+    }
+
+    if not has_pool {
+        return HoldReason.NoCompatiblePool
+    }
+
+    if (
+        service.spread_across_zones
+        and has_capacity_candidate(cluster, service, remaining_cpu_millis, remaining_memory_mib)
+    ) {
+        return HoldReason.ReplicaSpreadLimit
+    }
+
+    HoldReason.CapacityExhausted
+}
+
+fn schedule_service(cluster: Cluster, service: ServiceDemand, plan: borrow mut CapacityPlan) {
+    var used_zones: Array<Option<U8>, 4> = [None, None, None, None]
+
+    for replica_index in 0..service.replica_count {
+        match choose_node(
+            cluster,
+            service,
+            used_zones,
+            plan.remaining_cpu_millis,
+            plan.remaining_memory_mib,
+        ) {
+            Some(node_index) => {
+                let node = cluster.nodes[node_index]
+                plan.remaining_cpu_millis[node_index] -= service.cpu_millis_per_replica
+                plan.remaining_memory_mib[node_index] -= service.memory_mib_per_replica
+                used_zones[replica_index] = Some(node.zone)
+                plan.decisions[plan.decision_count] = Some(
+                    ReplicaDecision(
+                        service_id: service.id,
+                        service_name: service.name,
+                        replica_index: replica_index + 1,
+                        priority: service.priority,
+                        outcome: ReplicaOutcome.Placed(node.id),
+                    ),
+                )
+                plan.decision_count += 1
+                plan.placed_count += 1
+            }
+            None => {
+                let reason = hold_reason(
+                    cluster,
+                    service,
+                    plan.remaining_cpu_millis,
+                    plan.remaining_memory_mib,
+                )
+                plan.decisions[plan.decision_count] = Some(
+                    ReplicaDecision(
+                        service_id: service.id,
+                        service_name: service.name,
+                        replica_index: replica_index + 1,
+                        priority: service.priority,
+                        outcome: ReplicaOutcome.Held(reason),
+                    ),
+                )
+                plan.decision_count += 1
+                plan.held_count += 1
+            }
+        }
+    }
+}
+
+pub fn plan_capacity(cluster: Cluster) -> Result<CapacityPlan, PlanError> {
+    match validate(cluster) { Ok(_) => {}, Err(problem) => return Err(problem) }
+
+    var plan = CapacityPlan(
+        decisions: [
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+        decision_count: 0,
+        remaining_cpu_millis: [
+            cluster.nodes[0].cpu_capacity_millis - cluster.nodes[0].reserved_cpu_millis,
+            cluster.nodes[1].cpu_capacity_millis - cluster.nodes[1].reserved_cpu_millis,
+            cluster.nodes[2].cpu_capacity_millis - cluster.nodes[2].reserved_cpu_millis,
+            cluster.nodes[3].cpu_capacity_millis - cluster.nodes[3].reserved_cpu_millis,
+            cluster.nodes[4].cpu_capacity_millis - cluster.nodes[4].reserved_cpu_millis,
+        ],
+        remaining_memory_mib: [
+            cluster.nodes[0].memory_capacity_mib - cluster.nodes[0].reserved_memory_mib,
+            cluster.nodes[1].memory_capacity_mib - cluster.nodes[1].reserved_memory_mib,
+            cluster.nodes[2].memory_capacity_mib - cluster.nodes[2].reserved_memory_mib,
+            cluster.nodes[3].memory_capacity_mib - cluster.nodes[3].reserved_memory_mib,
+            cluster.nodes[4].memory_capacity_mib - cluster.nodes[4].reserved_memory_mib,
+        ],
+        placed_count: 0,
+        held_count: 0,
+    )
+
+    var scheduled: Array<Bool, 6> = [false, false, false, false, false, false]
+    for _ in 0..cluster.services.len() {
+        var next_service: Option<USize> = None
+        for candidate_index in 0..cluster.services.len() {
+            if not scheduled[candidate_index] {
+                match next_service {
+                    Some(current_index) => {
+                        if service_precedes(
+                            cluster.services[candidate_index],
+                            cluster.services[current_index],
+                        ) {
+                            next_service = Some(candidate_index)
+                        }
+                    }
+                    None => {
+                        next_service = Some(candidate_index)
+                    }
+                }
+            }
+        }
+
+        match next_service {
+            Some(service_index) => {
+                scheduled[service_index] = true
+                schedule_service(cluster, cluster.services[service_index], borrow mut plan)
+            }
+            None => {}
+        }
+    }
+
+    Ok(plan)
+}
