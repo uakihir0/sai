@@ -19181,6 +19181,19 @@ fn unary_not_arguments_to_direct_calls_remain_behind_the_stage_gate() {
 fn unary_bitwise_not_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
     let source = concat!(
         "pub fn bitnot_path(value: I32) -> I32 { identity_i32(~value) }\n",
+        "pub fn bitnot_direct_integer_literal_local() -> I16 {\n",
+        "    let source = 7\n",
+        "    identity_i16(~source)\n",
+        "}\n",
+        "pub fn bitnot_nested_direct_integer_literal_local() -> U16 {\n",
+        "    let source = 7\n",
+        "    identity_u16(identity_u16(~source))\n",
+        "}\n",
+        "pub fn bitnot_direct_integer_literal_alias() -> I32 {\n",
+        "    let source = 7\n",
+        "    let alias = source\n",
+        "    identity_i32(~alias)\n",
+        "}\n",
         "pub fn nested_bitnot_local(value: Byte) -> Byte {\n",
         "    let copy = value\n",
         "    identity_byte(identity_byte(~copy))\n",
@@ -19199,6 +19212,8 @@ fn unary_bitwise_not_path_arguments_to_direct_calls_remain_behind_the_stage_gate
         "    identity_i32(identity_i32(identity_i32(~value)))\n",
         "}\n",
         "fn identity_i32(value: I32) -> I32 { value }\n",
+        "fn identity_i16(value: I16) -> I16 { value }\n",
+        "fn identity_u16(value: U16) -> U16 { value }\n",
         "fn identity_byte(value: Byte) -> Byte { value }\n",
         "fn generic_identity<T>(value: T) -> I32 { 0 }\n",
     );
