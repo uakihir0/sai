@@ -2572,10 +2572,27 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         operand: &'hir Expr<'hir>,
         expression: HirId,
     ) -> Result<LocalType, ()> {
+        let source_type = self.check_local_path(operand)?;
+        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+        if let LocalType::LiteralVariable(id) = source_type {
+            let is_direct_integer_literal_source = self
+                .direct_unannotated_integer_literals
+                .contains(&source_binding);
+            if is_direct_integer_literal_source
+                && self.literal_variables.get(id).is_some_and(|variable| {
+                    variable.kind == PrimitiveLiteralKind::Integer && variable.resolved.is_none()
+                })
+            {
+                // A direct integer literal local can share its inference
+                // variable with this BitNot result. The enclosing call's
+                // parameter expectation resolves both facts and performs the
+                // range check at the source literal.
+                return Ok(source_type);
+            }
+        }
+
         let operand_type = self
-            .check_local_path(operand)
-            .ok()
-            .and_then(|local_type| self.concrete_local_type(local_type))
+            .concrete_local_type(source_type)
             .filter(|primitive| supports_primitive_literal(*primitive))
             .ok_or(())?;
         if !is_bitwise_primitive(operand_type) {
