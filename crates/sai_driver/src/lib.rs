@@ -9437,6 +9437,10 @@ fn primitive_body_errors_to_diagnostics(
         matches!(
             error.kind,
             sai_ty::typeck::body::PrimitiveBodyErrorKind::DeferredOperatorTraitNotSupported { .. }
+                | sai_ty::typeck::body::PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                    operator: UnOp::Neg,
+                    ..
+                }
         )
     });
     let mut diagnostics = Vec::with_capacity(errors.len());
@@ -48830,6 +48834,541 @@ property "shared"() {}
             ),
             "signed integer facts retain their exact canonical type"
         );
+    }
+
+    #[test]
+    fn primitive_body_type_results_defer_negation_of_flat_local_literals() {
+        use sai_resolve::package_scopes::{PathRes, Res};
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub fn default_integer() -> I64 {\n",
+            "    let source = 7\n",
+            "    let result = -source\n",
+            "    let returned: I64 = 0\n",
+            "    returned\n",
+            "}\n",
+            "pub fn default_float() -> F64 {\n",
+            "    let source = 1.5\n",
+            "    let result = -source\n",
+            "    let returned: F64 = 0.0\n",
+            "    returned\n",
+            "}\n",
+            "pub fn annotated_i32() -> I32 {\n",
+            "    let source = 7\n",
+            "    let result: I32 = -source\n",
+            "    result\n",
+            "}\n",
+            "pub fn annotated_f32() -> F32 {\n",
+            "    let source = 1.5\n",
+            "    let result: F32 = -source\n",
+            "    result\n",
+            "}\n",
+            "pub fn tail_inferred() -> I16 {\n",
+            "    let source = 7\n",
+            "    let copied = source\n",
+            "    let result = -copied\n",
+            "    result\n",
+            "}\n",
+            "pub fn shadowed_alias(source: F64) -> I32 {\n",
+            "    let integer = 7\n",
+            "    let source = integer\n",
+            "    let result = -source\n",
+            "    result\n",
+            "}\n",
+            "pub fn unsigned_annotation() -> U8 {\n",
+            "    let source = 7\n",
+            "    let result: U8 = -source\n",
+            "    let valid: U8 = 1\n",
+            "    valid\n",
+            "}\n",
+            "pub fn unsigned_tail() -> U8 {\n",
+            "    let source = 7\n",
+            "    let result = -source\n",
+            "    let valid: U8 = 1\n",
+            "    result\n",
+            "}\n",
+            "pub fn unsigned_range_and_negation_order() -> U8 {\n",
+            "    let source = 256\n",
+            "    let negated = -source\n",
+            "    let constrained: U8 = source\n",
+            "    let valid: U8 = 1\n",
+            "    valid\n",
+            "}\n",
+            "pub fn positive_i64_boundary() -> I64 {\n",
+            "    let source = 9223372036854775808\n",
+            "    let result = -source\n",
+            "    let returned: I64 = 0\n",
+            "    returned\n",
+            "}\n",
+            "pub fn compound_operand(source: I32) -> I32 {\n",
+            "    let result = -(source + 1)\n",
+            "    result\n",
+            "}\n",
+            "pub fn call_operand(source: I32) -> I32 {\n",
+            "    let result = -identity_i32(source)\n",
+            "    result\n",
+            "}\n",
+            "pub fn compound_source() -> I32 {\n",
+            "    let source = 1 + 2\n",
+            "    let result = -source\n",
+            "    result\n",
+            "}\n",
+            "pub fn double_negation() -> I32 {\n",
+            "    let source = 1\n",
+            "    let result = - -source\n",
+            "    result\n",
+            "}\n",
+            "pub fn negated_result_alias() -> I32 {\n",
+            "    let source = 1\n",
+            "    let result = -source\n",
+            "    let second = -result\n",
+            "    second\n",
+            "}\n",
+            "pub fn mutable_source() -> I32 {\n",
+            "    var source = 1\n",
+            "    let result = -source\n",
+            "    result\n",
+            "}\n",
+            "pub fn deep_nested_source() -> I32 {\n",
+            "    let source = 1\n",
+            "    let result = {\n",
+            "        let copied = source\n",
+            "        -copied\n",
+            "    }\n",
+            "    result\n",
+            "}\n",
+            "pub fn forward_source() -> I32 {\n",
+            "    let result = -source\n",
+            "    let source = 1\n",
+            "    result\n",
+            "}\n",
+            "const GLOBAL: I32 = 1\n",
+            "pub fn global_source() -> I32 {\n",
+            "    let result = -GLOBAL\n",
+            "    result\n",
+            "}\n",
+            "pub fn identity_i32(value: I32) -> I32 { value }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{name}` is present"))
+        }
+
+        fn binding_named(
+            database: &RootDatabase,
+            owner: &FunctionOwnerResolution,
+            name: &str,
+        ) -> Vec<sai_hir::BindingId> {
+            let mut bindings = owner
+                .local_resolution()
+                .expect("local results belong to this owner")
+                .expect("owner locals were resolved")
+                .bindings
+                .iter()
+                .filter_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved| resolved.as_ref() == name)
+                            .map(|_| *binding)
+                    })
+                })
+                .collect::<Vec<_>>();
+            bindings.sort_by_key(|binding| binding.raw());
+            bindings
+        }
+
+        let assert_supported = |name: &str, expected_codes: &[sai_diagnostics::Code]| {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } =
+                owner.body_type_check().expect("body check is available")
+            else {
+                panic!("function `{name}` remains in the supported flat-body slice");
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                expected_codes,
+                "diagnostics for `{name}`: {diagnostics:?}"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("supported owner has no projection error")
+                .expect("supported owner publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+            (owner, results)
+        };
+
+        for (name, expected) in [
+            ("default_integer", PrimTy::I64),
+            ("default_float", PrimTy::F64),
+        ] {
+            let (owner, results) = assert_supported(name, &[]);
+            for local in ["source", "result"] {
+                let bindings = binding_named(&database, owner, local);
+                let [binding] = bindings.as_slice() else {
+                    panic!("{name}: exactly one `{local}` binding exists");
+                };
+                assert_eq!(
+                    results.binding_type(*binding),
+                    Some(expected),
+                    "{name}/{local}"
+                );
+            }
+        }
+        for (name, result_type, source_type) in [
+            ("annotated_i32", PrimTy::I32, PrimTy::I32),
+            ("annotated_f32", PrimTy::F32, PrimTy::F32),
+            ("tail_inferred", PrimTy::I16, PrimTy::I16),
+        ] {
+            let (owner, results) = assert_supported(name, &[]);
+            for local in ["source", "result"] {
+                let bindings = binding_named(&database, owner, local);
+                let [binding] = bindings.as_slice() else {
+                    panic!("{name}: exactly one `{local}` binding exists");
+                };
+                let expected = if local == "source" {
+                    source_type
+                } else {
+                    result_type
+                };
+                assert_eq!(
+                    results.binding_type(*binding),
+                    Some(expected),
+                    "{name}/{local}"
+                );
+            }
+        }
+
+        let (shadowed_owner, shadowed_results) = assert_supported("shadowed_alias", &[]);
+        let source_bindings = binding_named(&database, shadowed_owner, "source");
+        let [outer_source, inner_source] = source_bindings.as_slice() else {
+            panic!("the local shadow creates two distinct source bindings");
+        };
+        assert_ne!(outer_source, inner_source);
+        assert_eq!(
+            shadowed_results.binding_type(*outer_source),
+            Some(PrimTy::F64)
+        );
+        assert_eq!(
+            shadowed_results.binding_type(*inner_source),
+            Some(PrimTy::I32)
+        );
+        let integer_bindings = binding_named(&database, shadowed_owner, "integer");
+        let [integer] = integer_bindings.as_slice() else {
+            panic!("the unannotated integer source binding exists");
+        };
+        assert_eq!(shadowed_results.binding_type(*integer), Some(PrimTy::I32));
+
+        for name in ["unsigned_annotation", "unsigned_tail"] {
+            let (owner, results) =
+                assert_supported(name, &[sai_diagnostics::Code::OperatorNotSupported]);
+            let diagnostic = owner.body_type_check().expect("body check is available");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = diagnostic else {
+                unreachable!();
+            };
+            assert_eq!(
+                diagnostics[0].message, "operator `-` has no `Neg` implementation for `U8`",
+                "{name}"
+            );
+            let declaration = if name == "unsigned_annotation" {
+                "let result: U8 = -source"
+            } else {
+                "let result = -source"
+            };
+            let function_start = root
+                .find(&format!("pub fn {name}"))
+                .expect("the unsigned function exists");
+            let unary_start = root[function_start..]
+                .find(declaration)
+                .map(|offset| function_start + offset)
+                .expect("the constrained unary initializer exists")
+                + declaration
+                    .find("-source")
+                    .expect("the unary operator is present");
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("unsupported unary diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(unary_start as u32),
+                    sai_diagnostics::TextSize::new((unary_start + "-source".len()) as u32),
+                )
+                .expect("the unary expression span is ordered"),
+                "{name}"
+            );
+            let source_bindings = binding_named(&database, owner, "source");
+            let [source] = source_bindings.as_slice() else {
+                panic!("{name}: the original source remains a binding");
+            };
+            let valid_bindings = binding_named(&database, owner, "valid");
+            let [valid] = valid_bindings.as_slice() else {
+                panic!("{name}: the independent recovery sibling remains a binding");
+            };
+            assert_eq!(results.binding_type(*source), Some(PrimTy::U8), "{name}");
+            assert_eq!(results.binding_type(*valid), Some(PrimTy::U8), "{name}");
+            if name == "unsigned_tail" {
+                let result_bindings = binding_named(&database, owner, "result");
+                let [result] = result_bindings.as_slice() else {
+                    panic!("the inferred result binding exists");
+                };
+                assert_eq!(
+                    results.binding_type(*result),
+                    None,
+                    "an unsupported inferred unary result is tainted"
+                );
+            }
+        }
+
+        let (range_and_negation_owner, _) = assert_supported(
+            "unsigned_range_and_negation_order",
+            &[
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::OperatorNotSupported,
+            ],
+        );
+        let FunctionBodyTypeCheck::Supported { diagnostics } = range_and_negation_owner
+            .body_type_check()
+            .expect("range and Neg body check is available")
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "integer literal is out of range for `U8`",
+                "operator `-` has no `Neg` implementation for `U8`",
+            ]
+        );
+        let range_function_start = root
+            .find("pub fn unsigned_range_and_negation_order")
+            .expect("the combined range and Neg function exists");
+        let range_literal_start = root[range_function_start..]
+            .find("let source = 256")
+            .map(|offset| range_function_start + offset + "let source = ".len())
+            .expect("the source literal exists");
+        let negation_start = root[range_function_start..]
+            .find("let negated = -source")
+            .map(|offset| range_function_start + offset + "let negated = ".len())
+            .expect("the unary initializer exists");
+        for (diagnostic, start, len) in [
+            (&diagnostics[0], range_literal_start, "256".len()),
+            (&diagnostics[1], negation_start, "-source".len()),
+        ] {
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("deferred type error has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + len) as u32),
+                )
+                .expect("diagnostic span is ordered")
+            );
+        }
+
+        let (boundary_owner, _) = assert_supported(
+            "positive_i64_boundary",
+            &[sai_diagnostics::Code::LiteralOutOfRange],
+        );
+        let FunctionBodyTypeCheck::Supported { diagnostics } = boundary_owner
+            .body_type_check()
+            .expect("boundary body check is available")
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            diagnostics[0].message,
+            "integer literal is out of range for `I64`"
+        );
+        let boundary_start = root
+            .find("let source = 9223372036854775808")
+            .expect("the positive boundary literal is present")
+            + "let source = ".len();
+        assert_eq!(
+            diagnostics[0]
+                .primary()
+                .expect("the source literal range error has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(boundary_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (boundary_start + "9223372036854775808".len()) as u32
+                ),
+            )
+            .expect("the boundary literal span is ordered")
+        );
+
+        let annotated_owner = owner_named(&database, &resolved, "annotated_i32");
+        let descriptor = *collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.owner == annotated_owner.owner())
+            .expect("the annotated function has a top-level descriptor");
+        let owner_inputs = database
+            .current_owner_inputs(&snapshot, descriptor.file, &collection.target_cfg)
+            .expect("owner inputs are current");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&annotated_owner.owner().def_id.package())
+                .expect("the owner package has a definition-path interner"),
+        );
+        let arena = HirArena::new();
+        let lowering_context = HirLoweringContext::new(
+            &owner_inputs.ast_ids,
+            &snapshot,
+            &owner_inputs.root,
+            &arena,
+            &database.symbols,
+            &def_paths,
+        );
+        let (hir_owner, source_map) = lower_top_level_owner(
+            descriptor,
+            &def_paths
+                .resolve_def_id(annotated_owner.owner().def_id.to_def_id())
+                .expect("the owner path resolves")
+                .expect("the owner path exists"),
+            &owner_inputs.filtered_item_tree,
+            &owner_inputs.retained_item_kinds,
+            &lowering_context,
+        )
+        .expect("the annotated owner lowers");
+        assert_eq!(hir_owner.id, annotated_owner.owner());
+        let unary_start = root
+            .find("let result: I32 = -source")
+            .expect("the annotated negation initializer is present")
+            + "let result: I32 = ".len();
+        let local_paths = annotated_owner
+            .local_resolution()
+            .expect("annotated owner locals are available")
+            .expect("annotated owner has locals");
+        let ids_at_range = |start: usize, len: usize| {
+            let range = sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(start as u32),
+                sai_diagnostics::TextSize::new((start + len) as u32),
+            )
+            .expect("expression span is ordered");
+            source_map
+                .node_to_syntax()
+                .iter_enumerated()
+                .filter_map(|(local_id, pointer)| {
+                    (pointer.text_range() == range).then_some(sai_hir::HirId {
+                        owner: annotated_owner.owner(),
+                        local_id,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let unary_ids = ids_at_range(unary_start, "-source".len());
+        let [unary_id] = unary_ids.as_slice() else {
+            panic!("the unary expression has one exact HIR node");
+        };
+        let source_span_ids = ids_at_range(unary_start + 1, "source".len());
+        let annotated_results = annotated_owner
+            .primitive_body_type_results()
+            .expect("annotated owner results are available")
+            .expect("annotated owner publishes results");
+        assert_eq!(
+            annotated_results.expression_type(*unary_id),
+            Some(PrimTy::I32)
+        );
+        let source_bindings = binding_named(&database, annotated_owner, "source");
+        let [source_binding] = source_bindings.as_slice() else {
+            panic!("the exact source binding exists");
+        };
+        assert!(source_span_ids.iter().any(|hir_id| {
+            matches!(
+                local_paths.paths.get(hir_id),
+                Some(PathRes {
+                    base: Res::Local(binding),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                }) if binding == source_binding
+            )
+        }));
+        let source_expression_facts = source_span_ids
+            .iter()
+            .filter(|hir_id| annotated_results.expression_type(**hir_id) == Some(PrimTy::I32))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_expression_facts.len(),
+            1,
+            "the exact operand expression retains its I32 fact"
+        );
+
+        for name in [
+            "compound_operand",
+            "call_operand",
+            "compound_source",
+            "double_negation",
+            "negated_result_alias",
+            "mutable_source",
+            "deep_nested_source",
+            "forward_source",
+            "global_source",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("owner projection query succeeds")
+                    .is_none(),
+                "unsupported shape `{name}` remains outside the primitive local checker"
+            );
+        }
     }
 
     #[test]

@@ -3765,6 +3765,8 @@ negation, and deeper scopes remain gated. CLI Stage 0 stays unchanged, and no
 lowering or runtime behavior is added. These inference, source-preservation,
 shape, recovery/fact, and stage-boundary decisions are **Review required**. See
 spec/06 §§6.8.6 and 6.8.10 and [the IR-991 implementation review](../design/implementation-review.md#ir-991-2026-10-27-deferred-unary-negation-of-flat-local-literals).
+When a later unsigned constraint also makes the source literal out of range,
+the source-literal and unary-operator diagnostics retain source order.
 
 **IR-991 implementation plan.** (1) Add a deferred `Neg` site attached to the
 source literal variable and reuse that variable as the initializer result.
