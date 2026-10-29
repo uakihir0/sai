@@ -11307,10 +11307,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
             "}\n",
         ),
         concat!(
-            "pub fn first(value: I32) -> I32 { value }\n",
-            "pub fn second(value: I32) -> I32 { value }\n",
-        ),
-        concat!(
             "@target(\"wasm64-core\")\n",
             "pub fn filtered(value: I32) -> I32 { value }\n",
             "pub fn identity(value: I32) -> I32 { value }\n",
@@ -11321,6 +11317,26 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
             "function body outside the direct parameter slice",
         );
     }
+}
+
+#[test]
+fn multiple_supported_public_function_bodies_emit_check_result() {
+    let output = run_check(
+        concat!(
+            "pub fn first(value: I32) -> I32 { value }\n",
+            "pub fn second(value: I32) -> I32 { value }\n",
+        ),
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("\"type\":\"result\",\"kind\":\"check\"")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "complete supported functions should produce a check result:\n{stdout}"
+    );
 }
 
 #[cfg(all(

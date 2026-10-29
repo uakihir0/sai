@@ -1740,7 +1740,7 @@ fn run_check(
     let profile = check_profile_override(command).unwrap_or_else(|| "dev".to_owned());
     let root_analysis_is_covered = root_coverage.empty_root_module_only_covered
         || root_coverage.public_primitive_const_set_covered
-        || root_coverage.single_public_function_body_covered
+        || root_coverage.public_function_body_set_covered
         || root_coverage.single_public_inherent_method_body_covered;
     let check_slice_is_supported = root_analysis_is_covered
         && empty_root_manifest_supported
@@ -2031,7 +2031,7 @@ fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize>
     (const_count > 0).then_some(const_count)
 }
 
-fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
+fn check_source_is_unattributed_public_function_set(source: &[u8]) -> bool {
     use sai_syntax::ast::AstNode as _;
     use sai_syntax::ast::CallExpr;
 
@@ -2051,19 +2051,25 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     {
         return false;
     }
-    let mut items = source_file.items();
-    let Some(sai_syntax::ast::Item::Function(function)) = items.next() else {
-        return false;
-    };
-    items.next().is_none()
-        && function.attrs().next().is_none()
-        && !function
-            .syntax()
-            .descendants()
-            .any(|node| CallExpr::can_cast(node.kind()))
-        && function
-            .visibility()
-            .is_some_and(|visibility| visibility.pub_token().is_some())
+    let mut function_count = 0usize;
+    for item in source_file.items() {
+        let sai_syntax::ast::Item::Function(function) = item else {
+            return false;
+        };
+        if function.attrs().next().is_some()
+            || function
+                .syntax()
+                .descendants()
+                .any(|node| CallExpr::can_cast(node.kind()))
+            || !function
+                .visibility()
+                .is_some_and(|visibility| visibility.pub_token().is_some())
+        {
+            return false;
+        }
+        function_count = function_count.saturating_add(1);
+    }
+    function_count > 0
 }
 
 fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> bool {
@@ -2500,19 +2506,12 @@ fn check_flat_unused_bindings(
     )
 }
 
-fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
-    use sai_syntax::ast::{self, AstNode as _};
+fn check_function_body_matches_unused_variable_gate(
+    function: sai_syntax::ast::FnDecl,
+) -> Option<bool> {
+    use sai_syntax::ast;
+    use sai_syntax::ast::AstNode as _;
 
-    let parsed = sai_fmt::parse_source(source).ok()?;
-    let source_file = ast::SourceFile::cast(parsed.root().clone())?;
-    let mut functions = source_file
-        .syntax()
-        .descendants()
-        .filter_map(ast::FnDecl::cast);
-    let function = functions.next()?;
-    if functions.next().is_some() {
-        return None;
-    }
     let parameters = function.params()?;
     let has_parameters = parameters.self_param().is_some() || parameters.params().next().is_some();
     let body = function.body()?;
@@ -2625,6 +2624,41 @@ fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
     })
 }
 
+fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
+    use sai_syntax::ast::{self, AstNode as _};
+
+    let parsed = sai_fmt::parse_source(source).ok()?;
+    let source_file = ast::SourceFile::cast(parsed.root().clone())?;
+    let mut functions = source_file
+        .syntax()
+        .descendants()
+        .filter_map(ast::FnDecl::cast);
+    let function = functions.next()?;
+    if functions.next().is_some() {
+        return None;
+    }
+    check_function_body_matches_unused_variable_gate(function)
+}
+
+fn check_function_set_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
+    use sai_syntax::ast::{self, AstNode as _};
+
+    let parsed = sai_fmt::parse_source(source).ok()?;
+    let source_file = ast::SourceFile::cast(parsed.root().clone())?;
+    let mut function_count = 0usize;
+    for item in source_file.items() {
+        let ast::Item::Function(function) = item else {
+            return None;
+        };
+        function_count = function_count.saturating_add(1);
+        match check_function_body_matches_unused_variable_gate(function)? {
+            true => return Some(true),
+            false => {}
+        }
+    }
+    (function_count > 0).then_some(false)
+}
+
 fn check_public_primitive_const_set_coverage(
     source_count: usize,
     scopes: &sai_driver::Phase1PackageScopes,
@@ -2668,26 +2702,38 @@ fn check_public_function_body_coverage(
     if !source_is_candidate
         || scopes.modules.len() != 1
         || !scopes.modules[0].imports.is_empty()
-        || scopes.top_level_owners.len() != 1
-        || function_resolutions.owners().len() != 1
-        || scopes.top_level_owners[0].kind != sai_driver::TopLevelOwnerKind::Function
+        || scopes.top_level_owners.is_empty()
+        || scopes.top_level_owners.len() != function_resolutions.owners().len()
+        || scopes
+            .top_level_owners
+            .iter()
+            .any(|descriptor| descriptor.kind != sai_driver::TopLevelOwnerKind::Function)
     {
         return false;
     }
-    let owner = &function_resolutions.owners()[0];
-    if owner.owner() != scopes.top_level_owners[0].owner {
-        return false;
+    let mut owner_ids = HashSet::with_capacity(scopes.top_level_owners.len());
+    for descriptor in &scopes.top_level_owners {
+        if !owner_ids.insert(descriptor.owner) {
+            return false;
+        }
     }
-    owner
-        .body_type_check()
-        .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
-        && owner
-            .local_resolution()
-            .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
-        && owner
-            .resolution()
-            .is_ok_and(|resolution| resolution.diagnostics.is_empty())
-        && owner.lowering_diagnostics().is_empty()
+    for owner in function_resolutions.owners() {
+        if !owner_ids.remove(&owner.owner())
+            || !owner
+                .body_type_check()
+                .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
+            || !owner
+                .local_resolution()
+                .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
+            || !owner
+                .resolution()
+                .is_ok_and(|resolution| resolution.diagnostics.is_empty())
+            || !owner.lowering_diagnostics().is_empty()
+        {
+            return false;
+        }
+    }
+    owner_ids.is_empty()
 }
 
 fn check_public_inherent_method_body_coverage(
@@ -6160,7 +6206,7 @@ struct CheckWorkspaceDiagnostics {
 struct CheckRootCoverage {
     empty_root_module_only_covered: bool,
     public_primitive_const_set_covered: bool,
-    single_public_function_body_covered: bool,
+    public_function_body_set_covered: bool,
     single_public_inherent_method_body_covered: bool,
 }
 
@@ -6514,7 +6560,7 @@ fn module_tree_workspace_check_diagnostics(
     } else {
         None
     };
-    let root_single_function_source_candidate = root_const_input_shape
+    let root_public_function_set_source_candidate = root_const_input_shape
         && inputs[0]
             .source_inputs
             .first()
@@ -6525,7 +6571,7 @@ fn module_tree_workspace_check_diagnostics(
                     format!("{}/lib.sai", inputs[0].source_directory)
                 };
                 path == &root_source_path
-                    && check_source_is_single_unattributed_public_function(source.as_ref())
+                    && check_source_is_unattributed_public_function_set(source.as_ref())
             });
     let root_single_inherent_method_source_candidate = root_const_input_shape
         && inputs[0]
@@ -6541,7 +6587,7 @@ fn module_tree_workspace_check_diagnostics(
                     && check_source_is_single_unattributed_public_inherent_method(source.as_ref())
             });
     let mut public_primitive_const_set_covered = false;
-    let mut single_public_function_body_covered = false;
+    let mut public_function_body_set_covered = false;
     let mut single_public_inherent_method_body_covered = false;
     let mut database = RootDatabase::new()
         .map_err(|error| format!("could not initialize query database: {error:?}"))?;
@@ -7131,7 +7177,7 @@ fn module_tree_workspace_check_diagnostics(
                         .iter()
                         .any(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Function);
                 let function_resolutions =
-                    if root_single_function_source_candidate || has_local_enum_and_function {
+                    if root_public_function_set_source_candidate || has_local_enum_and_function {
                         Some(
                             database
                                 .resolve_function_owner_analyses(
@@ -7186,7 +7232,7 @@ fn module_tree_workspace_check_diagnostics(
                     infos = infos.saturating_add(enum_call_infos);
                 }
 
-                if root_single_function_source_candidate
+                if root_public_function_set_source_candidate
                     && let Some(function_resolutions) = &function_resolutions
                 {
                     let mut body_diagnostics = Vec::new();
@@ -7219,13 +7265,13 @@ fn module_tree_workspace_check_diagnostics(
                     warnings = warnings.saturating_add(body_warnings);
                     infos = infos.saturating_add(body_infos);
 
-                    if root_single_function_source_candidate
+                    if root_public_function_set_source_candidate
                         && (body_errors > 0
                             || inputs[0]
                                 .source_inputs
                                 .first()
                                 .is_some_and(|(_, _, source)| {
-                                    check_body_matches_unused_variable_gate(source.as_ref())
+                                    check_function_set_matches_unused_variable_gate(source.as_ref())
                                         == Some(false)
                                 }))
                         && check_public_function_body_coverage(
@@ -7234,7 +7280,7 @@ fn module_tree_workspace_check_diagnostics(
                             &function_resolutions,
                         )
                     {
-                        single_public_function_body_covered = true;
+                        public_function_body_set_covered = true;
                     }
                 }
 
@@ -7928,7 +7974,7 @@ fn module_tree_workspace_check_diagnostics(
         root_coverage: CheckRootCoverage {
             empty_root_module_only_covered,
             public_primitive_const_set_covered,
-            single_public_function_body_covered,
+            public_function_body_set_covered,
             single_public_inherent_method_body_covered,
         },
     })
@@ -16544,6 +16590,141 @@ mod tests {
             fs::read(&source_path).expect("source remains unchanged"),
             original_source
         );
+    }
+
+    #[test]
+    fn check_accepts_multiple_supported_public_function_bodies() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        set_check_targets(&package, "wasm32-core");
+        fs::write(
+            package.join("src/lib.sai"),
+            b"pub fn first() -> I32 { 1 }\npub fn second() -> Bool { true }\n",
+        )
+        .expect("write supported function set");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package.to_str().expect("package path is UTF-8"),
+            "check",
+        ]);
+
+        assert_eq!(exit_code, 0, "{stdout}");
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"command\":\"check\""));
+        assert!(stdout.contains("\"type\":\"result\",\"kind\":\"check\""));
+        assert!(!stdout.contains("FEATURE_NOT_IMPLEMENTED"));
+    }
+
+    #[test]
+    fn check_reports_body_errors_across_multiple_supported_public_functions() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        set_check_targets(&package, "wasm32-core");
+        fs::write(
+            package.join("src/lib.sai"),
+            b"pub fn first() -> I32 { true }\npub fn second() -> Bool { 1 }\n",
+        )
+        .expect("write mismatched function set");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package.to_str().expect("package path is UTF-8"),
+            "check",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "TYPE_MISMATCH").len(),
+            2,
+            "{stdout}"
+        );
+        assert!(!stdout.contains("FEATURE_NOT_IMPLEMENTED"), "{stdout}");
+        assert!(!stdout.contains("\"type\":\"result\""), "{stdout}");
+    }
+
+    #[test]
+    fn check_keeps_the_feature_gate_when_one_public_function_is_unsupported() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        set_check_targets(&package, "wasm32-core");
+        fs::write(
+            package.join("src/lib.sai"),
+            b"pub fn supported() -> I32 { 1 }\npub fn unsupported() -> I32 { 1 + 2 }\n",
+        )
+        .expect("write mixed supported and unsupported function set");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package.to_str().expect("package path is UTF-8"),
+            "check",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"type\":\"result\""), "{stdout}");
+    }
+
+    #[test]
+    fn check_keeps_the_feature_gate_when_a_later_function_matches_unused_variable_boundary() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        set_check_targets(&package, "wasm32-core");
+        fs::write(
+            package.join("src/lib.sai"),
+            b"pub fn supported() -> I32 { 1 }\npub fn gated(value: I32) -> I32 {\n    let unused = 3\n    value\n}\n",
+        )
+        .expect("write function set with a gated later body");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package.to_str().expect("package path is UTF-8"),
+            "check",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"type\":\"result\""), "{stdout}");
+    }
+
+    #[test]
+    fn check_keeps_the_feature_gate_when_a_function_set_includes_a_private_function() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        set_check_targets(&package, "wasm32-core");
+        fs::write(
+            package.join("src/lib.sai"),
+            b"pub fn supported() -> I32 { 1 }\nfn private() -> I32 { 1 }\n",
+        )
+        .expect("write function set with a private function");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package.to_str().expect("package path is UTF-8"),
+            "check",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"type\":\"result\""), "{stdout}");
     }
 
     #[test]
