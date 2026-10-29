@@ -92,11 +92,19 @@ if args == ["--format=json", "explain", "--list"]:
     print(line(summary()).rstrip("\\n"))
     raise SystemExit(0)
 
-if args == [
+stdin_check_args = [
     "--format=json", "--max-errors=0", "fmt", "--check",
     "--stdin-kind", "source", "-",
-]:
-    formatter_input = sys.stdin.buffer.read()
+]
+package_check_args = ["--format=json", "--max-errors=0", "fmt", "--check"]
+is_package_check = args == package_check_args
+if args == stdin_check_args or is_package_check:
+    formatter_input = (
+        Path("src/lib.sai").read_bytes() if is_package_check
+        else sys.stdin.buffer.read()
+    )
+    formatter_path = "src/lib.sai" if is_package_check else "<stdin>"
+    formatter_file_count = 2 if is_package_check else 1
     try:
         receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -113,7 +121,8 @@ if args == [
         receipt.setdefault("formatter_check_inputs", []).append(
             formatter_input.decode("utf-8")
         )
-        receipt["formatter_check_argv"] = args
+        receipt.setdefault("formatter_check_argvs", []).append(args)
+        receipt.setdefault("formatter_check_paths", []).append(formatter_path)
     Path(RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
     if is_fmt_fixture_check:
         if MODE == "fmt_check_malformed":
@@ -172,7 +181,14 @@ if args == [
             if (input_lines[index] if index < len(input_lines) else None)
             != (output_lines[index] if index < len(output_lines) else None)
         ), None)
-        forced_canonical_diagnostic = MODE == "fmt_check_canonical_diagnostic"
+        forced_canonical_diagnostic = (
+            MODE == "fmt_check_canonical_diagnostic"
+            or (
+                is_package_check
+                and MODE == "fmt_check_package_manifest_diagnostic"
+                and formatter_input == EXPECTED_FORMATTED
+            )
+        )
         diagnostics = []
         if difference is not None or forced_canonical_diagnostic:
             line_number = 1 if difference is None else difference + 1
@@ -199,7 +215,7 @@ if args == [
             diagnostic = {{
                 "type":"diagnostic","code":"UNFORMATTED_FILE","severity":"error",
                 "level":None,"message":"file is not formatted","primary":{{
-                    "file":{{"path":"<stdin>","package":None,"snapshot":None}},
+                    "file":{{"path":formatter_path,"package":None,"snapshot":None}},
                     "start":start_position,
                     "end":end_position
                 }},"primary_label":"","labels":[],
@@ -228,6 +244,14 @@ if args == [
                 diagnostic["primary"]["end"]["utf16_col"] += 1
             if MODE == "fmt_check_wrong_data":
                 diagnostic["data"]["expected"] = "different"
+            if is_package_check and MODE == "fmt_check_package_wrong_path":
+                diagnostic["primary"]["file"]["path"] = "src/other.sai"
+            if (
+                is_package_check
+                and MODE == "fmt_check_package_manifest_diagnostic"
+                and formatter_input == EXPECTED_FORMATTED
+            ):
+                diagnostic["primary"]["file"]["path"] = "sai.package"
             diagnostics = [diagnostic]
             if MODE == "fmt_check_extra_diagnostic":
                 diagnostics.append(json.loads(json.dumps(diagnostic)))
@@ -240,16 +264,30 @@ if args == [
             status = 0
         else:
             status = 1 if errors else 0
-        changed = [] if formatter_input == EXPECTED_FORMATTED else ["<stdin>"]
+        changed = [] if formatter_input == EXPECTED_FORMATTED else [formatter_path]
         refused = []
         output = None
         if MODE == "fmt_check_wrong_result":
             changed = []
-            refused = ["<stdin>"]
+            refused = [formatter_path]
             output = "unexpected"
+        files = formatter_file_count
+        if is_package_check and MODE == "fmt_check_package_wrong_files":
+            files = 1
+        if is_package_check and MODE == "fmt_check_package_wrong_changed":
+            changed = ["src/other.sai"]
         result = {{"type":"result","kind":"fmt","data":{{
-            "check":True,"files":1,"changed":changed,"refused":refused,"output":output
+            "check":True,"files":files,"changed":changed,"refused":refused,"output":output
         }}}}
+        if is_package_check and MODE == "fmt_check_package_mutates_source":
+            Path("src/lib.sai").write_bytes(b"modified by fake IUT\\n")
+        if is_package_check and MODE == "fmt_check_package_rewrites_identical_source":
+            source_path = Path("src/lib.sai")
+            source_path.write_bytes(source_path.read_bytes())
+        if is_package_check and MODE == "fmt_check_package_adds_source":
+            Path("src/extra.sai").write_bytes(b"added by fake IUT\\n")
+        if is_package_check and MODE == "fmt_check_package_mutates_manifest":
+            Path("sai.package").write_bytes(b"modified by fake IUT\\n")
         print(line(header("fmt", None)).rstrip("\\n"))
         for diagnostic in diagnostics:
             print(line(diagnostic).rstrip("\\n"))
@@ -1000,23 +1038,26 @@ raise SystemExit(exit_code)
         self.assertIsNone(report["results"][0]["compatibility_execution"])
         self.assertIs(report["claim"], False)
         self.assertIn(
-            "no-argument package-wide fmt --check",
+            "generated package with one source file",
             report["limitations"][2],
         )
         self.assertIn(
-            "multi-file or path-based fmt --check behavior are not covered.",
+            "workspace and multi-source package checks, path-based fmt --check",
             report["limitations"][2],
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual(receipt["fmt_argv"], [
             "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
         ])
-        self.assertEqual(receipt["calls"], ["fmt", "fmt", "fmt-check", "fmt-check"])
+        self.assertEqual(
+            receipt["calls"],
+            ["fmt", "fmt", "fmt-check", "fmt-check", "fmt-check", "fmt-check"],
+        )
         self.assertEqual(receipt["formatter_inputs"], [
             original.decode("utf-8"),
             self.expected_format.decode("utf-8"),
         ])
-        self.assertEqual(receipt["formatter_check_argv"], [
+        stdin_check_argv = [
             "--format=json",
             "--max-errors=0",
             "fmt",
@@ -1024,12 +1065,62 @@ raise SystemExit(exit_code)
             "--stdin-kind",
             "source",
             "-",
+        ]
+        package_check_argv = ["--format=json", "--max-errors=0", "fmt", "--check"]
+        self.assertEqual(receipt["formatter_check_argvs"], [
+            stdin_check_argv, stdin_check_argv, package_check_argv, package_check_argv,
         ])
         self.assertEqual(receipt["formatter_check_inputs"], [
             original.decode("utf-8"),
             self.expected_format.decode("utf-8"),
+            original.decode("utf-8"),
+            self.expected_format.decode("utf-8"),
+        ])
+        self.assertEqual(receipt["formatter_check_paths"], [
+            "<stdin>", "<stdin>", "src/lib.sai", "src/lib.sai",
         ])
         self.assertEqual(self.source.read_bytes(), original)
+
+    def test_fmt_package_check_rejects_bad_file_inventory_and_manifest(self):
+        cases = (
+            ("fmt_check_package_wrong_files", "invalid fixture result"),
+            ("fmt_check_package_wrong_changed", "invalid fixture result"),
+            (
+                "fmt_check_package_wrong_path",
+                "outside the selected fixture file",
+            ),
+            (
+                "fmt_check_package_manifest_diagnostic",
+                "outside the selected fixture file",
+            ),
+            (
+                "fmt_check_package_mutates_source",
+                "modified or replaced the source fixture",
+            ),
+            (
+                "fmt_check_package_rewrites_identical_source",
+                "modified or replaced the source fixture",
+            ),
+            (
+                "fmt_check_package_adds_source",
+                "changed the package source inventory",
+            ),
+            (
+                "fmt_check_package_mutates_manifest",
+                "modified or replaced the generated package contract",
+            ),
+        )
+        for mode, expected_failure in cases:
+            with self.subTest(mode=mode):
+                self._fmt_fixture()
+                self.mode = mode
+                self._write_fake()
+                report = self._run()
+                self.assertEqual(report["outcome"], "fail")
+                self.assertIn(
+                    expected_failure,
+                    " ".join(report["results"][0]["failures"]),
+                )
 
     def test_fmt_check_line_contract_uses_lf_bytes_and_empty_missing_lines(self):
         cases = (
@@ -1114,7 +1205,7 @@ raise SystemExit(exit_code)
             ("fmt_check_wrong_data", "first differing line"),
             ("fmt_check_extra_diagnostic", "exactly one diagnostic"),
             ("fmt_check_missing_diagnostic", "unexpected exit code"),
-            ("fmt_check_wrong_result", "invalid source stdin result"),
+            ("fmt_check_wrong_result", "invalid fixture result"),
             ("fmt_check_suppressed", "suppressed unexpected diagnostics"),
         ):
             with self.subTest(mode=mode):

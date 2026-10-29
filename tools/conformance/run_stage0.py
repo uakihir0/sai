@@ -467,6 +467,87 @@ def _run_fmt_fixture(
                 registered_codes=registered_codes,
             )
 
+        source_dir = package_root / "src"
+        source_dir.mkdir()
+        manifest_file = package_root / "sai.package"
+        manifest_file.write_text(
+            PACKAGE_MANIFEST,
+            encoding="utf-8",
+            newline="\n",
+        )
+        source_file = source_dir / "lib.sai"
+        expected_sources = ("src/lib.sai",)
+        manifest_state = _file_state(manifest_file)
+        package_check_command = [
+            "--format=json",
+            "--max-errors=0",
+            "fmt",
+            "--check",
+        ]
+        for check_input in (source_bytes, expected_output):
+            source_file.write_bytes(check_input)
+            if _package_sai_inventory(package_root) != expected_sources:
+                raise SmokeError(
+                    "generated formatter package has an unexpected source inventory"
+                )
+            source_state = _file_state(source_file)
+            checked = _run_iut(
+                iut,
+                package_check_command,
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+            )
+            _validate_fmt_check(
+                checked,
+                input_bytes=check_input,
+                expected_output=expected_output,
+                registered_codes=registered_codes,
+                file_path="src/lib.sai",
+                file_count=2,
+            )
+            package_sources = _package_sai_inventory(package_root)
+            if package_sources != expected_sources:
+                raise SmokeError(
+                    f"sai fmt --check changed the package source inventory: "
+                    f"{package_sources!r}"
+                )
+            if _file_state(source_file) != source_state:
+                raise SmokeError("sai fmt --check modified or replaced the source fixture")
+            if source_file.read_bytes() != check_input:
+                raise SmokeError("sai fmt --check modified the source fixture")
+            if _file_state(manifest_file) != manifest_state:
+                raise SmokeError(
+                    "sai fmt --check modified or replaced the generated package contract"
+                )
+            if manifest_file.read_bytes() != PACKAGE_MANIFEST.encode("utf-8"):
+                raise SmokeError("sai fmt --check modified the generated package contract")
+
+
+def _package_sai_inventory(package_root: Path) -> tuple[str, ...]:
+    paths = (
+        path.relative_to(package_root).as_posix()
+        for path in package_root.rglob("*.sai")
+        if path.is_file()
+    )
+    return tuple(sorted(paths))
+
+
+def _file_state(path: Path) -> tuple[int, int, int, int, int, int, int] | None:
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    return (
+        info.st_mode,
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_nlink,
+    )
+
 
 def _split_lf_lines(source: bytes) -> list[bytes]:
     """Split only after LF, preserving each terminator and any preceding CR."""
@@ -557,6 +638,7 @@ def _formatter_envelope(
     completed: subprocess.CompletedProcess,
     *,
     registered_codes: set[str],
+    primary_file: str = "<stdin>",
 ) -> tuple[list[dict], dict, dict, list[dict]]:
     records = _records(
         completed.stdout,
@@ -596,7 +678,11 @@ def _formatter_envelope(
     }
     if any(set(item) != expected_diagnostic_fields for item in diagnostics):
         raise SmokeError("sai fmt returned an invalid diagnostic schema")
-    actual = _formatter_diagnostics(records, registered_codes)
+    actual = _formatter_diagnostics(
+        records,
+        registered_codes,
+        primary_file=primary_file,
+    )
     result = records[-2]
     if result.get("kind") != "fmt" or set(result) != {"type", "kind", "data"}:
         raise SmokeError("sai fmt returned an invalid result kind")
@@ -613,24 +699,27 @@ def _validate_fmt_check(
     input_bytes: bytes,
     expected_output: bytes,
     registered_codes: set[str],
+    file_path: str = "<stdin>",
+    file_count: int = 1,
 ) -> None:
     actual, data, summary, diagnostics = _formatter_envelope(
         completed,
         registered_codes=registered_codes,
+        primary_file=file_path,
     )
     difference = _first_differing_lf_line(input_bytes, expected_output)
     if (
         type(data["check"]) is not bool
         or data["check"] is not True
         or type(data["files"]) is not int
-        or data["files"] != 1
+        or data["files"] != file_count
         or not isinstance(data["changed"], list)
-        or data["changed"] != ([] if difference is None else ["<stdin>"])
+        or data["changed"] != ([] if difference is None else [file_path])
         or not isinstance(data["refused"], list)
         or data["refused"] != []
         or data["output"] is not None
     ):
-        raise SmokeError("sai fmt --check returned an invalid source stdin result")
+        raise SmokeError("sai fmt --check returned an invalid fixture result")
     if summary["suppressed"] != {
         "cascade": 0,
         "duplicate": 0,
@@ -686,7 +775,7 @@ def _validate_fmt_check(
     }
     if (
         primary is None
-        or primary["file"] != {"path": "<stdin>", "package": None, "snapshot": None}
+        or primary["file"] != {"path": file_path, "package": None, "snapshot": None}
         or primary["start"] != expected_start
         or primary["end"] != expected_end
         or expected_start["line"] != line
@@ -1008,7 +1097,12 @@ def _formatter_refusal_codes(docs_root: Path) -> set[str]:
     return codes
 
 
-def _formatter_diagnostics(records: list[dict], codes: set[str]) -> list[dict]:
+def _formatter_diagnostics(
+    records: list[dict],
+    codes: set[str],
+    *,
+    primary_file: str = "<stdin>",
+) -> list[dict]:
     actual = []
     for record in records:
         if record["type"] != "diagnostic":
@@ -1026,11 +1120,11 @@ def _formatter_diagnostics(records: list[dict], codes: set[str]) -> list[dict]:
         else:
             source = primary["file"]
             if (
-                source["path"] != "<stdin>"
+                source["path"] != primary_file
                 or source.get("package") is not None
                 or source.get("snapshot") is not None
             ):
-                raise SmokeError("formatter diagnostic is outside standard input")
+                raise SmokeError("formatter diagnostic is outside the selected fixture file")
             file = "src/lib.sai"
             line = primary["start"]["line"]
         severity = {"warn": "warning"}.get(record["severity"], record["severity"])
@@ -1299,9 +1393,11 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "The caller must supply this repository's reference sai binary; the runner "
             "cannot verify the identity of the executable passed with --iut.",
             "Formatter coverage is limited to single-file source fmt goldens, their "
-            "fixed-point and input/expected-output fmt --check checks, and refusal cases. "
-            "Package formatting and no-argument package-wide fmt --check, layout variants, "
-            "and multi-file or path-based fmt --check behavior are not covered.",
+            "fixed-point and source-stdin fmt --check checks, one no-argument fmt --check "
+            "in a generated package with one source file, and refusal cases. "
+            "Package-contract formatting variants and goldens, workspace and multi-source "
+            "package checks, path-based fmt --check, layout variants, and complete "
+            "formatter-rule coverage are not covered.",
             "This smoke subset does not establish section, diagnostic, or suite coverage "
             "and cannot substantiate a conformance claim.",
         ],
