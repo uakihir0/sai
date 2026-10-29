@@ -2190,6 +2190,67 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
             .is_some_and(|visibility| visibility.pub_token().is_some())
 }
 
+fn check_literal_tail_needs_unused_variable_analysis(source: &[u8]) -> Option<bool> {
+    use sai_syntax::ast::{self, AstNode as _};
+
+    let parsed = sai_fmt::parse_source(source).ok()?;
+    let source_file = ast::SourceFile::cast(parsed.root().clone())?;
+    let mut functions = source_file
+        .syntax()
+        .descendants()
+        .filter_map(ast::FnDecl::cast);
+    let function = functions.next()?;
+    if functions.next().is_some() {
+        return None;
+    }
+    let parameters = function.params()?;
+    let has_parameters = parameters.self_param().is_some() || parameters.params().next().is_some();
+    let body = function.body()?;
+    let mut statements = body.statements().peekable();
+    if statements.peek().is_none() {
+        return Some(false);
+    }
+    let mut has_prior_statement = false;
+    let tail = loop {
+        let statement = statements.next()?;
+        if statements.peek().is_none() {
+            break statement;
+        }
+        has_prior_statement = true;
+    };
+    if !has_parameters && !has_prior_statement {
+        return Some(false);
+    }
+    let ast::Stmt::Expr(tail) = tail else {
+        return Some(false);
+    };
+    let mut expression = tail.expression()?;
+    let expression = loop {
+        match expression {
+            ast::Expr::Paren(paren) => expression = paren.expression()?,
+            other => break other,
+        }
+    };
+    Some(match expression {
+        ast::Expr::Literal(literal) => matches!(
+            literal.token(),
+            Some(
+                ast::LiteralToken::Int(_)
+                    | ast::LiteralToken::Float(_)
+                    | ast::LiteralToken::True(_)
+                    | ast::LiteralToken::False(_)
+                    | ast::LiteralToken::Byte(_)
+                    | ast::LiteralToken::Char(_)
+            )
+        ),
+        ast::Expr::Prefix(prefix) => {
+            matches!(prefix.op(), Some((_, ast::PrefixOp::Neg)))
+                && matches!(prefix.operand(), Some(ast::Expr::Literal(literal)) if matches!(literal.token(), Some(ast::LiteralToken::Int(_) | ast::LiteralToken::Float(_))))
+        }
+        _ => false,
+    })
+}
+
 fn check_public_primitive_const_set_coverage(
     source_count: usize,
     scopes: &sai_driver::Phase1PackageScopes,
@@ -6785,6 +6846,15 @@ fn module_tree_workspace_check_diagnostics(
                     infos = infos.saturating_add(body_infos);
 
                     if root_single_function_source_candidate
+                        && (body_errors > 0
+                            || inputs[0]
+                                .source_inputs
+                                .first()
+                                .is_some_and(|(_, _, source)| {
+                                    check_literal_tail_needs_unused_variable_analysis(
+                                        source.as_ref(),
+                                    ) == Some(false)
+                                }))
                         && check_public_function_body_coverage(
                             true,
                             collection.scopes(),
@@ -6867,11 +6937,20 @@ fn module_tree_workspace_check_diagnostics(
                     warnings = warnings.saturating_add(body_warnings);
                     infos = infos.saturating_add(body_infos);
 
-                    if check_public_inherent_method_body_coverage(
-                        true,
-                        collection.scopes(),
-                        &method_resolutions,
-                    ) {
+                    if (body_errors > 0
+                        || inputs[0]
+                            .source_inputs
+                            .first()
+                            .is_some_and(|(_, _, source)| {
+                                check_literal_tail_needs_unused_variable_analysis(source.as_ref())
+                                    == Some(false)
+                            }))
+                        && check_public_inherent_method_body_coverage(
+                            true,
+                            collection.scopes(),
+                            &method_resolutions,
+                        )
+                    {
                         single_public_inherent_method_body_covered = true;
                     }
                 }

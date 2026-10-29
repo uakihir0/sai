@@ -9120,3 +9120,9 @@
 
 - **Review required:** The current `sai check` success slices can accept functions containing unused local bindings without emitting the Stage 0 `UNUSED_VARIABLE` warning. Body type-check support is not proof of lint completeness. A separate binding-identity-based analysis, lint-level resolution, and preservation of structured fixes and level provenance are required before claiming full coverage. This issue also affects existing accepted shapes, not only new literal-tail work.
 - **Evidence:** Independent review identified accepted examples in the existing CLI tests and traced their local resolutions; the lint's scope and exclusions are specified in spec/15 §15.8. Until the lint pipeline is integrated, new success slices must not be admitted solely because body checking reports `Supported`.
+
+### IR-1002 (2026-10-29): type-check direct literal tails with locals
+
+- **Decision — review required:** Extend the primitive body checker and driver to type a direct scalar literal tail against the function return type, including with parameters or prior supported locals. Publish only untainted partial facts. Keep newly covered CLI success cases gated until unused-binding analysis exists; known type errors are still reported. This conservative gate does not resolve the pre-existing coverage gap in IR-1001.
+- **Verification:** The `sai_ty` suite (152 tests), focused driver integration and compatibility tests, and seven focused CLI boundary and compatibility tests passed. Tests cover result facts, independent local errors, type and range errors, functions and methods, parenthesized and negative literals, and unsupported shapes.
+- **Hostile review:** Independent review found that the driver extension implicitly broadened CLI success despite missing `UNUSED_VARIABLE`. The explicit gate and regression tests were added; a subsequent static review found no further actionable regression. Full driver and CLI suites were not run.

@@ -1,5 +1,9 @@
 //! Narrow, compositional checks for flat primitive-local function bodies.
 
+#[cfg(test)]
+#[path = "body_tests.rs"]
+mod body_tests;
+
 use super::literal::{
     PrimitiveLiteralResult, check_primitive_literal, is_integer_primitive,
     supports_primitive_literal,
@@ -504,7 +508,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .input
                 .call_signatures
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-        if block.stmts.is_empty() && !is_supported_field_tail && !is_supported_call_tail {
+        let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some());
+        if block.stmts.is_empty()
+            && !is_supported_field_tail
+            && !is_supported_call_tail
+            && !is_supported_literal_tail
+        {
             return Err(());
         }
         for stmt in block.stmts {
@@ -2350,6 +2359,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_expr(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
+        if let ExprKind::Lit(literal) = expression.kind {
+            let found = primitive_literal_kind(literal).ok_or(())?;
+            self.check_annotated_literal(self.input.return_type, literal, found, expression.hir_id);
+            return Ok(());
+        }
         let local_type = if self.expression_has_unknown_field_error(expression) {
             if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. }) {
                 return Err(());

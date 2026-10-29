@@ -8564,6 +8564,7 @@ fn check_function_body_primitive_local_block(
             || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
     let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
+    let is_supported_literal_tail = is_direct_function_scalar_literal(tail);
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8574,9 +8575,14 @@ fn check_function_body_primitive_local_block(
         }
         ExprKind::Field { .. } if is_supported_field_tail => None,
         ExprKind::Call { .. } if is_supported_call_tail => None,
+        ExprKind::Lit(_) if is_supported_literal_tail => None,
         _ => return Ok(None),
     };
-    if block.stmts.is_empty() && !is_supported_field_tail && !is_supported_call_tail {
+    if block.stmts.is_empty()
+        && !is_supported_field_tail
+        && !is_supported_call_tail
+        && !is_supported_literal_tail
+    {
         return Ok(None);
     }
 
@@ -47514,6 +47520,226 @@ property "shared"() {}
                 .expect("canonical Str identity body check succeeds"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
+    }
+
+    #[test]
+    fn primitive_literal_tail_driver_integration() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub fn empty() -> I8 { 12 }\n",
+            "pub fn locals(input: I16) -> I8 {\n",
+            "    let copied = input\n",
+            "    let loose = 42\n",
+            "    12\n",
+            "}\n",
+            "pub fn mismatch(input: I16) -> Bool {\n",
+            "    let copied = input\n",
+            "    7\n",
+            "}\n",
+            "pub fn overflow() -> USize {\n",
+            "    let flag = true\n",
+            "    4294967296\n",
+            "}\n",
+            "pub fn local_errors() -> I8 {\n",
+            "    let bad: Bool = 1\n",
+            "    let huge = 9223372036854775808\n",
+            "    let alias = huge\n",
+            "    let safe = true\n",
+            "    12\n",
+            "}\n",
+            "pub fn unsupported() -> I8 { let value = 1\n value + 1 }\n",
+            "pub fn byte_string() -> Byte { let flag = true\n b\"x\" }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 7);
+
+        for (index, expected_tail, expected_error) in [
+            (0, Some(PrimTy::I8), None),
+            (1, Some(PrimTy::I8), None),
+            (
+                2,
+                None,
+                Some((sai_diagnostics::Code::TypeMismatch, "mismatch", "7")),
+            ),
+            (
+                3,
+                None,
+                Some((
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    "overflow",
+                    "4294967296",
+                )),
+            ),
+            (4, Some(PrimTy::I8), None),
+        ] {
+            let owner = &resolved.owners()[index];
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner.body_type_check().unwrap()
+            else {
+                panic!("literal tail must be supported");
+            };
+            if index == 4 {
+                assert_eq!(diagnostics.len(), 2);
+                for (diagnostic, code, token) in [
+                    (&diagnostics[0], sai_diagnostics::Code::TypeMismatch, "1"),
+                    (
+                        &diagnostics[1],
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        "9223372036854775808",
+                    ),
+                ] {
+                    assert_eq!(diagnostic.code, code);
+                    let function_start = root.find("pub fn local_errors").unwrap();
+                    let statement = if code == sai_diagnostics::Code::TypeMismatch {
+                        "let bad: Bool = "
+                    } else {
+                        "let huge = "
+                    };
+                    let start = function_start
+                        + root[function_start..].find(statement).unwrap()
+                        + statement.len();
+                    assert_eq!(
+                        diagnostic.primary().unwrap().span.range,
+                        sai_diagnostics::TextRange::new(
+                            sai_diagnostics::TextSize::new(start as u32),
+                            sai_diagnostics::TextSize::new((start + token.len()) as u32),
+                        )
+                        .unwrap()
+                    );
+                }
+            } else if let Some((code, function, text)) = expected_error {
+                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(diagnostics[0].code, code);
+                let function_start = root.find(&format!("pub fn {function}")).unwrap();
+                let start = function_start + root[function_start..].find(text).unwrap();
+                assert_eq!(
+                    diagnostics[0].primary().unwrap().span.range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(start as u32),
+                        sai_diagnostics::TextSize::new((start + text.len()) as u32),
+                    )
+                    .unwrap()
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            }
+
+            let results = owner
+                .primitive_body_type_results()
+                .unwrap()
+                .expect("partial facts exist");
+            assert_eq!(results.owner(), owner.owner());
+            assert_primitive_type_result_parity(&database, results);
+            let descriptor = *collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .find(|descriptor| descriptor.owner == owner.owner())
+                .unwrap();
+            let inputs = database
+                .current_owner_inputs(&snapshot, descriptor.file, &collection.target_cfg)
+                .unwrap();
+            let paths = Arc::clone(
+                database
+                    .def_paths
+                    .get(&owner.owner().def_id.package())
+                    .unwrap(),
+            );
+            let path = paths
+                .resolve_def_id(owner.owner().def_id.to_def_id())
+                .unwrap()
+                .unwrap();
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &inputs.ast_ids,
+                &snapshot,
+                &inputs.root,
+                &arena,
+                &database.symbols,
+                &paths,
+            );
+            let (hir_owner, _) = lower_top_level_owner(
+                descriptor,
+                &path,
+                &inputs.filtered_item_tree,
+                &inputs.retained_item_kinds,
+                &context,
+            )
+            .unwrap();
+            let body = hir_owner.body.unwrap();
+            let ExprKind::Block(block) = body.value.kind else {
+                panic!("block expected")
+            };
+            assert_eq!(
+                results.expression_type(block.tail.unwrap().hir_id),
+                expected_tail
+            );
+            for parameter in body.params {
+                assert_eq!(results.binding_type(parameter.binding), Some(PrimTy::I16));
+            }
+            for (statement_index, stmt) in block.stmts.iter().enumerate() {
+                let StmtKind::Let { pat, init, .. } = stmt.kind else {
+                    panic!("let expected")
+                };
+                let PatKind::Binding { binding, .. } = pat.kind else {
+                    panic!("binding expected")
+                };
+                if index == 4 {
+                    let expected_binding = match statement_index {
+                        0 | 3 => Some(PrimTy::Bool),
+                        _ => None,
+                    };
+                    let expected_expression = if statement_index == 3 {
+                        Some(PrimTy::Bool)
+                    } else {
+                        None
+                    };
+                    assert_eq!(results.binding_type(binding), expected_binding);
+                    assert_eq!(results.expression_type(init.hir_id), expected_expression);
+                    assert_eq!(
+                        results
+                            .partial_results()
+                            .canonical_binding_type(binding)
+                            .is_some(),
+                        expected_binding.is_some()
+                    );
+                    assert_eq!(
+                        results
+                            .partial_results()
+                            .canonical_expression_type(init.hir_id)
+                            .is_some(),
+                        expected_expression.is_some()
+                    );
+                    continue;
+                }
+                let expected = match (index, init.kind) {
+                    (1, ExprKind::Lit(_)) => PrimTy::I64,
+                    (3, _) => PrimTy::Bool,
+                    _ => PrimTy::I16,
+                };
+                assert_eq!(results.binding_type(binding), Some(expected));
+                assert_eq!(results.expression_type(init.hir_id), Some(expected));
+            }
+        }
+        for owner in &resolved.owners()[5..] {
+            assert!(matches!(
+                owner.body_type_check().unwrap(),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+            assert!(owner.primitive_body_type_results().unwrap().is_none());
+        }
     }
 
     #[test]

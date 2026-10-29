@@ -9996,6 +9996,94 @@ fn unsupported_primitive_local_not_shapes_remain_gated() {
 }
 
 #[test]
+fn literal_tail_with_locals_preserves_stage_zero_boundary() {
+    for source in [
+        "pub fn answer() -> I8 { 12 }\n",
+        "pub fn answer() -> I8 { (-128) }\n",
+        "pub fn answer() -> Bool { true }\n",
+        "pub fn answer(input: I8) -> I8 { input }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+    for source in [
+        "pub fn answer() -> I8 {\n    let local = true\n    12\n}\n",
+        "pub fn answer(input: I16) -> I8 {\n    let local = input\n    12\n}\n",
+        "pub fn answer(input: I16) -> I8 { 12 }\n",
+        "pub fn answer(input: I16) -> I8 { ((-128)) }\n",
+        "pub fn answer(input: I16) -> Bool { (true) }\n",
+        "pub fn answer(input: I16) -> Byte { b'x' }\n",
+        "pub fn answer(input: I16) -> Char { 'x' }\n",
+        "pub fn answer(input: I16) -> F32 { -1.5 }\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+    for (source, code, message, token) in [
+        (
+            "pub fn answer() -> I8 {\n    let bad: Bool = 1\n    12\n}\n",
+            "TYPE_MISMATCH",
+            "expected `Bool`, found an integer literal",
+            "1\n",
+        ),
+        (
+            "pub fn answer() -> USize {\n    let local = true\n    4294967296\n}\n",
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `USize`",
+            "4294967296\n",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches(&format!("\"code\":\"{code}\"")).count(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{stdout}"
+        );
+        let start = source.find(token).unwrap();
+        assert_json_diagnostic_primary_span(&stdout, code, message, start, start + token.len() - 1);
+    }
+}
+
+#[test]
+fn literal_tail_in_inherent_method_preserves_stage_zero_boundary() {
+    for body in [
+        "pub fn answer(self: borrow Self) -> I8 { 12 }",
+        "pub fn answer(self: borrow Self, input: I16) -> I8 { 12 }",
+        "pub fn answer(self: borrow Self) -> I8 { let local = true\n ((-128)) }",
+    ] {
+        let source = format!("type Counter {{ marker: I32 }}\nimpl Counter {{\n{body}\n}}\n");
+        assert_check_stays_gated_without_syntax_errors(&run_check(&source, "", &[], &[]), &source);
+    }
+    let source = "type Counter { marker: I32 }\nimpl Counter {\n    pub fn answer(self: borrow Self) -> I8 {\n        let bad: Bool = 1\n        12\n    }\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "{stdout}"
+    );
+    let start = source.find("= 1\n").unwrap() + 2;
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found an integer literal",
+        start,
+        start + 1,
+    );
+}
+
+#[test]
 fn public_unannotated_primitive_literal_local_emits_check_result() {
     for source in [
         "pub fn answer() -> I32 {\n    let value = 42\n    value\n}\n",
