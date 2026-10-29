@@ -132,7 +132,7 @@ raise SystemExit(exit_code)
             f"//@ kind: {kind}\n"
             "//@ stage: 0\n"
             "//@ spec: spec/02 §2.1\n"
-            f"{body}{extra}",
+            f"{extra}{body}",
             encoding="utf-8",
         )
 
@@ -144,6 +144,7 @@ raise SystemExit(exit_code)
         report = self._run()
         self.assertEqual(report["mode"], "partial-smoke")
         self.assertIs(report["claim"], False)
+        self.assertIs(report["iut_identity_verified"], False)
         self.assertEqual(report["outcome"], "pass")
         self.assertEqual(report["results"][0]["configuration"], {
             "target": None, "profile": None,
@@ -191,6 +192,19 @@ raise SystemExit(exit_code)
                 "HOME": str(cwd / "home"),
             })
 
+    def test_native_child_observes_only_the_documented_environment(self):
+        environment_utility = Path("/usr/bin/env")
+        if not environment_utility.is_file():
+            self.skipTest("/usr/bin/env is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            completed = _run_iut(environment_utility, [], Path(temporary), 1)
+        self.assertEqual(completed.returncode, 0)
+        observed = dict(
+            line.split("=", 1)
+            for line in completed.stdout.decode("utf-8").splitlines()
+        )
+        self.assertEqual(set(observed), {"NO_COLOR", "SAI_CACHE_DIR", "HOME"})
+
     def test_check_fail_matches_expected_diagnostic_and_has_no_result(self):
         self._fixture("check-fail", body="@ //~ error EXPECTED_TOKEN\n")
         report = self._run()
@@ -199,12 +213,22 @@ raise SystemExit(exit_code)
         self.assertEqual(report["results"][0]["failures"], [])
 
     def test_explicit_target_or_profile_and_unused_directives_fail_closed(self):
-        for directive in ("targets: wasm32-core", "profiles: dev", "options: --tests"):
+        for directive in (
+            "targets: wasm32-core",
+            "profiles: dev",
+            "options: --tests",
+            "reference-only: implementation-defined limit",
+        ):
             with self.subTest(directive=directive):
                 self._fixture(extra=f"//@ {directive}\n")
                 report = self._run()
                 self.assertEqual(report["outcome"], "fail")
                 self.assertTrue(report["results"][0]["failures"])
+                if directive.startswith("reference-only"):
+                    self.assertIn(
+                        "IUT identity is not verified",
+                        report["results"][0]["failures"][0],
+                    )
 
     def test_spec_reference_cannot_escape_docs_root(self):
         docs_root = Path(__file__).resolve().parents[2] / "docs"

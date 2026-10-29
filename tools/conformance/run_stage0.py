@@ -33,7 +33,7 @@ PACKAGE_MANIFEST = (
     "targets { wasm32-core }\n"
 )
 TIMEOUT_SECONDS = 600
-ALLOWED_DIRECTIVES = {"kind", "stage", "spec", "diag", "reference-only"}
+ALLOWED_DIRECTIVES = {"kind", "stage", "spec", "diag"}
 SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+\Z")
 DOCUMENT_AREA = {"spec", "package", "impl"}
@@ -182,6 +182,10 @@ def _validate_directives(extracted: dict, docs_root: Path) -> tuple[dict, list[d
         raise SmokeError("directive presence metadata is missing or invalid")
     if "targets" in specified or "profiles" in specified:
         raise SmokeError("Stage 0 target/profile directives are unsupported")
+    if "reference-only" in specified:
+        raise SmokeError(
+            "reference-only fixtures are unsupported because IUT identity is not verified"
+        )
     unsupported = set(specified) - ALLOWED_DIRECTIVES
     if unsupported:
         raise SmokeError("unsupported directive(s): " + ", ".join(sorted(unsupported)))
@@ -414,6 +418,7 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
         "type": "summary",
         "mode": "partial-smoke",
         "claim": False,
+        "iut_identity_verified": False,
         "outcome": "fail",
         "tests": 0,
         "passed": 0,
@@ -423,6 +428,8 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
         "limitations": [
             "Stage 0 selects one targetless/profileless configuration; the current CLI "
             "uses the generated package's wasm32-core/dev defaults for execution.",
+            "The caller must supply this repository's reference sai binary; the runner "
+            "cannot verify the identity of the executable passed with --iut.",
             "This smoke subset does not establish section, diagnostic, or suite coverage "
             "and cannot substantiate a conformance claim.",
         ],
@@ -461,7 +468,11 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--iut", required=True, help="absolute path to the IUT executable")
+    parser.add_argument(
+        "--iut",
+        required=True,
+        help="absolute path to this repository's reference sai executable; identity is not verified",
+    )
     parser.add_argument("conformance_directory", type=Path)
     arguments = parser.parse_args()
     report = run_suite(arguments.iut, arguments.conformance_directory)
