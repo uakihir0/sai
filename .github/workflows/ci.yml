@@ -41,6 +41,8 @@ jobs:
         run: cargo test -p gix-protocol --lib --features blocking-client,async-client,sha1,sha256 --locked
       - name: Test protocol ref bounds with async client only
         run: cargo test -p gix-protocol --lib --features async-client,sha1,sha256 --locked
+      - name: Test protocol ref bounds with dependency-only SHA-256
+        run: cargo test -p gix-protocol --lib --no-default-features --features blocking-client,gix-hash/sha256 --locked
       - name: Test workspace
         env:
           RUST_TEST_THREADS: 1

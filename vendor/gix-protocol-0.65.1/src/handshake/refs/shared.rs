@@ -419,6 +419,15 @@ mod tests {
         refs::shared::{AdvertisementBudget, InternalRef},
     };
 
+    fn hash_line(line: &[u8]) -> bstr::BString {
+        let line = std::str::from_utf8(line).expect("ASCII test line");
+        line.replace(
+            "000000000000000000000000000000000000000",
+            &"0".repeat(gix_hash::Kind::default().len_in_hex() - 1),
+        )
+        .into()
+    }
+
     #[test]
     fn from_capabilities_extracts_symbolic_references() -> Result<(), client::Error> {
         let caps = client::Capabilities::from_bytes(
@@ -460,7 +469,7 @@ mod tests {
             &mut out_refs,
             &mut out_shallow,
             &mut budget,
-            b"0000000000000000000000000000000000000001 refs/heads/one".as_bstr(),
+            hash_line(b"0000000000000000000000000000000000000001 refs/heads/one").as_bstr(),
         )
         .unwrap();
         let error = refs::shared::parse_v1(
@@ -468,7 +477,7 @@ mod tests {
             &mut out_refs,
             &mut out_shallow,
             &mut budget,
-            b"0000000000000000000000000000000000000002 refs/heads/two".as_bstr(),
+            hash_line(b"0000000000000000000000000000000000000002 refs/heads/two").as_bstr(),
         )
         .unwrap_err();
 
@@ -488,7 +497,7 @@ mod tests {
             &mut out_refs,
             &mut out_shallow,
             &mut budget,
-            b"0000000000000000000000000000000000000001 refs/heads/one".as_bstr(),
+            hash_line(b"0000000000000000000000000000000000000001 refs/heads/one").as_bstr(),
         )
         .unwrap_err();
 
@@ -508,13 +517,13 @@ mod tests {
         refs::shared::push_v2_ref(
             &mut out_refs,
             &mut budget,
-            b"0000000000000000000000000000000000000001 refs/tags/v1.0.0".as_bstr(),
+            hash_line(b"0000000000000000000000000000000000000001 refs/tags/v1.0.0").as_bstr(),
         )
         .unwrap();
         let error = refs::shared::push_v2_ref(
             &mut out_refs,
             &mut budget,
-            b"0000000000000000000000000000000000000002 refs/tags/v2.0.0".as_bstr(),
+            hash_line(b"0000000000000000000000000000000000000002 refs/tags/v2.0.0").as_bstr(),
         )
         .unwrap_err();
 
@@ -531,7 +540,7 @@ mod tests {
         let error = refs::shared::push_v2_ref(
             &mut out_refs,
             &mut budget,
-            b"0000000000000000000000000000000000000001 refs/tags/v1.0.0".as_bstr(),
+            hash_line(b"0000000000000000000000000000000000000001 refs/tags/v1.0.0").as_bstr(),
         )
         .unwrap_err();
 
@@ -555,7 +564,7 @@ mod tests {
         refs::shared::push_v2_ref(
             &mut out_refs,
             &mut budget,
-            b"0000000000000000000000000000000000000001 refs/heads/HEAD symref-target:refs/heads/main"
+            hash_line(b"0000000000000000000000000000000000000001 refs/heads/HEAD symref-target:refs/heads/main")
                 .as_bstr(),
         )
         .unwrap();
@@ -568,7 +577,7 @@ mod tests {
         let error = refs::shared::push_v2_ref(
             &mut out_refs,
             &mut budget,
-            b"0000000000000000000000000000000000000001 refs/heads/HEAD symref-target:refs/heads/main"
+            hash_line(b"0000000000000000000000000000000000000001 refs/heads/HEAD symref-target:refs/heads/main")
                 .as_bstr(),
         )
         .unwrap_err();
@@ -584,8 +593,8 @@ mod tests {
     #[test]
     fn v1_and_v2_peeled_refs_count_the_primary_name_once() {
         let ref_name = b"refs/tags/v1.0.0";
-        let direct = b"0000000000000000000000000000000000000001 refs/tags/v1.0.0";
-        let peeled = b"0000000000000000000000000000000000000002 refs/tags/v1.0.0^{}";
+        let direct = hash_line(b"0000000000000000000000000000000000000001 refs/tags/v1.0.0");
+        let peeled = hash_line(b"0000000000000000000000000000000000000002 refs/tags/v1.0.0^{}");
         let mut v1_refs = Vec::new();
         let mut v1_shallow = Vec::new();
         let mut v1_budget = AdvertisementBudget::default();
@@ -613,7 +622,7 @@ mod tests {
         refs::shared::push_v2_ref(
             &mut v2_refs,
             &mut v2_budget,
-            b"0000000000000000000000000000000000000001 refs/tags/v1.0.0 peeled:0000000000000000000000000000000000000002"
+            hash_line(b"0000000000000000000000000000000000000001 refs/tags/v1.0.0 peeled:0000000000000000000000000000000000000002")
                 .as_bstr(),
         )
         .unwrap();
@@ -636,7 +645,7 @@ mod tests {
             &mut out_refs,
             &mut out_shallow,
             &mut budget,
-            b"0000000000000000000000000000000000000001 HEAD".as_bstr(),
+            hash_line(b"0000000000000000000000000000000000000001 HEAD").as_bstr(),
         )
         .unwrap();
         assert_eq!(budget.name_bytes, (ref_name.len() + target.len()) as u64);
