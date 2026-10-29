@@ -72,6 +72,18 @@ It assumes the tree is not modified concurrently and does not validate
 directives or fixture contents. Windows junction behavior still needs a
 Windows runtime test.
 
+## Configuration selection
+
+`python3 -B tools/conformance/configurations.py < request.json` selects a
+bounded subset of normal test configurations. It rejects stage-0 checks with
+explicit target or profile restrictions and requires explicit, nonempty
+WASI-only test targets for `run-fail`. Later-stage tests return
+`staged-selection-required` with exit status 2 instead of a selected result.
+The caller must validate the remaining test metadata and implementation
+capabilities, including optional `wasm64-wasi` component support. This helper
+does not run tests, resolve staged fallback configurations, or establish a
+conformance claim.
+
 These components are not the full harness and cannot substantiate a
 conformance claim. The caller must resolve package paths, validate NDJSON,
 run the IUT and manage the staged command sequence and
