@@ -9313,3 +9313,9 @@
 - **Decision — review required:** Add a diagnostic UTF-16 inverse that excludes the leading BOM, while retaining the existing LSP conversion which counts it. The inverse returns a decoded-text offset, not the original-byte offset of a diagnostic span; malformed UTF-8 interiors cannot be represented individually, and no production caller is changed.
 - **Verification:** The VFS suite passed 52 tests with two ignored, including BOM and non-BOM round trips, surrogate boundaries, invalid UTF-8, CRLF, and unchanged LSP behavior.
 - **Hostile review:** Independent review found no actionable defect, verified that LSP behavior is preserved, and requested clarification of the decoded-offset distinction. LSP synchronization and BOM edit representability remain incomplete.
+
+### IR-1034 (2026-10-29): defer bounded lexical token-ID remapping
+
+- **Decision — review required:** Revert the attempted CST pre-order token-ID remapping instead of introducing diagnostic failures and silently omitting mandatory fixes at its size and count limits. The existing lexer ordinal, parse-time fix binding, and formatter-unit issues in IR-1030 remain unresolved.
+- **Verification:** The attempted change passed 436 syntax tests and 37 HIR attribute tests, but those tests did not cover the defects found during review; the change was reverted.
+- **Hostile review:** An independent reviewer found that the size limit turns ordinary HIR diagnostics into internal failures, repeated full-file parsing and replay can be quadratic, and the fix budget silently omits required fixes. A second investigation could not resolve these safely within syntax alone; snapshot-bound batched planning and coordinated HIR/diagnostic handling remain necessary.
