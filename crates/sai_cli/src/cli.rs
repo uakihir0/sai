@@ -2190,6 +2190,103 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
             .is_some_and(|visibility| visibility.pub_token().is_some())
 }
 
+fn check_plain_path_name(path: &sai_syntax::ast::PathExpr) -> Option<String> {
+    use sai_syntax::ast::AstNode as _;
+
+    let name = path.name()?;
+    if path.generic_args().is_some() || path.syntax().text_range() != name.syntax().text_range() {
+        return None;
+    }
+    let token = name
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            sai_syntax::SyntaxElement::Token(token)
+                if matches!(
+                    token.kind(),
+                    sai_syntax::SyntaxKind::LIDENT | sai_syntax::SyntaxKind::UIDENT
+                ) =>
+            {
+                Some(token)
+            }
+            _ => None,
+        })?;
+    Some(sai_syntax::normalize_identifier(
+        token.text().strip_prefix("r#").unwrap_or(token.text()),
+    ))
+}
+
+fn check_simple_local_name(local: &sai_syntax::ast::LetStmt) -> Option<String> {
+    use sai_syntax::ast;
+
+    let ast::Pattern::Binding(binding) = local.pattern()? else {
+        return None;
+    };
+    if binding.mode().is_some() || local.else_clause().is_some() {
+        return None;
+    }
+    let token = binding.name()?.token()?;
+    Some(sai_syntax::normalize_identifier(
+        token.text().strip_prefix("r#").unwrap_or(token.text()),
+    ))
+}
+
+fn check_known_unused_binding_shape(
+    parameters: &sai_syntax::ast::ParamList,
+    body: &sai_syntax::ast::Block,
+    tail: &sai_syntax::ast::PathExpr,
+) -> Option<bool> {
+    use sai_syntax::ast;
+
+    let tail_name = check_plain_path_name(tail)?;
+    let mut statements = body.statements();
+    let Some(ast::Stmt::Let(first)) = statements.next() else {
+        return Some(false);
+    };
+    let second = statements.next()?;
+    let third = statements.next();
+    if statements.next().is_some() {
+        return Some(false);
+    }
+    let names = parameters
+        .params()
+        .map(|parameter| {
+            let token = parameter.name()?.token()?;
+            Some(sai_syntax::normalize_identifier(
+                token.text().strip_prefix("r#").unwrap_or(token.text()),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let integer = |expression: Option<ast::Expr>| matches!(expression, Some(ast::Expr::Literal(literal)) if matches!(literal.token(), Some(ast::LiteralToken::Int(_))));
+    match (second, third) {
+        (ast::Stmt::Expr(_), None) => {
+            if check_simple_local_name(&first)? != tail_name {
+                return Some(false);
+            }
+            let initializer = first.initializer()?;
+            let used_parameter = if let ast::Expr::Path(path) = &initializer {
+                Some(check_plain_path_name(path)?)
+            } else if integer(Some(initializer)) {
+                None
+            } else {
+                return Some(false);
+            };
+            Some(
+                names
+                    .iter()
+                    .any(|name| !name.starts_with('_') && used_parameter.as_ref() != Some(name)),
+            )
+        }
+        (ast::Stmt::Let(second), Some(ast::Stmt::Expr(_))) => Some(
+            !check_simple_local_name(&first)?.starts_with('_')
+                && check_simple_local_name(&second)? == tail_name
+                && integer(first.initializer())
+                && integer(second.initializer()),
+        ),
+        _ => Some(false),
+    }
+}
+
 fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
     use sai_syntax::ast::{self, AstNode as _};
 
@@ -2208,6 +2305,17 @@ fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
     let body = function.body()?;
     let mut statements = body.statements().peekable();
     if statements.peek().is_none() {
+        for parameter in parameters.params() {
+            let token = parameter.name()?.token()?;
+            if !token
+                .text()
+                .strip_prefix("r#")
+                .unwrap_or(token.text())
+                .starts_with('_')
+            {
+                return Some(true);
+            }
+        }
         return Some(false);
     }
     let mut has_prior_statement = false;
@@ -2236,6 +2344,9 @@ fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
         && let Some(path_name) = path.name()
         && path.syntax().text_range() == path_name.syntax().text_range()
     {
+        if check_known_unused_binding_shape(&parameters, &body, path).unwrap_or(false) {
+            return Some(true);
+        }
         let mut statements = body.statements();
         if let (Some(ast::Stmt::Let(local)), Some(ast::Stmt::Expr(_)), None) =
             (statements.next(), statements.next(), statements.next())
@@ -14607,9 +14718,9 @@ mod tests {
                 ("é", "n", "/*n*/é", true),
                 ("x", "é", "/*n*/x", true),
                 ("x", "r#n", "/*n*/x", true),
-                ("x", "n", "/*n*/r#n", false),
-                ("x", "é", "r#é", false),
-                ("x", "r#n", "n", false),
+                ("x", "n", "/*n*/r#n", true),
+                ("x", "é", "r#é", true),
+                ("x", "r#n", "n", true),
             ] {
                 let body = format!("let {binding} = 1\n    {tail}");
                 for source in [
@@ -14625,6 +14736,52 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn unused_binding_gate_retains_existing_boundaries() {
+        for (source, expected) in [
+            ("pub fn f(x: I32) {}\n", true),
+            ("pub fn f(x: I32) -> I32 { x }\n", false),
+            (
+                "pub fn f(r#value: I32) -> I32 { let value = 1\n r#value }\n",
+                true,
+            ),
+            ("pub fn f(é: I32) -> I32 { let é = 1\n é }\n", true),
+            (
+                "pub fn f() -> I32 { let first: U8 = 7\n let value: I32 = 42\n value }\n",
+                true,
+            ),
+            (
+                "type Counter { marker: I32 }\nimpl Counter { pub fn f(self: borrow Self) -> I8 { 12 } }\n",
+                true,
+            ),
+        ] {
+            assert_eq!(
+                check_body_matches_unused_variable_gate(source.as_bytes()),
+                Some(expected),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn unused_binding_gate_checks_empty_bodies() {
+        for (source, expected) in [
+            ("pub fn f(x: I32) {}\n", true),
+            ("pub fn f(_x: I32) {}\n", false),
+            ("pub fn f() {}\n", false),
+            (
+                "type Counter { marker: I32 }\nimpl Counter { pub fn f(self: borrow Self) {} }\n",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                check_body_matches_unused_variable_gate(source.as_bytes()),
+                Some(expected),
+                "{source}"
+            );
         }
     }
 

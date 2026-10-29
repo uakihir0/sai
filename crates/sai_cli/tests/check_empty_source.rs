@@ -4584,7 +4584,7 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
 #[test]
 fn public_function_with_annotated_primitive_locals_emits_check_result() {
     for source in [
-        "pub fn answer() -> I32 {\n    let first: U8 = 7\n    let value: I32 = 42\n    value\n}\n",
+        "pub fn answer() -> I32 {\n    let _first: U8 = 7\n    let value: I32 = 42\n    value\n}\n",
         "pub fn first() -> U8 {\n    let first: U8 = 7\n    let value: I32 = 42\n    first\n}\n",
         "pub fn copy_chain() -> I32 {\n    let first: I32 = 21\n    let second: I32 = first\n    let third: I32 = second\n    third\n}\n",
     ] {
@@ -10014,6 +10014,96 @@ fn unused_literal_binding_with_bom_and_comment_stays_gated() {
             }
         }
     }
+}
+
+#[test]
+fn ir_1013_multiple_unused_local_binding_stays_gated() {
+    let source = "pub fn f() -> I32 {\n    let first = 1\n    let second = 2\n    second\n}\n";
+    assert_ir_1013_unused_binding_gate(source);
+}
+
+#[test]
+fn ir_1013_unused_parameter_among_two_stays_gated() {
+    let source = "pub fn f(x: I32, y: I32) -> I32 {\n    let z = x\n    z\n}\n";
+    assert_ir_1013_unused_binding_gate(source);
+}
+
+#[test]
+fn ir_1013_single_unused_parameter_stays_gated() {
+    let source = "pub fn f(x: I32) -> I32 {\n    let value = 1\n    value\n}\n";
+    assert_ir_1013_unused_binding_gate(source);
+}
+
+#[test]
+fn ir_1013_shadowed_parameter_stays_gated() {
+    let source = "pub fn f(x: I32) -> I32 {\n    let x = 1\n    x\n}\n";
+    assert_ir_1013_unused_binding_gate(source);
+}
+
+#[test]
+fn ir_1013_shadowed_parameter_and_two_locals_stay_gated() {
+    let source = "pub fn f(x: I32) -> I32 {\n    let x = 1\n    let z = 2\n    z\n}\n";
+    assert_ir_1013_unused_binding_gate(source);
+}
+
+#[test]
+fn ir_1013_raw_identifier_shadowing_stays_gated() {
+    let source = "pub fn f(r#value: I32) -> I32 {\n    let value = 1\n    r#value\n}\n";
+    assert_ir_1013_unused_binding_gate(source);
+}
+
+#[test]
+fn ir_1013_unicode_identifier_shadowing_stays_gated() {
+    let source = "pub fn f(é: I32) -> I32 {\n    let é = 1\n    é\n}\n";
+    assert_ir_1013_unused_binding_gate(source);
+}
+
+#[test]
+fn ir_1013_inherent_method_unused_parameter_stays_gated() {
+    let source = "type Counter { marker: I32 }\nimpl Counter {\n    pub fn f(self: borrow Self, x: I32, y: I32) -> I32 {\n        let z = x\n        z\n    }\n}\n";
+    assert_ir_1013_unused_binding_gate(source);
+}
+
+#[test]
+fn ir_1013_unused_parameter_with_empty_body_stays_gated() {
+    assert_ir_1013_unused_binding_gate("pub fn f(x: I32) {}\n");
+}
+
+#[test]
+fn ir_1013_proven_single_binding_cases_remain_supported() {
+    for source in [
+        "pub fn f(x: I32) -> I32 { x }\n",
+        "pub fn f(x: I32) -> I32 { (x) }\n",
+        "pub fn f() -> I32 {\n    let value = 1\n    value\n}\n",
+        "pub fn f() -> F32 {\n    let value = 1.25\n    value\n}\n",
+        "pub fn f(x: I32) -> I32 {\n    let _value = 1\n    x\n}\n",
+        "pub fn f() -> I32 { if true { 1 } else { 2 } }\n",
+        "type Counter { marker: I32 }\nimpl Counter {\n    pub fn f(self: borrow Self) -> I32 { self.marker }\n}\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{source}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_success_result(output, "wasm32-core", "dev");
+    }
+}
+
+fn assert_ir_1013_unused_binding_gate(source: &str) {
+    let output = run_check(source, "", &[], &[]);
+    let stdout = std::str::from_utf8(&output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        !stdout.contains("\"code\":\"UNUSED_VARIABLE\""),
+        "{source}: incomplete analysis must not invent a lint:\n{stdout}"
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, source);
+    assert_eq!(
+        stdout.matches("\"type\":\"diagnostic\"").count(),
+        1 + stdout.matches("\"code\":\"UNNECESSARY_RAW_IDENT\"").count(),
+        "{source}: fixture must not be gated by unrelated errors:\n{stdout}"
+    );
 }
 
 #[test]
