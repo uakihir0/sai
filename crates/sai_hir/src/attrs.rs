@@ -1056,7 +1056,14 @@ fn validate_lint_names(
                 diagnostics.push(diagnostic);
             }
             LintNameLookup::Unknown => {
-                let candidates = lint_name_candidates(&spelling);
+                let uppercase = spelling.to_uppercase();
+                let has_case_correction = LINT_REGISTRY
+                    .iter()
+                    .any(|candidate| candidate.code == uppercase);
+                let candidates = lint_name_candidates(
+                    &spelling,
+                    has_case_correction.then_some(uppercase.as_str()),
+                );
                 let mut diagnostic = diagnostic_at(
                     Code::UnknownLint,
                     format!("unknown lint `{spelling}`"),
@@ -1092,11 +1099,7 @@ fn validate_lint_names(
                         .map_err(|_| AttrValidationError::SnapshotMismatch)?;
                 }
 
-                let uppercase = spelling.to_ascii_uppercase();
-                if LINT_REGISTRY
-                    .iter()
-                    .any(|candidate| candidate.code == uppercase)
-                {
+                if has_case_correction {
                     let primary = diagnostic
                         .primary()
                         .cloned()
@@ -1122,9 +1125,10 @@ fn validate_lint_names(
     Ok(Some(PreparedAttribute::Lints(retained)))
 }
 
-fn lint_name_candidates(name: &str) -> Vec<(&'static str, usize)> {
+fn lint_name_candidates(name: &str, case_correction: Option<&str>) -> Vec<(&'static str, usize)> {
     let mut candidates = LINT_REGISTRY
         .iter()
+        .filter(|candidate| Some(candidate.code) != case_correction)
         .filter_map(|candidate| {
             let distance = damerau_levenshtein(name, candidate.code);
             (distance <= 2).then_some((candidate.code, distance))
@@ -3328,6 +3332,143 @@ mod tests {
             )
             .expect("ordered range")
         );
+    }
+
+    #[test]
+    fn unicode_uppercase_lint_corrections_replace_original_bytes() {
+        for name in [
+            "mıssıng_docs",
+            "MıSSıNG_DOCS",
+            "mißing_docs",
+            "MISSING_DOCs",
+        ] {
+            let source = format!("@allow({name})\nfn f() {{}}\n");
+            let (validated, _) = validate_source(&source, function_target());
+
+            assert!(validated.lint_levels.is_empty(), "{name}");
+            assert_eq!(validated.diagnostics.len(), 1, "{name}");
+            let diagnostic = &validated.diagnostics[0];
+            assert_eq!(diagnostic.code, Code::UnknownLint, "{name}");
+            assert_eq!(
+                diagnostic.data.get("name"),
+                Some(&Value::String(name.to_owned()))
+            );
+            let Some(Value::Array(candidates)) = diagnostic.data.get("candidates") else {
+                panic!("missing candidates for {name}");
+            };
+            assert!(
+                !candidates.contains(&Value::String("MISSING_DOCS".to_owned())),
+                "{name}"
+            );
+            assert_eq!(diagnostic.fixes().len(), 1, "{name}");
+            let fix = &diagnostic.fixes()[0];
+            assert_eq!(fix.applicability(), Applicability::MachineApplicable);
+            assert_eq!(fix.edits().len(), 1);
+            assert_eq!(fix.edits()[0].new_text, "MISSING_DOCS");
+            let start = source.find(name).expect("lint name");
+            assert_eq!(
+                fix.edits()[0].range.range,
+                sai_vfs::TextRange::new(
+                    sai_vfs::TextSize::new(u32::try_from(start).expect("start fits")),
+                    sai_vfs::TextSize::new(u32::try_from(start + name.len()).expect("end fits")),
+                )
+                .expect("ordered range")
+            );
+        }
+    }
+
+    fn apply_unicode_lint_fixes(source: &str, validated: &ValidatedAttrs) -> String {
+        let mut edits = Vec::new();
+        for diagnostic in &validated.diagnostics {
+            assert_eq!(diagnostic.code, Code::UnknownLint);
+            assert_eq!(diagnostic.fixes().len(), 1);
+            let fix = &diagnostic.fixes()[0];
+            assert_eq!(fix.applicability(), Applicability::MachineApplicable);
+            assert_eq!(fix.edits().len(), 1);
+            let edit = &fix.edits()[0];
+            assert_eq!(edit.new_text, "MISSING_DOCS");
+            edits.push((edit.range.range, edit.new_text.clone()));
+        }
+        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start()));
+        let mut result = source.to_owned();
+        for (range, replacement) in edits {
+            result.replace_range(
+                range.start().to_usize()..range.end().to_usize(),
+                &replacement,
+            );
+        }
+        result
+    }
+
+    #[test]
+    fn unicode_lint_fix_revalidation_conflicting_levels_keep_first() {
+        for (source, fixed, initial_level, final_level) in [
+            (
+                "@allow(mıssıng_docs)\n@deny(MISSING_DOCS)\nfn f() {}\n",
+                "@allow(MISSING_DOCS)\n@deny(MISSING_DOCS)\nfn f() {}\n",
+                DiagnosticLintLevel::Deny,
+                DiagnosticLintLevel::Allow,
+            ),
+            (
+                "@deny(MISSING_DOCS)\n@allow(mıssıng_docs)\nfn f() {}\n",
+                "@deny(MISSING_DOCS)\n@allow(MISSING_DOCS)\nfn f() {}\n",
+                DiagnosticLintLevel::Deny,
+                DiagnosticLintLevel::Deny,
+            ),
+        ] {
+            let (before, _) = validate_source(source, function_target());
+            assert_eq!(before.diagnostics.len(), 1);
+            assert_eq!(before.lint_levels.len(), 1);
+            assert_eq!(before.lint_levels[0].level, initial_level);
+            let actual_fixed = apply_unicode_lint_fixes(source, &before);
+            assert_eq!(actual_fixed, fixed);
+            let (after, _) = validate_source(&actual_fixed, function_target());
+            assert_eq!(after.diagnostics.len(), 1);
+            assert_eq!(after.diagnostics[0].code, Code::ConflictingLintLevel);
+            assert_eq!(after.lint_levels.len(), 1);
+            assert_eq!(after.lint_levels[0].level, final_level);
+        }
+    }
+
+    #[test]
+    fn unicode_lint_fix_revalidation_creates_duplicate_arguments() {
+        for (source, fixed, initial_errors, initial_levels) in [
+            (
+                "@allow(MISSING_DOCS, mıssıng_docs)\nfn f() {}\n",
+                "@allow(MISSING_DOCS, MISSING_DOCS)\nfn f() {}\n",
+                1,
+                1,
+            ),
+            (
+                "@allow(mıssıng_docs, mißing_docs)\nfn f() {}\n",
+                "@allow(MISSING_DOCS, MISSING_DOCS)\nfn f() {}\n",
+                2,
+                0,
+            ),
+        ] {
+            let (before, _) = validate_source(source, function_target());
+            assert_eq!(before.diagnostics.len(), initial_errors);
+            assert_eq!(before.lint_levels.len(), initial_levels);
+            let actual_fixed = apply_unicode_lint_fixes(source, &before);
+            assert_eq!(actual_fixed, fixed);
+            let (after, _) = validate_source(&actual_fixed, function_target());
+            assert_eq!(after.diagnostics.len(), 1);
+            assert_eq!(after.diagnostics[0].code, Code::DuplicateAttributeArgument);
+            assert_eq!(after.lint_levels.len(), 1);
+            assert_eq!(after.lint_levels[0].level, DiagnosticLintLevel::Allow);
+        }
+    }
+
+    #[test]
+    fn unicode_uppercase_does_not_correct_unknown_or_hard_codes() {
+        for name in ["mıssıng_docx", "mısplaced_doc_comment"] {
+            let source = format!("@allow({name})\nfn f() {{}}\n");
+            let (validated, _) = validate_source(&source, function_target());
+            assert!(validated.lint_levels.is_empty(), "{name}");
+            assert_eq!(validated.diagnostics.len(), 1, "{name}");
+            assert_eq!(validated.diagnostics[0].code, Code::UnknownLint, "{name}");
+            assert!(validated.diagnostics[0].fixes().is_empty(), "{name}");
+        }
     }
 
     #[test]
