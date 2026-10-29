@@ -1,0 +1,5 @@
+//@ kind: fmt-refuse
+//@ stage: 0
+//@ spec: impl/02 §2.5.11, impl/14 §14.2.2
+//@ diag: error EXPECTED_TOKEN at src/lib.sai:6
+pub fn broken() -> Bool { true

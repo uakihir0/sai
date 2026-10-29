@@ -8,7 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from run_stage0 import ROOT_ID, _resolve_spec_reference, _run_iut, run_suite
+from run_stage0 import (
+    ROOT_ID,
+    SmokeError,
+    _formatter_refusal_codes,
+    _resolve_spec_reference,
+    _run_iut,
+    run_suite,
+)
 
 
 class Stage0SmokeRunnerTests(unittest.TestCase):
@@ -50,8 +57,8 @@ def header(command, root):
             "tool":{{"name":"sai","version":"0.1.0"}},
             "command":command,"root":root}}
 
-def summary(errors=0, exit_code=0):
-    return {{"type":"summary","errors":errors,"warnings":0,"infos":0,
+def summary(errors=0, warnings=0, infos=0, exit_code=0):
+    return {{"type":"summary","errors":errors,"warnings":warnings,"infos":infos,
             "shown_errors":errors,
             "suppressed":{{"cascade":0,"duplicate":0,"dependency":0}},
             "exit_code":exit_code}}
@@ -69,9 +76,11 @@ if args == ["--format=json", "explain", "--list"]:
             "INVALID_ASSIGN_TARGET",
             "INVARIANT_OUTSIDE_DEFINING_MODULE",
             "LITERAL_OUT_OF_RANGE",
+            "MISSING_FN_BODY",
             "NAMED_ARGUMENT_ON_FUNCTION",
             "OR_PATTERN_BINDING_MISMATCH",
             "UNFORMATTED_FILE",
+            "UNKNOWN_ATTRIBUTE",
         ]
     print(line(header("explain", None)).rstrip("\\n"))
     print(line({{"type":"result","kind":"explain.list","data":{{"codes":[
@@ -123,6 +132,22 @@ if args == [
         }}}}
         status = 1
         errors = len(diagnostics)
+    elif MODE == "formatter_unexpected_validation_refusal":
+        diagnostic = {{
+            "type":"diagnostic","code":"MISSING_FN_BODY","severity":"error",
+            "level":None,"message":"function requires a body","primary":{{
+                "file":{{"path":"<stdin>","package":None,"snapshot":None}},
+                "start":{{"byte":0,"line":5,"col":1,"utf16_col":1}},
+                "end":{{"byte":1,"line":5,"col":2,"utf16_col":2}}
+            }},"primary_label":"","labels":[],"children":[],"fixes":[],
+            "related":[],"data":{{}},"node":None,"symbol":None,"package":None
+        }}
+        result = {{"type":"result","kind":"fmt","data":{{
+            "check":True,"files":1,"changed":[],"refused":["<stdin>"],"output":None
+        }}}}
+        status = 1
+        errors = 1
+        diagnostics = [diagnostic]
     elif MODE == "formatter_unexpected_refusal":
         diagnostic = {{
             "type":"diagnostic","code":"FEATURE_NOT_IMPLEMENTED","severity":"error",
@@ -224,6 +249,53 @@ if args == [
         }},"primary_label":"","labels":[],"children":[],"fixes":[],
         "related":[],"data":{{}},"node":None,"symbol":None,"package":None
     }}
+    if MODE.startswith("fmt_refuse"):
+        warnings = 0
+        if MODE == "fmt_refuse_malformed":
+            sys.stdout.buffer.write(b"{{bad json\\n")
+            raise SystemExit(0)
+        if MODE == "fmt_refuse_accepts":
+            diagnostics = []
+            status = 0
+            errors = 0
+            result_data = {{
+                "check":False,"files":1,"changed":[],
+                "refused":[],"output":formatter_input.decode("utf-8")
+            }}
+        else:
+            diagnostic["primary"]["start"]["line"] = formatter_input.count(b"\\n") + 1
+            diagnostic["primary"]["end"]["line"] = formatter_input.count(b"\\n") + 1
+            if MODE == "fmt_refuse_wrong_line":
+                diagnostic["primary"]["start"]["line"] -= 1
+                diagnostic["primary"]["end"]["line"] -= 1
+            if MODE == "fmt_refuse_validation_diagnostic":
+                diagnostic["code"] = "MISSING_FN_BODY"
+                diagnostic["message"] = "function requires a body"
+            if MODE == "fmt_refuse_warning":
+                diagnostic["severity"] = "warning"
+            if MODE == "fmt_refuse_internal_error":
+                diagnostic["code"] = "INTERNAL_COMPILER_ERROR"
+                diagnostic["message"] = "internal compiler error"
+            diagnostics = [diagnostic]
+            if MODE == "fmt_refuse_extra_diagnostic":
+                diagnostics.append(json.loads(json.dumps(diagnostic)))
+            status = 101 if MODE == "fmt_refuse_internal_error" else 1
+            errors = sum(item["severity"] == "error" for item in diagnostics)
+            warnings = sum(item["severity"] == "warning" for item in diagnostics)
+            result_data = {{
+                "check":False,"files":1,"changed":[],
+                "refused":["<stdin>"],"output":None
+            }}
+            if MODE == "fmt_refuse_bad_schema":
+                result_data.pop("output")
+        result = {{"type":"result","kind":"fmt","data":result_data}}
+        print(line(header("fmt", None)).rstrip("\\n"))
+        for item in diagnostics:
+            print(line(item).rstrip("\\n"))
+        print(line(result).rstrip("\\n"))
+        print(line(summary(errors=errors, warnings=warnings, exit_code=status)).rstrip("\\n"))
+        raise SystemExit(status)
+
     if MODE == "fmt_refused":
         output = None
         changed = []
@@ -327,13 +399,20 @@ if MODE == "stderr":
 is_fail = b"check-fail" in source
 diagnostics = []
 if is_fail:
-    offset = source.index(b"@")
+    if MODE == "validation_only_check":
+        offset = source.index(b"pub fn missing")
+        code = "MISSING_FN_BODY"
+        line_number = source[:offset].count(b"\\n") + 1
+    else:
+        offset = source.index(b"@")
+        code = "EXPECTED_TOKEN"
+        line_number = 4
     diagnostics.append({{
-        "type":"diagnostic","code":"EXPECTED_TOKEN","severity":"error",
+        "type":"diagnostic","code":code,"severity":"error",
         "level":None,"message":"expected a token","primary":{{
             "file":{{"path":"src/lib.sai","package":ROOT,"snapshot":None}},
-            "start":{{"byte":offset,"line":4,"col":1,"utf16_col":1}},
-            "end":{{"byte":offset+1,"line":4,"col":2,"utf16_col":2}}
+            "start":{{"byte":offset,"line":line_number,"col":1,"utf16_col":1}},
+            "end":{{"byte":offset+1,"line":line_number,"col":2,"utf16_col":2}}
         }},"primary_label":"","labels":[],"children":[],"fixes":[],
         "related":[],"data":{{}},"node":None,"symbol":None,"package":ROOT
     }})
@@ -361,13 +440,13 @@ raise SystemExit(exit_code)
         self.script.write_text(script, encoding="utf-8")
         self.launcher.chmod(0o755)
 
-    def _fixture(self, kind="check-pass", *, extra="", body=None):
+    def _fixture(self, kind="check-pass", *, extra="", body=None, spec="spec/02 §2.1"):
         if body is None:
             body = "pub fn value() -> Bool { true }\n"
         self.source.write_text(
             f"//@ kind: {kind}\n"
             "//@ stage: 0\n"
-            "//@ spec: spec/02 §2.1\n"
+            f"//@ spec: {spec}\n"
             f"{extra}{body}",
             encoding="utf-8",
         )
@@ -468,7 +547,7 @@ raise SystemExit(exit_code)
         report = self._run()
         self.assertEqual(report["outcome"], "fail")
         self.assertIn(
-            "accepted source with explicitly expected lexical or syntax errors",
+            "accepted source with explicitly expected refusal errors",
             " ".join(report["results"][0]["failures"]),
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
@@ -481,7 +560,7 @@ raise SystemExit(exit_code)
         report = self._run()
         self.assertEqual(report["outcome"], "fail")
         self.assertIn(
-            "only by lexical or syntax errors",
+            "non-parser or unsupported",
             " ".join(report["results"][0]["failures"]),
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
@@ -498,7 +577,7 @@ raise SystemExit(exit_code)
         report = self._run()
         self.assertEqual(report["outcome"], "fail")
         self.assertIn(
-            "only by lexical or syntax errors",
+            "non-parser or unsupported",
             " ".join(report["results"][0]["failures"]),
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
@@ -518,9 +597,114 @@ raise SystemExit(exit_code)
         report = self._run()
         self.assertEqual(report["outcome"], "fail")
         self.assertIn(
-            "only by lexical or syntax errors",
+            "non-parser or unsupported",
             " ".join(report["results"][0]["failures"]),
         )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt"])
+
+    def test_formatter_refusal_taxonomy_uses_exact_parser_phase_rows(self):
+        codes = _formatter_refusal_codes(Path(__file__).resolve().parents[2] / "docs")
+        self.assertTrue({
+            "INVALID_UTF8",
+            "EXPECTED_TOKEN",
+            "EXPECTED_EXPRESSION",
+            "UNEXPECTED_NEWLINE",
+            "IMPLEMENTATION_LIMIT_EXCEEDED",
+        } <= codes)
+        self.assertFalse({
+            "LITERAL_OUT_OF_RANGE",
+            "CLAUSE_ORDER",
+            "MISSING_FN_BODY",
+            "UNKNOWN_ATTRIBUTE",
+            "INFER_IN_SIGNATURE",
+            "NAMED_ARGUMENT_ON_FUNCTION",
+            "INVALID_ASSIGN_TARGET",
+            "FEATURE_NOT_IMPLEMENTED",
+            "GENERIC_INTERFACE_ITEM",
+            "INTERFACE_FN_CLAUSE",
+            "EFFECTS_ON_INTERFACE_FN",
+            "OR_PATTERN_BINDING_MISMATCH",
+            "INVARIANT_OUTSIDE_DEFINING_MODULE",
+            "MISPLACED_DOC_COMMENT",
+        } & codes)
+
+    def test_formatter_refusal_taxonomy_uses_fail_closed_parser_severities(self):
+        required = (
+            "INVALID_UTF8",
+            "EXPECTED_TOKEN",
+            "EXPECTED_EXPRESSION",
+            "UNEXPECTED_NEWLINE",
+            "IMPLEMENTATION_LIMIT_EXCEEDED",
+        )
+
+        def write_docs(root, parser_rows):
+            lexical = root / "spec" / "02-lexical-structure.md"
+            implementation = root / "impl" / "02-frontend-ast-hir.md"
+            lexical.parent.mkdir(parents=True, exist_ok=True)
+            implementation.parent.mkdir(parents=True, exist_ok=True)
+            lexical.write_text(
+                "## 2.12 Lexical diagnostics\n\n"
+                "| Code | Severity | Description |\n"
+                "|---|---|---|\n"
+                + "".join(f"| `{code}` | error | sample |\n" for code in required),
+                encoding="utf-8",
+            )
+            implementation.write_text(
+                "### 2.5.12 Syntactic validation\n\n"
+                "| Code | Where | Check |\n"
+                "|---|---|---|\n"
+                + "".join(
+                    f"| `{code}` | parser | sample |\n" for code in parser_rows
+                )
+                + "\n## 2.12 Diagnostics\n\n"
+                "| Code | Severity | Description |\n"
+                "|---|---|---|\n"
+                "| `EXPECTED_TOKEN` | error | sample |\n"
+                "| `FUTURE_PARSER_WARNING` | warning | sample |\n",
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            docs = Path(temporary) / "docs"
+            write_docs(docs, ("EXPECTED_TOKEN", "FUTURE_PARSER_WARNING"))
+            codes = _formatter_refusal_codes(docs)
+            self.assertNotIn("FUTURE_PARSER_WARNING", codes)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            docs = Path(temporary) / "docs"
+            write_docs(docs, ("EXPECTED_TOKEN", "UNREGISTERED_PARSER_CODE"))
+            with self.assertRaisesRegex(
+                SmokeError,
+                "missing severity definitions",
+            ):
+                _formatter_refusal_codes(docs)
+
+    def test_expected_validation_error_does_not_force_formatter_preflight_refusal(self):
+        self._fixture(
+            "check-fail",
+            extra=(
+                "//@ diag: error MISSING_FN_BODY at src/lib.sai:5\n"
+            ),
+            body="pub fn missing();\n",
+            spec="impl/02 §2.5.12",
+        )
+        self.mode = "validation_only_check"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "pass")
+        self.assertEqual(report["results"][0]["failures"], [])
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt", "check"])
+
+    def test_fake_validation_only_formatter_refusal_is_rejected_before_check(self):
+        self._fixture()
+        self.mode = "formatter_unexpected_validation_refusal"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn("non-parser or unsupported",
+                      " ".join(report["results"][0]["failures"]))
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual(receipt["calls"], ["fmt"])
 
@@ -556,6 +740,99 @@ raise SystemExit(exit_code)
         self.expected_format = expected
         self.mode = "fmt_fixture"
         self._write_fake()
+
+    def _fmt_refuse_fixture(
+        self, *, expected_line=6, extra="", body="pub fn broken() -> Bool { true\n",
+    ):
+        self.source.write_text(
+            "//@ kind: fmt-refuse\n"
+            "//@ stage: 0\n"
+            "//@ spec: impl/02 §2.5.11, impl/14 §14.2.2\n"
+            f"//@ diag: error EXPECTED_TOKEN at src/lib.sai:{expected_line}\n"
+            + extra
+            + body,
+            encoding="utf-8",
+        )
+        self.mode = "fmt_refuse"
+        self._write_fake()
+
+    def test_fmt_refuse_accepts_exact_error_multiset_without_preflight_or_check(self):
+        self._fmt_refuse_fixture()
+        original = self.source.read_bytes()
+        report = self._run()
+        self.assertEqual(report["outcome"], "pass")
+        self.assertEqual(report["results"][0]["outcome"], "pass")
+        self.assertIsNone(report["results"][0]["compatibility_execution"])
+        self.assertIs(report["claim"], False)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["fmt_argv"], [
+            "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
+        ])
+        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["formatter_inputs"], [original.decode("utf-8")])
+        self.assertEqual(self.source.read_bytes(), original)
+
+    def test_fmt_refuse_rejects_missing_wrong_and_extra_diagnostics(self):
+        self._fmt_refuse_fixture()
+        self.source.write_text(
+            "//@ kind: fmt-refuse\n"
+            "//@ stage: 0\n"
+            "//@ spec: impl/02 §2.5.11\n"
+            "pub fn broken() -> Bool { true\n",
+            encoding="utf-8",
+        )
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn("require expected error diagnostics",
+                      " ".join(report["results"][0]["failures"]))
+
+        for mode, extra, reason in (
+            ("fmt_refuse", "",
+             "does not match the expected error multiset"),
+            ("fmt_refuse_extra_diagnostic", "", "does not match the expected error multiset"),
+            ("fmt_refuse_validation_diagnostic", "", "non-parser or unsupported"),
+            ("fmt_refuse_warning", "", "non-parser or unsupported"),
+        ):
+            with self.subTest(mode=mode, extra=extra):
+                expected_line = 5 if mode == "fmt_refuse" else 6
+                self._fmt_refuse_fixture(expected_line=expected_line, extra=extra)
+                self.mode = mode
+                self._write_fake()
+                report = self._run()
+                self.assertEqual(report["outcome"], "fail")
+                self.assertIn(reason, " ".join(report["results"][0]["failures"]))
+
+        self._fmt_refuse_fixture()
+        self.mode = "fmt_refuse_wrong_line"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn("does not match the expected error multiset",
+                      " ".join(report["results"][0]["failures"]))
+
+    def test_fmt_refuse_rejects_acceptance_bad_schema_malformed_stream_and_ice(self):
+        for mode, reason in (
+            ("fmt_refuse_accepts", "was accepted by the formatter"),
+            ("fmt_refuse_bad_schema", "invalid result schema"),
+            ("fmt_refuse_malformed", "invalid record"),
+            ("fmt_refuse_internal_error", "internal compiler error"),
+        ):
+            with self.subTest(mode=mode):
+                self._fmt_refuse_fixture()
+                self.mode = mode
+                self._write_fake()
+                report = self._run()
+                self.assertEqual(report["outcome"], "fail")
+                self.assertIn(reason, " ".join(report["results"][0]["failures"]))
+
+    def test_fmt_refuse_rejects_every_sidecar(self):
+        self._fmt_refuse_fixture()
+        (self.fixture_dir / "case.expected.sai").write_bytes(b"unexpected\n")
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn("sidecars are unsupported",
+                      " ".join(report["results"][0]["failures"]))
+        self.assertFalse(self.receipt.exists())
 
     def test_fmt_compares_original_bytes_and_expected_fixed_point(self):
         self._fmt_fixture()

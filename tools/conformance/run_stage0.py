@@ -2,8 +2,8 @@
 """Run a deliberately partial Stage 0 smoke suite against a black-box IUT.
 
 This runner accepts only reference-implementation, single-file Stage 0
-check-pass/check-fail and source-fmt tests. Its results are useful smoke
-evidence only; it never reports a conformance claim.
+check-pass/check-fail and source-fmt/fmt-refuse tests. Its results are useful
+smoke evidence only; it never reports a conformance claim.
 """
 
 from __future__ import annotations
@@ -197,8 +197,8 @@ def _validate_directives(extracted: dict, docs_root: Path) -> tuple[dict, list[d
     if not {"kind", "stage", "spec"} <= set(specified):
         raise SmokeError("Stage 0 tests require kind, stage, and spec directives")
     kind = directives.get("kind")
-    if kind not in ("check-pass", "check-fail", "fmt"):
-        raise SmokeError("only check-pass, check-fail, and fmt are supported")
+    if kind not in ("check-pass", "check-fail", "fmt", "fmt-refuse"):
+        raise SmokeError("only check-pass, check-fail, fmt, and fmt-refuse are supported")
     if directives.get("stage") != 0:
         raise SmokeError("only Stage 0 tests are supported")
     if not isinstance(directives.get("spec"), list) or not directives["spec"]:
@@ -206,9 +206,26 @@ def _validate_directives(extracted: dict, docs_root: Path) -> tuple[dict, list[d
     for reference in directives["spec"]:
         _resolve_spec_reference(reference, docs_root)
 
-    if kind == "fmt":
-        if expected or "diag" in specified:
+    if kind in ("fmt", "fmt-refuse"):
+        if kind == "fmt" and (expected or "diag" in specified):
             raise SmokeError("source fmt fixtures do not support diagnostic expectations")
+        if kind == "fmt-refuse":
+            refusal_codes = _formatter_refusal_codes(docs_root)
+            if not expected or "diag" not in specified:
+                raise SmokeError("source fmt-refuse fixtures require expected error diagnostics")
+            for diagnostic in expected:
+                if (
+                    not isinstance(diagnostic, dict)
+                    or diagnostic.get("file") != "src/lib.sai"
+                    or type(diagnostic.get("line")) is not int
+                    or diagnostic["line"] < 1
+                    or diagnostic.get("severity") != "error"
+                    or diagnostic.get("code") not in refusal_codes
+                ):
+                    raise SmokeError(
+                        "source fmt-refuse expectations must be located formatter "
+                        "refusal errors"
+                    )
         # Stage 0's formatter command is targetless; configurations.select()
         # intentionally selects configurations only for Stage 0 checks.
         selected = {
@@ -427,6 +444,108 @@ def _run_fmt_fixture(
         )
 
 
+def _formatter_envelope(
+    completed: subprocess.CompletedProcess,
+    *,
+    registered_codes: set[str],
+) -> tuple[list[dict], dict, dict]:
+    records = _records(
+        completed.stdout,
+        exit_code=completed.returncode,
+        stderr=completed.stderr,
+        max_errors=0,
+    )
+    header = records[0]
+    if (
+        set(header) != {"type", "format", "version", "tool", "command", "root"}
+        or header.get("command") != "fmt"
+        or header.get("root") is not None
+        or not isinstance(header.get("tool"), dict)
+        or set(header["tool"]) != {"name", "version"}
+    ):
+        raise SmokeError("sai fmt returned the wrong header")
+    if (
+        len(records) < 3
+        or records[-2]["type"] != "result"
+        or sum(record["type"] == "result" for record in records) != 1
+        or any(record["type"] != "diagnostic" for record in records[1:-2])
+    ):
+        raise SmokeError("sai fmt returned the wrong record shape")
+    summary = records[-1]
+    if (
+        set(summary) != {
+            "type", "errors", "warnings", "infos", "shown_errors", "suppressed", "exit_code",
+        }
+        or not isinstance(summary.get("suppressed"), dict)
+        or set(summary["suppressed"]) != {"cascade", "duplicate", "dependency"}
+    ):
+        raise SmokeError("sai fmt returned an invalid summary schema")
+    diagnostics = records[1:-2]
+    expected_diagnostic_fields = {
+        "type", "code", "severity", "level", "message", "primary", "primary_label",
+        "labels", "children", "fixes", "related", "data", "node", "symbol", "package",
+    }
+    if any(set(item) != expected_diagnostic_fields for item in diagnostics):
+        raise SmokeError("sai fmt returned an invalid diagnostic schema")
+    actual = _formatter_diagnostics(records, registered_codes)
+    result = records[-2]
+    if result.get("kind") != "fmt" or set(result) != {"type", "kind", "data"}:
+        raise SmokeError("sai fmt returned an invalid result kind")
+    data = result.get("data")
+    fields = {"check", "files", "changed", "refused", "output"}
+    if not isinstance(data, dict) or set(data) != fields:
+        raise SmokeError("sai fmt returned an invalid result schema")
+    return actual, data, summary
+
+
+def _validate_fmt_refusal(
+    completed: subprocess.CompletedProcess,
+    *,
+    expected: list[dict],
+    registered_codes: set[str],
+    refusal_codes: set[str],
+) -> None:
+    actual, data, summary = _formatter_envelope(
+        completed,
+        registered_codes=registered_codes,
+    )
+    if completed.returncode == 0:
+        raise SmokeError("source fmt-refuse fixture was accepted by the formatter")
+    if (
+        type(data["check"]) is not bool
+        or data["check"] is not False
+        or type(data["files"]) is not int
+        or data["files"] != 1
+        or not isinstance(data["changed"], list)
+        or data["changed"] != []
+        or not isinstance(data["refused"], list)
+        or data["refused"] != ["<stdin>"]
+        or data["output"] is not None
+    ):
+        raise SmokeError("sai fmt refusal result does not match the source stdin fixture")
+    if completed.returncode != 1 or summary["exit_code"] != 1:
+        raise SmokeError("sai fmt-refuse returned an abnormal exit code")
+    if not actual:
+        raise SmokeError("sai fmt-refuse returned no diagnostic")
+    if any(
+        item["severity"] != "error" or item["code"] not in refusal_codes
+        for item in actual
+    ):
+        raise SmokeError(
+            "formatter refusal included a non-parser or unsupported diagnostic"
+        )
+    expected_counts = Counter(
+        (item["file"], item["line"], item["severity"], item["code"])
+        for item in expected
+    )
+    actual_counts = Counter(
+        (item["file"], item["line"], item["severity"], item["code"])
+        for item in actual
+    )
+    if expected_counts != actual_counts:
+        raise SmokeError("formatter refusal does not match the expected error multiset")
+
+
 def _actual_diagnostics(records: list[dict], codes: set[str]) -> list[dict]:
     actual = []
     for record in records:
@@ -506,52 +625,189 @@ def _validate_check_result(records: list[dict], *, kind: str, exit_code: int,
         raise SmokeError("sai check result does not match the smoke package")
 
 
-def _lexical_syntax_error_codes(docs_root: Path) -> set[str]:
-    sections = (
-        ("spec/02-lexical-structure.md", "## 2.12 Lexical diagnostics"),
-        ("spec/03-grammar.md", "## 3.16 Syntactic diagnostics"),
+def _read_markdown_section(
+    docs_root: Path,
+    *,
+    relative_path: str,
+    heading: str,
+    level: int,
+) -> list[str]:
+    path = docs_root / relative_path
+    try:
+        resolved_docs = docs_root.resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+        resolved_path.relative_to(resolved_docs)
+        lines = resolved_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, RuntimeError, UnicodeError, ValueError):
+        raise SmokeError("could not read formatter refusal diagnostic definitions") from None
+    marker = "#" * level + " " + heading
+    start = None
+    end = len(lines)
+    heading_pattern = re.compile(r"^(#{1," + str(level) + r"})[ \t]+")
+    for index, line in enumerate(lines):
+        if line == marker:
+            start = index + 1
+            continue
+        if start is not None and heading_pattern.match(line):
+            end = index
+            break
+    if start is None:
+        raise SmokeError("formatter refusal diagnostic definition section is missing")
+    return lines[start:end]
+
+
+def _table_cells(line: str) -> list[str] | None:
+    stripped = line.strip()
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return None
+    cells = []
+    start = 1
+    in_code = False
+    for index in range(1, len(stripped) - 1):
+        char = stripped[index]
+        if char == "`":
+            in_code = not in_code
+        elif char == "|" and not in_code:
+            cells.append(stripped[start:index].strip())
+            start = index + 1
+    cells.append(stripped[start:-1].strip())
+    return cells
+
+
+def _formatter_refusal_codes(docs_root: Path) -> set[str]:
+    code_pattern = re.compile(r"`([A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+)`")
+    lexical_lines = _read_markdown_section(
+        docs_root,
+        relative_path="spec/02-lexical-structure.md",
+        heading="2.12 Lexical diagnostics",
+        level=2,
     )
-    codes = set()
-    row_pattern = re.compile(r"\|\s*`([A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+)`\s*\|\s*([^|]+)\|")
-    for relative_path, heading in sections:
-        path = docs_root / relative_path
-        try:
-            resolved_docs = docs_root.resolve(strict=True)
-            resolved_path = path.resolve(strict=True)
-            resolved_path.relative_to(resolved_docs)
-            lines = resolved_path.read_text(encoding="utf-8").splitlines()
-        except (OSError, RuntimeError, UnicodeError, ValueError):
-            raise SmokeError("could not read lexical and syntax diagnostic definitions") from None
-        in_section = False
-        found_section = False
-        section_codes = set()
-        for line in lines:
-            if line == heading:
-                in_section = True
-                found_section = True
-                continue
-            if in_section and line.startswith("## "):
-                break
-            if not in_section:
-                continue
-            match = row_pattern.match(line)
-            if match and match.group(2).strip() == "error":
-                section_codes.add(match.group(1))
-        if not found_section or not section_codes:
-            raise SmokeError("lexical and syntax diagnostic definitions are incomplete")
-        codes.update(section_codes)
-    # Spec/02 §2.6.1 requires the literal's type to be known before its range
-    # can be checked. Spec/03 §3.16 also lists diagnostics whose some cases
-    # require name resolution or type checking. Exclude each whole code
-    # because the formatter's diagnostic code cannot distinguish those cases
-    # from parser-detectable variants.
-    codes.difference_update({
+    parser_lines = _read_markdown_section(
+        docs_root,
+        relative_path="impl/02-frontend-ast-hir.md",
+        heading="2.5.12 Syntactic validation",
+        level=3,
+    )
+    diagnostic_lines = _read_markdown_section(
+        docs_root,
+        relative_path="impl/02-frontend-ast-hir.md",
+        heading="2.12 Diagnostics",
+        level=2,
+    )
+    codes: set[str] = set()
+    lexical_codes: set[str] = set()
+    parser_codes: set[str] = set()
+    diagnostic_severities: dict[str, str] = {}
+    found_lexical_table = False
+    for line in lexical_lines:
+        cells = _table_cells(line)
+        if not cells:
+            continue
+        if cells == ["Code", "Severity", "Description"]:
+            found_lexical_table = True
+            continue
+        if not cells[0].startswith("`"):
+            continue
+        if len(cells) != 3:
+            raise SmokeError("formatter lexical diagnostic table has an unsupported row")
+        matches = code_pattern.findall(cells[0])
+        if len(matches) != 1 or "`" + matches[0] + "`" != cells[0]:
+            raise SmokeError("formatter lexical diagnostic table has an unsupported row")
+        if cells[1] not in ("error", "warning", "warning (lint)"):
+            raise SmokeError("formatter lexical diagnostic severity is unsupported")
+        if cells[1] == "error" and matches[0] != "LITERAL_OUT_OF_RANGE":
+            lexical_codes.add(matches[0])
+
+    found_parser_table = False
+    for line in parser_lines:
+        cells = _table_cells(line)
+        if not cells:
+            continue
+        if cells == ["Code", "Where", "Check"]:
+            found_parser_table = True
+            continue
+        if not cells[0].startswith("`"):
+            continue
+        if len(cells) != 3:
+            raise SmokeError("formatter parser diagnostic table has an unsupported row")
+        row_codes = code_pattern.findall(cells[0])
+        if not row_codes:
+            raise SmokeError("formatter parser diagnostic table has an unsupported row")
+        remainder = code_pattern.sub("", cells[0]).replace(",", "").strip()
+        if remainder:
+            raise SmokeError("formatter parser diagnostic code list is malformed")
+        # Only an exact parser phase is accepted. Rows with mixed phases such
+        # as "parser for ..., validation for ..." are excluded as whole rows.
+        if cells[1] == "parser":
+            parser_codes.update(row_codes)
+
+    found_diagnostic_table = False
+    for line in diagnostic_lines:
+        cells = _table_cells(line)
+        if not cells:
+            continue
+        if cells == ["Code", "Severity", "Description"]:
+            found_diagnostic_table = True
+            continue
+        if not cells[0].startswith("`"):
+            continue
+        if len(cells) != 3:
+            raise SmokeError("formatter diagnostic severity table has an unsupported row")
+        row_codes = code_pattern.findall(cells[0])
+        if not row_codes:
+            raise SmokeError("formatter diagnostic severity table has an unsupported row")
+        remainder = code_pattern.sub("", cells[0]).replace(",", "").strip()
+        if remainder or cells[1] not in ("error", "warning", "warning (lint)"):
+            raise SmokeError("formatter diagnostic severity row is malformed")
+        for code in row_codes:
+            previous = diagnostic_severities.setdefault(code, cells[1])
+            if previous != cells[1]:
+                raise SmokeError("formatter diagnostic severity is inconsistent")
+
+    if (
+        not found_lexical_table
+        or not found_parser_table
+        or not found_diagnostic_table
+    ):
+        raise SmokeError("formatter refusal diagnostic tables are incomplete")
+    unknown_parser_codes = parser_codes - diagnostic_severities.keys()
+    if unknown_parser_codes:
+        raise SmokeError(
+            "formatter parser diagnostics are missing severity definitions"
+        )
+    # The implementation diagnostic table is authoritative for parser severity.
+    # A new parser-phase warning must remain excluded even if it is absent from
+    # the lexical table (which contains only lexer-owned severities).
+    parser_codes = {
+        code for code in parser_codes
+        if diagnostic_severities[code] == "error"
+    }
+    parser_codes.discard("CLAUSE_ORDER")
+    codes = lexical_codes | parser_codes
+    required = {
+        "INVALID_UTF8",
+        "EXPECTED_TOKEN",
+        "EXPECTED_EXPRESSION",
+        "UNEXPECTED_NEWLINE",
+        "IMPLEMENTATION_LIMIT_EXCEEDED",
+    }
+    excluded = {
         "LITERAL_OUT_OF_RANGE",
-        "INVARIANT_OUTSIDE_DEFINING_MODULE",
-        "OR_PATTERN_BINDING_MISMATCH",
+        "CLAUSE_ORDER",
+        "MISSING_FN_BODY",
+        "UNKNOWN_ATTRIBUTE",
+        "INFER_IN_SIGNATURE",
         "NAMED_ARGUMENT_ON_FUNCTION",
         "INVALID_ASSIGN_TARGET",
-    })
+        "INVARIANT_OUTSIDE_DEFINING_MODULE",
+        "OR_PATTERN_BINDING_MISMATCH",
+        "FEATURE_NOT_IMPLEMENTED",
+        "GENERIC_INTERFACE_ITEM",
+        "INTERFACE_FN_CLAUSE",
+        "EFFECTS_ON_INTERFACE_FN",
+    }
+    if not required <= codes or codes & excluded:
+        raise SmokeError("formatter refusal diagnostic tables do not match the supported taxonomy")
     return codes
 
 
@@ -595,7 +851,7 @@ def _validate_formatter_preflight(
     *,
     expected: list[dict],
     registered_codes: set[str],
-    lexical_syntax_codes: set[str],
+    formatter_refusal_codes: set[str],
 ) -> None:
     records = _records(
         completed.stdout,
@@ -633,12 +889,12 @@ def _validate_formatter_preflight(
     actual = _formatter_diagnostics(records, registered_codes)
     expected_parse_errors = [
         item for item in expected
-        if item["severity"] == "error" and item["code"] in lexical_syntax_codes
+        if item["severity"] == "error" and item["code"] in formatter_refusal_codes
     ]
     if completed.returncode == 0:
         if expected_parse_errors:
             raise SmokeError(
-                "formatter accepted source with explicitly expected lexical or syntax errors"
+                "formatter accepted source with explicitly expected refusal errors"
             )
         if actual or data["changed"] or data["refused"]:
             raise SmokeError("sai fmt --check did not confirm canonical source")
@@ -651,10 +907,10 @@ def _validate_formatter_preflight(
     if data["changed"] or data["refused"] != ["<stdin>"]:
         raise SmokeError("sai fmt --check returned an unexpected refusal")
     if not actual or any(
-        item["severity"] != "error" or item["code"] not in lexical_syntax_codes
+        item["severity"] != "error" or item["code"] not in formatter_refusal_codes
         for item in actual
     ):
-        raise SmokeError("formatter refusal was not caused only by lexical or syntax errors")
+        raise SmokeError("formatter refusal included a non-parser or unsupported diagnostic")
 
     expected_parse_counts = Counter(
         (item["file"], item["line"], item["severity"], item["code"])
@@ -666,7 +922,7 @@ def _validate_formatter_preflight(
     )
     if not expected_parse_errors or expected_parse_counts != actual_parse_counts:
         raise SmokeError(
-            "formatter refusal does not match explicitly expected lexical or syntax errors"
+            "formatter refusal does not match explicitly expected errors"
         )
 
 
@@ -719,6 +975,37 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
             )
             output["outcome"] = "pass"
             return output
+        if directives["kind"] == "fmt-refuse":
+            _reject_sidecars(source_path, path)
+            refusal_codes = _formatter_refusal_codes(docs_root)
+            command = [
+                "--format=json",
+                "--max-errors=0",
+                "fmt",
+                "--stdin-kind",
+                "source",
+                "-",
+            ]
+            with tempfile.TemporaryDirectory(prefix="sai-stage0-fmt-refuse-") as temporary:
+                sandbox_root = Path(temporary)
+                package_root = sandbox_root / "package"
+                package_root.mkdir()
+                completed = _run_iut(
+                    iut,
+                    command,
+                    package_root,
+                    timeout,
+                    state_root=sandbox_root,
+                    stdin_data=source_bytes,
+                )
+            _validate_fmt_refusal(
+                completed,
+                expected=expected,
+                registered_codes=codes,
+                refusal_codes=refusal_codes,
+            )
+            output["outcome"] = "pass"
+            return output
         output["compatibility_execution"] = {
             "manifest_target": "wasm32-core",
             "cli_profile_default": "dev",
@@ -751,7 +1038,7 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
                 formatter,
                 expected=expected,
                 registered_codes=codes,
-                lexical_syntax_codes=_lexical_syntax_error_codes(docs_root),
+                formatter_refusal_codes=_formatter_refusal_codes(docs_root),
             )
             source_dir = package_root / "src"
             source_dir.mkdir()
@@ -815,8 +1102,8 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "The caller must supply this repository's reference sai binary; the runner "
             "cannot verify the identity of the executable passed with --iut.",
             "Formatter coverage is limited to single-file source fmt goldens and "
-            "fixed-point checks; fmt-refuse, package formatting, layout variants, "
-            "and fmt --check behavior are not covered.",
+            "refusals; fixed-point checks cover fmt goldens only. Package formatting, "
+            "layout variants, and fmt --check behavior are not covered.",
             "This smoke subset does not establish section, diagnostic, or suite coverage "
             "and cannot substantiate a conformance claim.",
         ],
