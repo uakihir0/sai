@@ -97,13 +97,17 @@ stdin_check_args = [
     "--stdin-kind", "source", "-",
 ]
 package_check_args = ["--format=json", "--max-errors=0", "fmt", "--check"]
+path_check_args = [
+    "--format=json", "--max-errors=0", "fmt", "--check", "src/lib.sai",
+]
 is_package_check = args == package_check_args
-if args == stdin_check_args or is_package_check:
+is_path_check = args == path_check_args
+if args == stdin_check_args or is_package_check or is_path_check:
     formatter_input = (
-        Path("src/lib.sai").read_bytes() if is_package_check
+        Path("src/lib.sai").read_bytes() if is_package_check or is_path_check
         else sys.stdin.buffer.read()
     )
-    formatter_path = "src/lib.sai" if is_package_check else "<stdin>"
+    formatter_path = "src/lib.sai" if is_package_check or is_path_check else "<stdin>"
     formatter_file_count = 2 if is_package_check else 1
     try:
         receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
@@ -244,7 +248,10 @@ if args == stdin_check_args or is_package_check:
                 diagnostic["primary"]["end"]["utf16_col"] += 1
             if MODE == "fmt_check_wrong_data":
                 diagnostic["data"]["expected"] = "different"
-            if is_package_check and MODE == "fmt_check_package_wrong_path":
+            if (
+                (is_package_check and MODE == "fmt_check_package_wrong_path")
+                or (is_path_check and MODE == "fmt_check_path_wrong_path")
+            ):
                 diagnostic["primary"]["file"]["path"] = "src/other.sai"
             if (
                 is_package_check
@@ -274,7 +281,11 @@ if args == stdin_check_args or is_package_check:
         files = formatter_file_count
         if is_package_check and MODE == "fmt_check_package_wrong_files":
             files = 1
+        if is_path_check and MODE == "fmt_check_path_wrong_files":
+            files = 2
         if is_package_check and MODE == "fmt_check_package_wrong_changed":
+            changed = ["src/other.sai"]
+        if is_path_check and MODE == "fmt_check_path_wrong_changed":
             changed = ["src/other.sai"]
         result = {{"type":"result","kind":"fmt","data":{{
             "check":True,"files":files,"changed":changed,"refused":refused,"output":output
@@ -285,6 +296,11 @@ if args == stdin_check_args or is_package_check:
             source_path = Path("src/lib.sai")
             source_path.write_bytes(source_path.read_bytes())
         if is_package_check and MODE == "fmt_check_package_adds_source":
+            Path("src/extra.sai").write_bytes(b"added by fake IUT\\n")
+        if is_path_check and MODE == "fmt_check_path_rewrites_identical_source":
+            source_path = Path("src/lib.sai")
+            source_path.write_bytes(source_path.read_bytes())
+        if is_path_check and MODE == "fmt_check_path_adds_source":
             Path("src/extra.sai").write_bytes(b"added by fake IUT\\n")
         if is_package_check and MODE == "fmt_check_package_mutates_manifest":
             Path("sai.package").write_bytes(b"modified by fake IUT\\n")
@@ -1038,20 +1054,31 @@ raise SystemExit(exit_code)
         self.assertIsNone(report["results"][0]["compatibility_execution"])
         self.assertIs(report["claim"], False)
         self.assertIn(
-            "generated package with one source file",
+            "generated package-wide",
             report["limitations"][2],
         )
         self.assertIn(
-            "workspace and multi-source package checks, path-based fmt --check",
+            "fmt --check with one explicit path",
             report["limitations"][2],
         )
+        self.assertIn("workspaces, multi-source package checks", report["limitations"][2])
+        self.assertIn("multiple explicit path arguments", report["limitations"][2])
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual(receipt["fmt_argv"], [
             "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
         ])
         self.assertEqual(
             receipt["calls"],
-            ["fmt", "fmt", "fmt-check", "fmt-check", "fmt-check", "fmt-check"],
+            [
+                "fmt",
+                "fmt",
+                "fmt-check",
+                "fmt-check",
+                "fmt-check",
+                "fmt-check",
+                "fmt-check",
+                "fmt-check",
+            ],
         )
         self.assertEqual(receipt["formatter_inputs"], [
             original.decode("utf-8"),
@@ -1067,26 +1094,47 @@ raise SystemExit(exit_code)
             "-",
         ]
         package_check_argv = ["--format=json", "--max-errors=0", "fmt", "--check"]
+        path_check_argv = [
+            "--format=json", "--max-errors=0", "fmt", "--check", "src/lib.sai",
+        ]
         self.assertEqual(receipt["formatter_check_argvs"], [
-            stdin_check_argv, stdin_check_argv, package_check_argv, package_check_argv,
+            stdin_check_argv,
+            stdin_check_argv,
+            package_check_argv,
+            path_check_argv,
+            package_check_argv,
+            path_check_argv,
         ])
         self.assertEqual(receipt["formatter_check_inputs"], [
             original.decode("utf-8"),
             self.expected_format.decode("utf-8"),
             original.decode("utf-8"),
+            original.decode("utf-8"),
+            self.expected_format.decode("utf-8"),
             self.expected_format.decode("utf-8"),
         ])
         self.assertEqual(receipt["formatter_check_paths"], [
-            "<stdin>", "<stdin>", "src/lib.sai", "src/lib.sai",
+            "<stdin>",
+            "<stdin>",
+            "src/lib.sai",
+            "src/lib.sai",
+            "src/lib.sai",
+            "src/lib.sai",
         ])
         self.assertEqual(self.source.read_bytes(), original)
 
-    def test_fmt_package_check_rejects_bad_file_inventory_and_manifest(self):
+    def test_fmt_package_and_path_checks_reject_bad_files_and_paths(self):
         cases = (
             ("fmt_check_package_wrong_files", "invalid fixture result"),
             ("fmt_check_package_wrong_changed", "invalid fixture result"),
             (
                 "fmt_check_package_wrong_path",
+                "outside the selected fixture file",
+            ),
+            ("fmt_check_path_wrong_files", "invalid fixture result"),
+            ("fmt_check_path_wrong_changed", "invalid fixture result"),
+            (
+                "fmt_check_path_wrong_path",
                 "outside the selected fixture file",
             ),
             (
@@ -1103,6 +1151,14 @@ raise SystemExit(exit_code)
             ),
             (
                 "fmt_check_package_adds_source",
+                "changed the package source inventory",
+            ),
+            (
+                "fmt_check_path_rewrites_identical_source",
+                "modified or replaced the source fixture",
+            ),
+            (
+                "fmt_check_path_adds_source",
                 "changed the package source inventory",
             ),
             (

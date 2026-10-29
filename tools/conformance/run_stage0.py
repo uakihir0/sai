@@ -484,44 +484,53 @@ def _run_fmt_fixture(
             "fmt",
             "--check",
         ]
+        path_check_command = [*package_check_command, "src/lib.sai"]
         for check_input in (source_bytes, expected_output):
-            source_file.write_bytes(check_input)
-            if _package_sai_inventory(package_root) != expected_sources:
-                raise SmokeError(
-                    "generated formatter package has an unexpected source inventory"
+            for check_command, file_count in (
+                (package_check_command, 2),
+                (path_check_command, 1),
+            ):
+                source_file.write_bytes(check_input)
+                if _package_sai_inventory(package_root) != expected_sources:
+                    raise SmokeError(
+                        "generated formatter package has an unexpected source inventory"
+                    )
+                source_state = _file_state(source_file)
+                checked = _run_iut(
+                    iut,
+                    check_command,
+                    package_root,
+                    timeout,
+                    state_root=sandbox_root,
                 )
-            source_state = _file_state(source_file)
-            checked = _run_iut(
-                iut,
-                package_check_command,
-                package_root,
-                timeout,
-                state_root=sandbox_root,
-            )
-            _validate_fmt_check(
-                checked,
-                input_bytes=check_input,
-                expected_output=expected_output,
-                registered_codes=registered_codes,
-                file_path="src/lib.sai",
-                file_count=2,
-            )
-            package_sources = _package_sai_inventory(package_root)
-            if package_sources != expected_sources:
-                raise SmokeError(
-                    f"sai fmt --check changed the package source inventory: "
-                    f"{package_sources!r}"
+                _validate_fmt_check(
+                    checked,
+                    input_bytes=check_input,
+                    expected_output=expected_output,
+                    registered_codes=registered_codes,
+                    file_path="src/lib.sai",
+                    file_count=file_count,
                 )
-            if _file_state(source_file) != source_state:
-                raise SmokeError("sai fmt --check modified or replaced the source fixture")
-            if source_file.read_bytes() != check_input:
-                raise SmokeError("sai fmt --check modified the source fixture")
-            if _file_state(manifest_file) != manifest_state:
-                raise SmokeError(
-                    "sai fmt --check modified or replaced the generated package contract"
-                )
-            if manifest_file.read_bytes() != PACKAGE_MANIFEST.encode("utf-8"):
-                raise SmokeError("sai fmt --check modified the generated package contract")
+                package_sources = _package_sai_inventory(package_root)
+                if package_sources != expected_sources:
+                    raise SmokeError(
+                        f"sai fmt --check changed the package source inventory: "
+                        f"{package_sources!r}"
+                    )
+                if _file_state(source_file) != source_state:
+                    raise SmokeError(
+                        "sai fmt --check modified or replaced the source fixture"
+                    )
+                if source_file.read_bytes() != check_input:
+                    raise SmokeError("sai fmt --check modified the source fixture")
+                if _file_state(manifest_file) != manifest_state:
+                    raise SmokeError(
+                        "sai fmt --check modified or replaced the generated package contract"
+                    )
+                if manifest_file.read_bytes() != PACKAGE_MANIFEST.encode("utf-8"):
+                    raise SmokeError(
+                        "sai fmt --check modified the generated package contract"
+                    )
 
 
 def _package_sai_inventory(package_root: Path) -> tuple[str, ...]:
@@ -1393,10 +1402,10 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "The caller must supply this repository's reference sai binary; the runner "
             "cannot verify the identity of the executable passed with --iut.",
             "Formatter coverage is limited to single-file source fmt goldens, their "
-            "fixed-point and source-stdin fmt --check checks, one no-argument fmt --check "
-            "in a generated package with one source file, and refusal cases. "
-            "Package-contract formatting variants and goldens, workspace and multi-source "
-            "package checks, path-based fmt --check, layout variants, and complete "
+            "fixed-point, source-stdin, generated package-wide, and fmt --check with "
+            "one explicit path, and refusal cases. Package-contract formatting "
+            "variants and goldens, workspaces, multi-source package checks, multiple "
+            "explicit path arguments, layout variants, and complete "
             "formatter-rule coverage are not covered.",
             "This smoke subset does not establish section, diagnostic, or suite coverage "
             "and cannot substantiate a conformance claim.",
