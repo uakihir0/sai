@@ -2218,6 +2218,109 @@ impl SourceFile {
         Arc::clone(&self.raw_bytes)
     }
 
+    /// Converts an LSP UTF-16 range to byte offsets in the original source.
+    ///
+    /// Unlike [`LineIndex::from_lsp_utf16`], this preserves the distinction
+    /// between a position before a leading BOM and one after it, so a range
+    /// can edit the BOM itself. This is available only for valid UTF-8 source
+    /// snapshots. Positions inside a Unicode scalar or ranges that split a
+    /// CR LF pair, or reversed ranges are rejected; character positions beyond
+    /// a line are clamped as LSP requires.
+    pub fn lsp_utf16_range_to_original(
+        &self,
+        start: LspPosition,
+        end: LspPosition,
+    ) -> Option<TextRange> {
+        self.lsp_range_to_original(start, end, LspPositionEncoding::Utf16)
+    }
+
+    /// Converts an LSP UTF-8 range to byte offsets in the original source.
+    ///
+    /// Unlike [`LineIndex::from_lsp_utf8`], this preserves the distinction
+    /// between a position before a leading BOM and one after it, so a range
+    /// can edit the BOM itself. This is available only for valid UTF-8 source
+    /// snapshots. Positions inside a Unicode scalar or ranges that split a
+    /// CR LF pair, or reversed ranges are rejected; character positions beyond
+    /// a line are clamped as LSP requires.
+    pub fn lsp_utf8_range_to_original(
+        &self,
+        start: LspPosition,
+        end: LspPosition,
+    ) -> Option<TextRange> {
+        self.lsp_range_to_original(start, end, LspPositionEncoding::Utf8)
+    }
+
+    fn lsp_range_to_original(
+        &self,
+        start: LspPosition,
+        end: LspPosition,
+        encoding: LspPositionEncoding,
+    ) -> Option<TextRange> {
+        if start.line > end.line
+            || (start.line == end.line && start.character > end.character)
+            || !self.invalid_utf8.is_empty()
+        {
+            return None;
+        }
+
+        let start = self.lsp_position_to_original(start, encoding)?;
+        let end = self.lsp_position_to_original(end, encoding)?;
+        let range = TextRange::new(start, end)?;
+        (self.is_original_char_boundary(range.start())
+            && self.is_original_char_boundary(range.end())
+            && self.is_original_crlf_boundary(range.start())
+            && self.is_original_crlf_boundary(range.end()))
+        .then_some(range)
+    }
+
+    fn lsp_position_to_original(
+        &self,
+        position: LspPosition,
+        encoding: LspPositionEncoding,
+    ) -> Option<TextSize> {
+        let line_index = self
+            .line_index
+            .clamped_line_index(position.line.saturating_add(1));
+        let line = u32::try_from(line_index).ok()?;
+        let line_end = TextSize::from_usize(self.line_index.line_end(line_index))?;
+        let line_end_position = match encoding {
+            LspPositionEncoding::Utf8 => self.line_index.to_lsp_utf8(line_end),
+            LspPositionEncoding::Utf16 => self.line_index.to_lsp_utf16(line_end),
+        };
+        let normalized_position = LspPosition {
+            line,
+            character: position.character.min(line_end_position.character),
+        };
+
+        if self.had_bom && line_index == 0 {
+            match (encoding, position.character) {
+                (_, 0) => return Some(TextSize::new(0)),
+                (LspPositionEncoding::Utf8, 1 | 2) => return None,
+                _ => {}
+            }
+        }
+
+        let decoded = match encoding {
+            LspPositionEncoding::Utf8 => self
+                .line_index
+                .from_lsp_utf8(position.line, position.character),
+            LspPositionEncoding::Utf16 => self
+                .line_index
+                .from_lsp_utf16(position.line, position.character),
+        };
+        let mapped_position = match encoding {
+            LspPositionEncoding::Utf8 => self.line_index.to_lsp_utf8(decoded),
+            LspPositionEncoding::Utf16 => self.line_index.to_lsp_utf16(decoded),
+        };
+        if mapped_position != normalized_position {
+            return None;
+        }
+
+        let original = self.to_original_offset(decoded)?;
+        (self.is_original_char_boundary(original) && self.is_original_crlf_boundary(original))
+            .then_some(original)
+    }
+
     /// Maps a decoded-text offset to its byte offset in the original source.
     pub fn to_original_offset(&self, decoded: TextSize) -> Option<TextSize> {
         if decoded.to_usize() > self.text.len() || !self.text.is_char_boundary(decoded.to_usize()) {
@@ -2278,6 +2381,12 @@ impl SourceFile {
         let bytes = self.raw_bytes();
         offset == 0 || offset >= bytes.len() || bytes[offset - 1] != b'\r' || bytes[offset] != b'\n'
     }
+}
+
+#[derive(Clone, Copy)]
+enum LspPositionEncoding {
+    Utf8,
+    Utf16,
 }
 
 fn is_canonical_source_path(path: &str) -> bool {
@@ -2832,6 +2941,118 @@ mod tests {
         );
         assert_eq!(file.line_index().from_lsp_utf8(0, 0), size(0));
         assert_eq!(file.line_index().from_lsp_utf8(0, 4), size(1));
+    }
+
+    #[test]
+    fn lsp_edit_ranges_distinguish_positions_before_and_after_a_leading_bom() {
+        let file = SourceFile::decode(FileId::new(1), b"\xEF\xBB\xBFa\r\nb").unwrap();
+        let utf16 = |line, character| LspPosition { line, character };
+        let utf8 = |line, character| LspPosition { line, character };
+
+        assert_eq!(
+            file.lsp_utf16_range_to_original(utf16(0, 0), utf16(0, 0)),
+            Some(TextRange::empty(size(0)))
+        );
+        assert_eq!(
+            file.lsp_utf16_range_to_original(utf16(0, 0), utf16(0, 1)),
+            Some(TextRange::new(size(0), size(3)).unwrap())
+        );
+        assert_eq!(
+            file.lsp_utf16_range_to_original(utf16(0, 1), utf16(0, 2)),
+            Some(TextRange::new(size(3), size(4)).unwrap())
+        );
+
+        assert_eq!(
+            file.lsp_utf8_range_to_original(utf8(0, 0), utf8(0, 0)),
+            Some(TextRange::empty(size(0)))
+        );
+        assert_eq!(
+            file.lsp_utf8_range_to_original(utf8(0, 0), utf8(0, 3)),
+            Some(TextRange::new(size(0), size(3)).unwrap())
+        );
+        assert_eq!(
+            file.lsp_utf8_range_to_original(utf8(0, 3), utf8(0, 4)),
+            Some(TextRange::new(size(3), size(4)).unwrap())
+        );
+
+        assert_eq!(
+            file.lsp_utf8_range_to_original(utf8(0, 1), utf8(0, 3)),
+            None,
+            "UTF-8 positions inside the BOM are not edit boundaries"
+        );
+        assert_eq!(
+            file.lsp_utf16_range_to_original(utf16(0, 2), utf16(1, 0)),
+            Some(TextRange::new(size(4), size(6)).unwrap()),
+            "a range crossing lines includes the complete CR LF pair"
+        );
+        assert_eq!(
+            file.lsp_utf8_range_to_original(utf8(0, 4), utf8(1, 0)),
+            Some(TextRange::new(size(4), size(6)).unwrap()),
+            "UTF-8 ranges also include the complete CR LF pair"
+        );
+        assert_eq!(
+            file.lsp_utf16_range_to_original(utf16(0, u32::MAX), utf16(1, 0)),
+            Some(TextRange::new(size(4), size(6)).unwrap()),
+            "overlong line positions clamp before the complete CR LF pair"
+        );
+        assert_eq!(
+            file.lsp_utf16_range_to_original(utf16(1, 0), utf16(0, 0)),
+            None,
+            "a reversed LSP range stays invalid after line clamping"
+        );
+        assert_eq!(
+            file.lsp_utf16_range_to_original(utf16(0, u32::MAX), utf16(0, 2)),
+            None,
+            "a reversed LSP range stays invalid after character clamping"
+        );
+
+        let without_bom = SourceFile::new(FileId::new(2), "é", false).unwrap();
+        assert_eq!(
+            without_bom.lsp_utf16_range_to_original(utf16(0, 0), utf16(0, 1)),
+            Some(TextRange::new(size(0), size(2)).unwrap())
+        );
+        assert_eq!(
+            without_bom.lsp_utf8_range_to_original(utf8(0, 0), utf8(0, 2)),
+            Some(TextRange::new(size(0), size(2)).unwrap())
+        );
+
+        let single_line_bom = SourceFile::new(FileId::new(3), "a", true).unwrap();
+        assert_eq!(
+            single_line_bom.lsp_utf16_range_to_original(utf16(u32::MAX, 1), utf16(u32::MAX, 2)),
+            Some(TextRange::new(size(3), size(4)).unwrap()),
+            "BOM shift uses the actual line after an out-of-range line is clamped"
+        );
+        assert_eq!(
+            single_line_bom.lsp_utf8_range_to_original(utf8(u32::MAX, 3), utf8(u32::MAX, 4)),
+            Some(TextRange::new(size(3), size(4)).unwrap()),
+            "UTF-8 BOM shift uses the actual clamped line"
+        );
+    }
+
+    #[test]
+    fn lsp_edit_ranges_reject_malformed_source_and_scalar_interiors() {
+        let malformed = SourceFile::decode(FileId::new(1), b"\xEF\xBB\xBF\xFFx").unwrap();
+        let valid = SourceFile::new(FileId::new(2), "a🦀b", false).unwrap();
+        let position = |line, character| LspPosition { line, character };
+
+        assert_eq!(
+            malformed.lsp_utf16_range_to_original(position(0, 0), position(0, 1)),
+            None
+        );
+        assert_eq!(
+            malformed.lsp_utf8_range_to_original(position(0, 0), position(0, 3)),
+            None
+        );
+        assert_eq!(
+            valid.lsp_utf16_range_to_original(position(0, 1), position(0, 2)),
+            None,
+            "a UTF-16 position inside a surrogate pair is not an edit boundary"
+        );
+        assert_eq!(
+            valid.lsp_utf8_range_to_original(position(0, 1), position(0, 2)),
+            None,
+            "a UTF-8 position inside a scalar is not an edit boundary"
+        );
     }
 
     #[test]
