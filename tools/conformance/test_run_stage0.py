@@ -58,18 +58,152 @@ args = sys.argv[1:]
 if args == ["--format=json", "explain", "--list"]:
     if MODE == "bad_registry":
         code = "UNREGISTERED_EXAMPLE"
+        codes = [code]
     else:
-        code = "EXPECTED_TOKEN"
+        codes = [
+            "EXPECTED_TOKEN",
+            "FEATURE_NOT_IMPLEMENTED",
+            "INTERNAL_COMPILER_ERROR",
+            "INVALID_ASSIGN_TARGET",
+            "INVARIANT_OUTSIDE_DEFINING_MODULE",
+            "LITERAL_OUT_OF_RANGE",
+            "NAMED_ARGUMENT_ON_FUNCTION",
+            "OR_PATTERN_BINDING_MISMATCH",
+            "UNFORMATTED_FILE",
+        ]
     print(line(header("explain", None)).rstrip("\\n"))
     print(line({{"type":"result","kind":"explain.list","data":{{"codes":[
-        {{"code":code,"class":"hard","summary":"A token was expected."}}
+        {{"code":code,"class":"hard","summary":"A diagnostic."}}
+        for code in codes
     ]}}}}).rstrip("\\n"))
     print(line(summary()).rstrip("\\n"))
     raise SystemExit(0)
 
+if args == [
+    "--format=json", "--max-errors=0", "fmt", "--check",
+    "--stdin-kind", "source", "-",
+]:
+    formatter_input = sys.stdin.buffer.read()
+    try:
+        receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        receipt = {{}}
+    receipt.update({{
+        "formatter_argv":args,
+        "formatter_input":formatter_input.decode("utf-8"),
+    }})
+    receipt.setdefault("calls", []).append("fmt")
+    Path(RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
+    if MODE == "formatter_malformed":
+        sys.stdout.buffer.write(b"{{bad json\\n")
+        raise SystemExit(0)
+    if MODE == "formatter_extra_refusal" or (
+        MODE != "formatter_accepts_expected_parse_error"
+        and b"@ //~ error EXPECTED_TOKEN" in formatter_input
+    ):
+        diagnostic = {{
+            "type":"diagnostic","code":"EXPECTED_TOKEN","severity":"error",
+            "level":None,"message":"expected a token","primary":{{
+                "file":{{"path":"<stdin>","package":None,"snapshot":None}},
+                "start":{{"byte":0,"line":4,"col":1,"utf16_col":1}},
+                "end":{{"byte":1,"line":4,"col":2,"utf16_col":2}}
+            }},"primary_label":"","labels":[],"children":[],"fixes":[],
+            "related":[],"data":{{}},"node":None,"symbol":None,"package":None
+        }}
+        diagnostics = [diagnostic]
+        if MODE == "formatter_extra_refusal":
+            extra = json.loads(json.dumps(diagnostic))
+            extra["primary"]["start"]["line"] = 5
+            extra["primary"]["end"]["line"] = 5
+            diagnostics.append(extra)
+        result = {{"type":"result","kind":"fmt","data":{{
+            "check":True,"files":1,"changed":[],"refused":["<stdin>"],"output":None
+        }}}}
+        status = 1
+        errors = len(diagnostics)
+    elif MODE == "formatter_unexpected_refusal":
+        diagnostic = {{
+            "type":"diagnostic","code":"FEATURE_NOT_IMPLEMENTED","severity":"error",
+            "level":None,"message":"unsupported formatting shape","primary":None,
+            "primary_label":"","labels":[],"children":[],"fixes":[],
+            "related":[],"data":{{}},"node":None,"symbol":None,"package":None
+        }}
+        result = {{"type":"result","kind":"fmt","data":{{
+            "check":True,"files":1,"changed":[],"refused":["<stdin>"],"output":None
+        }}}}
+        status = 1
+        errors = 1
+        diagnostics = [diagnostic]
+    elif MODE == "formatter_semantic_refusal":
+        diagnostic = {{
+            "type":"diagnostic","code":"LITERAL_OUT_OF_RANGE","severity":"error",
+            "level":None,"message":"literal is outside its type's range","primary":{{
+                "file":{{"path":"<stdin>","package":None,"snapshot":None}},
+                "start":{{"byte":0,"line":5,"col":1,"utf16_col":1}},
+                "end":{{"byte":1,"line":5,"col":2,"utf16_col":2}}
+            }},"primary_label":"","labels":[],"children":[],"fixes":[],
+            "related":[],"data":{{}},"node":None,"symbol":None,"package":None
+        }}
+        result = {{"type":"result","kind":"fmt","data":{{
+            "check":True,"files":1,"changed":[],"refused":["<stdin>"],"output":None
+        }}}}
+        status = 1
+        errors = 1
+        diagnostics = [diagnostic]
+    elif MODE == "formatter_resolution_refusal":
+        diagnostic = {{
+            "type":"diagnostic","code":"NAMED_ARGUMENT_ON_FUNCTION","severity":"error",
+            "level":None,"message":"named arguments require a callable interface","primary":{{
+                "file":{{"path":"<stdin>","package":None,"snapshot":None}},
+                "start":{{"byte":0,"line":6,"col":1,"utf16_col":1}},
+                "end":{{"byte":1,"line":6,"col":2,"utf16_col":2}}
+            }},"primary_label":"","labels":[],"children":[],"fixes":[],
+            "related":[],"data":{{}},"node":None,"symbol":None,"package":None
+        }}
+        result = {{"type":"result","kind":"fmt","data":{{
+            "check":True,"files":1,"changed":[],"refused":["<stdin>"],"output":None
+        }}}}
+        status = 1
+        errors = 1
+        diagnostics = [diagnostic]
+    elif MODE == "formatter_unformatted":
+        diagnostic = {{
+            "type":"diagnostic","code":"UNFORMATTED_FILE","severity":"error",
+            "level":None,"message":"file is not formatted","primary":{{
+                "file":{{"path":"<stdin>","package":None,"snapshot":None}},
+                "start":{{"byte":0,"line":4,"col":1,"utf16_col":1}},
+                "end":{{"byte":1,"line":4,"col":2,"utf16_col":2}}
+            }},"primary_label":"","labels":[],"children":[],"fixes":[],
+            "related":[],"data":{{"line":4,"expected":"formatted"}}, "node":None,
+            "symbol":None,"package":None
+        }}
+        result = {{"type":"result","kind":"fmt","data":{{
+            "check":True,"files":1,"changed":["<stdin>"],"refused":[],"output":None
+        }}}}
+        status = 1
+        errors = 1
+        diagnostics = [diagnostic]
+    else:
+        result = {{"type":"result","kind":"fmt","data":{{
+            "check":True,"files":1,"changed":[],"refused":[],"output":None
+        }}}}
+        status = 0
+        errors = 0
+        diagnostics = []
+    print(line(header("fmt", None)).rstrip("\\n"))
+    for diagnostic in diagnostics:
+        print(line(diagnostic).rstrip("\\n"))
+    print(line(result).rstrip("\\n"))
+    print(line(summary(errors=errors, exit_code=status)).rstrip("\\n"))
+    raise SystemExit(status)
+
 root = Path.cwd()
 source = (root / "src" / "lib.sai").read_bytes()
-Path(RECEIPT).write_text(json.dumps({{
+try:
+    receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    receipt = {{}}
+receipt.update({{
     "argv":args,
     "cwd":str(root),
     "environment":dict(os.environ),
@@ -78,7 +212,9 @@ Path(RECEIPT).write_text(json.dumps({{
     "package_entries":sorted(path.name for path in root.iterdir()),
     "source_entries":sorted(path.name for path in (root / "src").iterdir()),
     "sandbox_entries":sorted(path.name for path in root.parent.iterdir()),
-}}), encoding="utf-8")
+}})
+receipt.setdefault("calls", []).append("check")
+Path(RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
 
 if MODE == "timeout":
     time.sleep(10)
@@ -156,11 +292,22 @@ raise SystemExit(exit_code)
         self.assertEqual(receipt["argv"], [
             "--format=json", "--max-errors=0", "check", "--jobs=1",
         ])
+        self.assertEqual(receipt["formatter_argv"], [
+            "--format=json", "--max-errors=0", "fmt", "--check",
+            "--stdin-kind", "source", "-",
+        ])
+        self.assertEqual(receipt["calls"], ["fmt", "check"])
         self.assertEqual(receipt["manifest"],
                          "package conformance:test @ 0.1.0\n"
                          "compiler ^0.1\nsource \"src\"\n"
                          "targets { wasm32-core }\n")
         self.assertEqual(receipt["source"], self.source.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["formatter_input"], self.source.read_text(encoding="utf-8"))
+        self.assertEqual(
+            self.source.read_bytes(),
+            receipt["formatter_input"].encode("utf-8"),
+            "formatter preflight must not rewrite the fixture",
+        )
         expected_environment = {
             "NO_COLOR", "SAI_CACHE_DIR", "HOME",
         }
@@ -207,10 +354,117 @@ raise SystemExit(exit_code)
 
     def test_check_fail_matches_expected_diagnostic_and_has_no_result(self):
         self._fixture("check-fail", body="@ //~ error EXPECTED_TOKEN\n")
+        self.mode = "formatter_expected_refusal"
+        self._write_fake()
         report = self._run()
         self.assertEqual(report["outcome"], "pass")
         self.assertEqual(report["results"][0]["outcome"], "pass")
         self.assertEqual(report["results"][0]["failures"], [])
+
+    def test_formatter_must_refuse_source_with_expected_syntax_error(self):
+        self._fixture("check-fail", body="@ //~ error EXPECTED_TOKEN\n")
+        self.mode = "formatter_accepts_expected_parse_error"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "accepted source with explicitly expected lexical or syntax errors",
+            " ".join(report["results"][0]["failures"]),
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt"])
+
+    def test_unexpected_formatter_refusal_fails_before_check(self):
+        self._fixture()
+        self.mode = "formatter_unexpected_refusal"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "only by lexical or syntax errors",
+            " ".join(report["results"][0]["failures"]),
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt"])
+
+    def test_expected_type_dependent_literal_error_is_not_a_parse_refusal(self):
+        self._fixture(
+            "check-fail",
+            extra="//@ diag: error LITERAL_OUT_OF_RANGE at src/lib.sai:5\n",
+            body="pub const OVERFLOW: I8 = 128\n",
+        )
+        self.mode = "formatter_semantic_refusal"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "only by lexical or syntax errors",
+            " ".join(report["results"][0]["failures"]),
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt"])
+
+    def test_expected_name_resolution_error_is_not_a_parse_refusal(self):
+        self._fixture(
+            "check-fail",
+            extra="//@ diag: error NAMED_ARGUMENT_ON_FUNCTION at src/lib.sai:6\n",
+            body=(
+                "pub fn target(value: Bool) {}\n"
+                "pub fn caller() { target(other = true) }\n"
+            ),
+        )
+        self.mode = "formatter_resolution_refusal"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "only by lexical or syntax errors",
+            " ".join(report["results"][0]["failures"]),
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt"])
+
+    def test_formatter_refusal_with_unexpected_parse_error_fails(self):
+        self._fixture("check-fail", body="@ //~ error EXPECTED_TOKEN\n")
+        self.mode = "formatter_extra_refusal"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "does not match explicitly expected",
+            " ".join(report["results"][0]["failures"]),
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt"])
+
+    def test_noncanonical_source_fails_before_check_without_rewriting(self):
+        self._fixture(body="pub fn value()->Bool{true}\n")
+        original = self.source.read_bytes()
+        self.mode = "formatter_unformatted"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "not in canonical formatter form",
+            " ".join(report["results"][0]["failures"]),
+        )
+        self.assertEqual(self.source.read_bytes(), original)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["formatter_input"].encode("utf-8"), original)
+
+    def test_malformed_formatter_stream_fails_closed(self):
+        self._fixture()
+        self.mode = "formatter_malformed"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "invalid record",
+            " ".join(report["results"][0]["failures"]),
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt"])
 
     def test_explicit_target_or_profile_and_unused_directives_fail_closed(self):
         for directive in (

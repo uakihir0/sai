@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path, PurePosixPath
 
 import configurations
@@ -64,28 +65,32 @@ def _records(stdout: bytes, *, exit_code: int, stderr: bytes,
 
 
 def _run_iut(iut: Path, argv: list[str], cwd: Path, timeout: float, *,
-             state_root: Path | None = None) -> subprocess.CompletedProcess:
+             state_root: Path | None = None,
+             stdin_data: bytes | None = None) -> subprocess.CompletedProcess:
     state_root = cwd if state_root is None else state_root
     cache = state_root / "cache"
     home = state_root / "home"
-    cache.mkdir()
-    home.mkdir()
+    cache.mkdir(exist_ok=True)
+    home.mkdir(exist_ok=True)
     environment = {
         "NO_COLOR": "1",
         "SAI_CACHE_DIR": str(cache),
         "HOME": str(home),
     }
     try:
-        return subprocess.run(
-            [str(iut), *argv],
-            cwd=cwd,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-        )
+        process_options = {
+            "cwd": cwd,
+            "env": environment,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "timeout": timeout,
+            "check": False,
+        }
+        if stdin_data is None:
+            process_options["stdin"] = subprocess.DEVNULL
+        else:
+            process_options["input"] = stdin_data
+        return subprocess.run([str(iut), *argv], **process_options)
     except subprocess.TimeoutExpired:
         raise SmokeError("IUT exceeded the smoke-run timeout") from None
     except OSError:
@@ -324,6 +329,170 @@ def _validate_check_result(records: list[dict], *, kind: str, exit_code: int,
         raise SmokeError("sai check result does not match the smoke package")
 
 
+def _lexical_syntax_error_codes(docs_root: Path) -> set[str]:
+    sections = (
+        ("spec/02-lexical-structure.md", "## 2.12 Lexical diagnostics"),
+        ("spec/03-grammar.md", "## 3.16 Syntactic diagnostics"),
+    )
+    codes = set()
+    row_pattern = re.compile(r"\|\s*`([A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+)`\s*\|\s*([^|]+)\|")
+    for relative_path, heading in sections:
+        path = docs_root / relative_path
+        try:
+            resolved_docs = docs_root.resolve(strict=True)
+            resolved_path = path.resolve(strict=True)
+            resolved_path.relative_to(resolved_docs)
+            lines = resolved_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, RuntimeError, UnicodeError, ValueError):
+            raise SmokeError("could not read lexical and syntax diagnostic definitions") from None
+        in_section = False
+        found_section = False
+        section_codes = set()
+        for line in lines:
+            if line == heading:
+                in_section = True
+                found_section = True
+                continue
+            if in_section and line.startswith("## "):
+                break
+            if not in_section:
+                continue
+            match = row_pattern.match(line)
+            if match and match.group(2).strip() == "error":
+                section_codes.add(match.group(1))
+        if not found_section or not section_codes:
+            raise SmokeError("lexical and syntax diagnostic definitions are incomplete")
+        codes.update(section_codes)
+    # Spec/02 §2.6.1 requires the literal's type to be known before its range
+    # can be checked. Spec/03 §3.16 also lists diagnostics whose some cases
+    # require name resolution or type checking. Exclude each whole code
+    # because the formatter's diagnostic code cannot distinguish those cases
+    # from parser-detectable variants.
+    codes.difference_update({
+        "LITERAL_OUT_OF_RANGE",
+        "INVARIANT_OUTSIDE_DEFINING_MODULE",
+        "OR_PATTERN_BINDING_MISMATCH",
+        "NAMED_ARGUMENT_ON_FUNCTION",
+        "INVALID_ASSIGN_TARGET",
+    })
+    return codes
+
+
+def _formatter_diagnostics(records: list[dict], codes: set[str]) -> list[dict]:
+    actual = []
+    for record in records:
+        if record["type"] != "diagnostic":
+            continue
+        code = record["code"]
+        if code == "INTERNAL_COMPILER_ERROR":
+            raise SmokeError("formatter preflight reported an internal compiler error")
+        if code not in codes:
+            raise SmokeError(f"unregistered diagnostic code: {code}")
+        if record.get("package") is not None:
+            raise SmokeError("formatter preflight diagnostic has an unexpected package")
+        primary = record["primary"]
+        if primary is None:
+            file = line = None
+        else:
+            source = primary["file"]
+            if (
+                source["path"] != "<stdin>"
+                or source.get("package") is not None
+                or source.get("snapshot") is not None
+            ):
+                raise SmokeError("formatter diagnostic is outside standard input")
+            file = "src/lib.sai"
+            line = primary["start"]["line"]
+        severity = {"warn": "warning"}.get(record["severity"], record["severity"])
+        actual.append({
+            "file": file,
+            "line": line,
+            "severity": severity,
+            "code": code,
+        })
+    return actual
+
+
+def _validate_formatter_preflight(
+    completed: subprocess.CompletedProcess,
+    *,
+    expected: list[dict],
+    registered_codes: set[str],
+    lexical_syntax_codes: set[str],
+) -> None:
+    records = _records(
+        completed.stdout,
+        exit_code=completed.returncode,
+        stderr=completed.stderr,
+        max_errors=0,
+    )
+    header = records[0]
+    if header.get("command") != "fmt" or header.get("root") is not None:
+        raise SmokeError("sai fmt --check returned the wrong header")
+    if (
+        len(records) < 3
+        or records[-2]["type"] != "result"
+        or sum(record["type"] == "result" for record in records) != 1
+        or any(record["type"] != "diagnostic" for record in records[1:-2])
+    ):
+        raise SmokeError("sai fmt --check returned no result")
+    result = records[-2]
+    if result.get("kind") != "fmt" or set(result) != {"type", "kind", "data"}:
+        raise SmokeError("sai fmt --check returned an invalid result kind")
+    data = result.get("data")
+    fields = {"check", "files", "changed", "refused", "output"}
+    if not isinstance(data, dict) or set(data) != fields:
+        raise SmokeError("sai fmt --check returned an invalid result schema")
+    if (
+        data["check"] is not True
+        or type(data["files"]) is not int
+        or data["files"] != 1
+        or not isinstance(data["changed"], list)
+        or not isinstance(data["refused"], list)
+        or data["output"] is not None
+    ):
+        raise SmokeError("sai fmt --check result does not match the stdin fixture")
+
+    actual = _formatter_diagnostics(records, registered_codes)
+    expected_parse_errors = [
+        item for item in expected
+        if item["severity"] == "error" and item["code"] in lexical_syntax_codes
+    ]
+    if completed.returncode == 0:
+        if expected_parse_errors:
+            raise SmokeError(
+                "formatter accepted source with explicitly expected lexical or syntax errors"
+            )
+        if actual or data["changed"] or data["refused"]:
+            raise SmokeError("sai fmt --check did not confirm canonical source")
+        return
+
+    if completed.returncode != 1:
+        raise SmokeError("sai fmt --check returned an abnormal exit code")
+    if data["changed"] == ["<stdin>"] and not data["refused"]:
+        raise SmokeError("source is not in canonical formatter form")
+    if data["changed"] or data["refused"] != ["<stdin>"]:
+        raise SmokeError("sai fmt --check returned an unexpected refusal")
+    if not actual or any(
+        item["severity"] != "error" or item["code"] not in lexical_syntax_codes
+        for item in actual
+    ):
+        raise SmokeError("formatter refusal was not caused only by lexical or syntax errors")
+
+    expected_parse_counts = Counter(
+        (item["file"], item["line"], item["severity"], item["code"])
+        for item in expected_parse_errors
+    )
+    actual_parse_counts = Counter(
+        (item["file"], item["line"], item["severity"], item["code"])
+        for item in actual
+    )
+    if not expected_parse_errors or expected_parse_counts != actual_parse_counts:
+        raise SmokeError(
+            "formatter refusal does not match explicitly expected lexical or syntax errors"
+        )
+
+
 def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[str],
                  *, timeout: float, docs_root: Path) -> dict:
     path = fixture["path"]
@@ -369,6 +538,28 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
             sandbox_root = Path(temporary)
             package_root = sandbox_root / "package"
             package_root.mkdir()
+            formatter = _run_iut(
+                iut,
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "fmt",
+                    "--check",
+                    "--stdin-kind",
+                    "source",
+                    "-",
+                ],
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+                stdin_data=source_bytes,
+            )
+            _validate_formatter_preflight(
+                formatter,
+                expected=expected,
+                registered_codes=codes,
+                lexical_syntax_codes=_lexical_syntax_error_codes(docs_root),
+            )
             source_dir = package_root / "src"
             source_dir.mkdir()
             (package_root / "sai.package").write_text(PACKAGE_MANIFEST, encoding="utf-8", newline="\n")
