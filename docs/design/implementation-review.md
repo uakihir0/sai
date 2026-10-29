@@ -9138,3 +9138,9 @@
 - **Decision — review required:** Add a standalone partial NDJSON validator rather than claiming full conformance. A successful partial validation exits with status 2; command-specific schemas, the configured error limit, diagnostic ordering, registered codes, source-dependent constraints, process status and stderr still require separate checks.
 - **Verification:** Ten focused stream tests passed, as did all 52 currently available conformance-component tests. The standalone component has not been integrated into a harness.
 - **Hostile review:** Independent review found that warning and info totals accepted inflated counts. They now require exact agreement; a re-review found no further defect in the checked subset.
+
+### IR-1005 (2026-10-29): bound line-index conversion costs
+
+- **Decision — review required:** Index UTF-16 deltas at sparse character-boundary checkpoints, and scan short ranges directly. This limits repeated long-line scans while avoiding a per-character index and preserving existing BOM, malformed UTF-8, rounding and stable-hash behavior.
+- **Verification:** The final `sai_vfs` suite passed 49 tests; `sai_syntax` (425) and `sai_diagnostics` (65) passed before the final short-range optimization. A 16 MiB non-ASCII sample used approximately 512 KiB for checkpoints; microbenchmarks are directional, not a general performance guarantee.
+- **Hostile review:** Independent review identified per-character index memory amplification and short-range performance regressions. Sparse checkpoints and short-range fast paths addressed both; a final independent model comparison found no further actionable defect.

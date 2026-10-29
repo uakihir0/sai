@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 /// Maximum source-file size, measured in bytes as read from disk.
 pub const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 
+const POSITION_CHECKPOINT_INTERVAL: usize = 256;
+
 /// A session-local identity for a source file.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FileId(u32);
@@ -505,6 +507,7 @@ pub struct LineIndex {
     bom_shift: u32,
     invalid_utf8: Arc<[InvalidUtf8Sequence]>,
     invalid_utf8_prefix_delta: Vec<i64>,
+    utf16_checkpoints: Vec<(u32, u32)>,
 }
 
 impl LineIndex {
@@ -532,6 +535,34 @@ impl LineIndex {
                 .saturating_sub(sequence.decoded_range.start().to_usize());
             prefix_delta += i64::from(sequence.raw_len) - decoded_width as i64;
             invalid_utf8_prefix_delta.push(prefix_delta);
+        }
+
+        let mut utf16_checkpoints =
+            Vec::with_capacity(text.len() / POSITION_CHECKPOINT_INTERVAL + 1);
+        utf16_checkpoints.push((0, 0));
+        let mut utf16_units = 0_u32;
+        let mut next_checkpoint = POSITION_CHECKPOINT_INTERVAL;
+        let mut invalid_sequences = invalid_utf8.iter().peekable();
+        for (offset, character) in text.char_indices() {
+            let width = if invalid_sequences
+                .peek()
+                .is_some_and(|sequence| sequence.decoded_range.start().to_usize() == offset)
+            {
+                invalid_sequences
+                    .next()
+                    .expect("peeked sequence exists")
+                    .raw_len
+            } else {
+                character.len_utf16() as u32
+            };
+            utf16_units = utf16_units.saturating_add(width);
+            let end = offset + character.len_utf8();
+            if end >= next_checkpoint {
+                if let Ok(end) = u32::try_from(end) {
+                    utf16_checkpoints.push((end, utf16_units));
+                }
+                next_checkpoint = end.saturating_add(POSITION_CHECKPOINT_INTERVAL);
+            }
         }
 
         let mut line_starts = vec![TextSize::new(0)];
@@ -568,6 +599,7 @@ impl LineIndex {
             bom_shift: if had_bom { 3 } else { 0 },
             invalid_utf8,
             invalid_utf8_prefix_delta,
+            utf16_checkpoints,
         }
     }
 
@@ -640,32 +672,7 @@ impl LineIndex {
         let start = self.line_starts[line_index].to_usize();
         let end = self.line_end(line_index);
         let target = col.saturating_sub(1);
-        let mut units = 0u32;
-        let mut offset = start;
-
-        while offset < end {
-            if let Some(sequence) = self.invalid_sequence_at(offset) {
-                let width = sequence.raw_len;
-                if target < units.saturating_add(width) {
-                    return TextSize::new(offset as u32);
-                }
-                units = units.saturating_add(width);
-                offset = sequence.decoded_range.end().to_usize();
-                continue;
-            }
-
-            let Some(ch) = self.text[offset..end].chars().next() else {
-                break;
-            };
-            let width = u32::try_from(ch.len_utf8()).unwrap_or(u32::MAX);
-            if target < units.saturating_add(width) {
-                return TextSize::new(offset as u32);
-            }
-            units = units.saturating_add(width);
-            offset += ch.len_utf8();
-        }
-
-        TextSize::new(offset as u32)
+        self.offset_for_units(start, end, target as usize, false)
     }
 
     /// Converts a one-based UTF-16 position to an offset, rounding down inside a surrogate pair.
@@ -676,31 +683,7 @@ impl LineIndex {
         let target = utf16_col
             .saturating_sub(1)
             .saturating_sub(u32::from(self.bom_shift > 0 && line_index == 0));
-        let mut units = 0u32;
-        let mut offset = start;
-
-        while offset < end {
-            if let Some(sequence) = self.invalid_sequence_at(offset) {
-                if target < units.saturating_add(sequence.raw_len) {
-                    return TextSize::new(offset as u32);
-                }
-                units = units.saturating_add(sequence.raw_len);
-                offset = sequence.decoded_range.end().to_usize();
-                continue;
-            }
-
-            let Some(ch) = self.text[offset..end].chars().next() else {
-                break;
-            };
-            let width = ch.len_utf16() as u32;
-            if units.saturating_add(width) > target {
-                return TextSize::new(offset as u32);
-            }
-            units += width;
-            offset += ch.len_utf8();
-        }
-
-        TextSize::new(offset as u32)
+        self.offset_for_units(start, end, target as usize, true)
     }
 
     /// Maps a zero-based UTF-16 LSP position to an internal source offset.
@@ -765,54 +748,141 @@ impl LineIndex {
         offset
     }
 
-    fn invalid_sequence_at(&self, offset: usize) -> Option<InvalidUtf8Sequence> {
-        let index = self
+    fn offset_for_units(
+        &self,
+        start: usize,
+        end: usize,
+        mut target: usize,
+        utf16: bool,
+    ) -> TextSize {
+        if target == 0 {
+            return TextSize::new(start as u32);
+        }
+        let end = end.max(start);
+        let mut start = start;
+        if self.scan_position_units(&mut start, end, &mut target, utf16) {
+            return TextSize::new(start as u32);
+        }
+        let units_at_start = if utf16 {
+            self.utf16_units_between(0, start)
+        } else {
+            self.original_byte_offset(start) as usize
+        };
+        let desired = units_at_start.saturating_add(target);
+        let checkpoint_units = |position, units| {
+            if utf16 {
+                units as usize
+            } else {
+                self.original_byte_offset(position as usize) as usize
+            }
+        };
+        let count = self
+            .utf16_checkpoints
+            .partition_point(|&(position, units)| {
+                position as usize <= end && checkpoint_units(position, units) <= desired
+            });
+        if let Some(&(position, units)) = count
+            .checked_sub(1)
+            .and_then(|index| self.utf16_checkpoints.get(index))
+        {
+            if position as usize > start {
+                start = position as usize;
+                target = desired - checkpoint_units(position, units);
+            }
+        }
+        self.scan_position_units(&mut start, end, &mut target, utf16);
+        TextSize::new(start as u32)
+    }
+
+    fn scan_position_units(
+        &self,
+        start: &mut usize,
+        end: usize,
+        target: &mut usize,
+        utf16: bool,
+    ) -> bool {
+        let first_invalid = self
             .invalid_utf8
-            .partition_point(|sequence| sequence.decoded_range.start().to_usize() < offset);
-        self.invalid_utf8
-            .get(index)
-            .copied()
-            .filter(|sequence| sequence.decoded_range.start().to_usize() == offset)
+            .partition_point(|sequence| sequence.decoded_range.start().to_usize() < *start);
+        let mut invalid_sequences = self.invalid_utf8[first_invalid..].iter().peekable();
+        let local_end = start.saturating_add(POSITION_CHECKPOINT_INTERVAL).min(end);
+        while *start < local_end && *target > 0 {
+            let character = self.text[*start..]
+                .chars()
+                .next()
+                .expect("offset is in text");
+            let width = if invalid_sequences
+                .peek()
+                .is_some_and(|sequence| sequence.decoded_range.start().to_usize() == *start)
+            {
+                invalid_sequences
+                    .next()
+                    .expect("peeked sequence exists")
+                    .raw_len as usize
+            } else if utf16 {
+                character.len_utf16()
+            } else {
+                character.len_utf8()
+            };
+            if *target < width {
+                return true;
+            }
+            *target -= width;
+            *start += character.len_utf8();
+        }
+        *target == 0 || *start == end
     }
 
     fn utf8_units_between(&self, start: usize, end: usize) -> u32 {
-        let mut total = 0u32;
-        let mut offset = start;
-
-        while offset < end {
-            if let Some(sequence) = self.invalid_sequence_at(offset) {
-                total = total.saturating_add(sequence.raw_len);
-                offset = sequence.decoded_range.end().to_usize();
-                continue;
-            }
-            let Some(ch) = self.text[offset..end].chars().next() else {
-                break;
-            };
-            total = total.saturating_add(u32::try_from(ch.len_utf8()).unwrap_or(u32::MAX));
-            offset += ch.len_utf8();
-        }
-
-        total
+        self.original_byte_offset(end)
+            .saturating_sub(self.original_byte_offset(start))
     }
 
     fn utf16_units_between(&self, start: usize, end: usize) -> usize {
-        let mut total = 0usize;
-        let mut offset = start;
-
-        while offset < end {
-            if let Some(sequence) = self.invalid_sequence_at(offset) {
-                total = total.saturating_add(sequence.raw_len as usize);
-                offset = sequence.decoded_range.end().to_usize();
-                continue;
-            }
-            let Some(ch) = self.text[offset..end].chars().next() else {
-                break;
-            };
-            total = total.saturating_add(ch.len_utf16());
-            offset += ch.len_utf8();
+        if start == end {
+            return 0;
         }
+        if end - start <= POSITION_CHECKPOINT_INTERVAL {
+            return self.utf16_units_in_range(start, end);
+        }
+        let end_count = self
+            .utf16_checkpoints
+            .partition_point(|(position, _)| *position as usize <= end);
+        let (end_position, end_units) = self.utf16_checkpoints[end_count - 1];
+        if start >= end_position as usize {
+            return self.utf16_units_in_range(start, end);
+        }
+        let start_count = self
+            .utf16_checkpoints
+            .partition_point(|(position, _)| *position as usize <= start);
+        let (start_position, start_units) = self.utf16_checkpoints[start_count - 1];
+        let absolute_end =
+            end_units as usize + self.utf16_units_in_range(end_position as usize, end);
+        let absolute_start =
+            start_units as usize + self.utf16_units_in_range(start_position as usize, start);
+        absolute_end - absolute_start
+    }
 
-        total
+    fn utf16_units_in_range(&self, start: usize, end: usize) -> usize {
+        let first_invalid = self
+            .invalid_utf8
+            .partition_point(|sequence| sequence.decoded_range.start().to_usize() < start);
+        let mut invalid_sequences = self.invalid_utf8[first_invalid..].iter().peekable();
+        self.text[start..end]
+            .char_indices()
+            .map(|(relative, character)| {
+                if invalid_sequences.peek().is_some_and(|sequence| {
+                    sequence.decoded_range.start().to_usize() == start + relative
+                }) {
+                    invalid_sequences
+                        .next()
+                        .expect("peeked sequence exists")
+                        .raw_len as usize
+                } else {
+                    character.len_utf16()
+                }
+            })
+            .sum()
     }
 
     fn original_byte_offset(&self, offset: usize) -> u32 {
@@ -2450,6 +2520,233 @@ mod tests {
                 utf16_col: 4,
             }
         );
+    }
+
+    #[test]
+    fn short_utf16_ranges_preserve_malformed_and_multibyte_widths() {
+        let mut bytes = vec![b'a'; 253];
+        bytes.extend_from_slice(b"\xff\xf0\x90\x80b");
+        bytes.extend_from_slice("é🦀".as_bytes());
+        let file = SourceFile::decode(FileId::new(1), &bytes).expect("source decodes");
+        let index = file.line_index();
+        let sequences = file.invalid_utf8_sequences();
+        let first = sequences[0].decoded_range();
+        let second = sequences[1].decoded_range();
+        let after_invalid = second.end().to_usize();
+        assert_eq!(index.utf16_units_between(253, 253), 0);
+        assert_eq!(
+            index.utf16_units_between(first.start().to_usize(), first.end().to_usize()),
+            1
+        );
+        assert_eq!(
+            index.utf16_units_between(second.start().to_usize(), after_invalid),
+            3
+        );
+        assert_eq!(index.utf16_units_between(253, file.text().len()), 8);
+        assert_eq!(
+            index.utf16_units_between(after_invalid, file.text().len()),
+            4
+        );
+        let lines = LineIndex::new("x\n".repeat(128));
+        assert_eq!(
+            lines.position(size(254)),
+            Position {
+                byte: 254,
+                line: 128,
+                col: 1,
+                utf16_col: 1
+            }
+        );
+        assert_eq!(
+            lines.position(size(255)),
+            Position {
+                byte: 255,
+                line: 128,
+                col: 2,
+                utf16_col: 2
+            }
+        );
+    }
+
+    #[test]
+    #[ignore = "manual short-range timing comparison"]
+    fn short_utf16_range_measurements() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let index = LineIndex::new("x\n".repeat(128));
+        let legacy = |start, end| {
+            let delta_at = |offset| {
+                let count = index
+                    .utf16_checkpoints
+                    .partition_point(|(position, _)| *position as usize <= offset);
+                let (position, units) = index.utf16_checkpoints[count - 1];
+                let position = position as usize;
+                let delta: i64 = index.text[position..offset]
+                    .chars()
+                    .map(|character| character.len_utf16() as i64 - character.len_utf8() as i64)
+                    .sum();
+                i64::from(units) - position as i64 + delta
+            };
+            ((end - start) as i64 + delta_at(end) - delta_at(start)) as usize
+        };
+        for end in [254, 255] {
+            assert_eq!(index.utf16_units_between(254, end), legacy(254, end));
+            let iterations = 100_000;
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(index.utf16_units_between(black_box(254), black_box(end)));
+            }
+            let current = started.elapsed();
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(legacy(black_box(254), black_box(end)));
+            }
+            eprintln!(
+                "range 254..{end}, {iterations} iterations: current {current:?}; prior two scans {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_position_conversions_match_a_linear_reference() {
+        let mut crossing_checkpoints = vec![b'a'; 255];
+        crossing_checkpoints.extend_from_slice("🦀é\r\n".as_bytes());
+        crossing_checkpoints.extend_from_slice("é".repeat(130).as_bytes());
+        crossing_checkpoints.extend_from_slice(b"\xff\xf0\x90\x80");
+        crossing_checkpoints.extend_from_slice(&vec![b'z'; 300]);
+        crossing_checkpoints.extend_from_slice("界🦀".repeat(90).as_bytes());
+        for bytes in [
+            &b"\xef\xbb\xbfA\xc3\xa9\xff\xf0\x9f\xa6\x80\r\n\xef\xbf\xbd\xf0\x90\x80"[..],
+            &b"a\r\nb\rc\n"[..],
+            crossing_checkpoints.as_slice(),
+        ] {
+            let file = SourceFile::decode(FileId::new(1), bytes).expect("source decodes");
+            let index = file.line_index();
+            for (line_number, start) in index.line_starts.iter().enumerate() {
+                let start = start.to_usize();
+                let end = index.line_end(line_number).max(start);
+                let mut boundaries = vec![(start, 0_u32, 0_u32)];
+                let mut utf8 = 0_u32;
+                let mut utf16 = 0_u32;
+                for (relative, character) in file.text()[start..end].char_indices() {
+                    let offset = start + relative;
+                    let invalid = file.invalid_utf8_sequence_at(size(offset));
+                    utf8 +=
+                        invalid.map_or(character.len_utf8() as u32, |sequence| sequence.raw_len());
+                    utf16 +=
+                        invalid.map_or(character.len_utf16() as u32, |sequence| sequence.raw_len());
+                    boundaries.push((offset + character.len_utf8(), utf8, utf16));
+                }
+                for &(offset, utf8, utf16) in &boundaries {
+                    let position = index.position(size(offset));
+                    assert_eq!((position.col, position.utf16_col), (utf8 + 1, utf16 + 1));
+                }
+                for target in 0..=utf8 + 1 {
+                    let expected = boundaries
+                        .iter()
+                        .rev()
+                        .find(|(_, units, _)| *units <= target)
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        index.offset(line_number as u32 + 1, target + 1),
+                        size(expected)
+                    );
+                }
+                let bom = u32::from(file.had_bom() && line_number == 0);
+                for target in 0..=utf16 + 1 {
+                    let expected = boundaries
+                        .iter()
+                        .rev()
+                        .find(|(_, _, units)| *units <= target)
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        index.from_utf16(line_number as u32 + 1, target + bom + 1),
+                        size(expected)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_ascii_lines_use_sparse_position_indexes() {
+        let text = format!("{}🦀{}", "a".repeat(500_000), "b".repeat(500_000));
+        let index = LineIndex::new(text);
+        assert!(index.utf16_checkpoints.len() <= 1_000_004 / POSITION_CHECKPOINT_INTERVAL + 1);
+        for offset in (0..=1_000_004).step_by(997) {
+            let position = index.position(size(offset));
+            let normalized = index.normalized_offset(size(offset));
+            assert_eq!(index.offset(position.line, position.col), normalized);
+            assert_eq!(
+                index.from_utf16(position.line, position.utf16_col),
+                normalized
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_sized_unicode_source_has_bounded_position_index() {
+        let index = LineIndex::new("é".repeat(MAX_SOURCE_BYTES / 2));
+        let index_bytes = index.utf16_checkpoints.capacity() * std::mem::size_of::<(u32, u32)>();
+        assert!(index_bytes <= 2 * MAX_SOURCE_BYTES / POSITION_CHECKPOINT_INTERVAL * 8);
+        assert_eq!(index.from_utf16(1, 2), size(2));
+        assert_eq!(
+            index.from_utf16(1, (MAX_SOURCE_BYTES / 2 + 1) as u32),
+            size(MAX_SOURCE_BYTES)
+        );
+    }
+
+    #[test]
+    #[ignore = "manual timing comparison"]
+    fn position_index_measurements() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let index = LineIndex::new("é".repeat(MAX_SOURCE_BYTES / 2));
+        let dense: Vec<(usize, i64)> = (1..=MAX_SOURCE_BYTES / 2)
+            .map(|number| (number * 2, -(number as i64)))
+            .collect();
+        let dense_bytes = dense.capacity() * std::mem::size_of::<(usize, i64)>();
+        let sparse_bytes = index.utf16_checkpoints.capacity() * std::mem::size_of::<(u32, u32)>();
+        eprintln!(
+            "dense entries: {dense_bytes} bytes; checkpoints: {sparse_bytes} bytes (capacity)"
+        );
+        for target in [0_u32, 1, 32, MAX_SOURCE_BYTES as u32 / 4] {
+            assert_eq!(index.from_utf16(1, target + 1), size(target as usize * 2));
+            let iterations = 10_000;
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(index.from_utf16(1, black_box(target + 1)));
+            }
+            let sparse_time = started.elapsed();
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let target = black_box(target) as usize;
+                let mut low = 0usize;
+                let mut high = MAX_SOURCE_BYTES;
+                while low < high {
+                    let middle = low + (high - low + 1) / 2;
+                    let boundary = middle & !1;
+                    let count = dense.partition_point(|(end, _)| *end <= boundary);
+                    let delta = count.checked_sub(1).map_or(0, |index| dense[index].1);
+                    let units = (boundary as i64 + delta) as usize;
+                    if units <= target {
+                        low = middle;
+                    } else {
+                        high = middle - 1;
+                    }
+                }
+                black_box(low & !1);
+            }
+            eprintln!(
+                "column {target}, {iterations} iterations: checkpoints {sparse_time:?}; prior dense full-line search {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     #[test]
