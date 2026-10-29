@@ -9168,3 +9168,9 @@
 - **Decision — review required:** Honor the same-line requirement for a `return` operand even where parentheses or brackets suppress newline tokens, and stop Pratt continuation after a line-ending valueless `return`. This preserves the physical-line rule rather than accepting a later operand or operator.
 - **Verification:** All 427 `sai_syntax` tests passed, including comments with line breaks, nested expressions and same-line continuations. The separate behavior of `break` and `continue` was not audited in this change.
 - **Hostile review:** Independent review found that the initial operand guard still allowed postfix and binary operators to bind across the line. The Pratt boundary was corrected and re-reviewed.
+
+### IR-1010 (2026-10-29): parse opaque symbol URI path bytes
+
+- **Decision — review required:** Accept percent-encoded non-UTF-8 bytes in Symbol ID path segments and normalize their escapes without interpreting them as identifiers. The path is descriptive; resolution continues to use package and hash identity.
+- **Verification:** All 80 `sai_semantic` library tests and the file's formatting check passed. Tests cover malformed escapes, encoded separators and byte-preserving normalization.
+- **Hostile review:** Independent review checked the URI rules, package identity and encoded separator behavior and found no actionable defect.

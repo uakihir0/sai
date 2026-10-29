@@ -159,22 +159,15 @@ impl SymbolId {
         }
 
         let raw_segments = &path[separator + 1..];
-        let mut decoded_path_segments = Vec::new();
+        let mut encoded_path_segments = Vec::new();
         for segment in raw_segments.split('/') {
             if segment.is_empty() {
                 return Err(SymbolIdError::EmptyPathSegment);
             }
-            if !is_valid_uri_segment(segment) {
-                return Err(SymbolIdError::InvalidPathSegment);
-            }
-            decoded_path_segments.push(
-                decode_uri_component(segment, is_pchar).ok_or(SymbolIdError::InvalidPathSegment)?,
-            );
+            let decoded =
+                decode_uri_bytes(segment, is_pchar).ok_or(SymbolIdError::InvalidPathSegment)?;
+            encoded_path_segments.push(percent_encode_bytes(&decoded).into_boxed_str());
         }
-        let encoded_path_segments = decoded_path_segments
-            .iter()
-            .map(|segment| percent_encode(segment).into_boxed_str())
-            .collect();
 
         Ok(Self::from_encoded_parts(
             package_id.into_boxed_str(),
@@ -406,8 +399,12 @@ fn is_valid_package_segment(value: &str) -> bool {
 }
 
 fn percent_encode(component: &str) -> String {
+    percent_encode_bytes(component.as_bytes())
+}
+
+fn percent_encode_bytes(component: &[u8]) -> String {
     let mut encoded = String::with_capacity(component.len());
-    for byte in component.bytes() {
+    for &byte in component {
         if is_pchar(byte) {
             encoded.push(char::from(byte));
         } else {
@@ -419,28 +416,11 @@ fn percent_encode(component: &str) -> String {
     encoded
 }
 
-fn is_valid_uri_segment(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit()
-            {
-                return false;
-            }
-            index += 3;
-        } else if is_pchar(bytes[index]) {
-            index += 1;
-        } else {
-            return false;
-        }
-    }
-    !bytes.is_empty()
+fn decode_uri_component(value: &str, allowed_unescaped: fn(u8) -> bool) -> Option<String> {
+    String::from_utf8(decode_uri_bytes(value, allowed_unescaped)?).ok()
 }
 
-fn decode_uri_component(value: &str, allowed_unescaped: fn(u8) -> bool) -> Option<String> {
+fn decode_uri_bytes(value: &str, allowed_unescaped: fn(u8) -> bool) -> Option<Vec<u8>> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -463,7 +443,7 @@ fn decode_uri_component(value: &str, allowed_unescaped: fn(u8) -> bool) -> Optio
             return None;
         }
     }
-    String::from_utf8(decoded).ok()
+    Some(decoded)
 }
 
 fn percent_encode_package_id(package_id: &str) -> String {
@@ -651,6 +631,24 @@ mod tests {
             "symbol://acme%3Ashop/field%5Bwidth%5D#00FF0A"
         );
         assert_eq!(lowercase_escape.package_id(), "acme:shop");
+    }
+
+    #[test]
+    fn parses_opaque_uri_path_bytes_without_requiring_utf8() {
+        let id = SymbolId::parse("symbol://acme%3auser/%ff/%c3%28/%41%2f#8F21A7")
+            .expect("URI path segments may contain arbitrary percent-encoded bytes");
+
+        assert_eq!(id.as_str(), "symbol://acme%3Auser/%FF/%C3(/A%2F#8F21A7");
+        assert_eq!(id.package_id(), "acme:user");
+        assert_eq!(id.hex(), hex("8F21A7"));
+        assert_eq!(
+            id.encoded_path_segments()
+                .iter()
+                .map(Box::as_ref)
+                .collect::<Vec<_>>(),
+            ["%FF", "%C3(", "A%2F"]
+        );
+        assert_eq!(SymbolId::parse(id.as_str()).unwrap().as_str(), id.as_str());
     }
 
     #[test]
