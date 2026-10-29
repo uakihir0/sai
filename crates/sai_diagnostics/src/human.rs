@@ -177,7 +177,7 @@ impl Renderer<'_> {
                 paint(self.color, BOLD_BLUE, arrow)
             );
             if let Some(snippet) = &group.snippet {
-                self.snippet_block(&mut out, &block_gutter, width, snippet);
+                self.snippet_block(&mut out, &block_gutter, width, snippet, diagnostic.severity);
             }
         }
 
@@ -220,11 +220,7 @@ impl Renderer<'_> {
     }
 
     fn heading(&self, out: &mut String, diagnostic: &Diagnostic) {
-        let (word, sgr) = match diagnostic.severity {
-            Severity::Error => ("error", BOLD_RED),
-            Severity::Warning => ("warning", BOLD_YELLOW),
-            Severity::Info => ("info", BOLD_CYAN),
-        };
+        let (word, sgr) = severity_style(diagnostic.severity);
         let code = format!("{word}[{}]", diagnostic.code.as_str());
         let _ = writeln!(
             out,
@@ -235,7 +231,14 @@ impl Renderer<'_> {
     }
 
     /// The `G |` line, the rows, and the closing `G |` line of one snippet (§11.6.4).
-    fn snippet_block(&self, out: &mut String, gutter: &str, width: usize, snippet: &Snippet) {
+    fn snippet_block(
+        &self,
+        out: &mut String,
+        gutter: &str,
+        width: usize,
+        snippet: &Snippet,
+        severity: Severity,
+    ) {
         let bar = paint(self.color, BOLD_BLUE, "|");
         let _ = writeln!(out, "{gutter} {bar}");
         for row in &snippet.rows {
@@ -251,7 +254,7 @@ impl Renderer<'_> {
                     let number = paint(self.color, BOLD_BLUE, &format!("{number:>width$}"));
                     let _ = writeln!(out, "{number} {bar} {text}");
                     for mark in marks {
-                        self.mark_row(out, gutter, &bar, mark);
+                        self.mark_row(out, gutter, &bar, mark, severity);
                     }
                 }
             }
@@ -259,9 +262,16 @@ impl Renderer<'_> {
         let _ = writeln!(out, "{gutter} {bar}");
     }
 
-    fn mark_row(&self, out: &mut String, gutter: &str, bar: &str, mark: &SnippetMark) {
+    fn mark_row(
+        &self,
+        out: &mut String,
+        gutter: &str,
+        bar: &str,
+        mark: &SnippetMark,
+        severity: Severity,
+    ) {
         let (glyph, sgr) = if mark.primary {
-            ("^", BOLD_RED)
+            ("^", severity_style(severity).1)
         } else {
             ("-", BOLD_BLUE)
         };
@@ -564,6 +574,14 @@ fn same_file(left: &Location, right: &Location) -> bool {
 
 fn same_file_ref(left: &SourceRef, right: &SourceRef) -> bool {
     left.path == right.path && left.package == right.package
+}
+
+fn severity_style(severity: Severity) -> (&'static str, &'static str) {
+    match severity {
+        Severity::Error => ("error", BOLD_RED),
+        Severity::Warning => ("warning", BOLD_YELLOW),
+        Severity::Info => ("info", BOLD_CYAN),
+    }
 }
 
 fn paint(color: bool, sgr: &str, text: &str) -> String {
@@ -1196,6 +1214,67 @@ mod tests {
             rendered.contains("   \x1b[1;34m=\x1b[0m \x1b[1;32mhelp\x1b[0m: replace with `name`\n")
         );
         assert!(!render_diagnostic(&diagnostic, &TestSource::default(), false).contains('\x1b'));
+    }
+
+    #[test]
+    fn primary_marks_follow_the_diagnostic_severity() {
+        let user = user_text();
+        let source = TestSource {
+            files: vec![("src/user.sai", user.clone())],
+            snippets: vec![(
+                "src/user.sai",
+                Snippet {
+                    rows: vec![SnippetRow::Line {
+                        number: 12,
+                        text: "    let label = user.username".to_owned(),
+                        marks: vec![
+                            SnippetMark {
+                                column: 21,
+                                width: 8,
+                                primary: true,
+                                message: "primary".to_owned(),
+                            },
+                            SnippetMark {
+                                column: 4,
+                                width: 3,
+                                primary: false,
+                                message: "secondary".to_owned(),
+                            },
+                        ],
+                    }],
+                },
+            )],
+            ..TestSource::default()
+        };
+
+        for (severity, color) in [
+            (Severity::Error, "\x1b[1;31m"),
+            (Severity::Warning, "\x1b[1;33m"),
+            (Severity::Info, "\x1b[1;36m"),
+        ] {
+            let mut diagnostic = user_diagnostic(&user);
+            diagnostic.severity = severity;
+            let rendered = render_diagnostic(&diagnostic, &source, true);
+            assert!(rendered.contains(&format!("{color}^^^^^^^^\x1b[0m {color}primary\x1b[0m")));
+            assert!(rendered.contains(&format!("\x1b[1;34m---\x1b[0m \x1b[1;34msecondary\x1b[0m")));
+            let plain = render_diagnostic(&diagnostic, &source, false);
+            assert_eq!(
+                plain,
+                lines(&[
+                    &format!(
+                        "{}[UNKNOWN_FIELD]: `User` has no field `username`",
+                        severity.as_str()
+                    ),
+                    "  --> src/user.sai:12:22",
+                    "   |",
+                    "12 |     let label = user.username",
+                    "   |                      ^^^^^^^^ primary",
+                    "   |     --- secondary",
+                    "   |",
+                    "",
+                ])
+            );
+        }
     }
 
     #[test]

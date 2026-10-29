@@ -108,6 +108,37 @@ fn execute_check(root: &std::path::Path, options: &[&str]) -> Output {
         .expect("run sai check subprocess")
 }
 
+#[test]
+fn check_colors_warning_primary_mark_yellow() {
+    let temporary = TestDirectory::new();
+    prepare_check_workspace(
+        &temporary.0,
+        "",
+        "targets { wasm32-core, wasm32-core }\n",
+        &[],
+        &[],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&temporary.0)
+        .args(["--color", "always", "check"])
+        .output()
+        .expect("run sai check subprocess");
+    let stderr = std::str::from_utf8(&output.stderr).expect("CLI stderr is UTF-8");
+    assert!(output.status.success(), "check failed:\n{stderr}");
+    assert!(
+        stderr.contains("\x1b[1;33mwarning[DUPLICATE_LIST_ITEM]\x1b[0m"),
+        "missing warning heading:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "\x1b[1;34m4\x1b[0m \x1b[1;34m|\x1b[0m targets {{ wasm32-core, wasm32-core }}\n  \x1b[1;34m|\x1b[0m {}\x1b[1;33m^^^^^^^^^^^\x1b[0m\n",
+            " ".repeat(23)
+        )),
+        "missing yellow primary mark for the duplicate target:\n{stderr}"
+    );
+}
+
 fn prepare_cli_rollback_journal(
     root: &std::path::Path,
     source_before: &[u8],
