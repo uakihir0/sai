@@ -1,8 +1,9 @@
 //! Conservative, standalone conversion of owner-local unused binding candidates.
 //!
-//! This is not part of the driver pipeline. `Complete` inputs are caller
-//! assertions about the exact owner, build, snapshot, and symbol interner;
-//! incomplete scope or lint collection must never be passed as complete.
+//! Direct calls require caller assertions about the exact owner, build,
+//! snapshot, and symbol interner; incomplete scope or lint collection must
+//! never be passed as complete. The opt-in driver bridge supplies its own
+//! conservative context and uses the same converter with live owner HIR.
 //!
 //! Fix verification currently accepts only one edit entirely within the name.
 //! A conforming planner can also reformat the enclosing format unit, even
@@ -178,6 +179,7 @@ pub enum LintContext<'a> {
 
 /// Whether the analyzed body is real, active for this build, and its
 /// complete lowering diagnostics are available for the exact owner.
+#[derive(Clone, Copy)]
 pub enum OwnerScope<'a> {
     Complete {
         lowering_diagnostics: &'a [Diagnostic],
@@ -201,7 +203,7 @@ pub struct UnusedBindingInputs<'a, 'hir, P> {
 }
 
 /// No diagnostics are returned when any part of the conversion is unknown.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnusedBindingDiagnostics {
     Complete(Vec<Diagnostic>),
     Incomplete,
@@ -210,11 +212,37 @@ pub enum UnusedBindingDiagnostics {
 pub fn unused_binding_diagnostics<P: FixOperationPlanner>(
     inputs: UnusedBindingInputs<'_, '_, P>,
 ) -> UnusedBindingDiagnostics {
-    convert(inputs).unwrap_or(UnusedBindingDiagnostics::Incomplete)
+    if !matches!(&inputs.lint, LintContext::Complete(_))
+        || !matches!(inputs.module_aliases, ModuleAliases::Complete(_))
+    {
+        return UnusedBindingDiagnostics::Incomplete;
+    }
+    let analysis = match inputs.owner_scope {
+        OwnerScope::Complete {
+            lowering_diagnostics,
+        } => analyze_unused_bindings(
+            inputs.body,
+            inputs.source_map,
+            inputs.snapshot,
+            inputs.symbols,
+            inputs.module_aliases,
+            lowering_diagnostics,
+        ),
+        OwnerScope::Unavailable => return UnusedBindingDiagnostics::Incomplete,
+    };
+    unused_binding_diagnostics_from_analysis(inputs, &analysis)
+}
+
+pub(crate) fn unused_binding_diagnostics_from_analysis<P: FixOperationPlanner>(
+    inputs: UnusedBindingInputs<'_, '_, P>,
+    analysis: &UnusedBindingAnalysis,
+) -> UnusedBindingDiagnostics {
+    convert(inputs, analysis).unwrap_or(UnusedBindingDiagnostics::Incomplete)
 }
 
 fn convert<P: FixOperationPlanner>(
     inputs: UnusedBindingInputs<'_, '_, P>,
+    analysis: &UnusedBindingAnalysis,
 ) -> Option<UnusedBindingDiagnostics> {
     let LintContext::Complete(lint) = inputs.lint else {
         return None;
@@ -222,23 +250,13 @@ fn convert<P: FixOperationPlanner>(
     let ModuleAliases::Complete(aliases) = inputs.module_aliases else {
         return None;
     };
-    let OwnerScope::Complete {
-        lowering_diagnostics,
-    } = inputs.owner_scope
-    else {
+    if !matches!(inputs.owner_scope, OwnerScope::Complete { .. }) {
+        return None;
+    }
+    let UnusedBindingAnalysis::Complete { owner, unused } = analysis else {
         return None;
     };
-    let UnusedBindingAnalysis::Complete { owner, unused } = analyze_unused_bindings(
-        inputs.body,
-        inputs.source_map,
-        inputs.snapshot,
-        inputs.symbols,
-        ModuleAliases::Complete(aliases),
-        lowering_diagnostics,
-    ) else {
-        return None;
-    };
-    if owner != inputs.body.owner {
+    if *owner != inputs.body.owner {
         return None;
     }
     let file = inputs.snapshot.file(inputs.source_map.file())?;

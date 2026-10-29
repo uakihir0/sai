@@ -2533,6 +2533,7 @@ pub struct FunctionOwnerResolution {
     /// label resolver's diagnostics so the caller can preserve phase order.
     lowering_diagnostics: Vec<Diagnostic>,
     unused_binding_analysis: Option<UnusedBindingAnalysis>,
+    unused_binding_diagnostics: Option<unused_binding_diagnostics::UnusedBindingDiagnostics>,
 }
 
 /// Supported semantic function signature data or the explicit boundary that
@@ -6735,6 +6736,22 @@ pub struct FunctionOwnerResolutions {
     owners: Vec<FunctionOwnerResolution>,
     function_signature_owners: HashMap<DefId, FunctionSignatureOwnerIndex>,
     session_token: SessionToken,
+    unused_diagnostic_request: Option<(FileId, RootUnusedBindingOptions)>,
+}
+
+/// Prevalidated effective command-line settings for UNUSED_VARIABLE.
+/// Callers must reject invalid or conflicting CLI options before constructing this.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RootUnusedBindingOptions {
+    pub cli: Option<OverrideLintLevel>,
+    pub deny_warnings: bool,
+}
+
+struct RootUnusedBindingSettings {
+    options: RootUnusedBindingOptions,
+    manifest: Option<sai_diagnostics::ManifestLintLevel>,
+    policy: sai_diagnostics::LintPolicies,
+    manifest_cost: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6792,6 +6809,38 @@ impl FunctionOwnerResolutions {
             return None;
         }
         result.unused_binding_analysis.as_ref()
+    }
+
+    /// Returns only diagnostics produced for these exact inputs and settings.
+    /// `None` means unavailable or stale; `Incomplete` is never a clean result.
+    pub fn unused_binding_diagnostics(
+        &self,
+        database: &mut RootDatabase,
+        collection: &Phase1PackageScopesCollection,
+        snapshot: &WorkspaceSnapshot,
+        manifest_file: FileId,
+        options: RootUnusedBindingOptions,
+        owner: OwnerId,
+    ) -> Option<&unused_binding_diagnostics::UnusedBindingDiagnostics> {
+        if self.unused_diagnostic_request != Some((manifest_file, options))
+            || self.session_token != database.session_token
+            || !self.matches_collection(collection)
+            || !self.matches_snapshot(snapshot)
+            || !database.root_unused_binding_context_is_current(
+                collection,
+                &collection.module_tree,
+                snapshot,
+                manifest_file,
+            )
+        {
+            return None;
+        }
+        let mut owners = self.owners.iter().filter(|item| item.owner == owner);
+        let result = owners.next()?;
+        if owners.next().is_some() {
+            return None;
+        }
+        result.unused_binding_diagnostics.as_ref()
     }
 
     pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
@@ -15007,6 +15056,29 @@ impl UnusedBindingAnalysisBudget {
         self.remaining_bytes -= source_bytes;
         true
     }
+
+    fn reserve_bytes(&mut self, bytes: usize) -> bool {
+        if self.exhausted || bytes > self.remaining_bytes {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining_bytes -= bytes;
+        true
+    }
+
+    fn reserve_conversion(&mut self, source_bytes: usize, candidates: usize) -> bool {
+        let cost = candidates
+            .checked_mul(4)
+            .and_then(|value| value.checked_add(3))
+            .and_then(|passes| source_bytes.checked_add(1)?.checked_mul(passes));
+        match cost {
+            Some(cost) if candidates <= 64 => self.reserve_bytes(cost),
+            _ => {
+                self.exhausted = true;
+                false
+            }
+        }
+    }
 }
 
 fn unused_binding_scope_is_complete(module_scope: &Phase1ModuleScopes) -> bool {
@@ -20115,6 +20187,7 @@ impl RootDatabase {
             None,
             None,
             false,
+            None,
         )
     }
 
@@ -20138,7 +20211,220 @@ impl RootDatabase {
             None,
             None,
             true,
+            None,
         )
+    }
+
+    /// Opts in to diagnostics for one public top-level function in a root-only
+    /// graph with exactly `src/lib.sai` and no source attributes or imports.
+    /// `options` must contain the complete, prevalidated effective CLI settings.
+    /// The request budgets manifest parsing, candidate analysis and conversion
+    /// against 8 MiB of cumulative input-volume work; existing owner checks and
+    /// query computation are not covered by this budget. Budget exhaustion,
+    /// unknown context, unsupported analysis or fix planning is incomplete.
+    /// This does not certify the build or cover methods, attributes or other
+    /// owners. A complete candidate analysis alone is not a diagnostic result.
+    pub fn resolve_function_owner_analyses_with_unused_binding_diagnostics(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        manifest_file: FileId,
+        options: RootUnusedBindingOptions,
+    ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
+        let settings = self.root_unused_binding_settings(
+            collection,
+            module_tree,
+            snapshot,
+            manifest_file,
+            options,
+        );
+        let mut result = self.resolve_function_owner_analyses_inner(
+            collection,
+            module_tree,
+            snapshot,
+            None,
+            None,
+            None,
+            settings.is_some(),
+            Some(settings.as_ref()),
+        )?;
+        result.unused_diagnostic_request = Some((manifest_file, options));
+        Ok(result)
+    }
+
+    fn root_unused_binding_context_is_current(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        manifest_file: FileId,
+    ) -> bool {
+        if collection.session_token != self.session_token
+            || collection.snapshot_id != snapshot.id()
+            || collection.module_tree != *module_tree
+            || module_tree.modules.len() != 1
+            || collection.scopes.function_owners.len() != 1
+            || collection.scopes.top_level_owners.len() != 1
+            || !collection.build_context.is_root_package
+            || collection.build_context.is_test_build
+            || collection.build_context.analyzes_tests
+        {
+            return false;
+        }
+        let Ok(graph) = self.package_graph.get(&mut self.query_database, 0) else {
+            return false;
+        };
+        let Some(graph) = graph.as_ref().as_ref() else {
+            return false;
+        };
+        if graph.nodes().len() != 1
+            || graph.root().key() != &collection.package_key
+            || graph.root().role() != PackageGraphRole::Root
+            || graph.root().form() != PackageForm::Source
+            || !graph.root().active_edges().is_empty()
+            || collection.package_graph_fingerprint != Some(fingerprint(graph))
+        {
+            return false;
+        }
+        let Some(manifest) = snapshot.file(manifest_file) else {
+            return false;
+        };
+        if manifest.path() != "sai.package" {
+            return false;
+        }
+        if manifest.source().raw_bytes().len() > MAX_UNUSED_BINDING_ANALYSIS_BYTES / 4 {
+            return false;
+        }
+        if manifest.package()
+            != Some(format!("{}@{}", graph.root().identity(), graph.root().version()).as_str())
+        {
+            return false;
+        }
+        let Some(key) = self.file_key(manifest_file) else {
+            return false;
+        };
+        if key.package_key() != collection.package_key.as_str() || key.path() != "sai.package" {
+            return false;
+        }
+        let Ok(tracked) = self
+            .declared_requirements
+            .input
+            .get(&mut self.query_database, collection.package_key.clone())
+        else {
+            return false;
+        };
+        if tracked.dependency || tracked.source_bytes.as_ref() != manifest.source().raw_bytes() {
+            return false;
+        }
+        let file = module_tree.modules[0].file;
+        let Some(source) = snapshot.file(file) else {
+            return false;
+        };
+        if source
+            .source()
+            .raw_bytes()
+            .len()
+            .max(source.source().text().len())
+            > MAX_UNUSED_BINDING_ANALYSIS_BYTES / 4
+        {
+            return false;
+        }
+        let Some(key) = self.file_key(file).cloned() else {
+            return false;
+        };
+        if key.package_key() != collection.package_key.as_str()
+            || key.path() != "src/lib.sai"
+            || source.path() != key.path()
+            || source.package() != manifest.package()
+        {
+            return false;
+        }
+        if !matches!(self.file_contents(key), Ok(Some(FileContents::Bytes(bytes))) if bytes.as_ref() == source.source().raw_bytes())
+        {
+            return false;
+        }
+        let Ok(Some(files)) = self
+            .vfs
+            .package_files(&mut self.query_database, collection.package_key.clone())
+        else {
+            return false;
+        };
+        if !files.source_directory_exists()
+            || files.entries().len() != 1
+            || files.entries()[0].kind() != sai_vfs::PackageFileKind::File
+            || files.entries()[0].path().as_str() != "lib.sai"
+        {
+            return false;
+        }
+        let Ok(directory) = PackageSourceDirectory::new("src") else {
+            return false;
+        };
+        matches!(self.module_tree(module_tree.package, directory, None), Ok(current) if *current == *module_tree)
+    }
+
+    fn root_unused_binding_settings(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        manifest_file: FileId,
+        options: RootUnusedBindingOptions,
+    ) -> Option<RootUnusedBindingSettings> {
+        if !self.root_unused_binding_context_is_current(
+            collection,
+            module_tree,
+            snapshot,
+            manifest_file,
+        ) {
+            return None;
+        }
+        let source = snapshot.file(manifest_file)?.source();
+        let manifest_cost = source.raw_bytes().len().checked_mul(4)?;
+        if manifest_cost > MAX_UNUSED_BINDING_ANALYSIS_BYTES {
+            return None;
+        }
+        let parsed = sai_package::manifest::parse_for_role(source.raw_bytes(), PackageRole::Root);
+        let header = &parsed.file().header.as_ref()?.value;
+        let graph = self.package_graph.get(&mut self.query_database, 0).ok()?;
+        let graph = graph.as_ref().as_ref()?;
+        if header.identity.to_string() != graph.root().identity()
+            || &header.version != graph.root().version()
+        {
+            return None;
+        }
+        let validation = sai_package::validation::validate(
+            &parsed,
+            sai_package::validation::PackageValidationContext::default(),
+        );
+        if !parsed.is_syntax_valid() || !parsed.warnings().is_empty()
+            || parsed.file().declarations.iter().any(|decl| !matches!(decl.value,
+                sai_package::manifest::PackageDeclaration::Source(_) | sai_package::manifest::PackageDeclaration::Targets(_)
+                | sai_package::manifest::PackageDeclaration::Lints(_) | sai_package::manifest::PackageDeclaration::Policy(_)
+                | sai_package::manifest::PackageDeclaration::Description(_) | sai_package::manifest::PackageDeclaration::License(_)
+                | sai_package::manifest::PackageDeclaration::Repository(_) | sai_package::manifest::PackageDeclaration::Authors(_)))
+            || !parsed.file().declarations.iter().any(|decl| matches!(&decl.value, sai_package::manifest::PackageDeclaration::Source(path) if path.as_ref() == "src"))
+            || !parsed.file().declarations.iter().any(|decl| matches!(&decl.value, sai_package::manifest::PackageDeclaration::Targets(targets) if targets.iter().any(|target| target.value.as_ref() == collection.target_cfg.target_name())))
+            || !validation.is_valid() || !validation.warnings.is_empty()
+        { return None; }
+        let policy = sai_package::validation::resolve_lint_policies(
+            snapshot,
+            manifest_file,
+            PackageRole::Root,
+        )
+        .ok()?;
+        let mut levels = sai_package::validation::resolve_manifest_lint_levels(
+            snapshot,
+            manifest_file,
+            PackageRole::Root,
+        )
+        .ok()?;
+        Some(RootUnusedBindingSettings {
+            options,
+            manifest: levels.remove("UNUSED_VARIABLE"),
+            policy,
+            manifest_cost,
+        })
     }
 
     /// Resolves function-owner type prefixes through a validated active-source
@@ -20165,6 +20451,7 @@ impl RootDatabase {
             None,
             None,
             false,
+            None,
         )
     }
 
@@ -20195,6 +20482,7 @@ impl RootDatabase {
             Some(wit_view_scopes),
             None,
             false,
+            None,
         )
     }
 
@@ -20273,6 +20561,7 @@ impl RootDatabase {
             wit_view_scopes,
             Some(&world_fields),
             false,
+            None,
         )
     }
 
@@ -20285,6 +20574,7 @@ impl RootDatabase {
         wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
         world_fields: Option<&FunctionOwnerWorldFieldInputs>,
         analyze_unused: bool,
+        diagnostic_settings: Option<Option<&RootUnusedBindingSettings>>,
     ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
         if collection.session_token != self.session_token {
             return Err(OwnerControlFlowResolutionError::SessionMismatch);
@@ -20360,6 +20650,9 @@ impl RootDatabase {
         let descriptors = &collection.scopes.function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
         let mut unused_budget = UnusedBindingAnalysisBudget::new();
+        if let Some(Some(settings)) = diagnostic_settings {
+            unused_budget.reserve_bytes(settings.manifest_cost);
+        }
         let mut group_start = 0;
         while group_start < descriptors.len() {
             let file = descriptors[group_start].file;
@@ -20367,12 +20660,13 @@ impl RootDatabase {
             while group_end < descriptors.len() && descriptors[group_end].file == file {
                 group_end += 1;
             }
-            let inputs =
-                match self.current_owner_inputs(snapshot, file, &collection.target_cfg) {
-                    Ok(inputs) => inputs,
-                    Err(error) => {
-                        owners.extend(descriptors[group_start..group_end].iter().map(
-                            |descriptor| FunctionOwnerResolution {
+            let inputs = match self.current_owner_inputs(snapshot, file, &collection.target_cfg) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    owners.extend(
+                        descriptors[group_start..group_end]
+                            .iter()
+                            .map(|descriptor| FunctionOwnerResolution {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
@@ -20385,17 +20679,21 @@ impl RootDatabase {
                                 module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
-                                world_field_resolution:
-                                    world_fields.map(|_| Err(error.clone())).unwrap_or(Ok(None)),
+                                world_field_resolution: world_fields
+                                    .map(|_| Err(error.clone()))
+                                    .unwrap_or(Ok(None)),
                                 lowering_diagnostics: Vec::new(),
-                                unused_binding_analysis:
-                                    analyze_unused.then_some(UnusedBindingAnalysis::Incomplete),
-                            },
-                        ));
-                        group_start = group_end;
-                        continue;
-                    }
-                };
+                                unused_binding_analysis: analyze_unused
+                                    .then_some(UnusedBindingAnalysis::Incomplete),
+                                unused_binding_diagnostics: diagnostic_settings.map(|_| {
+                                    unused_binding_diagnostics::UnusedBindingDiagnostics::Incomplete
+                                }),
+                            }),
+                    );
+                    group_start = group_end;
+                    continue;
+                }
+            };
             let module_scope = module_scope_for_file(collection, module_tree, file);
             let module_aliases = module_scope
                 .as_ref()
@@ -20423,6 +20721,8 @@ impl RootDatabase {
                 let mut world_field_resolution = None;
                 let mut unused_binding_analysis =
                     analyze_unused.then_some(UnusedBindingAnalysis::Incomplete);
+                let mut unused_binding_diagnostics = diagnostic_settings
+                    .map(|_| unused_binding_diagnostics::UnusedBindingDiagnostics::Incomplete);
                 let resolution = (|| {
                     let owner_descriptor = find_top_level_owner_descriptor(
                         &top_level_owner_index,
@@ -20811,6 +21111,52 @@ impl RootDatabase {
                                     ModuleAliases::Complete(aliases),
                                     &lowering_diagnostics,
                                 ));
+                                if let (
+                                    Some(Some(settings)),
+                                    Some(
+                                        analysis @ UnusedBindingAnalysis::Complete {
+                                            unused, ..
+                                        },
+                                    ),
+                                ) = (diagnostic_settings, unused_binding_analysis.as_ref())
+                                    && matches!(hir_owner.node, OwnerNode::Item(item) if item.vis == Visibility::Pub)
+                                    && module_scope
+                                        .as_ref()
+                                        .is_ok_and(|scope| scope.imports.is_empty())
+                                    && !inputs.root.descendants().any(|node| {
+                                        node.kind() == sai_syntax::SyntaxKind::ATTRIBUTE
+                                    })
+                                    && unused_budget.reserve_conversion(
+                                        inputs
+                                            .source
+                                            .raw_bytes()
+                                            .len()
+                                            .max(inputs.source.text().len()),
+                                        unused.len(),
+                                    )
+                                {
+                                    let lint = sai_diagnostics::LintResolutionContext {
+                                        primary: None,
+                                        attributes: &[],
+                                        cli: settings.options.cli,
+                                        manifest: settings.manifest.as_ref(),
+                                        package_policy: &settings.policy,
+                                        root_policy: &settings.policy,
+                                        is_root_or_workspace_member: true,
+                                        deny_warnings: settings.options.deny_warnings,
+                                    };
+                                    let planner =
+                                        canonical_name_fix_planner::CanonicalNameFixPlanner::new(
+                                            snapshot,
+                                        );
+                                    unused_binding_diagnostics = Some(unused_binding_diagnostics::unused_binding_diagnostics_from_analysis(
+                                        unused_binding_diagnostics::UnusedBindingInputs {
+                                            body, source_map: &source_map, snapshot, symbols: &self.symbols,
+                                            module_aliases: ModuleAliases::Complete(aliases),
+                                            owner_scope: unused_binding_diagnostics::OwnerScope::Complete { lowering_diagnostics: &lowering_diagnostics },
+                                            lint: unused_binding_diagnostics::LintContext::Complete(&lint), planner: &planner,
+                                        }, analysis));
+                                }
                             }
                             labels
                         }
@@ -20880,6 +21226,7 @@ impl RootDatabase {
                     world_field_resolution,
                     lowering_diagnostics,
                     unused_binding_analysis,
+                    unused_binding_diagnostics,
                 });
             }
             group_start = group_end;
@@ -20901,6 +21248,7 @@ impl RootDatabase {
             ),
             owners,
             session_token: collection.session_token.clone(),
+            unused_diagnostic_request: None,
         })
     }
 
@@ -74717,6 +75065,629 @@ property "shared"() {}
         let mut budget = UnusedBindingAnalysisBudget::new();
         assert!(budget.reserve(MAX_UNUSED_BINDING_ANALYSIS_BYTES));
         assert!(!budget.reserve(1));
+    }
+
+    fn unused_diagnostic_fixture(
+        source: &[u8],
+        manifest: &[u8],
+    ) -> (
+        RootDatabase,
+        ModuleTree,
+        WorkspaceSnapshot,
+        Phase1PackageScopesCollection,
+        FileId,
+    ) {
+        let (mut database, _, _, package) = phase1_fixture(source, b"");
+        database
+            .set_package_manifest(
+                package,
+                Arc::from(manifest),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .unwrap();
+        database
+            .set_package_files(
+                PackageKey::new("acme:phase1#1").unwrap(),
+                PackageFilesSnapshot::new(
+                    true,
+                    [PackageFileEntry::new("lib.sai", PackageFileKind::File).unwrap()],
+                )
+                .unwrap(),
+                Durability::Low,
+            )
+            .unwrap();
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .unwrap();
+        let tree = database
+            .module_tree(package, PackageSourceDirectory::new("src").unwrap(), None)
+            .unwrap()
+            .as_ref()
+            .clone();
+        let manifest_file = database
+            .intern_package_file(package, PackageRelativePath::new("sai.package").unwrap())
+            .unwrap();
+        let snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(tree.modules[0].file, source).unwrap()),
+                "src/lib.sai",
+                Some("acme:phase1@1.0.0".into()),
+                Some(17),
+            ),
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(manifest_file, manifest).unwrap()),
+                "sai.package",
+                Some("acme:phase1@1.0.0".into()),
+                Some(17),
+            ),
+        ])
+        .unwrap();
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").unwrap(),
+                Phase1BuildContext {
+                    is_root_package: true,
+                    ..Phase1BuildContext::default()
+                },
+            )
+            .unwrap();
+        (database, tree, snapshot, collection, manifest_file)
+    }
+
+    #[test]
+    fn opt_in_unused_diagnostics_emits_and_resolves_settings() {
+        use unused_binding_diagnostics::UnusedBindingDiagnostics;
+        let source =
+            sai_fmt::format_source(b"pub fn f(x: I32) -> I32 { let dead = 1\n x\n }").unwrap();
+        for (manifest_suffix, options, expected) in [
+            (
+                "",
+                RootUnusedBindingOptions {
+                    cli: None,
+                    deny_warnings: false,
+                },
+                Some(sai_diagnostics::Severity::Warning),
+            ),
+            (
+                "lints { deny UNUSED_VARIABLE }\n",
+                RootUnusedBindingOptions {
+                    cli: None,
+                    deny_warnings: false,
+                },
+                Some(sai_diagnostics::Severity::Error),
+            ),
+            (
+                "lints { deny UNUSED_VARIABLE }\n",
+                RootUnusedBindingOptions {
+                    cli: Some(OverrideLintLevel::Allow),
+                    deny_warnings: false,
+                },
+                None,
+            ),
+            (
+                "lints { allow UNUSED_VARIABLE }\n",
+                RootUnusedBindingOptions {
+                    cli: Some(OverrideLintLevel::Deny),
+                    deny_warnings: false,
+                },
+                Some(sai_diagnostics::Severity::Error),
+            ),
+            (
+                "",
+                RootUnusedBindingOptions {
+                    cli: None,
+                    deny_warnings: true,
+                },
+                Some(sai_diagnostics::Severity::Error),
+            ),
+        ] {
+            let manifest = format!(
+                "package acme:phase1 @ 1.0.0\nsource \"src\"\ntargets {{ wasm32-core }}\n{manifest_suffix}"
+            );
+            let (mut database, tree, snapshot, collection, manifest_file) =
+                unused_diagnostic_fixture(source.as_bytes(), manifest.as_bytes());
+            let result = database
+                .resolve_function_owner_analyses_with_unused_binding_diagnostics(
+                    &collection,
+                    &tree,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                )
+                .unwrap();
+            let owner = result.owners()[0].owner();
+            let Some(UnusedBindingDiagnostics::Complete(diagnostics)) = result
+                .unused_binding_diagnostics(
+                    &mut database,
+                    &collection,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                    owner,
+                )
+            else {
+                panic!("expected complete diagnostic conversion");
+            };
+            assert_eq!(diagnostics.len(), usize::from(expected.is_some()));
+            if let Some(severity) = expected {
+                assert_eq!(diagnostics[0].severity, severity);
+                assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnusedVariable);
+                assert_eq!(diagnostics[0].fixes().len(), 1);
+            }
+            let different = RootUnusedBindingOptions {
+                cli: Some(OverrideLintLevel::Warn),
+                ..options
+            };
+            assert!(
+                result
+                    .unused_binding_diagnostics(
+                        &mut database,
+                        &collection,
+                        &snapshot,
+                        manifest_file,
+                        different,
+                        owner
+                    )
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn opt_in_unused_diagnostics_requires_public_function() {
+        use unused_binding_diagnostics::UnusedBindingDiagnostics;
+        let manifest = b"package acme:phase1 @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n";
+        let options = RootUnusedBindingOptions {
+            cli: None,
+            deny_warnings: false,
+        };
+        for (visibility, is_public) in [("pub ", true), ("", false)] {
+            let source = sai_fmt::format_source(
+                format!("{visibility}fn f(x: I32) -> I32 {{ x }}").as_bytes(),
+            )
+            .unwrap();
+            let (mut database, tree, snapshot, collection, manifest_file) =
+                unused_diagnostic_fixture(source.as_bytes(), manifest);
+            let candidates = database
+                .resolve_function_owner_analyses_with_unused_bindings(&collection, &tree, &snapshot)
+                .unwrap();
+            let owner = candidates.owners()[0].owner();
+            let candidate = candidates
+                .unused_binding_analysis(&database, &collection, &snapshot, owner)
+                .cloned();
+            let result = database
+                .resolve_function_owner_analyses_with_unused_binding_diagnostics(
+                    &collection,
+                    &tree,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                )
+                .unwrap();
+            assert_eq!(
+                result.unused_binding_analysis(&database, &collection, &snapshot, owner),
+                candidate.as_ref()
+            );
+            let diagnostics = result.unused_binding_diagnostics(
+                &mut database,
+                &collection,
+                &snapshot,
+                manifest_file,
+                options,
+                owner,
+            );
+            if is_public {
+                assert!(matches!(
+                    candidate,
+                    Some(UnusedBindingAnalysis::Complete { unused, .. }) if unused.is_empty()
+                ));
+                assert!(matches!(
+                    diagnostics,
+                    Some(UnusedBindingDiagnostics::Complete(items)) if items.is_empty()
+                ));
+            } else {
+                assert_eq!(candidate, Some(UnusedBindingAnalysis::Incomplete));
+                assert_eq!(diagnostics, Some(&UnusedBindingDiagnostics::Incomplete));
+            }
+        }
+    }
+
+    #[test]
+    fn opt_in_unused_diagnostics_rejects_unsupported_and_stale() {
+        use unused_binding_diagnostics::UnusedBindingDiagnostics;
+        let manifest = b"package acme:phase1 @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n";
+        let options = RootUnusedBindingOptions {
+            cli: None,
+            deny_warnings: false,
+        };
+        for source in [
+            "pub fn f(x: I32) -> I32 { 0 }\n",
+            "@allow(UNUSED_VARIABLE)\npub fn f(x: I32) -> I32 { x }\n",
+        ] {
+            let (mut database, tree, snapshot, collection, manifest_file) =
+                unused_diagnostic_fixture(source.as_bytes(), manifest);
+            let result = database
+                .resolve_function_owner_analyses_with_unused_binding_diagnostics(
+                    &collection,
+                    &tree,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                )
+                .unwrap();
+            let owner = result.owners()[0].owner();
+            assert_eq!(
+                result.unused_binding_diagnostics(
+                    &mut database,
+                    &collection,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                    owner
+                ),
+                Some(&UnusedBindingDiagnostics::Incomplete)
+            );
+            database
+                .set_package_graph(Some(phase1_root_only_graph_with_toolchain("1.8.3")))
+                .unwrap();
+            assert!(
+                result
+                    .unused_binding_diagnostics(
+                        &mut database,
+                        &collection,
+                        &snapshot,
+                        manifest_file,
+                        options,
+                        owner
+                    )
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn opt_in_unused_diagnostics_conversion_budget_is_cumulative() {
+        let mut budget = UnusedBindingAnalysisBudget::new();
+        assert!(budget.reserve(10));
+        assert!(budget.reserve_conversion(10, 1));
+        assert!(!budget.reserve_conversion(MAX_UNUSED_BINDING_ANALYSIS_BYTES, 1));
+        assert!(!budget.reserve_conversion(1, 0));
+        let mut budget = UnusedBindingAnalysisBudget::new();
+        assert!(!budget.reserve_conversion(usize::MAX, 1));
+        assert!(!budget.reserve(1));
+    }
+
+    #[test]
+    fn opt_in_unused_diagnostics_budget_exhaustion_is_incomplete() {
+        use unused_binding_diagnostics::UnusedBindingDiagnostics;
+        let mut source =
+            sai_fmt::format_source(b"pub fn f(x: I32) -> I32 { let dead = 1\n x\n }").unwrap();
+        source.push_str("/*");
+        source.push_str(&"a".repeat(1_100_000));
+        source.push_str("*/\n");
+        let manifest = b"package acme:phase1 @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n";
+        let options = RootUnusedBindingOptions {
+            cli: None,
+            deny_warnings: false,
+        };
+        let (mut database, tree, snapshot, collection, manifest_file) =
+            unused_diagnostic_fixture(source.as_bytes(), manifest);
+        let result = database
+            .resolve_function_owner_analyses_with_unused_binding_diagnostics(
+                &collection,
+                &tree,
+                &snapshot,
+                manifest_file,
+                options,
+            )
+            .unwrap();
+        let owner = result.owners()[0].owner();
+        assert!(
+            matches!(result.unused_binding_analysis(&database, &collection, &snapshot, owner), Some(UnusedBindingAnalysis::Complete { unused, .. }) if unused.len() == 1)
+        );
+        assert_eq!(
+            result.unused_binding_diagnostics(
+                &mut database,
+                &collection,
+                &snapshot,
+                manifest_file,
+                options,
+                owner
+            ),
+            Some(&UnusedBindingDiagnostics::Incomplete)
+        );
+    }
+
+    #[test]
+    fn opt_in_unused_diagnostics_guards_inputs_and_normal_calls() {
+        use unused_binding_diagnostics::UnusedBindingDiagnostics;
+        let source =
+            sai_fmt::format_source(b"pub fn f(x: I32) -> I32 { let dead = 1\n x\n }").unwrap();
+        let manifest = b"package acme:phase1 @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n";
+        let options = RootUnusedBindingOptions {
+            cli: None,
+            deny_warnings: false,
+        };
+        let (mut database, tree, snapshot, collection, manifest_file) =
+            unused_diagnostic_fixture(source.as_bytes(), manifest);
+        let normal = database
+            .resolve_function_owner_analyses(&collection, &tree, &snapshot)
+            .unwrap();
+        let owner = normal.owners()[0].owner();
+        assert!(
+            normal
+                .unused_binding_diagnostics(
+                    &mut database,
+                    &collection,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                    owner
+                )
+                .is_none()
+        );
+        let result = database
+            .resolve_function_owner_analyses_with_unused_binding_diagnostics(
+                &collection,
+                &tree,
+                &snapshot,
+                manifest_file,
+                options,
+            )
+            .unwrap();
+        assert!(matches!(
+            result.unused_binding_diagnostics(
+                &mut database,
+                &collection,
+                &snapshot,
+                manifest_file,
+                options,
+                owner
+            ),
+            Some(UnusedBindingDiagnostics::Complete(_))
+        ));
+        database.set_package_manifest(tree.package, Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\nlints { deny UNUSED_VARIABLE }\n"[..]), PackageRole::Root, Durability::Low).unwrap();
+        assert!(
+            result
+                .unused_binding_diagnostics(
+                    &mut database,
+                    &collection,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                    owner
+                )
+                .is_none()
+        );
+        let result = database
+            .resolve_function_owner_analyses_with_unused_binding_diagnostics(
+                &collection,
+                &tree,
+                &snapshot,
+                manifest_file,
+                options,
+            )
+            .unwrap();
+        assert!(
+            result
+                .unused_binding_diagnostics(
+                    &mut database,
+                    &collection,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                    owner
+                )
+                .is_none()
+        );
+        database
+            .set_package_manifest(
+                tree.package,
+                Arc::from(&manifest[..]),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .unwrap();
+        database
+            .set_file_contents(
+                FileKey::new("acme:phase1#1", "src/lib.sai").unwrap(),
+                Arc::from(&b"pub fn f() {}\n"[..]),
+                Durability::Low,
+            )
+            .unwrap();
+        assert!(
+            result
+                .unused_binding_diagnostics(
+                    &mut database,
+                    &collection,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                    owner
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn opt_in_unused_diagnostics_rejects_invalid_manifest_settings() {
+        use unused_binding_diagnostics::UnusedBindingDiagnostics;
+        let source = b"pub fn f(x: I32) -> I32 { x }\n";
+        let manifest = b"package acme:phase1 @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\nlints { allow UNKNOWN_LINT_NAME }\n";
+        let options = RootUnusedBindingOptions {
+            cli: None,
+            deny_warnings: false,
+        };
+        let (mut database, tree, snapshot, collection, manifest_file) =
+            unused_diagnostic_fixture(source, manifest);
+        let result = database
+            .resolve_function_owner_analyses_with_unused_binding_diagnostics(
+                &collection,
+                &tree,
+                &snapshot,
+                manifest_file,
+                options,
+            )
+            .unwrap();
+        let owner = result.owners()[0].owner();
+        assert_eq!(
+            result.unused_binding_diagnostics(
+                &mut database,
+                &collection,
+                &snapshot,
+                manifest_file,
+                options,
+                owner,
+            ),
+            Some(&UnusedBindingDiagnostics::Incomplete)
+        );
+        assert!(
+            result
+                .unused_binding_analysis(&database, &collection, &snapshot, owner)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn opt_in_unused_diagnostics_rejects_manifest_header_and_path_mismatch() {
+        use unused_binding_diagnostics::UnusedBindingDiagnostics;
+        let source = b"pub fn f(x: I32) -> I32 { x }\n";
+        let options = RootUnusedBindingOptions {
+            cli: None,
+            deny_warnings: false,
+        };
+        for header in ["other:pkg @ 1.0.0", "acme:phase1 @ 1.0.1"] {
+            let manifest = format!("package {header}\nsource \"src\"\ntargets {{ wasm32-core }}\n");
+            let (mut database, tree, snapshot, collection, manifest_file) =
+                unused_diagnostic_fixture(source, manifest.as_bytes());
+            let result = database
+                .resolve_function_owner_analyses_with_unused_binding_diagnostics(
+                    &collection,
+                    &tree,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                )
+                .unwrap();
+            let owner = result.owners()[0].owner();
+            assert_eq!(
+                result.unused_binding_diagnostics(
+                    &mut database,
+                    &collection,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                    owner,
+                ),
+                Some(&UnusedBindingDiagnostics::Incomplete)
+            );
+            assert!(
+                result
+                    .unused_binding_analysis(&database, &collection, &snapshot, owner)
+                    .is_none()
+            );
+        }
+
+        let manifest = b"package acme:phase1 @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n";
+        let (mut database, tree, snapshot, _, manifest_file) =
+            unused_diagnostic_fixture(source, manifest);
+        let snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::clone(snapshot.file(tree.modules[0].file).unwrap().source()),
+                "src/lib.sai",
+                Some("acme:phase1@1.0.0".into()),
+                Some(17),
+            ),
+            SnapshotFile::new(
+                Arc::clone(snapshot.file(manifest_file).unwrap().source()),
+                "nested/sai.package",
+                Some("acme:phase1@1.0.0".into()),
+                Some(17),
+            ),
+        ])
+        .unwrap();
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").unwrap(),
+                Phase1BuildContext {
+                    is_root_package: true,
+                    ..Phase1BuildContext::default()
+                },
+            )
+            .unwrap();
+        let result = database
+            .resolve_function_owner_analyses_with_unused_binding_diagnostics(
+                &collection,
+                &tree,
+                &snapshot,
+                manifest_file,
+                options,
+            )
+            .unwrap();
+        let owner = result.owners()[0].owner();
+        assert!(
+            result
+                .unused_binding_diagnostics(
+                    &mut database,
+                    &collection,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                    owner,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn opt_in_unused_diagnostics_empty_and_collision() {
+        use unused_binding_diagnostics::UnusedBindingDiagnostics;
+        let manifest = b"package acme:phase1 @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n";
+        let options = RootUnusedBindingOptions {
+            cli: None,
+            deny_warnings: false,
+        };
+        for (source, collision) in [
+            ("pub fn f(x: I32) -> I32 { x }", false),
+            (
+                "pub fn f(x: I32) -> I32 { let dead = 1\n let _dead = 2\n x\n }",
+                true,
+            ),
+        ] {
+            let source = sai_fmt::format_source(source.as_bytes()).unwrap();
+            let (mut database, tree, snapshot, collection, manifest_file) =
+                unused_diagnostic_fixture(source.as_bytes(), manifest);
+            let result = database
+                .resolve_function_owner_analyses_with_unused_binding_diagnostics(
+                    &collection,
+                    &tree,
+                    &snapshot,
+                    manifest_file,
+                    options,
+                )
+                .unwrap();
+            let owner = result.owners()[0].owner();
+            let actual = result.unused_binding_diagnostics(
+                &mut database,
+                &collection,
+                &snapshot,
+                manifest_file,
+                options,
+                owner,
+            );
+            if collision {
+                assert_eq!(actual, Some(&UnusedBindingDiagnostics::Incomplete));
+            } else {
+                assert!(
+                    matches!(actual, Some(UnusedBindingDiagnostics::Complete(diagnostics)) if diagnostics.is_empty())
+                );
+            }
+        }
     }
 
     #[test]
