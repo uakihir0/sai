@@ -11,6 +11,7 @@ mod interface_resource_alias;
 mod interface_use_queries;
 mod local_enum_variant_value_queries;
 mod module_function_inventory;
+pub mod unused_binding_diagnostics;
 pub mod package_graph;
 mod package_wit_name_queries;
 pub mod symbol_index_store;

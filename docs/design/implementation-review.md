@@ -9175,3 +9175,9 @@
 - **Decision — review required:** Accept percent-encoded non-UTF-8 bytes in Symbol ID path segments and normalize their escapes without interpreting them as identifiers. The path is descriptive; resolution continues to use package and hash identity.
 - **Verification:** All 80 `sai_semantic` library tests and the file's formatting check passed. Tests cover malformed escapes, encoded separators and byte-preserving normalization.
 - **Hostile review:** Independent review checked the URI rules, package identity and encoded separator behavior and found no actionable defect.
+
+### IR-1011 (2026-10-29): convert bounded unused bindings to diagnostics
+
+- **Decision — review required:** Provide a standalone diagnostic conversion with explicit complete scope, alias and lint-context contracts. It returns `Incomplete` for unverifiable fixes, including legitimate format-unit edits outside the binding name. A temporary limit of 64 candidates and 8 MiB of candidate-count times source size bounds repeated fix-validation copies; exceeding it returns `Incomplete`, never a clean result. The planner's own work remains unbounded.
+- **Verification:** Eleven focused driver tests passed, including lint levels, raw and BOM offsets, unsafe fixes, limits and scope failures. The component is not wired into the pipeline; a production format-unit planner and complete context collection are still required.
+- **Hostile review:** Independent review found per-candidate whole-tree scans, valid formatted edits being rejected and repeated whole-file copies. Indexing and a bounded conservative refusal address the immediate risks; a final review found no further issue in those bounds. Eliminating the temporary limits requires reusable fix validation.
