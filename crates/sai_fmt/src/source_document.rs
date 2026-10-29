@@ -4100,6 +4100,22 @@ fn node_ends_with_multiline_block_string(
     is_multiline_block_string(source, &token)
 }
 
+fn multiline_postfix_separator(
+    source: &ParsedSource,
+    base: &SyntaxNode,
+    context: ExpressionContext,
+    newline_is_safe: bool,
+) -> Result<Doc, SourceDocumentError> {
+    if !node_ends_with_multiline_block_string(source, base)? {
+        return Ok(Doc::text(""));
+    }
+    if newline_is_safe || !matches!(context, ExpressionContext::Unprotected) {
+        Ok(Doc::HardLine)
+    } else {
+        Err(SourceDocumentError::UnsupportedShape)
+    }
+}
+
 fn is_multiline_block_string(
     source: &ParsedSource,
     token: &SyntaxToken,
@@ -5613,6 +5629,10 @@ fn tuple_pattern_document(
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
+    let line_break_before_comma = elements
+        .iter()
+        .map(|element| node_ends_with_multiline_block_string(source, element.syntax()))
+        .collect::<Result<Vec<_>, _>>()?;
     let documents = elements
         .into_iter()
         .map(|element| pattern_document(source, &element, expression_group_ids))
@@ -5629,6 +5649,7 @@ fn tuple_pattern_document(
         DelimitedListSuffixes {
             opening: opening_suffix,
             separators: separator_suffixes,
+            line_break_before_comma,
         },
     ))
 }
@@ -5647,6 +5668,10 @@ fn slice_pattern_document(
     ) {
         return Err(SourceDocumentError::UnsupportedShape);
     }
+    let line_break_before_comma = children
+        .iter()
+        .map(|child| node_ends_with_multiline_block_string(source, child))
+        .collect::<Result<Vec<_>, _>>()?;
     let documents = children
         .into_iter()
         .map(|child| {
@@ -5676,6 +5701,7 @@ fn slice_pattern_document(
         DelimitedListSuffixes {
             opening: opening_suffix,
             separators: separator_suffixes,
+            line_break_before_comma,
         },
     ))
 }
@@ -5790,6 +5816,10 @@ fn constructor_pattern_arguments_document(
     ) {
         return Err(SourceDocumentError::UnsupportedShape);
     }
+    let line_break_before_comma = children
+        .iter()
+        .map(|child| node_ends_with_multiline_block_string(source, child))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut documents = Vec::with_capacity(children.len());
     for child in &children {
         if let Some(pattern) = ast::Pattern::cast(child.clone()) {
@@ -5830,6 +5860,7 @@ fn constructor_pattern_arguments_document(
         DelimitedListSuffixes {
             opening: opening_suffix,
             separators: separator_suffixes,
+            line_break_before_comma,
         },
     ))
 }
@@ -7203,14 +7234,21 @@ fn cast_expression_document(
     }
     // The parser binds `as` tighter than every binary operator, so the operand is
     // never an unparenthesized binary chain that could need parentheses.
+    let operand_document = expression_document(
+        source,
+        &operand,
+        ExpressionContext::Unprotected,
+        expression_group_ids,
+    )?;
+    let as_separator = if node_ends_with_multiline_block_string(source, operand.syntax())? {
+        Doc::HardLine
+    } else {
+        Doc::text(" ")
+    };
     Ok(Doc::concat([
-        expression_document(
-            source,
-            &operand,
-            ExpressionContext::Unprotected,
-            expression_group_ids,
-        )?,
-        Doc::text(" as "),
+        operand_document,
+        as_separator,
+        Doc::text("as "),
         type_document(source, &ty)?,
     ]))
 }
@@ -7313,6 +7351,7 @@ fn expression_document(
             let base = field.base().ok_or(SourceDocumentError::UnsupportedShape)?;
             let documents = vec![
                 expression_document(source, &base, context, expression_group_ids)?,
+                multiline_postfix_separator(source, base.syntax(), context, true)?,
                 field_suffix_document(source, field)?,
             ];
             Ok(Doc::concat(documents))
@@ -7355,6 +7394,7 @@ fn expression_document(
             }
             Ok(Doc::concat([
                 expression_document(source, &callee, context, expression_group_ids)?,
+                multiline_postfix_separator(source, callee.syntax(), context, false)?,
                 call_arguments_document(source, &arguments, expression_group_ids)?,
             ]))
         }
@@ -7364,6 +7404,7 @@ fn expression_document(
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
             Ok(Doc::concat([
                 expression_document(source, &base, context, expression_group_ids)?,
+                multiline_postfix_separator(source, base.syntax(), context, true)?,
                 tuple_index_suffix_document(tuple_index)?,
             ]))
         }
@@ -7373,6 +7414,7 @@ fn expression_document(
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
             Ok(Doc::concat([
                 expression_document(source, &operand, context, expression_group_ids)?,
+                multiline_postfix_separator(source, operand.syntax(), context, true)?,
                 await_suffix_document(await_expr)?,
             ]))
         }
@@ -7382,6 +7424,7 @@ fn expression_document(
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
             Ok(Doc::concat([
                 expression_document(source, &operand, context, expression_group_ids)?,
+                multiline_postfix_separator(source, operand.syntax(), context, false)?,
                 try_suffix_document(try_expr)?,
             ]))
         }
@@ -7391,6 +7434,7 @@ fn expression_document(
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
             Ok(Doc::concat([
                 expression_document(source, &base, context, expression_group_ids)?,
+                multiline_postfix_separator(source, base.syntax(), context, false)?,
                 index_suffix_document(source, index_expr, expression_group_ids)?,
             ]))
         }
@@ -7527,13 +7571,18 @@ fn tuple_expression_document(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let line_break_before_comma = elements
+        .iter()
+        .map(|element| node_ends_with_multiline_block_string(source, element.syntax()))
+        .collect::<Result<Vec<_>, _>>()?;
     let range = tuple.syntax().text_range();
-    Ok(delimited_list_document(
+    Ok(delimited_list_document_with_item_comma_line_breaks(
         GroupId(range.start().raw()),
         "(",
         ")",
         documents,
         true,
+        line_break_before_comma,
     ))
 }
 
@@ -7564,13 +7613,18 @@ fn array_expression_document(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let line_break_before_comma = elements
+        .iter()
+        .map(|element| node_ends_with_multiline_block_string(source, element.syntax()))
+        .collect::<Result<Vec<_>, _>>()?;
     let range = array.syntax().text_range();
-    Ok(delimited_list_document(
+    Ok(delimited_list_document_with_item_comma_line_breaks(
         GroupId(range.start().raw()),
         "[",
         "]",
         documents,
         false,
+        line_break_before_comma,
     ))
 }
 
@@ -7674,6 +7728,12 @@ fn range_expression_document(
             &start,
             endpoint_context,
             expression_group_ids,
+        )?);
+        documents.push(multiline_postfix_separator(
+            source,
+            start.syntax(),
+            context,
+            false,
         )?);
     }
     documents.push(Doc::text(token_text(source, &operator)?.to_owned()));
@@ -7996,6 +8056,9 @@ fn member_chain_document(
         })
         .map(|(index, _)| index)
         .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let head_suffix_newline_is_safe = reverse_operations[..first_segment]
+        .first()
+        .is_none_or(|operation| operation.kind != OperationKind::AttachPrevious);
     let head_forces_chain_break = head
         .syntax()
         .descendants()
@@ -8045,12 +8108,19 @@ fn member_chain_document(
         }
     }
 
-    let mut chain = vec![expression_document(
-        source,
-        &head,
-        context,
-        expression_group_ids,
-    )?];
+    let mut chain = vec![
+        expression_document(source, &head, context, expression_group_ids)?,
+        if head_suffixes.is_empty() {
+            Doc::text("")
+        } else {
+            multiline_postfix_separator(
+                source,
+                head.syntax(),
+                context,
+                head_suffix_newline_is_safe,
+            )?
+        },
+    ];
     chain.extend(head_suffixes);
     let mut suffixes = Vec::with_capacity(segments.len() * 2);
     let chain_group = expression_group_ids.next();
@@ -8101,6 +8171,7 @@ fn call_arguments_document(
         if has_trailing_record_update {
             return Err(SourceDocumentError::UnsupportedShape);
         }
+        let line_break_before_comma = node_ends_with_multiline_block_string(source, &node)?;
         let document = match node.kind() {
             SyntaxKind::ARG => {
                 let argument = ast::Arg::cast(node).ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -8178,7 +8249,11 @@ fn call_arguments_document(
             }
             _ => return Err(SourceDocumentError::UnsupportedShape),
         };
-        documents.push((document, has_trailing_record_update));
+        documents.push((
+            document,
+            has_trailing_record_update,
+            line_break_before_comma,
+        ));
     }
     if !comma_delimited_tokens_match(
         arguments.syntax(),
@@ -8195,15 +8270,32 @@ fn call_arguments_document(
     let range = arguments.syntax().text_range();
     let group = GroupId(range.start().raw());
     let mut contents = Vec::with_capacity(documents.len() * 2 + 2);
-    contents.push(Doc::SoftLine);
-    for (index, (document, is_record_update)) in documents.iter().enumerate() {
+    let force_break = documents
+        .iter()
+        .any(|(document, _, _)| document_contains_unavoidable_forced_break(document));
+    contents.push(if force_break {
+        Doc::HardLine
+    } else {
+        Doc::SoftLine
+    });
+    for (index, (document, is_record_update, line_break_before_comma)) in
+        documents.iter().enumerate()
+    {
         if index > 0 {
+            if documents[index - 1].2 {
+                contents.push(Doc::HardLine);
+            }
             contents.push(Doc::text(","));
             contents.push(Doc::Line);
         }
         contents.push(document.clone());
         if index + 1 == documents.len() && !is_record_update {
-            contents.push(Doc::if_broken(group, Doc::text(","), Doc::text("")));
+            let trailing_comma = if *line_break_before_comma {
+                Doc::concat([Doc::HardLine, Doc::text(",")])
+            } else {
+                Doc::text(",")
+            };
+            contents.push(Doc::if_broken(group, trailing_comma, Doc::text("")));
         }
     }
     let ordinary = Doc::group(
@@ -8231,11 +8323,11 @@ fn call_arguments_document(
     if flat_document_width(&closure_header).is_some()
         && documents[..documents.len() - 1]
             .iter()
-            .all(|(document, _)| flat_document_width(document).is_some())
+            .all(|(document, _, _)| flat_document_width(document).is_some())
     {
         let closure_body = block_document(source, &closure_body, expression_group_ids)?;
         let mut hugged = vec![Doc::text("(")];
-        for (index, (document, _)) in documents[..documents.len() - 1].iter().enumerate() {
+        for (index, (document, _, _)) in documents[..documents.len() - 1].iter().enumerate() {
             if index > 0 {
                 hugged.push(Doc::text(", "));
             }
@@ -8839,6 +8931,29 @@ fn delimited_list_document(
     delimited_list_document_with_options(group, open, close, items, true, keep_singleton_comma)
 }
 
+fn delimited_list_document_with_item_comma_line_breaks(
+    group: GroupId,
+    open: &str,
+    close: &str,
+    items: Vec<Doc>,
+    keep_singleton_comma: bool,
+    line_break_before_comma: Vec<bool>,
+) -> Doc {
+    delimited_list_document_with_options_and_suffixes(
+        group,
+        open,
+        close,
+        items,
+        true,
+        keep_singleton_comma,
+        DelimitedListSuffixes {
+            opening: Vec::new(),
+            separators: Vec::new(),
+            line_break_before_comma,
+        },
+    )
+}
+
 fn delimited_list_document_with_options(
     group: GroupId,
     open: &str,
@@ -8877,6 +8992,7 @@ fn delimited_list_document_with_options_and_opening_suffix(
         DelimitedListSuffixes {
             opening: opening_suffix,
             separators: Vec::new(),
+            line_break_before_comma: Vec::new(),
         },
     )
 }
@@ -8884,6 +9000,7 @@ fn delimited_list_document_with_options_and_opening_suffix(
 struct DelimitedListSuffixes {
     opening: Vec<Doc>,
     separators: Vec<Vec<Doc>>,
+    line_break_before_comma: Vec<bool>,
 }
 
 fn delimited_list_document_with_options_and_suffixes(
@@ -8902,14 +9019,25 @@ fn delimited_list_document_with_options_and_suffixes(
             Doc::text(close),
         ]);
     }
+    let force_break = items.iter().any(document_contains_unavoidable_forced_break);
     let mut contents = Vec::with_capacity(items.len() * 2 + 2);
-    contents.push(if suffixes.opening.is_empty() {
+    contents.push(if force_break {
+        Doc::HardLine
+    } else if suffixes.opening.is_empty() {
         Doc::SoftLine
     } else {
         Doc::Line
     });
     for (index, item) in items.iter().cloned().enumerate() {
         if index > 0 {
+            if suffixes
+                .line_break_before_comma
+                .get(index - 1)
+                .copied()
+                .unwrap_or(false)
+            {
+                contents.push(Doc::if_broken(group, Doc::HardLine, Doc::text("")));
+            }
             contents.push(Doc::text(","));
             if let Some(suffix) = suffixes.separators.get(index - 1) {
                 contents.extend(suffix.iter().cloned());
@@ -8918,9 +9046,23 @@ fn delimited_list_document_with_options_and_suffixes(
         }
         contents.push(item);
     }
+    let trailing_comma = if suffixes
+        .line_break_before_comma
+        .last()
+        .copied()
+        .unwrap_or(false)
+    {
+        Doc::concat([Doc::HardLine, Doc::text(",")])
+    } else {
+        Doc::text(",")
+    };
     contents.push(Doc::if_broken(
         group,
-        Doc::text(if trailing_comma_when_broken { "," } else { "" }),
+        if trailing_comma_when_broken {
+            trailing_comma
+        } else {
+            Doc::text("")
+        },
         Doc::text(if keep_singleton_comma && items.len() == 1 {
             ","
         } else {

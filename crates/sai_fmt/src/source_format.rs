@@ -598,6 +598,222 @@ mod tests {
     use sai_diagnostics::{Code, Diagnostic, Severity};
 
     #[test]
+    fn preserves_multiline_string_value_whitespace() {
+        let input = b"fn f(){let value=\"\"\"\n  text   \n  \"\"\"\nvalue}";
+        let expected =
+            "fn f() {\n    let value = \"\"\"\n        text   \n        \"\"\"\n    value\n}\n";
+        let formatted = format_source(input).expect("multiline string should format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn formats_multiline_block_strings_as_array_or_tuple_elements() {
+        for (input, opening) in [
+            (
+                b"fn f(){let value=[\"\"\"\n  text   \n  \"\"\"\n]\nvalue}".as_slice(),
+                "let value = [\n",
+            ),
+            (
+                b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n, 1]\nvalue}",
+                "let value = [\n",
+            ),
+            (
+                b"fn f(){let value=(\"\"\"\n  text\n  \"\"\"\n,)\nvalue}",
+                "let value = (\n",
+            ),
+            (
+                b"fn f(){let value=[1, \"\"\"\r\n  text\r\n  \"\"\"\r\n]\nvalue}",
+                "let value = [\n",
+            ),
+        ] {
+            let input = parse_source(input).expect("input must be syntactically valid");
+            let formatted = format_source(input.text().as_bytes())
+                .expect("multiline list elements should format");
+            assert!(
+                formatted.contains(opening),
+                "the containing list must break:\n{formatted}"
+            );
+            let output = parse_source(formatted.as_bytes()).expect("formatted output must parse");
+            assert_eq!(
+                syntax_normal_form(&input.root())
+                    .into_iter()
+                    .map(|event| event.element)
+                    .collect::<Vec<_>>(),
+                syntax_normal_form(&output.root())
+                    .into_iter()
+                    .map(|event| event.element)
+                    .collect::<Vec<_>>(),
+                "formatting must preserve the multiline string value"
+            );
+            assert_eq!(
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
+                "formatted output must be idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn formats_nested_multiline_block_strings_in_array_or_tuple_elements() {
+        for (input, opening) in [
+            (
+                b"fn f(){let value=[g(\"\"\"\n  text\n  \"\"\"\n)]\nvalue}".as_slice(),
+                "let value = [\n",
+            ),
+            (
+                b"fn f(){let value=[g(\"\"\"\n  text\n  \"\"\"\n, 1)]\nvalue}",
+                "let value = [\n",
+            ),
+            (
+                b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n as Str]\nvalue}",
+                "let value = [\n",
+            ),
+            (
+                b"fn f(){let value=(g(\"\"\"\r\n  text\r\n  \"\"\"\r\n),)\nvalue}",
+                "let value = (\n",
+            ),
+            (
+                b"fn f(){let value=(\"\"\"\n  text\n  \"\"\"\n as Str,)\nvalue}",
+                "let value = (\n",
+            ),
+        ] {
+            let input = parse_source(input).expect("input must be syntactically valid");
+            let formatted = format_source(input.text().as_bytes())
+                .expect("nested multiline list elements should format");
+            assert!(
+                formatted.contains(opening),
+                "the containing list must break:\n{formatted}"
+            );
+            let output = parse_source(formatted.as_bytes()).expect("formatted output must parse");
+            assert_eq!(
+                syntax_normal_form(&input.root())
+                    .into_iter()
+                    .map(|event| event.element)
+                    .collect::<Vec<_>>(),
+                syntax_normal_form(&output.root())
+                    .into_iter()
+                    .map(|event| event.element)
+                    .collect::<Vec<_>>(),
+                "formatting must preserve the nested multiline string value"
+            );
+            assert_eq!(
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
+                "formatted output must be idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn separates_multiline_block_strings_from_continuing_expression_tokens() {
+        for input in [
+            b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n  .field()]\nvalue}".as_slice(),
+            b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n  .field.first().second()]\nvalue}",
+            b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n  .await.first().second()]\nvalue}",
+            b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n  .0.first().second()]\nvalue}",
+            b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n  .await]\nvalue}",
+            b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n  .0]\nvalue}",
+            b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n  ()]\nvalue}",
+            b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n  [0]]\nvalue}",
+            b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n  ?]\nvalue}",
+            b"fn f(){let value=[\"\"\"\n  text\n  \"\"\"\n  ..last]\nvalue}",
+        ] {
+            let input = parse_source(input).expect("input must be syntactically valid");
+            let formatted = format_source(input.text().as_bytes())
+                .expect("multiline string postfixes should format");
+            let output = parse_source(formatted.as_bytes()).expect("formatted output must parse");
+            assert_eq!(
+                syntax_normal_form(&input.root())
+                    .into_iter()
+                    .map(|event| event.element)
+                    .collect::<Vec<_>>(),
+                syntax_normal_form(&output.root())
+                    .into_iter()
+                    .map(|event| event.element)
+                    .collect::<Vec<_>>(),
+                "formatting must preserve multiline string postfix syntax"
+            );
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn breaks_multiline_strings_in_tuple_pattern_lists_before_the_comma() {
+        let input =
+            b"fn f(value: (Str, I32)){if let (\"\"\"\n  text\n  \"\"\"\n, item) = value {item}}";
+        let input = parse_source(input).expect("input must be syntactically valid");
+        let formatted =
+            format_source(input.text().as_bytes()).expect("tuple pattern should format");
+        let output = parse_source(formatted.as_bytes()).expect("formatted output must parse");
+        assert_eq!(
+            syntax_normal_form(&input.root())
+                .into_iter()
+                .map(|event| event.element)
+                .collect::<Vec<_>>(),
+            syntax_normal_form(&output.root())
+                .into_iter()
+                .map(|event| event.element)
+                .collect::<Vec<_>>(),
+            "formatting must preserve the multiline string pattern"
+        );
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn breaks_multiline_strings_in_slice_and_constructor_pattern_lists() {
+        for input in [
+            b"fn f(value: Arr){if let [\"\"\"\n  text\n  \"\"\"\n, item] = value {item}}"
+                .as_slice(),
+            b"fn f(value: Pair){if let Pair(\"\"\"\n  text\n  \"\"\"\n, item) = value {item}}",
+        ] {
+            let input = parse_source(input).expect("input must be syntactically valid");
+            let formatted =
+                format_source(input.text().as_bytes()).expect("pattern list should format");
+            let output = parse_source(formatted.as_bytes()).expect("formatted output must parse");
+            assert_eq!(
+                syntax_normal_form(&input.root())
+                    .into_iter()
+                    .map(|event| event.element)
+                    .collect::<Vec<_>>(),
+                syntax_normal_form(&output.root())
+                    .into_iter()
+                    .map(|event| event.element)
+                    .collect::<Vec<_>>(),
+                "formatting must preserve multiline string pattern lists"
+            );
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn continued_and_raw_strings_in_arrays_remain_supported() {
+        for input in [
+            b"fn f(){let value=[\"first\\\n  second\"]\nvalue}".as_slice(),
+            b"fn f(){let value=[r\"first\nsecond\"]\nvalue}",
+            b"fn f(){let value=[g(r\"first\nsecond\")]\nvalue}",
+            b"fn f(){let value=[g(\"first\\\n  second\")]\nvalue}",
+            b"fn f(){let value=(\"text\",)\nvalue}",
+        ] {
+            let parsed = parse_source(input).expect("string-containing list input parses");
+            let formatted = format_source(input).expect("other string forms remain supported");
+            let output = parse_source(formatted.as_bytes()).expect("formatted output parses");
+            assert_eq!(
+                syntax_normal_form(&parsed.root())
+                    .into_iter()
+                    .map(|event| event.element)
+                    .collect::<Vec<_>>(),
+                syntax_normal_form(&output.root())
+                    .into_iter()
+                    .map(|event| event.element)
+                    .collect::<Vec<_>>(),
+                "raw and continued string values must be preserved"
+            );
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
     fn formats_and_verifies_a_supported_source_file() {
         let source =
             b"///  greeting  \n@deprecated(\"old\",)\nfn greet(name:Str){let value=0xff\nvalue}";
