@@ -3,7 +3,8 @@ use crate::{
     OwnerId, Span, SpanCtxt,
 };
 use sai_diagnostics::{
-    Code, Diagnostic, DiagnosticTemplate, Location, Severity, SourceRef, Span as DiagnosticSpan,
+    Code, Diagnostic, DiagnosticTemplate, DiagnosticTemplateError, Location, Severity, SourceRef,
+    Span as DiagnosticSpan, Value,
 };
 use sai_syntax::{SyntaxNode, SyntaxNodePtr, SyntaxNodePtrError, ast::AstIdMap};
 use sai_vfs::WorkspaceSnapshot;
@@ -506,14 +507,32 @@ impl<'root> HirSourceMapBuilder<'root> {
         self.push_diagnostic(diagnostic)
     }
 
-    pub fn push_diagnostic(&mut self, diagnostic: Diagnostic) -> Result<(), HirSourceMapError> {
-        let diagnostic = diagnostic
-            .with_workspace_snapshot(&self.snapshot)
-            .map_err(|_| HirSourceMapError::DiagnosticNotValidForSnapshot)?;
+    /// Rejects over-depth diagnostic data rather than retaining it in a
+    /// snapshot-bound fallback that would recursively clone it later.
+    pub fn push_diagnostic(&mut self, mut diagnostic: Diagnostic) -> Result<(), HirSourceMapError> {
         let stored =
             match diagnostic.to_template_for_file(&self.snapshot, self.file, &self.source_ref) {
                 Ok(template) => SourceMapDiagnostic::Template(Box::new(template)),
-                Err(_) => SourceMapDiagnostic::SnapshotBound(Box::new(diagnostic)),
+                Err(DiagnosticTemplateError::ValueTooDeep) => {
+                    let mut pending = std::mem::take(&mut diagnostic.data)
+                        .into_values()
+                        .collect::<Vec<_>>();
+                    while let Some(value) = pending.pop() {
+                        match value {
+                            Value::Array(values) => pending.extend(values),
+                            Value::Object(values) => pending.extend(values.into_values()),
+                            Value::Null | Value::Bool(_) | Value::Integer(_) | Value::String(_) => {
+                            }
+                        }
+                    }
+                    return Err(HirSourceMapError::DiagnosticDataTooDeep);
+                }
+                Err(_) => {
+                    let diagnostic = diagnostic
+                        .with_workspace_snapshot(&self.snapshot)
+                        .map_err(|_| HirSourceMapError::DiagnosticNotValidForSnapshot)?;
+                    SourceMapDiagnostic::SnapshotBound(Box::new(diagnostic))
+                }
             };
         self.diagnostics.push(stored);
         Ok(())
@@ -570,6 +589,7 @@ pub enum HirSourceMapError {
     WorkspaceSnapshotMismatch,
     FileMissingFromSnapshot,
     DiagnosticNotValidForSnapshot,
+    DiagnosticDataTooDeep,
     SourceTextNotValidForSnapshot,
     UnknownBindingAlias,
     NestedDefinitionIdMismatch,
@@ -922,6 +942,115 @@ mod tests {
             first_map.diagnostics(&second_snapshot),
             Err(HirSourceMapError::DiagnosticNotValidForSnapshot)
         );
+    }
+
+    #[test]
+    fn source_map_rejects_deep_diagnostic_data_without_recursive_drop() {
+        let file = crate::FileId::new(58);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() {}\n");
+        let function = function_node(&parsed.root);
+        let mut builder =
+            HirSourceMapBuilder::new(owner_id("f"), &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("builder");
+        for (depth, contextual) in [(129, true), (20_000, false), (20_000, true)] {
+            let mut value = Value::Null;
+            for index in 1..depth {
+                value = if index % 2 == 0 {
+                    Value::Object(sai_diagnostics::ValueObject::from([(
+                        "child".to_owned(),
+                        value,
+                    )]))
+                } else {
+                    Value::Array(vec![value])
+                };
+            }
+            let mut diagnostic =
+                Diagnostic::new(Code::ExpectedToken, Severity::Error, "deep", None);
+            if contextual {
+                diagnostic = diagnostic
+                    .with_cause(sai_diagnostics::CauseKey::new([
+                        sai_diagnostics::PoisonFact::ErrorType("cause".to_owned()),
+                    ]))
+                    .unwrap();
+            }
+            diagnostic.data.insert("nested".to_owned(), value);
+            assert_eq!(
+                builder.push_diagnostic(diagnostic),
+                Err(HirSourceMapError::DiagnosticDataTooDeep),
+                "depth={depth}, contextual={contextual}"
+            );
+            assert!(builder.diagnostics.is_empty());
+        }
+
+        let mut value = Value::Null;
+        for _ in 1..=127 {
+            value = Value::Array(vec![value]);
+        }
+        let mut accepted = Diagnostic::new(Code::ExpectedToken, Severity::Error, "bounded", None)
+            .with_cause(sai_diagnostics::CauseKey::new([
+                sai_diagnostics::PoisonFact::ErrorType("cause".to_owned()),
+            ]))
+            .unwrap();
+        accepted.data.insert("nested".to_owned(), value);
+        builder
+            .push_diagnostic(accepted)
+            .expect("depth 128 is valid");
+        let map = builder.finish();
+        let diagnostics = map
+            .diagnostics(&snapshot)
+            .expect("bounded diagnostic can be cloned");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "bounded");
+        assert_eq!(diagnostics[0].cause().facts().len(), 1);
+    }
+
+    #[test]
+    fn source_map_deep_sibling_rejection_preserves_existing_diagnostic() {
+        let file = crate::FileId::new(59);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() {}\n");
+        let function = function_node(&parsed.root);
+        let mut builder =
+            HirSourceMapBuilder::new(owner_id("f"), &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("builder");
+        let mut earlier = Diagnostic::new(Code::ExpectedToken, Severity::Error, "earlier", None);
+        earlier.data.insert("marker".to_owned(), Value::Bool(true));
+        builder
+            .push_diagnostic(earlier)
+            .expect("store earlier diagnostic");
+
+        let deep_value = || {
+            let mut value = Value::Null;
+            for index in 0..15_000 {
+                value = if index % 2 == 0 {
+                    Value::Array(vec![value])
+                } else {
+                    Value::Object(sai_diagnostics::ValueObject::from([(
+                        "child".to_owned(),
+                        value,
+                    )]))
+                };
+            }
+            value
+        };
+        let mut rejected = Diagnostic::new(Code::ExpectedToken, Severity::Error, "deep", None);
+        rejected.data.insert("first".to_owned(), deep_value());
+        rejected.data.insert("second".to_owned(), deep_value());
+        rejected.data.insert(
+            "siblings".to_owned(),
+            Value::Array(vec![deep_value(), deep_value()]),
+        );
+        assert_eq!(
+            builder.push_diagnostic(rejected),
+            Err(HirSourceMapError::DiagnosticDataTooDeep)
+        );
+
+        let map = builder.finish();
+        let diagnostics = map
+            .diagnostics(&snapshot)
+            .expect("earlier diagnostic survives");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "earlier");
+        assert_eq!(diagnostics[0].data.get("marker"), Some(&Value::Bool(true)));
     }
 
     #[test]
