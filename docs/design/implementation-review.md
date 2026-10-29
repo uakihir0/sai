@@ -9150,3 +9150,9 @@
 - **Decision — review required:** Add an independent scanner for diagnostic annotations and root directives, rejecting ambiguous or unsupported syntax rather than guessing or reporting an empty expectation set. Package paths, format strings, execution expectations, non-ASCII code outside comments and literals, and some malformed inputs remain unsupported; callers must report such tests as unrun, not passed.
 - **Verification:** The component tests passed together (52 tests), including 27 extractor tests. This scanner and the matcher do not constitute the full harness or validate all directive values.
 - **Hostile review:** Independent reviews found several false-extraction risks involving raw identifiers, numeric suffixes, package paths and malformed escapes, as well as doc-token directive placement. These were addressed conservatively and a final focused review found no further actionable defect.
+
+### IR-1007 (2026-10-29): analyze a bounded subset of unused bindings
+
+- **Decision — review required:** Add owner-local binding-identity analysis as a separate component. It returns no candidates when syntax, lowering, resolution or module-alias information is incomplete. The caller must guarantee that its `Complete` alias set is current and exhaustive; the component cannot verify that guarantee itself. It emits no lint and does not expand CLI coverage.
+- **Verification:** The `sai_resolve` suite passed 272 tests, including scope and shadowing, assignment use, real-lowering spans, incompatible source maps and unsupported pattern cases. Closures, complex patterns, typed locals, contracts and several other forms remain incomplete.
+- **Hostile review:** Independent review identified the missing alias-completeness contract and weaknesses in source-map and parameter-span tests. The explicit contract and regression tests were added and re-reviewed. Integrating the actual module scope and lint pipeline remains necessary to resolve IR-1001.

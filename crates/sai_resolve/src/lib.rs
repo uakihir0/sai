@@ -16,6 +16,7 @@ pub mod use_item_binding;
 pub mod use_path;
 pub mod use_target;
 pub mod use_target_diagnostics;
+pub mod unused_binding;
 pub mod wit_name;
 pub mod wit_name_collisions;
 pub mod world_elaboration;

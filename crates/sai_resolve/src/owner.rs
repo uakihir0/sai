@@ -1792,6 +1792,9 @@ fn push_path_args<'hir>(work: &mut Vec<Work<'hir>>, path: sai_hir::types::Path<'
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unused_binding::{
+        ModuleAliases, UnusedBindingAnalysis, analyze_unused_bindings as analyze_with_aliases,
+    };
     use crate::world_members::{
         DeferredWorldField, WorldFieldResolution, WorldFieldResolutionInput, WorldImportFnLookup,
         WorldMemberDeferral, resolve_owner_world_fields,
@@ -1810,6 +1813,24 @@ mod tests {
     use sai_syntax::ast::AstIdMap;
     use sai_vfs::{FileId, SnapshotFile, SourceFile, TextRange, TextSize, WorkspaceSnapshot};
     use std::sync::Arc;
+
+    fn analyze_unused_bindings(
+        body: &Body<'_>,
+        source_map: &HirSourceMap,
+        snapshot: &WorkspaceSnapshot,
+        symbols: &Interner,
+        module_aliases: &HashSet<Symbol>,
+        lowering_diagnostics: &[Diagnostic],
+    ) -> UnusedBindingAnalysis {
+        analyze_with_aliases(
+            body,
+            source_map,
+            snapshot,
+            symbols,
+            ModuleAliases::Complete(module_aliases),
+            lowering_diagnostics,
+        )
+    }
 
     fn owner_id() -> OwnerId {
         owner_id_with_local().0
@@ -2548,6 +2569,504 @@ mod tests {
                 hir_id: call_result_field.hir_id,
                 reason: WorldMemberDeferral::OrdinaryMember,
             }]
+        );
+    }
+
+    #[test]
+    fn unused_binding_analysis_accepts_real_lowered_function_bodies() {
+        for (text, expected, complete, or_pattern) in [
+            (
+                "fn sample(x: I32) -> I32 {\n let x = x\n x\n}\n",
+                &[][..],
+                true,
+                false,
+            ),
+            (
+                "fn sample(x: I32) -> I32 {\n let y = x\n x\n}\n",
+                &[("y", "let y", 0)][..],
+                true,
+                false,
+            ),
+            (
+                "fn sample(x: I32) -> I32 {\n let r#type = x\n x\n}\n",
+                &[("type", "let r#type", 0)][..],
+                true,
+                false,
+            ),
+            (
+                "fn sample(unused: I32) -> I32 { 0 }\n",
+                &[("unused", "unused: I32", 0)][..],
+                true,
+                false,
+            ),
+            (
+                "fn sample(r#type: I32) -> I32 { 0 }\n",
+                &[("type", "r#type: I32", 0)][..],
+                true,
+                false,
+            ),
+            ("fn sample(x: I32) -> I32 { x + x }\n", &[][..], true, false),
+            (
+                "fn sample() -> I32 { if true {\n let same = 1\n 0\n } else {\n let same = 2\n 0\n } }\n",
+                &[("same", "let same", 0), ("same", "let same", 1)][..],
+                true,
+                false,
+            ),
+            (
+                "fn sample(x: I32) -> I32 {\n let (a, b) = (x, x)\n x\n}\n",
+                &[][..],
+                false,
+                false,
+            ),
+            (
+                "fn sample(x: I32) -> I32 {\n let y: I32 = x\n x\n}\n",
+                &[][..],
+                false,
+                false,
+            ),
+            (
+                "fn sample(x: I32) -> I32 { match x { value | value => value } }\n",
+                &[][..],
+                false,
+                true,
+            ),
+            (
+                "use acme:app/other as alias\nfn sample(alias: I32) -> I32 { 0 }\n",
+                &[][..],
+                false,
+                false,
+            ),
+        ] {
+            let file = FileId::new(1);
+            let source = Arc::new(SourceFile::new(file, text, false).unwrap());
+            let snapshot =
+                WorkspaceSnapshot::new([SnapshotFile::new(source, "src/lib.sai", None, None)])
+                    .unwrap();
+            let parsed = sai_syntax::parse(&snapshot, file).unwrap();
+            assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+            let ast_ids = AstIdMap::new(file, &parsed.root).unwrap();
+            let symbols = Interner::new();
+            let tree =
+                sai_hir::item_tree::ItemTree::collect(file, text, &parsed.root, &ast_ids, &symbols)
+                    .unwrap();
+            let entry = &tree.items[0];
+            let packages = PackageInterner::new();
+            let package = packages.intern("acme:app#1.0").unwrap();
+            let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+            let path = DefPath::new(
+                package,
+                vec![DisambiguatedDefPathData {
+                    data: DefPathData::ValueNs(entry.name),
+                    disambiguator: 0,
+                }],
+                &packages,
+                &symbols,
+            )
+            .unwrap();
+            let owner = OwnerId {
+                def_id: paths.intern(path.clone()).unwrap(),
+            };
+            let arena = HirArena::new();
+            let context = sai_hir::lower::HirLoweringContext::new(
+                &ast_ids,
+                &snapshot,
+                &parsed.root,
+                &arena,
+                &symbols,
+                &paths,
+            );
+            let (lowered, source_map) =
+                sai_hir::lower::lower_function_owner(owner, &path, &tree, entry.ast_id, &context)
+                    .unwrap();
+            assert!(lowered.diagnostics.is_empty(), "{:?}", lowered.diagnostics);
+            if or_pattern {
+                let ExprKind::Block(block) = lowered.body.unwrap().value.kind else {
+                    panic!("expected function block");
+                };
+                let ExprKind::Match { arms, .. } = block.tail.unwrap().kind else {
+                    panic!("expected match expression");
+                };
+                assert!(matches!(arms[0].pat.kind, PatKind::Or(_)));
+            }
+            let mut module_aliases = HashSet::new();
+            if text.starts_with("use acme:app/other as alias") {
+                module_aliases.insert(symbols.intern("alias").unwrap());
+                let locals = resolve_owner_locals(
+                    lowered.body.unwrap(),
+                    &source_map,
+                    &snapshot,
+                    &symbols,
+                    &module_aliases,
+                )
+                .unwrap();
+                let diagnostic = locals
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.code == Code::ShadowsModule)
+                    .expect("alias shadowing is diagnosed");
+                let span = diagnostic.primary().unwrap().span.range;
+                let start = text.find("alias: I32").unwrap();
+                assert_eq!(
+                    (span.start().to_usize(), span.end().to_usize()),
+                    (start, start + "alias".len())
+                );
+            }
+            assert_eq!(
+                analyze_with_aliases(
+                    lowered.body.unwrap(),
+                    &source_map,
+                    &snapshot,
+                    &symbols,
+                    ModuleAliases::Unavailable,
+                    &lowered.diagnostics,
+                ),
+                UnusedBindingAnalysis::Incomplete,
+                "{text}"
+            );
+            let result = analyze_unused_bindings(
+                lowered.body.unwrap(),
+                &source_map,
+                &snapshot,
+                &symbols,
+                &module_aliases,
+                &lowered.diagnostics,
+            );
+            if !complete {
+                assert_eq!(result, UnusedBindingAnalysis::Incomplete, "{text}");
+                continue;
+            }
+            let UnusedBindingAnalysis::Complete { unused, .. } = result else {
+                panic!("real body is incomplete: {text}");
+            };
+            assert!(unused.iter().all(|candidate| {
+                candidate.span.file == file && candidate.span.ctxt == SpanCtxt::Root
+            }));
+            if unused.len() == 2 {
+                assert_ne!(unused[0].binding, unused[1].binding);
+            }
+            let actual = unused
+                .iter()
+                .map(|candidate| {
+                    (
+                        symbols.resolve(candidate.name).unwrap().to_string(),
+                        candidate.span.range.start().to_usize(),
+                        candidate.span.range.end().to_usize(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected = expected
+                .iter()
+                .map(|(name, declaration, occurrence)| {
+                    let (prefix_len, token) = match declaration.strip_prefix("let ") {
+                        Some(token) => ("let ".len(), token),
+                        None => (0, declaration.split_once(':').unwrap().0),
+                    };
+                    let start =
+                        text.match_indices(declaration).nth(*occurrence).unwrap().0 + prefix_len;
+                    (name.to_string(), start, start + token.len())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn unused_binding_analysis_requires_matching_source_map_for_valid_body() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let unused = symbols.intern("unused").unwrap();
+        let params = [BodyParam {
+            hir_id: hir_id(owner, 1),
+            binding: BindingId::from_raw(0),
+            name: Some(local_name(unused, 0, 6)),
+            mutable: false,
+        }];
+        let literal = expr(
+            &arena,
+            owner,
+            2,
+            10,
+            11,
+            ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+        );
+        let (snapshot, source_map) = local_source_context(owner);
+        let body = body(&arena, owner, source_map.source_id(), &params, literal, &[]);
+        let (_, other_map) = local_source_context(owner);
+        assert!(source_map.matches_body(body));
+        assert!(other_map.matches_snapshot_file(&snapshot));
+        assert!(!other_map.matches_body(body));
+        let result =
+            analyze_unused_bindings(body, &source_map, &snapshot, &symbols, &HashSet::new(), &[]);
+        let UnusedBindingAnalysis::Complete { unused, .. } = result else {
+            panic!("matching source map must produce a complete analysis");
+        };
+        assert_eq!(unused.len(), 1);
+        assert_eq!(unused[0].binding, params[0].binding);
+        assert_eq!(unused[0].span, params[0].name.unwrap().span);
+        assert_eq!(
+            analyze_unused_bindings(body, &other_map, &snapshot, &symbols, &HashSet::new(), &[]),
+            UnusedBindingAnalysis::Incomplete
+        );
+    }
+
+    #[test]
+    fn unused_binding_analysis_respects_shadowing_and_initializer_scope() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let x_name = symbols.intern("x").unwrap();
+        let ignored = symbols.intern("_ignored").unwrap();
+        let params = [
+            BodyParam {
+                hir_id: hir_id(owner, 1),
+                binding: BindingId::from_raw(0),
+                name: Some(local_name(x_name, 0, 1)),
+                mutable: false,
+            },
+            BodyParam {
+                hir_id: hir_id(owner, 2),
+                binding: BindingId::from_raw(2),
+                name: Some(local_name(ignored, 2, 10)),
+                mutable: false,
+            },
+        ];
+        let init = local_path_expr(&arena, owner, 10, 20, 21, x_name, PathRoot::Plain);
+        let pat = local_binding_pat(
+            &arena,
+            owner,
+            20,
+            local_name(x_name, 25, 26),
+            BindingId::from_raw(1),
+            BindingMode::Value,
+        );
+        let stmt = Stmt {
+            hir_id: hir_id(owner, 21),
+            kind: StmtKind::Let {
+                pat,
+                ty: None,
+                init,
+                els: None,
+            },
+            span: hir_span(25, 30),
+        };
+        let block = block_with_stmts(&arena, owner, 30, &[stmt], None);
+        let root = expr(&arena, owner, 31, 0, 120, ExprKind::Block(block));
+        let (snapshot, source_map) = local_source_context(owner);
+        let body = body(&arena, owner, source_map.source_id(), &params, root, &[]);
+        let result =
+            analyze_unused_bindings(body, &source_map, &snapshot, &symbols, &HashSet::new(), &[]);
+        let UnusedBindingAnalysis::Complete { unused, .. } = result else {
+            panic!("supported body must be complete");
+        };
+        assert_eq!(unused.len(), 1);
+        assert_eq!(unused[0].binding, BindingId::from_raw(1));
+        assert_eq!(unused[0].span, pat.span);
+
+        let local_use = local_path_expr(&arena, owner, 40, 40, 41, x_name, PathRoot::Plain);
+        let block = block_with_stmts(&arena, owner, 50, &[stmt], Some(local_use));
+        let root = expr(&arena, owner, 51, 0, 120, ExprKind::Block(block));
+        let both_used = arena.alloc_body(sai_hir::body::Body {
+            owner,
+            source_id: source_map.source_id(),
+            params: &params,
+            value: root,
+            contracts: &[],
+            invariant_preds: &[],
+        });
+        assert!(matches!(
+            analyze_unused_bindings(both_used, &source_map, &snapshot, &symbols, &HashSet::new(), &[]),
+            UnusedBindingAnalysis::Complete { unused, .. } if unused.is_empty()
+        ));
+    }
+
+    #[test]
+    fn unused_binding_analysis_counts_assignment_and_reports_in_source_order() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let first = symbols.intern("first").unwrap();
+        let second = symbols.intern("second").unwrap();
+        let written = symbols.intern("written").unwrap();
+        let params = [
+            BodyParam {
+                hir_id: hir_id(owner, 1),
+                binding: BindingId::from_raw(0),
+                name: Some(local_name(second, 9, 15)),
+                mutable: false,
+            },
+            BodyParam {
+                hir_id: hir_id(owner, 2),
+                binding: BindingId::from_raw(1),
+                name: Some(local_name(first, 2, 7)),
+                mutable: false,
+            },
+            BodyParam {
+                hir_id: hir_id(owner, 3),
+                binding: BindingId::from_raw(2),
+                name: Some(local_name(written, 16, 23)),
+                mutable: true,
+            },
+        ];
+        let lhs = local_path_expr(&arena, owner, 10, 30, 37, written, PathRoot::Plain);
+        let rhs = expr(
+            &arena,
+            owner,
+            20,
+            40,
+            41,
+            ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+        );
+        let stmt = Stmt {
+            hir_id: hir_id(owner, 21),
+            kind: StmtKind::Assign { lhs, rhs },
+            span: hir_span(30, 41),
+        };
+        let block = block_with_stmts(&arena, owner, 30, &[stmt], None);
+        let root = expr(&arena, owner, 31, 0, 120, ExprKind::Block(block));
+        let (snapshot, source_map) = local_source_context(owner);
+        let body = body(&arena, owner, source_map.source_id(), &params, root, &[]);
+        let result =
+            analyze_unused_bindings(body, &source_map, &snapshot, &symbols, &HashSet::new(), &[]);
+        let UnusedBindingAnalysis::Complete { unused, .. } = result else {
+            panic!("supported body must be complete");
+        };
+        assert_eq!(
+            unused.iter().map(|item| item.binding).collect::<Vec<_>>(),
+            [BindingId::from_raw(1), BindingId::from_raw(0)]
+        );
+    }
+
+    #[test]
+    fn unused_binding_analysis_fails_closed_for_unresolved_and_recovered_inputs() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let missing = symbols.intern("missing").unwrap();
+        let path = local_path_expr(&arena, owner, 10, 20, 27, missing, PathRoot::Plain);
+        let (snapshot, source_map) = local_source_context(owner);
+        let unresolved = body(&arena, owner, source_map.source_id(), &[], path, &[]);
+        assert_eq!(
+            analyze_unused_bindings(
+                unresolved,
+                &source_map,
+                &snapshot,
+                &symbols,
+                &HashSet::new(),
+                &[]
+            ),
+            UnusedBindingAnalysis::Incomplete
+        );
+        let error = expr(&arena, owner, 20, 30, 31, ExprKind::Err);
+        let recovered = body(&arena, owner, source_map.source_id(), &[], error, &[]);
+        assert_eq!(
+            analyze_unused_bindings(
+                recovered,
+                &source_map,
+                &snapshot,
+                &symbols,
+                &HashSet::new(),
+                &[]
+            ),
+            UnusedBindingAnalysis::Incomplete
+        );
+        let self_name = symbols.intern("self").unwrap();
+        let params = [BodyParam {
+            hir_id: hir_id(owner, 30),
+            binding: BindingId::from_raw(0),
+            name: Some(local_name(self_name, 0, 4)),
+            mutable: false,
+        }];
+        let literal = expr(
+            &arena,
+            owner,
+            31,
+            10,
+            11,
+            ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+        );
+        let receiver = body(&arena, owner, source_map.source_id(), &params, literal, &[]);
+        assert_eq!(
+            analyze_unused_bindings(
+                receiver,
+                &source_map,
+                &snapshot,
+                &symbols,
+                &HashSet::new(),
+                &[]
+            ),
+            UnusedBindingAnalysis::Incomplete
+        );
+        let call = expr(
+            &arena,
+            owner,
+            40,
+            10,
+            15,
+            ExprKind::Call {
+                callee: literal,
+                args: &[],
+                base: None,
+            },
+        );
+        let unsupported = body(&arena, owner, source_map.source_id(), &[], call, &[]);
+        assert_eq!(
+            analyze_unused_bindings(
+                unsupported,
+                &source_map,
+                &snapshot,
+                &symbols,
+                &HashSet::new(),
+                &[]
+            ),
+            UnusedBindingAnalysis::Incomplete
+        );
+        let diagnostic = Diagnostic::new(Code::TypeMismatch, Severity::Error, "recovery", None);
+        let clean = body(&arena, owner, source_map.source_id(), &[], literal, &[]);
+        assert_eq!(
+            analyze_unused_bindings(
+                clean,
+                &source_map,
+                &snapshot,
+                &symbols,
+                &HashSet::new(),
+                &[diagnostic]
+            ),
+            UnusedBindingAnalysis::Incomplete
+        );
+        let (changed, _) = local_source_context_with(owner, &format!("x{}", " ".repeat(127)), None);
+        assert_eq!(
+            analyze_unused_bindings(clean, &source_map, &changed, &symbols, &HashSet::new(), &[]),
+            UnusedBindingAnalysis::Incomplete
+        );
+
+        let closure_body = block_with_stmts(&arena, owner, 50, &[], Some(literal));
+        let closure = arena.alloc_closure(Closure {
+            def_id: owner.def_id,
+            capture: CaptureBy::Infer,
+            params: &[],
+            ret: None,
+            body: closure_body,
+        });
+        let closure_expr = expr(&arena, owner, 52, 10, 15, ExprKind::Closure(closure));
+        let closure_owner = body(
+            &arena,
+            owner,
+            source_map.source_id(),
+            &[],
+            closure_expr,
+            &[],
+        );
+        assert_eq!(
+            analyze_unused_bindings(
+                closure_owner,
+                &source_map,
+                &snapshot,
+                &symbols,
+                &HashSet::new(),
+                &[]
+            ),
+            UnusedBindingAnalysis::Incomplete
         );
     }
 
