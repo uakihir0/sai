@@ -124,6 +124,7 @@ use sai_resolve::prelude::{
     PreludeBinding, PrimitivePreludeBuildError, build_primitive_prelude,
     primitive_prelude_fingerprint,
 };
+use sai_resolve::unused_binding::{ModuleAliases, UnusedBindingAnalysis, analyze_unused_bindings};
 use sai_resolve::use_target_diagnostics::{
     UseTargetDiagnosticsError, collect_local_use_target_diagnostics,
 };
@@ -2531,6 +2532,7 @@ pub struct FunctionOwnerResolution {
     /// Diagnostics produced while lowering the owner, kept separate from the
     /// label resolver's diagnostics so the caller can preserve phase order.
     lowering_diagnostics: Vec<Diagnostic>,
+    unused_binding_analysis: Option<UnusedBindingAnalysis>,
 }
 
 /// Supported semantic function signature data or the explicit boundary that
@@ -6764,6 +6766,34 @@ fn index_function_signature_owners(
 }
 
 impl FunctionOwnerResolutions {
+    /// Returns opt-in candidates only for the original database, collection,
+    /// snapshot and owner. `None` also means the analysis was not requested.
+    /// These are historical collection-bound results: this does not check
+    /// whether the database's current graph or other inputs have since changed.
+    /// Recollect current inputs before using them as current results.
+    /// A complete result is a bounded candidate set, not lint diagnostics or
+    /// evidence that other semantic phases are complete.
+    pub fn unused_binding_analysis(
+        &self,
+        database: &RootDatabase,
+        collection: &Phase1PackageScopesCollection,
+        snapshot: &WorkspaceSnapshot,
+        owner: OwnerId,
+    ) -> Option<&UnusedBindingAnalysis> {
+        if self.session_token != database.session_token
+            || !self.matches_collection(collection)
+            || !self.matches_snapshot(snapshot)
+        {
+            return None;
+        }
+        let mut matches = self.owners.iter().filter(|item| item.owner == owner);
+        let result = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        result.unused_binding_analysis.as_ref()
+    }
+
     pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
         self.snapshot_id
     }
@@ -14950,6 +14980,66 @@ fn module_aliases_for_scope(module_scope: &Phase1ModuleScopes) -> HashSet<Symbol
         .collect()
 }
 
+const MAX_UNUSED_BINDING_ANALYSIS_OWNERS: usize = 64;
+const MAX_UNUSED_BINDING_ANALYSIS_BYTES: usize = 8 * 1024 * 1024;
+
+struct UnusedBindingAnalysisBudget {
+    remaining_owners: usize,
+    remaining_bytes: usize,
+    exhausted: bool,
+}
+
+impl UnusedBindingAnalysisBudget {
+    fn new() -> Self {
+        Self {
+            remaining_owners: MAX_UNUSED_BINDING_ANALYSIS_OWNERS,
+            remaining_bytes: MAX_UNUSED_BINDING_ANALYSIS_BYTES,
+            exhausted: false,
+        }
+    }
+
+    fn reserve(&mut self, source_bytes: usize) -> bool {
+        if self.exhausted || self.remaining_owners == 0 || source_bytes > self.remaining_bytes {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining_owners -= 1;
+        self.remaining_bytes -= source_bytes;
+        true
+    }
+}
+
+fn unused_binding_scope_is_complete(module_scope: &Phase1ModuleScopes) -> bool {
+    let bindings_match_imports =
+        module_scope
+            .scope
+            .iter()
+            .all(|(name, binding)| match binding.origin {
+                BindingOrigin::Decl => true,
+                BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => module_scope
+                    .imports
+                    .get(import.0 as usize)
+                    .is_some_and(|entry| entry.name == *name && entry.res == binding.res),
+            });
+    bindings_match_imports && module_scope.imports.iter().enumerate().all(|(index, import)| {
+        if import.inactive || import.retain_for_conflicts || matches!(import.res, Res::Err) {
+            return false;
+        }
+        if matches!(import.res, Res::TestOnly(marker) if !import.test_only || marker.0 as usize != index) {
+            return false;
+        }
+        if import.item_index.is_some() {
+            return false;
+        }
+        if !matches!(import.res, Res::Def(DefKind::Module | DefKind::Interface, _) | Res::TestOnly(_)) {
+            return false;
+        }
+        module_scope.scope.get(&import.name).is_some_and(|binding| {
+            matches!(binding.origin, BindingOrigin::Use { import } | BindingOrigin::PubUse { import } if import.0 as usize == index)
+        })
+    })
+}
+
 fn owner_generic_parameters(owner: &HirOwner<'_>) -> HashSet<Symbol> {
     let generics = match owner.node {
         OwnerNode::Item(item) => match item.kind {
@@ -20024,6 +20114,30 @@ impl RootDatabase {
             None,
             None,
             None,
+            false,
+        )
+    }
+
+    /// Opts in to bounded unused-binding candidates for top-level functions.
+    /// Unsupported body type checks, unresolved scopes, and errors detected
+    /// by the selected owner and scope checks yield incomplete results. Other
+    /// diagnostics, including unrelated interface errors, are not checked.
+    /// Analysis stops after 64 owners or 8 MiB of cumulative source bytes.
+    /// This does not emit lints or establish general coverage.
+    pub fn resolve_function_owner_analyses_with_unused_bindings(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
+        self.resolve_function_owner_analyses_inner(
+            collection,
+            module_tree,
+            snapshot,
+            None,
+            None,
+            None,
+            true,
         )
     }
 
@@ -20050,6 +20164,7 @@ impl RootDatabase {
             Some(member_scopes),
             None,
             None,
+            false,
         )
     }
 
@@ -20079,6 +20194,7 @@ impl RootDatabase {
             Some(member_scopes),
             Some(wit_view_scopes),
             None,
+            false,
         )
     }
 
@@ -20156,6 +20272,7 @@ impl RootDatabase {
             member_scopes,
             wit_view_scopes,
             Some(&world_fields),
+            false,
         )
     }
 
@@ -20167,6 +20284,7 @@ impl RootDatabase {
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
         wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
         world_fields: Option<&FunctionOwnerWorldFieldInputs>,
+        analyze_unused: bool,
     ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
         if collection.session_token != self.session_token {
             return Err(OwnerControlFlowResolutionError::SessionMismatch);
@@ -20241,6 +20359,7 @@ impl RootDatabase {
         );
         let descriptors = &collection.scopes.function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
+        let mut unused_budget = UnusedBindingAnalysisBudget::new();
         let mut group_start = 0;
         while group_start < descriptors.len() {
             let file = descriptors[group_start].file;
@@ -20269,6 +20388,8 @@ impl RootDatabase {
                                 world_field_resolution:
                                     world_fields.map(|_| Err(error.clone())).unwrap_or(Ok(None)),
                                 lowering_diagnostics: Vec::new(),
+                                unused_binding_analysis:
+                                    analyze_unused.then_some(UnusedBindingAnalysis::Incomplete),
                             },
                         ));
                         group_start = group_end;
@@ -20280,6 +20401,12 @@ impl RootDatabase {
                 .as_ref()
                 .map(|scope| module_aliases_for_scope(scope))
                 .map_err(Clone::clone);
+            let unused_scope_complete = analyze_unused
+                && collection.scopes.diagnostics.is_empty()
+                && module_tree.diagnostics.is_empty()
+                && module_scope
+                    .as_ref()
+                    .is_ok_and(|scope| unused_binding_scope_is_complete(scope));
 
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
@@ -20294,6 +20421,8 @@ impl RootDatabase {
                 let mut test_only_path_resolution = None;
                 let mut test_only_diagnostics = None;
                 let mut world_field_resolution = None;
+                let mut unused_binding_analysis =
+                    analyze_unused.then_some(UnusedBindingAnalysis::Incomplete);
                 let resolution = (|| {
                     let owner_descriptor = find_top_level_owner_descriptor(
                         &top_level_owner_index,
@@ -20649,6 +20778,40 @@ impl RootDatabase {
                                     local_resolution = Some(Err(error));
                                 }
                             };
+                            if unused_scope_complete
+                                && hir_owner.id == descriptor.owner
+                                && body.owner == descriptor.owner
+                                && matches!(hir_owner.node, OwnerNode::Item(item) if matches!(item.kind, ItemKind::Fn { has_body: true, .. }))
+                                && labels
+                                    .as_ref()
+                                    .is_ok_and(|labels| labels.diagnostics.is_empty())
+                                && matches!(&local_resolution, Some(Ok(Some(locals))) if locals.diagnostics.is_empty())
+                                && body_type_check.as_ref().is_some_and(|check| {
+                                    check.is_supported() && check.diagnostics().is_empty()
+                                })
+                                && matches!(&type_path_resolution, Some(Ok(Some(paths))) if paths.deferred_paths().is_empty() && paths.module_path_errors().is_empty())
+                                && matches!(&module_resolution, Some(Ok(_)))
+                                && matches!(&signature_projection, Some(Ok(_)))
+                                && !matches!(&module_path_diagnostics, Some(Err(_)))
+                                && matches!(&test_only_diagnostics, Some(Ok(diagnostics)) if diagnostics.is_empty())
+                                && let Ok(aliases) = &module_aliases
+                                && unused_budget.reserve(
+                                    inputs
+                                        .source
+                                        .raw_bytes()
+                                        .len()
+                                        .max(inputs.source.text().len()),
+                                )
+                            {
+                                unused_binding_analysis = Some(analyze_unused_bindings(
+                                    body,
+                                    &source_map,
+                                    snapshot,
+                                    &self.symbols,
+                                    ModuleAliases::Complete(aliases),
+                                    &lowering_diagnostics,
+                                ));
+                            }
                             labels
                         }
                         None => {
@@ -20716,6 +20879,7 @@ impl RootDatabase {
                     test_only_diagnostics,
                     world_field_resolution,
                     lowering_diagnostics,
+                    unused_binding_analysis,
                 });
             }
             group_start = group_end;
@@ -74497,6 +74661,306 @@ property "shared"() {}
             "a name from the root module does not leak into a child module's unqualified scope"
         );
         assert_eq!(child_owner.deferred_paths[0].name, root_value_symbol);
+    }
+
+    #[test]
+    fn opt_in_unused_bindings_exhausts_per_request_budget() {
+        let mut source = String::from("fn unsupported() -> I32 { 1 }\n");
+        for index in 0..=MAX_UNUSED_BINDING_ANALYSIS_OWNERS {
+            source.push_str(&format!("pub fn f{index}(value: I32) -> I32 {{ value }}\n"));
+        }
+        let (mut database, tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let cfg = target_cfg_for_check("wasm32-core").unwrap();
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &tree,
+                &snapshot,
+                &cfg,
+                Phase1BuildContext::default(),
+            )
+            .unwrap();
+        let results = database
+            .resolve_function_owner_analyses_with_unused_bindings(&collection, &tree, &snapshot)
+            .unwrap();
+        assert_eq!(
+            results.owners().len(),
+            MAX_UNUSED_BINDING_ANALYSIS_OWNERS + 2
+        );
+        assert_eq!(
+            results.unused_binding_analysis(
+                &database,
+                &collection,
+                &snapshot,
+                results.owners()[0].owner()
+            ),
+            Some(&UnusedBindingAnalysis::Incomplete)
+        );
+        for owner in &results.owners()[1..=MAX_UNUSED_BINDING_ANALYSIS_OWNERS] {
+            assert!(matches!(
+                results.unused_binding_analysis(&database, &collection, &snapshot, owner.owner()),
+                Some(UnusedBindingAnalysis::Complete { .. })
+            ));
+        }
+        assert_eq!(
+            results.unused_binding_analysis(
+                &database,
+                &collection,
+                &snapshot,
+                results.owners().last().unwrap().owner()
+            ),
+            Some(&UnusedBindingAnalysis::Incomplete)
+        );
+        let mut budget = UnusedBindingAnalysisBudget::new();
+        assert!(budget.reserve(MAX_UNUSED_BINDING_ANALYSIS_BYTES - 1));
+        assert!(!budget.reserve(2));
+        assert!(!budget.reserve(1));
+        let mut budget = UnusedBindingAnalysisBudget::new();
+        assert!(budget.reserve(MAX_UNUSED_BINDING_ANALYSIS_BYTES));
+        assert!(!budget.reserve(1));
+    }
+
+    #[test]
+    fn opt_in_unused_bindings_preserve_owner_and_provenance() {
+        let root = concat!(
+            "pub fn f(x: I32) -> I32 {\n let dead = 1\n x\n}\n",
+            "pub fn used() -> I32 {\n let value = 1\n value\n}\n",
+        );
+        let (mut database, tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let cfg = target_cfg_for_check("wasm32-core").unwrap();
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &tree,
+                &snapshot,
+                &cfg,
+                Phase1BuildContext::default(),
+            )
+            .unwrap();
+        assert!(
+            collection.scopes.diagnostics.is_empty(),
+            "{:?}",
+            collection.scopes.diagnostics
+        );
+        let normal = database
+            .resolve_function_owner_analyses(&collection, &tree, &snapshot)
+            .unwrap();
+        let results = database
+            .resolve_function_owner_analyses_with_unused_bindings(&collection, &tree, &snapshot)
+            .unwrap();
+        let owner = results.owners()[0].owner();
+        assert!(
+            normal
+                .unused_binding_analysis(&database, &collection, &snapshot, owner)
+                .is_none()
+        );
+        let Some(UnusedBindingAnalysis::Complete {
+            owner: result_owner,
+            unused,
+        }) = results.unused_binding_analysis(&database, &collection, &snapshot, owner)
+        else {
+            panic!("expected complete unused-binding analysis");
+        };
+        assert_eq!(*result_owner, owner);
+        assert_eq!(unused.len(), 1);
+        assert_eq!(
+            database.resolve_symbol(unused[0].name).unwrap().as_ref(),
+            "dead"
+        );
+        assert!(matches!(
+            results.unused_binding_analysis(&database, &collection, &snapshot, results.owners()[1].owner()),
+            Some(UnusedBindingAnalysis::Complete { unused, .. }) if unused.is_empty()
+        ));
+        let other_database = RootDatabase::new().unwrap();
+        assert!(
+            results
+                .unused_binding_analysis(&other_database, &collection, &snapshot, owner)
+                .is_none()
+        );
+        let (_, _, other_snapshot, _) = phase1_fixture(b"fn different() {}\n", b"");
+        assert!(
+            results
+                .unused_binding_analysis(&database, &collection, &other_snapshot, owner)
+                .is_none()
+        );
+        let other_collection = database
+            .collect_phase1_package_scopes_collection(
+                &tree,
+                &snapshot,
+                &cfg,
+                Phase1BuildContext {
+                    analyzes_tests: true,
+                    ..Phase1BuildContext::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            results
+                .unused_binding_analysis(&database, &other_collection, &snapshot, owner)
+                .is_none()
+        );
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .unwrap();
+        assert!(matches!(
+            results.unused_binding_analysis(&database, &collection, &snapshot, owner),
+            Some(UnusedBindingAnalysis::Complete { .. })
+        ));
+        let current_collection = database
+            .collect_phase1_package_scopes_collection(
+                &tree,
+                &snapshot,
+                &cfg,
+                Phase1BuildContext::default(),
+            )
+            .unwrap();
+        assert!(
+            results
+                .unused_binding_analysis(&database, &current_collection, &snapshot, owner)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn opt_in_unused_bindings_reject_incomplete_bodies() {
+        for source in [
+            "fn bodyless(x: I32) -> I32\n",
+            "fn unresolved() -> I32 { missing }\n",
+            "fn bad() -> I32 {\n let value: Bool = 1\n 1\n}\n",
+            "pub fn bad() -> Bool {\n let value = 1\n value\n}\n",
+            "fn bad() -> I32 {\n let value =\n}\n",
+        ] {
+            let (mut database, tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+            let cfg = target_cfg_for_check("wasm32-core").unwrap();
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &tree,
+                    &snapshot,
+                    &cfg,
+                    Phase1BuildContext::default(),
+                )
+                .unwrap();
+            let results = database
+                .resolve_function_owner_analyses_with_unused_bindings(&collection, &tree, &snapshot)
+                .unwrap();
+            assert!(!results.owners().is_empty(), "{source}");
+            if source.starts_with("pub fn bad() -> Bool") {
+                let check = results.owners()[0].body_type_check().unwrap();
+                assert!(check.is_supported() && !check.diagnostics().is_empty());
+            }
+            assert_eq!(
+                results.unused_binding_analysis(
+                    &database,
+                    &collection,
+                    &snapshot,
+                    results.owners()[0].owner()
+                ),
+                Some(&UnusedBindingAnalysis::Incomplete),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn opt_in_unused_bindings_use_actual_module_aliases() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "pub fn clear(x: I32) -> I32 {\n let dead = 1\n x\n}\n",
+            "pub fn shadow(child_alias: I32) -> I32 { child_alias }\n",
+        );
+        let child = b"pub fn child(child_alias: I32) -> I32 { child_alias }\n";
+        let (mut database, tree, snapshot, _) = phase1_fixture(root.as_bytes(), child);
+        let cfg = target_cfg_for_check("wasm32-core").unwrap();
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &tree,
+                &snapshot,
+                &cfg,
+                Phase1BuildContext::default(),
+            )
+            .unwrap();
+        let results = database
+            .resolve_function_owner_analyses_with_unused_bindings(&collection, &tree, &snapshot)
+            .unwrap();
+        assert!(matches!(
+            results.unused_binding_analysis(&database, &collection, &snapshot, results.owners()[0].owner()),
+            Some(UnusedBindingAnalysis::Complete { unused, .. }) if unused.len() == 1
+        ));
+        assert_eq!(
+            results.unused_binding_analysis(
+                &database,
+                &collection,
+                &snapshot,
+                results.owners()[1].owner()
+            ),
+            Some(&UnusedBindingAnalysis::Incomplete)
+        );
+        assert!(matches!(
+            results.unused_binding_analysis(&database, &collection, &snapshot, results.owners()[2].owner()),
+            Some(UnusedBindingAnalysis::Complete { unused, .. }) if unused.is_empty()
+        ));
+        let mut unknown = collection.clone();
+        unknown.scopes.modules[0].imports[0].res = Res::Err;
+        let unknown_results = database
+            .resolve_function_owner_analyses_with_unused_bindings(&unknown, &tree, &snapshot)
+            .unwrap();
+        assert_eq!(
+            unknown_results.unused_binding_analysis(
+                &database,
+                &unknown,
+                &snapshot,
+                unknown_results.owners()[0].owner()
+            ),
+            Some(&UnusedBindingAnalysis::Incomplete)
+        );
+        let mut unknown = collection.clone();
+        let alias = unknown.scopes.modules[0].imports[0].name;
+        unknown.scopes.modules[0].scope.remove(&alias);
+        let unknown_results = database
+            .resolve_function_owner_analyses_with_unused_bindings(&unknown, &tree, &snapshot)
+            .unwrap();
+        assert_eq!(
+            unknown_results.unused_binding_analysis(
+                &database,
+                &unknown,
+                &snapshot,
+                unknown_results.owners()[0].owner()
+            ),
+            Some(&UnusedBindingAnalysis::Incomplete)
+        );
+    }
+
+    #[test]
+    fn opt_in_unused_bindings_rejects_interface_item_imports() {
+        let root = b"use acme:phase1/child.{api}\npub fn f(value: I32) -> I32 { value }\n";
+        let child = b"pub interface api {}\n";
+        let (mut database, tree, snapshot, _) = phase1_fixture(root, child);
+        let cfg = target_cfg_for_check("wasm32-core").unwrap();
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &tree,
+                &snapshot,
+                &cfg,
+                Phase1BuildContext::default(),
+            )
+            .unwrap();
+        assert!(collection.scopes.diagnostics.is_empty());
+        assert!(
+            collection.scopes.modules[0]
+                .imports
+                .iter()
+                .any(|import| import.item_index.is_some())
+        );
+        let results = database
+            .resolve_function_owner_analyses_with_unused_bindings(&collection, &tree, &snapshot)
+            .unwrap();
+        assert_eq!(
+            results.unused_binding_analysis(
+                &database,
+                &collection,
+                &snapshot,
+                results.owners()[0].owner()
+            ),
+            Some(&UnusedBindingAnalysis::Incomplete)
+        );
     }
 
     #[test]

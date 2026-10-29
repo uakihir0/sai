@@ -9223,3 +9223,9 @@
 - **Decision — review required:** Validate recorded dependencies in read order and recompute as soon as one changes. Continuing to refresh the old dependency list can evaluate a branch that the changed input has made obsolete, turning a removed input into a fatal error.
 - **Verification:** All 29 `sai_query` tests passed, including obsolete branches, unchanged-prefix validation, backdating, cancellation and retry, and errors in newly required dependencies.
 - **Hostile review:** Independent reviews checked read ordering, replacement of dependency lists, backdating and failure propagation, and requested additional regression cases; a final static review found no further actionable defect.
+
+### IR-1019 (2026-10-29): expose opt-in owner-local unused candidates
+
+- **Decision — review required:** Expose conservative top-level function candidates while the owner HIR and scope are live, without emitting lints or enabling CLI success. Results are historical and bound to their original collection and snapshot; callers must recollect current inputs. A temporary request-wide cap of 64 analyzed owners and 8 MiB of cumulative source bytes returns `Incomplete` on exhaustion. Item-list imports and unsupported or erroneous owner phases also remain incomplete.
+- **Verification:** Five focused integration tests and five existing adapter tests passed. The byte-budget boundary is unit-tested; a full large-file integration test and general lint-context, method, structured-fix and CLI integration remain open.
+- **Hostile review:** Independent review identified repeated full-file parsing, stale-graph ambiguity, uncertain interface import aliases and an overbroad documentation claim. The budget, historical-result contract, conservative import handling and narrowed documentation address these findings; the cap is not a substitute for scalable analysis.
