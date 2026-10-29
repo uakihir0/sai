@@ -8655,9 +8655,6 @@ fn run_fmt(
         parsed.globals.max_errors
     };
     let formatting_result = sai_fmt::format_package_with_error_limit(&source, max_errors);
-    if cancellation.is_cancelled() {
-        return report_interrupted(parsed, stdout, stderr);
-    }
     let formatted = match formatting_result {
         Ok(formatted) => formatted,
         Err(error) => {
@@ -8670,7 +8667,13 @@ fn run_fmt(
                 parsed.globals.format == OutputFormat::Human,
             );
             if cancellation.is_cancelled() {
-                return report_interrupted(parsed, stdout, stderr);
+                return report_fmt_interrupted(
+                    parsed,
+                    diagnostics.diagnostics,
+                    diagnostics.total_error_count,
+                    stdout,
+                    stderr,
+                );
             }
             return report_fmt_diagnostics(
                 parsed,
@@ -8816,7 +8819,13 @@ fn run_fmt_source_stdin(
                 parsed.globals.format == OutputFormat::Human,
             );
             if cancellation.is_cancelled() {
-                return report_interrupted(parsed, stdout, stderr);
+                return report_fmt_interrupted(
+                    parsed,
+                    batch.diagnostics,
+                    batch.total_error_count,
+                    stdout,
+                    stderr,
+                );
             }
             return report_fmt_diagnostics(
                 parsed,
@@ -9619,19 +9628,36 @@ fn run_fmt_workspace_at(
         error_limit,
         diagnostic_base,
     );
-    if discovery.interrupted || cancellation.is_cancelled() {
-        return report_interrupted(parsed, stdout, stderr);
-    }
+    let discovery_interrupted = discovery.interrupted || cancellation.is_cancelled();
     let input_paths = discovery.input_paths.clone();
     let signature = fmt_workspace_signature(&discovery);
     let initial_error_count = discovery.total_error_count;
     let initial_errors = std::mem::take(&mut discovery.errors);
-    let initial_diagnostics = fmt_workspace_diagnostics(
+    let mut initial_diagnostics = fmt_workspace_diagnostics(
         &discovery,
         cwd,
         diagnostic_base,
         parsed.globals.format == OutputFormat::Human,
     );
+    if discovery_interrupted || cancellation.is_cancelled() {
+        for error in initial_errors {
+            let path = fmt_workspace_selection_error_path(&error.path, &signature);
+            let source_path = fmt_path_reference(&path, cwd, Some(diagnostic_base));
+            initial_diagnostics.push(fmt_io_diagnostic(
+                "SOURCE_READ_FAILED",
+                &source_path,
+                "could not inspect a formatter input path",
+                &error.source,
+            ));
+        }
+        return report_fmt_interrupted(
+            parsed,
+            initial_diagnostics,
+            initial_error_count,
+            stdout,
+            stderr,
+        );
+    }
     run_fmt_paths_for_inputs(
         parsed,
         command,
@@ -9816,9 +9842,7 @@ fn run_fmt_paths_for_inputs(
     } else {
         crate::fmt_paths::select_fmt_paths(input_paths, &cwd, cancellation)
     };
-    if selection.interrupted {
-        return report_interrupted(parsed, stdout, stderr);
-    }
+    let selection_interrupted = selection.interrupted;
     let selection_signature = fmt_path_selection_signature(&selection);
     let selected_error_count = selection.errors.len();
     selection.errors.extend(initial_errors);
@@ -9870,13 +9894,16 @@ fn run_fmt_paths_for_inputs(
             &error.source,
         ));
     }
+    if selection_interrupted || cancellation.is_cancelled() {
+        return report_fmt_interrupted(parsed, diagnostics, total_error_count, stdout, stderr);
+    }
 
     let mut files = Vec::with_capacity(selection.files.len());
     let mut roots_by_path = HashMap::<PathBuf, FmtPackageRoot>::new();
     let mut blocked_files = HashSet::new();
     for selected in selection.files {
         if cancellation.is_cancelled() {
-            return report_interrupted(parsed, stdout, stderr);
+            return report_fmt_interrupted(parsed, diagnostics, total_error_count, stdout, stderr);
         }
         let crate::fmt_paths::SelectedFmtPath {
             path,
@@ -10028,7 +10055,13 @@ fn run_fmt_paths_for_inputs(
     for root in &roots {
         loop {
             if cancellation.is_cancelled() {
-                return report_interrupted(parsed, stdout, stderr);
+                return report_fmt_interrupted(
+                    parsed,
+                    diagnostics,
+                    total_error_count,
+                    stdout,
+                    stderr,
+                );
             }
             match WorkspaceLockGuard::try_acquire(&root.path, lock_mode) {
                 Ok(Some(guard)) => {
@@ -10040,8 +10073,25 @@ fn run_fmt_paths_for_inputs(
                         && parsed.globals.format == OutputFormat::Human
                         && !parsed.globals.quiet
                     {
-                        if let Err(error) = stderr.write_all(b"waiting for .sai/lock\n") {
-                            return report_stderr_failure(error);
+                        let mut pending_prefix = Vec::new();
+                        if let Err(exit_code) = write_fmt_status_line(
+                            "waiting for .sai/lock\n",
+                            &diagnostics,
+                            cancellation,
+                            stderr,
+                            &mut pending_prefix,
+                        ) {
+                            if exit_code == 130 || cancellation.is_cancelled() {
+                                return report_fmt_interrupted_with_prefix(
+                                    parsed,
+                                    diagnostics,
+                                    total_error_count,
+                                    stdout,
+                                    stderr,
+                                    &pending_prefix,
+                                );
+                            }
+                            return exit_code;
                         }
                         retry_state.waiting_reported = true;
                     }
@@ -10095,7 +10145,7 @@ fn run_fmt_paths_for_inputs(
         crate::fmt_paths::select_fmt_paths_for_comparison(input_paths, &cwd, cancellation)
     };
     if current_selection.interrupted || cancellation.is_cancelled() {
-        return report_interrupted(parsed, stdout, stderr);
+        return report_fmt_interrupted(parsed, diagnostics, total_error_count, stdout, stderr);
     }
     let mut current_roots_by_path = HashMap::new();
     let mut current_discovery_failed = workspace_discovery_signature.is_some_and(|signature| {
@@ -10183,7 +10233,7 @@ fn run_fmt_paths_for_inputs(
                 Err(_) => crate::fmt_workspace::FmtWorkspaceDiscovery::default(),
             };
         if cancellation.is_cancelled() || current_discovery.interrupted {
-            return report_interrupted(parsed, stdout, stderr);
+            return report_fmt_interrupted(parsed, diagnostics, total_error_count, stdout, stderr);
         }
         if fmt_workspace_signature(&current_discovery) != *expected {
             drop(files);
@@ -10224,7 +10274,7 @@ fn run_fmt_paths_for_inputs(
     };
     for mut file in files {
         if cancellation.is_cancelled() {
-            return report_interrupted(parsed, stdout, stderr);
+            return report_fmt_interrupted(parsed, diagnostics, total_error_count, stdout, stderr);
         }
         if blocked_files.contains(&file.path)
             || file
@@ -10269,7 +10319,13 @@ fn run_fmt_paths_for_inputs(
             ) {
                 Ok(source) => source,
                 Err(StdinReadError::Interrupted) => {
-                    return report_interrupted(parsed, stdout, stderr);
+                    return report_fmt_interrupted(
+                        parsed,
+                        diagnostics,
+                        total_error_count,
+                        stdout,
+                        stderr,
+                    );
                 }
                 Err(StdinReadError::Io(error)) => {
                     diagnostics.push(fmt_io_diagnostic(
@@ -10300,9 +10356,6 @@ fn run_fmt_paths_for_inputs(
                 continue;
             }
             let formatting_result = sai_fmt::format_package_with_error_limit(&source, max_errors);
-            if cancellation.is_cancelled() {
-                return report_interrupted(parsed, stdout, stderr);
-            }
             let formatted = match formatting_result {
                 Ok(formatted) => formatted,
                 Err(error) => {
@@ -10318,18 +10371,37 @@ fn run_fmt_paths_for_inputs(
                         parsed.globals.format == OutputFormat::Human,
                     );
                     total_error_count = total_error_count.saturating_add(batch.total_error_count);
+                    let internal_error = batch
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == "INTERNAL_COMPILER_ERROR");
                     diagnostics.extend(batch.diagnostics);
+                    if internal_error {
+                        break;
+                    }
                     continue;
                 }
             };
             if cancellation.is_cancelled() {
-                return report_interrupted(parsed, stdout, stderr);
+                return report_fmt_interrupted(
+                    parsed,
+                    diagnostics,
+                    total_error_count,
+                    stdout,
+                    stderr,
+                );
             }
             let differs = source.as_ref() != formatted.as_bytes();
             if differs {
                 if !check {
                     if cancellation.is_cancelled() {
-                        return report_interrupted(parsed, stdout, stderr);
+                        return report_fmt_interrupted(
+                            parsed,
+                            diagnostics,
+                            total_error_count,
+                            stdout,
+                            stderr,
+                        );
                     }
                     // The atomic writer reopens the selected destination and
                     // verifies its identity and bytes immediately before
@@ -10382,7 +10454,13 @@ fn run_fmt_paths_for_inputs(
                 }
             }
             if cancellation.is_cancelled() {
-                return report_interrupted(parsed, stdout, stderr);
+                return report_fmt_interrupted(
+                    parsed,
+                    diagnostics,
+                    total_error_count,
+                    stdout,
+                    stderr,
+                );
             }
         } else {
             let source_file = match open_selected_fmt_file(&mut file) {
@@ -10415,7 +10493,13 @@ fn run_fmt_paths_for_inputs(
                 match read_source_limited(source_file, sai_vfs::MAX_SOURCE_BYTES, cancellation) {
                     Ok(source) => source,
                     Err(SourceInputReadError::Interrupted) => {
-                        return report_interrupted(parsed, stdout, stderr);
+                        return report_fmt_interrupted(
+                            parsed,
+                            diagnostics,
+                            total_error_count,
+                            stdout,
+                            stderr,
+                        );
                     }
                     Err(SourceInputReadError::Io(error)) => {
                         diagnostics.push(fmt_io_diagnostic(
@@ -10449,18 +10533,37 @@ fn run_fmt_paths_for_inputs(
                         parsed.globals.format == OutputFormat::Human,
                     );
                     total_error_count = total_error_count.saturating_add(batch.total_error_count);
+                    let internal_error = batch
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == "INTERNAL_COMPILER_ERROR");
                     diagnostics.extend(batch.diagnostics);
+                    if internal_error {
+                        break;
+                    }
                     continue;
                 }
             };
             if cancellation.is_cancelled() {
-                return report_interrupted(parsed, stdout, stderr);
+                return report_fmt_interrupted(
+                    parsed,
+                    diagnostics,
+                    total_error_count,
+                    stdout,
+                    stderr,
+                );
             }
             let differs = source.as_ref() != formatted.as_bytes();
             if differs {
                 if !check {
                     if cancellation.is_cancelled() {
-                        return report_interrupted(parsed, stdout, stderr);
+                        return report_fmt_interrupted(
+                            parsed,
+                            diagnostics,
+                            total_error_count,
+                            stdout,
+                            stderr,
+                        );
                     }
                     match write_file_atomically_in_directory(
                         file.parent
@@ -10508,26 +10611,44 @@ fn run_fmt_paths_for_inputs(
                 }
             }
             if cancellation.is_cancelled() {
-                return report_interrupted(parsed, stdout, stderr);
+                return report_fmt_interrupted(
+                    parsed,
+                    diagnostics,
+                    total_error_count,
+                    stdout,
+                    stderr,
+                );
             }
         }
     }
     if cancellation.is_cancelled() {
-        return report_interrupted(parsed, stdout, stderr);
+        return report_fmt_interrupted(parsed, diagnostics, total_error_count, stdout, stderr);
     }
 
-    if parsed.globals.format == OutputFormat::Human && !parsed.globals.quiet {
-        for path in human_changed_paths {
-            if check {
-                continue;
+    if parsed.globals.format == OutputFormat::Human && !parsed.globals.quiet && !check {
+        let mut pending_prefix = Vec::new();
+        if let Err(exit_code) = write_human_fmt_progress(
+            &human_changed_paths,
+            &diagnostics,
+            cancellation,
+            stderr,
+            &mut pending_prefix,
+        ) {
+            if exit_code == 130 || cancellation.is_cancelled() {
+                return report_fmt_interrupted_with_prefix(
+                    parsed,
+                    diagnostics,
+                    total_error_count,
+                    stdout,
+                    stderr,
+                    &pending_prefix,
+                );
             }
-            let line = format!("formatted {path}\n");
-            let line = escape_terminal_controls(&line);
-            if let Err(error) = stderr.write_all(line.as_bytes()) {
-                report_stderr_failure(error);
-                return 4;
-            }
+            return exit_code;
         }
+    }
+    if cancellation.is_cancelled() {
+        return report_fmt_interrupted(parsed, diagnostics, total_error_count, stdout, stderr);
     }
 
     if !diagnostics.is_empty() {
@@ -10551,6 +10672,77 @@ fn run_fmt_paths_for_inputs(
             }
         }
     }
+}
+
+fn write_human_fmt_progress(
+    paths: &[String],
+    diagnostics: &[CliDiagnostic],
+    cancellation: &CancellationToken,
+    stderr: &mut impl Write,
+    pending_prefix: &mut Vec<u8>,
+) -> Result<(), i32> {
+    pending_prefix.clear();
+    for path in paths {
+        if cancellation.is_cancelled() {
+            return Err(130);
+        }
+        let line = format!("formatted {path}\n");
+        let line = escape_terminal_controls(&line);
+        write_fmt_status_line(&line, diagnostics, cancellation, stderr, pending_prefix)?;
+    }
+    Ok(())
+}
+
+fn write_fmt_status_line(
+    line: &str,
+    diagnostics: &[CliDiagnostic],
+    cancellation: &CancellationToken,
+    stderr: &mut impl Write,
+    pending_prefix: &mut Vec<u8>,
+) -> Result<(), i32> {
+    pending_prefix.clear();
+    let mut remaining = line.as_bytes();
+    while !remaining.is_empty() {
+        if cancellation.is_cancelled() {
+            return Err(130);
+        }
+        let result = stderr.write(remaining);
+        if let Ok(written) = result {
+            if written > 0 {
+                remaining = &remaining[written..];
+                pending_prefix.clear();
+                if !remaining.is_empty() {
+                    let written_total = line.len() - remaining.len();
+                    let mut boundary = written_total;
+                    while !line.is_char_boundary(boundary) {
+                        boundary += 1;
+                    }
+                    pending_prefix.extend_from_slice(&line.as_bytes()[written_total..boundary]);
+                    pending_prefix.push(b'\n');
+                }
+            }
+        }
+        if cancellation.is_cancelled() {
+            return Err(130);
+        }
+        let error = match result {
+            Ok(0) => io::ErrorKind::WriteZero.into(),
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => error,
+        };
+        return Err(
+            if diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "INTERNAL_COMPILER_ERROR")
+            {
+                101
+            } else {
+                report_stderr_failure(error)
+            },
+        );
+    }
+    Ok(())
 }
 
 fn fmt_path_reference(path: &Path, cwd: &Path, package_root: Option<&Path>) -> String {
@@ -11064,14 +11256,7 @@ fn write_json_fmt_success(writer: &mut impl Write, result: FmtResult) -> io::Res
     write_json_summary(writer, 0, 0, 0)
 }
 
-fn report_fmt_diagnostics(
-    parsed: &ParsedArgs,
-    mut diagnostics: Vec<CliDiagnostic>,
-    total_error_count: usize,
-    result: Option<FmtResult>,
-    stdout: &mut impl Write,
-    stderr: &mut impl Write,
-) -> i32 {
+fn sort_fmt_diagnostics(diagnostics: &mut [CliDiagnostic]) {
     diagnostics.sort_by(|left, right| {
         let left_path = left
             .primary
@@ -11089,13 +11274,75 @@ fn report_fmt_diagnostics(
             .primary
             .as_ref()
             .map_or(usize::MAX, |location| location.start.byte);
-        left_path
-            .as_bytes()
-            .cmp(right_path.as_bytes())
+        (left.code == "INTERNAL_COMPILER_ERROR")
+            .cmp(&(right.code == "INTERNAL_COMPILER_ERROR"))
+            .then_with(|| left_path.as_bytes().cmp(right_path.as_bytes()))
             .then_with(|| left_offset.cmp(&right_offset))
             .then_with(|| left.code.cmp(right.code))
             .then_with(|| left.message.cmp(&right.message))
     });
+}
+
+fn report_fmt_interrupted(
+    parsed: &ParsedArgs,
+    diagnostics: Vec<CliDiagnostic>,
+    total_error_count: usize,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    report_fmt_interrupted_with_prefix(parsed, diagnostics, total_error_count, stdout, stderr, &[])
+}
+
+fn report_fmt_interrupted_with_prefix(
+    parsed: &ParsedArgs,
+    mut diagnostics: Vec<CliDiagnostic>,
+    total_error_count: usize,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    pending_prefix: &[u8],
+) -> i32 {
+    sort_fmt_diagnostics(&mut diagnostics);
+    if parsed.globals.max_errors != 0 {
+        diagnostics.truncate(parsed.globals.max_errors);
+    }
+    match parsed.globals.format {
+        OutputFormat::Human => {
+            let mut output = pending_prefix.to_vec();
+            let _ = write_human_diagnostics(
+                &mut output,
+                "fmt",
+                &diagnostics,
+                false,
+                color_enabled(parsed.globals.color, io::stderr().is_terminal()),
+                total_error_count,
+                parsed.globals.max_errors,
+            );
+            if !output.is_empty() {
+                let _ = stderr.write_all(&output);
+            }
+        }
+        OutputFormat::Json => {
+            if let Err(error) =
+                write_json_diagnostics(stdout, "fmt", &diagnostics, total_error_count, 130)
+            {
+                if !report_stdout_failure(stderr, error) {
+                    return 4;
+                }
+            }
+        }
+    }
+    130
+}
+
+fn report_fmt_diagnostics(
+    parsed: &ParsedArgs,
+    mut diagnostics: Vec<CliDiagnostic>,
+    total_error_count: usize,
+    result: Option<FmtResult>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    sort_fmt_diagnostics(&mut diagnostics);
     let total = total_error_count;
     let exit_code = if diagnostics
         .iter()
@@ -11124,7 +11371,11 @@ fn report_fmt_diagnostics(
                 total,
                 parsed.globals.max_errors,
             ) {
-                report_stderr_failure(error)
+                if exit_code == 101 {
+                    101
+                } else {
+                    report_stderr_failure(error)
+                }
             } else {
                 exit_code
             }
@@ -11133,8 +11384,11 @@ fn report_fmt_diagnostics(
             if let Err(error) =
                 write_json_fmt_diagnostics(stdout, &diagnostics, total, exit_code, result.as_ref())
             {
-                report_stdout_failure(stderr, error);
-                4
+                if report_stdout_failure(stderr, error) && exit_code == 101 {
+                    101
+                } else {
+                    4
+                }
             } else {
                 exit_code
             }
@@ -15142,6 +15396,28 @@ mod tests {
     impl std::io::Write for BrokenPipeWriter {
         fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
             Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CancellingWriter {
+        cancellation: CancellationToken,
+        fail: bool,
+        writes: usize,
+    }
+
+    impl std::io::Write for CancellingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.cancellation.cancel();
+            if self.fail {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(bytes.len())
+            }
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -19695,6 +19971,561 @@ mod tests {
         assert!(!stdout.contains("\"kind\":\"fmt\""));
         assert!(stdout.contains("\"exit_code\":101"));
         assert_eq!(stdout.lines().count(), 3);
+    }
+
+    #[test]
+    fn fmt_write_failure_exit_precedence() {
+        for format in ["human", "json"] {
+            for limit in ["0", "1"] {
+                for include_ice in [false, true] {
+                    let arguments = ["--format", format, "--max-errors", limit, "fmt"]
+                        .map(std::ffi::OsString::from);
+                    let parsed = parse_args(&arguments);
+                    let diagnostics = || {
+                        let mut diagnostics = vec![super::fmt_io_diagnostic(
+                            "SOURCE_READ_FAILED",
+                            "a.sai",
+                            "could not read source",
+                            &io::Error::other("test failure"),
+                        )];
+                        if include_ice {
+                            diagnostics
+                                .push(internal_fmt_diagnostic("formatter failed".to_owned(), None));
+                        }
+                        diagnostics
+                    };
+                    let count = if include_ice { 2 } else { 1 };
+                    let expected = if include_ice { 101 } else { 4 };
+                    if include_ice && limit == "1" {
+                        let mut stdout = Vec::new();
+                        let mut stderr = Vec::new();
+                        let exit = report_fmt_diagnostics(
+                            &parsed,
+                            diagnostics(),
+                            count,
+                            None,
+                            &mut stdout,
+                            &mut stderr,
+                        );
+                        let output = if format == "human" { stderr } else { stdout };
+                        let output = String::from_utf8(output).unwrap();
+                        assert_eq!(exit, 101);
+                        assert!(output.contains("SOURCE_READ_FAILED"));
+                        assert!(!output.contains("INTERNAL_COMPILER_ERROR"));
+                    }
+                    if format == "human" {
+                        let exit = report_fmt_diagnostics(
+                            &parsed,
+                            diagnostics(),
+                            count,
+                            None,
+                            &mut Vec::new(),
+                            &mut BrokenPipeWriter,
+                        );
+                        assert_eq!(
+                            exit, expected,
+                            "format={format}, limit={limit}, ice={include_ice}"
+                        );
+                    } else {
+                        let mut stderr = Vec::new();
+                        let exit = report_fmt_diagnostics(
+                            &parsed,
+                            diagnostics(),
+                            count,
+                            None,
+                            &mut BrokenPipeWriter,
+                            &mut stderr,
+                        );
+                        assert_eq!(
+                            exit, expected,
+                            "format={format}, limit={limit}, ice={include_ice}"
+                        );
+                        let message = String::from_utf8(stderr).unwrap();
+                        assert!(message.starts_with("sai: cannot write to standard output: "));
+                        assert_eq!(message.lines().count(), 1);
+                        let exit = report_fmt_diagnostics(
+                            &parsed,
+                            diagnostics(),
+                            count,
+                            None,
+                            &mut BrokenPipeWriter,
+                            &mut BrokenPipeWriter,
+                        );
+                        assert_eq!(
+                            exit, 4,
+                            "both streams fail, limit={limit}, ice={include_ice}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fmt_write_failure_progress_preserves_ice_precedence() {
+        struct RetryingWriter {
+            calls: usize,
+            output: Vec<u8>,
+        }
+
+        impl std::io::Write for RetryingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.output.push(bytes[0]);
+                Ok(1)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let paths = vec!["changed.sai".to_owned()];
+        let diagnostics = vec![internal_fmt_diagnostic("formatter failed".to_owned(), None)];
+        assert_eq!(
+            super::write_human_fmt_progress(
+                &paths,
+                &diagnostics,
+                &CancellationToken::default(),
+                &mut BrokenPipeWriter,
+                &mut Vec::new(),
+            ),
+            Err(101)
+        );
+        assert_eq!(
+            super::write_human_fmt_progress(
+                &paths,
+                &[],
+                &CancellationToken::default(),
+                &mut BrokenPipeWriter,
+                &mut Vec::new(),
+            ),
+            Err(4)
+        );
+        for fail in [false, true] {
+            let cancellation = CancellationToken::default();
+            let mut writer = CancellingWriter {
+                cancellation: cancellation.clone(),
+                fail,
+                writes: 0,
+            };
+            assert_eq!(
+                super::write_human_fmt_progress(
+                    &paths,
+                    &diagnostics,
+                    &cancellation,
+                    &mut writer,
+                    &mut Vec::new(),
+                ),
+                Err(130)
+            );
+            assert_eq!(writer.writes, 1);
+        }
+        let mut writer = RetryingWriter {
+            calls: 0,
+            output: Vec::new(),
+        };
+        assert_eq!(
+            super::write_human_fmt_progress(
+                &paths,
+                &diagnostics,
+                &CancellationToken::default(),
+                &mut writer,
+                &mut Vec::new(),
+            ),
+            Ok(())
+        );
+        assert_eq!(writer.output, b"formatted changed.sai\n");
+    }
+
+    #[test]
+    fn fmt_write_failure_progress_interruption_runs_through_cli() {
+        for fail in [false, true] {
+            let directory = TestDirectory::new();
+            let manifest = directory.child("sai.package");
+            fs::write(&manifest, b"package acme:app@1.0.0\nsource\"src\"\n").unwrap();
+            let arguments = [std::ffi::OsString::from("fmt"), manifest.into_os_string()];
+            let cancellation = CancellationToken::default();
+            let mut writer = CancellingWriter {
+                cancellation: cancellation.clone(),
+                fail,
+                writes: 0,
+            };
+            let exit =
+                run_with_cancellation(&arguments, &cancellation, &mut Vec::new(), &mut writer);
+            assert_eq!(exit, 130);
+            assert_eq!(writer.writes, 1);
+        }
+    }
+
+    #[test]
+    fn fmt_write_failure_progress_interruption_preserves_diagnostics() {
+        struct ProgressWriter {
+            cancellation: CancellationToken,
+            mode: &'static str,
+            calls: usize,
+            output: Vec<u8>,
+        }
+
+        impl std::io::Write for ProgressWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    self.cancellation.cancel();
+                    match self.mode {
+                        "short" => {
+                            self.output.push(bytes[0]);
+                            return Ok(1);
+                        }
+                        "interrupted" => return Err(io::ErrorKind::Interrupted.into()),
+                        "failed" => return Err(io::ErrorKind::BrokenPipe.into()),
+                        _ => {}
+                    }
+                }
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for mode in ["short", "interrupted", "failed", "complete"] {
+            let directory = TestDirectory::new();
+            let manifest = directory.child("sai.package");
+            fs::write(&manifest, b"package acme:app@1.0.0\nsource\"src\"\n").unwrap();
+            let arguments = [
+                std::ffi::OsString::from("--color=never"),
+                std::ffi::OsString::from("fmt"),
+                directory.child("missing.sai").into_os_string(),
+                manifest.into_os_string(),
+            ];
+            let cancellation = CancellationToken::default();
+            let mut writer = ProgressWriter {
+                cancellation: cancellation.clone(),
+                mode,
+                calls: 0,
+                output: Vec::new(),
+            };
+            let exit =
+                run_with_cancellation(&arguments, &cancellation, &mut Vec::new(), &mut writer);
+            let output = String::from_utf8(writer.output).unwrap();
+            assert_eq!(exit, 130, "mode={mode}");
+            assert_eq!(writer.calls, 2, "mode={mode}, output={output}");
+            assert!(
+                output.contains("error[PATH_NOT_FOUND]"),
+                "mode={mode}: {output}"
+            );
+            assert!(!output.contains("fmt failed:"), "mode={mode}: {output}");
+            if mode == "short" {
+                assert!(output.starts_with("f\nerror["), "{output}");
+            }
+        }
+    }
+
+    #[test]
+    fn fmt_write_failure_progress_interruption_finishes_prefix_without_diagnostics() {
+        struct ProgressWriter {
+            cancellation: CancellationToken,
+            split_utf8: bool,
+            calls: usize,
+            output: Vec<u8>,
+        }
+
+        impl std::io::Write for ProgressWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    let count = if self.split_utf8 {
+                        bytes
+                            .windows(2)
+                            .position(|pair| pair == "é".as_bytes())
+                            .unwrap()
+                            + 1
+                    } else {
+                        1
+                    };
+                    self.output.extend_from_slice(&bytes[..count]);
+                    self.cancellation.cancel();
+                    return Ok(count);
+                }
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for split_utf8 in [false, true] {
+            let directory = TestDirectory::new();
+            let parent = directory.child("é");
+            fs::create_dir(&parent).unwrap();
+            let manifest = parent.join("sai.package");
+            fs::write(&manifest, b"package acme:app@1.0.0\nsource\"src\"\n").unwrap();
+            let arguments = [std::ffi::OsString::from("fmt"), manifest.into_os_string()];
+            let cancellation = CancellationToken::default();
+            let mut writer = ProgressWriter {
+                cancellation: cancellation.clone(),
+                split_utf8,
+                calls: 0,
+                output: Vec::new(),
+            };
+            let mut stdout = Vec::new();
+            let exit = run_with_cancellation(&arguments, &cancellation, &mut stdout, &mut writer);
+            let output = String::from_utf8(writer.output).unwrap();
+            assert_eq!(exit, 130);
+            assert_eq!(writer.calls, 2);
+            assert!(stdout.is_empty());
+            if split_utf8 {
+                assert!(output.ends_with("é\n"), "{output}");
+            } else {
+                assert_eq!(output, "f\n");
+            }
+            assert!(!output.contains("error["));
+            assert!(!output.contains("fmt failed:"));
+        }
+    }
+
+    #[test]
+    fn fmt_write_failure_progress_interruption_completes_utf8_boundary() {
+        struct PartialWriter {
+            cancellation: CancellationToken,
+            output: Vec<u8>,
+        }
+
+        impl std::io::Write for PartialWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let count = bytes.iter().position(|byte| *byte >= 0x80).unwrap() + 1;
+                self.output.extend_from_slice(&bytes[..count]);
+                self.cancellation.cancel();
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let cancellation = CancellationToken::default();
+        let mut writer = PartialWriter {
+            cancellation: cancellation.clone(),
+            output: Vec::new(),
+        };
+        let mut prefix = Vec::new();
+        assert_eq!(
+            super::write_human_fmt_progress(
+                &["é.sai".to_owned()],
+                &[],
+                &cancellation,
+                &mut writer,
+                &mut prefix,
+            ),
+            Err(130)
+        );
+        writer.output.extend_from_slice(&prefix);
+        writer.output.extend_from_slice(b"error[TEST]");
+        assert_eq!(
+            String::from_utf8(writer.output).unwrap(),
+            "formatted é\nerror[TEST]"
+        );
+    }
+
+    #[test]
+    fn fmt_write_failure_early_interruption_preserves_initial_diagnostics() {
+        for format in ["human", "json"] {
+            let arguments = ["--format", format, "--color=never", "fmt", "missing.sai"]
+                .map(std::ffi::OsString::from);
+            let parsed = parse_args(&arguments);
+            let command = parsed.command.as_ref().expect("fmt command");
+            let cancellation = CancellationToken::default();
+            cancellation.cancel();
+            let diagnostic = super::fmt_io_diagnostic(
+                "SOURCE_READ_FAILED",
+                "earlier.sai",
+                "read failed",
+                &io::Error::other("failure"),
+            );
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = super::run_fmt_paths_for_inputs(
+                &parsed,
+                command,
+                super::FmtPathRunInput {
+                    positionals: &[],
+                    input_paths: &[PathBuf::from("missing.sai")],
+                    initial_errors: Vec::new(),
+                    initial_diagnostics: vec![diagnostic],
+                    initial_error_count: 1,
+                    workspace_discovery_signature: None,
+                    workspace_start_directory: None,
+                },
+                &cancellation,
+                &mut stdout,
+                &mut stderr,
+                &mut super::FmtPathRetryState {
+                    remaining_retries: 0,
+                    waiting_reported: false,
+                },
+            );
+            assert_eq!(exit, 130, "{format}");
+            let output = String::from_utf8(if format == "json" { stdout } else { stderr }).unwrap();
+            assert!(output.contains("SOURCE_READ_FAILED"), "{format}: {output}");
+            if format == "json" {
+                assert!(output.contains("\"exit_code\":130"), "{output}");
+            } else {
+                assert!(!output.contains("fmt failed:"), "{output}");
+            }
+        }
+    }
+
+    #[test]
+    fn fmt_write_failure_lock_wait_interruption_preserves_diagnostics() {
+        struct LockWaitWriter {
+            cancellation: CancellationToken,
+            output: Vec<u8>,
+            first: bool,
+        }
+
+        impl std::io::Write for LockWaitWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.first {
+                    self.first = false;
+                    self.output.push(bytes[0]);
+                    self.cancellation.cancel();
+                    return Ok(1);
+                }
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let directory = TestDirectory::new();
+        let package = create_check_package(&directory);
+        let _guard =
+            super::WorkspaceLockGuard::try_acquire(&package, super::WorkspaceLockMode::Exclusive)
+                .unwrap()
+                .expect("acquire fixture lock");
+        let arguments = [
+            std::ffi::OsString::from("--color=never"),
+            std::ffi::OsString::from("fmt"),
+            directory.child("missing.sai").into_os_string(),
+            package.join("sai.package").into_os_string(),
+        ];
+        let cancellation = CancellationToken::default();
+        let mut writer = LockWaitWriter {
+            cancellation: cancellation.clone(),
+            output: Vec::new(),
+            first: true,
+        };
+        assert_eq!(
+            run_with_cancellation(&arguments, &cancellation, &mut Vec::new(), &mut writer),
+            130
+        );
+        let output = String::from_utf8(writer.output).unwrap();
+        assert!(output.starts_with("w\nerror[PATH_NOT_FOUND]"), "{output}");
+        assert!(!output.contains("fmt failed:"), "{output}");
+    }
+
+    #[test]
+    fn fmt_write_failure_interrupted_json_keeps_diagnostics_and_precedence() {
+        let arguments = ["--format=json", "--max-errors", "1", "fmt"].map(std::ffi::OsString::from);
+        let parsed = parse_args(&arguments);
+        let diagnostics = || {
+            vec![
+                super::fmt_io_diagnostic(
+                    "SOURCE_READ_FAILED",
+                    "a.sai",
+                    "read failed",
+                    &io::Error::other("failure"),
+                ),
+                internal_fmt_diagnostic("formatter failed".to_owned(), None),
+            ]
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            super::report_fmt_interrupted(&parsed, diagnostics(), 2, &mut stdout, &mut stderr),
+            130
+        );
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("SOURCE_READ_FAILED"));
+        assert!(!output.contains("INTERNAL_COMPILER_ERROR"));
+        assert!(output.contains("\"errors\":2"));
+        assert!(output.contains("\"shown_errors\":1"));
+        assert!(output.contains("\"exit_code\":130"));
+        assert!(stderr.is_empty());
+        assert_eq!(
+            super::report_fmt_interrupted(
+                &parsed,
+                diagnostics(),
+                2,
+                &mut BrokenPipeWriter,
+                &mut Vec::new(),
+            ),
+            130
+        );
+        assert_eq!(
+            super::report_fmt_interrupted(
+                &parsed,
+                diagnostics(),
+                2,
+                &mut BrokenPipeWriter,
+                &mut BrokenPipeWriter,
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn fmt_write_failure_ice_follows_earlier_diagnostics() {
+        for format in ["human", "json"] {
+            for located in [false, true] {
+                let arguments =
+                    ["--format", format, "--max-errors", "0", "fmt"].map(std::ffi::OsString::from);
+                let parsed = parse_args(&arguments);
+                let earlier = super::fmt_io_diagnostic(
+                    "SOURCE_READ_FAILED",
+                    "z.sai",
+                    "could not read source",
+                    &io::Error::other("test failure"),
+                );
+                let primary = located.then(|| {
+                    let mut source = CliSourceIndex::new(Arc::from(&b"x"[..]));
+                    source.location("a.sai", 0..1, false)
+                });
+                let ice = internal_fmt_diagnostic("formatter failed".to_owned(), primary);
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let exit = report_fmt_diagnostics(
+                    &parsed,
+                    vec![earlier, ice],
+                    2,
+                    None,
+                    &mut stdout,
+                    &mut stderr,
+                );
+                let output =
+                    String::from_utf8(if format == "human" { stderr } else { stdout }).unwrap();
+                assert_eq!(exit, 101);
+                let earlier = output
+                    .find("SOURCE_READ_FAILED")
+                    .expect("earlier diagnostic");
+                let ice = output
+                    .find("INTERNAL_COMPILER_ERROR")
+                    .expect("ICE diagnostic");
+                assert!(earlier < ice);
+            }
+        }
     }
 
     #[test]

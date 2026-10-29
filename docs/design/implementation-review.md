@@ -9259,3 +9259,9 @@
 - **Decision — review required:** Accept complete package paths only when their introducer, newline context and end boundary are unambiguous. Reject malformed or uncertain paths instead of interpreting them as ordinary tokens and possibly missing expectations. This relaxes one scanner limitation without claiming full lexer coverage.
 - **Verification:** The focused extractor suite ran 29 tests; the full conformance-component suite ran 93 tests successfully with three skips. The scanner still rejects other unsupported or ambiguous source forms and is not a full conformance harness.
 - **Hostile review:** Independent review checked package-segment grammar, boundaries, newline suppression, comments and strings and found no actionable false-negative within the accepted subset.
+
+### IR-1025 (2026-10-29): preserve fmt failures and interrupted diagnostics
+
+- **Decision — review required:** Preserve `fmt`'s internal-error precedence on output failures, stop processing files after an internal error, and retain diagnostics gathered before cancellation at the covered safe points. A partial progress line is completed before diagnostics so that UTF-8 and diagnostic headings remain valid. The interpretation of a simultaneous failure of both output streams follows IR-1016.
+- **Verification:** Ten focused writer and interruption tests passed, including short writes and split UTF-8; formatting and diff checks passed. An end-to-end formatter ICE injection test is still missing. Cancellation during final human or JSON rendering remains unresolved and can leave a non-interrupted exit or summary.
+- **Hostile review:** Independent reviews found lost diagnostics, unchecked cancellation between short writes, malformed joined headings and unfinished prefixes without diagnostics. The covered paths were corrected; the final focused review found no further defect in the prefix repair.
