@@ -3325,16 +3325,28 @@ fn public_inherent_method_body_emits_check_result() {
 
 #[test]
 fn public_inherent_method_body_reads_primitive_field() {
-    let source = concat!(
-        "type Counter { count: I32 }\n",
-        "impl Counter {\n",
-        "    pub fn current_count(self: borrow Self) -> I32 {\n",
-        "        let count = self.count\n",
-        "        count\n",
-        "    }\n",
-        "}\n",
-    );
-    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    for source in [
+        concat!(
+            "type Counter { count: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> I32 {\n",
+            "        let count = self.count\n",
+            "        count\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { count: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self, _unused: I32) -> I32 {\n",
+            "        let count = self.count\n",
+            "        count\n",
+            "    }\n",
+            "}\n",
+        ),
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
 }
 
 #[test]
@@ -9024,13 +9036,12 @@ fn primitive_arithmetic_local_literal_range_uses_the_selected_pointer_width() {
     }
 
     let wasm64 = run_check(source, manifest, &[], &["--target", "wasm64-core"]);
-    assert_eq!(
-        wasm64.status.code(),
-        Some(0),
-        "both literals should fit wasm64:\n{}",
-        String::from_utf8_lossy(&wasm64.stdout)
+    let wasm64_stdout = String::from_utf8(wasm64.stdout.clone()).expect("CLI stdout is UTF-8");
+    assert!(
+        !wasm64_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""),
+        "both literals should fit wasm64:\n{wasm64_stdout}"
     );
-    assert_success_result(wasm64, "wasm64-core", "dev");
+    assert_check_stays_gated(&wasm64, source);
 }
 
 #[test]
@@ -10027,8 +10038,13 @@ fn unused_literal_binding_with_bom_and_comment_stays_gated() {
 
 #[test]
 fn ir_1013_multiple_unused_local_binding_stays_gated() {
-    let source = "pub fn f() -> I32 {\n    let first = 1\n    let second = 2\n    second\n}\n";
-    assert_ir_1013_unused_binding_gate(source);
+    for source in [
+        "pub fn f() -> I32 {\n    let first = 1\n    let second = 2\n    second\n}\n",
+        "pub fn f(left: I32, right: I32) -> I32 {\n    let unused = left + right\n    let result = left + right\n    result\n}\n",
+        "pub fn f(left: I32, right: I32, spare: I32) -> I32 {\n    let unused = left + right\n    let result = left + right\n    result\n}\n",
+    ] {
+        assert_ir_1013_unused_binding_gate(source);
+    }
 }
 
 #[test]
@@ -10100,8 +10116,12 @@ fn ir_1013_unicode_identifier_shadowing_stays_gated() {
 
 #[test]
 fn ir_1013_inherent_method_unused_parameter_stays_gated() {
-    let source = "type Counter { marker: I32 }\nimpl Counter {\n    pub fn f(self: borrow Self, x: I32, y: I32) -> I32 {\n        let z = x\n        z\n    }\n}\n";
-    assert_ir_1013_unused_binding_gate(source);
+    for source in [
+        "type Counter { marker: I32 }\nimpl Counter {\n    pub fn f(self: borrow Self, x: I32, y: I32) -> I32 {\n        let z = x\n        z\n    }\n}\n",
+        "type Counter { marker: I32 }\nimpl Counter {\n    pub fn f(self: borrow Self, unused: I32) -> I32 {\n        let value = self.marker\n        value\n    }\n}\n",
+    ] {
+        assert_ir_1013_unused_binding_gate(source);
+    }
 }
 
 #[test]

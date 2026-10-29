@@ -2231,6 +2231,154 @@ fn check_simple_local_name(local: &sai_syntax::ast::LetStmt) -> Option<String> {
     ))
 }
 
+fn check_flat_expression_uses_bindings(
+    expression: &sai_syntax::ast::Expr,
+    bindings: &mut [(String, bool)],
+) -> Option<()> {
+    use sai_syntax::ast;
+
+    let mut pending = vec![expression.clone()];
+    while let Some(expression) = pending.pop() {
+        match expression {
+            ast::Expr::Path(path) => {
+                let name = check_plain_path_name(&path)?;
+                if let Some((_, used)) = bindings
+                    .iter_mut()
+                    .rev()
+                    .find(|(binding, _)| *binding == name)
+                {
+                    *used = true;
+                }
+            }
+            ast::Expr::Literal(literal) if literal.token().is_some() => {}
+            ast::Expr::Paren(paren) => pending.push(paren.expression()?),
+            ast::Expr::Binary(binary) => {
+                pending.push(binary.rhs()?);
+                pending.push(binary.lhs()?);
+            }
+            ast::Expr::Prefix(prefix) => pending.push(prefix.operand()?),
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CheckBindingAnalysis {
+    NotApplicable,
+    Complete(bool),
+    Incomplete,
+}
+
+fn check_two_binary_local_unused_bindings(
+    parameters: &sai_syntax::ast::ParamList,
+    body: &sai_syntax::ast::Block,
+    tail: &sai_syntax::ast::PathExpr,
+) -> CheckBindingAnalysis {
+    use sai_syntax::ast;
+
+    let mut statements = body.statements();
+    let Some(ast::Stmt::Let(first)) = statements.next() else {
+        return CheckBindingAnalysis::NotApplicable;
+    };
+    let Some(ast::Stmt::Let(second)) = statements.next() else {
+        return CheckBindingAnalysis::NotApplicable;
+    };
+    if !matches!(first.initializer(), Some(ast::Expr::Binary(_)))
+        || !matches!(second.initializer(), Some(ast::Expr::Binary(_)))
+        || !matches!(statements.next(), Some(ast::Stmt::Expr(_)))
+        || statements.next().is_some()
+    {
+        return CheckBindingAnalysis::NotApplicable;
+    }
+
+    let mut bindings = Vec::new();
+    for parameter in parameters.params() {
+        if bindings.len() == 64 {
+            return CheckBindingAnalysis::Incomplete;
+        }
+        let Some(token) = parameter.name().and_then(|name| name.token()) else {
+            return CheckBindingAnalysis::NotApplicable;
+        };
+        bindings.push((
+            sai_syntax::normalize_identifier(
+                token.text().strip_prefix("r#").unwrap_or(token.text()),
+            ),
+            false,
+        ));
+    }
+    for local in [&first, &second] {
+        if bindings.len() == 64 {
+            return CheckBindingAnalysis::Incomplete;
+        }
+        let Some(initializer) = local.initializer() else {
+            return CheckBindingAnalysis::NotApplicable;
+        };
+        if check_flat_expression_uses_bindings(&initializer, &mut bindings).is_none() {
+            return CheckBindingAnalysis::NotApplicable;
+        }
+        let Some(name) = check_simple_local_name(local) else {
+            return CheckBindingAnalysis::NotApplicable;
+        };
+        bindings.push((name, false));
+    }
+    let Some(tail_name) = check_plain_path_name(tail) else {
+        return CheckBindingAnalysis::NotApplicable;
+    };
+    if let Some((_, used)) = bindings
+        .iter_mut()
+        .rev()
+        .find(|(binding, _)| *binding == tail_name)
+    {
+        *used = true;
+    }
+    CheckBindingAnalysis::Complete(
+        bindings
+            .iter()
+            .any(|(name, used)| !name.starts_with('_') && !used),
+    )
+}
+
+fn check_self_field_local_unused_parameters(
+    parameters: &sai_syntax::ast::ParamList,
+    body: &sai_syntax::ast::Block,
+    tail: &sai_syntax::ast::PathExpr,
+) -> Option<bool> {
+    use sai_syntax::ast;
+
+    if parameters.self_param().is_none() {
+        return None;
+    }
+    let mut statements = body.statements();
+    let Some(ast::Stmt::Let(local)) = statements.next() else {
+        return None;
+    };
+    if !matches!(statements.next(), Some(ast::Stmt::Expr(_))) || statements.next().is_some() {
+        return None;
+    }
+    let Some(ast::Expr::Field(field)) = local.initializer() else {
+        return None;
+    };
+    if field.generic_args().is_some()
+        || !matches!(field.base(), Some(ast::Expr::SelfValue(_)))
+        || check_simple_local_name(&local)? != check_plain_path_name(tail)?
+    {
+        return None;
+    }
+    for parameter in parameters.params() {
+        let token = parameter.name()?.token()?;
+        if !token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(token.text())
+            .starts_with('_')
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 fn check_known_unused_binding_shape(
     parameters: &sai_syntax::ast::ParamList,
     body: &sai_syntax::ast::Block,
@@ -2409,6 +2557,14 @@ fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
         && let Some(path_name) = path.name()
         && path.syntax().text_range() == path_name.syntax().text_range()
     {
+        if check_self_field_local_unused_parameters(&parameters, &body, path).unwrap_or(false) {
+            return Some(true);
+        }
+        match check_two_binary_local_unused_bindings(&parameters, &body, path) {
+            CheckBindingAnalysis::Complete(true) => return Some(true),
+            CheckBindingAnalysis::Incomplete => return None,
+            CheckBindingAnalysis::Complete(false) | CheckBindingAnalysis::NotApplicable => {}
+        }
         if check_flat_unused_bindings(&parameters, &body, path).unwrap_or(false) {
             return Some(true);
         }
@@ -14749,18 +14905,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        CancellationAwareStdin, CheckDiagnostic, CheckLockedDependencyPackage,
-        CheckLockedDependencySource, CheckLockedWitDirectory, CheckModuleTreePackageInput,
-        CheckPackageManifestInput, CheckWorkspaceSourceBudget, CheckWorkspaceWitBudget,
-        CliDiagnostic, CliLocation, CliPosition, CliSourceIndex, EXPLAIN_CODE_SUMMARIES,
-        PackageKey, PackageRelativePath, RenderedSourceLine, StdinBroker, StdinReadError,
-        WorkspaceSnapshot, check_body_matches_unused_variable_gate,
+        CancellationAwareStdin, CheckBindingAnalysis, CheckDiagnostic,
+        CheckLockedDependencyPackage, CheckLockedDependencySource, CheckLockedWitDirectory,
+        CheckModuleTreePackageInput, CheckPackageManifestInput, CheckWorkspaceSourceBudget,
+        CheckWorkspaceWitBudget, CliDiagnostic, CliLocation, CliPosition, CliSourceIndex,
+        EXPLAIN_CODE_SUMMARIES, PackageKey, PackageRelativePath, RenderedSourceLine, StdinBroker,
+        StdinReadError, WorkspaceSnapshot, check_body_matches_unused_variable_gate,
         check_locked_active_wit_directory_inputs, check_locked_dependency_source_inputs,
         check_locked_wit_directory_inputs, check_module_tree_workspace_exceeds_limits,
         check_package_manifest_snapshot_files,
-        check_source_is_single_unattributed_public_inherent_method, cli_position,
-        compare_check_diagnostics, fmt_path_selection_signature, has_incomplete_wit_input_capture,
-        human_file_path, internal_fmt_diagnostic, parse_args, phase1_package_collection_order,
+        check_source_is_single_unattributed_public_inherent_method,
+        check_two_binary_local_unused_bindings, cli_position, compare_check_diagnostics,
+        fmt_path_selection_signature, has_incomplete_wit_input_capture, human_file_path,
+        internal_fmt_diagnostic, parse_args, phase1_package_collection_order,
         read_file_limited_with_progress, relative_path, report_fmt_diagnostics, run,
         run_new_with_creator, run_with_cancellation, run_with_cancellation_and_input,
         write_file_atomically_in_directory, write_human_diagnostics, write_json_explain_diagnostic,
@@ -14872,6 +15029,67 @@ mod tests {
             assert_eq!(
                 check_body_matches_unused_variable_gate(source.as_bytes()),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn two_binary_local_gate_reports_unknown_at_binding_limit() {
+        use sai_syntax::ast::{self, AstNode as _};
+
+        for parameter_count in [62, 63, 64, 65] {
+            let parameters = (0..parameter_count)
+                .map(|index| format!("p{index}: I32"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let first_initializer = (0..parameter_count)
+                .map(|index| format!("p{index}"))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let second_initializer = format!("first + p0");
+            let source = format!(
+                "pub fn f({parameters}) -> I32 {{\n\
+                 let first = {first_initializer}\n\
+                 let second = {second_initializer}\n\
+                 second\n\
+                 }}\n"
+            );
+            let parsed = sai_fmt::parse_source(source.as_bytes()).expect("source parses");
+            let source_file =
+                ast::SourceFile::cast(parsed.root().clone()).expect("source file root");
+            let ast::Item::Function(function) = source_file.items().next().expect("function")
+            else {
+                panic!("expected function item");
+            };
+            let parameters = function.params().expect("parameter list");
+            let body = function.body().expect("function body");
+            let mut statements = body.statements();
+            statements.next().expect("first local");
+            statements.next().expect("second local");
+            let ast::Stmt::Expr(tail) = statements.next().expect("tail expression") else {
+                panic!("expected tail expression");
+            };
+            let ast::Expr::Path(tail) = tail.expression().expect("tail path") else {
+                panic!("expected path tail");
+            };
+
+            assert_eq!(
+                check_two_binary_local_unused_bindings(&parameters, &body, &tail),
+                if parameter_count == 62 {
+                    CheckBindingAnalysis::Complete(false)
+                } else {
+                    CheckBindingAnalysis::Incomplete
+                },
+                "the binary-local helper's 64-binding analysis boundary at {parameter_count} parameters"
+            );
+            assert_eq!(
+                check_body_matches_unused_variable_gate(source.as_bytes()),
+                if parameter_count == 62 {
+                    Some(false)
+                } else {
+                    None
+                },
+                "the root coverage gate must preserve incomplete status at {parameter_count} parameters"
             );
         }
     }
