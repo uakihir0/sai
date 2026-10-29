@@ -9156,3 +9156,9 @@
 - **Decision — review required:** Add owner-local binding-identity analysis as a separate component. It returns no candidates when syntax, lowering, resolution or module-alias information is incomplete. The caller must guarantee that its `Complete` alias set is current and exhaustive; the component cannot verify that guarantee itself. It emits no lint and does not expand CLI coverage.
 - **Verification:** The `sai_resolve` suite passed 272 tests, including scope and shadowing, assignment use, real-lowering spans, incompatible source maps and unsupported pattern cases. Closures, complex patterns, typed locals, contracts and several other forms remain incomplete.
 - **Hostile review:** Independent review identified the missing alias-completeness contract and weaknesses in source-map and parameter-span tests. The explicit contract and regression tests were added and re-reviewed. Integrating the actual module scope and lint pipeline remains necessary to resolve IR-1001.
+
+### IR-1008 (2026-10-29): opt in to primitive assertion checking
+
+- **Decision — review required:** Add an opt-in checker for message-free assertions over supported scalar literals and trusted concrete primitive paths. Unknown or pending prior diagnostics and unsupported conditions remain gated; existing driver and CLI entry points do not opt in, so this does not claim complete assertion support.
+- **Verification:** All 157 `sai_ty` tests passed, including supported conditions, type errors, delayed literal errors and conservative rejection cases. Actual lowering and CLI integration remain future work.
+- **Hostile review:** An independent reviewer found that delayed literal errors could bypass the prior-error guard. Pending literal and unary candidates now prevent path checking; a re-review found no further actionable defect in the checked subset.

@@ -278,6 +278,26 @@ struct LiteralVariable<'hir> {
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
 pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> PrimitiveBodyCheck {
+    check_primitive_local_block_body_impl(input, false)
+}
+
+/// Opt-in primitive-local checking with message-free `assert` statements.
+///
+/// Assertion conditions are limited to scalar literals and trusted, concrete
+/// primitive local paths. All other conditions and assertion messages remain
+/// unsupported. Paths are also rejected after an earlier body error, while
+/// literal or operator diagnostics may still be deferred, or when unknown
+/// self-field errors are present; the driver's legacy gate is unchanged.
+pub fn check_primitive_local_block_body_with_assertions(
+    input: PrimitiveBodyInput<'_, '_>,
+) -> PrimitiveBodyCheck {
+    check_primitive_local_block_body_impl(input, true)
+}
+
+fn check_primitive_local_block_body_impl(
+    input: PrimitiveBodyInput<'_, '_>,
+    allow_assertions: bool,
+) -> PrimitiveBodyCheck {
     if !supports_primitive_literal(input.return_type) {
         return PrimitiveBodyCheck::Unsupported;
     }
@@ -300,6 +320,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
     }
     let mut context = FnCtxt {
         input,
+        allow_assertions,
         known_bindings,
         binding_type_candidates,
         binding_candidate_order: Vec::new(),
@@ -342,6 +363,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
 
 struct FnCtxt<'a, 'hir> {
     input: PrimitiveBodyInput<'a, 'hir>,
+    allow_assertions: bool,
     known_bindings: HashMap<BindingId, LocalType>,
     binding_type_candidates: HashMap<BindingId, LocalType>,
     binding_candidate_order: Vec<BindingId>,
@@ -526,6 +548,45 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_stmt(&mut self, stmt: &Stmt<'hir>) -> Result<(), ()> {
+        if let StmtKind::Assert { cond, msg, .. } = stmt.kind {
+            if !self.allow_assertions || msg.is_some() {
+                return Err(());
+            }
+            return match cond.kind {
+                ExprKind::Lit(literal) => {
+                    let found = primitive_literal_kind(literal).ok_or(())?;
+                    self.check_annotated_literal(PrimTy::Bool, literal, found, cond.hir_id);
+                    Ok(())
+                }
+                ExprKind::Path(_) => {
+                    if !self.errors.is_empty()
+                        || self.pending_operator_trait_count != 0
+                        || self
+                            .literal_variables
+                            .iter()
+                            .any(|variable| variable.resolved.is_none())
+                        || self
+                            .input
+                            .unknown_self_fields
+                            .is_some_and(|fields| !fields.is_empty())
+                    {
+                        return Err(());
+                    }
+                    let binding = self.plain_local_path_binding(cond).ok_or(())?;
+                    if !self.trusted_bindings.contains(&binding) {
+                        return Err(());
+                    }
+                    let LocalType::Concrete(found) = self.check_local_path(cond)? else {
+                        return Err(());
+                    };
+                    if !supports_primitive_literal(found) {
+                        return Err(());
+                    }
+                    self.check_annotated_path(LocalType::Concrete(found), PrimTy::Bool, cond.hir_id)
+                }
+                _ => Err(()),
+            };
+        }
         let StmtKind::Let {
             pat,
             ty,
@@ -3860,8 +3921,14 @@ fn collect_primitive_expression_nodes<'hir>(
     match expression.kind {
         ExprKind::Block(block) => {
             for stmt in block.stmts {
-                if let StmtKind::Let { init, .. } = stmt.kind {
-                    collect_primitive_expression_nodes(init, nodes);
+                match stmt.kind {
+                    StmtKind::Let { init, .. } => collect_primitive_expression_nodes(init, nodes),
+                    StmtKind::Assert {
+                        cond, msg: None, ..
+                    } => {
+                        collect_primitive_expression_nodes(cond, nodes);
+                    }
+                    _ => {}
                 }
             }
             if let Some(tail) = block.tail {
