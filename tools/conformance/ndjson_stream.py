@@ -6,6 +6,7 @@ validation: command-specific result schemas, diagnostic ordering and other
 context-dependent rules still need to be checked by the caller.
 """
 
+import argparse
 import json
 import re
 import sys
@@ -77,6 +78,8 @@ SUMMARY = fields(type=("const", "summary"), errors="uint", warnings="uint", info
                  shown_errors="uint", suppressed=fields(cascade="uint", duplicate="uint", dependency="uint"),
                  exit_code="uint")
 SCHEMAS = {"header": HEADER, "diagnostic": DIAGNOSTIC, "result": RESULT, "summary": SUMMARY}
+UNSET = object()
+EXIT_CODES = frozenset((0, 1, 2, 3, 4, 101, 130))
 
 
 def check(value, spec, path):
@@ -185,8 +188,22 @@ def parse_line(line):
     return value
 
 
-def validate_stream(lines):
-    """Return records after partial v1 validation; never a conformance verdict."""
+def validate_stream(lines, *, max_errors=UNSET, process_exit_code=UNSET, stderr=UNSET):
+    """Return partially validated records; optional inputs enable independent checks.
+
+    stderr is the complete captured bytes for a normal, successful stdout write.
+    Failed stdout writes and their potentially incomplete streams require a
+    separate protocol check and are not accepted by this validator.
+    """
+    if max_errors is not UNSET and (type(max_errors) is not int or max_errors < 0):
+        raise StreamError("max_errors must be a non-negative integer")
+    if process_exit_code is not UNSET and (type(process_exit_code) is not int or
+                                            process_exit_code not in EXIT_CODES):
+        raise StreamError("invalid process exit code")
+    if stderr is not UNSET and not isinstance(stderr, bytes):
+        raise StreamError("stderr must be captured bytes")
+    if stderr is not UNSET and stderr:
+        raise StreamError("stderr must be empty when stdout writes succeed")
     records = []
     seen_result = False
     interleavable = True
@@ -216,6 +233,12 @@ def validate_stream(lines):
                         record["warnings"] != shown["warning"] or
                         record["infos"] != shown["info"]):
                     raise StreamError("inconsistent diagnostic counts")
+                if max_errors is not UNSET:
+                    expected = record["errors"] if max_errors == 0 else min(record["errors"], max_errors)
+                    if record["shown_errors"] != expected:
+                        raise StreamError("shown_errors inconsistent with max_errors")
+                if process_exit_code is not UNSET and record["exit_code"] != process_exit_code:
+                    raise StreamError("summary exit_code differs from process exit code")
             records.append(record)
         except StreamError as error:
             raise StreamError(f"line {number}: {error}") from error
@@ -225,14 +248,35 @@ def validate_stream(lines):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--max-errors", type=int, default=UNSET,
+                        help="actual IUT --max-errors value (0 means unlimited)")
+    parser.add_argument("--process-exit-code", type=int, default=UNSET,
+                        help="observed IUT process exit code")
+    parser.add_argument("--stderr-file", default=UNSET,
+                        help="file containing complete captured IUT stderr")
+    args = parser.parse_args()
     try:
-        records = validate_stream(sys.stdin.buffer)
-    except StreamError as error:
+        stderr = UNSET
+        if args.stderr_file is not UNSET:
+            with open(args.stderr_file, "rb", buffering=0) as captured:
+                stderr = captured.read(1)
+        records = validate_stream(sys.stdin.buffer, max_errors=args.max_errors,
+                                  process_exit_code=args.process_exit_code, stderr=stderr)
+    except (StreamError, OSError) as error:
         print(f"invalid stream: {error}", file=sys.stderr)
         return 1
+    unchecked = ["command-specific result schemas", "diagnostic order and registry",
+                 "source-dependent semantics", "exit-code semantics", "golden comparison"]
+    if args.max_errors is UNSET:
+        unchecked.append("max-errors count")
+    if args.process_exit_code is UNSET:
+        unchecked.append("process exit code match")
+    if args.stderr_file is UNSET:
+        unchecked.append("stderr")
+    unchecked.append("stdout write failure protocol")
     print(json.dumps({"status": "partial", "records": len(records),
-                      "unchecked": ["command-specific result schemas", "diagnostic order and registry",
-                                    "source-dependent semantics", "process exit and stderr", "golden comparison"]}))
+                      "unchecked": unchecked}))
     return 2
 
 

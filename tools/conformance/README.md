@@ -54,9 +54,11 @@ test must not be treated as passing or as having no expectations.
 
 `python3 tools/conformance/ndjson_stream.py` reads a binary NDJSON stream from
 standard input and checks common version 1 wire-format and record constraints.
-Even when these checks succeed, it reports `partial` and exits 2: callers must
-still check command-specific schemas, the error limit, diagnostic ordering,
-registered codes, source-dependent constraints, process status and stderr.
+The optional `--max-errors`, `--process-exit-code`, and `--stderr-file` inputs
+check the observed error limit, exit-code agreement, and empty stderr. Even
+when these checks succeed, it reports `partial` and exits 2: callers must still
+check command-specific schemas, diagnostic ordering, registered codes,
+source-dependent constraints, exit-code semantics and stdout write failures.
 
 These components are not the full harness and cannot substantiate a
 conformance claim. The caller must discover tests, resolve package paths,

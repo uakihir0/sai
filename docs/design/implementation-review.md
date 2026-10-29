@@ -9181,3 +9181,9 @@
 - **Decision — review required:** Provide a standalone diagnostic conversion with explicit complete scope, alias and lint-context contracts. It returns `Incomplete` for unverifiable fixes, including legitimate format-unit edits outside the binding name. A temporary limit of 64 candidates and 8 MiB of candidate-count times source size bounds repeated fix-validation copies; exceeding it returns `Incomplete`, never a clean result. The planner's own work remains unbounded.
 - **Verification:** Eleven focused driver tests passed, including lint levels, raw and BOM offsets, unsafe fixes, limits and scope failures. The component is not wired into the pipeline; a production format-unit planner and complete context collection are still required.
 - **Hostile review:** Independent review found per-candidate whole-tree scans, valid formatted edits being rejected and repeated whole-file copies. Indexing and a bounded conservative refusal address the immediate risks; a final review found no further issue in those bounds. Eliminating the temporary limits requires reusable fix validation.
+
+### IR-1012 (2026-10-29): check observed diagnostic command metadata
+
+- **Decision — review required:** Allow the partial stream validator to check explicitly supplied error limits, process exit-code agreement and captured stderr. Missing observations remain unchecked, and even a successful partial check cannot substantiate a conformance claim or validate exit-code semantics and stdout write failure.
+- **Verification:** All 56 conformance-component tests passed; focused tests cover bounds, mismatched process status and stderr. The validator remains independent of compiler internals.
+- **Hostile review:** Independent review found that reading the entire stderr capture could exhaust memory on an invalid implementation. The CLI now checks only its first byte, including for unbounded streams; re-review found no further actionable defect in the checked subset.

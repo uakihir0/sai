@@ -2,10 +2,12 @@ import io
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import mock_open, patch
 
-from ndjson_stream import StreamError, validate_stream
+from ndjson_stream import StreamError, main, validate_stream
 
 
 def header(command="check"):
@@ -214,6 +216,97 @@ class StreamTests(unittest.TestCase):
         self.validate([header(), record, summary(1, 1)])
         variants[0]["steps"] = [step] * 33
         self.invalid([header(), record, summary(1, 1)])
+
+    def test_explicit_error_limit(self):
+        error = diagnostic()
+        warning = diagnostic()
+        warning["severity"] = "warning"
+        info = diagnostic()
+        info["severity"] = "info"
+        for total, shown, limit, valid in ((0, 0, 0, True), (0, 0, 50, True),
+                                           (1, 1, 0, True), (2, 1, 0, False),
+                                           (2, 1, 1, True), (2, 1, 2, False),
+                                           (2, 2, 1, False), (2, 2, 50, True),
+                                           (51, 50, 50, True), (51, 49, 50, False)):
+            end = summary(total, shown)
+            end["warnings"] = end["infos"] = 1
+            records = [header(), warning, *([error] * shown), info, end]
+            with self.subTest(total=total, shown=shown, limit=limit):
+                if valid:
+                    self.assertEqual(validate_stream(io.BytesIO(encode(records)), max_errors=limit), records)
+                else:
+                    with self.assertRaises(StreamError):
+                        validate_stream(io.BytesIO(encode(records)), max_errors=limit)
+        records = [header(), error, summary(2, 1)]
+        self.assertEqual(self.validate(records), records)
+        for invalid in (None, True, -1, 1.5, "0"):
+            with self.subTest(invalid=invalid), self.assertRaises(StreamError):
+                validate_stream(io.BytesIO(encode(records)), max_errors=invalid)
+
+    def test_process_context_checks_are_independent(self):
+        records = [header(), summary()]
+        data = encode(records)
+        self.assertEqual(validate_stream(io.BytesIO(data), process_exit_code=0), records)
+        self.assertEqual(validate_stream(io.BytesIO(data), stderr=b""), records)
+        self.assertEqual(validate_stream(io.BytesIO(data), max_errors=0,
+                                         process_exit_code=0, stderr=b""), records)
+        for invalid in (None, True, -1, 255, "0"):
+            with self.subTest(exit_code=invalid), self.assertRaises(StreamError):
+                validate_stream(io.BytesIO(data), process_exit_code=invalid)
+        for invalid in (None, "", bytearray(), b"warning\n", b"\xff"):
+            with self.subTest(stderr=invalid), self.assertRaises(StreamError):
+                validate_stream(io.BytesIO(data), stderr=invalid)
+        with self.assertRaises(StreamError):
+            validate_stream(io.BytesIO(data), process_exit_code=1)
+        for code in (0, 1, 2, 3, 4, 101, 130):
+            end = summary()
+            end["exit_code"] = code
+            self.assertEqual(validate_stream(io.BytesIO(encode([header(), end])),
+                                             process_exit_code=code), [header(), end])
+        with self.assertRaises(StreamError):
+            validate_stream(io.BytesIO(b""), process_exit_code=4,
+                            stderr=b"sai: cannot write to standard output: broken pipe\n")
+
+    def test_cli_optional_checks_and_partial_reporting(self):
+        script = Path(__file__).with_name("ndjson_stream.py")
+        records = [header(), diagnostic(), summary(2, 1)]
+        with tempfile.TemporaryDirectory() as directory:
+            stderr_file = Path(directory) / "stderr"
+            stderr_file.write_bytes(b"")
+            command = [sys.executable, "-B", str(script), "--max-errors", "1",
+                       "--process-exit-code", "0", "--stderr-file", str(stderr_file)]
+            result = subprocess.run(command, input=encode(records), capture_output=True, check=False)
+            self.assertEqual(result.returncode, 2)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "partial")
+            self.assertNotIn("max-errors count", report["unchecked"])
+            self.assertNotIn("process exit code match", report["unchecked"])
+            self.assertNotIn("stderr", report["unchecked"])
+            self.assertIn("diagnostic order and registry", report["unchecked"])
+            self.assertIn("exit-code semantics", report["unchecked"])
+            self.assertIn("stdout write failure protocol", report["unchecked"])
+            for changed in (["--max-errors", "0"], ["--process-exit-code", "1"],
+                            ["--stderr-file", str(stderr_file / "missing")]):
+                result = subprocess.run([sys.executable, "-B", str(script), *changed],
+                                        input=encode(records), capture_output=True, check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, b"")
+            stderr_file.write_bytes(b"unexpected\n")
+            result = subprocess.run(command, input=encode(records), capture_output=True, check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, b"")
+        result = subprocess.run([sys.executable, "-B", str(script)], input=encode(records),
+                                capture_output=True, check=False)
+        report = json.loads(result.stdout)
+        self.assertTrue({"max-errors count", "process exit code match", "stderr"} <= set(report["unchecked"]))
+
+    def test_cli_reads_only_one_stderr_byte(self):
+        captured = mock_open(read_data=b"unexpected stderr")
+        with patch("builtins.open", captured), patch.object(sys, "argv", ["validator", "--stderr-file", "stderr"]), \
+                patch.object(sys, "stderr", new_callable=io.StringIO):
+            self.assertEqual(main(), 1)
+        captured.assert_called_once_with("stderr", "rb", buffering=0)
+        captured().read.assert_called_once_with(1)
 
     def test_cli_never_reports_partial_as_success(self):
         script = Path(__file__).with_name("ndjson_stream.py")
