@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod canonical_name_fix_planner;
 mod export_world_queries;
 pub mod index_operation_journal_cli_preflight;
 pub mod index_operation_journal_executor;
@@ -11,11 +12,10 @@ mod interface_resource_alias;
 mod interface_use_queries;
 mod local_enum_variant_value_queries;
 mod module_function_inventory;
-pub mod canonical_name_fix_planner;
-pub mod unused_binding_diagnostics;
 pub mod package_graph;
 mod package_wit_name_queries;
 pub mod symbol_index_store;
+pub mod unused_binding_diagnostics;
 mod wit_function_inventory;
 mod wit_package_queries;
 mod world_elaboration_adapter;
@@ -20660,13 +20660,12 @@ impl RootDatabase {
             while group_end < descriptors.len() && descriptors[group_end].file == file {
                 group_end += 1;
             }
-            let inputs = match self.current_owner_inputs(snapshot, file, &collection.target_cfg) {
-                Ok(inputs) => inputs,
-                Err(error) => {
-                    owners.extend(
-                        descriptors[group_start..group_end]
-                            .iter()
-                            .map(|descriptor| FunctionOwnerResolution {
+            let inputs =
+                match self.current_owner_inputs(snapshot, file, &collection.target_cfg) {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        owners.extend(descriptors[group_start..group_end].iter().map(
+                            |descriptor| FunctionOwnerResolution {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
@@ -20679,21 +20678,20 @@ impl RootDatabase {
                                 module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
-                                world_field_resolution: world_fields
-                                    .map(|_| Err(error.clone()))
-                                    .unwrap_or(Ok(None)),
+                                world_field_resolution:
+                                    world_fields.map(|_| Err(error.clone())).unwrap_or(Ok(None)),
                                 lowering_diagnostics: Vec::new(),
-                                unused_binding_analysis: analyze_unused
-                                    .then_some(UnusedBindingAnalysis::Incomplete),
+                                unused_binding_analysis:
+                                    analyze_unused.then_some(UnusedBindingAnalysis::Incomplete),
                                 unused_binding_diagnostics: diagnostic_settings.map(|_| {
                                     unused_binding_diagnostics::UnusedBindingDiagnostics::Incomplete
                                 }),
-                            }),
-                    );
-                    group_start = group_end;
-                    continue;
-                }
-            };
+                            },
+                        ));
+                        group_start = group_end;
+                        continue;
+                    }
+                };
             let module_scope = module_scope_for_file(collection, module_tree, file);
             let module_aliases = module_scope
                 .as_ref()
