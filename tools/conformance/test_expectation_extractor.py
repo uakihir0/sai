@@ -88,6 +88,29 @@ let good = 1 //~ error TRUE_ERROR
                         with self.assertRaisesRegex(ValueError, "package-path candidates"):
                             extract(source, "src/lib.sai")
 
+    def test_complete_package_paths_with_unambiguous_boundaries(self):
+        for introducer in ("use", "export", "import", "include"):
+            for path in ("acme:json", "foo-bar:api/sub_foo-v2", "f:pkg/r"):
+                for suffix in (" ", "\t", ".{Thing} ", ", ", "{} "):
+                    source = introducer + " /* comment */ " + path + suffix + "//~ error SOME_ERROR\n"
+                    with self.subTest(source=source):
+                        self.assertEqual(extract(source, "src/lib.sai"), [expected(1, "error", "SOME_ERROR")])
+                with self.subTest(introducer=introducer, path=path):
+                    self.assertEqual(extract(introducer + " " + path, "src/lib.sai"), [])
+                    source = "(" + introducer + "\n" + path + "\n)\nx //~ error SOME_ERROR\n"
+                    self.assertEqual(extract(source, "src/lib.sai"), [expected(4, "error", "SOME_ERROR")])
+        source = 'use acme:json\nlet text = "//~ error FALSE_ERROR"\nx //~ error TRUE_ERROR\n'
+        self.assertEqual(extract(source, "src/lib.sai"), [expected(3, "error", "TRUE_ERROR")])
+
+    def test_ambiguous_package_path_boundaries_remain_unsupported(self):
+        for path in ("acme:", "acme:Bad", "acme:foo-", "acme:foo--bar", "acme:foo_",
+                     "acme:foo/", "acme:foo/Bad", "acme:foo/r#\"text\"", "acme:foo//~ error FALSE_ERROR"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "package-path candidates"):
+                extract("use " + path + "\n", "src/lib.sai")
+        for source in ("use\nname:import acme:r\"text\"", ") use\nacme:foo"):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "package-path candidates"):
+                extract(source, "src/lib.sai")
+
     def test_type_annotations_do_not_activate_package_paths(self):
         for prefix in ('let name:Type = 1\n', 'name: Type\n', 'let name: pkg.Type = 1\n',
                        'let value = "import"; name:Type\n', 'r#import name:Type\n',
@@ -316,6 +339,11 @@ let good = 1 //~ error TRUE_ERROR
                                      capture_output=True, check=False)
             self.assertEqual(process.returncode, 0)
             self.assertEqual(json.loads(process.stdout)["expected"], [expected(1, "error", "SOME_ERROR")])
+            source.write_bytes(b"use foo-bar:api/sub_name.{Thing} //~ error UNKNOWN_PACKAGE\n")
+            process = subprocess.run([sys.executable, "-B", str(script), str(source), "--path", "src/lib.sai"],
+                                     capture_output=True, check=False)
+            self.assertEqual(process.returncode, 0)
+            self.assertEqual(json.loads(process.stdout)["expected"], [expected(1, "error", "UNKNOWN_PACKAGE")])
             source.write_bytes(b'123r"escaped \\\" //~ error FALSE_ERROR" //~ error MALFORMED_NUMBER\n')
             process = subprocess.run([sys.executable, "-B", str(script), str(source), "--path", "src/lib.sai"],
                                      capture_output=True, check=False)

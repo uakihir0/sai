@@ -15,8 +15,8 @@ unsupported; the scanner does not depend on Python's Unicode identifier tables.
 Invalid UTF-8 is supported only as isolated bytes outside comments and literals.
 Invalid escapes, manifest line continuations, and a backslash immediately
 followed by a lone CR (including in comments and raw strings) are rejected.
-Outside manifests, package-path candidates in an applicable introducer context
-are rejected. Ambiguous bracket recovery also causes conservative rejection.
+Outside manifests, only complete package paths with unambiguous boundaries are
+supported. Ambiguous newline or bracket recovery causes conservative rejection.
 Output is a JSON object with an `expected` array
 in the diagnostic matcher's input format. Errors exit with status 2.
 See docs/impl/15-conformance-and-testing.md §15.3.
@@ -36,6 +36,7 @@ DIAGNOSTIC = re.compile(rf"(error|warning|info)[ \t]+({CODE})\Z")
 DIRECTIVE_DIAGNOSTIC = re.compile(rf"(error|warning|info)[ \t]+({CODE})(?:[ \t]+at[ \t]+(.+):([1-9][0-9]*))?\Z")
 SIMPLE_CODE = re.compile(rf"({CODE})(?=$|[ \t(;,])")
 POSSIBLE_PACKAGE_PATH = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*:")
+PACKAGE_PATH = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*:[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:/[a-z][a-z0-9_]*(?:-[a-z0-9]+)*)*")
 UNICODE_ESCAPE = re.compile(r"\\u\{([0-9a-fA-F]{1,6})\}")
 DIRECTIVES = {
     "kind", "stage", "spec", "targets", "profiles", "options", "component",
@@ -300,7 +301,13 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
                             (introducer in ("import", "include") and
                              (not line_break or brackets_unknown or (brackets and brackets[-1] in "(["))))
             if not is_manifest and path_context and POSSIBLE_PACKAGE_PATH.match(source, position):
-                fail("package-path candidates are not supported")
+                path_match = PACKAGE_PATH.match(source, position)
+                safe_newline = not line_break or (not brackets_unknown and brackets and brackets[-1] in "([")
+                if (not safe_newline or path_match is None or
+                        (path_match.end() < len(source) and source[path_match.end()] not in " \t\n.,{}")):
+                    fail("package-path candidates with ambiguous boundaries are not supported")
+                position = path_match.end()
+                continue
             position += 1
             while position < len(source) and is_identifier_continue(source[position]):
                 position += 1

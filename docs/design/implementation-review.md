@@ -9253,3 +9253,9 @@
 - **Decision — review required:** Revert a proposed physical-line restriction on `break` and `continue` operands and labels. Spec/02 §2.10.2 explicitly treats line breaks inside parentheses and brackets as whitespace, whereas spec/03 §3.13.4 only explicitly requires `return`'s operand to start on the same line. The prose that these keywords end expressions at line end is ambiguous in the presence of suppressed newlines and needs specification review.
 - **Verification:** A focused parser test demonstrated the proposed behavior, and independent review identified cases it would reject despite the lexical suppression rule. The proposed parser changes and their tests were removed; this decision does not assert that all related parser cases are correct.
 - **Hostile review:** The review specifically identified rejected multiline `break` operands and `continue` labels in argument lists, plus operator continuation changes. The existing parser behavior was retained rather than introducing those unproven restrictions.
+
+### IR-1024 (2026-10-29): extract expectations around bounded package paths
+
+- **Decision — review required:** Accept complete package paths only when their introducer, newline context and end boundary are unambiguous. Reject malformed or uncertain paths instead of interpreting them as ordinary tokens and possibly missing expectations. This relaxes one scanner limitation without claiming full lexer coverage.
+- **Verification:** The focused extractor suite ran 29 tests; the full conformance-component suite ran 93 tests successfully with three skips. The scanner still rejects other unsupported or ambiguous source forms and is not a full conformance harness.
+- **Hostile review:** Independent review checked package-segment grammar, boundaries, newline suppression, comments and strings and found no actionable false-negative within the accepted subset.

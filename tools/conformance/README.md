@@ -44,9 +44,10 @@ for the root file's diagnostic directives and `--lint-levels` with a JSON map
 of lint codes to resolved levels. The output can supply the matcher's
 `expected` array. Invalid input or unsupported syntax exits with status 2.
 
-The scanner is deliberately incomplete: it rejects package-path candidates,
-format strings, execution expectations, non-ASCII code outside literals and
-comments, and ambiguous malformed inputs. Directive placement and repetition
+The scanner is deliberately incomplete: it rejects package paths with
+ambiguous boundaries or newline contexts, format strings, execution
+expectations, non-ASCII code outside literals and comments, and ambiguous
+malformed inputs. Directive placement and repetition
 are checked, but other directive values are not validated. An unsupported
 test must not be treated as passing or as having no expectations.
 
