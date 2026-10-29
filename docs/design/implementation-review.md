@@ -9097,3 +9097,9 @@
 - **Decision — review required:** Treat a `sai.package` containing only whitespace or a BOM as empty, and emit no newline. The formatter's empty-file rule (§14.3.4) applies to package files as well as source files; nonempty comments and declarations retain their final newline.
 - **Verification:** All 395 `sai_fmt` tests passed, as did a CLI `fmt --check` test covering empty, whitespace-only, and BOM-only files and ensuring the check does not modify them. The added tests also cover comment-only input, strings containing comment markers, and idempotence.
 - **Hostile review:** An independent reviewer found no behavioral defect but requested the comment, string, and CLI cases; these were added and tested.
+
+### IR-998 (2026-10-29): resolve package-path and newline lookahead
+
+- **Decision — review required:** A line break eligible for statement termination is resolved using ordinary-token lookahead, and that token is not re-lexed as a package path. The previous rules were circular for `import\nor-service:foo`: treating the path as one token inserts a newline, which removes the path context; treating `or` as a continuation suppresses it, restoring that context. Ordinary-token priority makes the result deterministic, retains normal continuation behavior, and prevents a contextual introducer from consuming a path across an emitted newline. D-LEX-01 and §2.9 now state this choice explicitly.
+- **Verification:** The lexer suite passed 425 tests, including contextual introducers, ordinary continuation tokens, malformed paths, bracket contexts, and parser recovery. The error recovery for malformed world declarations can still produce multiple syntax diagnostics; cascade suppression remains separate work.
+- **Hostile review:** Two independent reviews identified and confirmed the circular specification and requested continuation, malformed-path, bracket, and world-recovery cases. These cases were added; the priority rule requires human review.

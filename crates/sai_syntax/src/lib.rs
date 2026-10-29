@@ -1872,7 +1872,10 @@ impl<'a> Lexer<'a> {
             return self.lex_doc_comment();
         }
         let ch = self.peek().ok_or(LexError::InvalidSourceSpan)?;
-        if let Some(path) = self.try_pkg_path()? {
+        if self.armed_newline.is_none()
+            && !self.newline_emitted_since_previous
+            && let Some(path) = self.try_pkg_path()?
+        {
             return Ok(path);
         }
         if ch == 'b'
@@ -5435,6 +5438,249 @@ mod tests {
                 .iter()
                 .all(|token| token.kind != SyntaxKind::PKG_PATH)
         );
+    }
+
+    #[test]
+    fn package_path_introducers_do_not_cross_statement_newlines() {
+        for introducer in ["import", "include"] {
+            for separator in ["\n", " /*\n*/ ", "\r\n"] {
+                let text = format!("{introducer}{separator}sai:http/client");
+                let output = lex_text(&text);
+                let tokens = output
+                    .tokens
+                    .iter()
+                    .map(|token| (token.kind, output.token_text(token, &text)))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    tokens,
+                    [
+                        (SyntaxKind::LIDENT, introducer),
+                        (SyntaxKind::NEWLINE, ""),
+                        (SyntaxKind::LIDENT, "sai"),
+                        (SyntaxKind::COLON, ":"),
+                        (SyntaxKind::LIDENT, "http"),
+                        (SyntaxKind::SLASH, "/"),
+                        (SyntaxKind::LIDENT, "client"),
+                        (SyntaxKind::NEWLINE, ""),
+                        (SyntaxKind::EOF, ""),
+                    ],
+                    "{text:?}"
+                );
+                assert!(output.errors.is_empty(), "{text:?}: {:?}", output.errors);
+            }
+
+            let text = format!("({introducer}\nsai:http/client)");
+            let output = lex_text(&text);
+            assert!(output.tokens.iter().any(|token| {
+                token.kind == SyntaxKind::PKG_PATH
+                    && output.token_text(token, &text) == "sai:http/client"
+            }));
+            assert!(output.errors.is_empty(), "{text:?}: {:?}", output.errors);
+        }
+
+        for introducer in ["use", "export"] {
+            let text = format!("{introducer}\nsai:http/client");
+            let output = lex_text(&text);
+            assert!(output.tokens.iter().any(|token| {
+                token.kind == SyntaxKind::PKG_PATH
+                    && output.token_text(token, &text) == "sai:http/client"
+            }));
+            assert!(output.errors.is_empty(), "{text:?}: {:?}", output.errors);
+        }
+    }
+
+    #[test]
+    fn pending_newline_uses_ordinary_tokens_before_package_path_recognition() {
+        for introducer in ["import", "include"] {
+            for separator in ["\n", " /*\n*/ ", "\r\n"] {
+                for (suffix, expected) in [
+                    (
+                        "or-service:foo/bar",
+                        vec![
+                            (SyntaxKind::OR_KW, "or"),
+                            (SyntaxKind::MINUS, "-"),
+                            (SyntaxKind::LIDENT, "service"),
+                            (SyntaxKind::COLON, ":"),
+                            (SyntaxKind::LIDENT, "foo"),
+                            (SyntaxKind::SLASH, "/"),
+                            (SyntaxKind::LIDENT, "bar"),
+                        ],
+                    ),
+                    (
+                        "and:HTTP",
+                        vec![
+                            (SyntaxKind::AND_KW, "and"),
+                            (SyntaxKind::COLON, ":"),
+                            (SyntaxKind::UIDENT, "HTTP"),
+                        ],
+                    ),
+                    (
+                        "else:foo",
+                        vec![
+                            (SyntaxKind::ELSE_KW, "else"),
+                            (SyntaxKind::COLON, ":"),
+                            (SyntaxKind::LIDENT, "foo"),
+                        ],
+                    ),
+                ] {
+                    let text = format!("{introducer}{separator}{suffix}");
+                    let output = lex_text(&text);
+                    let tokens = output
+                        .tokens
+                        .iter()
+                        .map(|token| (token.kind, output.token_text(token, &text)))
+                        .collect::<Vec<_>>();
+                    let mut expected_tokens = vec![(SyntaxKind::LIDENT, introducer)];
+                    expected_tokens.extend(expected);
+                    expected_tokens.extend([(SyntaxKind::NEWLINE, ""), (SyntaxKind::EOF, "")]);
+                    assert_eq!(tokens, expected_tokens, "{text:?}");
+                    assert!(
+                        output.tokens[1]
+                            .flags
+                            .contains(TokenFlags::AFTER_LINE_BREAK)
+                    );
+                    assert!(output.errors.is_empty(), "{text:?}: {:?}", output.errors);
+                    assert_eq!(output.newline_causes.len(), 1, "{text:?}");
+                    assert!(matches!(
+                        output.newline_causes[0].trigger,
+                        NewlineTrigger::Eof
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_named_package_paths_remain_paths_without_pending_newline() {
+        for introducer in ["import", "include", "use", "export"] {
+            for (prefix, suffix) in [("", ""), ("(", ")"), ("[", "]")] {
+                let separator = if prefix.is_empty() { " " } else { "\n" };
+                for (path, malformed) in [("or-service:foo/bar", false), ("and:HTTP", true)] {
+                    let text = format!("{prefix}{introducer}{separator}{path}{suffix}");
+                    let output = lex_text(&text);
+                    let package = output
+                        .tokens
+                        .iter()
+                        .find(|token| token.kind == SyntaxKind::PKG_PATH)
+                        .unwrap_or_else(|| panic!("missing package path: {text:?}"));
+                    assert_eq!(output.token_text(package, &text), path, "{text:?}");
+                    assert_eq!(package.flags.contains(TokenFlags::HAS_ERROR), malformed);
+                    assert_eq!(
+                        output
+                            .errors
+                            .iter()
+                            .map(|error| error.code)
+                            .collect::<Vec<_>>(),
+                        if malformed {
+                            vec![Code::MalformedPackagePath]
+                        } else {
+                            vec![]
+                        },
+                        "{text:?}"
+                    );
+                }
+            }
+        }
+
+        for introducer in ["use", "export"] {
+            let text = format!("{introducer}\nor-service:foo/bar");
+            let output = lex_text(&text);
+            assert_eq!(
+                output
+                    .tokens
+                    .iter()
+                    .map(|token| token.kind)
+                    .collect::<Vec<_>>(),
+                [
+                    if introducer == "use" {
+                        SyntaxKind::USE_KW
+                    } else {
+                        SyntaxKind::EXPORT_KW
+                    },
+                    SyntaxKind::PKG_PATH,
+                    SyntaxKind::NEWLINE,
+                    SyntaxKind::EOF,
+                ],
+                "{text:?}"
+            );
+            assert_eq!(
+                output.token_text(&output.tokens[1], &text),
+                "or-service:foo/bar"
+            );
+            assert!(output.errors.is_empty(), "{text:?}: {:?}", output.errors);
+        }
+    }
+
+    #[test]
+    fn package_path_context_ends_at_newline_inside_braces() {
+        for introducer in ["import", "include"] {
+            let text = format!("{{{introducer}\nsai:http/client}}");
+            let output = lex_text(&text);
+            assert_eq!(
+                output
+                    .tokens
+                    .iter()
+                    .map(|token| token.kind)
+                    .collect::<Vec<_>>(),
+                [
+                    SyntaxKind::L_BRACE,
+                    SyntaxKind::LIDENT,
+                    SyntaxKind::NEWLINE,
+                    SyntaxKind::LIDENT,
+                    SyntaxKind::COLON,
+                    SyntaxKind::LIDENT,
+                    SyntaxKind::SLASH,
+                    SyntaxKind::LIDENT,
+                    SyntaxKind::R_BRACE,
+                    SyntaxKind::NEWLINE,
+                    SyntaxKind::EOF,
+                ],
+                "{text:?}"
+            );
+            assert!(output.errors.is_empty(), "{text:?}: {:?}", output.errors);
+        }
+    }
+
+    #[test]
+    fn world_item_recovery_after_import_newline_keeps_following_items() {
+        let text = "world client {\nimport\ninclude core:pkg/world\nexport acme:api/iface\n}\n";
+        let (_, parsed) = parse_text(text);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::ExpectedToken)
+        );
+        for kind in [
+            SyntaxKind::WORLD_IMPORT,
+            SyntaxKind::WORLD_INCLUDE,
+            SyntaxKind::WORLD_EXPORT,
+        ] {
+            assert_eq!(
+                parsed
+                    .root
+                    .descendants()
+                    .filter(|node| node.kind() == kind)
+                    .count(),
+                1,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(parsed.root.green().text_len().to_usize(), text.len());
+    }
+
+    #[test]
+    fn contextual_import_name_continues_across_boolean_operator_newlines() {
+        for name in ["import", "include"] {
+            for operator in ["and", "or"] {
+                let text = format!(
+                    "fn main() {{\nlet {name} = true\nlet result = {name}\n{operator} false\n}}\n"
+                );
+                let (_, parsed) = parse_text(&text);
+                assert!(parsed.errors.is_empty(), "{text:?}: {:?}", parsed.errors);
+                assert_eq!(parsed.root.green().text_len().to_usize(), text.len());
+            }
+        }
     }
 
     #[test]

@@ -51,6 +51,7 @@ The principles of draft §2 are treated as preconditions: Wasm-first, no mandato
      - `or`
      - `else`
   4. Consecutive `NEWLINE`s collapse into one.
+- When a line break satisfies rules 1 and 2, the first token after it is lexed using ordinary token rules, not the context-sensitive package-path rule. That token determines rule 3 and remains the token emitted. This resolves the circular dependency between package-path recognition and newline insertion; without a newline candidate, package-path recognition is unchanged.
 - In addition, the parser skips `NEWLINE` at specific grammar positions (before signature clauses, before a function body `{`, and so on). These positions are marked `nl` in the EBNF.
 - Rationale: P9, P8. The rule depends only on the previous token and on the first token of the next line (as in Go). It never guesses non-locally the way JavaScript's ASI does.
 - Consequence: a line ending in `a >` is a syntax error. To break a binary expression across lines, put the operator at the end of the line or wrap the expression in parentheses. The formatter wraps with parentheses.

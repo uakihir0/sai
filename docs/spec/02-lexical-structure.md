@@ -234,6 +234,7 @@ PathSeg    ::= [a-z] [a-z0-9_]* ( "-" [a-z0-9]+ )*
 3. A `PKG_PATH` ends before `.`, whitespace, a line break, `{`, `,`, `}`, and so on. `use sai:http/client.{HttpClient}` lexes as `use` `PKG_PATH(sai:http/client)` `.` `{` `UIDENT` `}`.
 4. `PKG_PATH` belongs to the set E (§2.10).
 5. Input that starts with `PkgSeg ":"` in such a position but has a segment that violates `PkgSeg` or `PathSeg` (for example an uppercase letter, `--`, or a trailing `-`) is `MALFORMED_PACKAGE_PATH`.
+6. If a preceding line break satisfies §2.10.2 rules 1 and 2, the first token after it is lexed by the ordinary rules instead. It determines whether rule 3 suppresses `NEWLINE` and is not re-lexed as a package path. For example, `import\nor-service:foo` begins with the ordinary `or` token, so the newline is suppressed; `import\nsai:http` emits a `NEWLINE` before `sai`. Line breaks ignored inside `(` or `[` do not invoke this exception.
 
 ## 2.10 NEWLINE generation (statement termination)
 
