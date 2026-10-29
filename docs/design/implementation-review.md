@@ -9295,3 +9295,9 @@
 - **Decision — review required:** Revert the attempted non-NFC label diagnostic and parse-time lexical-fix binding rather than extend existing invalid structured-fix behavior. Ordinary parse currently drops lexical fixes, while `lex_with_fixes` uses a lexer-token ordinal where semantic operations require a tree pre-order token ID. Both remain unresolved. A proposed public sparse replay shortcut was also rejected because a planner could claim matching edits while its actual operation produces different bytes.
 - **Verification:** The attempted syntax and HIR changes passed their focused suites before review, but independent review exposed the operation-ID and parse-binding defects. The attempted changes were reverted; those passing tests do not establish correctness of the reverted behavior.
 - **Hostile review:** Reviews also found quadratic full-file replay and an NFC error-flag recovery regression. A future solution needs an authoritative snapshot-bound operation engine with correct semantic IDs, formatter-unit behavior, and exact edit equivalence; no incomplete shortcut is claimed as conformant.
+
+### IR-1031 (2026-10-29): clamp UTF-8 LSP lines before applying BOM shift
+
+- **Decision — review required:** Apply the first-line BOM shift based on the actual clamped line, including an out-of-range line clamped to a single-line file. This corrects decoded offsets without changing multi-line or non-BOM behavior.
+- **Verification:** The `sai_vfs` suite passed 50 tests with two ignored; focused regressions cover multibyte boundaries, CRLF, trailing empty lines and maximal positions. This does not implement LSP document synchronization.
+- **Hostile review:** Independent review found no defect in the clamping change, requested explicit boundary assertions, and identified separate pre-existing UTF-16 diagnostic round-trip and BOM-edit representation issues that remain for follow-up.

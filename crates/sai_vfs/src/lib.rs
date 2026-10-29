@@ -694,7 +694,7 @@ impl LineIndex {
     /// Maps a zero-based UTF-8 LSP position to an internal source offset.
     pub fn from_lsp_utf8(&self, line: u32, character: u32) -> TextSize {
         let line_number = line.saturating_add(1);
-        let bom_shift = if self.bom_shift > 0 && line == 0 {
+        let bom_shift = if self.bom_shift > 0 && self.clamped_line_index(line_number) == 0 {
             self.bom_shift
         } else {
             0
@@ -2824,6 +2824,70 @@ mod tests {
         );
         assert_eq!(file.line_index().from_lsp_utf8(0, 0), size(0));
         assert_eq!(file.line_index().from_lsp_utf8(0, 4), size(1));
+    }
+
+    #[test]
+    fn lsp_utf8_clamped_line_uses_actual_line_for_bom_shift() {
+        let file = SourceFile::new(FileId::new(1), "a🦀b", true).unwrap();
+        let index = file.line_index();
+        for line in [1, 5, u32::MAX] {
+            for character in 0..=10 {
+                assert_eq!(
+                    index.from_lsp_utf8(line, character),
+                    index.from_lsp_utf8(0, character),
+                    "line {line}, character {character}"
+                );
+            }
+        }
+        for (line, character, expected) in [
+            (0, 0, 0),
+            (5, 1, 0),
+            (5, 3, 0),
+            (5, 4, 1),
+            (5, 5, 1),
+            (5, 7, 1),
+            (5, 8, 5),
+            (5, 9, 6),
+            (u32::MAX, u32::MAX, 6),
+        ] {
+            assert_eq!(
+                index.from_lsp_utf8(line, character),
+                size(expected),
+                "line {line}, character {character}"
+            );
+        }
+        assert_eq!(index.from_lsp_utf16(5, 1), size(0));
+
+        let multiline = SourceFile::new(FileId::new(2), "a\nabcdef", true).unwrap();
+        assert_eq!(multiline.line_index().from_lsp_utf8(5, 3), size(5));
+        let without_bom = SourceFile::new(FileId::new(3), "abcdef", false).unwrap();
+        assert_eq!(without_bom.line_index().from_lsp_utf8(5, 3), size(3));
+    }
+
+    #[test]
+    fn lsp_utf8_offsets_clamp_at_crlf_and_trailing_empty_line() {
+        let file = SourceFile::new(FileId::new(1), "a\r\n🦀z\r\n", true).unwrap();
+        let index = file.line_index();
+        for (line, character, expected) in [
+            (0, 3, 0),
+            (0, 4, 1),
+            (0, u32::MAX, 1),
+            (1, 0, 3),
+            (1, 1, 3),
+            (1, 3, 3),
+            (1, 4, 7),
+            (1, 5, 8),
+            (1, u32::MAX, 8),
+            (2, 0, 10),
+            (2, u32::MAX, 10),
+            (u32::MAX, u32::MAX, 10),
+        ] {
+            assert_eq!(
+                index.from_lsp_utf8(line, character),
+                size(expected),
+                "line {line}, character {character}"
+            );
+        }
     }
 
     #[test]
