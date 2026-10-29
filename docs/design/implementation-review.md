@@ -9120,6 +9120,7 @@
 
 - **Review required:** The current `sai check` success slices can accept functions containing unused local bindings without emitting the Stage 0 `UNUSED_VARIABLE` warning. Body type-check support is not proof of lint completeness. A separate binding-identity-based analysis, lint-level resolution, and preservation of structured fixes and level provenance are required before claiming full coverage. This issue also affects existing accepted shapes, not only new literal-tail work.
 - **Evidence:** Independent review identified accepted examples in the existing CLI tests and traced their local resolutions; the lint's scope and exclusions are specified in spec/15 §15.8. Until the lint pipeline is integrated, new success slices must not be admitted solely because body checking reports `Supported`.
+- **Integration audit:** The existing literal-tail gate does not establish coverage for non-literal tails. A static counterexample is a function with an unused local followed by a parameter path as its tail. The eventual gate must require complete unused-binding analysis for every active owner, not infer coverage from the tail syntax. The current CLI diagnostic projection also lacks lint-level and fix data, and a production format-unit fix planner is still missing.
 
 ### IR-1002 (2026-10-29): type-check direct literal tails with locals
 
