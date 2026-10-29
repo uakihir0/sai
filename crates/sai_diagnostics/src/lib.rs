@@ -1796,75 +1796,129 @@ fn stable_hash_range(range: Option<TextRange>, hasher: &mut StableHasher) {
     }
 }
 
-fn stable_hash_value_object(value: &ValueObject, hasher: &mut StableHasher) {
-    enum Entry<'a> {
-        Value(&'a Value),
-        Key(&'a str),
-    }
+enum ValueHashFrame<'a> {
+    Array(std::slice::Iter<'a, Value>),
+    Object(std::collections::btree_map::Iter<'a, String, Value>),
+}
 
+enum ValueHashItem<'a> {
+    Value(&'a Value),
+    ObjectEntry(&'a str, &'a Value),
+}
+
+impl<'a> ValueHashFrame<'a> {
+    fn next(&mut self) -> Option<ValueHashItem<'a>> {
+        match self {
+            Self::Array(values) => values.next().map(ValueHashItem::Value),
+            Self::Object(values) => values
+                .next()
+                .map(|(key, value)| ValueHashItem::ObjectEntry(key, value)),
+        }
+    }
+}
+
+fn stable_hash_value_object(value: &ValueObject, hasher: &mut StableHasher) {
     hasher.write_tag(0xD4);
     hasher.write_len(u64::try_from(value.len()).unwrap_or(u64::MAX));
-    let mut stack = Vec::with_capacity(value.len().saturating_mul(2));
-    for (key, value) in value.iter().rev() {
-        stack.push(Entry::Value(value));
-        stack.push(Entry::Key(key));
+    let mut stack = vec![ValueHashFrame::Object(value.iter())];
+    while !stack.is_empty() {
+        let item = stack.last_mut().and_then(ValueHashFrame::next);
+        match item {
+            Some(ValueHashItem::ObjectEntry(key, value)) => {
+                key.stable_hash(hasher);
+                stable_hash_value(value, hasher, &mut stack);
+            }
+            Some(ValueHashItem::Value(value)) => stable_hash_value(value, hasher, &mut stack),
+            None => {
+                stack.pop();
+            }
+        }
     }
-    while let Some(entry) = stack.pop() {
-        match entry {
-            Entry::Key(key) => key.stable_hash(hasher),
-            Entry::Value(value) => match value {
-                Value::Null => hasher.write_tag(0),
-                Value::Bool(value) => {
-                    hasher.write_tag(1);
-                    value.stable_hash(hasher);
-                }
-                Value::Integer(value) => {
-                    hasher.write_tag(2);
-                    value.stable_hash(hasher);
-                }
-                Value::String(value) => {
-                    hasher.write_tag(3);
-                    value.stable_hash(hasher);
-                }
-                Value::Array(values) => {
-                    hasher.write_tag(4);
-                    hasher.write_len(u64::try_from(values.len()).unwrap_or(u64::MAX));
-                    stack.extend(values.iter().rev().map(Entry::Value));
-                }
-                Value::Object(values) => {
-                    hasher.write_tag(5);
-                    hasher.write_len(u64::try_from(values.len()).unwrap_or(u64::MAX));
-                    for (key, value) in values.iter().rev() {
-                        stack.push(Entry::Value(value));
-                        stack.push(Entry::Key(key));
-                    }
-                }
-            },
+}
+
+fn stable_hash_value<'a>(
+    value: &'a Value,
+    hasher: &mut StableHasher,
+    stack: &mut Vec<ValueHashFrame<'a>>,
+) {
+    match value {
+        Value::Null => hasher.write_tag(0),
+        Value::Bool(value) => {
+            hasher.write_tag(1);
+            value.stable_hash(hasher);
+        }
+        Value::Integer(value) => {
+            hasher.write_tag(2);
+            value.stable_hash(hasher);
+        }
+        Value::String(value) => {
+            hasher.write_tag(3);
+            value.stable_hash(hasher);
+        }
+        Value::Array(values) => {
+            hasher.write_tag(4);
+            hasher.write_len(u64::try_from(values.len()).unwrap_or(u64::MAX));
+            if !values.is_empty() {
+                stack.push(ValueHashFrame::Array(values.iter()));
+            }
+        }
+        Value::Object(values) => {
+            hasher.write_tag(5);
+            hasher.write_len(u64::try_from(values.len()).unwrap_or(u64::MAX));
+            if !values.is_empty() {
+                stack.push(ValueHashFrame::Object(values.iter()));
+            }
+        }
+    }
+}
+
+enum ValueDepthFrame<'a> {
+    Array(std::slice::Iter<'a, Value>),
+    Object(std::collections::btree_map::Values<'a, String, Value>),
+}
+
+impl<'a> ValueDepthFrame<'a> {
+    fn next(&mut self) -> Option<&'a Value> {
+        match self {
+            Self::Array(values) => values.next(),
+            Self::Object(values) => values.next(),
         }
     }
 }
 
 fn value_object_within_depth(value: &ValueObject, max_depth: usize) -> bool {
-    let mut stack = value
-        .values()
-        .map(|value| (value, 1_usize))
-        .collect::<Vec<_>>();
-    while let Some((value, depth)) = stack.pop() {
+    let mut stack = vec![(ValueDepthFrame::Object(value.values()), 1_usize)];
+    while !stack.is_empty() {
+        let next = match stack.last_mut() {
+            Some((frame, depth)) => frame.next().map(|value| (value, *depth)),
+            None => return true,
+        };
+        let Some((child, depth)) = next else {
+            stack.pop();
+            continue;
+        };
         if depth > max_depth {
             return false;
         }
-        match value {
-            Value::Array(values) => {
-                stack.extend(values.iter().map(|value| (value, depth.saturating_add(1))));
+        match child {
+            Value::Array(values) if !values.is_empty() => {
+                stack.push((
+                    ValueDepthFrame::Array(values.iter()),
+                    depth.saturating_add(1),
+                ));
             }
-            Value::Object(values) => {
-                stack.extend(
-                    values
-                        .values()
-                        .map(|value| (value, depth.saturating_add(1))),
-                );
+            Value::Object(values) if !values.is_empty() => {
+                stack.push((
+                    ValueDepthFrame::Object(values.values()),
+                    depth.saturating_add(1),
+                ));
             }
-            Value::Null | Value::Bool(_) | Value::Integer(_) | Value::String(_) => {}
+            Value::Null
+            | Value::Bool(_)
+            | Value::Integer(_)
+            | Value::String(_)
+            | Value::Array(_)
+            | Value::Object(_) => {}
         }
     }
     true
@@ -4194,6 +4248,25 @@ mod tests {
         // Value uses recursive drop; keep this over-limit stress fixture alive
         // until process exit after checking the template boundary and hasher.
         std::mem::forget(diagnostic);
+    }
+
+    #[test]
+    fn diagnostic_value_traversals_handle_wide_data_without_flattening_siblings() {
+        let mut siblings = vec![Value::Null; 100_000];
+        let mut over_depth = Value::Null;
+        for _ in 0..DIAGNOSTIC_TEMPLATE_MAX_VALUE_DEPTH {
+            over_depth = Value::Array(vec![over_depth]);
+        }
+        siblings.push(over_depth);
+
+        let data = ValueObject::from([("wide".to_owned(), Value::Array(siblings))]);
+        assert!(!value_object_within_depth(
+            &data,
+            DIAGNOSTIC_TEMPLATE_MAX_VALUE_DEPTH
+        ));
+        let mut hasher = StableHasher::new();
+        stable_hash_value_object(&data, &mut hasher);
+        assert_ne!(hasher.finish(), StableHasher::new().finish());
     }
 
     #[test]

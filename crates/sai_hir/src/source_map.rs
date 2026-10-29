@@ -14,6 +14,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_HIR_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
+enum OwnedValueFrame {
+    Array(std::vec::IntoIter<Value>),
+    Object(std::collections::btree_map::IntoValues<String, Value>),
+}
+
+impl OwnedValueFrame {
+    fn next(&mut self) -> Option<Value> {
+        match self {
+            Self::Array(values) => values.next(),
+            Self::Object(values) => values.next(),
+        }
+    }
+}
+
+fn drop_value_object_iteratively(values: sai_diagnostics::ValueObject) {
+    let mut stack = vec![OwnedValueFrame::Object(values.into_values())];
+    while !stack.is_empty() {
+        match stack.last_mut().and_then(OwnedValueFrame::next) {
+            Some(Value::Array(values)) => stack.push(OwnedValueFrame::Array(values.into_iter())),
+            Some(Value::Object(values)) => {
+                stack.push(OwnedValueFrame::Object(values.into_values()));
+            }
+            Some(value) => drop(value),
+            None => {
+                stack.pop();
+            }
+        }
+    }
+}
+
 /// Runtime identity shared by one lowered owner's bodies and source map.
 ///
 /// This identity is deliberately excluded from semantic equality and hashing:
@@ -514,17 +544,7 @@ impl<'root> HirSourceMapBuilder<'root> {
             match diagnostic.to_template_for_file(&self.snapshot, self.file, &self.source_ref) {
                 Ok(template) => SourceMapDiagnostic::Template(Box::new(template)),
                 Err(DiagnosticTemplateError::ValueTooDeep) => {
-                    let mut pending = std::mem::take(&mut diagnostic.data)
-                        .into_values()
-                        .collect::<Vec<_>>();
-                    while let Some(value) = pending.pop() {
-                        match value {
-                            Value::Array(values) => pending.extend(values),
-                            Value::Object(values) => pending.extend(values.into_values()),
-                            Value::Null | Value::Bool(_) | Value::Integer(_) | Value::String(_) => {
-                            }
-                        }
-                    }
+                    drop_value_object_iteratively(std::mem::take(&mut diagnostic.data));
                     return Err(HirSourceMapError::DiagnosticDataTooDeep);
                 }
                 Err(_) => {
@@ -1038,6 +1058,10 @@ mod tests {
         rejected.data.insert(
             "siblings".to_owned(),
             Value::Array(vec![deep_value(), deep_value()]),
+        );
+        rejected.data.insert(
+            "zz_wide".to_owned(),
+            Value::Array(vec![Value::Null; 100_000]),
         );
         assert_eq!(
             builder.push_diagnostic(rejected),
