@@ -7,10 +7,12 @@ The directory represents tests/conformance; returned paths are relative to
 tests and sorted by UTF-8 bytes. A .t directory is one fixture and must have
 a regular root sai.package. Its contents are inspected for unsafe filesystem
 entries but not searched for tests. Since the format does not reserve test or
-subdirectory names, expected/fixed .sai names are rejected rather than guessed.
-.wit/.mir directories require one unambiguous owner and are rejected if they
-contain a possible nested test. Other sidecar-shaped entries must have exactly
-one owner and the required file or directory type.
+subdirectory names, .expected.sai and .fixed.sai suffixes are reserved as
+single-file sidecars and require one unambiguous existing source owner, using
+the supported target/profile suffixes. .wit/.mir directories require one
+unambiguous owner and are rejected if they contain a possible nested test.
+Other sidecar-shaped entries must have exactly one owner and the required file
+or directory type.
 
 This conservative subset rejects symlinks and Windows reparse points in the
 supplied root path and tree, UNC/device-namespace roots, special files,
@@ -35,6 +37,7 @@ TARGETS = {"wasm32-core", "wasm64-core", "wasm32-wasi", "wasm64-wasi"}
 PROFILES = {"dev", "release", "tiny"}
 FILE_SIDECARS = (".stdin", ".stdout", ".stderr", ".panic", ".json",
                  ".color-human", ".human")
+SOURCE_FILE_SIDECARS = (".expected.sai", ".fixed.sai")
 WINDOWS_DEVICES = {"con", "prn", "aux", "nul", "conin$", "conout$", "clock$"} | {
     f"{prefix}{number}" for prefix in ("com", "lpt") for number in range(10)
 }
@@ -154,14 +157,23 @@ def discover(conformance_directory: os.PathLike | str) -> list[dict[str, str]]:
                             or (kinds[entry.name] == "directory" and entry.name.endswith(".t"))):
                         raise DiscoveryError(f"possible nested test in sidecar directory: {(relative + '/' + entry.name)!a}")
 
-            sources = {name[:-4] for name, kind in kinds.items()
-                       if search and kind == "file" and name.endswith(".sai") and name != ".sai"}
+            sources = {
+                name[:-4] for name, kind in kinds.items()
+                if (search and kind == "file" and name.endswith(".sai") and name != ".sai"
+                    and not name.endswith(SOURCE_FILE_SIDECARS))
+            }
+            source_sidecars = set()
             for name, kind in kinds.items():
                 if not search:
                     continue
                 path = relative + "/" + name
-                if name.endswith((".expected.sai", ".fixed.sai")):
-                    raise DiscoveryError(f"ambiguous test or source sidecar: {path!a}")
+                for suffix in SOURCE_FILE_SIDECARS:
+                    if name.endswith(suffix):
+                        if kind != "file":
+                            raise DiscoveryError(f"sidecar is not a file: {path!a}")
+                        _owner(name[:-len(suffix)], sources, path)
+                        source_sidecars.add(name)
+                        break
                 for suffix in FILE_SIDECARS:
                     if name.endswith(suffix):
                         if kind != "file":
@@ -176,7 +188,8 @@ def discover(conformance_directory: os.PathLike | str) -> list[dict[str, str]]:
                 if search and kind == "file" and name.endswith(".sai"):
                     if name == ".sai":
                         raise DiscoveryError(f"empty fixture name: {path!a}")
-                    fixtures.append({"path": path, "kind": "single-file", "root_file": path})
+                    if name not in source_sidecars:
+                        fixtures.append({"path": path, "kind": "single-file", "root_file": path})
                 elif kind == "directory":
                     if search and name.endswith(".t"):
                         if name == ".t":

@@ -40,16 +40,35 @@ staged status can be reported. An ICE diagnostic or exit 101 always fails.
 
 `python3 tools/conformance/expectation_extractor.py SOURCE --path ROOT_RELATIVE_PATH`
 extracts diagnostic annotations from a single source file. Add `--directives`
-for the root file's diagnostic directives and `--lint-levels` with a JSON map
-of lint codes to resolved levels. The output can supply the matcher's
-`expected` array. Invalid input or unsupported syntax exits with status 2.
+for the root file's diagnostic directives. Add `--validate-test-directives` to
+require and validate the full `kind`, `stage`, and `spec` header and receive
+normalized metadata alongside the matcher's `expected` array. This strict mode
+includes optional defaults for targets, profiles, options, component, calls,
+args, seed, diagnostics, fuel, memory, stderr failure and reference-only reason.
+`--lint-levels` supplies a JSON map of lint codes to resolved levels.
+Invalid input or unsupported syntax exits with status 2.
+
+The normalized `directives` object uses `kind`, numeric `stage`, `spec` entries
+of `{document, section}`, arrays for `targets`, `profiles`, `options`, `call`,
+`args` and `diag`, a boolean `component`, and nullable optional values. Defaults
+are all four targets, `dev release tiny`, empty options/calls/args/diagnostics,
+`component: false`, no seed or reference-only reason, fuel `10000000000`,
+memory limit `4096`, and no stderr failure. `--path` remains the source path
+used for diagnostic locations.
 
 The scanner is deliberately incomplete: it rejects package paths with
 ambiguous boundaries or newline contexts, format strings, execution
 expectations, non-ASCII code outside literals and comments, and ambiguous
-malformed inputs. Directive placement and repetition
-are checked, but other directive values are not validated. An unsupported
-test must not be treated as passing or as having no expectations.
+malformed inputs. Expectation-only mode checks directive placement and
+repetition but does not validate values. Strict mode validates directive
+names, repeatability, placement and the documented value forms, including the
+allowed target/profile/option names, comma-separated section-reference syntax,
+JSON-string arguments, and the call expression's export/argument/result
+structure. It does not check that referenced specification sections exist,
+resolve a call against a built artifact, validate call value encodings, or
+enforce cross-field applicability rules; the configuration selector and future
+coverage/execution harness must do those checks. An unsupported test must not
+be treated as passing or as having no expectations.
 
 ## NDJSON envelope
 
@@ -66,12 +85,20 @@ source-dependent constraints, exit-code semantics and stdout write failures.
 `python3 -B tools/conformance/fixture_discovery.py tests/conformance` lists
 single-file and directory fixtures in deterministic path order. It inspects
 paths without executing tests. It rejects ambiguous test/sidecar layouts,
-including `.expected.sai` and `.fixed.sai`, possible tests inside `.wit/` or
-`.mir/` directories, non-ASCII names, UNC roots, unsafe entries, and
-nonportable name collisions. Thus it does not yet support every valid suite.
-It assumes the tree is not modified concurrently and does not validate
-directives or fixture contents. Windows junction behavior still needs a
-Windows runtime test.
+including possible tests inside `.wit/` or `.mir/` directories, non-ASCII names,
+UNC roots, unsafe entries, and nonportable name collisions. Thus it does not
+yet support every valid suite. It assumes the tree is not modified concurrently
+and does not validate directives or fixture contents. Windows junction
+behavior still needs a Windows runtime test.
+
+### Single-file formatter and fix sidecars
+
+The discovery pass accepts `<name>.expected.sai` and `<name>.fixed.sai` when
+exactly one existing `<name>.sai` owns the sidecar. It also accepts the
+supported `.<target>`, `.<profile>`, and `.<target>.<profile>` specializations.
+These suffixes are reserved for sidecars: an orphan, wrong-type entry, or
+specialized name that matches multiple source fixtures is rejected rather than
+classified as a test.
 
 ## Configuration selection
 

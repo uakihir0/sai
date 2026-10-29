@@ -64,14 +64,52 @@ class FixtureDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(DiscoveryError, "ambiguous sidecar"):
             discover(self.root)
 
-    def test_source_sidecars_are_not_silently_classified(self):
+    def test_expected_and_fixed_source_sidecars_have_one_owner(self):
         self.file("chapter/case.sai", b"//@ kind: check-pass\n")
         self.file("chapter/case.expected.sai", b"//@ kind: check-pass\n")
-        with self.assertRaisesRegex(DiscoveryError, "ambiguous test or source sidecar"):
+        self.file("chapter/case.fixed.sai", b"fn main() {}\n")
+        for sidecar in (
+            "case.dev.expected.sai",
+            "case.release.fixed.sai",
+            "case.wasm32-core.expected.sai",
+            "case.wasm64-wasi.fixed.sai",
+            "case.wasm32-core.dev.expected.sai",
+            "case.wasm64-wasi.tiny.fixed.sai",
+        ):
+            self.file("chapter/" + sidecar)
+        self.assertEqual(discover(self.root), [
+            {"path": "conformance/chapter/case.sai", "kind": "single-file",
+             "root_file": "conformance/chapter/case.sai"},
+        ])
+
+    def test_source_sidecar_suffixes_reject_orphans_wrong_types_and_ambiguous_owners(self):
+        self.file("chapter/orphan.expected.sai")
+        with self.assertRaisesRegex(DiscoveryError, "unowned or ambiguous"):
             discover(self.root)
-        (self.root / "chapter/case.expected.sai").unlink()
+        (self.root / "chapter/orphan.expected.sai").unlink()
+
+        self.file("chapter/case.sai")
+        self.directory("chapter/case.fixed.sai")
+        with self.assertRaisesRegex(DiscoveryError, "sidecar is not a file"):
+            discover(self.root)
+        (self.root / "chapter/case.fixed.sai").rmdir()
+
+        self.file("chapter/case.dev.sai")
+        self.file("chapter/case.dev.expected.sai")
+        with self.assertRaisesRegex(DiscoveryError, "ambiguous sidecar"):
+            discover(self.root)
+        (self.root / "chapter/case.dev.expected.sai").unlink()
+
         self.file("chapter/case.wasm32-core.dev.fixed.sai")
-        with self.assertRaisesRegex(DiscoveryError, "ambiguous test or source sidecar"):
+        self.assertEqual(len(discover(self.root)), 2)
+        self.file("chapter/case.wasm32-core.dev.sai")
+        with self.assertRaisesRegex(DiscoveryError, "ambiguous sidecar"):
+            discover(self.root)
+
+    def test_source_sidecar_specialization_order_matches_the_documented_form(self):
+        self.file("chapter/case.sai")
+        self.file("chapter/case.dev.wasm32-core.expected.sai")
+        with self.assertRaisesRegex(DiscoveryError, "unowned or ambiguous"):
             discover(self.root)
 
     def test_sidecar_shaped_directories_do_not_hide_nested_tests(self):
@@ -118,6 +156,8 @@ class FixtureDiscoveryTests(unittest.TestCase):
         self.file("chapter/z.expected.sai")
         self.file("chapter/a.sai")
         self.file("chapter/a.fixed.sai")
+        self.file("chapter/a.wasm32-core.dev.sai")
+        self.file("chapter/a.wasm32-core.dev.fixed.sai")
         script = Path(__file__).with_name("fixture_discovery.py")
         errors = []
         for seed in ("1", "2", "99"):
@@ -128,7 +168,7 @@ class FixtureDiscoveryTests(unittest.TestCase):
             self.assertEqual(result.stdout, b"")
             errors.append(result.stderr)
         self.assertEqual(len(set(errors)), 1)
-        self.assertIn(b"a.fixed.sai", errors[0])
+        self.assertIn(b"a.wasm32-core.dev.fixed.sai", errors[0])
 
     def test_missing_manifest_and_wrong_node_types(self):
         self.directory("chapter/missing.t")
