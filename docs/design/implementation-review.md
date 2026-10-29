@@ -9085,3 +9085,9 @@
 - **Decision — review required:** Use the diagnostic's final severity for primary marks and labels, including lint diagnostics after level resolution. This follows the heading color required by §11.10.7; secondary marks remain blue. The renderer does not infer severity from the diagnostic code or lint level.
 - **Verification:** The `sai_diagnostics` suite passed (65 tests), including all three severities, secondary marks, and exact uncolored output. A CLI regression test exercises a real duplicate-target warning with `--color always`. `cargo fmt --all -- --check` and `git diff --check` were checked separately.
 - **Hostile review:** An independent reviewer found that the initial test reused implementation color constants and lacked a CLI-level warning case and exact uncolored output. The test now asserts literal ANSI sequences and exact plain output, and a CLI regression was added. No implementation defect was identified in the review.
+
+### IR-996 (2026-10-29): run protocol feature matrices in CI
+
+- **Decision — review required:** Run both explicitly required `gix-protocol` feature configurations on every existing CI platform, before the workspace suite. Separate Cargo invocations avoid workspace feature unification masking the async-only configuration; no new cache is introduced.
+- **Verification:** Both documented commands passed locally on macOS (10 tests each). The hosted Linux and Windows jobs remain to be verified by CI.
+- **Hostile review:** An independent reviewer confirmed that both required configurations are exercised separately, and identified missing adapter-level boundary coverage. That coverage is being handled independently; the change does not claim the complete conformance merge gate.

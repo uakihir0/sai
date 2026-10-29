@@ -37,6 +37,10 @@ jobs:
       - name: Test Windows package cache recovery
         if: runner.os == 'Windows'
         run: cargo test -p sai_package package_cache::tests::corrupt_source_removal_clears_readonly_nested_files --locked -- --nocapture
+      - name: Test protocol ref bounds with blocking and async clients
+        run: cargo test -p gix-protocol --lib --features blocking-client,async-client,sha1,sha256 --locked
+      - name: Test protocol ref bounds with async client only
+        run: cargo test -p gix-protocol --lib --features async-client,sha1,sha256 --locked
       - name: Test workspace
         env:
           RUST_TEST_THREADS: 1
