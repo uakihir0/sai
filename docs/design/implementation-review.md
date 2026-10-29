@@ -9132,3 +9132,9 @@
 - **Decision — review required:** Run the independent Python conformance component tests in a separate Ubuntu matrix on Python 3.10, 3.12, and 3.14. This covers the oldest supported syntax and two newer runtimes without delaying the platform-specific Rust jobs.
 - **Verification:** The component tests passed locally on Python 3.12 and 3.14. Python 3.10 and GitHub Actions execution remain unverified locally.
 - **Hostile review:** An independent review found no actionable workflow or test-discovery defect; it confirmed the untracked extractor tests cannot run in CI until committed.
+
+### IR-1004 (2026-10-29): validate the common diagnostic stream envelope
+
+- **Decision — review required:** Add a standalone partial NDJSON validator rather than claiming full conformance. A successful partial validation exits with status 2; command-specific schemas, the configured error limit, diagnostic ordering, registered codes, source-dependent constraints, process status and stderr still require separate checks.
+- **Verification:** Ten focused stream tests passed, as did all 52 currently available conformance-component tests. The standalone component has not been integrated into a harness.
+- **Hostile review:** Independent review found that warning and info totals accepted inflated counts. They now require exact agreement; a re-review found no further defect in the checked subset.
