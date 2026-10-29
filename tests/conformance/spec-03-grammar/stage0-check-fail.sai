@@ -1,0 +1,7 @@
+//@ kind: check-fail
+//@ stage: 0
+//@ spec: spec/03 §3.5
+//@ diag: error FEATURE_NOT_IMPLEMENTED
+//@ diag: error EXPECTED_TOKEN at src/lib.sai:7
+//@ diag: error EXPECTED_TOKEN at src/lib.sai:8
+fn main( {

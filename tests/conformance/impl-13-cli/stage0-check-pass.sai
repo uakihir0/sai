@@ -1,0 +1,4 @@
+//@ kind: check-pass
+//@ stage: 0
+//@ spec: impl/13 §13.6.2
+pub fn ready() -> () {}
