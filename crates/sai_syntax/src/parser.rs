@@ -3631,6 +3631,100 @@ mod tests {
     }
 
     #[test]
+    fn return_value_must_start_on_the_same_physical_line() {
+        use crate::ast::{AstNode, ReturnExpr};
+
+        for source in [
+            "fn f() { consume(return\n 42) }\n",
+            "fn f() { [return\r\n 42] }\n",
+            "fn f() { consume(return /* comment\n */ 42) }\n",
+        ] {
+            let output = parse_file(source);
+            let root = crate::SyntaxNode::new_root(output.root);
+            let expression = root
+                .descendants()
+                .find_map(ReturnExpr::cast)
+                .expect("return expression");
+            assert!(expression.value().is_none(), "{source:?}");
+            assert!(!output.errors.is_empty(), "{source:?}");
+        }
+
+        for source in [
+            "fn f() { consume(return 42) }\n",
+            "fn f() { consume(return /* comment */ 42) }\n",
+            "fn f() { consume(return (1 +\n 2)) }\n",
+            "fn f() { consume(return\n) }\n",
+        ] {
+            let output = parse_file(source);
+            assert!(output.errors.is_empty(), "{source:?}: {:?}", output.errors);
+            let root = crate::SyntaxNode::new_root(output.root);
+            let expression = root
+                .descendants()
+                .find_map(ReturnExpr::cast)
+                .expect("return expression");
+            assert_eq!(expression.value().is_some(), !source.contains("return\n)"));
+        }
+    }
+
+    #[test]
+    fn line_ended_return_cannot_acquire_operators_or_postfixes() {
+        use crate::ast::{AstNode, ReturnExpr};
+
+        for suffix in [
+            "\n -1",
+            "\r\n +1",
+            "\n and flag",
+            "\n (42)",
+            "\n [0]",
+            "\n .member",
+            "\n ?",
+            "\n as I32",
+            " /* comment\n */ -1",
+            " /* comment\n */ (42)",
+            " // comment\n .member",
+        ] {
+            let source = format!("fn f() {{ [return{suffix}] }}\n");
+            let output = parse_file(&source);
+            let root = crate::SyntaxNode::new_root(output.root);
+            let expression = root
+                .descendants()
+                .find_map(ReturnExpr::cast)
+                .expect("return expression");
+            assert!(expression.value().is_none(), "{source:?}");
+            assert_eq!(
+                expression.syntax().parent().map(|node| node.kind()),
+                Some(SyntaxKind::ARRAY_EXPR),
+                "{source:?}"
+            );
+            assert!(!output.errors.is_empty(), "{source:?}");
+        }
+
+        let source = "fn f() { [1 + return\n -1] }\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert!(!output.errors.is_empty(), "{source:?}");
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BIN_EXPR)
+                .count(),
+            1,
+            "{source:?}"
+        );
+
+        for source in [
+            "fn f() { [return\n, 42] }\n",
+            "fn f() { [(return)\n -1] }\n",
+            "fn f() { [(return)\n .member] }\n",
+            "fn f() { [return -1] }\n",
+            "fn f() { [return (42)] }\n",
+            "fn f() { [return 1\n + 2] }\n",
+        ] {
+            let output = parse_file(source);
+            assert!(output.errors.is_empty(), "{source:?}: {:?}", output.errors);
+        }
+    }
+
+    #[test]
     fn generated_postfix_collection_and_argument_roles_follow_parsed_children() {
         use crate::ast::{
             ArgList, ArrayExpr, AstNode, AwaitExpr, CallExpr, FStringInterp, FieldExpr, IndexExpr,

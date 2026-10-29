@@ -9162,3 +9162,9 @@
 - **Decision — review required:** Add an opt-in checker for message-free assertions over supported scalar literals and trusted concrete primitive paths. Unknown or pending prior diagnostics and unsupported conditions remain gated; existing driver and CLI entry points do not opt in, so this does not claim complete assertion support.
 - **Verification:** All 157 `sai_ty` tests passed, including supported conditions, type errors, delayed literal errors and conservative rejection cases. Actual lowering and CLI integration remain future work.
 - **Hostile review:** An independent reviewer found that delayed literal errors could bypass the prior-error guard. Pending literal and unary candidates now prevent path checking; a re-review found no further actionable defect in the checked subset.
+
+### IR-1009 (2026-10-29): terminate return expressions at physical line breaks
+
+- **Decision — review required:** Honor the same-line requirement for a `return` operand even where parentheses or brackets suppress newline tokens, and stop Pratt continuation after a line-ending valueless `return`. This preserves the physical-line rule rather than accepting a later operand or operator.
+- **Verification:** All 427 `sai_syntax` tests passed, including comments with line breaks, nested expressions and same-line continuations. The separate behavior of `break` and `continue` was not audited in this change.
+- **Hostile review:** Independent review found that the initial operand guard still allowed postfix and binary operators to bind across the line. The Pratt boundary was corrected and re-reviewed.

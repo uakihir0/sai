@@ -5502,6 +5502,15 @@ impl Parser<'_, '_> {
         let mut previous_non_associative =
             (lhs.kind() == SyntaxKind::RANGE_EXPR).then_some(NonAssociativeOperator::Range);
         loop {
+            if self.at_physical_line_start()
+                && self
+                    .position
+                    .checked_sub(1)
+                    .and_then(|position| self.tokens.get(position))
+                    .is_some_and(|token| token.kind == SyntaxKind::RETURN_KW)
+            {
+                break;
+            }
             if self.at_any(&[
                 SyntaxKind::DOT,
                 SyntaxKind::L_PAREN,
@@ -6986,6 +6995,7 @@ impl Parser<'_, '_> {
         let expression = self.start();
         self.bump();
         if self.current() != SyntaxKind::NEWLINE
+            && !self.at_physical_line_start()
             && self.at_expression_start()
             && !(self.no_block_operand && self.at(SyntaxKind::L_BRACE))
         {
