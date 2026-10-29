@@ -4585,11 +4585,13 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
 fn public_function_with_annotated_primitive_locals_emits_check_result() {
     for source in [
         "pub fn answer() -> I32 {\n    let _first: U8 = 7\n    let value: I32 = 42\n    value\n}\n",
-        "pub fn first() -> U8 {\n    let first: U8 = 7\n    let value: I32 = 42\n    first\n}\n",
         "pub fn copy_chain() -> I32 {\n    let first: I32 = 21\n    let second: I32 = first\n    let third: I32 = second\n    third\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
+    assert_ir_1013_unused_binding_gate(
+        "pub fn first() -> U8 {\n    let first: U8 = 7\n    let value: I32 = 42\n    first\n}\n",
+    );
 }
 
 #[test]
@@ -4638,12 +4640,14 @@ fn annotated_primitive_local_reports_semantic_errors_without_a_feature_gate() {
 fn public_unannotated_copy_of_annotated_primitive_local_emits_check_result() {
     for source in [
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = source\n    copied\n}\n",
-        "pub fn copy_source_tail() -> I32 {\n    let source: I32 = 42\n    let copied = source\n    source\n}\n",
         "pub fn byte_copy() -> U8 {\n    let source: U8 = 7\n    let copied = source\n    copied\n}\n",
         "pub fn bool_copy() -> Bool {\n    let source: Bool = true\n    let copied = source\n    copied\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
+    assert_ir_1013_unused_binding_gate(
+        "pub fn copy_source_tail() -> I32 {\n    let source: I32 = 42\n    let copied = source\n    source\n}\n",
+    );
 }
 
 #[test]
@@ -4708,10 +4712,14 @@ fn public_parameter_local_copy_emits_check_result() {
     for source in [
         "pub fn copy_annotated(source: I32) -> I32 {\n    let copied: I32 = source\n    copied\n}\n",
         "pub fn copy_unannotated(source: I32) -> I32 {\n    let copied = source\n    copied\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+    for source in [
         "pub fn parameter_tail(source: I32) -> I32 {\n    let copied: I32 = source\n    source\n}\n",
         "pub fn parameter_tail_second(first: I32, second: Bool) -> Bool {\n    let copied: I32 = first\n    second\n}\n",
     ] {
-        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+        assert_ir_1013_unused_binding_gate(source);
     }
 }
 
@@ -4802,7 +4810,7 @@ fn public_two_parameter_local_copies_emit_check_result() {
         "pub fn copy_pair(first: I32, second: Bool) -> I32 {\n    let first_copy = first\n    let second_copy = second\n    first_copy\n}\n",
         "pub fn copy_triple(first: I32, second: Bool, third: U16) -> U16 {\n    let first_copy = first\n    let second_copy: Bool = second\n    let third_copy = third\n    third_copy\n}\n",
     ] {
-        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+        assert_ir_1013_unused_binding_gate(source);
     }
 }
 
@@ -4998,12 +5006,13 @@ fn unsupported_unannotated_literal_copy_forms_remain_gated() {
 
 #[test]
 fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
+    let source = "pub fn copy_chain() -> I8 {\n    let source = 127\n    let first = source\n    let second = first\n    let copied = second\n    copied\n}\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     for source in [
-        "pub fn copy_chain() -> I8 {\n    let source = 127\n    let first = source\n    let second = first\n    let copied = second\n    copied\n}\n",
         "pub fn copy_source_tail() -> I32 {\n    let source = 42\n    let copied = source\n    source\n}\n",
         "pub fn earlier_tail() -> I8 {\n    let earlier = 42\n    let later = 7\n    earlier\n}\n",
     ] {
-        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+        assert_ir_1013_unused_binding_gate(source);
     }
 }
 
@@ -10020,6 +10029,37 @@ fn unused_literal_binding_with_bom_and_comment_stays_gated() {
 fn ir_1013_multiple_unused_local_binding_stays_gated() {
     let source = "pub fn f() -> I32 {\n    let first = 1\n    let second = 2\n    second\n}\n";
     assert_ir_1013_unused_binding_gate(source);
+}
+
+#[test]
+fn flat_unused_binding_chains_stay_gated() {
+    for source in [
+        "pub fn f(x: I32) -> I32 { let copied = x\n x }\n",
+        "pub fn f() -> I32 { let first = 1\n let second = first\n first }\n",
+        "pub fn f(x: I32) -> I32 { let x = 1\n let copied = x\n copied }\n",
+        "pub fn f(r#value: I32) -> I32 { let value = 1\n let copied = value\n copied }\n",
+        "pub fn f(é: I32) -> I32 { let é = 1\n let copied = é\n copied }\n",
+    ] {
+        assert_ir_1013_unused_binding_gate(source);
+    }
+}
+
+#[test]
+fn flat_used_binding_chains_remain_supported() {
+    for source in [
+        "pub fn f(x: I32) -> I32 { let copied = x\n copied }\n",
+        "pub fn f(x: I32) -> I32 { let x = x\n let copied = x\n copied }\n",
+        "pub fn f(x: I32) -> I32 { let _copied = x\n x }\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{source}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_success_result(output, "wasm32-core", "dev");
+    }
 }
 
 #[test]

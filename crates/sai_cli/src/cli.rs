@@ -2287,6 +2287,71 @@ fn check_known_unused_binding_shape(
     }
 }
 
+fn check_flat_unused_bindings(
+    parameters: &sai_syntax::ast::ParamList,
+    body: &sai_syntax::ast::Block,
+    tail: &sai_syntax::ast::PathExpr,
+) -> Option<bool> {
+    use sai_syntax::ast;
+
+    let mut bindings = Vec::new();
+    for parameter in parameters.params() {
+        if bindings.len() == 64 {
+            return Some(true);
+        }
+        let token = parameter.name()?.token()?;
+        bindings.push((
+            sai_syntax::normalize_identifier(
+                token.text().strip_prefix("r#").unwrap_or(token.text()),
+            ),
+            false,
+        ));
+    }
+    let mut statements = body.statements().peekable();
+    while let Some(statement) = statements.next() {
+        if statements.peek().is_none() {
+            if !matches!(statement, ast::Stmt::Expr(_)) {
+                return None;
+            }
+            break;
+        }
+        let ast::Stmt::Let(local) = statement else {
+            return None;
+        };
+        if bindings.len() == 64 {
+            return Some(true);
+        }
+        match local.initializer()? {
+            ast::Expr::Path(path) => {
+                let name = check_plain_path_name(&path)?;
+                if let Some((_, used)) = bindings
+                    .iter_mut()
+                    .rev()
+                    .find(|(binding, _)| *binding == name)
+                {
+                    *used = true;
+                }
+            }
+            ast::Expr::Literal(literal) if literal.token().is_some() => {}
+            _ => return None,
+        }
+        bindings.push((check_simple_local_name(&local)?, false));
+    }
+    let name = check_plain_path_name(tail)?;
+    if let Some((_, used)) = bindings
+        .iter_mut()
+        .rev()
+        .find(|(binding, _)| *binding == name)
+    {
+        *used = true;
+    }
+    Some(
+        bindings
+            .iter()
+            .any(|(name, used)| !name.starts_with('_') && !used),
+    )
+}
+
 fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
     use sai_syntax::ast::{self, AstNode as _};
 
@@ -2344,6 +2409,9 @@ fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
         && let Some(path_name) = path.name()
         && path.syntax().text_range() == path_name.syntax().text_range()
     {
+        if check_flat_unused_bindings(&parameters, &body, path).unwrap_or(false) {
+            return Some(true);
+        }
         if check_known_unused_binding_shape(&parameters, &body, path).unwrap_or(false) {
             return Some(true);
         }
@@ -14781,6 +14849,29 @@ mod tests {
                 check_body_matches_unused_variable_gate(source.as_bytes()),
                 Some(expected),
                 "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn unused_binding_gate_fails_closed_at_flat_binding_limit() {
+        for (count, expected) in [(64, Some(false)), (65, Some(true))] {
+            let declarations = (0..count)
+                .map(|index| {
+                    if index == 0 {
+                        "let value0 = 1\n".to_owned()
+                    } else {
+                        format!("let value{index} = value{}\n", index - 1)
+                    }
+                })
+                .collect::<String>();
+            let source = format!(
+                "pub fn f() -> I32 {{\n{declarations}value{}\n}}\n",
+                count - 1
+            );
+            assert_eq!(
+                check_body_matches_unused_variable_gate(source.as_bytes()),
+                expected
             );
         }
     }

@@ -9301,3 +9301,9 @@
 - **Decision — review required:** Apply the first-line BOM shift based on the actual clamped line, including an out-of-range line clamped to a single-line file. This corrects decoded offsets without changing multi-line or non-BOM behavior.
 - **Verification:** The `sai_vfs` suite passed 50 tests with two ignored; focused regressions cover multibyte boundaries, CRLF, trailing empty lines and maximal positions. This does not implement LSP document synchronization.
 - **Hostile review:** Independent review found no defect in the clamping change, requested explicit boundary assertions, and identified separate pre-existing UTF-16 diagnostic round-trip and BOM-edit representation issues that remain for follow-up.
+
+### IR-1032 (2026-10-29): gate unused bindings in flat copy chains
+
+- **Decision — review required:** Extend the existing incomplete-check gate for flat local initializers consisting solely of literals or unqualified paths. Track use in source order, resolving the nearest shadowing binding, and gate rather than emit an invented lint. Reaching a 65th binding gates the supported flat slice. Existing success fixtures that contained demonstrably unused bindings now expect the stage gate.
+- **Verification:** All 381 `check_empty_source` integration tests passed, and the focused 64/65-binding boundary test passed. The last boundary-only change was verified separately after the integration run.
+- **Hostile review:** A reviewer confirmed the flat cases and identified pre-existing fail-open coverage for unsupported initializers and larger bodies when traversal becomes unknown before the limit. Attempts to gate every unknown case or extend expression traversal rejected 56 and 39 existing tests respectively, many of which themselves expect success despite unused bindings. Those paths remain unresolved; this bounded change does not establish general lint coverage or full Stage 0 correctness.
