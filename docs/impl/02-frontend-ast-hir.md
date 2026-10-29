@@ -475,6 +475,7 @@ Punctuators are lexed with maximal munch over the table of spec/02 §2.8, except
 
 ```rust
 fn try_pkg_path(&mut self) -> Option<Token> {
+    if self.armed_newline.is_some() || self.nl_emitted_since_prev { return None; }
     let prev = self.prev.as_ref()?;
     if !matches!(prev.text_is, PrevText::Use | PrevText::Export | PrevText::Import | PrevText::Include) { return None; }
     let start = self.pos;
@@ -504,6 +505,7 @@ fn try_pkg_path(&mut self) -> Option<Token> {
 - `PrevText::Import` and `PrevText::Include` are set only for a non-raw `LIDENT` whose text is exactly `import` / `include`; `PrevText::Use` and `PrevText::Export` for the keywords `use` and `export`.
 - Trivia between the keyword and the path is allowed (`use  sai:core/fmt`), because `prev` refers to the previous token, not the previous character.
 - The PKG_PATH attempt happens before identifier lexing, so `use sai:http/client` never produces `LIDENT(sai) COLON …`.
+- A pending or already emitted `NEWLINE` prevents the attempt. An eligible line break uses an ordinary token for continuation lookahead, even when it suppresses the newline; see spec/02 §2.9 item 6.
 
 ### 2.4.11 NEWLINE generation
 
