@@ -9115,3 +9115,8 @@
 - **Decision — review required:** Test V1 and V2 through the actual blocking and async parsing adapters with synthetic packet readers. They exercise cumulative advertisement limits and error propagation without network access; they do not substitute for an end-to-end transport test. Fixtures choose the default enabled hash kind from `gix-hash`, including when only a dependency feature enables SHA-256.
 - **Verification:** The adapter and library tests passed locally in six client/hash configurations, including dependency-only SHA-256. CI now includes that configuration as well as the two required client combinations; Linux and Windows results remain pending.
 - **Hostile review:** An independent reviewer found missing async V2 and V1 capability-budget cases, plus SHA-256-only and dependency-feature fixture failures. Each was addressed and re-reviewed; no further defect was found.
+
+### IR-1001 (2026-10-29): audit unused-variable coverage
+
+- **Review required:** The current `sai check` success slices can accept functions containing unused local bindings without emitting the Stage 0 `UNUSED_VARIABLE` warning. Body type-check support is not proof of lint completeness. A separate binding-identity-based analysis, lint-level resolution, and preservation of structured fixes and level provenance are required before claiming full coverage. This issue also affects existing accepted shapes, not only new literal-tail work.
+- **Evidence:** Independent review identified accepted examples in the existing CLI tests and traced their local resolutions; the lint's scope and exclusions are specified in spec/15 §15.8. Until the lint pipeline is integrated, new success slices must not be admitted solely because body checking reports `Supported`.
