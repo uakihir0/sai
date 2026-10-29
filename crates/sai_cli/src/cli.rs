@@ -8251,21 +8251,6 @@ fn report_check_outcome(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
-    diagnostics.sort_by(compare_check_diagnostics);
-    let mut shown_error_count = 0usize;
-    let diagnostics = diagnostics
-        .into_iter()
-        .filter(|diagnostic| {
-            if diagnostic.severity != sai_diagnostics::Severity::Error {
-                return true;
-            }
-            if parsed.globals.max_errors != 0 && shown_error_count >= parsed.globals.max_errors {
-                return false;
-            }
-            shown_error_count = shown_error_count.saturating_add(1);
-            true
-        })
-        .collect::<Vec<_>>();
     let exit_code = if diagnostics
         .iter()
         .any(|diagnostic| diagnostic.diagnostic.code == "INTERNAL_COMPILER_ERROR")
@@ -8286,6 +8271,21 @@ fn report_check_outcome(
     } else {
         1
     };
+    diagnostics.sort_by(compare_check_diagnostics);
+    let mut shown_error_count = 0usize;
+    let diagnostics = diagnostics
+        .into_iter()
+        .filter(|diagnostic| {
+            if diagnostic.severity != sai_diagnostics::Severity::Error {
+                return true;
+            }
+            if parsed.globals.max_errors != 0 && shown_error_count >= parsed.globals.max_errors {
+                return false;
+            }
+            shown_error_count = shown_error_count.saturating_add(1);
+            true
+        })
+        .collect::<Vec<_>>();
     match parsed.globals.format {
         OutputFormat::Human => {
             let mut rendered = String::new();
@@ -8331,7 +8331,13 @@ fn report_check_outcome(
             }
             match stderr.write_all(rendered.as_bytes()) {
                 Ok(()) => exit_code,
-                Err(error) => report_stderr_failure(error),
+                Err(error) => {
+                    if exit_code == 101 {
+                        101
+                    } else {
+                        report_stderr_failure(error)
+                    }
+                }
             }
         }
         OutputFormat::Json => {
@@ -8350,8 +8356,11 @@ fn report_check_outcome(
             match result {
                 Ok(()) => exit_code,
                 Err(error) => {
-                    report_stdout_failure(stderr, error);
-                    4
+                    if report_stdout_failure(stderr, error) && exit_code == 101 {
+                        101
+                    } else {
+                        4
+                    }
                 }
             }
         }
@@ -12550,7 +12559,9 @@ fn report_interrupted(
             .as_ref()
             .map_or_else(|| "sai".to_owned(), command_path);
         if let Err(error) = write_json_diagnostics(stdout, &command_name, &[], 0, 130) {
-            report_stdout_failure(stderr, error);
+            if !report_stdout_failure(stderr, error) {
+                return 4;
+            }
         }
     }
     130
@@ -14269,8 +14280,8 @@ fn write_stdout_text(stdout: &mut impl Write, value: &str, stderr: &mut impl Wri
     }
 }
 
-fn report_stdout_failure(stderr: &mut impl Write, error: io::Error) {
-    let _ = writeln!(stderr, "sai: cannot write to standard output: {error}");
+fn report_stdout_failure(stderr: &mut impl Write, error: io::Error) -> bool {
+    writeln!(stderr, "sai: cannot write to standard output: {error}").is_ok()
 }
 
 fn report_stderr_failure(_error: io::Error) -> i32 {
@@ -15259,6 +15270,170 @@ mod tests {
             children: Vec::new(),
             node: None,
             symbol: None,
+        }
+    }
+
+    #[test]
+    fn check_exit_status_ignores_diagnostic_display_limit() {
+        for (fatal_codes, expected) in [
+            (vec!["INTERNAL_COMPILER_ERROR", "OUTPUT_WRITE_FAILED"], 101),
+            (vec!["OUTPUT_WRITE_FAILED", "NO_PACKAGE_FOUND"], 4),
+            (vec!["NO_PACKAGE_FOUND"], 2),
+            (vec![], 1),
+        ] {
+            for limit in ["0", "1"] {
+                let arguments = ["--format=json", "--max-errors", limit, "check"]
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>();
+                let parsed = parse_args(&arguments);
+                let mut codes = vec!["FEATURE_NOT_IMPLEMENTED"];
+                codes.extend(fatal_codes.iter().copied());
+                let diagnostics = codes
+                    .iter()
+                    .map(|code| {
+                        check_diagnostic_for_order(
+                            code,
+                            sai_diagnostics::Severity::Error,
+                            None,
+                            0,
+                            0,
+                            code,
+                            None,
+                            "",
+                        )
+                    })
+                    .collect();
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let exit = super::report_check_outcome(
+                    &parsed,
+                    diagnostics,
+                    codes.len(),
+                    0,
+                    0,
+                    None,
+                    None,
+                    &mut stdout,
+                    &mut stderr,
+                );
+                let output = String::from_utf8(stdout).expect("JSON output is UTF-8");
+                assert_eq!(exit, expected, "limit={limit}, output={output}");
+                assert!(output.contains(&format!("\"errors\":{}", codes.len())));
+                assert!(output.contains(&format!("\"exit_code\":{expected}")));
+                let shown = if limit == "1" { 1 } else { codes.len() };
+                assert!(output.contains(&format!("\"shown_errors\":{shown}")));
+                assert_eq!(output.matches("\"type\":\"diagnostic\"").count(), shown);
+                assert!(stderr.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn check_human_exit_status_includes_hidden_internal_error() {
+        let arguments = ["--format=human", "--max-errors", "1", "check"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        let parsed = parse_args(&arguments);
+        let diagnostics = vec![
+            super::check_incomplete_diagnostic(parsed.command.as_ref().expect("check command")),
+            super::check_internal_diagnostic("analysis failed", None),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = super::report_check_outcome(
+            &parsed,
+            diagnostics,
+            2,
+            0,
+            0,
+            None,
+            None,
+            &mut stdout,
+            &mut stderr,
+        );
+        let output = String::from_utf8(stderr).expect("human output is UTF-8");
+        assert_eq!(exit, 101);
+        assert!(output.contains("FEATURE_NOT_IMPLEMENTED"), "{output}");
+        assert!(!output.contains("INTERNAL_COMPILER_ERROR"), "{output}");
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn write_failure_exit_precedence_check() {
+        for format in ["human", "json"] {
+            for limit in ["0", "1"] {
+                for include_ice in [false, true] {
+                    let arguments = ["--format", format, "--max-errors", limit, "check"]
+                        .map(std::ffi::OsString::from);
+                    let parsed = parse_args(&arguments);
+                    let diagnostics = || {
+                        let mut diagnostics = vec![super::check_incomplete_diagnostic(
+                            parsed.command.as_ref().expect("check command"),
+                        )];
+                        if include_ice {
+                            diagnostics
+                                .push(super::check_internal_diagnostic("analysis failed", None));
+                        }
+                        diagnostics
+                    };
+                    let count = if include_ice { 2 } else { 1 };
+                    let expected = if include_ice { 101 } else { 4 };
+                    if format == "human" {
+                        let exit = super::report_check_outcome(
+                            &parsed,
+                            diagnostics(),
+                            count,
+                            0,
+                            0,
+                            None,
+                            None,
+                            &mut Vec::new(),
+                            &mut BrokenPipeWriter,
+                        );
+                        assert_eq!(
+                            exit, expected,
+                            "format={format}, limit={limit}, ice={include_ice}"
+                        );
+                    } else {
+                        let mut stderr = Vec::new();
+                        let exit = super::report_check_outcome(
+                            &parsed,
+                            diagnostics(),
+                            count,
+                            0,
+                            0,
+                            None,
+                            None,
+                            &mut BrokenPipeWriter,
+                            &mut stderr,
+                        );
+                        assert_eq!(
+                            exit, expected,
+                            "format={format}, limit={limit}, ice={include_ice}"
+                        );
+                        let message = String::from_utf8(stderr).unwrap();
+                        assert!(message.starts_with("sai: cannot write to standard output: "));
+                        assert_eq!(message.lines().count(), 1);
+                        let exit = super::report_check_outcome(
+                            &parsed,
+                            diagnostics(),
+                            count,
+                            0,
+                            0,
+                            None,
+                            None,
+                            &mut BrokenPipeWriter,
+                            &mut BrokenPipeWriter,
+                        );
+                        assert_eq!(
+                            exit, 4,
+                            "both streams fail, limit={limit}, ice={include_ice}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -20616,6 +20791,20 @@ mod tests {
                 .unwrap()
                 .contains("cannot write to standard output")
         );
+    }
+
+    #[test]
+    fn write_failure_exit_precedence_interrupted() {
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let arguments = ["--format=json", "new"].map(std::ffi::OsString::from);
+        let exit_code = run_with_cancellation(
+            &arguments,
+            &cancellation,
+            &mut BrokenPipeWriter,
+            &mut BrokenPipeWriter,
+        );
+        assert_eq!(exit_code, 4);
     }
 
     #[test]

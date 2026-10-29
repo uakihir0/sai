@@ -9205,3 +9205,9 @@
 - **Decision — review required:** Do not land a local change to classify malformed type declarations during attribute filtering. Unknown type forms currently fall back to aliases, which can produce inappropriate attribute or target decisions; this remains unresolved. Recovery needs an explicit unclassified or poisoned representation carried through lowering, resolution and WIT checks.
 - **Verification:** Seven existing HIR target-filter tests passed after the attempted change was reverted. No complete recovery behavior is claimed.
 - **Hostile review:** Independent reviews found that the proposed fallback could either turn user syntax errors into internal compiler errors or turn missing record bodies into valid-looking empty records and spurious WIT errors. The attempted change was reverted rather than introducing those regressions.
+
+### IR-1016 (2026-10-29): preserve check exit precedence under output limits
+
+- **Decision — review required:** Select the `check` exit code before applying the display limit. For a failed stdout write, treat §13.3.4's explicit both-streams-fail exit 4 as an exception to the general 101/130 precedence; otherwise preserve the higher-priority code. The interaction of those clauses merits specification review.
+- **Verification:** Six focused tests passed for hidden errors, human and JSON output, failing writers and interruption. The analogous `fmt` write-failure precedence and preserving diagnostics collected before interruption remain unresolved.
+- **Hostile review:** Independent review found the pre-existing write-failure precedence issue and requested failing-writer and interruption tests. A further review found the separate `fmt` and cancellation gaps but no new defect in this change.
