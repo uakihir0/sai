@@ -9211,3 +9211,9 @@
 - **Decision — review required:** Select the `check` exit code before applying the display limit. For a failed stdout write, treat §13.3.4's explicit both-streams-fail exit 4 as an exception to the general 101/130 precedence; otherwise preserve the higher-priority code. The interaction of those clauses merits specification review.
 - **Verification:** Six focused tests passed for hidden errors, human and JSON output, failing writers and interruption. The analogous `fmt` write-failure precedence and preserving diagnostics collected before interruption remain unresolved.
 - **Hostile review:** Independent review found the pre-existing write-failure precedence issue and requested failing-writer and interruption tests. A further review found the separate `fmt` and cancellation gaps but no new defect in this change.
+
+### IR-1017 (2026-10-29): discover a conservative subset of fixtures
+
+- **Decision — review required:** Provide deterministic fixture discovery without making a conformance claim. Ambiguous test/sidecar names, non-ASCII names, UNC roots and other nonportable or unsafe layouts are rejected rather than guessed. This intentionally excludes valid suites until their ambiguity and portability can be handled without silently omitting tests; concurrent filesystem mutation is outside the current contract.
+- **Verification:** All 79 Python conformance-component tests passed, with three filesystem- or platform-dependent skips. Windows junction handling is tested with simulated metadata but still needs a Windows runtime run.
+- **Hostile review:** Reviews found potentially hidden tests, ambiguous sidecars, nondeterministic error selection, symlink ancestry and Windows reparse-point/device-name cases. The component now fails closed on these layouts; a final review also prompted portable symlink-test assertions.

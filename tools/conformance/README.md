@@ -60,9 +60,21 @@ when these checks succeed, it reports `partial` and exits 2: callers must still
 check command-specific schemas, diagnostic ordering, registered codes,
 source-dependent constraints, exit-code semantics and stdout write failures.
 
+## Fixture discovery
+
+`python3 -B tools/conformance/fixture_discovery.py tests/conformance` lists
+single-file and directory fixtures in deterministic path order. It inspects
+paths without executing tests. It rejects ambiguous test/sidecar layouts,
+including `.expected.sai` and `.fixed.sai`, possible tests inside `.wit/` or
+`.mir/` directories, non-ASCII names, UNC roots, unsafe entries, and
+nonportable name collisions. Thus it does not yet support every valid suite.
+It assumes the tree is not modified concurrently and does not validate
+directives or fixture contents. Windows junction behavior still needs a
+Windows runtime test.
+
 These components are not the full harness and cannot substantiate a
-conformance claim. The caller must discover tests, resolve package paths,
-validate NDJSON, run the IUT and manage the staged command sequence and
+conformance claim. The caller must resolve package paths, validate NDJSON,
+run the IUT and manage the staged command sequence and
 configurations. The matcher only judges supplied normalized diagnostics and
 process exit code; it does not validate the complete command protocol.
 
