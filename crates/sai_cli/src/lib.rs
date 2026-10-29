@@ -2,6 +2,7 @@
 
 pub mod args;
 pub mod cli;
+pub mod diagnostic_projection;
 mod fmt_paths;
 mod fmt_workspace;
 pub mod help;

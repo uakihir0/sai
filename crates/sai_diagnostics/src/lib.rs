@@ -1484,6 +1484,17 @@ impl Diagnostic {
         mut self,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<Self, FixValidationError> {
+        self.validate_workspace_snapshot(snapshot)?;
+        self.workspace_snapshot = Some(snapshot.clone());
+        Ok(self)
+    }
+
+    /// Validates this diagnostic's source references against a workspace
+    /// snapshot without cloning or binding the diagnostic.
+    pub fn validate_workspace_snapshot(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<(), FixValidationError> {
         if self
             .workspace_snapshot
             .as_ref()
@@ -1511,8 +1522,7 @@ impl Diagnostic {
             validate_related(snapshot, related)?;
         }
         validate_cause(snapshot, &self.cause)?;
-        self.workspace_snapshot = Some(snapshot.clone());
-        Ok(self)
+        Ok(())
     }
 
     pub fn with_fix(mut self, fix: Fix) -> Result<Self, FixValidationError> {
@@ -3626,6 +3636,71 @@ mod tests {
             diagnostic.with_workspace_snapshot(&second_snapshot),
             Err(FixValidationError::SnapshotMismatch)
         );
+    }
+
+    #[test]
+    fn validates_workspace_snapshot_without_binding_or_cloning() {
+        let primary = test_location(None);
+        let make_snapshot = || {
+            WorkspaceSnapshot::new([SnapshotFile::new(
+                Arc::new(SourceFile::new(FileId::new(1), "x", false).expect("source")),
+                "src/lib.sai",
+                None,
+                None,
+            )])
+            .expect("single-file snapshot")
+        };
+        let first_snapshot = make_snapshot();
+        let second_snapshot = make_snapshot();
+        let unbound = Diagnostic::new(
+            Code::UnexpectedCharacter,
+            Severity::Error,
+            "unexpected character",
+            None,
+        );
+        assert_eq!(unbound.validate_workspace_snapshot(&first_snapshot), Ok(()));
+        assert!(!unbound.has_workspace_snapshot());
+        let valid_cause = unbound
+            .clone()
+            .with_cause(CauseKey::new([PoisonFact::SyntaxNode(
+                test_location(None).span,
+            )]))
+            .expect("unbound diagnostic may retain a valid cause fact");
+        assert_eq!(
+            valid_cause.validate_workspace_snapshot(&first_snapshot),
+            Ok(())
+        );
+        assert!(!valid_cause.has_workspace_snapshot());
+        let invalid_cause = unbound
+            .with_cause(CauseKey::new([PoisonFact::SyntaxNode(Span::new(
+                FileId::new(2),
+                TextRange::new(TextSize::new(0), TextSize::new(1)).expect("ordered cause span"),
+            ))]))
+            .expect("unbound diagnostics may collect cause facts");
+        assert_eq!(
+            invalid_cause.validate_workspace_snapshot(&first_snapshot),
+            Err(FixValidationError::SnapshotMismatch)
+        );
+
+        let diagnostic = Diagnostic::new(
+            Code::UnexpectedCharacter,
+            Severity::Error,
+            "unexpected character",
+            Some(primary),
+        )
+        .with_workspace_snapshot(&first_snapshot)
+        .expect("diagnostic matches first snapshot");
+
+        assert!(diagnostic.has_workspace_snapshot());
+        assert_eq!(
+            diagnostic.validate_workspace_snapshot(&first_snapshot),
+            Ok(())
+        );
+        assert_eq!(
+            diagnostic.validate_workspace_snapshot(&second_snapshot),
+            Err(FixValidationError::SnapshotMismatch)
+        );
+        assert!(diagnostic.has_workspace_snapshot());
     }
 
     #[test]
