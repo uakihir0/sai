@@ -120,12 +120,13 @@ conformance claim.
 `python3 -B tools/conformance/run_stage0.py --iut /absolute/path/to/sai tests/conformance`
 runs a deliberately limited set of Stage 0 checks and source formatter cases
 through the IUT's command line. It accepts single-file `check-pass`,
-`check-fail`, and `fmt` fixtures with `kind`, `stage`, and resolvable `spec`
-directives. A `fmt` fixture must have exactly one sibling
-`<name>.expected.sai`; other sidecars remain unsupported. The runner rejects
-explicit target/profile restrictions, unsupported directives, directory
-fixtures, an empty fixture set, and inputs whose specification references do
-not resolve beneath `docs/`.
+`check-fail`, `fmt`, and `fmt-refuse` fixtures with `kind`, `stage`, and
+resolvable `spec` directives. A `fmt` fixture must have exactly one sibling
+`<name>.expected.sai`; `fmt-refuse` requires explicit, nonempty expected error
+diagnostics and rejects every sidecar. Other sidecars remain unsupported. The
+runner rejects explicit target/profile restrictions, unsupported directives,
+directory fixtures, an empty fixture set, and inputs whose specification
+references do not resolve beneath `docs/`.
 
 Every accepted fixture runs in a fresh sandbox with only `NO_COLOR=1`,
 `SAI_CACHE_DIR=<sandbox>/cache`, and `HOME=<sandbox>/home` in the IUT
@@ -139,8 +140,16 @@ For a `fmt` fixture it passes the unchanged source bytes on standard input to
 `sai --format=json --max-errors=0 fmt --stdin-kind source -`, compares the JSON
 `output` bytes with `<name>.expected.sai`, then formats the expected bytes again
 and requires the same output with an empty `changed` list. It does not run
-`sai check` or the canonical-input preflight for `fmt`. A timeout is a failure,
-never a pass.
+`sai check` or the canonical-input preflight for `fmt`. For `fmt-refuse`, it
+passes the unchanged source bytes to the same formatter command and requires a
+strict refusal result (`exit 1`, one file, no output, and `<stdin>` in
+`refused`) whose nonempty error multiset exactly matches the fixture's
+expectations. It derives allowed refusal codes from the lexical error table
+and parser-only rows in the syntactic-validation table; parser severities come
+from the implementation diagnostics table, and unknown severities fail
+closed. Validation and mixed parser/validation codes are excluded. This kind
+also bypasses canonical-input preflight and `sai check`. A timeout is a
+failure, never a pass.
 
 The runner treats the supplied executable as the repository's reference
 implementation, but cannot verify its identity from the black-box protocol.
@@ -157,8 +166,10 @@ This runner is useful as smoke evidence only; it does not validate suite
 coverage, goldens, all directive applicability, or the complete conformance
 protocol, and cannot substantiate a conformance claim.
 Formatter coverage is limited to single-file source `fmt` byte comparisons and
-fixed-point checks. `fmt-refuse`, `sai.package` formatting, `sai fmt --check`,
-layout variants, and rule coverage remain unsupported.
+fixed-point checks plus exact-diagnostic `fmt-refuse` cases. Fixed-point checks
+apply only to `fmt` pass fixtures. Package formatting, layout variants,
+general `sai fmt --check` behavior, and complete rule coverage remain
+unsupported.
 
 The subprocess environment mapping contains exactly the three listed entries.
 On macOS, Python test executables may add `LC_CTYPE` and
