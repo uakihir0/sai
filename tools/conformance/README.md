@@ -146,8 +146,18 @@ that differs must report exactly one `UNFORMATTED_FILE` on the first differing
 line, with its expected-line data and complete primary byte, line, UTF-8 column,
 and UTF-16 column positions matching `docs/impl/14-formatter.md` §14.11.4.
 Suppressed cascade, duplicate, and dependency diagnostic counts must be zero.
-It does not run `sai check` or the
-canonical-input preflight for `fmt`. For `fmt-refuse`, it passes the unchanged
+The runner also copies the input and expected output, in separate runs, as the
+only source file in a generated package and invokes no-argument
+`sai fmt --check`; the generated `sai.package` is checked alongside it. It
+requires the `.sai` inventory to remain unchanged and compares each selected
+file's metadata and bytes to ensure `--check` neither modifies nor replaces the
+source or manifest. It does not run `sai check` or the canonical-input preflight
+for `fmt`. It also runs
+`sai --format=json --max-errors=0 fmt --check src/lib.sai` on both byte
+sequences, requires exactly one selected source, and checks the same canonical
+pass result or exact first-difference diagnostic. Multiple explicit path
+arguments are not covered. For
+`fmt-refuse`, it passes the unchanged
 source bytes to the same formatter command and requires a strict refusal result
 (`exit 1`, one file, no output, and `<stdin>` in `refused`) whose nonempty error
 multiset exactly matches the fixture's expectations. It derives allowed
@@ -172,11 +182,12 @@ This runner is useful as smoke evidence only; it does not validate suite
 coverage, goldens, all directive applicability, or the complete conformance
 protocol, and cannot substantiate a conformance claim.
 Formatter coverage is limited to single-file source `fmt` byte comparisons,
-fixed-point checks, input and expected-output `fmt --check` results, and
-exact-diagnostic `fmt-refuse` cases. Fixed-point and `fmt --check` checks apply
-only to `fmt` pass fixtures. Package formatting, no-argument package-wide
-`fmt --check`, layout variants, multi-file and path-based `fmt --check`, and
-complete rule coverage remain unsupported.
+fixed-point checks, source-stdin, generated package-wide `fmt --check` and
+`fmt --check` with one explicit path, and exact-diagnostic `fmt-refuse` cases.
+Fixed-point and `fmt --check` checks apply only to `fmt` pass fixtures.
+Package-contract formatting variants and goldens, package workspaces,
+multi-source package checks, multiple explicit path arguments, layout variants,
+and complete rule coverage remain unsupported.
 
 The subprocess environment mapping contains exactly the three listed entries.
 On macOS, Python test executables may add `LC_CTYPE` and
