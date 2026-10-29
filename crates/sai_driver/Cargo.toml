@@ -8,6 +8,7 @@ rust-version.workspace = true
 ctrlc.workspace = true
 getrandom.workspace = true
 sai_diagnostics = { path = "../sai_diagnostics" }
+sai_fmt = { path = "../sai_fmt" }
 sai_hir = { path = "../sai_hir" }
 sai_intern = { path = "../sai_intern" }
 sai_package = { path = "../sai_package" }

@@ -3069,6 +3069,7 @@ dependencies = [
  "ctrlc",
  "getrandom 0.4.3",
  "sai_diagnostics",
+ "sai_fmt",
  "sai_hir",
  "sai_intern",
  "sai_package",
