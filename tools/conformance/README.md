@@ -118,19 +118,29 @@ conformance claim.
 ## Stage 0 partial smoke runner
 
 `python3 -B tools/conformance/run_stage0.py --iut /absolute/path/to/sai tests/conformance`
-runs a deliberately limited set of Stage 0 checks through the IUT's command
-line. It accepts only single-file `check-pass` and `check-fail` fixtures, with
-`kind`, `stage`, and resolvable `spec` directives. It rejects explicit
-target/profile restrictions, unsupported directives, directory fixtures, all
-sidecars, an empty fixture set, and inputs whose specification references do
+runs a deliberately limited set of Stage 0 checks and source formatter cases
+through the IUT's command line. It accepts single-file `check-pass`,
+`check-fail`, and `fmt` fixtures with `kind`, `stage`, and resolvable `spec`
+directives. A `fmt` fixture must have exactly one sibling
+`<name>.expected.sai`; other sidecars remain unsupported. The runner rejects
+explicit target/profile restrictions, unsupported directives, directory
+fixtures, an empty fixture set, and inputs whose specification references do
 not resolve beneath `docs/`.
 
-For each accepted fixture it makes a fresh sandbox, copies the source unchanged,
-creates the required package manifest, and passes only `NO_COLOR=1`,
-`SAI_CACHE_DIR=<sandbox>/cache`, and `HOME=<sandbox>/home` to the IUT. It invokes
+Every accepted fixture runs in a fresh sandbox with only `NO_COLOR=1`,
+`SAI_CACHE_DIR=<sandbox>/cache`, and `HOME=<sandbox>/home` in the IUT
+environment. For a check fixture, the runner copies the source unchanged,
+creates the generated package manifest, invokes
 `sai --format=json --max-errors=0 check --jobs=1`, validates the diagnostic
 registry and JSON stream, checks diagnostic order and result semantics, and
-compares expected diagnostics. A timeout is a failure, never a pass.
+compares expected diagnostics.
+
+For a `fmt` fixture it passes the unchanged source bytes on standard input to
+`sai --format=json --max-errors=0 fmt --stdin-kind source -`, compares the JSON
+`output` bytes with `<name>.expected.sai`, then formats the expected bytes again
+and requires the same output with an empty `changed` list. It does not run
+`sai check` or the canonical-input preflight for `fmt`. A timeout is a failure,
+never a pass.
 
 The runner treats the supplied executable as the repository's reference
 implementation, but cannot verify its identity from the black-box protocol.
@@ -146,6 +156,9 @@ execution and always sets `mode` to `partial-smoke` and `claim` to `false`.
 This runner is useful as smoke evidence only; it does not validate suite
 coverage, goldens, all directive applicability, or the complete conformance
 protocol, and cannot substantiate a conformance claim.
+Formatter coverage is limited to single-file source `fmt` byte comparisons and
+fixed-point checks. `fmt-refuse`, `sai.package` formatting, `sai fmt --check`,
+layout variants, and rule coverage remain unsupported.
 
 The subprocess environment mapping contains exactly the three listed entries.
 On macOS, Python test executables may add `LC_CTYPE` and
