@@ -442,13 +442,122 @@ def _run_fmt_fixture(
             registered_codes=registered_codes,
             fixed_point=True,
         )
+        check_command = [
+            "--format=json",
+            "--max-errors=0",
+            "fmt",
+            "--check",
+            "--stdin-kind",
+            "source",
+            "-",
+        ]
+        for check_input in (source_bytes, expected_output):
+            checked = _run_iut(
+                iut,
+                check_command,
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+                stdin_data=check_input,
+            )
+            _validate_fmt_check(
+                checked,
+                input_bytes=check_input,
+                expected_output=expected_output,
+                registered_codes=registered_codes,
+            )
+
+
+def _split_lf_lines(source: bytes) -> list[bytes]:
+    """Split only after LF, preserving each terminator and any preceding CR."""
+    lines = []
+    start = 0
+    while start < len(source):
+        newline = source.find(b"\n", start)
+        if newline < 0:
+            lines.append(source[start:])
+            break
+        lines.append(source[start:newline + 1])
+        start = newline + 1
+    return lines
+
+
+def _first_differing_lf_line(
+    input_bytes: bytes,
+    expected_output: bytes,
+) -> tuple[int, bytes | None, int, int] | None:
+    """Return line, expected content, and input span for the first byte difference."""
+    input_lines = _split_lf_lines(input_bytes)
+    output_lines = _split_lf_lines(expected_output)
+    offset = 0
+    for index in range(max(len(input_lines), len(output_lines))):
+        input_line = input_lines[index] if index < len(input_lines) else None
+        output_line = output_lines[index] if index < len(output_lines) else None
+        if input_line == output_line:
+            if input_line is not None:
+                offset += len(input_line)
+            continue
+        if input_line is None:
+            start = end = len(input_bytes)
+        else:
+            start = offset
+            end = start + len(input_line)
+            if input_line.endswith(b"\n"):
+                end -= 1
+                if end > start and input_bytes[end - 1] == 13:
+                    end -= 1
+        if output_line is None:
+            expected_line = None
+        else:
+            expected_line = (
+                output_line[:-1] if output_line.endswith(b"\n") else output_line
+            )
+        return index + 1, expected_line, start, end
+    return None
+
+
+def _source_position(input_bytes: bytes, offset: int) -> dict[str, int]:
+    """Map an original-file byte offset to its diagnostic position."""
+    bom_length = 3 if input_bytes.startswith(b"\xef\xbb\xbf") else 0
+    if offset <= bom_length:
+        return {"line": 1, "col": 1, "utf16_col": 1}
+
+    line = 1
+    line_start = bom_length
+    cursor = bom_length
+    while cursor < offset:
+        byte = input_bytes[cursor]
+        if byte == 13:
+            terminator_end = (
+                cursor + 2
+                if input_bytes[cursor:cursor + 2] == b"\r\n"
+                else cursor + 1
+            )
+            if terminator_end > offset:
+                break
+            line += 1
+            line_start = terminator_end
+            cursor = terminator_end
+        elif byte == 10:
+            line += 1
+            line_start = cursor + 1
+            cursor += 1
+        else:
+            cursor += 1
+
+    prefix = input_bytes[line_start:offset].decode("utf-8", "strict")
+    return {
+        "line": line,
+        "col": offset - line_start + 1,
+        "utf16_col": 1 + sum(2 if ord(character) > 0xFFFF else 1 for character in prefix),
+    }
 
 
 def _formatter_envelope(
     completed: subprocess.CompletedProcess,
     *,
     registered_codes: set[str],
-) -> tuple[list[dict], dict, dict]:
+) -> tuple[list[dict], dict, dict, list[dict]]:
     records = _records(
         completed.stdout,
         exit_code=completed.returncode,
@@ -495,7 +604,95 @@ def _formatter_envelope(
     fields = {"check", "files", "changed", "refused", "output"}
     if not isinstance(data, dict) or set(data) != fields:
         raise SmokeError("sai fmt returned an invalid result schema")
-    return actual, data, summary
+    return actual, data, summary, diagnostics
+
+
+def _validate_fmt_check(
+    completed: subprocess.CompletedProcess,
+    *,
+    input_bytes: bytes,
+    expected_output: bytes,
+    registered_codes: set[str],
+) -> None:
+    actual, data, summary, diagnostics = _formatter_envelope(
+        completed,
+        registered_codes=registered_codes,
+    )
+    difference = _first_differing_lf_line(input_bytes, expected_output)
+    if (
+        type(data["check"]) is not bool
+        or data["check"] is not True
+        or type(data["files"]) is not int
+        or data["files"] != 1
+        or not isinstance(data["changed"], list)
+        or data["changed"] != ([] if difference is None else ["<stdin>"])
+        or not isinstance(data["refused"], list)
+        or data["refused"] != []
+        or data["output"] is not None
+    ):
+        raise SmokeError("sai fmt --check returned an invalid source stdin result")
+    if summary["suppressed"] != {
+        "cascade": 0,
+        "duplicate": 0,
+        "dependency": 0,
+    }:
+        raise SmokeError("sai fmt --check suppressed unexpected diagnostics")
+    if difference is None:
+        if diagnostics or actual:
+            raise SmokeError("canonical formatter output produced a --check diagnostic")
+        if completed.returncode != 0 or summary["exit_code"] != 0:
+            raise SmokeError("sai fmt --check returned an unexpected exit code")
+        return
+    if completed.returncode != 1 or summary["exit_code"] != 1:
+        raise SmokeError("sai fmt --check returned an unexpected exit code")
+    if len(diagnostics) != 1 or len(actual) != 1:
+        raise SmokeError("noncanonical formatter input did not produce exactly one diagnostic")
+
+    line, expected_line, start_byte, end_byte = difference
+    diagnostic = diagnostics[0]
+    if (
+        diagnostic["code"] != "UNFORMATTED_FILE"
+        or diagnostic["severity"] != "error"
+        or diagnostic["message"] != "file is not formatted"
+        or diagnostic["level"] is not None
+        or diagnostic["primary_label"] != ""
+        or diagnostic["labels"] != []
+        or diagnostic["fixes"] != []
+        or diagnostic["related"] != []
+        or diagnostic["node"] is not None
+        or diagnostic["symbol"] is not None
+        or diagnostic["package"] is not None
+        or diagnostic["children"] != [{
+            "kind": "help",
+            "message": "run `sai fmt <path>` to format this file",
+            "location": None,
+        }]
+        or diagnostic["data"] != {
+            "line": line,
+            "expected": (
+                None if expected_line is None else expected_line.decode("utf-8", "strict")
+            ),
+        }
+    ):
+        raise SmokeError("UNFORMATTED_FILE does not match the first differing line")
+    primary = diagnostic["primary"]
+    expected_start = {
+        "byte": start_byte,
+        **_source_position(input_bytes, start_byte),
+    }
+    expected_end = {
+        "byte": end_byte,
+        **_source_position(input_bytes, end_byte),
+    }
+    if (
+        primary is None
+        or primary["file"] != {"path": "<stdin>", "package": None, "snapshot": None}
+        or primary["start"] != expected_start
+        or primary["end"] != expected_end
+        or expected_start["line"] != line
+        or expected_end["line"] != line
+    ):
+        raise SmokeError("UNFORMATTED_FILE has the wrong primary position or byte span")
 
 
 def _validate_fmt_refusal(
@@ -505,7 +702,7 @@ def _validate_fmt_refusal(
     registered_codes: set[str],
     refusal_codes: set[str],
 ) -> None:
-    actual, data, summary = _formatter_envelope(
+    actual, data, summary, _ = _formatter_envelope(
         completed,
         registered_codes=registered_codes,
     )
@@ -1101,9 +1298,10 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "uses the generated package's wasm32-core/dev defaults for execution.",
             "The caller must supply this repository's reference sai binary; the runner "
             "cannot verify the identity of the executable passed with --iut.",
-            "Formatter coverage is limited to single-file source fmt goldens and "
-            "refusals; fixed-point checks cover fmt goldens only. Package formatting, "
-            "layout variants, and fmt --check behavior are not covered.",
+            "Formatter coverage is limited to single-file source fmt goldens, their "
+            "fixed-point and input/expected-output fmt --check checks, and refusal cases. "
+            "Package formatting and no-argument package-wide fmt --check, layout variants, "
+            "and multi-file or path-based fmt --check behavior are not covered.",
             "This smoke subset does not establish section, diagnostic, or suite coverage "
             "and cannot substantiate a conformance claim.",
         ],

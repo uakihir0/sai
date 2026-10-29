@@ -11,8 +11,10 @@ from unittest.mock import patch
 from run_stage0 import (
     ROOT_ID,
     SmokeError,
+    _first_differing_lf_line,
     _formatter_refusal_codes,
     _resolve_spec_reference,
+    _source_position,
     _run_iut,
     run_suite,
 )
@@ -103,8 +105,160 @@ if args == [
         "formatter_argv":args,
         "formatter_input":formatter_input.decode("utf-8"),
     }})
-    receipt.setdefault("calls", []).append("fmt")
+    is_fmt_fixture_check = MODE == "fmt_fixture" or MODE.startswith("fmt_check_")
+    receipt.setdefault("calls", []).append(
+        "fmt-check" if is_fmt_fixture_check else "fmt"
+    )
+    if is_fmt_fixture_check:
+        receipt.setdefault("formatter_check_inputs", []).append(
+            formatter_input.decode("utf-8")
+        )
+        receipt["formatter_check_argv"] = args
     Path(RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
+    if is_fmt_fixture_check:
+        if MODE == "fmt_check_malformed":
+            sys.stdout.buffer.write(b"{{bad json\\n")
+            raise SystemExit(0)
+        def split_lf(value):
+            lines = []
+            start = 0
+            while start < len(value):
+                newline = value.find(b"\\n", start)
+                if newline < 0:
+                    lines.append(value[start:])
+                    break
+                lines.append(value[start:newline + 1])
+                start = newline + 1
+            return lines
+
+        def position(value, offset):
+            bom_length = 3 if value.startswith(b"\\xef\\xbb\\xbf") else 0
+            if offset <= bom_length:
+                return {{
+                    "byte":offset,"line":1,"col":1,"utf16_col":1
+                }}
+            line = 1
+            line_start = bom_length
+            cursor = bom_length
+            while cursor < offset:
+                byte = value[cursor]
+                if byte == 13:
+                    terminator_end = (
+                        cursor + 2 if value[cursor:cursor + 2] == b"\\r\\n"
+                        else cursor + 1
+                    )
+                    if terminator_end > offset:
+                        break
+                    line += 1
+                    line_start = terminator_end
+                    cursor = terminator_end
+                elif byte == 10:
+                    line += 1
+                    line_start = cursor + 1
+                    cursor += 1
+                else:
+                    cursor += 1
+            prefix = value[line_start:offset].decode("utf-8")
+            return {{
+                "byte":offset,"line":line,"col":offset-line_start+1,
+                "utf16_col":1+sum(2 if ord(character)>0xffff else 1
+                                   for character in prefix)
+            }}
+
+        input_lines = split_lf(formatter_input)
+        output_lines = split_lf(EXPECTED_FORMATTED)
+        difference = next((
+            index for index in range(max(len(input_lines), len(output_lines)))
+            if (input_lines[index] if index < len(input_lines) else None)
+            != (output_lines[index] if index < len(output_lines) else None)
+        ), None)
+        forced_canonical_diagnostic = MODE == "fmt_check_canonical_diagnostic"
+        diagnostics = []
+        if difference is not None or forced_canonical_diagnostic:
+            line_number = 1 if difference is None else difference + 1
+            input_line = (
+                None if difference is None or difference >= len(input_lines)
+                else input_lines[difference]
+            )
+            output_line = (
+                None if difference is None or difference >= len(output_lines)
+                else output_lines[difference]
+            )
+            start_byte = (
+                len(formatter_input) if input_line is None
+                else sum(len(item) for item in input_lines[:difference])
+            )
+            end_byte = start_byte if input_line is None else start_byte + len(input_line)
+            if input_line is not None and input_line.endswith(b"\\n"):
+                end_byte -= 1
+                if end_byte > start_byte and formatter_input[end_byte - 1] == 13:
+                    end_byte -= 1
+            expected_line = None if output_line is None else output_line.removesuffix(b"\\n")
+            start_position = position(formatter_input, start_byte)
+            end_position = position(formatter_input, end_byte)
+            diagnostic = {{
+                "type":"diagnostic","code":"UNFORMATTED_FILE","severity":"error",
+                "level":None,"message":"file is not formatted","primary":{{
+                    "file":{{"path":"<stdin>","package":None,"snapshot":None}},
+                    "start":start_position,
+                    "end":end_position
+                }},"primary_label":"","labels":[],
+                "children":[{{"kind":"help","message":"run `sai fmt <path>` to format this file",
+                             "location":None}}],
+                "fixes":[],"related":[],
+                "data":{{"line":line_number,"expected":(
+                    None if expected_line is None else expected_line.decode("utf-8")
+                )}},
+                "node":None,"symbol":None,"package":None
+            }}
+            if MODE == "fmt_check_wrong_code":
+                diagnostic["code"] = "EXPECTED_TOKEN"
+            if MODE == "fmt_check_wrong_severity":
+                diagnostic["severity"] = "warning"
+            if MODE == "fmt_check_wrong_message":
+                diagnostic["message"] = "different"
+            if MODE == "fmt_check_wrong_line":
+                diagnostic["primary"]["start"]["line"] += 1
+                diagnostic["primary"]["end"]["line"] += 1
+            if MODE == "fmt_check_wrong_span":
+                diagnostic["primary"]["end"]["byte"] += 1
+            if MODE == "fmt_check_wrong_column":
+                diagnostic["primary"]["start"]["col"] += 1
+            if MODE == "fmt_check_wrong_utf16_column":
+                diagnostic["primary"]["end"]["utf16_col"] += 1
+            if MODE == "fmt_check_wrong_data":
+                diagnostic["data"]["expected"] = "different"
+            diagnostics = [diagnostic]
+            if MODE == "fmt_check_extra_diagnostic":
+                diagnostics.append(json.loads(json.dumps(diagnostic)))
+            if MODE == "fmt_check_missing_diagnostic":
+                diagnostics = []
+
+        errors = sum(item["severity"] == "error" for item in diagnostics)
+        warnings = sum(item["severity"] == "warning" for item in diagnostics)
+        if MODE == "fmt_check_missing_diagnostic":
+            status = 0
+        else:
+            status = 1 if errors else 0
+        changed = [] if formatter_input == EXPECTED_FORMATTED else ["<stdin>"]
+        refused = []
+        output = None
+        if MODE == "fmt_check_wrong_result":
+            changed = []
+            refused = ["<stdin>"]
+            output = "unexpected"
+        result = {{"type":"result","kind":"fmt","data":{{
+            "check":True,"files":1,"changed":changed,"refused":refused,"output":output
+        }}}}
+        print(line(header("fmt", None)).rstrip("\\n"))
+        for diagnostic in diagnostics:
+            print(line(diagnostic).rstrip("\\n"))
+        print(line(result).rstrip("\\n"))
+        summary_record = summary(errors=errors, warnings=warnings, exit_code=status)
+        if MODE == "fmt_check_suppressed":
+            summary_record["suppressed"]["cascade"] = 1
+        print(line(summary_record).rstrip("\\n"))
+        raise SystemExit(status)
     if MODE == "formatter_malformed":
         sys.stdout.buffer.write(b"{{bad json\\n")
         raise SystemExit(0)
@@ -845,16 +999,147 @@ raise SystemExit(exit_code)
         })
         self.assertIsNone(report["results"][0]["compatibility_execution"])
         self.assertIs(report["claim"], False)
+        self.assertIn(
+            "no-argument package-wide fmt --check",
+            report["limitations"][2],
+        )
+        self.assertIn(
+            "multi-file or path-based fmt --check behavior are not covered.",
+            report["limitations"][2],
+        )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual(receipt["fmt_argv"], [
             "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
         ])
-        self.assertEqual(receipt["calls"], ["fmt", "fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt", "fmt-check", "fmt-check"])
         self.assertEqual(receipt["formatter_inputs"], [
             original.decode("utf-8"),
             self.expected_format.decode("utf-8"),
         ])
+        self.assertEqual(receipt["formatter_check_argv"], [
+            "--format=json",
+            "--max-errors=0",
+            "fmt",
+            "--check",
+            "--stdin-kind",
+            "source",
+            "-",
+        ])
+        self.assertEqual(receipt["formatter_check_inputs"], [
+            original.decode("utf-8"),
+            self.expected_format.decode("utf-8"),
+        ])
         self.assertEqual(self.source.read_bytes(), original)
+
+    def test_fmt_check_line_contract_uses_lf_bytes_and_empty_missing_lines(self):
+        cases = (
+            (
+                b"fn f(){}\n",
+                b"fn f() {}\n",
+                (1, b"fn f() {}", 0, 8),
+            ),
+            (
+                b"fn f(){}\r\n",
+                b"fn f() {}\n",
+                (1, b"fn f() {}", 0, 8),
+            ),
+            (
+                b"\xef\xbb\xbffn f(){}\n",
+                b"fn f() {}\n",
+                (1, b"fn f() {}", 0, 11),
+            ),
+            (
+                b"first\n",
+                b"first\nsecond\n",
+                (2, b"second", 6, 6),
+            ),
+            (
+                b"first\nsecond\n",
+                b"first\n",
+                (2, None, 6, 12),
+            ),
+            (
+                b"fn f() {}\n",
+                b"fn f() {}",
+                (1, b"fn f() {}", 0, 9),
+            ),
+            (
+                b"fn f() {}",
+                b"fn f() {}\n",
+                (1, b"fn f() {}", 0, 9),
+            ),
+            (
+                b"\n",
+                b"",
+                (1, None, 0, 0),
+            ),
+            (
+                b"",
+                b"first\n",
+                (1, b"first", 0, 0),
+            ),
+            (b"same\n", b"same\n", None),
+        )
+        for input_bytes, expected_output, expected in cases:
+            with self.subTest(input_bytes=input_bytes, expected_output=expected_output):
+                self.assertEqual(
+                    _first_differing_lf_line(input_bytes, expected_output),
+                    expected,
+                )
+
+    def test_fmt_check_position_columns_follow_original_utf8_source_bytes(self):
+        source = b"\xef\xbb\xbfabc\r\n" + "é😀\n".encode("utf-8")
+        cases = (
+            (0, {"line": 1, "col": 1, "utf16_col": 1}),
+            (3, {"line": 1, "col": 1, "utf16_col": 1}),
+            (6, {"line": 1, "col": 4, "utf16_col": 4}),
+            (8, {"line": 2, "col": 1, "utf16_col": 1}),
+            (10, {"line": 2, "col": 3, "utf16_col": 2}),
+            (14, {"line": 2, "col": 7, "utf16_col": 4}),
+        )
+        for offset, expected in cases:
+            with self.subTest(offset=offset):
+                self.assertEqual(_source_position(source, offset), expected)
+
+    def test_fmt_check_rejects_malformed_and_inconsistent_responses(self):
+        for mode, reason in (
+            ("fmt_check_malformed", "invalid record"),
+            ("fmt_check_wrong_code", "first differing line"),
+            ("fmt_check_wrong_severity", "unexpected exit code"),
+            ("fmt_check_wrong_message", "first differing line"),
+            ("fmt_check_wrong_line", "wrong primary position or byte span"),
+            ("fmt_check_wrong_span", "wrong primary position or byte span"),
+            ("fmt_check_wrong_column", "wrong primary position or byte span"),
+            ("fmt_check_wrong_utf16_column", "wrong primary position or byte span"),
+            ("fmt_check_wrong_data", "first differing line"),
+            ("fmt_check_extra_diagnostic", "exactly one diagnostic"),
+            ("fmt_check_missing_diagnostic", "unexpected exit code"),
+            ("fmt_check_wrong_result", "invalid source stdin result"),
+            ("fmt_check_suppressed", "suppressed unexpected diagnostics"),
+        ):
+            with self.subTest(mode=mode):
+                self._fmt_fixture()
+                self.mode = mode
+                self._write_fake()
+                report = self._run()
+                self.assertEqual(report["outcome"], "fail")
+                self.assertIn(reason, " ".join(report["results"][0]["failures"]))
+
+    def test_fmt_check_rejects_unformatted_diagnostic_on_canonical_expected_output(self):
+        self._fmt_fixture()
+        self.mode = "fmt_check_canonical_diagnostic"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "canonical formatter output produced a --check diagnostic",
+            " ".join(report["results"][0]["failures"]),
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["formatter_check_inputs"], [
+            self.source.read_text(encoding="utf-8"),
+            self.expected_format.decode("utf-8"),
+        ])
 
     def test_fmt_requires_only_its_exact_expected_sidecar(self):
         self._fmt_fixture()
