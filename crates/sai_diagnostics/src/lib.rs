@@ -1603,13 +1603,21 @@ impl Diagnostic {
     /// binding because that binding is validated here and deliberately
     /// discarded. Every explicit location must belong to `file_id` and
     /// `source_ref`; contextual state that needs broader snapshot provenance
-    /// remains unsupported.
+    /// remains unsupported. Over-depth data is rejected before cloning or
+    /// validating other state, so `ValueTooDeep` takes precedence over those
+    /// errors. Otherwise snapshot validation precedes the file check, which
+    /// precedes rejection of contextual state. Unlike this method,
+    /// [`Self::to_template`] checks contextual state before data depth. Callers
+    /// remain responsible for dropping their original data.
     pub fn to_template_for_file(
         &self,
         snapshot: &WorkspaceSnapshot,
         file_id: FileId,
         source_ref: &SourceRef,
     ) -> Result<DiagnosticTemplate, DiagnosticTemplateError> {
+        if !value_object_within_depth(&self.data, DIAGNOSTIC_TEMPLATE_MAX_VALUE_DEPTH) {
+            return Err(DiagnosticTemplateError::ValueTooDeep);
+        }
         self.clone()
             .with_workspace_snapshot(snapshot)
             .map_err(|_| DiagnosticTemplateError::ContextualState)?;
@@ -4075,6 +4083,20 @@ mod tests {
             Diagnostic::new(Code::ExpectedToken, Severity::Error, "expected token", None);
         accepted.data.insert("nested".to_owned(), accepted_value);
         assert!(accepted.to_template().is_ok());
+        let source = Arc::new(SourceFile::new(FileId::new(1), "x", false).unwrap());
+        let snapshot =
+            WorkspaceSnapshot::new([SnapshotFile::new(source, "src/main.sai", None, None)])
+                .unwrap();
+        let source_ref = SourceRef {
+            path: "src/main.sai".to_owned(),
+            package: None,
+            snapshot: None,
+        };
+        assert!(
+            accepted
+                .to_template_for_file(&snapshot, FileId::new(1), &source_ref)
+                .is_ok()
+        );
 
         let mut nested = Value::Null;
         for _ in 0..20_000 {
@@ -4087,11 +4109,142 @@ mod tests {
             diagnostic.to_template(),
             Err(DiagnosticTemplateError::ValueTooDeep)
         );
+        assert_eq!(
+            diagnostic.to_template_for_file(&snapshot, FileId::new(1), &source_ref),
+            Err(DiagnosticTemplateError::ValueTooDeep)
+        );
         let mut hasher = StableHasher::new();
         stable_hash_value_object(&diagnostic.data, &mut hasher);
         assert_ne!(hasher.finish(), StableHasher::new().finish());
         // Value uses recursive drop; keep this over-limit stress fixture alive
         // until process exit after checking the template boundary and hasher.
         std::mem::forget(diagnostic);
+    }
+
+    #[test]
+    fn diagnostic_template_depth_boundary_includes_nested_objects() {
+        let source = Arc::new(SourceFile::new(FileId::new(1), "x", false).unwrap());
+        let snapshot =
+            WorkspaceSnapshot::new([SnapshotFile::new(source, "src/main.sai", None, None)])
+                .unwrap();
+        let source_ref = SourceRef {
+            path: "src/main.sai".to_owned(),
+            package: None,
+            snapshot: None,
+        };
+        for kind in ["arrays", "objects", "mixed"] {
+            for depth in [128, 129] {
+                let mut value = Value::Null;
+                for level in 1..depth {
+                    value = if kind == "objects" || (kind == "mixed" && level % 2 == 0) {
+                        Value::Object(ValueObject::from([("child".to_owned(), value)]))
+                    } else {
+                        Value::Array(vec![value])
+                    };
+                }
+                let mut diagnostic =
+                    Diagnostic::new(Code::ExpectedToken, Severity::Error, "expected", None);
+                diagnostic.data.insert("nested".to_owned(), value);
+                let expected_error = (depth > DIAGNOSTIC_TEMPLATE_MAX_VALUE_DEPTH)
+                    .then_some(DiagnosticTemplateError::ValueTooDeep);
+                assert_eq!(
+                    diagnostic.to_template().err(),
+                    expected_error,
+                    "{kind} {depth}"
+                );
+                assert_eq!(
+                    diagnostic
+                        .to_template_for_file(&snapshot, FileId::new(1), &source_ref)
+                        .err(),
+                    expected_error,
+                    "{kind} {depth}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_template_for_file_checks_depth_before_other_invalid_state() {
+        let source_ref = SourceRef {
+            path: "src/main.sai".to_owned(),
+            package: None,
+            snapshot: None,
+        };
+        let other_ref = SourceRef {
+            path: "src/other.sai".to_owned(),
+            package: None,
+            snapshot: None,
+        };
+        let snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::new(SourceFile::new(FileId::new(1), "x", false).unwrap()),
+                &source_ref.path,
+                None,
+                None,
+            ),
+            SnapshotFile::new(
+                Arc::new(SourceFile::new(FileId::new(2), "x", false).unwrap()),
+                &other_ref.path,
+                None,
+                None,
+            ),
+        ])
+        .unwrap();
+        let other_snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(FileId::new(2), "x", false).unwrap()),
+            &other_ref.path,
+            None,
+            None,
+        )])
+        .unwrap();
+        let mut diagnostic = Diagnostic::new(
+            Code::ExpectedToken,
+            Severity::Error,
+            "expected",
+            Some(Location {
+                file: source_ref.clone(),
+                span: Span::new(FileId::new(1), TextRange::empty(TextSize::new(0))),
+            }),
+        );
+        diagnostic
+            .set_level(Some(LevelInfo {
+                value: LintLevel::Deny,
+                source: LevelSource::Attribute,
+                location: None,
+            }))
+            .unwrap();
+        assert_eq!(
+            diagnostic.to_template_for_file(&other_snapshot, FileId::new(2), &other_ref),
+            Err(DiagnosticTemplateError::ContextualState)
+        );
+        assert_eq!(
+            diagnostic.to_template_for_file(&snapshot, FileId::new(2), &other_ref),
+            Err(DiagnosticTemplateError::MixedSource)
+        );
+        assert_eq!(
+            diagnostic.to_template_for_file(&snapshot, FileId::new(1), &source_ref),
+            Err(DiagnosticTemplateError::ContextualState)
+        );
+        let mut value = Value::Null;
+        for _ in 0..DIAGNOSTIC_TEMPLATE_MAX_VALUE_DEPTH {
+            value = Value::Object(ValueObject::from([("child".to_owned(), value)]));
+        }
+        diagnostic.data.insert("nested".to_owned(), value);
+        assert_eq!(
+            diagnostic.to_template_for_file(&other_snapshot, FileId::new(2), &other_ref),
+            Err(DiagnosticTemplateError::ValueTooDeep)
+        );
+        assert_eq!(
+            diagnostic.to_template_for_file(&snapshot, FileId::new(2), &other_ref),
+            Err(DiagnosticTemplateError::ValueTooDeep)
+        );
+        assert_eq!(
+            diagnostic.to_template_for_file(&snapshot, FileId::new(1), &source_ref),
+            Err(DiagnosticTemplateError::ValueTooDeep)
+        );
+        assert_eq!(
+            diagnostic.to_template(),
+            Err(DiagnosticTemplateError::ContextualState)
+        );
     }
 }

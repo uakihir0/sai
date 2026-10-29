@@ -9265,3 +9265,9 @@
 - **Decision — review required:** Preserve `fmt`'s internal-error precedence on output failures, stop processing files after an internal error, and retain diagnostics gathered before cancellation at the covered safe points. A partial progress line is completed before diagnostics so that UTF-8 and diagnostic headings remain valid. The interpretation of a simultaneous failure of both output streams follows IR-1016.
 - **Verification:** Ten focused writer and interruption tests passed, including short writes and split UTF-8; formatting and diff checks passed. An end-to-end formatter ICE injection test is still missing. Cancellation during final human or JSON rendering remains unresolved and can leave a non-interrupted exit or summary.
 - **Hostile review:** Independent reviews found lost diagnostics, unchecked cancellation between short writes, malformed joined headings and unfinished prefixes without diagnostics. The covered paths were corrected; the final focused review found no further defect in the prefix repair.
+
+### IR-1026 (2026-10-29): reject deep diagnostic values before template cloning
+
+- **Decision — review required:** Check the existing template depth limit before cloning data in snapshot-bound template conversion. This makes excessive depth take precedence over conflicting snapshot or contextual-state failures on that path, unlike the unbound conversion; the difference needs review. The limit controls depth, not breadth.
+- **Verification:** Five focused tests passed, including depth 128/129, nested arrays and objects, and mixed invalid states. Recursive cloning or dropping of independently constructed deep values elsewhere, including the HIR fallback, remains unsafe and is not fixed here.
+- **Hostile review:** Independent review confirmed that the guard itself traverses iteratively and cannot encounter cycles in the owned value tree; it identified remaining clone/drop risks and requested boundary and error-precedence tests.
