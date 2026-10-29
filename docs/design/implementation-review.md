@@ -9187,3 +9187,9 @@
 - **Decision — review required:** Allow the partial stream validator to check explicitly supplied error limits, process exit-code agreement and captured stderr. Missing observations remain unchecked, and even a successful partial check cannot substantiate a conformance claim or validate exit-code semantics and stdout write failure.
 - **Verification:** All 56 conformance-component tests passed; focused tests cover bounds, mismatched process status and stderr. The validator remains independent of compiler internals.
 - **Hostile review:** Independent review found that reading the entire stderr capture could exhaust memory on an invalid implementation. The CLI now checks only its first byte, including for unbounded streams; re-review found no further actionable defect in the checked subset.
+
+### IR-1013 (2026-10-29): gate one known unused-binding false success
+
+- **Decision — review required:** Conservatively gate a single-integer-local, different-path-tail shape that was observed to succeed without its required unused-binding warning. This is a narrow stopgap, not lint analysis: multiple locals, unused parameters and other shapes can still falsely succeed (IR-1001). A broad gate disrupted 75 existing tests, so it was not adopted without preserving their diagnostic coverage.
+- **Verification:** The affected CLI integration binary passed all 369 tests, and focused tests cover function and method names with BOM, Unicode and raw identifiers. The pre-change false success and remaining multi-binding false success were reproduced.
+- **Hostile review:** Independent review confirmed that general coverage remains incomplete and found a BOM offset error in the initial gate. Comparing CST identifier tokens instead of slicing original bytes corrected that specific regression; the reviewer found no new defect in the corrected subset.

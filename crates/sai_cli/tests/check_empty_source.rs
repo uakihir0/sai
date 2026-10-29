@@ -9996,6 +9996,68 @@ fn unsupported_primitive_local_not_shapes_remain_gated() {
 }
 
 #[test]
+fn unused_literal_binding_with_bom_and_comment_stays_gated() {
+    for prefix in ["", "\u{feff}"] {
+        for (parameter, tail) in [("x", "/*n*/x"), ("x", "/*n*/r#x"), ("é", "/*n*/é")] {
+            for source in [
+                format!(
+                    "{prefix}pub fn f({parameter}: I32) -> I32 {{\n    let n = 1\n    {tail}\n}}\n"
+                ),
+                format!(
+                    "{prefix}type Counter {{ marker: I32 }}\nimpl Counter {{\n    pub fn f(self: borrow Self, {parameter}: I32) -> I32 {{\n        let n = 1\n        {tail}\n    }}\n}}\n"
+                ),
+            ] {
+                assert_check_stays_gated_without_syntax_errors(
+                    &run_check(&source, "", &[], &[]),
+                    &source,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unused_binding_coverage_gates_non_literal_tail() {
+    for source in [
+        "pub fn f(x: I32) -> I32 {\n    let n = 1\n    x\n}\n",
+        "pub fn f(value: I32) -> I32 {\n    let ignored: I32 = 3\n    (value)\n}\n",
+        "type Counter { marker: I32 }\nimpl Counter {\n    pub fn f(self: borrow Self, x: I32) -> I32 {\n        let n = 1\n        x\n    }\n}\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+    assert_success_result(
+        run_check("pub fn f() -> I32 { 1 }\n", "", &[], &[]),
+        "wasm32-core",
+        "dev",
+    );
+    for source in [
+        "pub fn f(x: I32) -> I32 { x }\n",
+        "pub fn f() -> I32 {\n    let n = 1\n    n\n}\n",
+        "pub fn f(x: I32) -> I32 {\n    let _n = 1\n    x\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+    for source in [
+        "pub fn f(x: I32) -> I32 {\n    let bad: Bool = 1\n    x\n}\n",
+        "type Counter { marker: I32 }\nimpl Counter {\n    pub fn f(self: borrow Self, x: I32) -> I32 {\n        let bad: Bool = 1\n        x\n    }\n}\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
 fn literal_tail_with_locals_preserves_stage_zero_boundary() {
     for source in [
         "pub fn answer() -> I8 { 12 }\n",

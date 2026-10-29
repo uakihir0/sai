@@ -2190,7 +2190,7 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
             .is_some_and(|visibility| visibility.pub_token().is_some())
 }
 
-fn check_literal_tail_needs_unused_variable_analysis(source: &[u8]) -> Option<bool> {
+fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
     use sai_syntax::ast::{self, AstNode as _};
 
     let parsed = sai_fmt::parse_source(source).ok()?;
@@ -2231,6 +2231,45 @@ fn check_literal_tail_needs_unused_variable_analysis(source: &[u8]) -> Option<bo
             other => break other,
         }
     };
+    if let ast::Expr::Path(path) = &expression
+        && path.generic_args().is_none()
+        && let Some(path_name) = path.name()
+        && path.syntax().text_range() == path_name.syntax().text_range()
+    {
+        let mut statements = body.statements();
+        if let (Some(ast::Stmt::Let(local)), Some(ast::Stmt::Expr(_)), None) =
+            (statements.next(), statements.next(), statements.next())
+            && local.else_clause().is_none()
+            && matches!(local.initializer(), Some(ast::Expr::Literal(literal)) if matches!(literal.token(), Some(ast::LiteralToken::Int(_))))
+            && let Some(ast::Pattern::Binding(binding)) = local.pattern()
+            && binding.mode().is_none()
+            && let Some(name) = binding.name().and_then(|name| name.token())
+        {
+            let spelling = name.text().strip_prefix("r#").unwrap_or(name.text());
+            let path_token = path_name
+                .syntax()
+                .children_with_tokens()
+                .find_map(|element| match element {
+                    sai_syntax::SyntaxElement::Token(token)
+                        if matches!(
+                            token.kind(),
+                            sai_syntax::SyntaxKind::LIDENT | sai_syntax::SyntaxKind::UIDENT
+                        ) =>
+                    {
+                        Some(token)
+                    }
+                    _ => None,
+                })?;
+            let path_spelling = path_token.text();
+            let path_spelling = path_spelling.strip_prefix("r#").unwrap_or(path_spelling);
+            if !spelling.starts_with('_')
+                && sai_syntax::normalize_identifier(spelling)
+                    != sai_syntax::normalize_identifier(path_spelling)
+            {
+                return Some(true);
+            }
+        }
+    }
     Some(match expression {
         ast::Expr::Literal(literal) => matches!(
             literal.token(),
@@ -6851,9 +6890,8 @@ fn module_tree_workspace_check_diagnostics(
                                 .source_inputs
                                 .first()
                                 .is_some_and(|(_, _, source)| {
-                                    check_literal_tail_needs_unused_variable_analysis(
-                                        source.as_ref(),
-                                    ) == Some(false)
+                                    check_body_matches_unused_variable_gate(source.as_ref())
+                                        == Some(false)
                                 }))
                         && check_public_function_body_coverage(
                             true,
@@ -6942,7 +6980,7 @@ fn module_tree_workspace_check_diagnostics(
                             .source_inputs
                             .first()
                             .is_some_and(|(_, _, source)| {
-                                check_literal_tail_needs_unused_variable_analysis(source.as_ref())
+                                check_body_matches_unused_variable_gate(source.as_ref())
                                     == Some(false)
                             }))
                         && check_public_inherent_method_body_coverage(
@@ -14272,9 +14310,10 @@ mod tests {
         CheckPackageManifestInput, CheckWorkspaceSourceBudget, CheckWorkspaceWitBudget,
         CliDiagnostic, CliLocation, CliPosition, CliSourceIndex, EXPLAIN_CODE_SUMMARIES,
         PackageKey, PackageRelativePath, RenderedSourceLine, StdinBroker, StdinReadError,
-        WorkspaceSnapshot, check_locked_active_wit_directory_inputs,
-        check_locked_dependency_source_inputs, check_locked_wit_directory_inputs,
-        check_module_tree_workspace_exceeds_limits, check_package_manifest_snapshot_files,
+        WorkspaceSnapshot, check_body_matches_unused_variable_gate,
+        check_locked_active_wit_directory_inputs, check_locked_dependency_source_inputs,
+        check_locked_wit_directory_inputs, check_module_tree_workspace_exceeds_limits,
+        check_package_manifest_snapshot_files,
         check_source_is_single_unattributed_public_inherent_method, cli_position,
         compare_check_diagnostics, fmt_path_selection_signature, has_incomplete_wit_input_capture,
         human_file_path, internal_fmt_diagnostic, parse_args, phase1_package_collection_order,
@@ -14293,6 +14332,36 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn unused_binding_gate_reads_identifier_tokens_after_bom() {
+        for prefix in ["", "\u{feff}"] {
+            for (parameter, binding, tail, expected) in [
+                ("x", "n", "/*n*/x", true),
+                ("x", "n", "/*n*/r#x", true),
+                ("é", "n", "/*n*/é", true),
+                ("x", "é", "/*n*/x", true),
+                ("x", "r#n", "/*n*/x", true),
+                ("x", "n", "/*n*/r#n", false),
+                ("x", "é", "r#é", false),
+                ("x", "r#n", "n", false),
+            ] {
+                let body = format!("let {binding} = 1\n    {tail}");
+                for source in [
+                    format!("{prefix}pub fn f({parameter}: I32) -> I32 {{\n    {body}\n}}\n"),
+                    format!(
+                        "{prefix}type Counter {{ marker: I32 }}\nimpl Counter {{\n    pub fn f(self: borrow Self, {parameter}: I32) -> I32 {{\n        {body}\n    }}\n}}\n"
+                    ),
+                ] {
+                    assert_eq!(
+                        check_body_matches_unused_variable_gate(source.as_bytes()),
+                        Some(expected),
+                        "{source:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn unknown_self_field_source_is_an_inherent_method_check_candidate() {
