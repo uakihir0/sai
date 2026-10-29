@@ -14,6 +14,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  conformance-components:
+    name: Conformance components (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Test standalone conformance components
+        run: python -B -m unittest discover -s tools/conformance -p 'test_*.py'
+
   check:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

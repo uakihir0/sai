@@ -9126,3 +9126,9 @@
 - **Decision — review required:** Extend the primitive body checker and driver to type a direct scalar literal tail against the function return type, including with parameters or prior supported locals. Publish only untainted partial facts. Keep newly covered CLI success cases gated until unused-binding analysis exists; known type errors are still reported. This conservative gate does not resolve the pre-existing coverage gap in IR-1001.
 - **Verification:** The `sai_ty` suite (152 tests), focused driver integration and compatibility tests, and seven focused CLI boundary and compatibility tests passed. Tests cover result facts, independent local errors, type and range errors, functions and methods, parenthesized and negative literals, and unsupported shapes.
 - **Hostile review:** Independent review found that the driver extension implicitly broadened CLI success despite missing `UNUSED_VARIABLE`. The explicit gate and regression tests were added; a subsequent static review found no further actionable regression. Full driver and CLI suites were not run.
+
+### IR-1003 (2026-10-29): test standalone conformance components in CI
+
+- **Decision — review required:** Run the independent Python conformance component tests in a separate Ubuntu matrix on Python 3.10, 3.12, and 3.14. This covers the oldest supported syntax and two newer runtimes without delaying the platform-specific Rust jobs.
+- **Verification:** The component tests passed locally on Python 3.12 and 3.14. Python 3.10 and GitHub Actions execution remain unverified locally.
+- **Hostile review:** An independent review found no actionable workflow or test-discovery defect; it confirmed the untracked extractor tests cannot run in CI until committed.
