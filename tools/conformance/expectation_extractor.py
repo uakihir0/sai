@@ -2,23 +2,26 @@
 """Extract one source file's normalized diagnostic expectations.
 
 Usage: python3 expectation_extractor.py SOURCE --path ROOT_RELATIVE_PATH
-       [--directives] [--lint-levels JSON_OBJECT]
+       [--directives] [--validate-test-directives] [--lint-levels JSON_OBJECT]
 
 This is a conservative lexical scanner, not an IUT lexer or a complete suite
 validator. Format strings, execution annotations, and ambiguous or unfinished
 literals are rejected instead of guessed. Lint defaults must come from the
-IUT's explain records; allow-level lints cannot be expected. Other recognized
-directives are checked for placement and repetition, but their values are not
-validated. Lexically ill-formed tests whose comment boundaries cannot be
-established are unsupported. Non-ASCII code outside comments and literals is
+IUT's explain records; allow-level lints cannot be expected. Expectation-only
+mode checks directive placement and repetition but does not validate their
+values. `--validate-test-directives` additionally requires and validates the
+complete test header, returning normalized directive metadata. Lexically
+ill-formed tests whose comment boundaries cannot be established are
+unsupported. Non-ASCII code outside comments and literals is
 unsupported; the scanner does not depend on Python's Unicode identifier tables.
 Invalid UTF-8 is supported only as isolated bytes outside comments and literals.
 Invalid escapes, manifest line continuations, and a backslash immediately
 followed by a lone CR (including in comments and raw strings) are rejected.
 Outside manifests, only complete package paths with unambiguous boundaries are
 supported. Ambiguous newline or bracket recovery causes conservative rejection.
-Output is a JSON object with an `expected` array
-in the diagnostic matcher's input format. Errors exit with status 2.
+Output is a JSON object with an `expected` array in the diagnostic matcher's
+input format; strict mode also includes normalized `directives`. Errors exit
+with status 2.
 See docs/impl/15-conformance-and-testing.md §15.3.
 """
 
@@ -38,12 +41,23 @@ SIMPLE_CODE = re.compile(rf"({CODE})(?=$|[ \t(;,])")
 POSSIBLE_PACKAGE_PATH = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*:")
 PACKAGE_PATH = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*:[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:/[a-z][a-z0-9_]*(?:-[a-z0-9]+)*)*")
 UNICODE_ESCAPE = re.compile(r"\\u\{([0-9a-fA-F]{1,6})\}")
+SPEC_REFERENCE = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*)[ \t]+§([0-9]+(?:\.[0-9]+)*)\Z")
+CALL_EXPORT = re.compile(r"[A-Za-z_][A-Za-z0-9_.:/@#-]*\Z")
 DIRECTIVES = {
     "kind", "stage", "spec", "targets", "profiles", "options", "component",
     "call", "args", "seed", "diag", "fuel", "memory-limit", "stderr-fails",
     "reference-only",
 }
 LEVELS = {"info": "info", "warn": "warning", "deny": "error"}
+KINDS = {
+    "check-pass", "check-fail", "build-pass", "build-fail", "run-pass",
+    "run-fail", "run-panic", "run-trap", "test", "fmt", "fmt-refuse",
+    "protocol",
+}
+TARGETS = {"wasm32-core", "wasm64-core", "wasm32-wasi", "wasm64-wasi"}
+PROFILES = {"dev", "release", "tiny"}
+OPTION_FLAGS = {"--tests", "--deny-warnings", "--locked", "--offline", "--frozen"}
+OPTION_VALUE_FLAGS = {"--allow", "--warn", "--deny"}
 
 
 def root_relative(path: object) -> bool:
@@ -73,18 +87,272 @@ def unique_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
+def _parse_json_string_arguments(value: str) -> list[str]:
+    decoder = json.JSONDecoder()
+    result = []
+    position = 0
+    while position < len(value):
+        while position < len(value) and value[position] in " \t":
+            position += 1
+        if position == len(value):
+            break
+        try:
+            argument, end = decoder.raw_decode(value, position)
+        except (json.JSONDecodeError, RecursionError):
+            raise ValueError("args must contain space-separated JSON strings") from None
+        if not isinstance(argument, str):
+            raise ValueError("each args entry must be a JSON string")
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in argument):
+            raise ValueError("args strings must contain Unicode scalar values")
+        result.append(argument)
+        position = end
+        if position < len(value) and value[position] not in " \t":
+            raise ValueError("args entries must be separated by spaces")
+    if not result:
+        raise ValueError("args must contain at least one JSON string")
+    return result
+
+
+def _split_call_arguments(value: str) -> list[str]:
+    if not value.strip():
+        return []
+    result = []
+    start = 0
+    stack = []
+    quote = None
+    escaped = False
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for index, character in enumerate(value):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in ('"', "'"):
+            quote = character
+        elif character in "([{":
+            stack.append(character)
+        elif character in ")]}":
+            if not stack or stack.pop() != pairs[character]:
+                raise ValueError("call directive has unbalanced delimiters")
+        elif character == "," and not stack:
+            argument = value[start:index].strip()
+            if not argument:
+                raise ValueError("call directive has an empty argument")
+            result.append(argument)
+            start = index + 1
+    if quote is not None or escaped or stack:
+        raise ValueError("call directive has an unterminated string or delimiter")
+    final = value[start:].strip()
+    if not final:
+        raise ValueError("call directive has an empty argument")
+    result.append(final)
+    return result
+
+
+def _validate_call_value(value: str) -> None:
+    stack = []
+    quote = None
+    escaped = False
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for character in value:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in ('"', "'"):
+            quote = character
+        elif character in "([{":
+            stack.append(character)
+        elif character in ")]}":
+            if not stack or stack.pop() != pairs[character]:
+                raise ValueError("call directive has unbalanced delimiters")
+    if quote is not None or escaped or stack:
+        raise ValueError("call directive has an unterminated string or delimiter")
+
+
+def _parse_call(value: str) -> dict:
+    value = value.strip()
+    open_paren = value.find("(")
+    if open_paren <= 0:
+        raise ValueError("call must have the form <export>(<value>, ...) -> <result>")
+    export_text = value[:open_paren]
+    export = export_text.strip()
+    if export_text != export or not CALL_EXPORT.fullmatch(export):
+        raise ValueError("call has an invalid export name")
+
+    stack = []
+    quote = None
+    escaped = False
+    pairs = {")": "(", "]": "[", "}": "{"}
+    close_paren = None
+    for index in range(open_paren, len(value)):
+        character = value[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in ('"', "'"):
+            quote = character
+        elif character in "([{":
+            stack.append(character)
+        elif character in ")]}":
+            if not stack or stack.pop() != pairs[character]:
+                raise ValueError("call directive has unbalanced delimiters")
+            if not stack:
+                close_paren = index
+                break
+    if close_paren is None or quote is not None or escaped:
+        raise ValueError("call directive has an unterminated delimiter or string")
+
+    trailer = value[close_paren + 1:]
+    result_match = re.fullmatch(r"[ \t]*->[ \t]*(.+?)[ \t]*", trailer)
+    if result_match is None:
+        raise ValueError("call must have a result after `->`")
+    arguments = _split_call_arguments(value[open_paren + 1:close_paren])
+    result = result_match[1]
+    _validate_call_value(result)
+    return {"export": export, "arguments": arguments, "result": result}
+
+
+def _parse_options(value: str) -> list[str]:
+    tokens = value.split()
+    if not tokens:
+        raise ValueError("options must contain at least one option")
+    parsed = []
+    index = 0
+    while index < len(tokens):
+        option = tokens[index]
+        parsed.append(option)
+        index += 1
+        if option in OPTION_FLAGS:
+            continue
+        if option in OPTION_VALUE_FLAGS:
+            if index >= len(tokens) or not re.fullmatch(CODE, tokens[index]):
+                raise ValueError(f"{option} requires a diagnostic code")
+            parsed.append(tokens[index])
+            index += 1
+            continue
+        if option == "--wasm-feature":
+            if index >= len(tokens) or tokens[index] not in {"tail-call", "simd128"}:
+                raise ValueError("--wasm-feature requires tail-call or simd128")
+            parsed.append(tokens[index])
+            index += 1
+            continue
+        raise ValueError(f"unsupported test option: {option}")
+    return parsed
+
+
+def _parse_directive(name: str, value: str) -> object:
+    if name == "kind":
+        if value not in KINDS:
+            raise ValueError("unsupported test kind")
+        return value
+    if name == "stage":
+        if not re.fullmatch(r"[0-9]+", value) or int(value) > 7:
+            raise ValueError("stage must be a decimal integer from 0 to 7")
+        return int(value)
+    if name == "spec":
+        references = [reference.strip() for reference in value.split(",")]
+        if not references or any(not reference for reference in references):
+            raise ValueError("spec must contain one or more section references")
+        result = []
+        for reference in references:
+            match = SPEC_REFERENCE.fullmatch(reference)
+            if match is None or not root_relative(match[1]):
+                raise ValueError("spec entries must have the form `<document> §<section>`")
+            result.append({"document": match[1], "section": match[2]})
+        return result
+    if name in ("targets", "profiles"):
+        values = value.split()
+        allowed = TARGETS if name == "targets" else PROFILES
+        if not values or any(item not in allowed for item in values):
+            raise ValueError(f"{name} must contain supported names separated by spaces")
+        if len(set(values)) != len(values):
+            raise ValueError(f"{name} contains a duplicate name")
+        return values
+    if name == "options":
+        return _parse_options(value)
+    if name == "component":
+        if value:
+            raise ValueError("component is an empty flag")
+        return True
+    if name == "call":
+        return _parse_call(value)
+    if name == "args":
+        return _parse_json_string_arguments(value)
+    if name == "seed":
+        if not re.fullmatch(r"[0-9]+", value):
+            raise ValueError("seed must be a decimal integer")
+        return int(value)
+    if name == "diag":
+        diagnostic = DIRECTIVE_DIAGNOSTIC.fullmatch(value)
+        if diagnostic is None:
+            raise ValueError("invalid diagnostic directive")
+        severity, code, target_file, target_line = diagnostic.groups()
+        if target_file is not None and not root_relative(target_file):
+            raise ValueError("diagnostic directive path is not root-relative")
+        return {"file": target_file, "line": int(target_line) if target_line else None,
+                "severity": severity, "code": code}
+    if name in ("fuel", "memory-limit"):
+        if not re.fullmatch(r"[0-9]+", value):
+            raise ValueError(f"{name} must be a decimal integer")
+        return int(value)
+    if name == "stderr-fails":
+        if value != "first-write":
+            raise ValueError("stderr-fails supports only first-write")
+        return value
+    if name == "reference-only":
+        if not value:
+            raise ValueError("reference-only requires a reason")
+        return value
+    raise ValueError(f"unsupported directive: {name}")
+
+
 def extract(source: str, path: str, *, directives: bool = False, lint_levels: dict | None = None) -> list[dict]:
-    return _extract(source, path, directives=directives, lint_levels=lint_levels, invalid_bytes=False)
+    expected, _ = _extract(source, path, directives=directives, lint_levels=lint_levels,
+                           invalid_bytes=False)
+    return expected
 
 
 def extract_bytes(source: bytes, path: str, *, directives: bool = False, lint_levels: dict | None = None) -> list[dict]:
     if not isinstance(source, bytes):
         raise ValueError("source must be bytes")
-    return _extract(source.decode("utf-8", errors="surrogateescape"), path,
-                    directives=directives, lint_levels=lint_levels, invalid_bytes=True)
+    expected, _ = _extract(source.decode("utf-8", errors="surrogateescape"), path,
+                           directives=directives, lint_levels=lint_levels, invalid_bytes=True)
+    return expected
 
 
-def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | None, invalid_bytes: bool) -> list[dict]:
+def extract_with_directives(source: str, path: str, *, lint_levels: dict | None = None) -> dict:
+    """Extract expectations and validate the complete test directive header."""
+    expected, metadata = _extract(source, path, directives=True, lint_levels=lint_levels,
+                                  invalid_bytes=False, validate_test_directives=True)
+    return {"expected": expected, "directives": metadata}
+
+
+def extract_bytes_with_directives(source: bytes, path: str, *, lint_levels: dict | None = None) -> dict:
+    """Byte-preserving counterpart of :func:`extract_with_directives`."""
+    if not isinstance(source, bytes):
+        raise ValueError("source must be bytes")
+    expected, metadata = _extract(source.decode("utf-8", errors="surrogateescape"), path,
+                                  directives=True, lint_levels=lint_levels, invalid_bytes=True,
+                                  validate_test_directives=True)
+    return {"expected": expected, "directives": metadata}
+
+
+def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | None,
+             invalid_bytes: bool, validate_test_directives: bool = False) -> tuple[list[dict], dict | None]:
     if not isinstance(source, str) or not root_relative(path) or type(directives) is not bool:
         raise ValueError("invalid source, root-relative path, or directives flag")
     try:
@@ -114,6 +382,8 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
     line_break_since_previous = False
     brackets = []
     brackets_unknown = False
+    directive_values = {}
+    parsed_diagnostics = []
 
     def fail(message: str) -> None:
         raise ValueError(f"line {line}: {message}")
@@ -171,14 +441,16 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
             if name not in ("diag", "call") and name in seen_directives:
                 fail("repeated non-repeatable directive")
             seen_directives.add(name)
-            if name == "diag":
-                diagnostic = DIRECTIVE_DIAGNOSTIC.fullmatch(value)
-                if diagnostic is None:
-                    fail("invalid diagnostic directive")
-                severity, code, target_file, target_line = diagnostic.groups()
-                if target_file is not None and not root_relative(target_file):
-                    fail("diagnostic directive path is not root-relative")
-                emit(severity, code, target_file, int(target_line) if target_line else None)
+            if validate_test_directives or name == "diag":
+                try:
+                    parsed = _parse_directive(name, value)
+                except ValueError as error:
+                    fail(str(error))
+                if name == "diag":
+                    parsed_diagnostics.append(parsed)
+                    emit(parsed["severity"], parsed["code"], parsed["file"], parsed["line"])
+                else:
+                    directive_values.setdefault(name, []).append(parsed)
 
     def skip_escape(start: int, limit: int, *, byte: bool, continuation: bool) -> int:
         if start + 1 >= limit:
@@ -394,7 +666,34 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
             else:
                 brackets.pop()
         position += 1
-    return expected
+    if not validate_test_directives:
+        return expected, None
+
+    missing = {"kind", "stage", "spec"} - directive_values.keys()
+    if missing:
+        raise ValueError("missing required directive(s): " + ", ".join(sorted(missing)))
+
+    def one(name: str) -> object:
+        return directive_values[name][0]
+
+    metadata = {
+        "kind": one("kind"),
+        "stage": one("stage"),
+        "spec": one("spec"),
+        "targets": one("targets") if "targets" in directive_values else sorted(TARGETS),
+        "profiles": one("profiles") if "profiles" in directive_values else ["dev", "release", "tiny"],
+        "options": one("options") if "options" in directive_values else [],
+        "component": "component" in directive_values,
+        "call": directive_values.get("call", []),
+        "args": one("args") if "args" in directive_values else [],
+        "seed": one("seed") if "seed" in directive_values else None,
+        "diag": parsed_diagnostics,
+        "fuel": one("fuel") if "fuel" in directive_values else 10_000_000_000,
+        "memory_limit": one("memory-limit") if "memory-limit" in directive_values else 4096,
+        "stderr_fails": one("stderr-fails") if "stderr-fails" in directive_values else None,
+        "reference_only": one("reference-only") if "reference-only" in directive_values else None,
+    }
+    return expected, metadata
 
 
 def main() -> int:
@@ -402,17 +701,23 @@ def main() -> int:
     parser.add_argument("source", type=Path)
     parser.add_argument("--path", required=True)
     parser.add_argument("--directives", action="store_true")
+    parser.add_argument("--validate-test-directives", action="store_true")
     parser.add_argument("--lint-levels", default="{}")
     args = parser.parse_args()
     try:
         levels = json.loads(args.lint_levels, object_pairs_hook=unique_object)
         if not isinstance(levels, dict):
             raise ValueError("lint levels must be an object")
-        result = extract_bytes(args.source.read_bytes(), args.path, directives=args.directives, lint_levels=levels)
+        source = args.source.read_bytes()
+        if args.validate_test_directives:
+            result = extract_bytes_with_directives(source, args.path, lint_levels=levels)
+        else:
+            result = {"expected": extract_bytes(source, args.path, directives=args.directives,
+                                                lint_levels=levels)}
     except (OSError, ValueError) as error:
         print(f"invalid input: {error}", file=sys.stderr)
         return 2
-    print(json.dumps({"expected": result}, ensure_ascii=True, separators=(",", ":")))
+    print(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
     return 0
 
 

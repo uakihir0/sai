@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 
 from diagnostic_matcher import compare
-from expectation_extractor import extract, extract_bytes
+from expectation_extractor import (
+    extract,
+    extract_bytes,
+    extract_bytes_with_directives,
+    extract_with_directives,
+)
 
 
 def expected(line, severity, code, file="src/lib.sai"):
@@ -14,6 +19,185 @@ def expected(line, severity, code, file="src/lib.sai"):
 
 
 class ExpectationExtractorTests(unittest.TestCase):
+    def test_complete_directive_metadata_is_normalized(self):
+        source = r"""//@ kind: run-pass
+//@ stage: 1
+//@ spec: spec/06 §6.3, impl/15 §15.2.3, targets/targets-and-profiles §1.4
+//@ targets: wasm32-core wasm64-core
+//@ profiles: dev release
+//@ options: --tests --allow UNUSED_VARIABLE --wasm-feature tail-call --wasm-feature simd128
+//@ component:
+//@ call: add(i32:1, f32:0x3f800000) -> i32:2
+//@ call: acme:image/codec#encode("a,b", (true, 2)) -> ("x", "y")
+//@ args: "hello world" "" "escaped\nline"
+//@ seed: 42
+//@ diag: error EXPECTED_TOKEN
+//@ diag: warning UNUSED_VARIABLE at sub/pkg.sai:3
+//@ fuel: 1234
+//@ memory-limit: 64
+//@ stderr-fails: first-write
+//@ reference-only: relies on a reference implementation limit
+fn main() {}
+"""
+        result = extract_with_directives(source, "test.sai")
+        self.assertEqual(result["expected"], [
+            expected(None, "error", "EXPECTED_TOKEN", None),
+            expected(3, "warning", "UNUSED_VARIABLE", "sub/pkg.sai"),
+        ])
+        self.assertEqual(result["directives"], {
+            "kind": "run-pass",
+            "stage": 1,
+            "spec": [
+                {"document": "spec/06", "section": "6.3"},
+                {"document": "impl/15", "section": "15.2.3"},
+                {"document": "targets/targets-and-profiles", "section": "1.4"},
+            ],
+            "targets": ["wasm32-core", "wasm64-core"],
+            "profiles": ["dev", "release"],
+            "options": [
+                "--tests", "--allow", "UNUSED_VARIABLE",
+                "--wasm-feature", "tail-call", "--wasm-feature", "simd128",
+            ],
+            "component": True,
+            "call": [
+                {"export": "add", "arguments": ["i32:1", "f32:0x3f800000"], "result": "i32:2"},
+                {"export": "acme:image/codec#encode",
+                 "arguments": ['"a,b"', "(true, 2)"], "result": '("x", "y")'},
+            ],
+            "args": ["hello world", "", "escaped\nline"],
+            "seed": 42,
+            "diag": [
+                expected(None, "error", "EXPECTED_TOKEN", None),
+                expected(3, "warning", "UNUSED_VARIABLE", "sub/pkg.sai"),
+            ],
+            "fuel": 1234,
+            "memory_limit": 64,
+            "stderr_fails": "first-write",
+            "reference_only": "relies on a reference implementation limit",
+        })
+
+    def test_complete_directive_metadata_supplies_documented_defaults(self):
+        source = (
+            "//@ kind: check-pass\n"
+            "//@ stage: 0\n"
+            "//@ spec: spec/03 §3.1\n"
+            "package example:test @ 0.1.0\n"
+        )
+        result = extract_with_directives(source, "sai.package")
+        self.assertEqual(result, {
+            "expected": [],
+            "directives": {
+                "kind": "check-pass",
+                "stage": 0,
+                "spec": [{"document": "spec/03", "section": "3.1"}],
+                "targets": ["wasm32-core", "wasm32-wasi", "wasm64-core", "wasm64-wasi"],
+                "profiles": ["dev", "release", "tiny"],
+                "options": [],
+                "component": False,
+                "call": [],
+                "args": [],
+                "seed": None,
+                "diag": [],
+                "fuel": 10_000_000_000,
+                "memory_limit": 4096,
+                "stderr_fails": None,
+                "reference_only": None,
+            },
+        })
+        self.assertEqual(
+            extract_bytes_with_directives(source.encode(), "sai.package"),
+            result,
+        )
+
+    def test_complete_directive_metadata_rejects_missing_or_repeated_required_fields(self):
+        required = [
+            "//@ kind: check-pass\n",
+            "//@ stage: 0\n",
+            "//@ spec: spec/03 §3.1\n",
+        ]
+        for missing in range(len(required)):
+            source = "".join(value for index, value in enumerate(required) if index != missing)
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "missing required"):
+                extract_with_directives(source, "test.sai")
+
+        for duplicate in required:
+            source = "".join(required) + duplicate
+            with self.subTest(duplicate=duplicate), self.assertRaisesRegex(ValueError, "repeated"):
+                extract_with_directives(source, "test.sai")
+
+    def test_complete_directive_metadata_rejects_repeated_optional_nonrepeatable_fields(self):
+        base = (
+            "//@ kind: check-pass\n"
+            "//@ stage: 0\n"
+            "//@ spec: spec/03 §3.1\n"
+        )
+        for directive in (
+            "//@ targets: wasm32-core\n",
+            "//@ profiles: dev\n",
+            "//@ options: --tests\n",
+            "//@ component:\n",
+            "//@ args: \"one\"\n",
+            "//@ seed: 1\n",
+            "//@ fuel: 1\n",
+            "//@ memory-limit: 1\n",
+            "//@ stderr-fails: first-write\n",
+            "//@ reference-only: reason\n",
+        ):
+            with self.subTest(directive=directive), self.assertRaisesRegex(ValueError, "repeated"):
+                extract_with_directives(base + directive + directive, "test.sai")
+
+    def test_complete_directive_metadata_validates_values(self):
+        base = (
+            "//@ kind: check-pass\n"
+            "//@ stage: 0\n"
+            "//@ spec: spec/03 §3.1\n"
+        )
+        invalid = [
+            "//@ unknown: x\n",
+            "//@ kind: unknown\n",
+            "//@ stage: 8\n",
+            "//@ stage: -1\n",
+            "//@ spec: spec/03\n",
+            "//@ spec: spec/03 §3.1,\n",
+            "//@ targets: wasm32-core wasi\n",
+            "//@ targets: wasm32-core wasm32-core\n",
+            "//@ profiles: debug\n",
+            "//@ profiles: dev tiny dev\n",
+            "//@ options: --jobs 2\n",
+            "//@ options: --allow\n",
+            "//@ options: --allow not_a_code\n",
+            "//@ options: --wasm-feature reference-types\n",
+            "//@ component: yes\n",
+            "//@ call: add(i32:1, ) -> i32:2\n",
+            "//@ call: add (i32:1) -> i32:2\n",
+            "//@ call: add(i32:1) i32:2\n",
+            "//@ call: add(i32:1) ->\n",
+            "//@ call: add(i32:1) -> (i32:2\n",
+            "//@ args: \n",
+            "//@ args: 1\n",
+            "//@ args: \"one\"\"two\"\n",
+            "//@ seed: -1\n",
+            "//@ fuel: many\n",
+            "//@ memory-limit: 1.5\n",
+            "//@ stderr-fails: always\n",
+            "//@ reference-only:\n",
+            "//@ diag: error BAD_CODE at ../bad.sai:2\n",
+        ]
+        for directive in invalid:
+            with self.subTest(directive=directive), self.assertRaises(ValueError):
+                extract_with_directives(base + directive, "test.sai")
+
+    def test_complete_directive_metadata_rejects_directives_after_source_token(self):
+        source = (
+            "//@ kind: check-pass\n"
+            "//@ stage: 0\n"
+            "//@ spec: spec/03 §3.1\n"
+            "fn main() {}\n"
+            "//@ targets: wasm32-core\n"
+        )
+        with self.assertRaisesRegex(ValueError, "directive outside"):
+            extract_with_directives(source, "test.sai")
+
     def test_annotations_carets_multisets_and_line_endings(self):
         source = (
             "\ufefffn one() {\r\n"
@@ -339,6 +523,25 @@ let good = 1 //~ error TRUE_ERROR
                                      capture_output=True, check=False)
             self.assertEqual(process.returncode, 0)
             self.assertEqual(json.loads(process.stdout)["expected"], [expected(1, "error", "SOME_ERROR")])
+            source.write_text(
+                "//@ kind: check-pass\n//@ stage: 0\n//@ spec: spec/03 §3.1\nfn main() {}\n",
+                encoding="utf-8",
+            )
+            process = subprocess.run(
+                [sys.executable, "-B", str(script), str(source), "--path", "test.sai",
+                 "--validate-test-directives"],
+                capture_output=True, check=False,
+            )
+            self.assertEqual(process.returncode, 0)
+            self.assertEqual(json.loads(process.stdout)["directives"]["kind"], "check-pass")
+            source.write_text("//@ kind: check-pass\n", encoding="utf-8")
+            process = subprocess.run(
+                [sys.executable, "-B", str(script), str(source), "--path", "test.sai",
+                 "--validate-test-directives"],
+                capture_output=True, check=False,
+            )
+            self.assertEqual(process.returncode, 2)
+            self.assertEqual(process.stdout, b"")
             source.write_bytes(b"use foo-bar:api/sub_name.{Thing} //~ error UNKNOWN_PACKAGE\n")
             process = subprocess.run([sys.executable, "-B", str(script), str(source), "--path", "src/lib.sai"],
                                      capture_output=True, check=False)
