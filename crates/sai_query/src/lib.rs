@@ -945,7 +945,10 @@ where
             for dependency in &previous.dependencies {
                 database.check_cancellation()?;
                 let version = (dependency.refresh)(database)?;
-                changed |= version.changed_at > previous.verified_at;
+                if version.changed_at > previous.verified_at {
+                    changed = true;
+                    break;
+                }
                 dependencies.push(dependency.with_version(version));
             }
             database.check_cancellation()?;
@@ -1955,6 +1958,219 @@ mod tests {
                 .expect("unselected input is ignored"),
             20
         );
+    }
+
+    #[test]
+    fn changed_selector_does_not_refresh_removed_branch() {
+        let mut database = QueryDatabase::new();
+        let inputs = input::<u32>("inputs", Durability::Low);
+        inputs.set(&mut database, 0, 1).expect("selector sets");
+        inputs.set(&mut database, 1, 42).expect("branch input sets");
+
+        let branch_runs = Arc::new(AtomicUsize::new(0));
+        let branch_runs_in_query = Arc::clone(&branch_runs);
+        let branch_input = inputs.clone();
+        let branch = derived("branch", move |database, _| {
+            branch_runs_in_query.fetch_add(1, Ordering::SeqCst);
+            branch_input.get(database, 1).map(|value| *value)
+        });
+        let selected_runs = Arc::new(AtomicUsize::new(0));
+        let selected_runs_in_query = Arc::clone(&selected_runs);
+        let selector = inputs.clone();
+        let selected = derived("selected", move |database, _| {
+            selected_runs_in_query.fetch_add(1, Ordering::SeqCst);
+            if *selector.get(database, 0)? == 1 {
+                branch.get(database, 0).map(|value| *value)
+            } else {
+                Ok(42)
+            }
+        });
+
+        let original = selected
+            .get(&mut database, 0)
+            .expect("initial branch exists");
+        inputs
+            .apply_changes(
+                &mut database,
+                [
+                    InputChange::Set {
+                        key: 0,
+                        value: 0,
+                        durability: Durability::Low,
+                    },
+                    InputChange::Remove { key: 1 },
+                ],
+            )
+            .expect("batch succeeds");
+        let updated = selected
+            .get(&mut database, 0)
+            .expect("obsolete branch must not be refreshed");
+        assert_eq!(*updated, 42);
+        assert!(Arc::ptr_eq(&original, &updated));
+
+        inputs
+            .set(&mut database, 1, 99)
+            .expect("branch input returns");
+        assert!(Arc::ptr_eq(
+            &updated,
+            &selected
+                .get(&mut database, 0)
+                .expect("old branch is no longer a dependency")
+        ));
+        assert_eq!(selected_runs.load(Ordering::SeqCst), 2);
+        assert_eq!(branch_runs.load(Ordering::SeqCst), 1);
+        inputs.set(&mut database, 0, 1).expect("selector returns");
+        assert_eq!(*selected.get(&mut database, 0).expect("branch returns"), 99);
+        assert_eq!(selected_runs.load(Ordering::SeqCst), 3);
+        assert_eq!(branch_runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn unchanged_prefix_before_changed_selector_skips_removed_branch() {
+        let mut database = QueryDatabase::new();
+        let inputs = input::<u32>("inputs", Durability::Low);
+        inputs.set(&mut database, 0, 12).expect("prefix sets");
+        inputs.set(&mut database, 1, 1).expect("selector sets");
+        inputs.set(&mut database, 2, 40).expect("old branch sets");
+        inputs.set(&mut database, 3, 50).expect("new branch sets");
+
+        let prefix_runs = Arc::new(AtomicUsize::new(0));
+        let prefix_runs_in_query = Arc::clone(&prefix_runs);
+        let prefix_input = inputs.clone();
+        let prefix = derived("prefix", move |database, _| {
+            prefix_runs_in_query.fetch_add(1, Ordering::SeqCst);
+            Ok(*prefix_input.get(database, 0)? % 10)
+        });
+        let branch_runs = Arc::new(AtomicUsize::new(0));
+        let branch_runs_in_query = Arc::clone(&branch_runs);
+        let branch_input = inputs.clone();
+        let old_branch = derived("old_branch", move |database, _| {
+            branch_runs_in_query.fetch_add(1, Ordering::SeqCst);
+            branch_input.get(database, 2).map(|value| *value)
+        });
+        let selected_inputs = inputs.clone();
+        let selected = derived("selected", move |database, _| {
+            let prefix = *prefix.get(database, 0)?;
+            let value = if *selected_inputs.get(database, 1)? == 1 {
+                *old_branch.get(database, 0)?
+            } else {
+                *selected_inputs.get(database, 3)?
+            };
+            Ok(prefix + value)
+        });
+
+        assert_eq!(*selected.get(&mut database, 0).expect("initial"), 42);
+        inputs
+            .apply_changes(
+                &mut database,
+                [
+                    InputChange::Set {
+                        key: 0,
+                        value: 22,
+                        durability: Durability::Low,
+                    },
+                    InputChange::Set {
+                        key: 1,
+                        value: 0,
+                        durability: Durability::Low,
+                    },
+                    InputChange::Remove { key: 2 },
+                ],
+            )
+            .expect("batch succeeds");
+        assert_eq!(*selected.get(&mut database, 0).expect("switch"), 52);
+        assert_eq!(prefix_runs.load(Ordering::SeqCst), 2);
+        assert_eq!(branch_runs.load(Ordering::SeqCst), 1);
+        inputs
+            .set(&mut database, 3, 60)
+            .expect("new branch changes");
+        assert_eq!(*selected.get(&mut database, 0).expect("new dependency"), 62);
+    }
+
+    #[test]
+    fn cancellation_during_branch_recomputation_can_retry() {
+        let mut database = QueryDatabase::new();
+        let inputs = input::<u32>("inputs", Durability::Low);
+        inputs.set(&mut database, 0, 1).expect("selector sets");
+        inputs.set(&mut database, 1, 42).expect("old branch sets");
+        inputs.set(&mut database, 2, 99).expect("new branch sets");
+        let old_runs = Arc::new(AtomicUsize::new(0));
+        let old_runs_in_query = Arc::clone(&old_runs);
+        let old_input = inputs.clone();
+        let old_branch = derived("old_branch", move |database, _| {
+            old_runs_in_query.fetch_add(1, Ordering::SeqCst);
+            old_input.get(database, 1).map(|value| *value)
+        });
+        let cancel_next = Arc::new(AtomicBool::new(false));
+        let cancel_in_query = Arc::clone(&cancel_next);
+        let token = database.cancellation_token();
+        let selected_inputs = inputs.clone();
+        let selected = derived("selected", move |database, _| {
+            if *selected_inputs.get(database, 0)? == 1 {
+                old_branch.get(database, 0).map(|value| *value)
+            } else {
+                if cancel_in_query.swap(false, Ordering::SeqCst) {
+                    token.cancel();
+                    database.check_cancellation()?;
+                }
+                selected_inputs.get(database, 2).map(|value| *value)
+            }
+        });
+
+        assert_eq!(*selected.get(&mut database, 0).expect("initial"), 42);
+        inputs
+            .apply_changes(
+                &mut database,
+                [
+                    InputChange::Set {
+                        key: 0,
+                        value: 0,
+                        durability: Durability::Low,
+                    },
+                    InputChange::Remove { key: 1 },
+                ],
+            )
+            .expect("batch succeeds");
+        cancel_next.store(true, Ordering::SeqCst);
+        assert_eq!(selected.get(&mut database, 0), Err(QueryError::Cancelled));
+        database.reset_cancellation().expect("cancellation resets");
+        assert_eq!(*selected.get(&mut database, 0).expect("retry"), 99);
+        assert_eq!(old_runs.load(Ordering::SeqCst), 1);
+        inputs
+            .set(&mut database, 2, 100)
+            .expect("new branch changes");
+        assert_eq!(
+            *selected.get(&mut database, 0).expect("new dependency"),
+            100
+        );
+    }
+
+    #[test]
+    fn newly_required_dependency_failure_is_not_skipped() {
+        let mut database = QueryDatabase::new();
+        let selector = input::<bool>("selector", Durability::Low);
+        let required = input::<u32>("required", Durability::Low);
+        selector
+            .set(&mut database, 0, false)
+            .expect("selector sets");
+        let selector_in_query = selector.clone();
+        let selected = derived("selected", move |database, _| {
+            if *selector_in_query.get(database, 0)? {
+                required.get(database, 0).map(|value| *value)
+            } else {
+                Ok(42)
+            }
+        });
+
+        assert_eq!(*selected.get(&mut database, 0).expect("initial"), 42);
+        selector
+            .set(&mut database, 0, true)
+            .expect("selector changes");
+        let error = QueryError::MissingInput {
+            query: "required".to_owned(),
+        };
+        assert_eq!(selected.get(&mut database, 0), Err(error.clone()));
+        assert_eq!(database.check_cancellation(), Err(error));
     }
 
     #[test]

@@ -9217,3 +9217,9 @@
 - **Decision — review required:** Provide deterministic fixture discovery without making a conformance claim. Ambiguous test/sidecar names, non-ASCII names, UNC roots and other nonportable or unsafe layouts are rejected rather than guessed. This intentionally excludes valid suites until their ambiguity and portability can be handled without silently omitting tests; concurrent filesystem mutation is outside the current contract.
 - **Verification:** All 79 Python conformance-component tests passed, with three filesystem- or platform-dependent skips. Windows junction handling is tested with simulated metadata but still needs a Windows runtime run.
 - **Hostile review:** Reviews found potentially hidden tests, ambiguous sidecars, nondeterministic error selection, symlink ancestry and Windows reparse-point/device-name cases. The component now fails closed on these layouts; a final review also prompted portable symlink-test assertions.
+
+### IR-1018 (2026-10-29): stop query validation at the first changed dependency
+
+- **Decision — review required:** Validate recorded dependencies in read order and recompute as soon as one changes. Continuing to refresh the old dependency list can evaluate a branch that the changed input has made obsolete, turning a removed input into a fatal error.
+- **Verification:** All 29 `sai_query` tests passed, including obsolete branches, unchanged-prefix validation, backdating, cancellation and retry, and errors in newly required dependencies.
+- **Hostile review:** Independent reviews checked read ordering, replacement of dependency lists, backdating and failure propagation, and requested additional regression cases; a final static review found no further actionable defect.
