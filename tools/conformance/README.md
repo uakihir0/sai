@@ -55,6 +55,9 @@ are all four targets, `dev release tiny`, empty options/calls/args/diagnostics,
 `component: false`, no seed or reference-only reason, fuel `10000000000`,
 memory limit `4096`, and no stderr failure. `--path` remains the source path
 used for diagnostic locations.
+The sorted `specified` array lists directive names explicitly written in the
+test, including repeatable and empty-flag directives; it distinguishes an
+omitted default such as `targets` from an explicitly written value.
 
 The scanner is deliberately incomplete: it rejects package paths with
 ambiguous boundaries or newline contexts, format strings, execution

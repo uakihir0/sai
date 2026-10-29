@@ -677,6 +677,7 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
         return directive_values[name][0]
 
     metadata = {
+        "specified": sorted(seen_directives),
         "kind": one("kind"),
         "stage": one("stage"),
         "spec": one("spec"),

@@ -45,6 +45,11 @@ fn main() {}
             expected(3, "warning", "UNUSED_VARIABLE", "sub/pkg.sai"),
         ])
         self.assertEqual(result["directives"], {
+            "specified": [
+                "args", "call", "component", "diag", "fuel", "kind", "memory-limit",
+                "options", "profiles", "reference-only", "seed", "spec", "stage",
+                "stderr-fails", "targets",
+            ],
             "kind": "run-pass",
             "stage": 1,
             "spec": [
@@ -87,6 +92,7 @@ fn main() {}
         self.assertEqual(result, {
             "expected": [],
             "directives": {
+                "specified": ["kind", "spec", "stage"],
                 "kind": "check-pass",
                 "stage": 0,
                 "spec": [{"document": "spec/03", "section": "3.1"}],
