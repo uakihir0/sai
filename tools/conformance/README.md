@@ -139,17 +139,23 @@ compares expected diagnostics.
 For a `fmt` fixture it passes the unchanged source bytes on standard input to
 `sai --format=json --max-errors=0 fmt --stdin-kind source -`, compares the JSON
 `output` bytes with `<name>.expected.sai`, then formats the expected bytes again
-and requires the same output with an empty `changed` list. It does not run
-`sai check` or the canonical-input preflight for `fmt`. For `fmt-refuse`, it
-passes the unchanged source bytes to the same formatter command and requires a
-strict refusal result (`exit 1`, one file, no output, and `<stdin>` in
-`refused`) whose nonempty error multiset exactly matches the fixture's
-expectations. It derives allowed refusal codes from the lexical error table
-and parser-only rows in the syntactic-validation table; parser severities come
-from the implementation diagnostics table, and unknown severities fail
-closed. Validation and mixed parser/validation codes are excluded. This kind
-also bypasses canonical-input preflight and `sai check`. A timeout is a
-failure, never a pass.
+and requires the same output with an empty `changed` list. It then runs
+`sai --format=json --max-errors=0 fmt --check --stdin-kind source -` on the
+input and expected bytes. Expected bytes must pass without diagnostics; an input
+that differs must report exactly one `UNFORMATTED_FILE` on the first differing
+line, with its expected-line data and complete primary byte, line, UTF-8 column,
+and UTF-16 column positions matching `docs/impl/14-formatter.md` §14.11.4.
+Suppressed cascade, duplicate, and dependency diagnostic counts must be zero.
+It does not run `sai check` or the
+canonical-input preflight for `fmt`. For `fmt-refuse`, it passes the unchanged
+source bytes to the same formatter command and requires a strict refusal result
+(`exit 1`, one file, no output, and `<stdin>` in `refused`) whose nonempty error
+multiset exactly matches the fixture's expectations. It derives allowed
+refusal codes from the lexical error table and parser-only rows in the
+syntactic-validation table; parser severities come from the implementation
+diagnostics table, and unknown severities fail closed. Validation and mixed
+parser/validation codes are excluded. This kind also bypasses canonical-input
+preflight and `sai check`. A timeout is a failure, never a pass.
 
 The runner treats the supplied executable as the repository's reference
 implementation, but cannot verify its identity from the black-box protocol.
@@ -165,11 +171,12 @@ execution and always sets `mode` to `partial-smoke` and `claim` to `false`.
 This runner is useful as smoke evidence only; it does not validate suite
 coverage, goldens, all directive applicability, or the complete conformance
 protocol, and cannot substantiate a conformance claim.
-Formatter coverage is limited to single-file source `fmt` byte comparisons and
-fixed-point checks plus exact-diagnostic `fmt-refuse` cases. Fixed-point checks
-apply only to `fmt` pass fixtures. Package formatting, layout variants,
-general `sai fmt --check` behavior, and complete rule coverage remain
-unsupported.
+Formatter coverage is limited to single-file source `fmt` byte comparisons,
+fixed-point checks, input and expected-output `fmt --check` results, and
+exact-diagnostic `fmt-refuse` cases. Fixed-point and `fmt --check` checks apply
+only to `fmt` pass fixtures. Package formatting, no-argument package-wide
+`fmt --check`, layout variants, multi-file and path-based `fmt --check`, and
+complete rule coverage remain unsupported.
 
 The subprocess environment mapping contains exactly the three listed entries.
 On macOS, Python test executables may add `LC_CTYPE` and
