@@ -490,10 +490,33 @@ authors { \"A. Author\", \"B. Author\" }\n\
             format_package(source).expect("valid package should format"),
             "package acme:app @ 1.0.0\nsource \"src\"\n\n// first eof comment\n\n/* second\n   eof */\n"
         );
-        assert_eq!(
-            format_package(b"").expect("empty input is structural"),
-            "\n"
-        );
+        assert_eq!(format_package(b"").expect("empty input is structural"), "");
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_packages_format_to_empty_output() {
+        for source in [b"".as_slice(), b" \t\r\n\n ", b"\xef\xbb\xbf\t\r\n"] {
+            let formatted = format_package(source).expect("structural errors do not refuse");
+            assert_eq!(formatted, "");
+            assert_eq!(format_package(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn preserves_nonempty_package_content_without_a_final_newline() {
+        for (source, expected) in [
+            ("// only a comment", "// only a comment\n"),
+            ("/* only a comment */", "/* only a comment */\n"),
+            ("description \"\"", "description \"\"\n"),
+            (
+                "description \"// not a comment /* either */\"",
+                "description \"// not a comment /* either */\"\n",
+            ),
+        ] {
+            let formatted = format_package(source.as_bytes()).expect("package content formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_package(formatted.as_bytes()), Ok(formatted));
+        }
     }
 
     #[test]

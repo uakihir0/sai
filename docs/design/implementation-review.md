@@ -9091,3 +9091,9 @@
 - **Decision — review required:** Run both explicitly required `gix-protocol` feature configurations on every existing CI platform, before the workspace suite. Separate Cargo invocations avoid workspace feature unification masking the async-only configuration; no new cache is introduced.
 - **Verification:** Both documented commands passed locally on macOS (10 tests each). The hosted Linux and Windows jobs remain to be verified by CI.
 - **Hostile review:** An independent reviewer confirmed that both required configurations are exercised separately, and identified missing adapter-level boundary coverage. That coverage is being handled independently; the change does not claim the complete conformance merge gate.
+
+### IR-997 (2026-10-29): format empty package input as empty output
+
+- **Decision — review required:** Treat a `sai.package` containing only whitespace or a BOM as empty, and emit no newline. The formatter's empty-file rule (§14.3.4) applies to package files as well as source files; nonempty comments and declarations retain their final newline.
+- **Verification:** All 395 `sai_fmt` tests passed, as did a CLI `fmt --check` test covering empty, whitespace-only, and BOM-only files and ensuring the check does not modify them. The added tests also cover comment-only input, strings containing comment markers, and idempotence.
+- **Hostile review:** An independent reviewer found no behavioral defect but requested the comment, string, and CLI cases; these were added and tested.

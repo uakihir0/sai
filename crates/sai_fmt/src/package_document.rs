@@ -106,9 +106,6 @@ pub(crate) fn package_document(
             document.push(comment_text_doc(input, comment));
         }
     }
-    if document.is_empty() {
-        document.push(Doc::HardLine);
-    }
     Ok(Doc::concat(document))
 }
 
