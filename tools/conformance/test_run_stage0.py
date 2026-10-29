@@ -26,6 +26,7 @@ class Stage0SmokeRunnerTests(unittest.TestCase):
         self.launcher = self.script
         self.receipt = self.base / "receipt.json"
         self.mode = "normal"
+        self.expected_format = None
         self._write_fake()
 
     def _write_fake(self):
@@ -39,6 +40,7 @@ from pathlib import Path
 MODE = {self.mode!r}
 RECEIPT = {str(self.receipt)!r}
 ROOT = {ROOT_ID!r}
+EXPECTED_FORMATTED = {self.expected_format!r}
 
 def line(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\\n"
@@ -195,6 +197,104 @@ if args == [
         print(line(diagnostic).rstrip("\\n"))
     print(line(result).rstrip("\\n"))
     print(line(summary(errors=errors, exit_code=status)).rstrip("\\n"))
+    raise SystemExit(status)
+
+if args == [
+    "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
+]:
+    formatter_input = sys.stdin.buffer.read()
+    try:
+        receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        receipt = {{}}
+    receipt.setdefault("formatter_inputs", []).append(formatter_input.decode("utf-8"))
+    receipt.setdefault("calls", []).append("fmt")
+    receipt["fmt_argv"] = args
+    Path(RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
+    if MODE == "fmt_malformed":
+        sys.stdout.buffer.write(b"{{bad json\\n")
+        raise SystemExit(0)
+
+    diagnostic = {{
+        "type":"diagnostic","code":"EXPECTED_TOKEN","severity":"error",
+        "level":None,"message":"expected a token","primary":{{
+            "file":{{"path":"<stdin>","package":None,"snapshot":None}},
+            "start":{{"byte":0,"line":1,"col":1,"utf16_col":1}},
+            "end":{{"byte":1,"line":1,"col":2,"utf16_col":2}}
+        }},"primary_label":"","labels":[],"children":[],"fixes":[],
+        "related":[],"data":{{}},"node":None,"symbol":None,"package":None
+    }}
+    if MODE == "fmt_refused":
+        output = None
+        changed = []
+        refused = ["<stdin>"]
+        diagnostics = [diagnostic]
+        status = 1
+        result_data = {{
+            "check":False,"files":1,"changed":changed,
+            "refused":refused,"output":output
+        }}
+    elif MODE == "fmt_internal_error":
+        diagnostic["code"] = "INTERNAL_COMPILER_ERROR"
+        diagnostic["message"] = "internal compiler error"
+        output = None
+        changed = []
+        refused = ["<stdin>"]
+        diagnostics = [diagnostic]
+        status = 101
+        result_data = {{
+            "check":False,"files":1,"changed":changed,
+            "refused":refused,"output":output
+        }}
+    else:
+        output_bytes = EXPECTED_FORMATTED
+        if MODE == "fmt_output_mismatch":
+            output_bytes = b"different output\\n"
+        if MODE == "fmt_fixed_point_failure" and len(receipt["formatter_inputs"]) > 1:
+            output_bytes = EXPECTED_FORMATTED + b" "
+        output = output_bytes.decode("utf-8")
+        changed = [] if formatter_input == output_bytes else ["<stdin>"]
+        refused = []
+        diagnostics = []
+        status = 0
+        if MODE == "fmt_unexpected_diagnostic":
+            info = json.loads(json.dumps(diagnostic))
+            info["severity"] = "info"
+            info["code"] = "EXPECTED_TOKEN"
+            diagnostics = [info]
+        if MODE == "fmt_bad_schema":
+            result_data = {{
+                "check":False,"files":1,"changed":changed,
+                "refused":refused
+            }}
+        else:
+            result_data = {{
+                "check":False,"files":1,"changed":changed,
+                "refused":refused,"output":output
+            }}
+    result = {{"type":"result","kind":"fmt","data":result_data}}
+    errors = sum(item["severity"] == "error" for item in diagnostics)
+    infos = sum(item["severity"] == "info" for item in diagnostics)
+    command_header = header("fmt", None)
+    if MODE == "fmt_wrong_header":
+        command_header["command"] = "check"
+    if MODE == "fmt_wrong_root":
+        command_header["root"] = ROOT
+    print(line(command_header).rstrip("\\n"))
+    for item in diagnostics:
+        print(line(item).rstrip("\\n"))
+    print(line(result).rstrip("\\n"))
+    summary_record = summary(errors=errors, exit_code=status)
+    if infos != 0:
+        summary_record = {{
+              "type":"summary","errors":errors,"warnings":0,"infos":infos,
+              "shown_errors":errors,
+              "suppressed":{{"cascade":0,"duplicate":0,"dependency":0}},
+              "exit_code":status
+        }}
+    if MODE == "fmt_extra_summary":
+        summary_record["unexpected"] = True
+    print(line(summary_record).rstrip("\\n"))
     raise SystemExit(status)
 
 root = Path.cwd()
@@ -436,6 +536,136 @@ raise SystemExit(exit_code)
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual(receipt["calls"], ["fmt"])
+
+    def _fmt_fixture(self, *, body="pub fn value()->Bool{true}\n"):
+        self._fixture("fmt", body=body)
+        expected_path = self.source.with_name("case.expected.sai")
+        if expected_path.is_symlink() or expected_path.is_file():
+            expected_path.unlink()
+        elif expected_path.is_dir():
+            shutil.rmtree(expected_path)
+        expected = (
+            "//@ kind: fmt\n"
+            "//@ stage: 0\n"
+            "//@ spec: impl/14 §14.4.2\n"
+            "pub fn value() -> Bool {\n"
+            "    true\n"
+            "}\n"
+        ).encode("utf-8")
+        expected_path.write_bytes(expected)
+        self.expected_format = expected
+        self.mode = "fmt_fixture"
+        self._write_fake()
+
+    def test_fmt_compares_original_bytes_and_expected_fixed_point(self):
+        self._fmt_fixture()
+        original = self.source.read_bytes()
+        report = self._run()
+        self.assertEqual(report["outcome"], "pass")
+        self.assertEqual(report["results"][0]["outcome"], "pass")
+        self.assertEqual(report["results"][0]["configuration"], {
+            "target": None, "profile": None,
+        })
+        self.assertIsNone(report["results"][0]["compatibility_execution"])
+        self.assertIs(report["claim"], False)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["fmt_argv"], [
+            "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
+        ])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt"])
+        self.assertEqual(receipt["formatter_inputs"], [
+            original.decode("utf-8"),
+            self.expected_format.decode("utf-8"),
+        ])
+        self.assertEqual(self.source.read_bytes(), original)
+
+    def test_fmt_requires_only_its_exact_expected_sidecar(self):
+        self._fmt_fixture()
+        expected = self.source.with_name("case.expected.sai")
+        expected.unlink()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn("requires case.expected.sai",
+                      " ".join(report["results"][0]["failures"]))
+
+        self._fmt_fixture()
+        (self.fixture_dir / "case.fixed.sai").write_bytes(b"extra\n")
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn("sidecars are unsupported",
+                      " ".join(report["results"][0]["failures"]))
+
+        self._fmt_fixture()
+        (self.fixture_dir / "case.stdin").write_bytes(b"extra\n")
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn("sidecars are unsupported",
+                      " ".join(report["results"][0]["failures"]))
+
+    def test_fmt_wrong_type_or_symlink_expected_sidecar_fails_closed(self):
+        self._fmt_fixture()
+        expected = self.source.with_name("case.expected.sai")
+        expected.unlink()
+        expected.mkdir()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn("sidecar is not a file",
+                      " ".join(report["failures"]))
+
+        if hasattr(os, "symlink"):
+            self._fmt_fixture()
+            expected = self.source.with_name("case.expected.sai")
+            expected.unlink()
+            target = self.fixture_dir / "outside.txt"
+            target.write_bytes(self.expected_format)
+            expected.symlink_to(target)
+            report = self._run()
+            self.assertEqual(report["outcome"], "fail")
+            self.assertTrue(report["failures"])
+
+    def test_fmt_rejects_output_that_differs_from_expected(self):
+        self._fmt_fixture()
+        self.mode = "fmt_output_mismatch"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn("does not match the expected bytes",
+                      " ".join(report["results"][0]["failures"]))
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(len(receipt["formatter_inputs"]), 1)
+
+    def test_fmt_rejects_non_fixed_point_expected_output(self):
+        self._fmt_fixture()
+        self.mode = "fmt_fixed_point_failure"
+        self._write_fake()
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn("not a fixed point",
+                      " ".join(report["results"][0]["failures"]))
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(len(receipt["formatter_inputs"]), 2)
+
+    def test_fmt_malformed_refused_diagnostic_and_schema_fail_closed(self):
+        for mode, reason in (
+            ("fmt_malformed", "invalid record"),
+            ("fmt_refused", "was refused"),
+            ("fmt_internal_error", "formatter reported an internal compiler error"),
+            ("fmt_unexpected_diagnostic", "unexpected diagnostics"),
+            ("fmt_bad_schema", "invalid result schema"),
+            ("fmt_wrong_header", "wrong header"),
+            ("fmt_wrong_root", "wrong header"),
+            ("fmt_extra_summary", "invalid summary schema"),
+        ):
+            with self.subTest(mode=mode):
+                self._fmt_fixture()
+                self.mode = mode
+                self._write_fake()
+                report = self._run()
+                self.assertEqual(report["outcome"], "fail")
+                self.assertIn(
+                    reason,
+                    " ".join(report["results"][0]["failures"]),
+                )
 
     def test_noncanonical_source_fails_before_check_without_rewriting(self):
         self._fixture(body="pub fn value()->Bool{true}\n")

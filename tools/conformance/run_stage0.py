@@ -2,8 +2,8 @@
 """Run a deliberately partial Stage 0 smoke suite against a black-box IUT.
 
 This runner accepts only reference-implementation, single-file Stage 0
-check-pass/check-fail tests. Its results are useful smoke evidence only; it
-never reports a conformance claim.
+check-pass/check-fail and source-fmt tests. Its results are useful smoke
+evidence only; it never reports a conformance claim.
 """
 
 from __future__ import annotations
@@ -196,8 +196,9 @@ def _validate_directives(extracted: dict, docs_root: Path) -> tuple[dict, list[d
         raise SmokeError("unsupported directive(s): " + ", ".join(sorted(unsupported)))
     if not {"kind", "stage", "spec"} <= set(specified):
         raise SmokeError("Stage 0 tests require kind, stage, and spec directives")
-    if directives.get("kind") not in ("check-pass", "check-fail"):
-        raise SmokeError("only check-pass and check-fail are supported")
+    kind = directives.get("kind")
+    if kind not in ("check-pass", "check-fail", "fmt"):
+        raise SmokeError("only check-pass, check-fail, and fmt are supported")
     if directives.get("stage") != 0:
         raise SmokeError("only Stage 0 tests are supported")
     if not isinstance(directives.get("spec"), list) or not directives["spec"]:
@@ -205,20 +206,30 @@ def _validate_directives(extracted: dict, docs_root: Path) -> tuple[dict, list[d
     for reference in directives["spec"]:
         _resolve_spec_reference(reference, docs_root)
 
-    selection_request = {
-        "claim_stage": 0,
-        "test_stage": 0,
-        "kind": directives["kind"],
-        "claimed_targets": [],
-        "implementation": "reference",
-        "reference_only": directives.get("reference_only") is not None,
-    }
-    selected = configurations.select(selection_request)
-    if selected != {
-        "selection": "configurations",
-        "configurations": [{"target": None, "profile": None}],
-    }:
-        raise SmokeError("Stage 0 check did not select exactly one targetless configuration")
+    if kind == "fmt":
+        if expected or "diag" in specified:
+            raise SmokeError("source fmt fixtures do not support diagnostic expectations")
+        # Stage 0's formatter command is targetless; configurations.select()
+        # intentionally selects configurations only for Stage 0 checks.
+        selected = {
+            "selection": "formatter-smoke",
+            "configurations": [{"target": None, "profile": None}],
+        }
+    else:
+        selection_request = {
+            "claim_stage": 0,
+            "test_stage": 0,
+            "kind": kind,
+            "claimed_targets": [],
+            "implementation": "reference",
+            "reference_only": directives.get("reference_only") is not None,
+        }
+        selected = configurations.select(selection_request)
+        if selected != {
+            "selection": "configurations",
+            "configurations": [{"target": None, "profile": None}],
+        }:
+            raise SmokeError("Stage 0 check did not select exactly one targetless configuration")
     for diagnostic in expected:
         if not isinstance(diagnostic, dict):
             raise SmokeError("invalid expected diagnostic")
@@ -227,7 +238,7 @@ def _validate_directives(extracted: dict, docs_root: Path) -> tuple[dict, list[d
     return directives, expected, selected
 
 
-def _reject_sidecars(source: Path, fixture_path: str) -> None:
+def _reject_sidecars(source: Path, fixture_path: str, *, allow_expected: bool = False) -> None:
     stem = source.name[:-4]
     try:
         entries = list(source.parent.iterdir())
@@ -247,7 +258,173 @@ def _reject_sidecars(source: Path, fixture_path: str) -> None:
             if entry.name.endswith(suffix):
                 candidate = entry.name[:-len(suffix)]
                 if stem in fixture_discovery._owners(candidate, sources):
+                    if allow_expected and suffix == ".expected.sai" and entry.name == (
+                        stem + ".expected.sai"
+                    ):
+                        continue
                     raise SmokeError("sidecars are unsupported by the Stage 0 smoke runner")
+
+
+def _read_expected_format(source: Path, fixture_path: str) -> bytes:
+    expected = source.with_name(source.stem + ".expected.sai")
+    try:
+        info = expected.lstat()
+    except OSError:
+        raise SmokeError(f"source fmt fixture requires {source.stem}.expected.sai: {fixture_path}") from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise SmokeError("formatter expected-output sidecar is not a regular file")
+    try:
+        contents = expected.read_bytes()
+        contents.decode("utf-8", "strict")
+    except (OSError, UnicodeError):
+        raise SmokeError("formatter expected-output sidecar is not readable UTF-8") from None
+    return contents
+
+
+def _validate_fmt_output(
+    completed: subprocess.CompletedProcess,
+    *,
+    expected_output: bytes,
+    input_bytes: bytes,
+    registered_codes: set[str],
+    fixed_point: bool,
+) -> None:
+    records = _records(
+        completed.stdout,
+        exit_code=completed.returncode,
+        stderr=completed.stderr,
+        max_errors=0,
+    )
+    header = records[0]
+    if (
+        set(header) != {"type", "format", "version", "tool", "command", "root"}
+        or header.get("command") != "fmt"
+        or header.get("root") is not None
+        or set(header.get("tool", {})) != {"name", "version"}
+    ):
+        raise SmokeError("sai fmt returned the wrong header")
+    if (
+        len(records) < 3
+        or records[-2]["type"] != "result"
+        or sum(record["type"] == "result" for record in records) != 1
+        or any(record["type"] != "diagnostic" for record in records[1:-2])
+    ):
+        raise SmokeError("sai fmt returned the wrong record shape")
+    summary = records[-1]
+    if (
+        set(summary) != {
+            "type", "errors", "warnings", "infos", "shown_errors", "suppressed", "exit_code",
+        }
+        or set(summary["suppressed"]) != {"cascade", "duplicate", "dependency"}
+    ):
+        raise SmokeError("sai fmt returned an invalid summary schema")
+    actual_diagnostics = _formatter_diagnostics(records, registered_codes)
+    result = records[-2]
+    if result.get("kind") != "fmt" or set(result) != {"type", "kind", "data"}:
+        raise SmokeError("sai fmt returned an invalid result kind")
+    data = result.get("data")
+    fields = {"check", "files", "changed", "refused", "output"}
+    if not isinstance(data, dict) or set(data) != fields:
+        raise SmokeError("sai fmt returned an invalid result schema")
+    if (
+        data["check"] is not False
+        or type(data["files"]) is not int
+        or data["files"] != 1
+        or not isinstance(data["changed"], list)
+        or any(not isinstance(path, str) for path in data["changed"])
+        or data["changed"] not in ([], ["<stdin>"])
+        or not isinstance(data["refused"], list)
+        or any(not isinstance(path, str) for path in data["refused"])
+        or data["refused"] not in ([], ["<stdin>"])
+        or (data["output"] is not None and not isinstance(data["output"], str))
+    ):
+        raise SmokeError("sai fmt result does not match the source stdin fixture")
+    if completed.returncode != 0:
+        if completed.returncode != 1:
+            raise SmokeError("sai fmt returned an abnormal exit code")
+        if (
+            data["output"] is not None
+            or data["changed"]
+            or data["refused"] != ["<stdin>"]
+            or not actual_diagnostics
+            or any(item["severity"] != "error" for item in actual_diagnostics)
+        ):
+            raise SmokeError("sai fmt returned an invalid refusal")
+        raise SmokeError("source fmt fixture was refused by the formatter")
+    if actual_diagnostics:
+        raise SmokeError("source fmt returned unexpected diagnostics")
+    if data["refused"] or data["output"] is None:
+        raise SmokeError("sai fmt refused the source stdin fixture")
+    try:
+        actual_output = data["output"].encode("utf-8", "strict")
+    except UnicodeError:
+        raise SmokeError("sai fmt output is not valid UTF-8 text") from None
+    expected_changed = [] if input_bytes == actual_output else ["<stdin>"]
+    if fixed_point and data["changed"]:
+        raise SmokeError("formatting expected output was not a fixed point")
+    if data["changed"] != expected_changed:
+        raise SmokeError("sai fmt changed list does not match its input and output")
+    if actual_output != expected_output:
+        if fixed_point:
+            raise SmokeError("formatting expected output changed its bytes")
+        raise SmokeError("sai fmt output does not match the expected bytes")
+    # _records validates the summary values and its exit/count relationship.
+    if summary["exit_code"] != 0:
+        raise SmokeError("sai fmt summary reports an unsuccessful command")
+
+
+def _run_fmt_fixture(
+    source_path: Path,
+    fixture_path: str,
+    source_bytes: bytes,
+    iut: Path,
+    registered_codes: set[str],
+    *,
+    timeout: float,
+) -> None:
+    expected_output = _read_expected_format(source_path, fixture_path)
+    command = [
+        "--format=json",
+        "--max-errors=0",
+        "fmt",
+        "--stdin-kind",
+        "source",
+        "-",
+    ]
+    with tempfile.TemporaryDirectory(prefix="sai-stage0-fmt-") as temporary:
+        sandbox_root = Path(temporary)
+        package_root = sandbox_root / "package"
+        package_root.mkdir()
+        first = _run_iut(
+            iut,
+            command,
+            package_root,
+            timeout,
+            state_root=sandbox_root,
+            stdin_data=source_bytes,
+        )
+        _validate_fmt_output(
+            first,
+            expected_output=expected_output,
+            input_bytes=source_bytes,
+            registered_codes=registered_codes,
+            fixed_point=False,
+        )
+        second = _run_iut(
+            iut,
+            command,
+            package_root,
+            timeout,
+            state_root=sandbox_root,
+            stdin_data=expected_output,
+        )
+        _validate_fmt_output(
+            second,
+            expected_output=expected_output,
+            input_bytes=expected_output,
+            registered_codes=registered_codes,
+            fixed_point=True,
+        )
 
 
 def _actual_diagnostics(records: list[dict], codes: set[str]) -> list[dict]:
@@ -385,7 +562,7 @@ def _formatter_diagnostics(records: list[dict], codes: set[str]) -> list[dict]:
             continue
         code = record["code"]
         if code == "INTERNAL_COMPILER_ERROR":
-            raise SmokeError("formatter preflight reported an internal compiler error")
+            raise SmokeError("formatter reported an internal compiler error")
         if code not in codes:
             raise SmokeError(f"unregistered diagnostic code: {code}")
         if record.get("package") is not None:
@@ -502,7 +679,7 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
         "mode": "partial-smoke",
         "claim": False,
         "configuration": {"target": None, "profile": None},
-        "compatibility_execution": {"manifest_target": "wasm32-core", "cli_profile_default": "dev"},
+        "compatibility_execution": None,
         "outcome": "fail",
         "deviations": [],
         "failures": [],
@@ -520,7 +697,6 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
             raise SmokeError(f"could not inspect fixture source: {path}") from None
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise SmokeError("fixture source is not a regular file")
-        _reject_sidecars(source_path, path)
         try:
             source_bytes = source_path.read_bytes()
         except OSError:
@@ -531,6 +707,23 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
         directives, expected, selection = _validate_directives(extracted, docs_root)
         output["configuration"] = selection["configurations"][0]
         output["reference_only"] = directives["reference_only"] is not None
+        if directives["kind"] == "fmt":
+            _reject_sidecars(source_path, path, allow_expected=True)
+            _run_fmt_fixture(
+                source_path,
+                path,
+                source_bytes,
+                iut,
+                codes,
+                timeout=timeout,
+            )
+            output["outcome"] = "pass"
+            return output
+        output["compatibility_execution"] = {
+            "manifest_target": "wasm32-core",
+            "cli_profile_default": "dev",
+        }
+        _reject_sidecars(source_path, path)
         if any(item["file"] == "sai.package" for item in expected):
             raise SmokeError("manifest diagnostics are unsupported for generated packages")
 
@@ -604,7 +797,7 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
 
 def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
               *, timeout: float = TIMEOUT_SECONDS) -> dict:
-    """Run discovered Stage 0 check fixtures and return a non-claim report."""
+    """Run discovered Stage 0 check and source-fmt fixtures without a claim."""
     report = {
         "type": "summary",
         "mode": "partial-smoke",
@@ -621,6 +814,9 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "uses the generated package's wasm32-core/dev defaults for execution.",
             "The caller must supply this repository's reference sai binary; the runner "
             "cannot verify the identity of the executable passed with --iut.",
+            "Formatter coverage is limited to single-file source fmt goldens and "
+            "fixed-point checks; fmt-refuse, package formatting, layout variants, "
+            "and fmt --check behavior are not covered.",
             "This smoke subset does not establish section, diagnostic, or suite coverage "
             "and cannot substantiate a conformance claim.",
         ],

@@ -1,0 +1,4 @@
+//@ kind: fmt
+//@ stage: 0
+//@ spec: impl/14 §14.4.2
+pub fn value()->Bool{true}
