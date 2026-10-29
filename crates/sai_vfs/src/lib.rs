@@ -675,14 +675,22 @@ impl LineIndex {
         self.offset_for_units(start, end, target as usize, false)
     }
 
-    /// Converts a one-based UTF-16 position to an offset, rounding down inside a surrogate pair.
+    /// Converts a one-based UTF-16 LSP position to an offset, counting a leading BOM.
     pub fn from_utf16(&self, line: u32, utf16_col: u32) -> TextSize {
+        let line_index = self.clamped_line_index(line);
+        let bom_units = u32::from(self.bom_shift > 0 && line_index == 0);
+        self.from_diagnostic_utf16(line, utf16_col.saturating_sub(bom_units))
+    }
+
+    /// Converts the one-based UTF-16 column from [`Self::position`] to a decoded-text offset.
+    ///
+    /// Diagnostic columns exclude a leading BOM. Positions within a surrogate pair
+    /// are rounded down, and columns beyond the line are clamped to its end.
+    pub fn from_diagnostic_utf16(&self, line: u32, utf16_col: u32) -> TextSize {
         let line_index = self.clamped_line_index(line);
         let start = self.line_starts[line_index].to_usize();
         let end = self.line_end(line_index);
-        let target = utf16_col
-            .saturating_sub(1)
-            .saturating_sub(u32::from(self.bom_shift > 0 && line_index == 0));
+        let target = utf16_col.saturating_sub(1);
         self.offset_for_units(start, end, target as usize, true)
     }
 
@@ -2909,6 +2917,46 @@ mod tests {
             }
         );
         assert_eq!(file.line_index().from_lsp_utf16(0, 0), size(0));
+    }
+
+    #[test]
+    fn diagnostic_utf16_round_trips_without_changing_lsp_bom_positions() {
+        for bytes in [
+            &b"\xef\xbb\xbfa\xf0\x9f\xa6\x80\r\n\xf0\x90\x80z\n"[..],
+            &b"a\xf0\x9f\xa6\x80\r\n\xf0\x90\x80z\n"[..],
+        ] {
+            let file = SourceFile::decode(FileId::new(1), bytes).unwrap();
+            let index = file.line_index();
+            for offset in [0, 1, 5, 7, 10, 11, 12] {
+                let diagnostic = index.position(size(offset));
+                assert_eq!(
+                    index.from_diagnostic_utf16(diagnostic.line, diagnostic.utf16_col),
+                    size(offset),
+                    "diagnostic offset {offset}, BOM {}",
+                    file.had_bom()
+                );
+                let lsp = index.to_lsp_utf16(size(offset));
+                assert_eq!(
+                    index.from_lsp_utf16(lsp.line, lsp.character),
+                    size(offset),
+                    "LSP offset {offset}, BOM {}",
+                    file.had_bom()
+                );
+            }
+            assert_eq!(index.from_diagnostic_utf16(1, 2), size(1));
+            assert_eq!(index.from_diagnostic_utf16(1, 3), size(1));
+            assert_eq!(index.from_diagnostic_utf16(1, 4), size(5));
+            assert_eq!(index.from_diagnostic_utf16(1, u32::MAX), size(5));
+            assert_eq!(index.from_diagnostic_utf16(2, 2), size(7));
+            assert_eq!(index.from_diagnostic_utf16(2, 4), size(10));
+        }
+
+        let file = SourceFile::new(FileId::new(2), "a🦀", true).unwrap();
+        let index = file.line_index();
+        assert_eq!(index.position(size(1)).utf16_col, 2);
+        assert_eq!(index.from_utf16(1, 2), size(0));
+        assert_eq!(index.from_diagnostic_utf16(1, 2), size(1));
+        assert_eq!(index.from_lsp_utf16(0, 2), size(1));
     }
 
     #[test]
