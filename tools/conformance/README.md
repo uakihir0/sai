@@ -115,11 +115,49 @@ capabilities, including optional `wasm64-wasi` component support. This helper
 does not run tests, resolve staged fallback configurations, or establish a
 conformance claim.
 
-These components are not the full harness and cannot substantiate a
-conformance claim. The caller must resolve package paths, validate NDJSON,
-run the IUT and manage the staged command sequence and
-configurations. The matcher only judges supplied normalized diagnostics and
-process exit code; it does not validate the complete command protocol.
+## Stage 0 partial smoke runner
+
+`python3 -B tools/conformance/run_stage0.py --iut /absolute/path/to/sai tests/conformance`
+runs a deliberately limited set of Stage 0 checks through the IUT's command
+line. It accepts only single-file `check-pass` and `check-fail` fixtures, with
+`kind`, `stage`, and resolvable `spec` directives. It rejects explicit
+target/profile restrictions, unsupported directives, directory fixtures, all
+sidecars, an empty fixture set, and inputs whose specification references do
+not resolve beneath `docs/`.
+
+For each accepted fixture it makes a fresh sandbox, copies the source unchanged,
+creates the required package manifest, and passes only `NO_COLOR=1`,
+`SAI_CACHE_DIR=<sandbox>/cache`, and `HOME=<sandbox>/home` to the IUT. It invokes
+`sai --format=json --max-errors=0 check --jobs=1`, validates the diagnostic
+registry and JSON stream, checks diagnostic order and result semantics, and
+compares expected diagnostics. A timeout is a failure, never a pass.
+
+The runner treats the supplied executable as the repository's reference
+implementation, but cannot verify its identity from the black-box protocol.
+Callers must supply the reference binary, and the report sets
+`iut_identity_verified` to `false`. It rejects `reference-only` fixtures because
+it cannot establish that identity.
+
+The conceptual configuration is targetless and profileless, as Stage 0
+requires. The current CLI still executes this generated package as
+`wasm32-core`/`dev`: the package contract requires a nonempty target list and
+the CLI has no targetless Stage 0 mode. The report exposes this compatibility
+execution and always sets `mode` to `partial-smoke` and `claim` to `false`.
+This runner is useful as smoke evidence only; it does not validate suite
+coverage, goldens, all directive applicability, or the complete conformance
+protocol, and cannot substantiate a conformance claim.
+
+The subprocess environment mapping contains exactly the three listed entries.
+On macOS, Python test executables may add `LC_CTYPE` and
+`__CF_USER_TEXT_ENCODING` during their own interpreter initialization; a native
+child-process check verifies the environment received through direct execution.
+
+The standalone components and this limited runner are not the full harness.
+The matcher only judges supplied normalized diagnostics and process exit code;
+it does not validate the complete command protocol. The normative harness
+still needs to implement package-path resolution, every supported test kind,
+staged command sequences, configuration coverage, execution, goldens, and the
+suite claim.
 
 Run its isolated tests with
 `python3 -B -m unittest discover -s tools/conformance -p 'test_*.py'`.
