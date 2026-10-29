@@ -1,4 +1,4 @@
-# Conformance diagnostic matcher
+# Standalone conformance components
 
 This standalone component implements the diagnostic multiset comparison,
 acceptance outcome, ICE precedence, and single-command staged decision of
@@ -36,11 +36,33 @@ For these check commands, an error diagnostic requires IUT exit code 1 and no
 error requires 0. Other exits fail, as does an inconsistent 0 or 1, before
 staged status can be reported. An ICE diagnostic or exit 101 always fails.
 
-This is not the full harness and cannot substantiate a conformance claim. The
-caller must discover tests, parse annotations and directives, resolve package
-paths, validate NDJSON, run the IUT and manage the staged command sequence and
-configurations. This component only judges the supplied normalized diagnostics
-and process exit code; it does not validate the complete command protocol.
+## Expectation extraction
+
+`python3 tools/conformance/expectation_extractor.py SOURCE --path ROOT_RELATIVE_PATH`
+extracts diagnostic annotations from a single source file. Add `--directives`
+for the root file's diagnostic directives and `--lint-levels` with a JSON map
+of lint codes to resolved levels. The output can supply the matcher's
+`expected` array. Invalid input or unsupported syntax exits with status 2.
+
+The scanner is deliberately incomplete: it rejects package-path candidates,
+format strings, execution expectations, non-ASCII code outside literals and
+comments, and ambiguous malformed inputs. Directive placement and repetition
+are checked, but other directive values are not validated. An unsupported
+test must not be treated as passing or as having no expectations.
+
+## NDJSON envelope
+
+`python3 tools/conformance/ndjson_stream.py` reads a binary NDJSON stream from
+standard input and checks common version 1 wire-format and record constraints.
+Even when these checks succeed, it reports `partial` and exits 2: callers must
+still check command-specific schemas, the error limit, diagnostic ordering,
+registered codes, source-dependent constraints, process status and stderr.
+
+These components are not the full harness and cannot substantiate a
+conformance claim. The caller must discover tests, resolve package paths,
+validate NDJSON, run the IUT and manage the staged command sequence and
+configurations. The matcher only judges supplied normalized diagnostics and
+process exit code; it does not validate the complete command protocol.
 
 Run its isolated tests with
 `python3 -B -m unittest discover -s tools/conformance -p 'test_*.py'`.

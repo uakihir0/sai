@@ -9144,3 +9144,9 @@
 - **Decision — review required:** Index UTF-16 deltas at sparse character-boundary checkpoints, and scan short ranges directly. This limits repeated long-line scans while avoiding a per-character index and preserving existing BOM, malformed UTF-8, rounding and stable-hash behavior.
 - **Verification:** The final `sai_vfs` suite passed 49 tests; `sai_syntax` (425) and `sai_diagnostics` (65) passed before the final short-range optimization. A 16 MiB non-ASCII sample used approximately 512 KiB for checkpoints; microbenchmarks are directional, not a general performance guarantee.
 - **Hostile review:** Independent review identified per-character index memory amplification and short-range performance regressions. Sparse checkpoints and short-range fast paths addressed both; a final independent model comparison found no further actionable defect.
+
+### IR-1006 (2026-10-29): extract a conservative diagnostic expectation subset
+
+- **Decision — review required:** Add an independent scanner for diagnostic annotations and root directives, rejecting ambiguous or unsupported syntax rather than guessing or reporting an empty expectation set. Package paths, format strings, execution expectations, non-ASCII code outside comments and literals, and some malformed inputs remain unsupported; callers must report such tests as unrun, not passed.
+- **Verification:** The component tests passed together (52 tests), including 27 extractor tests. This scanner and the matcher do not constitute the full harness or validate all directive values.
+- **Hostile review:** Independent reviews found several false-extraction risks involving raw identifiers, numeric suffixes, package paths and malformed escapes, as well as doc-token directive placement. These were addressed conservatively and a final focused review found no further actionable defect.
