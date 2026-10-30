@@ -98,7 +98,7 @@ def _run_iut(iut: Path, argv: list[str], cwd: Path, timeout: float, *,
         raise SmokeError("could not start the IUT") from None
 
 
-def _read_registry(iut: Path, *, timeout: float) -> set[str]:
+def _read_registry_entries(iut: Path, *, timeout: float) -> dict[str, dict]:
     with tempfile.TemporaryDirectory(prefix="sai-stage0-registry-") as temporary:
         cwd = Path(temporary)
         completed = _run_iut(iut, ["--format=json", "explain", "--list"], cwd, timeout)
@@ -129,14 +129,31 @@ def _read_registry(iut: Path, *, timeout: float) -> set[str]:
                 or entry["class"] not in ("hard", "lint")
                 or not isinstance(entry["summary"], str)):
             raise SmokeError("sai explain --list returned an invalid code registry")
-        codes.append(entry["code"])
-    if codes != sorted(set(codes), key=lambda code: code.encode("utf-8")):
+        codes.append(entry)
+    names = [entry["code"] for entry in codes]
+    if names != sorted(set(names), key=lambda code: code.encode("utf-8")):
         raise SmokeError("sai explain --list returned an unordered or duplicate registry")
     summary = summaries[0]
-    if (summary["errors"] != 0 or summary["warnings"] != 0 or summary["infos"] != 0
-            or summary["exit_code"] != 0):
-        raise SmokeError("sai explain --list returned a nonempty summary")
-    return set(codes)
+    _validate_empty_summary(summary, command="sai explain --list")
+    return {entry["code"]: entry for entry in codes}
+
+
+def _validate_empty_summary(summary: dict, *, command: str) -> None:
+    if (
+        summary["errors"] != 0
+        or summary["warnings"] != 0
+        or summary["infos"] != 0
+        or summary["shown_errors"] != 0
+        or summary["suppressed"]["cascade"] != 0
+        or summary["suppressed"]["duplicate"] != 0
+        or summary["suppressed"]["dependency"] != 0
+        or summary["exit_code"] != 0
+    ):
+        raise SmokeError(f"{command} returned a nonempty summary")
+
+
+def _read_registry(iut: Path, *, timeout: float) -> set[str]:
+    return set(_read_registry_entries(iut, timeout=timeout))
 
 
 def _resolve_spec_reference(reference: dict, docs_root: Path) -> None:

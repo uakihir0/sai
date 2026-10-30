@@ -203,6 +203,27 @@ fixed-point checks, 16 deterministic layout variants, source-stdin, generated
 package-wide `fmt --check` and `fmt --check` with one explicit path, and
 exact-diagnostic `fmt-refuse` cases.
 Fixed-point and `fmt --check` checks apply only to `fmt` pass fixtures.
+
+## Stage 0 explanation-record partial smoke
+
+`python3 -B tools/conformance/run_explanation_smoke.py --iut /absolute/path/to/sai`
+checks the two complete Stage 0 explanation records currently implemented:
+`DUPLICATE_BINDING` and `INVALID_ESCAPE`. It verifies their `--list` entries,
+JSON metadata, Markdown heading/table/section structure, and marked Example and
+Fix fences. It compiles each Example with the generated single-file package,
+tries `sai check` before the documented `sai build` fallback, checks each Fix
+with `sai check`, and verifies formatter fixed points or the exact marked
+lexical refusal behavior.
+
+For `INVALID_ESCAPE`, the runner accepts only the current `sai check`
+`FEATURE_NOT_IMPLEMENTED` gate alongside the required diagnostic. It still
+rejects every other unmarked diagnostic. This reflects the present Stage 0
+checker boundary; the Example must produce `INVALID_ESCAPE` itself.
+
+This runner does not check the remaining registered records, staged
+applicability, diagnostic tables, or the registry requirements in
+`impl/15` §§15.8.4–15.8.5. It reports `mode: partial-smoke`,
+`claim: false`, and `iut_identity_verified: false`.
 Package-contract formatting variants and goldens, package workspaces,
 multi-source package checks, multiple explicit path arguments, complete
 formatter-rule coverage, and every refusal condition remain unsupported.
