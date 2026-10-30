@@ -2468,6 +2468,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         && self.input.unknown_self_fields
                             .is_some_and(|fields| fields.contains(&operand.hir_id))
             );
+            let is_supported_unknown_not_local = matches!(
+                expression.kind,
+                ExprKind::Unary(UnOp::Not, operand)
+                    if matches!(operand.kind, ExprKind::Path(_))
+                        && matches!(
+                            self.check_local_path(operand),
+                            Ok(LocalType::Error(_))
+                        )
+            );
             let is_supported_unknown_neg_or_bitnot_field = matches!(
                 expression.kind,
                 ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand)
@@ -2503,6 +2512,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             };
             if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. })
                 && !is_supported_unknown_not_field
+                && !is_supported_unknown_not_local
                 && !is_supported_unknown_neg_or_bitnot_field
                 && !is_supported_unknown_field_binary_tail
             {
