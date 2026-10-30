@@ -15,6 +15,9 @@ const DUPLICATE_BINDING_SUMMARY: &str = "Two bindings of one name in one scope: 
 const INVALID_ESCAPE_MARKDOWN: &str =
     include_str!("../../sai_diagnostics/src/explanations/invalid_escape.md");
 const INVALID_ESCAPE_SUMMARY: &str = "Invalid escape sequence";
+const LITERAL_OUT_OF_RANGE_MARKDOWN: &str =
+    include_str!("../../sai_diagnostics/src/explanations/literal_out_of_range.md");
+const LITERAL_OUT_OF_RANGE_SUMMARY: &str = "Literal out of range for its type";
 
 struct TestDirectory(PathBuf);
 
@@ -321,6 +324,51 @@ fn explain_invalid_escape_serializes_the_exact_json_record() {
 }
 
 #[test]
+fn explain_literal_out_of_range_prints_the_exact_markdown_record() {
+    let output = run_explain(&["explain", "LITERAL_OUT_OF_RANGE"]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(stdout, LITERAL_OUT_OF_RANGE_MARKDOWN);
+}
+
+#[test]
+fn explain_literal_out_of_range_serializes_the_exact_json_record() {
+    let output = run_explain(&["--format=json", "explain", "LITERAL_OUT_OF_RANGE"]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expected_result = format!(
+        concat!(
+            "{{\"type\":\"result\",\"kind\":\"explain\",\"data\":{{",
+            "\"code\":\"LITERAL_OUT_OF_RANGE\",\"class\":\"hard\",\"severity\":\"error\",",
+            "\"default_level\":null,\"stage\":0,\"owner\":\"spec/02-lexical-structure.md\",",
+            "\"since\":\"0.1.0\",\"status\":\"active\",\"superseded_by\":null,",
+            "\"summary\":{},\"markdown\":{}",
+            "}}}}"
+        ),
+        json_string(LITERAL_OUT_OF_RANGE_SUMMARY),
+        json_string(LITERAL_OUT_OF_RANGE_MARKDOWN),
+    );
+    let expected = format!(
+        concat!(
+            "{{\"type\":\"header\",\"format\":\"sai-diagnostics\",\"version\":1,",
+            "\"tool\":{{\"name\":\"sai\",\"version\":\"{}\"}},",
+            "\"command\":\"explain\",\"root\":null}}\n",
+            "{}\n",
+            "{{\"type\":\"summary\",\"errors\":0,\"warnings\":0,\"infos\":0,",
+            "\"shown_errors\":0,\"suppressed\":{{\"cascade\":0,\"duplicate\":0,",
+            "\"dependency\":0}},\"exit_code\":0}}\n"
+        ),
+        env!("CARGO_PKG_VERSION"),
+        expected_result,
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(stdout, expected);
+}
+
+#[test]
 fn explanation_example_is_rejected_and_fix_is_semantically_checked() {
     let example = source_block(TYPE_MISMATCH_MARKDOWN, "Example");
     let fix = source_block(TYPE_MISMATCH_MARKDOWN, "Fix");
@@ -539,6 +587,74 @@ fn invalid_escape_explanation_example_refuses_and_fix_is_clean_and_canonical() {
 }
 
 #[test]
+fn literal_out_of_range_explanation_example_is_exact_and_fix_is_clean_and_canonical() {
+    let example = source_block(LITERAL_OUT_OF_RANGE_MARKDOWN, "Example");
+    let fix = source_block(LITERAL_OUT_OF_RANGE_MARKDOWN, "Fix");
+
+    let rejected = run_check(&example);
+    let rejected_stdout = String::from_utf8(rejected.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(rejected.status.code(), Some(1), "{rejected_stdout}");
+    assert!(rejected.stderr.is_empty());
+    assert_eq!(
+        rejected_stdout.matches("\"type\":\"diagnostic\"").count(),
+        1,
+        "{rejected_stdout}"
+    );
+    assert_eq!(
+        rejected_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        1,
+        "{rejected_stdout}"
+    );
+    let diagnostic = rejected_stdout
+        .lines()
+        .find(|line| line.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""))
+        .expect("check reports the expected code");
+    assert!(
+        diagnostic.contains("\"severity\":\"error\""),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("\"path\":\"src/lib.sai\""),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("\"line\":1"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("\"message\":\"integer literal is out of range for `U8`\""),
+        "{diagnostic}"
+    );
+    assert!(!rejected_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+    assert!(!rejected_stdout.contains("\"type\":\"result\""));
+
+    let accepted = run_check(&fix);
+    let accepted_stdout = String::from_utf8(accepted.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(accepted.status.code(), Some(0), "{accepted_stdout}");
+    assert!(accepted.stderr.is_empty());
+    assert!(
+        accepted_stdout.contains("\"kind\":\"check\""),
+        "{accepted_stdout}"
+    );
+    assert!(!accepted_stdout.contains("\"type\":\"diagnostic\""));
+
+    for (label, source) in [("Example", example), ("Fix", fix)] {
+        let formatted = run_fmt_check(&source);
+        let stdout = String::from_utf8(formatted.stdout).expect("formatter stdout is UTF-8");
+        assert_eq!(
+            formatted.status.code(),
+            Some(0),
+            "{label} source is not formatter-canonical:\n{stdout}"
+        );
+        assert!(formatted.stderr.is_empty());
+        assert!(!stdout.contains("\"code\":\"UNFORMATTED_FILE\""));
+        assert!(
+            stdout.contains("\"refused\":[]"),
+            "{label} source was refused:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn explain_keeps_other_individual_codes_gated_and_preserves_list() {
     let gated = run_explain(&["--format=json", "explain", "UNKNOWN_FIELD"]);
     let gated_stdout = String::from_utf8(gated.stdout).expect("CLI stdout is UTF-8");
@@ -566,6 +682,21 @@ fn explain_keeps_other_individual_codes_gated_and_preserves_list() {
         .find("\"code\":\"INVALID_EXPORT_TARGET\"")
         .expect("list contains the following code");
     assert!(previous_code < invalid_escape && invalid_escape < next_code);
+    let literal_out_of_range_list_entry = "{\"code\":\"LITERAL_OUT_OF_RANGE\",\"class\":\"hard\","
+        .to_owned()
+        + "\"summary\":\"Literal out of range for its type\"}";
+    let previous_literal_code = list_stdout
+        .find("\"code\":\"LET_ELSE_NOT_DIVERGING\"")
+        .expect("list contains the preceding literal-range code");
+    let literal_out_of_range = list_stdout
+        .find(&literal_out_of_range_list_entry)
+        .expect("list contains the exact LITERAL_OUT_OF_RANGE entry");
+    let next_literal_code = list_stdout
+        .find("\"code\":\"LOCK_CORRUPT\"")
+        .expect("list contains the following literal-range code");
+    assert!(
+        previous_literal_code < literal_out_of_range && literal_out_of_range < next_literal_code
+    );
     assert!(list_stdout.contains("\"code\":\"TYPE_MISMATCH\",\"class\":\"hard\""));
     assert_eq!(list_stdout.matches("\"code\":").count(), 494);
 }
