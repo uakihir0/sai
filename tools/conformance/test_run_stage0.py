@@ -37,6 +37,8 @@ class Stage0SmokeRunnerTests(unittest.TestCase):
         self.launcher = self.script
         self.receipt = self.base / "receipt.json"
         self.mode = "normal"
+        self.refusal_code = "EXPECTED_TOKEN"
+        self.refusal_line = None
         self.expected_format = None
         self.layout_variants = [f"mock layout {index}\n".encode("utf-8") for index in range(16)]
         self.layout_variants_patch = patch(
@@ -58,6 +60,8 @@ from pathlib import Path
 MODE = {self.mode!r}
 RECEIPT = {str(self.receipt)!r}
 ROOT = {ROOT_ID!r}
+REFUSAL_CODE = {self.refusal_code!r}
+REFUSAL_LINE = {self.refusal_line!r}
 EXPECTED_FORMATTED = {self.expected_format!r}
 
 def line(value):
@@ -92,6 +96,7 @@ if args == ["--format=json", "explain", "--list"]:
             "OR_PATTERN_BINDING_MISMATCH",
             "UNFORMATTED_FILE",
             "UNKNOWN_ATTRIBUTE",
+            "UNTERMINATED_COMMENT",
         ]
     print(line(header("explain", None)).rstrip("\\n"))
     print(line({{"type":"result","kind":"explain.list","data":{{"codes":[
@@ -458,7 +463,7 @@ if args == [
         raise SystemExit(0)
 
     diagnostic = {{
-        "type":"diagnostic","code":"EXPECTED_TOKEN","severity":"error",
+        "type":"diagnostic","code":REFUSAL_CODE,"severity":"error",
         "level":None,"message":"expected a token","primary":{{
             "file":{{"path":"<stdin>","package":None,"snapshot":None}},
             "start":{{"byte":0,"line":1,"col":1,"utf16_col":1}},
@@ -480,8 +485,12 @@ if args == [
                 "refused":[],"output":formatter_input.decode("utf-8")
             }}
         else:
-            diagnostic["primary"]["start"]["line"] = formatter_input.count(b"\\n") + 1
-            diagnostic["primary"]["end"]["line"] = formatter_input.count(b"\\n") + 1
+            refusal_line = (
+                formatter_input.count(b"\\n") + 1
+                if REFUSAL_LINE is None else REFUSAL_LINE
+            )
+            diagnostic["primary"]["start"]["line"] = refusal_line
+            diagnostic["primary"]["end"]["line"] = refusal_line
             if MODE == "fmt_refuse_wrong_line":
                 diagnostic["primary"]["start"]["line"] -= 1
                 diagnostic["primary"]["end"]["line"] -= 1
@@ -962,7 +971,9 @@ raise SystemExit(exit_code)
 
     def _fmt_refuse_fixture(
         self, *, expected_line=6, extra="", body="pub fn broken() -> Bool { true\n",
+        code="EXPECTED_TOKEN",
     ):
+        self.refusal_code = code
         self.source.write_text(
             "//@ kind: fmt-refuse\n"
             "//@ stage: 0\n"
@@ -974,6 +985,30 @@ raise SystemExit(exit_code)
         )
         self.mode = "fmt_refuse"
         self._write_fake()
+
+    def test_fmt_refuse_accepts_unterminated_block_comment_fixture(self):
+        repository_fixture = (
+            Path(__file__).resolve().parents[2]
+            / "tests"
+            / "conformance"
+            / "impl-14-formatter"
+            / "refuse-unterminated-comment.sai"
+        )
+        self.source.write_bytes(repository_fixture.read_bytes())
+        self.refusal_code = "UNTERMINATED_COMMENT"
+        self.refusal_line = 5
+        self.mode = "fmt_refuse"
+        self._write_fake()
+
+        original = self.source.read_bytes()
+        report = self._run()
+        self.assertEqual(report["outcome"], "pass", report)
+        self.assertEqual(report["results"][0]["outcome"], "pass")
+        self.assertIs(report["claim"], False)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["formatter_inputs"], [original.decode("utf-8")])
+        self.assertEqual(self.source.read_bytes(), original)
 
     def test_layout_generator_passes_test_path_and_fixture_bytes(self):
         variants = [f"variant-{index}".encode("utf-8") for index in range(16)]

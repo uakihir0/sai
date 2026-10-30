@@ -1,0 +1,5 @@
+//@ kind: fmt-refuse
+//@ stage: 0
+//@ spec: spec/02 §2.3, impl/14 §14.2.2
+//@ diag: error UNTERMINATED_COMMENT at src/lib.sai:5
+/* this block comment is intentionally unterminated

@@ -466,6 +466,36 @@ pub fn invalid_escape() -> Str { "\q" }
                     "src/lib.sai",
                 )
 
+    def test_unterminated_block_comment_requires_matching_fmt_refuse_expectation(self):
+        source = """//@ kind: fmt-refuse
+//@ stage: 0
+//@ spec: spec/02 §2.3, impl/14 §14.2.2
+//@ diag: error UNTERMINATED_COMMENT at src/lib.sai:5
+/* intentionally unterminated
+"""
+        result = extract_with_directives(source, "src/lib.sai")
+        self.assertEqual(
+            result["expected"],
+            [expected(5, "error", "UNTERMINATED_COMMENT")],
+        )
+        self.assertEqual(result["directives"]["kind"], "fmt-refuse")
+
+        for header_kind, diagnostic in (
+            ("check-fail", "error UNTERMINATED_COMMENT at src/lib.sai:5"),
+            ("fmt-refuse", "error EXPECTED_TOKEN at src/lib.sai:5"),
+            ("fmt-refuse", "warning UNTERMINATED_COMMENT at src/lib.sai:5"),
+            ("fmt-refuse", "error UNTERMINATED_COMMENT at other.sai:5"),
+            ("fmt-refuse", "error UNTERMINATED_COMMENT at src/lib.sai:4"),
+        ):
+            malformed = source.replace("kind: fmt-refuse", f"kind: {header_kind}")
+            malformed = malformed.replace(
+                "error UNTERMINATED_COMMENT at src/lib.sai:5",
+                diagnostic,
+            )
+            with self.subTest(kind=header_kind, diagnostic=diagnostic):
+                with self.assertRaisesRegex(ValueError, "unterminated block comment"):
+                    extract_with_directives(malformed, "src/lib.sai")
+
     def test_invalid_escape_is_supported_in_only_a_marked_explanation_example(self):
         record_path = (
             Path(__file__).resolve().parents[2]

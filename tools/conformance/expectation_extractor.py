@@ -18,7 +18,10 @@ Invalid UTF-8 is supported only as isolated bytes outside comments and literals.
 Invalid escapes are rejected in ordinary source fixtures. They may be scanned
 inside a strictly headed `fmt-refuse` fixture or an explicitly marked
 `sai noncanonical` explanation Example, where the scanner skips the malformed
-literal escape while retaining the string boundary. Manifest line continuations
+literal escape while retaining the string boundary. An unterminated block
+comment is supported only in a strictly headed `fmt-refuse` fixture whose
+explicit error expectation names `UNTERMINATED_COMMENT` at the opening line.
+Manifest line continuations
 and a backslash immediately followed by a lone CR (including in comments and raw
 strings) are rejected.
 Outside manifests, only complete package paths with unambiguous boundaries are
@@ -576,6 +579,7 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
             continue
         if source.startswith("/*", position):
             depth = 1
+            line_at_comment_start = line
             position += 2
             while position < len(source) and depth:
                 if source.startswith("/*", position):
@@ -593,7 +597,19 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
                         line_break_since_previous = True
                     position += 1
             if depth:
-                fail("unterminated block comment")
+                expected_unterminated_comment = (
+                    validate_test_directives
+                    and directive_values.get("kind") == ["fmt-refuse"]
+                    and any(
+                        diagnostic["severity"] == "error"
+                        and diagnostic["code"] == "UNTERMINATED_COMMENT"
+                        and diagnostic["file"] == path
+                        and diagnostic["line"] == line_at_comment_start
+                        for diagnostic in parsed_diagnostics
+                    )
+                )
+                if not expected_unterminated_comment:
+                    fail("unterminated block comment")
             continue
 
         if ord(character) >= 128:
