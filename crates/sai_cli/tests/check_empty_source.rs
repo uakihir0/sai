@@ -5863,6 +5863,188 @@ fn unknown_direct_self_field_recovers_through_supported_unary_aliases() {
 }
 
 #[test]
+fn unknown_direct_self_field_tainted_local_not_method_tails_recover() {
+    let cases = [
+        (
+            "inferred local",
+            concat!(
+                "type User { name: Bool }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        let absent = self.naem\n",
+                "        not absent\n",
+                "    }\n",
+                "}\n",
+            ),
+            "naem",
+            None,
+        ),
+        (
+            "independent method-return mismatch",
+            concat!(
+                "type User { name: Bool }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        let absent = self.naem\n",
+                "        not absent\n",
+                "    }\n",
+                "}\n",
+            ),
+            "naem",
+            Some(("expected `I32`, found `Bool`", "not absent")),
+        ),
+        (
+            "annotated non-Bool local",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        let absent: I32 = self.naem\n",
+                "        not absent\n",
+                "    }\n",
+                "}\n",
+            ),
+            "naem",
+            Some(("expected `Bool`, found `I32`", "absent")),
+        ),
+        (
+            "error-tainted alias",
+            concat!(
+                "type User { name: Bool }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        let missing = self.naem\n",
+                "        let absent = missing\n",
+                "        not absent\n",
+                "    }\n",
+                "}\n",
+            ),
+            "naem",
+            None,
+        ),
+    ];
+
+    for (context, source, unknown_name, expected_mismatch) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert!(output.stderr.is_empty(), "{context}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{context} reports the original missing field exactly once:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} recovers the tainted `not` tail without a gate or success record:\n{stdout}"
+        );
+
+        let unknown_start = source.find(unknown_name).expect("unknown field exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            "`User` has no field `naem`",
+            unknown_start,
+            unknown_start + unknown_name.len(),
+        );
+
+        if let Some((message, expression)) = expected_mismatch {
+            assert_eq!(
+                stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+                1,
+                "{context} retains its independent mismatch:\n{stdout}"
+            );
+            let expression_start = source
+                .rfind(expression)
+                .expect("mismatch expression or operand exists");
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                message,
+                expression_start,
+                expression_start + expression.len(),
+            );
+        } else {
+            assert!(
+                !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+                "{context} should have no dependent type mismatch:\n{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_direct_self_field_unsupported_tainted_method_tails_remain_gated() {
+    let cases = [
+        (
+            "negation",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        let absent = self.naem\n",
+                "        -absent\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "bitwise not",
+            concat!(
+                "type User { name: U8 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> U8 {\n",
+                "        let absent = self.naem\n",
+                "        ~absent\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "nested not",
+            concat!(
+                "type User { name: Bool }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        let absent = self.naem\n",
+                "        not (not absent)\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "unresolved error literal local",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        let missing: F32 = self.naem\n",
+                "        let quotient = 128 / missing\n",
+                "        not quotient\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+    ];
+    for (context, source) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert!(output.stderr.is_empty(), "{context}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} remains behind the feature gate:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"UNKNOWN_FIELD\""),
+            "{context} does not leak the initializer's staged field diagnostic:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn unknown_direct_self_field_under_logical_not_recovers_bool_diagnostics() {
     let cases = [
         (
