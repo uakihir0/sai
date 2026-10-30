@@ -8508,21 +8508,20 @@ fn collect_inherent_method_direct_call_self_fields(
             ExprKind::Unary(UnOp::BitNot | UnOp::Neg, operand)
                 if matches!(operand.kind, ExprKind::Field { .. }) =>
             {
-                if !matches!(
-                    primitive_self_field_type(operand, &fields.fields, symbols),
-                    Some(Ok(_))
-                ) || !collect_inherent_method_self_field(
-                    owner,
-                    operand,
-                    true,
-                    fields,
-                    self_field_projections,
-                    unknown_self_fields,
-                    diagnostics,
-                    symbols,
-                    inputs,
-                    snapshot,
-                )? {
+                if primitive_self_field_type(operand, &fields.fields, symbols).is_none()
+                    || !collect_inherent_method_self_field(
+                        owner,
+                        operand,
+                        true,
+                        fields,
+                        self_field_projections,
+                        unknown_self_fields,
+                        diagnostics,
+                        symbols,
+                        inputs,
+                        snapshot,
+                    )?
+                {
                     return Ok(false);
                 }
             }
@@ -9481,6 +9480,7 @@ fn is_supported_direct_call_argument_shape(
             locals,
             inputs,
             self_field_projections,
+            unknown_self_fields,
         ),
         ExprKind::Unary(UnOp::Neg, _) => is_supported_direct_call_neg_argument_shape(
             expression,
@@ -9488,6 +9488,7 @@ fn is_supported_direct_call_argument_shape(
             locals,
             inputs,
             self_field_projections,
+            unknown_self_fields,
         ),
         ExprKind::Binary(BinOp::Rem, left, right) => {
             is_supported_direct_call_remainder_argument_shape(
@@ -9656,6 +9657,7 @@ fn is_supported_direct_call_arithmetic_argument_shape(
             locals,
             inputs,
             self_field_projections,
+            unknown_self_fields,
         ),
         ExprKind::Unary(UnOp::Neg, _) => is_supported_direct_call_neg_argument_shape(
             expression,
@@ -9663,6 +9665,7 @@ fn is_supported_direct_call_arithmetic_argument_shape(
             locals,
             inputs,
             self_field_projections,
+            unknown_self_fields,
         ),
         _ => is_supported_direct_call_leaf_argument_shape(
             expression,
@@ -9702,6 +9705,7 @@ fn is_supported_direct_call_bitwise_not_argument_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
 ) -> bool {
     let ExprKind::Unary(UnOp::BitNot, operand) = expression.kind else {
         return false;
@@ -9712,6 +9716,7 @@ fn is_supported_direct_call_bitwise_not_argument_shape(
         ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)) => true,
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
         }
         _ => false,
     }
@@ -9723,6 +9728,7 @@ fn is_supported_direct_call_neg_argument_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
 ) -> bool {
     let ExprKind::Unary(UnOp::Neg, operand) = expression.kind else {
         return false;
@@ -9732,6 +9738,7 @@ fn is_supported_direct_call_neg_argument_shape(
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
         }
         _ => false,
     }
@@ -85945,6 +85952,10 @@ property "shared"() {}
             "    let annotated_neg: I32 = -self.naem\n",
             "    let inferred_bitnot = ~self.naem\n",
             "    let annotated_bitnot: I32 = ~self.naem\n",
+            "    let inferred_neg_call = identity(-self.naem)\n",
+            "    let annotated_neg_call: I32 = identity(-self.naem)\n",
+            "    let inferred_bitnot_call = identity(~self.naem)\n",
+            "    let annotated_bitnot_call: I32 = identity(~self.naem)\n",
             "    let name = self.name\n",
             "    name\n",
             "  }\n",
@@ -85995,7 +86006,7 @@ property "shared"() {}
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
             panic!("a direct unknown self-field initializer should be checked: {check:#?}");
         };
-        assert_eq!(diagnostics.len(), 12, "{diagnostics:#?}");
+        assert_eq!(diagnostics.len(), 16, "{diagnostics:#?}");
         assert!(
             diagnostics
                 .iter()
@@ -86072,6 +86083,8 @@ property "shared"() {}
             "inferred_not",
             "inferred_neg",
             "inferred_bitnot",
+            "inferred_neg_call",
+            "inferred_bitnot_call",
         ] {
             assert_eq!(
                 type_results.binding_type(binding_named(name)),
@@ -86170,6 +86183,20 @@ property "shared"() {}
                     .canonical_binding_type(binding_named(name))
                     .is_some(),
                 "the explicit unary result annotation keeps its canonical fact: {name}"
+            );
+        }
+        for name in ["annotated_neg_call", "annotated_bitnot_call"] {
+            assert_eq!(
+                type_results.binding_type(binding_named(name)),
+                Some(sai_resolve::prelude::PrimTy::I32),
+                "an explicit annotation remains authoritative for an error-tainted unary call: {name}"
+            );
+            assert!(
+                type_results
+                    .partial_results()
+                    .canonical_binding_type(binding_named(name))
+                    .is_some(),
+                "the explicit unary call annotation keeps its canonical fact: {name}"
             );
         }
     }

@@ -2760,8 +2760,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     if is_supported_direct_call_bitwise_not_operand(
                         operand,
                         self.input.self_field_projections,
+                        self.input.unknown_self_fields,
                     ) =>
                 {
+                    if matches!(operand.kind, ExprKind::Field { .. })
+                        && self
+                            .input
+                            .unknown_self_fields
+                            .is_some_and(|fields| fields.contains(&operand.hir_id))
+                    {
+                        // The missing field has no type for BitNot to check or
+                        // for the call parameter to constrain.
+                        continue;
+                    }
                     let local_type = match operand.kind {
                         ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)) => {
                             self.check_direct_call_bitwise_not_literal(operand, *expected)?
@@ -2778,8 +2789,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     if is_supported_direct_call_neg_operand(
                         operand,
                         self.input.self_field_projections,
+                        self.input.unknown_self_fields,
                     ) =>
                 {
+                    if matches!(operand.kind, ExprKind::Field { .. })
+                        && self
+                            .input
+                            .unknown_self_fields
+                            .is_some_and(|fields| fields.contains(&operand.hir_id))
+                    {
+                        // Do not infer an unknown member's type from the
+                        // unary result or the expected call argument type.
+                        continue;
+                    }
                     let local_type = match operand.kind {
                         ExprKind::Field { .. } => {
                             self.check_direct_call_neg_field(operand, argument.expr.hir_id)?
@@ -5693,21 +5715,25 @@ fn is_supported_direct_call_not_operand(
 fn is_supported_direct_call_bitwise_not_operand(
     operand: &Expr<'_>,
     self_field_projections: Option<&HashMap<HirId, PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
 ) -> bool {
     matches!(
         operand.kind,
         ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_))
     ) || (matches!(operand.kind, ExprKind::Field { .. })
-        && self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)))
+        && (self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+            || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))))
 }
 
 fn is_supported_direct_call_neg_operand(
     operand: &Expr<'_>,
     self_field_projections: Option<&HashMap<HirId, PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
 ) -> bool {
     matches!(operand.kind, ExprKind::Path(_))
         || (matches!(operand.kind, ExprKind::Field { .. })
-            && self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)))
+            && (self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))))
 }
 
 fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
