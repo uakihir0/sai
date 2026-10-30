@@ -8468,6 +8468,26 @@ fn collect_inherent_method_direct_call_self_fields(
                     return Ok(false);
                 }
             }
+            ExprKind::Unary(UnOp::Not, operand)
+                if matches!(operand.kind, ExprKind::Field { .. }) =>
+            {
+                if primitive_self_field_type(operand, &fields.fields, symbols).is_none()
+                    || !collect_inherent_method_self_field(
+                        owner,
+                        operand,
+                        true,
+                        fields,
+                        self_field_projections,
+                        unknown_self_fields,
+                        diagnostics,
+                        symbols,
+                        inputs,
+                        snapshot,
+                    )?
+                {
+                    return Ok(false);
+                }
+            }
             ExprKind::Call { base: None, .. } if !nested => {
                 if !collect_inherent_method_direct_call_self_fields(
                     owner,
@@ -9393,6 +9413,8 @@ fn is_supported_direct_call_argument_shape(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
+            unknown_self_fields,
         ),
         ExprKind::Unary(UnOp::BitNot, _) => is_supported_direct_call_bitwise_not_argument_shape(
             expression,
@@ -9564,6 +9586,8 @@ fn is_supported_direct_call_arithmetic_argument_shape(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
+            unknown_self_fields,
         ),
         ExprKind::Unary(UnOp::BitNot, _) => is_supported_direct_call_bitwise_not_argument_shape(
             expression,
@@ -9591,6 +9615,8 @@ fn is_supported_direct_call_not_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
 ) -> bool {
     let ExprKind::Unary(UnOp::Not, operand) = expression.kind else {
         return false;
@@ -9599,6 +9625,10 @@ fn is_supported_direct_call_not_argument_shape(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Bool(_)) => true,
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+        }
         _ => false,
     }
 }
@@ -85836,6 +85866,8 @@ property "shared"() {}
             "    let propagated = copied_error + 1\n",
             "    let inferred_call = identity(self.naem)\n",
             "    let annotated_call: I32 = identity(self.naem)\n",
+            "    let inferred_not_call = identity_bool(not self.naem)\n",
+            "    let annotated_not_call: Bool = identity_bool(not self.naem)\n",
             "    let inferred_not = not self.naem\n",
             "    let annotated_not: Bool = not self.naem\n",
             "    let name = self.name\n",
@@ -85843,6 +85875,7 @@ property "shared"() {}
             "  }\n",
             "}\n",
             "pub fn identity(value: I32) -> I32 { value }\n",
+            "pub fn identity_bool(value: Bool) -> Bool { value }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -85887,7 +85920,7 @@ property "shared"() {}
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
             panic!("a direct unknown self-field initializer should be checked: {check:#?}");
         };
-        assert_eq!(diagnostics.len(), 6, "{diagnostics:#?}");
+        assert_eq!(diagnostics.len(), 8, "{diagnostics:#?}");
         assert!(
             diagnostics
                 .iter()
@@ -85929,6 +85962,7 @@ property "shared"() {}
             "copied_error",
             "propagated",
             "inferred_call",
+            "inferred_not_call",
             "inferred_not",
         ] {
             assert_eq!(
@@ -85991,6 +86025,18 @@ property "shared"() {}
                 .canonical_binding_type(binding_named("annotated_call"))
                 .is_some(),
             "the explicit call-result annotation keeps its canonical fact"
+        );
+        assert_eq!(
+            type_results.binding_type(binding_named("annotated_not_call")),
+            Some(sai_resolve::prelude::PrimTy::Bool),
+            "an explicit Bool annotation remains authoritative for a tainted logical-not call"
+        );
+        assert!(
+            type_results
+                .partial_results()
+                .canonical_binding_type(binding_named("annotated_not_call"))
+                .is_some(),
+            "the explicit logical-not call annotation keeps its canonical fact"
         );
         assert_eq!(
             type_results.binding_type(binding_named("annotated_not")),
