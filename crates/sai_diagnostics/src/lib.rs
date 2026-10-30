@@ -2815,7 +2815,7 @@ mod tests {
         let columns = row.split('|').map(str::trim).collect::<Vec<_>>();
         let record = explain_diagnostic(Code::TypeMismatch).expect("authored explanation");
 
-        assert_eq!(EXPLAIN_DIAGNOSTICS.len(), 4);
+        assert_eq!(EXPLAIN_DIAGNOSTICS.len(), 5);
         assert_eq!(record.code, Code::TypeMismatch);
         assert_eq!(record.class, DiagnosticCodeClass::Hard);
         assert_eq!(record.severity, Some(Severity::Error));
@@ -2894,7 +2894,7 @@ mod tests {
         let columns = row.split('|').map(str::trim).collect::<Vec<_>>();
         let record = explain_diagnostic(Code::InvalidEscape).expect("authored explanation");
 
-        assert_eq!(EXPLAIN_DIAGNOSTICS.len(), 4);
+        assert_eq!(EXPLAIN_DIAGNOSTICS.len(), 5);
         assert_eq!(record.code, Code::InvalidEscape);
         assert_eq!(record.class, DiagnosticCodeClass::Hard);
         assert_eq!(record.severity, Some(Severity::Error));
@@ -2945,7 +2945,7 @@ mod tests {
         let columns = row.split('|').map(str::trim).collect::<Vec<_>>();
         let record = explain_diagnostic(Code::LiteralOutOfRange).expect("authored explanation");
 
-        assert_eq!(EXPLAIN_DIAGNOSTICS.len(), 4);
+        assert_eq!(EXPLAIN_DIAGNOSTICS.len(), 5);
         assert_eq!(record.code, Code::LiteralOutOfRange);
         assert_eq!(record.class, DiagnosticCodeClass::Hard);
         assert_eq!(record.severity, Some(Severity::Error));
@@ -2975,6 +2975,41 @@ mod tests {
                 .expect("existing Stage 1 record")
                 .markdown,
             include_str!("explanations/type_mismatch.md")
+        );
+    }
+
+    #[test]
+    fn authored_malformed_number_explanation_matches_its_appendix_a_entry() {
+        let appendix_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/spec/appendix-a-diagnostic-codes.md");
+        let Ok(appendix) = std::fs::read_to_string(appendix_path) else {
+            return;
+        };
+        let row = appendix
+            .lines()
+            .find(|line| line.contains("| `MALFORMED_NUMBER` |"))
+            .expect("Appendix A contains MALFORMED_NUMBER");
+        let columns = row.split('|').map(str::trim).collect::<Vec<_>>();
+        let record = explain_diagnostic(Code::MalformedNumber).expect("authored explanation");
+
+        assert_eq!(EXPLAIN_DIAGNOSTICS.len(), 5);
+        assert_eq!(record.code, Code::MalformedNumber);
+        assert_eq!(record.class, DiagnosticCodeClass::Hard);
+        assert_eq!(record.severity, Some(Severity::Error));
+        assert_eq!(record.default_level, None);
+        assert_eq!(record.stage, 0);
+        assert_eq!(record.owner, "spec/02-lexical-structure.md");
+        assert_eq!(record.since, "0.1.0");
+        assert_eq!(record.status, DiagnosticCodeStatus::Active);
+        assert!(record.superseded_by.is_empty());
+        assert_eq!(columns[1], "`MALFORMED_NUMBER`");
+        assert_eq!(columns[2], "error");
+        assert_eq!(columns[3], "[02](02-lexical-structure.md)");
+        assert_eq!(columns[4], record.summary);
+        assert_eq!(record.summary, "Malformed numeric literal");
+        assert_eq!(
+            record.markdown,
+            include_str!("explanations/malformed_number.md")
         );
     }
 

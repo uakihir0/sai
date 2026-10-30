@@ -21952,7 +21952,7 @@ mod tests {
     #[test]
     fn explain_keeps_every_other_registered_code_gated() {
         for entry in EXPLAIN_CODE_SUMMARIES {
-            if entry.code == sai_diagnostics::Code::TypeMismatch {
+            if sai_diagnostics::explain_diagnostic(entry.code).is_some() {
                 continue;
             }
             let code = entry.code.as_str();

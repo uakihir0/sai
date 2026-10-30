@@ -18,6 +18,9 @@ const INVALID_ESCAPE_SUMMARY: &str = "Invalid escape sequence";
 const LITERAL_OUT_OF_RANGE_MARKDOWN: &str =
     include_str!("../../sai_diagnostics/src/explanations/literal_out_of_range.md");
 const LITERAL_OUT_OF_RANGE_SUMMARY: &str = "Literal out of range for its type";
+const MALFORMED_NUMBER_MARKDOWN: &str =
+    include_str!("../../sai_diagnostics/src/explanations/malformed_number.md");
+const MALFORMED_NUMBER_SUMMARY: &str = "Malformed numeric literal";
 
 struct TestDirectory(PathBuf);
 
@@ -655,6 +658,150 @@ fn literal_out_of_range_explanation_example_is_exact_and_fix_is_clean_and_canoni
 }
 
 #[test]
+fn explain_malformed_number_prints_the_exact_marked_record() {
+    let output = run_explain(&["explain", "MALFORMED_NUMBER"]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(stdout, MALFORMED_NUMBER_MARKDOWN);
+}
+
+#[test]
+fn explain_malformed_number_serializes_the_exact_json_record() {
+    let output = run_explain(&["--format=json", "explain", "MALFORMED_NUMBER"]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expected_result = format!(
+        concat!(
+            "{{\"type\":\"result\",\"kind\":\"explain\",\"data\":{{",
+            "\"code\":\"MALFORMED_NUMBER\",\"class\":\"hard\",\"severity\":\"error\",",
+            "\"default_level\":null,\"stage\":0,\"owner\":\"spec/02-lexical-structure.md\",",
+            "\"since\":\"0.1.0\",\"status\":\"active\",\"superseded_by\":null,",
+            "\"summary\":{},\"markdown\":{}",
+            "}}}}"
+        ),
+        json_string(MALFORMED_NUMBER_SUMMARY),
+        json_string(MALFORMED_NUMBER_MARKDOWN),
+    );
+    let expected = format!(
+        concat!(
+            "{{\"type\":\"header\",\"format\":\"sai-diagnostics\",\"version\":1,",
+            "\"tool\":{{\"name\":\"sai\",\"version\":\"{}\"}},",
+            "\"command\":\"explain\",\"root\":null}}\n",
+            "{}\n",
+            "{{\"type\":\"summary\",\"errors\":0,\"warnings\":0,\"infos\":0,",
+            "\"shown_errors\":0,\"suppressed\":{{\"cascade\":0,\"duplicate\":0,",
+            "\"dependency\":0}},\"exit_code\":0}}\n"
+        ),
+        env!("CARGO_PKG_VERSION"),
+        expected_result,
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(stdout, expected);
+}
+
+#[test]
+fn malformed_number_explanation_refuses_and_fix_is_clean_and_canonical() {
+    let (example, info) = source_block_with_info(MALFORMED_NUMBER_MARKDOWN, "Example");
+    assert_eq!(info, "sai noncanonical");
+    let fix = source_block(MALFORMED_NUMBER_MARKDOWN, "Fix");
+
+    let rejected = run_check(&example);
+    let rejected_stdout = String::from_utf8(rejected.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(rejected.status.code(), Some(1), "{rejected_stdout}");
+    assert!(rejected.stderr.is_empty());
+    assert_eq!(
+        rejected_stdout
+            .matches("\"code\":\"MALFORMED_NUMBER\"")
+            .count(),
+        1,
+        "{rejected_stdout}"
+    );
+    let check_diagnostic = rejected_stdout
+        .lines()
+        .find(|line| line.contains("\"code\":\"MALFORMED_NUMBER\""))
+        .expect("check reports the expected code");
+    assert!(check_diagnostic.contains("\"severity\":\"error\""));
+    assert!(check_diagnostic.contains("\"path\":\"src/lib.sai\""));
+    assert!(check_diagnostic.contains("\"line\":1"));
+    assert!(check_diagnostic.contains("\"message\":\"malformed numeric literal\""));
+    for diagnostic in rejected_stdout
+        .lines()
+        .filter(|line| line.contains("\"type\":\"diagnostic\""))
+    {
+        assert!(
+            diagnostic.contains("\"code\":\"MALFORMED_NUMBER\"")
+                || diagnostic.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "unexpected check diagnostic:\n{diagnostic}"
+        );
+    }
+
+    let refused = run_fmt(&example);
+    let refused_stdout = String::from_utf8(refused.stdout).expect("formatter stdout is UTF-8");
+    assert_eq!(refused.status.code(), Some(1), "{refused_stdout}");
+    assert!(refused.stderr.is_empty());
+    assert_eq!(refused_stdout.matches("\"type\":\"result\"").count(), 1);
+    assert!(
+        refused_stdout.contains("\"check\":false"),
+        "{refused_stdout}"
+    );
+    assert!(refused_stdout.contains("\"files\":1"), "{refused_stdout}");
+    assert!(
+        refused_stdout.contains("\"changed\":[]"),
+        "{refused_stdout}"
+    );
+    assert!(
+        refused_stdout.contains("\"refused\":[\"<stdin>\"]"),
+        "{refused_stdout}"
+    );
+    assert!(
+        refused_stdout.contains("\"output\":null"),
+        "{refused_stdout}"
+    );
+    assert_eq!(
+        refused_stdout.matches("\"type\":\"diagnostic\"").count(),
+        1,
+        "{refused_stdout}"
+    );
+    let formatter_diagnostic = refused_stdout
+        .lines()
+        .find(|line| line.contains("\"code\":\"MALFORMED_NUMBER\""))
+        .expect("formatter reports the expected refusal code");
+    assert!(formatter_diagnostic.contains("\"severity\":\"error\""));
+    assert!(formatter_diagnostic.contains("\"path\":\"<stdin>\""));
+    assert!(formatter_diagnostic.contains("\"line\":1"));
+    assert!(!refused_stdout.contains("\"code\":\"UNFORMATTED_FILE\""));
+    assert!(!refused_stdout.contains("pub const VALUE"));
+    let summary = refused_stdout
+        .lines()
+        .find(|line| line.contains("\"type\":\"summary\""))
+        .expect("formatter emits one summary record");
+    assert!(summary.contains("\"exit_code\":1"), "{summary}");
+
+    let accepted = run_check(&fix);
+    let accepted_stdout = String::from_utf8(accepted.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(accepted.status.code(), Some(0), "{accepted_stdout}");
+    assert!(accepted.stderr.is_empty());
+    assert!(
+        accepted_stdout.contains("\"kind\":\"check\""),
+        "{accepted_stdout}"
+    );
+    assert!(!accepted_stdout.contains("\"type\":\"diagnostic\""));
+
+    let formatted = run_fmt_check(&fix);
+    let formatted_stdout = String::from_utf8(formatted.stdout).expect("formatter stdout is UTF-8");
+    assert_eq!(formatted.status.code(), Some(0), "{formatted_stdout}");
+    assert!(formatted.stderr.is_empty());
+    assert!(
+        formatted_stdout.contains("\"refused\":[]"),
+        "{formatted_stdout}"
+    );
+    assert!(!formatted_stdout.contains("\"code\":\"UNFORMATTED_FILE\""));
+}
+
+#[test]
 fn explain_keeps_other_individual_codes_gated_and_preserves_list() {
     let gated = run_explain(&["--format=json", "explain", "UNKNOWN_FIELD"]);
     let gated_stdout = String::from_utf8(gated.stdout).expect("CLI stdout is UTF-8");
@@ -696,6 +843,19 @@ fn explain_keeps_other_individual_codes_gated_and_preserves_list() {
         .expect("list contains the following literal-range code");
     assert!(
         previous_literal_code < literal_out_of_range && literal_out_of_range < next_literal_code
+    );
+    let preceding_malformed_number = list_stdout
+        .find("\"code\":\"MALFORMED_MULTILINE_STRING\"")
+        .expect("list contains the preceding malformed-number code");
+    let malformed_number_list_entry = "{\"code\":\"MALFORMED_NUMBER\",\"class\":\"hard\",\"summary\":\"Malformed numeric literal\"}";
+    let malformed_number = list_stdout
+        .find(malformed_number_list_entry)
+        .expect("list contains the exact MALFORMED_NUMBER entry");
+    let next_malformed_number = list_stdout
+        .find("\"code\":\"MALFORMED_PACKAGE_PATH\"")
+        .expect("list contains the following malformed-number code");
+    assert!(
+        preceding_malformed_number < malformed_number && malformed_number < next_malformed_number
     );
     assert!(list_stdout.contains("\"code\":\"TYPE_MISMATCH\",\"class\":\"hard\""));
     assert_eq!(list_stdout.matches("\"code\":").count(), 494);
