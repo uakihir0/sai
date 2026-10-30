@@ -3308,6 +3308,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 {
                     Ok(())
                 }
+                ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand)
+                    if matches!(operand.kind, ExprKind::Field { .. })
+                        && self
+                            .input
+                            .unknown_self_fields
+                            .is_some_and(|fields| fields.contains(&operand.hir_id)) =>
+                {
+                    Ok(())
+                }
                 ExprKind::Unary(UnOp::BitNot, operand)
                     if matches!(operand.kind, ExprKind::Path(_))
                         && self.check_local_path(operand).is_ok_and(|local_type| {

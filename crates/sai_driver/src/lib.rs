@@ -8199,21 +8199,20 @@ fn check_inherent_method_body_type(
             ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand)
                 if matches!(operand.kind, ExprKind::Field { .. }) =>
             {
-                if !matches!(
-                    primitive_self_field_type(operand, &field_types.fields, symbols),
-                    Some(Ok(_))
-                ) || !collect_inherent_method_self_field(
-                    method_owner.id,
-                    operand,
-                    true,
-                    &field_types,
-                    &mut self_field_projections,
-                    &mut unknown_self_fields,
-                    &mut diagnostics,
-                    symbols,
-                    inputs,
-                    snapshot,
-                )? {
+                if primitive_self_field_type(operand, &field_types.fields, symbols).is_none()
+                    || !collect_inherent_method_self_field(
+                        method_owner.id,
+                        operand,
+                        true,
+                        &field_types,
+                        &mut self_field_projections,
+                        &mut unknown_self_fields,
+                        &mut diagnostics,
+                        symbols,
+                        inputs,
+                        snapshot,
+                    )?
+                {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
             }
@@ -9152,6 +9151,9 @@ fn check_function_body_primitive_local_block(
                 ExprKind::Field { .. }
                     if self_field_projections
                         .is_some_and(|fields| fields.contains_key(&operand.hir_id)) => {}
+                ExprKind::Field { .. }
+                    if unknown_self_fields
+                        .is_some_and(|fields| fields.contains(&operand.hir_id)) => {}
                 _ => return Ok(None),
             },
             ExprKind::Unary(UnOp::BitNot, operand) => {
@@ -9172,6 +9174,9 @@ fn check_function_body_primitive_local_block(
                         ExprKind::Field { .. }
                             if self_field_projections
                                 .is_some_and(|fields| fields.contains_key(&operand.hir_id)) => {}
+                        ExprKind::Field { .. }
+                            if unknown_self_fields
+                                .is_some_and(|fields| fields.contains(&operand.hir_id)) => {}
                         _ => return Ok(None),
                     }
                 }
@@ -85936,6 +85941,10 @@ property "shared"() {}
             "    let annotated_not_call: Bool = identity_bool(not self.naem)\n",
             "    let inferred_not = not self.naem\n",
             "    let annotated_not: Bool = not self.naem\n",
+            "    let inferred_neg = -self.naem\n",
+            "    let annotated_neg: I32 = -self.naem\n",
+            "    let inferred_bitnot = ~self.naem\n",
+            "    let annotated_bitnot: I32 = ~self.naem\n",
             "    let name = self.name\n",
             "    name\n",
             "  }\n",
@@ -85986,7 +85995,7 @@ property "shared"() {}
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
             panic!("a direct unknown self-field initializer should be checked: {check:#?}");
         };
-        assert_eq!(diagnostics.len(), 8, "{diagnostics:#?}");
+        assert_eq!(diagnostics.len(), 12, "{diagnostics:#?}");
         assert!(
             diagnostics
                 .iter()
@@ -85998,6 +86007,37 @@ property "shared"() {}
             .expect("unknown-field errors keep the partial projection")
             .expect("the method body publishes trustworthy independent results");
         assert_primitive_type_result_parity(&database, type_results);
+        let expression_types = type_results
+            .expression_types()
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expression_types.len(),
+            3,
+            "independent literal, known-field initializer, and local-tail facts remain, while tainted unary results are omitted: {expression_types:?}"
+        );
+        assert!(
+            expression_types
+                .iter()
+                .filter(|ty| **ty == sai_resolve::prelude::PrimTy::I32)
+                .count()
+                == 2
+                && expression_types
+                    .iter()
+                    .filter(|ty| **ty == sai_resolve::prelude::PrimTy::I64)
+                    .count()
+                    == 1,
+            "the independent I32 and I64 expression facts remain"
+        );
+        assert_eq!(
+            type_results
+                .partial_results()
+                .canonical_expression_types()
+                .len(),
+            3,
+            "unknown-field operands and their unary results do not gain canonical expression facts"
+        );
         let local_resolution = method
             .local_resolution()
             .expect("method locals remain available");
@@ -86030,6 +86070,8 @@ property "shared"() {}
             "inferred_call",
             "inferred_not_call",
             "inferred_not",
+            "inferred_neg",
+            "inferred_bitnot",
         ] {
             assert_eq!(
                 type_results.binding_type(binding_named(name)),
@@ -86116,6 +86158,20 @@ property "shared"() {}
                 .is_some(),
             "the explicit logical-not result annotation keeps its canonical fact"
         );
+        for name in ["annotated_neg", "annotated_bitnot"] {
+            assert_eq!(
+                type_results.binding_type(binding_named(name)),
+                Some(sai_resolve::prelude::PrimTy::I32),
+                "an explicit annotation remains authoritative for an error-tainted unary result: {name}"
+            );
+            assert!(
+                type_results
+                    .partial_results()
+                    .canonical_binding_type(binding_named(name))
+                    .is_some(),
+                "the explicit unary result annotation keeps its canonical fact: {name}"
+            );
+        }
     }
 
     #[test]
