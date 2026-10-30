@@ -2111,7 +2111,17 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
     let Some(fields) = struct_def.fields() else {
         return false;
     };
-    if items.next().is_some()
+    let trailing_functions_supported = items.all(|item| {
+        matches!(
+            item,
+            sai_syntax::ast::Item::Function(function)
+                if function.attrs().next().is_none()
+                    && function
+                        .visibility()
+                        .is_some_and(|visibility| visibility.pub_token().is_some())
+        )
+    });
+    if !trailing_functions_supported
         || type_decl.attrs().next().is_some()
         || type_decl
             .syntax()
@@ -2629,14 +2639,35 @@ fn check_body_matches_unused_variable_gate(source: &[u8]) -> Option<bool> {
 
     let parsed = sai_fmt::parse_source(source).ok()?;
     let source_file = ast::SourceFile::cast(parsed.root().clone())?;
-    let mut functions = source_file
-        .syntax()
-        .descendants()
-        .filter_map(ast::FnDecl::cast);
-    let function = functions.next()?;
-    if functions.next().is_some() {
-        return None;
-    }
+    let impls = source_file
+        .items()
+        .filter_map(|item| match item {
+            ast::Item::Impl(impl_decl) => Some(impl_decl),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let function = if impls.is_empty() {
+        let mut functions = source_file
+            .syntax()
+            .descendants()
+            .filter_map(ast::FnDecl::cast);
+        let function = functions.next()?;
+        if functions.next().is_some() {
+            return None;
+        }
+        function
+    } else {
+        if impls.len() != 1 {
+            return None;
+        }
+        let impl_items = impls[0].items()?;
+        let mut functions = impl_items.functions();
+        let function = functions.next()?;
+        if functions.next().is_some() {
+            return None;
+        }
+        function
+    };
     check_function_body_matches_unused_variable_gate(function)
 }
 
@@ -2740,11 +2771,11 @@ fn check_public_inherent_method_body_coverage(
     source_is_candidate: bool,
     scopes: &sai_driver::Phase1PackageScopes,
     method_resolutions: &sai_driver::TraitImplMemberTestOnlyResolutions,
+    function_resolutions: Option<&sai_driver::FunctionOwnerResolutions>,
 ) -> bool {
     if !source_is_candidate
         || scopes.modules.len() != 1
         || !scopes.modules[0].imports.is_empty()
-        || scopes.top_level_owners.len() != 2
         || method_resolutions.owners().len() != 1
         || scopes
             .top_level_owners
@@ -2761,7 +2792,9 @@ fn check_public_inherent_method_body_coverage(
         || scopes.top_level_owners.iter().any(|owner| {
             !matches!(
                 owner.kind,
-                sai_driver::TopLevelOwnerKind::Struct | sai_driver::TopLevelOwnerKind::Impl
+                sai_driver::TopLevelOwnerKind::Struct
+                    | sai_driver::TopLevelOwnerKind::Impl
+                    | sai_driver::TopLevelOwnerKind::Function
             )
         })
     {
@@ -2778,7 +2811,41 @@ fn check_public_inherent_method_body_coverage(
     }
 
     let method = &impl_owner.members()[0];
-    method.parent_owner() == impl_owner.owner()
+    let function_descriptors = scopes
+        .top_level_owners
+        .iter()
+        .filter(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Function)
+        .map(|owner| owner.owner)
+        .collect::<HashSet<_>>();
+    let functions_are_covered = if function_descriptors.is_empty() {
+        function_resolutions.is_none_or(|resolutions| resolutions.owners().is_empty())
+    } else {
+        function_resolutions.is_some_and(|resolutions| {
+            if resolutions.owners().len() != function_descriptors.len() {
+                return false;
+            }
+            let mut owner_ids = function_descriptors.clone();
+            for owner in resolutions.owners() {
+                if !owner_ids.remove(&owner.owner())
+                    || !owner
+                        .body_type_check()
+                        .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
+                    || !owner.local_resolution().is_ok_and(|locals| {
+                        locals.is_some_and(|locals| locals.diagnostics.is_empty())
+                    })
+                    || !owner
+                        .resolution()
+                        .is_ok_and(|resolution| resolution.diagnostics.is_empty())
+                    || !owner.lowering_diagnostics().is_empty()
+                {
+                    return false;
+                }
+            }
+            owner_ids.is_empty()
+        })
+    };
+    functions_are_covered
+        && method.parent_owner() == impl_owner.owner()
         && method.kind() == sai_driver::TraitImplMemberKind::ImplMethod
         && method
             .body_type_check()
@@ -7176,22 +7243,29 @@ fn module_tree_workspace_check_diagnostics(
                         .top_level_owners
                         .iter()
                         .any(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Function);
-                let function_resolutions =
-                    if root_public_function_set_source_candidate || has_local_enum_and_function {
-                        Some(
-                            database
-                                .resolve_function_owner_analyses(
-                                    &collection,
-                                    module_tree,
-                                    &workspace_snapshot,
-                                )
-                                .map_err(|error| {
-                                    format!("function owner analysis failed: {error:?}")
-                                })?,
-                        )
-                    } else {
-                        None
-                    };
+                let has_inherent_method_helpers = root_single_inherent_method_source_candidate
+                    && scopes
+                        .top_level_owners
+                        .iter()
+                        .any(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Function);
+                let function_resolutions = if root_public_function_set_source_candidate
+                    || has_local_enum_and_function
+                    || has_inherent_method_helpers
+                {
+                    Some(
+                        database
+                            .resolve_function_owner_analyses(
+                                &collection,
+                                module_tree,
+                                &workspace_snapshot,
+                            )
+                            .map_err(|error| {
+                                format!("function owner analysis failed: {error:?}")
+                            })?,
+                    )
+                } else {
+                    None
+                };
                 if let Some(function_resolutions) = &function_resolutions
                     && has_local_enum_and_function
                 {
@@ -7232,7 +7306,7 @@ fn module_tree_workspace_check_diagnostics(
                     infos = infos.saturating_add(enum_call_infos);
                 }
 
-                if root_public_function_set_source_candidate
+                if (root_public_function_set_source_candidate || has_inherent_method_helpers)
                     && let Some(function_resolutions) = &function_resolutions
                 {
                     let mut body_diagnostics = Vec::new();
@@ -7368,6 +7442,7 @@ fn module_tree_workspace_check_diagnostics(
                             true,
                             collection.scopes(),
                             &method_resolutions,
+                            function_resolutions.as_ref(),
                         )
                     {
                         single_public_inherent_method_body_covered = true;

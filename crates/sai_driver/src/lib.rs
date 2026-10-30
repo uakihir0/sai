@@ -8022,6 +8022,7 @@ fn check_inherent_method_body_type(
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -8196,6 +8197,23 @@ fn check_inherent_method_body_type(
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
             }
+            ExprKind::Call { base: None, .. } => {
+                if !collect_inherent_method_direct_call_self_fields(
+                    method_owner.id,
+                    init,
+                    false,
+                    direct_call_signatures,
+                    &field_types,
+                    &mut self_field_projections,
+                    &mut unknown_self_fields,
+                    &mut diagnostics,
+                    symbols,
+                    inputs,
+                    snapshot,
+                )? {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+            }
             _ => {}
         }
     }
@@ -8269,6 +8287,23 @@ fn check_inherent_method_body_type(
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
             }
+            ExprKind::Call { base: None, .. } => {
+                if !collect_inherent_method_direct_call_self_fields(
+                    method_owner.id,
+                    tail,
+                    false,
+                    direct_call_signatures,
+                    &field_types,
+                    &mut self_field_projections,
+                    &mut unknown_self_fields,
+                    &mut diagnostics,
+                    symbols,
+                    inputs,
+                    snapshot,
+                )? {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+            }
             _ => {}
         }
     }
@@ -8287,7 +8322,7 @@ fn check_inherent_method_body_type(
         &explicit_body,
         locals,
         type_paths,
-        None,
+        direct_call_signatures,
         true,
         semantic_types,
         symbols,
@@ -8342,6 +8377,78 @@ fn collect_inherent_method_self_field(
     Ok(true)
 }
 
+fn collect_inherent_method_direct_call_self_fields(
+    owner: OwnerId,
+    expression: &HirExpr<'_>,
+    nested: bool,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    fields: &InherentMethodPrimitiveFields,
+    self_field_projections: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+    unknown_self_fields: &mut HashSet<HirId>,
+    diagnostics: &mut Vec<Diagnostic>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<bool, OwnerControlFlowResolutionError> {
+    let ExprKind::Call {
+        callee,
+        args,
+        base: None,
+    } = expression.kind
+    else {
+        return Ok(false);
+    };
+    let Some(signature) = direct_call_signatures
+        .and_then(|signatures| signatures.get(&expression.hir_id))
+        .filter(|signature| signature.callee == callee.hir_id)
+    else {
+        return Ok(false);
+    };
+
+    for argument in args.iter().take(signature.parameters.len()) {
+        match argument.expr.kind {
+            ExprKind::Field { .. } => {
+                if !matches!(
+                    primitive_self_field_type(argument.expr, &fields.fields, symbols),
+                    Some(Ok(_))
+                ) || !collect_inherent_method_self_field(
+                    owner,
+                    argument.expr,
+                    true,
+                    fields,
+                    self_field_projections,
+                    unknown_self_fields,
+                    diagnostics,
+                    symbols,
+                    inputs,
+                    snapshot,
+                )? {
+                    return Ok(false);
+                }
+            }
+            ExprKind::Call { base: None, .. } if !nested => {
+                if !collect_inherent_method_direct_call_self_fields(
+                    owner,
+                    argument.expr,
+                    true,
+                    direct_call_signatures,
+                    fields,
+                    self_field_projections,
+                    unknown_self_fields,
+                    diagnostics,
+                    symbols,
+                    inputs,
+                    snapshot,
+                )? {
+                    return Ok(false);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
 fn inherent_method_primitive_field_types(
     self_ty: Ty<'_>,
     symbols: &Interner,
@@ -8377,13 +8484,23 @@ fn inherent_method_primitive_field_types(
     let Some(ast::Item::Impl(impl_decl)) = items.next() else {
         return None;
     };
+    let trailing_functions_supported = items.all(|item| {
+        matches!(
+            item,
+            ast::Item::Function(function)
+                if function.attrs().next().is_none()
+                    && function
+                        .visibility()
+                        .is_some_and(|visibility| visibility.pub_token().is_some())
+        )
+    });
     let type_name_node = type_decl.name()?;
     let type_name = type_name_node.token()?.text().to_owned();
     let type_name_span =
         sai_diagnostics::Span::new(inputs.source.id(), type_name_node.syntax().text_range());
     let struct_def = type_decl.struct_def()?;
     let fields = struct_def.fields()?;
-    if items.next().is_some()
+    if !trailing_functions_supported
         || type_decl.attrs().next().is_some()
         || type_decl
             .syntax()
@@ -8881,6 +8998,7 @@ fn check_function_body_primitive_local_block(
                                 locals,
                                 inputs,
                                 direct_call_signatures,
+                                self_field_projections,
                             )
                         })
                 }) => {}
@@ -9098,6 +9216,7 @@ fn check_function_body_primitive_local_block(
                     locals,
                     inputs,
                     direct_call_signatures,
+                    self_field_projections,
                 )
             })
         {
@@ -9206,11 +9325,15 @@ fn is_supported_direct_call_argument_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     match expression.kind {
         ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&expression.hir_id))
+        }
         ExprKind::Unary(UnOp::Not, _) => is_supported_direct_call_not_argument_shape(
             expression,
             preceding_bindings,
@@ -9304,6 +9427,7 @@ fn is_supported_direct_call_argument_shape(
                         preceding_bindings,
                         locals,
                         inputs,
+                        self_field_projections,
                     )
                 })
         }
@@ -9316,8 +9440,12 @@ fn is_supported_direct_call_arithmetic_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     match expression.kind {
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&expression.hir_id))
+        }
         ExprKind::Binary(BinOp::Rem, left, right) => {
             is_supported_direct_call_remainder_argument_shape(
                 left,
@@ -30672,6 +30800,13 @@ impl RootDatabase {
             })
             .collect::<Vec<_>>();
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let primitive_function_call_signatures = self.index_direct_primitive_function_signatures(
+            collection,
+            snapshot,
+            &top_level_owner_index,
+            &module_members,
+            source_graph_packages,
+        );
         let mut owners = Vec::with_capacity(descriptors.len());
 
         for descriptor in descriptors {
@@ -30935,6 +31070,18 @@ impl RootDatabase {
                                     let resolved_type_paths = type_path_resolution
                                         .as_ref()
                                         .and_then(|result| result.as_ref().ok());
+                                    let mut module = resolve_owner_module_paths(
+                                        &locals,
+                                        module_scope,
+                                        &generic_parameters,
+                                    );
+                                    let direct_call_signatures = direct_primitive_call_sites(
+                                        body,
+                                        &module,
+                                        &primitive_function_call_signatures,
+                                        collection.module_tree.package,
+                                        &inputs,
+                                    );
                                     body_type_check = if descriptor.kind == TopLevelOwnerKind::Impl
                                     {
                                         check_inherent_method_body_type(
@@ -30943,6 +31090,7 @@ impl RootDatabase {
                                             body,
                                             &locals,
                                             resolved_type_paths,
+                                            Some(&direct_call_signatures),
                                             &self.semantic_types,
                                             &self.symbols,
                                             &inputs,
@@ -30953,11 +31101,6 @@ impl RootDatabase {
                                     } else {
                                         Ok(FunctionBodyTypeCheck::Unsupported)
                                     };
-                                    let mut module = resolve_owner_module_paths(
-                                        &locals,
-                                        module_scope,
-                                        &generic_parameters,
-                                    );
                                     match collect_test_only_reference_diagnostics(
                                         member_owner,
                                         &locals.deferred_paths,
