@@ -1,0 +1,9 @@
+//@ kind: fmt
+//@ stage: 0
+//@ spec: impl/14 §14.6.4, impl/14 §14.8.3, spec/03 §3.12
+fn steps(){
+first()
+
+
+second()
+}

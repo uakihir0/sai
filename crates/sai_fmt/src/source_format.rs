@@ -1501,6 +1501,16 @@ mod tests {
     }
 
     #[test]
+    fn preserves_one_blank_line_between_block_statements() {
+        let source = "fn steps(){\nfirst()\n\n\nsecond()\n}";
+        let expected = "fn steps() {\n    first()\n\n    second()\n}\n";
+
+        let formatted = format_source(source.as_bytes()).expect("statement gap formats");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
     fn formats_comments_at_block_statement_boundaries() {
         let source = concat!(
             "fn work() {\n",
