@@ -8327,21 +8327,20 @@ fn check_inherent_method_body_type(
             ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand)
                 if matches!(operand.kind, ExprKind::Field { .. }) =>
             {
-                if !matches!(
-                    primitive_self_field_type(operand, &field_types.fields, symbols),
-                    Some(Ok(_))
-                ) || !collect_inherent_method_self_field(
-                    method_owner.id,
-                    operand,
-                    true,
-                    &field_types,
-                    &mut self_field_projections,
-                    &mut unknown_self_fields,
-                    &mut diagnostics,
-                    symbols,
-                    inputs,
-                    snapshot,
-                )? {
+                if primitive_self_field_type(operand, &field_types.fields, symbols).is_none()
+                    || !collect_inherent_method_self_field(
+                        method_owner.id,
+                        operand,
+                        true,
+                        &field_types,
+                        &mut self_field_projections,
+                        &mut unknown_self_fields,
+                        &mut diagnostics,
+                        symbols,
+                        inputs,
+                        snapshot,
+                    )?
+                {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
             }
@@ -8958,6 +8957,7 @@ fn check_function_body_primitive_local_block(
             if matches!(operand.kind, ExprKind::Field { .. }) =>
         {
             self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
         }
         _ => false,
     };
@@ -86170,6 +86170,81 @@ property "shared"() {}
                     .canonical_binding_type(binding_named(name))
                     .is_some(),
                 "the explicit unary result annotation keeps its canonical fact: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherent_method_unary_tails_recover_unknown_fields_without_tainted_facts() {
+        let cases = [
+            (
+                "negation",
+                concat!(
+                    "type User { name: I32 }\n",
+                    "impl User {\n",
+                    "  pub fn recover(self: borrow Self) -> Bool {\n",
+                    "    -self.naem\n",
+                    "  }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "bitwise not",
+                concat!(
+                    "type User { name: I32 }\n",
+                    "impl User {\n",
+                    "  pub fn recover(self: borrow Self) -> Bool {\n",
+                    "    ~self.naem\n",
+                    "  }\n",
+                    "}\n",
+                ),
+            ),
+        ];
+
+        for (operator, root) in cases {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("single inherent method collects");
+            let results = database
+                .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+                .expect("associated owner analysis succeeds");
+            let method = &results.owners()[0].members()[0];
+            let check = method
+                .body_type_check()
+                .expect("method body check has an independent result");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!(
+                    "a direct unknown field under unary {operator} should be recovered: {check:#?}"
+                );
+            };
+            assert_eq!(diagnostics.len(), 1, "{operator}: {diagnostics:#?}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::UnknownField,
+                "{operator}: {diagnostics:#?}"
+            );
+            let type_results = method
+                .primitive_body_type_results()
+                .expect("method type results have no resolution error")
+                .expect("a supported unary tail keeps its partial projection");
+            assert_primitive_type_result_parity(&database, type_results);
+            assert!(
+                type_results.expression_types().is_empty(),
+                "{operator}: an unknown operand leaves the unary tail without a primitive type"
+            );
+            assert!(
+                type_results
+                    .partial_results()
+                    .canonical_expression_types()
+                    .is_empty(),
+                "{operator}: an unknown operand leaves the unary tail without a canonical type"
             );
         }
     }

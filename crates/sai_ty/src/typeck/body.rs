@@ -550,6 +550,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.input
                     .self_field_projections
                     .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                    || self
+                        .input
+                        .unknown_self_fields
+                        .is_some_and(|fields| fields.contains(&operand.hir_id))
             }
             _ => false,
         };
@@ -2457,6 +2461,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         && self.input.unknown_self_fields
                             .is_some_and(|fields| fields.contains(&operand.hir_id))
             );
+            let is_supported_unknown_neg_or_bitnot_field = matches!(
+                expression.kind,
+                ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand)
+                    if matches!(operand.kind, ExprKind::Field { .. })
+                        && self
+                            .input
+                            .unknown_self_fields
+                            .is_some_and(|fields| fields.contains(&operand.hir_id))
+            );
             let is_supported_unknown_bool_comparison_field_tail = match expression.kind {
                 ExprKind::Binary(
                     BinOp::And
@@ -2485,6 +2498,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             };
             if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. })
                 && !is_supported_unknown_not_field
+                && !is_supported_unknown_neg_or_bitnot_field
                 && !is_supported_unknown_bool_comparison_field_tail
             {
                 return Err(());
