@@ -2815,7 +2815,7 @@ mod tests {
         let columns = row.split('|').map(str::trim).collect::<Vec<_>>();
         let record = explain_diagnostic(Code::TypeMismatch).expect("authored explanation");
 
-        assert_eq!(EXPLAIN_DIAGNOSTICS.len(), 1);
+        assert_eq!(EXPLAIN_DIAGNOSTICS.len(), 2);
         assert_eq!(record.code, Code::TypeMismatch);
         assert_eq!(record.class, DiagnosticCodeClass::Hard);
         assert_eq!(record.severity, Some(Severity::Error));
@@ -2840,6 +2840,43 @@ mod tests {
         assert!(
             explain_diagnostic(Code::UnknownField).is_none(),
             "other individual explanations remain gated"
+        );
+    }
+
+    #[test]
+    fn authored_duplicate_binding_explanation_matches_its_appendix_a_entry() {
+        let appendix_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/spec/appendix-a-diagnostic-codes.md");
+        let Ok(appendix) = std::fs::read_to_string(appendix_path) else {
+            return;
+        };
+        let row = appendix
+            .lines()
+            .find(|line| line.contains("| `DUPLICATE_BINDING` |"))
+            .expect("Appendix A contains DUPLICATE_BINDING");
+        let columns = row.split('|').map(str::trim).collect::<Vec<_>>();
+        let record = explain_diagnostic(Code::DuplicateBinding).expect("authored explanation");
+
+        assert_eq!(record.code, Code::DuplicateBinding);
+        assert_eq!(record.class, DiagnosticCodeClass::Hard);
+        assert_eq!(record.severity, Some(Severity::Error));
+        assert_eq!(record.default_level, None);
+        assert_eq!(record.stage, 0);
+        assert_eq!(record.owner, "spec/04-modules-and-names.md");
+        assert_eq!(record.since, "0.1.0");
+        assert_eq!(record.status, DiagnosticCodeStatus::Active);
+        assert!(record.superseded_by.is_empty());
+        assert_eq!(columns[1], "`DUPLICATE_BINDING`");
+        assert_eq!(columns[2], "error");
+        assert_eq!(columns[3], "[04](04-modules-and-names.md)");
+        assert_eq!(columns[4], record.summary);
+        assert_eq!(
+            record.summary,
+            "Two bindings of one name in one scope: module scope, block, parameter list, generic parameter list, pattern, interface (§4.4.3, D-MOD-03, N-A-8)"
+        );
+        assert_eq!(
+            record.markdown,
+            include_str!("explanations/duplicate_binding.md")
         );
     }
 
