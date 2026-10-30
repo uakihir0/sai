@@ -557,12 +557,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             _ => false,
         };
+        let is_supported_unary_path_tail = match tail.kind {
+            ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand) => {
+                self.plain_local_path_binding(operand).is_some()
+            }
+            _ => false,
+        };
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
             && !is_supported_literal_tail
             && !is_supported_binary_tail
             && !is_supported_unary_field_tail
+            && !is_supported_unary_path_tail
         {
             return Err(());
         }
@@ -2560,6 +2567,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.check_local_initializer_bitwise_not_path(operand, expression.hir_id)?
                         .0
                 }
+                ExprKind::Unary(UnOp::Not, operand)
+                    if matches!(operand.kind, ExprKind::Path(_)) =>
+                {
+                    self.check_logical_not_local_path_tail(operand)?
+                }
+                ExprKind::Unary(UnOp::Neg, operand)
+                    if matches!(operand.kind, ExprKind::Path(_)) =>
+                {
+                    self.check_local_initializer_neg_path(operand, expression.hir_id)?
+                        .0
+                }
+                ExprKind::Unary(UnOp::BitNot, operand)
+                    if matches!(operand.kind, ExprKind::Path(_)) =>
+                {
+                    self.check_local_initializer_bitwise_not_path(operand, expression.hir_id)?
+                        .0
+                }
                 _ => self.check_local_path(expression)?,
             }
         };
@@ -3070,6 +3094,35 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             PrimitiveBoolOperandResult::Unsupported => return Err(()),
         }
         Ok(LocalType::Concrete(PrimTy::Bool))
+    }
+
+    fn check_logical_not_local_path_tail(
+        &mut self,
+        operand: &'hir Expr<'hir>,
+    ) -> Result<LocalType, ()> {
+        let binding = self.plain_local_path_binding(operand).ok_or(())?;
+        let local_type = self.check_local_path(operand)?;
+        if let LocalType::LiteralVariable(id) = local_type {
+            if self.trusted_bindings.contains(&binding) {
+                let unresolved_kind = self
+                    .literal_variables
+                    .get(id)
+                    .and_then(|variable| (variable.resolved.is_none()).then_some(variable.kind));
+                let default_type = match unresolved_kind {
+                    Some(PrimitiveLiteralKind::Integer) => Some(PrimTy::I64),
+                    Some(PrimitiveLiteralKind::FloatingPoint) => Some(PrimTy::F64),
+                    _ => None,
+                };
+                if let Some(default_type) = default_type {
+                    // Logical `not` cannot constrain a numeric literal variable
+                    // to Bool. Apply the usual default before reporting the
+                    // ordinary operand mismatch at this path. This also handles
+                    // literals shared by accepted computed local initializers.
+                    self.resolve_literal_variable(id, default_type)?;
+                }
+            }
+        }
+        self.check_logical_not(operand)
     }
 
     fn check_direct_call_logical_not(

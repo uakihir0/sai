@@ -7647,6 +7647,7 @@ fn check_function_body_type(
             type_paths,
             direct_call_signatures,
             false,
+            false,
             semantic_types,
             symbols,
             None,
@@ -8333,6 +8334,14 @@ fn check_inherent_method_body_type(
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
             }
+            ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand) => {
+                let ExprKind::Path(path) = operand.kind else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                if resolved_plain_local_path_binding(path, locals, inputs).is_none() {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+            }
             ExprKind::Call { base: None, .. } => {
                 if !collect_inherent_method_direct_call_self_fields(
                     method_owner.id,
@@ -8369,6 +8378,7 @@ fn check_inherent_method_body_type(
         locals,
         type_paths,
         direct_call_signatures,
+        true,
         true,
         semantic_types,
         symbols,
@@ -8860,6 +8870,7 @@ fn check_function_body_primitive_local_block(
     type_paths: Option<&TypeOwnerPathResolution>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
     allow_binary_tail: bool,
+    allow_unary_path_tail: bool,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
@@ -8949,6 +8960,17 @@ fn check_function_body_primitive_local_block(
         }
         _ => false,
     };
+    let unary_path_binding = match tail.kind {
+        ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand) => {
+            if let ExprKind::Path(path) = operand.kind {
+                resolved_plain_local_path_binding(path, locals, inputs)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let is_supported_unary_path_tail = allow_unary_path_tail && unary_path_binding.is_some();
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8966,6 +8988,11 @@ fn check_function_body_primitive_local_block(
         {
             None
         }
+        ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, _)
+            if is_supported_unary_path_tail =>
+        {
+            unary_path_binding
+        }
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
@@ -8974,6 +9001,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_literal_tail
         && !is_supported_binary_tail
         && !is_supported_unary_field_tail
+        && !is_supported_unary_path_tail
     {
         return Ok(None);
     }
@@ -86173,6 +86201,102 @@ property "shared"() {}
                     .canonical_binding_type(binding_named(name))
                     .is_some(),
                 "the explicit unary call annotation keeps its canonical fact: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherent_method_unary_local_path_tails_retain_primitive_facts() {
+        let cases = [
+            (
+                "logical not",
+                sai_resolve::prelude::PrimTy::Bool,
+                concat!(
+                    "type User { marker: I32 }\n",
+                    "impl User {\n",
+                    "  pub fn check(self: borrow Self, enabled: Bool) -> Bool {\n",
+                    "    let copy = enabled\n",
+                    "    not copy\n",
+                    "  }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "negation",
+                sai_resolve::prelude::PrimTy::I32,
+                concat!(
+                    "type User { marker: I32 }\n",
+                    "impl User {\n",
+                    "  pub fn check(self: borrow Self, amount: I32) -> I32 {\n",
+                    "    let copy = amount\n",
+                    "    -copy\n",
+                    "  }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "bitwise not",
+                sai_resolve::prelude::PrimTy::U8,
+                concat!(
+                    "type User { marker: I32 }\n",
+                    "impl User {\n",
+                    "  pub fn check(self: borrow Self, bits: U8) -> U8 {\n",
+                    "    let copy = bits\n",
+                    "    ~copy\n",
+                    "  }\n",
+                    "}\n",
+                ),
+            ),
+        ];
+
+        for (operator, expected_type, root) in cases {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("single inherent method collects");
+            let results = database
+                .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+                .expect("associated owner analysis succeeds");
+            let method = &results.owners()[0].members()[0];
+            let FunctionBodyTypeCheck::Supported { diagnostics } = method
+                .body_type_check()
+                .expect("method body check has an independent result")
+            else {
+                panic!("a local-path {operator} tail should be supported");
+            };
+            assert!(diagnostics.is_empty(), "{operator}: {diagnostics:#?}");
+            let type_results = method
+                .primitive_body_type_results()
+                .expect("method type results have no resolution error")
+                .expect("supported unary tails keep their partial type projection");
+            assert_primitive_type_result_parity(&database, type_results);
+            let expression_types = type_results
+                .expression_types()
+                .values()
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                expression_types.len(),
+                3,
+                "{operator}: {expression_types:?}"
+            );
+            assert!(
+                expression_types.iter().all(|found| *found == expected_type),
+                "{operator}: {expression_types:?}"
+            );
+            assert_eq!(
+                type_results
+                    .partial_results()
+                    .canonical_expression_types()
+                    .len(),
+                expression_types.len(),
+                "{operator}: every trusted path and unary result has a canonical fact"
             );
         }
     }
