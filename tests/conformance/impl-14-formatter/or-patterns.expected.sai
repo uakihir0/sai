@@ -1,0 +1,15 @@
+//@ kind: fmt
+//@ stage: 0
+//@ spec: impl/14 §14.10.1, spec/03 §3.13.5, spec/03 §3.14
+
+fn is_open(status: OrderStatus) -> Bool {
+    match status {
+        .Pending |
+            .Active |
+            .AwaitingPayment |
+            .AwaitingShipment |
+            .AwaitingConfirmation |
+            .PartiallyRefunded => true
+        .Disabled(..) | .Closed => false
+    }
+}
