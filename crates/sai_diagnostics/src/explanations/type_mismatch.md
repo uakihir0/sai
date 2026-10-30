@@ -17,8 +17,7 @@ SAI does not silently convert between distinct numeric types or between integers
 ## Example
 
 ```sai
-// rejected: TYPE_MISMATCH
-pub const COUNT: I32 = true
+pub const COUNT: I32 = true // rejected: TYPE_MISMATCH
 ```
 
 ## Fix
