@@ -12,6 +12,9 @@ const TYPE_MISMATCH_SUMMARY: &str = "Two types that must be equal, or a coercion
 const DUPLICATE_BINDING_MARKDOWN: &str =
     include_str!("../../sai_diagnostics/src/explanations/duplicate_binding.md");
 const DUPLICATE_BINDING_SUMMARY: &str = "Two bindings of one name in one scope: module scope, block, parameter list, generic parameter list, pattern, interface (§4.4.3, D-MOD-03, N-A-8)";
+const INVALID_ESCAPE_MARKDOWN: &str =
+    include_str!("../../sai_diagnostics/src/explanations/invalid_escape.md");
+const INVALID_ESCAPE_SUMMARY: &str = "Invalid escape sequence";
 
 struct TestDirectory(PathBuf);
 
@@ -73,21 +76,34 @@ fn run_build(source: &str) -> Output {
 }
 
 fn source_block(markdown: &str, section: &str) -> String {
+    let (source, info) = source_block_with_info(markdown, section);
+    assert_eq!(info, "sai", "{section} must use a canonical SAI fence");
+    source
+}
+
+fn source_block_with_info(markdown: &str, section: &str) -> (String, String) {
     let markdown = markdown.replace("\r\n", "\n");
     let heading = format!("## {section}\n");
     let section = markdown
         .split_once(&heading)
         .unwrap_or_else(|| panic!("missing {heading:?} section"))
         .1;
-    let fence = section
-        .strip_prefix("\n```sai\n")
-        .or_else(|| section.strip_prefix("```sai\n"))
-        .expect("section starts with a SAI code fence");
+    let section = section.strip_prefix('\n').unwrap_or(section);
+    let (fence_info, fence) = section
+        .split_once('\n')
+        .expect("section starts with a fenced code block");
+    let info = fence_info
+        .strip_prefix("```")
+        .expect("section starts with a fenced code block");
+    assert!(
+        matches!(info, "sai" | "sai noncanonical"),
+        "unsupported SAI fence info string {info:?}"
+    );
     let source = fence
         .split_once("\n```")
         .expect("SAI code fence is closed")
         .0;
-    format!("{source}\n")
+    (format!("{source}\n"), info.to_owned())
 }
 
 #[test]
@@ -134,6 +150,25 @@ fn run_fmt_check(source: &str) -> Output {
             "source",
             "-",
         ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start sai fmt subprocess");
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(source.as_bytes())
+        .expect("write SAI source to formatter");
+    child
+        .wait_with_output()
+        .expect("wait for sai fmt subprocess")
+}
+
+fn run_fmt(source: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .args(["--format=json", "fmt", "--stdin-kind", "source", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -220,6 +255,51 @@ fn explain_duplicate_binding_serializes_the_exact_json_record() {
         ),
         json_string(DUPLICATE_BINDING_SUMMARY),
         json_string(DUPLICATE_BINDING_MARKDOWN),
+    );
+    let expected = format!(
+        concat!(
+            "{{\"type\":\"header\",\"format\":\"sai-diagnostics\",\"version\":1,",
+            "\"tool\":{{\"name\":\"sai\",\"version\":\"{}\"}},",
+            "\"command\":\"explain\",\"root\":null}}\n",
+            "{}\n",
+            "{{\"type\":\"summary\",\"errors\":0,\"warnings\":0,\"infos\":0,",
+            "\"shown_errors\":0,\"suppressed\":{{\"cascade\":0,\"duplicate\":0,",
+            "\"dependency\":0}},\"exit_code\":0}}\n"
+        ),
+        env!("CARGO_PKG_VERSION"),
+        expected_result,
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(stdout, expected);
+}
+
+#[test]
+fn explain_invalid_escape_prints_the_exact_markdown_record() {
+    let output = run_explain(&["explain", "INVALID_ESCAPE"]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(stdout, INVALID_ESCAPE_MARKDOWN);
+}
+
+#[test]
+fn explain_invalid_escape_serializes_the_exact_json_record() {
+    let output = run_explain(&["--format=json", "explain", "INVALID_ESCAPE"]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expected_result = format!(
+        concat!(
+            "{{\"type\":\"result\",\"kind\":\"explain\",\"data\":{{",
+            "\"code\":\"INVALID_ESCAPE\",\"class\":\"hard\",\"severity\":\"error\",",
+            "\"default_level\":null,\"stage\":0,\"owner\":\"spec/02-lexical-structure.md\",",
+            "\"since\":\"0.1.0\",\"status\":\"active\",\"superseded_by\":null,",
+            "\"summary\":{},\"markdown\":{}",
+            "}}}}"
+        ),
+        json_string(INVALID_ESCAPE_SUMMARY),
+        json_string(INVALID_ESCAPE_MARKDOWN),
     );
     let expected = format!(
         concat!(
@@ -351,6 +431,114 @@ fn duplicate_binding_explanation_example_is_rejected_and_fix_is_clean() {
 }
 
 #[test]
+fn invalid_escape_explanation_example_refuses_and_fix_is_clean_and_canonical() {
+    let (example, info) = source_block_with_info(INVALID_ESCAPE_MARKDOWN, "Example");
+    assert_eq!(info, "sai noncanonical");
+    let fix = source_block(INVALID_ESCAPE_MARKDOWN, "Fix");
+
+    let rejected = run_check(&example);
+    let rejected_stdout = String::from_utf8(rejected.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(rejected.status.code(), Some(1), "{rejected_stdout}");
+    assert!(rejected.stderr.is_empty());
+    assert_eq!(
+        rejected_stdout
+            .matches("\"code\":\"INVALID_ESCAPE\"")
+            .count(),
+        1,
+        "{rejected_stdout}"
+    );
+    let check_diagnostic = rejected_stdout
+        .lines()
+        .find(|line| line.contains("\"code\":\"INVALID_ESCAPE\""))
+        .expect("check reports the expected code");
+    assert!(check_diagnostic.contains("\"severity\":\"error\""));
+    assert!(check_diagnostic.contains("\"path\":\"src/lib.sai\""));
+    assert!(check_diagnostic.contains("\"line\":1"));
+    for diagnostic in rejected_stdout
+        .lines()
+        .filter(|line| line.contains("\"type\":\"diagnostic\""))
+    {
+        assert!(
+            diagnostic.contains("\"code\":\"INVALID_ESCAPE\"")
+                || diagnostic.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "unexpected check diagnostic:\n{diagnostic}"
+        );
+    }
+
+    let refused = run_fmt(&example);
+    let refused_stdout = String::from_utf8(refused.stdout).expect("formatter stdout is UTF-8");
+    assert_eq!(refused.status.code(), Some(1), "{refused_stdout}");
+    assert!(refused.stderr.is_empty());
+    assert_eq!(refused_stdout.matches("\"type\":\"result\"").count(), 1);
+    assert!(
+        refused_stdout.contains("\"check\":false"),
+        "{refused_stdout}"
+    );
+    assert!(refused_stdout.contains("\"files\":1"), "{refused_stdout}");
+    assert!(
+        refused_stdout.contains("\"changed\":[]"),
+        "{refused_stdout}"
+    );
+    assert_eq!(
+        refused_stdout.matches("\"type\":\"diagnostic\"").count(),
+        1,
+        "{refused_stdout}"
+    );
+    assert_eq!(
+        refused_stdout
+            .matches("\"code\":\"INVALID_ESCAPE\"")
+            .count(),
+        1,
+        "{refused_stdout}"
+    );
+    let formatter_diagnostic = refused_stdout
+        .lines()
+        .find(|line| line.contains("\"code\":\"INVALID_ESCAPE\""))
+        .expect("formatter reports the expected refusal code");
+    assert!(formatter_diagnostic.contains("\"severity\":\"error\""));
+    assert!(formatter_diagnostic.contains("\"path\":\"<stdin>\""));
+    assert!(formatter_diagnostic.contains("\"line\":1"));
+    assert!(!refused_stdout.contains("\"code\":\"UNFORMATTED_FILE\""));
+    assert!(
+        refused_stdout.contains("\"refused\":[\"<stdin>\"]"),
+        "{refused_stdout}"
+    );
+    assert!(
+        refused_stdout.contains("\"output\":null"),
+        "{refused_stdout}"
+    );
+    let summary = refused_stdout
+        .lines()
+        .find(|line| line.contains("\"type\":\"summary\""))
+        .expect("formatter emits one summary record");
+    assert!(summary.contains("\"exit_code\":1"), "{summary}");
+    assert!(
+        !refused_stdout.contains("pub const VALUE"),
+        "refused formatter input must not emit formatted source:\n{refused_stdout}"
+    );
+
+    let accepted = run_check(&fix);
+    let accepted_stdout = String::from_utf8(accepted.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(accepted.status.code(), Some(0), "{accepted_stdout}");
+    assert!(accepted.stderr.is_empty());
+    assert!(
+        accepted_stdout.contains("\"kind\":\"check\""),
+        "{accepted_stdout}"
+    );
+    assert!(!accepted_stdout.contains("\"type\":\"diagnostic\""));
+
+    let formatted = run_fmt_check(&fix);
+    let formatted_stdout = String::from_utf8(formatted.stdout).expect("formatter stdout is UTF-8");
+    assert_eq!(formatted.status.code(), Some(0), "{formatted_stdout}");
+    assert!(formatted.stderr.is_empty());
+    assert!(
+        formatted_stdout.contains("\"refused\":[]"),
+        "{formatted_stdout}"
+    );
+    assert!(!formatted_stdout.contains("\"code\":\"UNFORMATTED_FILE\""));
+}
+
+#[test]
 fn explain_keeps_other_individual_codes_gated_and_preserves_list() {
     let gated = run_explain(&["--format=json", "explain", "UNKNOWN_FIELD"]);
     let gated_stdout = String::from_utf8(gated.stdout).expect("CLI stdout is UTF-8");
@@ -366,6 +554,18 @@ fn explain_keeps_other_individual_codes_gated_and_preserves_list() {
     assert!(list.stderr.is_empty());
     assert!(list_stdout.contains("\"kind\":\"explain.list\""));
     assert!(list_stdout.contains("\"code\":\"DUPLICATE_BINDING\",\"class\":\"hard\""));
+    let invalid_escape_list_entry =
+        "{\"code\":\"INVALID_ESCAPE\",\"class\":\"hard\",\"summary\":\"Invalid escape sequence\"}";
+    let previous_code = list_stdout
+        .find("\"code\":\"INVALID_ENTRY_POINT\"")
+        .expect("list contains the preceding code");
+    let invalid_escape = list_stdout
+        .find(invalid_escape_list_entry)
+        .expect("list contains the exact INVALID_ESCAPE entry");
+    let next_code = list_stdout
+        .find("\"code\":\"INVALID_EXPORT_TARGET\"")
+        .expect("list contains the following code");
+    assert!(previous_code < invalid_escape && invalid_escape < next_code);
     assert!(list_stdout.contains("\"code\":\"TYPE_MISMATCH\",\"class\":\"hard\""));
     assert_eq!(list_stdout.matches("\"code\":").count(), 494);
 }

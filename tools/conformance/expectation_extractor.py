@@ -15,10 +15,12 @@ ill-formed tests whose comment boundaries cannot be established are
 unsupported. Non-ASCII code outside comments and literals is
 unsupported; the scanner does not depend on Python's Unicode identifier tables.
 Invalid UTF-8 is supported only as isolated bytes outside comments and literals.
-Invalid escapes are rejected except inside a strictly headed `fmt-refuse`
-fixture, where the scanner skips the malformed literal escape while retaining the
-string boundary. Manifest line continuations and a backslash immediately
-followed by a lone CR (including in comments and raw strings) are rejected.
+Invalid escapes are rejected in ordinary source fixtures. They may be scanned
+inside a strictly headed `fmt-refuse` fixture or an explicitly marked
+`sai noncanonical` explanation Example, where the scanner skips the malformed
+literal escape while retaining the string boundary. Manifest line continuations
+and a backslash immediately followed by a lone CR (including in comments and raw
+strings) are rejected.
 Outside manifests, only complete package paths with unambiguous boundaries are
 supported. Ambiguous newline or bracket recovery causes conservative rejection.
 Output is a JSON object with an `expected` array in the diagnostic matcher's
@@ -343,6 +345,40 @@ def extract_with_directives(source: str, path: str, *, lint_levels: dict | None 
     return {"expected": expected, "directives": metadata}
 
 
+def extract_explanation_example(source: str, *, section: str, info_string: str,
+                                path: str = "src/lib.sai",
+                                lint_levels: dict | None = None) -> list[dict]:
+    """Extract expectations from a fenced `sai explain` Example block.
+
+    The sole malformed-literal exception is a `sai noncanonical` Example that
+    expects INVALID_ESCAPE. Ordinary fixtures must use the fixture APIs, which
+    continue to reject malformed escapes except for strictly headed fmt-refuse.
+    """
+    if section != "Example" or info_string not in ("sai", "sai noncanonical"):
+        raise ValueError("explanation source must be an Example with a supported SAI fence")
+    if info_string == "sai":
+        return extract(source, path, lint_levels=lint_levels)
+    try:
+        return extract(source, path, lint_levels=lint_levels)
+    except ValueError as error:
+        if not str(error).endswith(": invalid or unsupported escape"):
+            raise
+    expected, _ = _extract(
+        source,
+        path,
+        directives=False,
+        lint_levels=lint_levels,
+        invalid_bytes=False,
+        allow_invalid_literal_escapes=True,
+    )
+    if not any(
+        item["severity"] == "error" and item["code"] == "INVALID_ESCAPE"
+        for item in expected
+    ):
+        raise ValueError("malformed explanation Example must expect INVALID_ESCAPE")
+    return expected
+
+
 def extract_bytes_with_directives(source: bytes, path: str, *, lint_levels: dict | None = None) -> dict:
     """Byte-preserving counterpart of :func:`extract_with_directives`."""
     if not isinstance(source, bytes):
@@ -354,7 +390,8 @@ def extract_bytes_with_directives(source: bytes, path: str, *, lint_levels: dict
 
 
 def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | None,
-             invalid_bytes: bool, validate_test_directives: bool = False) -> tuple[list[dict], dict | None]:
+             invalid_bytes: bool, validate_test_directives: bool = False,
+             allow_invalid_literal_escapes: bool = False) -> tuple[list[dict], dict | None]:
     if not isinstance(source, str) or not root_relative(path) or type(directives) is not bool:
         raise ValueError("invalid source, root-relative path, or directives flag")
     try:
@@ -379,7 +416,7 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
     code_on_line = False
     seen_token = False
     seen_directives = set()
-    allow_invalid_refusal_escapes = False
+    invalid_literal_escapes_allowed = allow_invalid_literal_escapes
     expected = []
     previous_introducer = None
     line_break_since_previous = False
@@ -402,7 +439,7 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
         expected.append({"file": target_file, "line": target_line, "severity": severity, "code": code})
 
     def process_comment(comment: str) -> None:
-        nonlocal allow_invalid_refusal_escapes
+        nonlocal invalid_literal_escapes_allowed
         if comment.startswith("//~"):
             value = comment[3:]
             caret_count = len(value) - len(value.lstrip("^"))
@@ -456,7 +493,7 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
                 else:
                     directive_values.setdefault(name, []).append(parsed)
                     if name == "kind" and parsed == "fmt-refuse":
-                        allow_invalid_refusal_escapes = True
+                        invalid_literal_escapes_allowed = True
 
     def skip_escape(start: int, limit: int, *, byte: bool, continuation: bool) -> int:
         if start + 1 >= limit:
@@ -476,7 +513,7 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
                     return match.end()
         if escaped == "x" and byte and start + 4 <= limit and re.fullmatch(r"[0-9a-fA-F]{2}", source[start + 2:start + 4]):
             return start + 4
-        if allow_invalid_refusal_escapes:
+        if invalid_literal_escapes_allowed:
             return start + 2
         fail("invalid or unsupported escape")
 

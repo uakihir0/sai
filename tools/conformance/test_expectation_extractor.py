@@ -7,9 +7,11 @@ from pathlib import Path
 
 from diagnostic_matcher import compare
 from expectation_extractor import (
+    KINDS,
     extract,
     extract_bytes,
     extract_bytes_with_directives,
+    extract_explanation_example,
     extract_with_directives,
 )
 
@@ -455,7 +457,7 @@ pub fn invalid_escape() -> Str { "\q" }
             expected(5, "error", "INVALID_ESCAPE"),
         ])
         self.assertEqual(result["directives"]["kind"], "fmt-refuse")
-        for kind in ("fmt", "check-fail"):
+        for kind in sorted(KINDS - {"fmt-refuse"}):
             with self.subTest(kind=kind), self.assertRaisesRegex(
                 ValueError, "invalid or unsupported escape"
             ):
@@ -463,6 +465,50 @@ pub fn invalid_escape() -> Str { "\q" }
                     source.replace("kind: fmt-refuse", f"kind: {kind}"),
                     "src/lib.sai",
                 )
+
+    def test_invalid_escape_is_supported_in_only_a_marked_explanation_example(self):
+        record_path = (
+            Path(__file__).resolve().parents[2]
+            / "crates/sai_diagnostics/src/explanations/invalid_escape.md"
+        )
+        markdown = record_path.read_text(encoding="utf-8")
+        example_section = markdown.split("## Example\n", 1)[1]
+        example_section = example_section.removeprefix("\n")
+        fence, remainder = example_section.split("\n", 1)
+        info_string = fence.removeprefix("```")
+        source = remainder.split("\n```", 1)[0] + "\n"
+        self.assertEqual(info_string, "sai noncanonical")
+        self.assertEqual(
+            extract_explanation_example(
+                source,
+                section="Example",
+                info_string=info_string,
+            ),
+            [expected(1, "error", "INVALID_ESCAPE")],
+        )
+        with self.assertRaisesRegex(ValueError, "invalid or unsupported escape"):
+            extract(source, "src/lib.sai")
+        with self.assertRaisesRegex(ValueError, "invalid or unsupported escape"):
+            extract_explanation_example(
+                source,
+                section="Example",
+                info_string="sai",
+            )
+        with self.assertRaisesRegex(ValueError, "Example with a supported SAI fence"):
+            extract_explanation_example(
+                source,
+                section="Fix",
+                info_string=info_string,
+            )
+        with self.assertRaisesRegex(ValueError, "must expect INVALID_ESCAPE"):
+            extract_explanation_example(
+                source.replace(
+                    "// rejected: INVALID_ESCAPE",
+                    "// rejected: EXPECTED_TOKEN",
+                ),
+                section="Example",
+                info_string=info_string,
+            )
 
     def test_valid_escapes_and_raw_strings_are_preserved(self):
         source = (r'''let a = "\u{41}\n\" // not a comment"''' + '\n' +

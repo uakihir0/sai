@@ -1,2 +1,3 @@
 DUPLICATE_BINDING|hard|error||0|spec/04-modules-and-names.md|0.1.0|active||explanations/duplicate_binding.md
+INVALID_ESCAPE|hard|error||0|spec/02-lexical-structure.md|0.1.0|active||explanations/invalid_escape.md
 TYPE_MISMATCH|hard|error||1|spec/05-types.md|0.1.0|active||explanations/type_mismatch.md
