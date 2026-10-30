@@ -48,6 +48,12 @@ RECORDS = {
         "stage": 1,
         "owner": "spec/05-types.md",
     },
+    "UNKNOWN_FIELD": {
+        "class": "hard",
+        "severity": "error",
+        "stage": 1,
+        "owner": "spec/06-expressions-and-statements.md",
+    },
 }
 DATA_FIELDS = {
     "code", "class", "severity", "default_level", "stage", "owner", "since",
@@ -768,7 +774,8 @@ def run_suite(iut: str | Path, *, timeout: float = TIMEOUT_SECONDS) -> dict:
         "failures": [],
         "limitations": [
             "Only DUPLICATE_BINDING, INVALID_ESCAPE, LITERAL_OUT_OF_RANGE, and "
-            "MALFORMED_NUMBER (Stage 0) and TYPE_MISMATCH (Stage 1) are checked; "
+            "MALFORMED_NUMBER (Stage 0) and TYPE_MISMATCH and UNKNOWN_FIELD "
+            "(Stage 1) are checked; "
             "other registered explanation records are not checked.",
             "This runner does not validate other registered explanation records, "
             "staged applicability, diagnostic tables, or the full registry checks "

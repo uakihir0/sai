@@ -123,13 +123,16 @@ class ExplanationMarkdownTests(unittest.TestCase):
             _source_fence("~~~sai\npub const X: U32 = 1\n```\n", role="Fix")
 
     def test_full_summary_matches_appendix_not_only_compact_list_prefix(self):
-        code = "DUPLICATE_BINDING"
-        canonical = _appendix_summary(REPOSITORY_ROOT / "docs", code=code)
-        self.assertEqual(
-            canonical,
-            "Two bindings of one name in one scope: module scope, block, parameter "
-            "list, generic parameter list, pattern, interface (§4.4.3, D-MOD-03, N-A-8)",
-        )
+        for code in ("DUPLICATE_BINDING", "UNKNOWN_FIELD"):
+            with self.subTest(code=code):
+                canonical = _appendix_summary(REPOSITORY_ROOT / "docs", code=code)
+                self.assertEqual(
+                    canonical,
+                    _parse_record(
+                        (EXPLANATIONS / f"{code.lower()}.md").read_text(encoding="utf-8"),
+                        code=code,
+                    )[1],
+                )
 
     def test_rejects_out_of_order_sections(self):
         markdown = (
@@ -385,6 +388,8 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
                 diagnostics.append(_diagnostic(code, line=2))
             elif code == "TYPE_MISMATCH":
                 diagnostics.append(_diagnostic(code, line=1))
+            elif code == "UNKNOWN_FIELD":
+                diagnostics.append(_diagnostic(code, line=7))
             else:
                 diagnostics.append(_diagnostic(code, line=1))
         exit_code = 1 if diagnostics else 0
@@ -466,6 +471,10 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
                 return self._check_response("DUPLICATE_BINDING", failed=True)
             if b"COUNT: I32 = true" in source:
                 return self._check_response("TYPE_MISMATCH", failed=True)
+            if b"self.ag // rejected" in source:
+                return self._check_response("UNKNOWN_FIELD", failed=True)
+            if b"self.age" in source:
+                return self._check_response("UNKNOWN_FIELD", failed=False)
             if b"\\q" in source:
                 return self._check_response(
                     "INVALID_ESCAPE", failed=True, include_gate=True,
@@ -502,7 +511,7 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
             report = run_suite(self.iut)
         self.assertEqual(report["mode"], "partial-smoke")
         self.assertIs(report["claim"], False)
-        self.assertEqual((report["tests"], report["passed"], report["failed"]), (5, 5, 0))
+        self.assertEqual((report["tests"], report["passed"], report["failed"]), (6, 6, 0))
         self.assertEqual(
             [result["test"] for result in report["results"]],
             [f"sai explain {code}" for code in RECORDS],
