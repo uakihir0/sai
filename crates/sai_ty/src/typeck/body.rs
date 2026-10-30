@@ -2761,13 +2761,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         operand: &'hir Expr<'hir>,
         expression: HirId,
     ) -> Result<(LocalType, bool), ()> {
-        let source_type = self.check_local_path(operand)?;
-        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
-        if self.deferred_neg_result_bindings.contains(&source_binding) {
+        let source_type = match operand.kind {
+            ExprKind::Field { .. } => self.check_binary_operand(operand)?,
+            _ => self.check_local_path(operand)?,
+        };
+        let source_binding = match operand.kind {
+            ExprKind::Path(_) => Some(self.plain_local_path_binding(operand).ok_or(())?),
+            _ => None,
+        };
+        if source_binding
+            .is_some_and(|binding| self.deferred_neg_result_bindings.contains(&binding))
+        {
             return Err(());
         }
         if let LocalType::LiteralVariable(id) = source_type {
-            let eligible_literal_path = self.is_eligible_unannotated_literal_path(operand);
+            let eligible_literal_path =
+                source_binding.is_some_and(|_| self.is_eligible_unannotated_literal_path(operand));
             if eligible_literal_path
                 && self.literal_variables.get(id).is_some_and(|variable| {
                     matches!(
@@ -2858,7 +2867,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
     fn check_logical_not(&mut self, operand: &'hir Expr<'hir>) -> Result<LocalType, ()> {
         let operand_type = self
-            .check_local_path(operand)
+            .check_binary_operand(operand)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .ok_or(())?;

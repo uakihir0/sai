@@ -8175,7 +8175,7 @@ fn check_inherent_method_body_type(
                     }
                 }
             }
-            ExprKind::Unary(UnOp::BitNot, operand)
+            ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand)
                 if matches!(operand.kind, ExprKind::Field { .. }) =>
             {
                 if !matches!(
@@ -8859,30 +8859,38 @@ fn check_function_body_primitive_local_block(
                     return Ok(None);
                 }
             }
-            ExprKind::Unary(UnOp::Not, operand) => {
-                let ExprKind::Path(path) = operand.kind else {
-                    return Ok(None);
-                };
-                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
-                else {
-                    return Ok(None);
-                };
-                if !preceding_bindings.contains(&source_binding) {
-                    return Ok(None);
+            ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
+                ExprKind::Path(path) => {
+                    let Some(source_binding) =
+                        resolved_plain_local_path_binding(path, locals, inputs)
+                    else {
+                        return Ok(None);
+                    };
+                    if !preceding_bindings.contains(&source_binding) {
+                        return Ok(None);
+                    }
                 }
-            }
-            ExprKind::Unary(UnOp::Neg, operand) => {
-                let ExprKind::Path(path) = operand.kind else {
-                    return Ok(None);
-                };
-                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
-                else {
-                    return Ok(None);
-                };
-                if !preceding_bindings.contains(&source_binding) {
-                    return Ok(None);
+                ExprKind::Field { .. }
+                    if self_field_projections
+                        .is_some_and(|fields| fields.contains_key(&operand.hir_id)) => {}
+                _ => return Ok(None),
+            },
+            ExprKind::Unary(UnOp::Neg, operand) => match operand.kind {
+                ExprKind::Path(path) => {
+                    let Some(source_binding) =
+                        resolved_plain_local_path_binding(path, locals, inputs)
+                    else {
+                        return Ok(None);
+                    };
+                    if !preceding_bindings.contains(&source_binding) {
+                        return Ok(None);
+                    }
                 }
-            }
+                ExprKind::Field { .. }
+                    if self_field_projections
+                        .is_some_and(|fields| fields.contains_key(&operand.hir_id)) => {}
+                _ => return Ok(None),
+            },
             ExprKind::Unary(UnOp::BitNot, operand) => {
                 if !is_direct_function_integer_literal(operand)
                     && !matches!(operand.kind, ExprKind::Lit(Lit::Byte(_)))
