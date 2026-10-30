@@ -4250,45 +4250,22 @@ fn public_inherent_method_bitwise_not_field_errors_keep_precise_spans() {
 }
 
 #[test]
-fn unsupported_direct_self_field_bitwise_not_shapes_stay_gated() {
-    let cases = [
-        (
-            "unknown field",
-            concat!(
-                "type Counter { bits: U8 }\n",
-                "impl Counter {\n",
-                "    pub fn invert(self: borrow Self) -> U8 {\n",
-                "        let result = ~self.missing\n",
-                "        result\n",
-                "    }\n",
-                "}\n",
-            ),
-            true,
+fn unsupported_direct_self_field_bitwise_not_computed_shapes_stay_gated() {
+    let cases = [(
+        "nested expression",
+        concat!(
+            "type Counter { bits: U8 }\n",
+            "impl Counter {\n",
+            "    pub fn invert(self: borrow Self) -> U8 {\n",
+            "        let result = ~(self.bits + 1)\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
         ),
-        (
-            "nested expression",
-            concat!(
-                "type Counter { bits: U8 }\n",
-                "impl Counter {\n",
-                "    pub fn invert(self: borrow Self) -> U8 {\n",
-                "        let result = ~(self.bits + 1)\n",
-                "        result\n",
-                "    }\n",
-                "}\n",
-            ),
-            false,
-        ),
-    ];
-    for (shape, source, has_unknown_field) in cases {
+    )];
+    for (shape, source) in cases {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated_without_syntax_errors(&output, shape);
-        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
-        if has_unknown_field {
-            assert!(
-                !stdout.contains("\"code\":\"UNKNOWN_FIELD\""),
-                "an unsupported unary shape must not leak a field diagnostic:\n{stdout}"
-            );
-        }
     }
 }
 
@@ -4603,21 +4580,8 @@ fn public_inherent_method_not_and_neg_field_errors_keep_precise_spans() {
 }
 
 #[test]
-fn unsupported_direct_self_field_unary_initializer_and_tail_shapes_stay_gated() {
+fn unsupported_direct_self_field_unary_computed_and_tail_shapes_stay_gated() {
     let cases = [
-        (
-            "unknown field under negation",
-            concat!(
-                "type Counter { amount: I32 }\n",
-                "impl Counter {\n",
-                "    pub fn negate(self: borrow Self) -> I32 {\n",
-                "        let result = -self.missing\n",
-                "        result\n",
-                "    }\n",
-                "}\n",
-            ),
-            true,
-        ),
         (
             "nested logical-not operand",
             concat!(
@@ -5573,6 +5537,214 @@ fn unknown_direct_self_field_under_logical_not_recovers_bool_diagnostics() {
                 "{context} has no independent type mismatch:\n{stdout}"
             );
         }
+    }
+}
+
+#[test]
+fn unknown_direct_self_field_under_neg_and_bitnot_initializers_recovers_without_type_cascades() {
+    let cases = [
+        (
+            "inferred negation",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        let recovered = -self.naem\n",
+                "        let copied = recovered\n",
+                "        copied\n",
+                "    }\n",
+                "}\n",
+            ),
+            None,
+        ),
+        (
+            "annotated negation",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        let recovered: I32 = -self.naem\n",
+                "        let wrong: Bool = recovered\n",
+                "        true\n",
+                "    }\n",
+                "}\n",
+            ),
+            Some(("expected `Bool`, found `I32`", "recovered")),
+        ),
+        (
+            "inferred bitwise not",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        let recovered = ~self.naem\n",
+                "        let copied = recovered\n",
+                "        copied\n",
+                "    }\n",
+                "}\n",
+            ),
+            None,
+        ),
+        (
+            "annotated bitwise not",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        let recovered: I32 = ~self.naem\n",
+                "        let wrong: Bool = recovered\n",
+                "        true\n",
+                "    }\n",
+                "}\n",
+            ),
+            Some(("expected `Bool`, found `I32`", "recovered")),
+        ),
+    ];
+
+    for (context, source, expected_mismatch) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{context}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\""),
+            "{context} reports the missing field without a gate or an invented operand type:\n{stdout}"
+        );
+        let field_start = source.rfind("naem").expect("unknown field exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            "`User` has no field `naem`",
+            field_start,
+            field_start + "naem".len(),
+        );
+        let unknown_field = stdout
+            .lines()
+            .find(|record| record.contains("\"field\":\"naem\""))
+            .expect("unknown-field diagnostic exists");
+        assert!(
+            unknown_field.contains("\"type_name\":\"User\"")
+                && unknown_field.contains("\"candidates\":[\"name\"]"),
+            "{context} retains the receiver type and candidate data:\n{unknown_field}"
+        );
+        if let Some((message, expression)) = expected_mismatch {
+            assert_eq!(
+                stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+                1,
+                "{context} preserves the mismatch against the explicit local annotation:\n{stdout}"
+            );
+            let expression_start = source
+                .rfind(expression)
+                .expect("annotated local use exists");
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                message,
+                expression_start,
+                expression_start + expression.len(),
+            );
+        } else {
+            assert!(
+                !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+                "{context} has no concrete result type to mismatch:\n{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_direct_self_field_under_neg_and_bitnot_outside_initializer_stays_gated() {
+    let cases = [
+        (
+            "negation method tail",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        -self.naem\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "bitwise not method tail",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        ~self.naem\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "nested negation initializer",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        let recovered = -(self.naem + 1)\n",
+                "        recovered\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "nested bitwise not initializer",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        let recovered = ~(self.naem & 1)\n",
+                "        recovered\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "negation direct call argument",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        let recovered = identity(-self.naem)\n",
+                "        recovered\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "bitwise not direct call argument",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        let recovered = identity(~self.naem)\n",
+                "        recovered\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
+    ];
+
+    for (context, source) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"code\":\"UNKNOWN_FIELD\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} remains gated without leaking a partial unknown-field diagnostic:\n{stdout}"
+        );
     }
 }
 
