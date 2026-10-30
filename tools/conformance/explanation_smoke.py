@@ -36,6 +36,12 @@ RECORDS = {
         "stage": 0,
         "owner": "spec/02-lexical-structure.md",
     },
+    "MALFORMED_NUMBER": {
+        "class": "hard",
+        "severity": "error",
+        "stage": 0,
+        "owner": "spec/02-lexical-structure.md",
+    },
     "TYPE_MISMATCH": {
         "class": "hard",
         "severity": "error",
@@ -408,7 +414,7 @@ def _command_diagnostics(
 
 def _allowed_feature_gate(record: dict, *, code: str, command: str) -> bool:
     return (
-        code == "INVALID_ESCAPE"
+        code in {"INVALID_ESCAPE", "MALFORMED_NUMBER"}
         and command == "check"
         and record.get("code") == "FEATURE_NOT_IMPLEMENTED"
         and record.get("severity") == "error"
@@ -761,9 +767,9 @@ def run_suite(iut: str | Path, *, timeout: float = TIMEOUT_SECONDS) -> dict:
         "results": [],
         "failures": [],
         "limitations": [
-            "Only DUPLICATE_BINDING, INVALID_ESCAPE, and LITERAL_OUT_OF_RANGE "
-            "(Stage 0) and TYPE_MISMATCH (Stage 1) are checked; other registered "
-            "explanation records are not checked.",
+            "Only DUPLICATE_BINDING, INVALID_ESCAPE, LITERAL_OUT_OF_RANGE, and "
+            "MALFORMED_NUMBER (Stage 0) and TYPE_MISMATCH (Stage 1) are checked; "
+            "other registered explanation records are not checked.",
             "This runner does not validate other registered explanation records, "
             "staged applicability, diagnostic tables, or the full registry checks "
             "required by impl/15 §§15.8.4–15.8.5.",

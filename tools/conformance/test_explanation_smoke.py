@@ -98,7 +98,12 @@ class ExplanationMarkdownTests(unittest.TestCase):
                 self.assertEqual(table["Severity"], expected["severity"])
                 self.assertEqual(table["Stage"], str(expected["stage"]))
                 self.assertEqual(table["Owner"], expected["owner"])
-                self.assertEqual(info, "sai noncanonical" if code == "INVALID_ESCAPE" else "sai")
+                self.assertEqual(
+                    info,
+                    "sai noncanonical"
+                    if code in {"INVALID_ESCAPE", "MALFORMED_NUMBER"}
+                    else "sai",
+                )
                 self.assertTrue(summary)
                 self.assertTrue(example.endswith("\n"))
                 self.assertTrue(fix.endswith("\n"))
@@ -190,6 +195,30 @@ class ExampleDiagnosticTests(unittest.TestCase):
         _validate_example_diagnostics(
             records, code="INVALID_ESCAPE", command="check", expected=expected,
         )
+
+    def test_malformed_number_allows_only_the_known_check_stage_gate(self):
+        expected = [{
+            "file": "src/lib.sai",
+            "line": 1,
+            "severity": "error",
+            "code": "MALFORMED_NUMBER",
+        }]
+        records = [
+            _diagnostic("MALFORMED_NUMBER", line=1),
+            _diagnostic(
+                "FEATURE_NOT_IMPLEMENTED",
+                path=None,
+                data={"stage": 0, "feature": "sai check"},
+                message="stage 0 feature `sai check` is not implemented",
+            ),
+        ]
+        _validate_example_diagnostics(
+            records, code="MALFORMED_NUMBER", command="check", expected=expected,
+        )
+        with self.assertRaisesRegex(ValueError, "not marked by the Example"):
+            _validate_example_diagnostics(
+                records, code="MALFORMED_NUMBER", command="build", expected=expected,
+            )
 
     def test_rejects_repeated_known_stage_gate(self):
         expected = [{
@@ -378,9 +407,15 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
 
     def _fmt_response(self, source):
         if b"\\q" in source:
-            diagnostics = [_diagnostic(
-                "INVALID_ESCAPE", path="<stdin>", file_package=None,
-            )]
+            code = "INVALID_ESCAPE"
+        elif b"1__2" in source:
+            code = "MALFORMED_NUMBER"
+        else:
+            code = None
+        if code is not None:
+            diagnostics = [
+                _diagnostic(code, path="<stdin>", file_package=None),
+            ]
             result = {
                 "type": "result",
                 "kind": "fmt",
@@ -437,6 +472,10 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
                 )
             if b"VALUE: U8 = 999" in source:
                 return self._check_response("LITERAL_OUT_OF_RANGE", failed=True)
+            if b"VALUE: U8 = 1__2" in source:
+                return self._check_response(
+                    "MALFORMED_NUMBER", failed=True, include_gate=True,
+                )
             return self._check_response("DUPLICATE_BINDING", failed=False)
         if len(argv) >= 2 and argv[-2:] == ["--target", "wasm32-core"]:
             source = (Path(cwd) / "src" / "lib.sai").read_bytes()
@@ -463,7 +502,7 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
             report = run_suite(self.iut)
         self.assertEqual(report["mode"], "partial-smoke")
         self.assertIs(report["claim"], False)
-        self.assertEqual((report["tests"], report["passed"], report["failed"]), (4, 4, 0))
+        self.assertEqual((report["tests"], report["passed"], report["failed"]), (5, 5, 0))
         self.assertEqual(
             [result["test"] for result in report["results"]],
             [f"sai explain {code}" for code in RECORDS],
