@@ -8160,7 +8160,7 @@ fn check_inherent_method_body_type(
                         && !collect_inherent_method_self_field(
                             method_owner.id,
                             operand,
-                            false,
+                            true,
                             &field_types,
                             &mut self_field_projections,
                             &mut unknown_self_fields,
@@ -8849,38 +8849,42 @@ fn check_function_body_primitive_local_block(
                         && unknown_self_fields
                             .is_some_and(|fields| fields.contains(&operand.hir_id))
                 };
-                let is_preceding_path_or_unknown_field = |operand: &HirExpr<'_>| {
-                    is_preceding_path(operand) || is_unknown_self_field(operand)
+                let is_preceding_path_or_self_field = |operand: &HirExpr<'_>| {
+                    is_preceding_path(operand)
+                        || is_unknown_self_field(operand)
+                        || (matches!(operand.kind, ExprKind::Field { .. })
+                            && self_field_projections
+                                .is_some_and(|fields| fields.contains_key(&operand.hir_id)))
                 };
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => {
-                        is_preceding_path_or_unknown_field(left)
-                            && is_preceding_path_or_unknown_field(right)
+                        is_preceding_path_or_self_field(left)
+                            && is_preceding_path_or_self_field(right)
                     }
                     BinOp::Shl | BinOp::Shr => {
-                        (is_preceding_path_or_unknown_field(left)
-                            && (is_preceding_path_or_unknown_field(right)
+                        (is_preceding_path_or_self_field(left)
+                            && (is_preceding_path_or_self_field(right)
                                 || is_direct_function_integer_literal(right)))
                             || (is_direct_function_integer_literal(left)
-                                && is_preceding_path_or_unknown_field(right))
+                                && is_preceding_path_or_self_field(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
-                                && (is_preceding_path_or_unknown_field(right)
+                                && (is_preceding_path_or_self_field(right)
                                     || is_direct_function_integer_literal(right)))
                     }
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
-                        (is_preceding_path_or_unknown_field(left)
-                            && is_preceding_path_or_unknown_field(right))
-                            || (is_preceding_path_or_unknown_field(left)
+                        (is_preceding_path_or_self_field(left)
+                            && is_preceding_path_or_self_field(right))
+                            || (is_preceding_path_or_self_field(left)
                                 && is_direct_function_integer_literal(right))
-                            || (is_preceding_path_or_unknown_field(left)
+                            || (is_preceding_path_or_self_field(left)
                                 && matches!(right.kind, ExprKind::Lit(Lit::Byte(_))))
-                            || (is_preceding_path_or_unknown_field(left)
+                            || (is_preceding_path_or_self_field(left)
                                 && matches!(
                                     right.kind,
                                     ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. })
                                 ))
                             || (is_direct_function_integer_literal(left)
-                                && is_preceding_path_or_unknown_field(right))
+                                && is_preceding_path_or_self_field(right))
                             || (is_direct_function_integer_literal(left)
                                 && is_direct_function_integer_literal(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Bool(_)))
@@ -8898,28 +8902,28 @@ fn check_function_body_primitive_local_block(
                             || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
                                 && is_direct_function_integer_literal(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
-                                && is_preceding_path_or_unknown_field(right))
+                                && is_preceding_path_or_self_field(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
-                                && (is_preceding_path_or_unknown_field(right)
+                                && (is_preceding_path_or_self_field(right)
                                     || is_direct_function_scalar_literal(right)))
                     }
                     BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
-                        (is_preceding_path_or_unknown_field(left)
-                            && is_preceding_path_or_unknown_field(right))
-                            || (is_preceding_path_or_unknown_field(left)
+                        (is_preceding_path_or_self_field(left)
+                            && is_preceding_path_or_self_field(right))
+                            || (is_preceding_path_or_self_field(left)
                                 && is_direct_function_integer_literal(right))
                             || (is_direct_function_integer_literal(left)
-                                && is_preceding_path_or_unknown_field(right))
+                                && is_preceding_path_or_self_field(right))
                             || (is_direct_function_integer_literal(left)
                                 && is_direct_function_integer_literal(right))
                     }
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                        (is_preceding_path_or_unknown_field(left)
-                            && is_preceding_path_or_unknown_field(right))
-                            || (is_preceding_path_or_unknown_field(left)
+                        (is_preceding_path_or_self_field(left)
+                            && is_preceding_path_or_self_field(right))
+                            || (is_preceding_path_or_self_field(left)
                                 && is_direct_function_numeric_literal(right))
                             || (is_direct_function_numeric_literal(left)
-                                && is_preceding_path_or_unknown_field(right))
+                                && is_preceding_path_or_self_field(right))
                             || (matches!(
                                 operator,
                                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
@@ -8927,12 +8931,12 @@ fn check_function_body_primitive_local_block(
                                 && is_direct_function_integer_literal(right))
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        (is_preceding_path_or_unknown_field(left)
-                            && is_preceding_path_or_unknown_field(right))
-                            || (is_preceding_path_or_unknown_field(left)
+                        (is_preceding_path_or_self_field(left)
+                            && is_preceding_path_or_self_field(right))
+                            || (is_preceding_path_or_self_field(left)
                                 && is_direct_function_scalar_literal(right))
                             || (is_direct_function_scalar_literal(left)
-                                && is_preceding_path_or_unknown_field(right))
+                                && is_preceding_path_or_self_field(right))
                     }
                 };
                 if !supported_shape {

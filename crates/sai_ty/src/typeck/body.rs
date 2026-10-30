@@ -1257,7 +1257,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Ok(local_type);
             }
             let right_type = self
-                .check_local_path(right)
+                .check_binary_operand(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
@@ -1288,7 +1288,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let left_type = self
-            .check_local_path(left)
+            .check_binary_operand(left)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .ok_or(())?;
@@ -1309,7 +1309,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let right_type = self
-            .check_local_path(right)
+            .check_binary_operand(right)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .ok_or(())?;
@@ -1359,7 +1359,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Err(());
             };
             let right_type = self
-                .check_local_path(right)
+                .check_binary_operand(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
@@ -1407,7 +1407,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let left_type = self
-            .check_local_path(left)
+            .check_binary_operand(left)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .ok_or(())?;
@@ -1428,7 +1428,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.check_annotated_literal(left_type, literal, found, right.hir_id);
         } else {
             let right_type = self
-                .check_local_path(right)
+                .check_binary_operand(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
@@ -1489,7 +1489,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Err(());
             }
             let right_type = self
-                .check_local_path(right)
+                .check_binary_operand(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
@@ -1525,7 +1525,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let left_type = self
-            .check_local_path(left)
+            .check_binary_operand(left)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
@@ -1545,7 +1545,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Ok(LocalType::Concrete(left_type));
         }
         let right_type = self
-            .check_local_path(right)
+            .check_binary_operand(right)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
@@ -1617,7 +1617,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
 
                 let right_type = self
-                    .check_local_path(right)
+                    .check_binary_operand(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
                     .filter(|primitive| supports_primitive_literal(*primitive))
@@ -1660,7 +1660,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 if primitive_literal_kind(literal) == Some(PrimitiveLiteralKind::Character) {
                     let ExprKind::Lit(right_literal) = right.kind else {
-                        let right_local_type = self.check_local_path(right)?;
+                        let right_local_type = self.check_binary_operand(right)?;
                         let eligible_unannotated_literal_path =
                             self.is_eligible_unannotated_literal_path(right);
                         let eligible_resolved_computed_literal_path =
@@ -1822,7 +1822,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
 
             let right_type = self
-                .check_local_path(right)
+                .check_binary_operand(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .filter(|primitive| supports_primitive_literal(*primitive))
@@ -1855,7 +1855,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let left_type = self
-            .check_local_path(left)
+            .check_binary_operand(left)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
@@ -1987,7 +1987,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let right_type = self
-            .check_local_path(right)
+            .check_binary_operand(right)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
@@ -2063,7 +2063,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         } else {
             let local_type = self
-                .check_local_path(left)
+                .check_binary_operand(left)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .filter(|primitive| supports_primitive_literal(*primitive))
@@ -2081,7 +2081,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.check_annotated_literal(PrimTy::U32, literal, kind, right.hir_id);
         } else {
             let right_type = self
-                .check_local_path(right)
+                .check_binary_operand(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .filter(|primitive| supports_primitive_literal(*primitive))
@@ -2132,11 +2132,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         right: &'hir Expr<'hir>,
     ) -> Result<LocalType, ()> {
         let left_path_type = self
-            .check_local_path(left)
+            .check_binary_operand(left)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type));
         let right_path_type = self
-            .check_local_path(right)
+            .check_binary_operand(right)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type));
         let left_literal = match left.kind {
@@ -2238,7 +2238,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // operands, preserving the source operator's short-circuit behavior.
         for operand in [left, right] {
             let operand_type = self
-                .check_local_path(operand)
+                .check_binary_operand(operand)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
@@ -3445,8 +3445,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     .unknown_self_fields
                     .is_some_and(|fields| fields.contains(&expression.hir_id))
         };
-        let is_path_or_unknown_field =
-            |expression: &Expr<'hir>| is_path(expression) || is_unknown_self_field(expression);
+        let is_known_self_field = |expression: &Expr<'hir>| {
+            matches!(expression.kind, ExprKind::Field { .. })
+                && self
+                    .input
+                    .self_field_projections
+                    .is_some_and(|fields| fields.contains_key(&expression.hir_id))
+        };
+        let is_path_or_self_field = |expression: &Expr<'hir>| {
+            is_path(expression)
+                || is_unknown_self_field(expression)
+                || is_known_self_field(expression)
+        };
         let is_literal = |expression: &Expr<'hir>| {
             matches!(
                 expression.kind,
@@ -3455,8 +3465,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
         let is_path_or_literal =
             |expression: &Expr<'hir>| is_path(expression) || is_literal(expression);
-        let is_path_literal_or_unknown_field = |expression: &Expr<'hir>| {
-            is_path_or_literal(expression) || is_unknown_self_field(expression)
+        let is_path_literal_or_self_field = |expression: &Expr<'hir>| {
+            is_path_or_literal(expression)
+                || is_unknown_self_field(expression)
+                || is_known_self_field(expression)
         };
         let primitive_path = |expression: &Expr<'hir>| self.known_recovery_operand_type(expression);
         let literal_kind = |expression: &Expr<'hir>| match expression.kind {
@@ -3493,9 +3505,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
 
         let shape_is_supported = match operator {
-            BinOp::And | BinOp::Or => {
-                is_path_or_unknown_field(left) && is_path_or_unknown_field(right)
-            }
+            BinOp::And | BinOp::Or => is_path_or_self_field(left) && is_path_or_self_field(right),
             BinOp::Shl | BinOp::Shr => {
                 let supported_left_literal = matches!(
                     left.kind,
@@ -3511,13 +3521,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         if primitive_literal_kind(literal)
                             == Some(PrimitiveLiteralKind::Integer)
                 );
-                (is_path_or_unknown_field(left) || supported_left_literal)
-                    && (is_path_or_unknown_field(right) || supported_right_literal)
+                (is_path_or_self_field(left) || supported_left_literal)
+                    && (is_path_or_self_field(right) || supported_right_literal)
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                (is_path_or_unknown_field(left) && is_path_or_unknown_field(right))
-                    || (is_path_or_unknown_field(left) && is_literal(right))
-                    || (is_literal(left) && is_path_or_unknown_field(right))
+                (is_path_or_self_field(left) && is_path_or_self_field(right))
+                    || (is_path_or_self_field(left) && is_literal(right))
+                    || (is_literal(left) && is_path_or_self_field(right))
             }
             BinOp::Add
             | BinOp::Sub
@@ -3530,7 +3540,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             | BinOp::BitAnd
             | BinOp::BitOr
             | BinOp::BitXor => {
-                is_path_literal_or_unknown_field(left) && is_path_literal_or_unknown_field(right)
+                is_path_literal_or_self_field(left) && is_path_literal_or_self_field(right)
             }
         };
         if !shape_is_supported {
@@ -3800,6 +3810,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.record_expression_type(expression.hir_id, local_type);
         }
         Ok(local_type)
+    }
+
+    fn check_binary_operand(&self, expression: &Expr<'hir>) -> Result<LocalType, ()> {
+        if matches!(expression.kind, ExprKind::Field { .. }) {
+            let local_type = LocalType::Concrete(
+                self.input
+                    .self_field_projections
+                    .and_then(|fields| fields.get(&expression.hir_id))
+                    .copied()
+                    .ok_or(())?,
+            );
+            self.record_expression_type(expression.hir_id, local_type);
+            return Ok(local_type);
+        }
+
+        self.check_local_path(expression)
     }
 
     fn resolve_local_path(&self, expression: &Expr<'hir>) -> Result<LocalType, ()> {
