@@ -3551,24 +3551,54 @@ fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
             ),
         ),
         (
-            "unknown field under negation in a call argument",
+            "unknown field under negation before a computed argument",
             concat!(
-                "type Counter { amount: I32 }\n",
+                "type Counter { count: I32 }\n",
                 "impl Counter {\n",
                 "    pub fn pass_field(self: borrow Self) -> I32 {\n",
-                "        identity(-self.missing)\n",
+                "        combine(-self.missing, self.count + 1)\n",
+                "    }\n",
+                "}\n",
+                "pub fn combine(first: I32, second: I32) -> I32 {\n",
+                "    let result = first + second\n",
+                "    result\n",
+                "}\n",
+            ),
+        ),
+        (
+            "unknown field under bitwise not before a computed argument",
+            concat!(
+                "type Counter { count: U8 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> U8 {\n",
+                "        combine_u8(~self.missing, self.count + 1)\n",
+                "    }\n",
+                "}\n",
+                "pub fn combine_u8(first: U8, second: U8) -> U8 {\n",
+                "    let result = first + second\n",
+                "    result\n",
+                "}\n",
+            ),
+        ),
+        (
+            "nested negation over an unknown field in a call argument",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(-(-self.missing))\n",
                 "    }\n",
                 "}\n",
                 "pub fn identity(value: I32) -> I32 { value }\n",
             ),
         ),
         (
-            "unknown field under bitwise not in a call argument",
+            "nested bitwise not over an unknown field in a call argument",
             concat!(
                 "type Counter { bits: U8 }\n",
                 "impl Counter {\n",
                 "    pub fn pass_field(self: borrow Self) -> U8 {\n",
-                "        identity_u8(~self.missing)\n",
+                "        identity_u8(~(~self.missing))\n",
                 "    }\n",
                 "}\n",
                 "pub fn identity_u8(value: U8) -> U8 { value }\n",
@@ -3637,6 +3667,18 @@ fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
                 "pub fn identity(value: I32) -> I32 { value }\n",
             ),
         ),
+        (
+            "named unknown unary field argument",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(value: -self.missing)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
     ];
     for (context, source) in cases {
         let output = run_check(source, "", &[], &[]);
@@ -3647,6 +3689,165 @@ fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
             "{context}: rejected field arguments must not leak a partial unknown-field diagnostic:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn direct_call_unknown_self_fields_under_neg_and_bitnot_recover_without_cascades() {
+    let cases = [
+        (
+            "root negation",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn read(self: borrow Self) -> Bool {\n",
+                "        accept_bool(-self.naem)\n",
+                "    }\n",
+                "}\n",
+                "pub fn accept_bool(value: Bool) -> I32 { 1 }\n",
+            ),
+            "naem",
+            "accept_bool(-self.naem)",
+            "expected `Bool`, found `I32`",
+        ),
+        (
+            "root bitwise not",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn read(self: borrow Self) -> Bool {\n",
+                "        accept_bool(~self.naem)\n",
+                "    }\n",
+                "}\n",
+                "pub fn accept_bool(value: Bool) -> I32 { 1 }\n",
+            ),
+            "naem",
+            "accept_bool(~self.naem)",
+            "expected `Bool`, found `I32`",
+        ),
+        (
+            "nested negation",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn read(self: borrow Self) -> Bool {\n",
+                "        accept_bool(identity_i32(-self.naem))\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_i32(value: I32) -> I32 { value }\n",
+                "pub fn accept_bool(value: Bool) -> Bool { value }\n",
+            ),
+            "naem",
+            "identity_i32(-self.naem)",
+            "expected `Bool`, found `I32`",
+        ),
+        (
+            "nested bitwise not",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn read(self: borrow Self) -> Bool {\n",
+                "        accept_bool(identity_i32(~self.naem))\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_i32(value: I32) -> I32 { value }\n",
+                "pub fn accept_bool(value: Bool) -> Bool { value }\n",
+            ),
+            "naem",
+            "identity_i32(~self.naem)",
+            "expected `Bool`, found `I32`",
+        ),
+    ];
+
+    for (context, source, field_name, mismatch_expression, mismatch_summary) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{context}:\n{stdout}"
+        );
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "only the independent known call result should mismatch:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"code\":\"OPERAND_TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} should avoid dependent unary/argument diagnostics and success records:\n{stdout}"
+        );
+        let field_start = source.find(field_name).expect("unknown field exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            "`User` has no field `naem`",
+            field_start,
+            field_start + field_name.len(),
+        );
+        let mismatch_start = source
+            .find(mismatch_expression)
+            .expect("independently typed expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            mismatch_summary,
+            mismatch_start,
+            mismatch_start + mismatch_expression.len(),
+        );
+        let unknown_field = stdout
+            .lines()
+            .find(|record| record.contains("\"field\":\"naem\""))
+            .expect("unknown-field diagnostic exists");
+        assert!(
+            unknown_field.contains("\"type_name\":\"User\"")
+                && unknown_field.contains("\"candidates\":[\"name\"]"),
+            "{context} retains receiver and candidate data:\n{unknown_field}"
+        );
+    }
+
+    let sibling_source = concat!(
+        "type User { name: I32, flag: Bool }\n",
+        "impl User {\n",
+        "    pub fn preserve_sibling(self: borrow Self) -> I32 {\n",
+        "        combine(-self.naem, self.flag)\n",
+        "    }\n",
+        "}\n",
+        "pub fn combine(first: I32, second: I32) -> I32 {\n",
+        "    let result = first + second\n",
+        "    result\n",
+        "}\n",
+    );
+    let sibling_output = run_check(sibling_source, "", &[], &[]);
+    let sibling_stdout = String::from_utf8(sibling_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(sibling_output.status.code(), Some(1), "{sibling_stdout}");
+    assert_eq!(
+        sibling_stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{sibling_stdout}"
+    );
+    assert_eq!(
+        sibling_stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the known sibling keeps its independent mismatch:\n{sibling_stdout}"
+    );
+    assert!(
+        !sibling_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !sibling_stdout.contains("\"type\":\"result\""),
+        "the unknown field and known sibling should both be checked:\n{sibling_stdout}"
+    );
+    let sibling_start = sibling_source
+        .find("self.flag")
+        .expect("known sibling argument exists");
+    assert_json_diagnostic_primary_span(
+        &sibling_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        sibling_start,
+        sibling_start + "self.flag".len(),
+    );
 }
 
 #[test]
@@ -3804,6 +4005,63 @@ fn direct_call_logical_not_ignores_arguments_beyond_the_parameter_prefix() {
         call_start,
         call_start + call.len(),
     );
+}
+
+#[test]
+fn direct_call_unknown_unary_self_fields_ignore_arguments_beyond_the_parameter_prefix() {
+    let cases = [
+        (
+            "negation",
+            "-self.missing",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn inspect(self: borrow Self) -> I32 {\n",
+                "        identity_i32(1, -self.missing)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_i32(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "bitwise not",
+            "~self.missing",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn inspect(self: borrow Self) -> I32 {\n",
+                "        identity_i32(1, ~self.missing)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_i32(value: I32) -> I32 { value }\n",
+            ),
+        ),
+    ];
+    for (context, unary, source) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
+            1,
+            "{context} retains the existing arity diagnostic:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"UNKNOWN_FIELD\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} beyond the checked prefix must not be field-validated or type-checked:\n{stdout}"
+        );
+        let call = format!("identity_i32(1, {unary})");
+        let call_start = source.find(&call).expect("wrong-arity call exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "WRONG_ARGUMENT_COUNT",
+            "function expects 1 argument but found 2",
+            call_start,
+            call_start + call.len(),
+        );
+    }
 }
 
 #[test]
@@ -5698,7 +5956,7 @@ fn unknown_direct_self_field_under_neg_and_bitnot_method_tails_recovers_without_
 }
 
 #[test]
-fn unknown_direct_self_field_under_neg_and_bitnot_nested_and_call_arguments_remain_gated() {
+fn unknown_direct_self_field_under_neg_and_bitnot_nested_forms_remain_gated() {
     let cases = [
         (
             "nested negation initializer",
@@ -5744,32 +6002,6 @@ fn unknown_direct_self_field_under_neg_and_bitnot_nested_and_call_arguments_rema
                 "        ~(self.naem & 1)\n",
                 "    }\n",
                 "}\n",
-            ),
-        ),
-        (
-            "negation direct call argument",
-            concat!(
-                "type User { name: I32 }\n",
-                "impl User {\n",
-                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
-                "        let recovered = identity(-self.naem)\n",
-                "        recovered\n",
-                "    }\n",
-                "}\n",
-                "pub fn identity(value: I32) -> I32 { value }\n",
-            ),
-        ),
-        (
-            "bitwise not direct call argument",
-            concat!(
-                "type User { name: I32 }\n",
-                "impl User {\n",
-                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
-                "        let recovered = identity(~self.naem)\n",
-                "        recovered\n",
-                "    }\n",
-                "}\n",
-                "pub fn identity(value: I32) -> I32 { value }\n",
             ),
         ),
     ];
