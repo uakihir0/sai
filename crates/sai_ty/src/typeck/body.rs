@@ -532,13 +532,27 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
         let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some());
         let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
-        let is_supported_unary_field_tail = matches!(
-            tail.kind,
-            ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand)
-                if matches!(operand.kind, ExprKind::Field { .. })
-                    && self.input.self_field_projections
-                        .is_some_and(|fields| fields.contains_key(&operand.hir_id))
-        );
+        let is_supported_unary_field_tail = match tail.kind {
+            ExprKind::Unary(UnOp::Not, operand)
+                if matches!(operand.kind, ExprKind::Field { .. }) =>
+            {
+                self.input
+                    .self_field_projections
+                    .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                    || self
+                        .input
+                        .unknown_self_fields
+                        .is_some_and(|fields| fields.contains(&operand.hir_id))
+            }
+            ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand)
+                if matches!(operand.kind, ExprKind::Field { .. }) =>
+            {
+                self.input
+                    .self_field_projections
+                    .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+            }
+            _ => false,
+        };
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
@@ -2436,7 +2450,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Ok(());
         }
         let local_type = if self.expression_has_unknown_field_error(expression) {
-            if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. }) {
+            let is_supported_unknown_not_field = matches!(
+                expression.kind,
+                ExprKind::Unary(UnOp::Not, operand)
+                    if matches!(operand.kind, ExprKind::Field { .. })
+                        && self.input.unknown_self_fields
+                            .is_some_and(|fields| fields.contains(&operand.hir_id))
+            );
+            if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. })
+                && !is_supported_unknown_not_field
+            {
                 return Err(());
             }
             self.check_error_tainted_expression(expression)?;
@@ -3180,6 +3203,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             PrimitiveBoolOperandResult::Unsupported => return Err(()),
                         }
                     }
+                    Ok(())
+                }
+                ExprKind::Unary(UnOp::Not, operand)
+                    if matches!(operand.kind, ExprKind::Field { .. })
+                        && self
+                            .input
+                            .unknown_self_fields
+                            .is_some_and(|fields| fields.contains(&operand.hir_id)) =>
+                {
                     Ok(())
                 }
                 ExprKind::Unary(UnOp::BitNot, operand)

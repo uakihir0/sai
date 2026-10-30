@@ -8176,7 +8176,27 @@ fn check_inherent_method_body_type(
                     }
                 }
             }
-            ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand)
+            ExprKind::Unary(UnOp::Not, operand)
+                if matches!(operand.kind, ExprKind::Field { .. }) =>
+            {
+                if primitive_self_field_type(operand, &field_types.fields, symbols).is_none()
+                    || !collect_inherent_method_self_field(
+                        method_owner.id,
+                        operand,
+                        true,
+                        &field_types,
+                        &mut self_field_projections,
+                        &mut unknown_self_fields,
+                        &mut diagnostics,
+                        symbols,
+                        inputs,
+                        snapshot,
+                    )?
+                {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+            }
+            ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand)
                 if matches!(operand.kind, ExprKind::Field { .. }) =>
             {
                 if !matches!(
@@ -8266,7 +8286,27 @@ fn check_inherent_method_body_type(
                     }
                 }
             }
-            ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand)
+            ExprKind::Unary(UnOp::Not, operand)
+                if matches!(operand.kind, ExprKind::Field { .. }) =>
+            {
+                if primitive_self_field_type(operand, &field_types.fields, symbols).is_none()
+                    || !collect_inherent_method_self_field(
+                        method_owner.id,
+                        operand,
+                        true,
+                        &field_types,
+                        &mut self_field_projections,
+                        &mut unknown_self_fields,
+                        &mut diagnostics,
+                        symbols,
+                        inputs,
+                        snapshot,
+                    )?
+                {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+            }
+            ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand)
                 if matches!(operand.kind, ExprKind::Field { .. }) =>
             {
                 if !matches!(
@@ -8850,13 +8890,18 @@ fn check_function_body_primitive_local_block(
             ExprKind::Binary(operator, _, _)
                 if is_function_primitive_local_binary_operator(operator)
         );
-    let is_supported_unary_field_tail = matches!(
-        tail.kind,
-        ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand)
-            if matches!(operand.kind, ExprKind::Field { .. })
-                && self_field_projections
-                    .is_some_and(|fields| fields.contains_key(&operand.hir_id))
-    );
+    let is_supported_unary_field_tail = match tail.kind {
+        ExprKind::Unary(UnOp::Not, operand) if matches!(operand.kind, ExprKind::Field { .. }) => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+        }
+        ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand)
+            if matches!(operand.kind, ExprKind::Field { .. }) =>
+        {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+        }
+        _ => false,
+    };
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -9028,6 +9073,9 @@ fn check_function_body_primitive_local_block(
                 ExprKind::Field { .. }
                     if self_field_projections
                         .is_some_and(|fields| fields.contains_key(&operand.hir_id)) => {}
+                ExprKind::Field { .. }
+                    if unknown_self_fields
+                        .is_some_and(|fields| fields.contains(&operand.hir_id)) => {}
                 _ => return Ok(None),
             },
             ExprKind::Unary(UnOp::Neg, operand) => match operand.kind {
@@ -85788,6 +85836,8 @@ property "shared"() {}
             "    let propagated = copied_error + 1\n",
             "    let inferred_call = identity(self.naem)\n",
             "    let annotated_call: I32 = identity(self.naem)\n",
+            "    let inferred_not = not self.naem\n",
+            "    let annotated_not: Bool = not self.naem\n",
             "    let name = self.name\n",
             "    name\n",
             "  }\n",
@@ -85837,7 +85887,7 @@ property "shared"() {}
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
             panic!("a direct unknown self-field initializer should be checked: {check:#?}");
         };
-        assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
+        assert_eq!(diagnostics.len(), 6, "{diagnostics:#?}");
         assert!(
             diagnostics
                 .iter()
@@ -85879,6 +85929,7 @@ property "shared"() {}
             "copied_error",
             "propagated",
             "inferred_call",
+            "inferred_not",
         ] {
             assert_eq!(
                 type_results.binding_type(binding_named(name)),
@@ -85940,6 +85991,18 @@ property "shared"() {}
                 .canonical_binding_type(binding_named("annotated_call"))
                 .is_some(),
             "the explicit call-result annotation keeps its canonical fact"
+        );
+        assert_eq!(
+            type_results.binding_type(binding_named("annotated_not")),
+            Some(sai_resolve::prelude::PrimTy::Bool),
+            "an explicit Bool annotation remains authoritative for a tainted logical-not result"
+        );
+        assert!(
+            type_results
+                .partial_results()
+                .canonical_binding_type(binding_named("annotated_not"))
+                .is_some(),
+            "the explicit logical-not result annotation keeps its canonical fact"
         );
     }
 
