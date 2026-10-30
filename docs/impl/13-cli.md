@@ -1490,7 +1490,7 @@ sai explain --list
 
 Prints the explanation of a diagnostic code or a lint, as defined by [11-diagnostics.md](11-diagnostics.md) §11.13. Stage 0. The command needs no package, accepts none of the options of §13.4, and reads no file. The human output is the Markdown text of 11 §11.13.2. JSON: kind `explain` (11 §11.13.2), or, with `--list`, one record of kind `explain.list` with `{"codes":[{"code":…,"class":"hard","summary":…}]}` in byte order. Exit codes: 0 if the code is registered; 1 for `UNKNOWN_DIAGNOSTIC_CODE`. `sai explain` without an argument and without `--list` is `MISSING_ARGUMENT`.
 
-**Current implementation slice.** `sai explain --list` is implemented for all 494 registered codes in human and JSON output. `sai explain DUPLICATE_BINDING`, `INVALID_ESCAPE`, `LITERAL_OUT_OF_RANGE`, `MALFORMED_NUMBER`, and `TYPE_MISMATCH` emit their complete metadata and Markdown records in human or JSON output. All other known individual codes still report `FEATURE_NOT_IMPLEMENTED` until their complete metadata and Markdown explanation records are available. An unknown code reports `UNKNOWN_DIAGNOSTIC_CODE` with ranked candidates.
+**Current implementation slice.** `sai explain --list` is implemented for all 494 registered codes in human and JSON output. `sai explain DUPLICATE_BINDING`, `INVALID_ESCAPE`, `LITERAL_OUT_OF_RANGE`, `MALFORMED_NUMBER`, `TYPE_MISMATCH`, and `UNKNOWN_FIELD` emit their complete metadata and Markdown records in human or JSON output. All other known individual codes still report `FEATURE_NOT_IMPLEMENTED` until their complete metadata and Markdown explanation records are available. An unknown code reports `UNKNOWN_DIAGNOSTIC_CODE` with ranked candidates.
 
 ### 13.6.21 `sai lsp`
 

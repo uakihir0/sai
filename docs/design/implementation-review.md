@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1080 (2026-10-30): explain unknown field diagnostics
+
+- **Decision:** Register a complete `sai explain UNKNOWN_FIELD` record with the normative stage, owner, summary, metadata, and a source example plus correction. Describe unknown fields in access, construction, and pattern positions; distinguish inaccessible fields (`PRIVATE_FIELD`), tuple indices outside the arity (`TUPLE_INDEX_OUT_OF_RANGE`), and enum payload access before matching the variant.
+- **Reason:** `UNKNOWN_FIELD` is registered and emitted by the checker, but its individual explanation is still behind `FEATURE_NOT_IMPLEMENTED`. A complete record lets the Stage 0 explanation command describe this diagnostic without claiming broader checker support.
+- **Boundary and judgment:** Use a bounded inherent-method field tail in the example because the current reference checker can reproduce that exact `UNKNOWN_FIELD` case and verify its corrected form. The sample illustrates one producing form; it does not claim that general Stage 1 field checking is implemented. This example boundary and the distinctions among related diagnostics are **Review required**.
+- **Review required:** Check the record metadata against Appendix A and the diagnostic owner; verify the example emits exactly `UNKNOWN_FIELD`, the fix emits no diagnostics, and both are formatter-canonical; ensure the prose does not confuse private fields, missing record fields, out-of-range tuple indices, or enum variants that must be matched.
+- **Verification:** `cargo test -p sai_diagnostics --locked`, `cargo test -p sai_cli --test explain --locked`, and `cargo test --workspace --locked` passed. The explanation smoke passed all six selected records; its Python unit suite passed all 21 tests. `cargo fmt --all -- --check` and `git diff --check` passed.
+- **Hostile review:** The independent review found stale gating assertions and implementation-slice documentation, then a tuple-index wording gap. The tests and docs were updated, and the explanation now states that zero-based out-of-range tuple indices use `TUPLE_INDEX_OUT_OF_RANGE`, while index access on non-tuple receivers uses `UNKNOWN_FIELD`. Final re-review found no remaining actionable issues.
+
 ### Sample projects (2026-10-27): add richer source examples
 
 - **Decision:** Add two project-shaped examples beyond Hello World: a robust sensor-statistics lab using median/MAD with bounded arithmetic, and a typed bytecode verifier using a bounded control-flow worklist and stack-join checks. Keep deterministic fixtures and document their current compiler-stage limits.
