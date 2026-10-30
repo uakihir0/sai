@@ -1,0 +1,10 @@
+use sai:alloc
+use sai:core/fmt
+
+pub use sai:core.{Option, Result}
+pub use sai:core/fmt.{FormatSpec, Writer, Writer as Sink}
+
+//@ kind: fmt
+//@ stage: 0
+//@ spec: impl/14 §14.7.2, impl/14 §14.14, spec/04 §4.2.1, spec/04 §4.3.1
+fn helper() {}
