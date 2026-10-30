@@ -6612,6 +6612,421 @@ fn unsupported_inherent_method_shapes_remain_gated() {
 }
 
 #[test]
+fn unknown_direct_self_fields_are_supported_for_every_non_boolean_binary_method_tail_operator() {
+    let operators = [
+        ("add", "+"),
+        ("subtract", "-"),
+        ("multiply", "*"),
+        ("divide", "/"),
+        ("remainder", "%"),
+        ("wrap_add", "+%"),
+        ("wrap_subtract", "-%"),
+        ("wrap_multiply", "*%"),
+        ("bit_and", "&"),
+        ("bit_or", "|"),
+        ("bit_xor", "^"),
+        ("shift_left", "<<"),
+        ("shift_right", ">>"),
+    ];
+    for (name, operator) in operators {
+        let unknown_name = format!("missing_{name}");
+        let source = format!(
+            "type User {{ count: I32 }}\n\
+             impl User {{\n\
+             pub fn recover(self: borrow Self) -> I32 {{\n\
+             self.count {operator} self.{unknown_name}\n\
+             }}\n\
+             }}\n"
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{name}:\n{stdout}");
+        assert!(output.stderr.is_empty(), "{name}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{name}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{name} should recover without a feature gate or successful result:\n{stdout}"
+        );
+        let field_start = source
+            .find(&format!("self.{unknown_name}"))
+            .expect("unknown field access exists")
+            + "self.".len();
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            &format!("`User` has no field `{unknown_name}`"),
+            field_start,
+            field_start + unknown_name.len(),
+        );
+    }
+}
+
+#[test]
+fn unknown_direct_self_fields_in_non_boolean_method_tails_are_diagnosed() {
+    let cases = [
+        (
+            "unknown right side keeps left-directed arithmetic result",
+            concat!(
+                "type User { count: I64 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        self.count + self.cout\n",
+                "    }\n",
+                "}\n",
+            ),
+            "cout",
+            Some((
+                "TYPE_MISMATCH",
+                "expected `I32`, found `I64`",
+                "self.count + self.cout",
+            )),
+        ),
+        (
+            "unknown left side does not invent a result type",
+            concat!(
+                "type User { count: I64 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I64 {\n",
+                "        self.cout + self.count\n",
+                "    }\n",
+                "}\n",
+            ),
+            "cout",
+            None,
+        ),
+        (
+            "unknown remainder operand keeps left type",
+            concat!(
+                "type User { count: U32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        self.count % self.cout\n",
+                "    }\n",
+                "}\n",
+            ),
+            "cout",
+            Some((
+                "TYPE_MISMATCH",
+                "expected `I32`, found `U32`",
+                "self.count % self.cout",
+            )),
+        ),
+        (
+            "unknown wrapping operand keeps left type",
+            concat!(
+                "type User { count: U16 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        self.count +% self.cout\n",
+                "    }\n",
+                "}\n",
+            ),
+            "cout",
+            Some((
+                "TYPE_MISMATCH",
+                "expected `I32`, found `U16`",
+                "self.count +% self.cout",
+            )),
+        ),
+        (
+            "unknown bitwise operand keeps left type",
+            concat!(
+                "type User { count: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        self.count & self.cout\n",
+                "    }\n",
+                "}\n",
+            ),
+            "cout",
+            Some((
+                "TYPE_MISMATCH",
+                "expected `Bool`, found `I32`",
+                "self.count & self.cout",
+            )),
+        ),
+        (
+            "unknown shift count keeps left type",
+            concat!(
+                "type User { count: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        self.count << self.cout\n",
+                "    }\n",
+                "}\n",
+            ),
+            "cout",
+            Some((
+                "TYPE_MISMATCH",
+                "expected `Bool`, found `I32`",
+                "self.count << self.cout",
+            )),
+        ),
+    ];
+
+    for (context, source, unknown_name, independent_mismatch) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert!(output.stderr.is_empty(), "{context}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{context}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} should recover without a feature gate or successful result:\n{stdout}"
+        );
+        let field_start = source
+            .find(&format!("self.{unknown_name}"))
+            .expect("unknown field access exists")
+            + "self.".len();
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            &format!("`User` has no field `{unknown_name}`"),
+            field_start,
+            field_start + unknown_name.len(),
+        );
+
+        if let Some((code, message, expression)) = independent_mismatch {
+            assert_eq!(
+                stdout.matches(&format!("\"code\":\"{code}\"")).count(),
+                1,
+                "{context} should retain exactly one independent result mismatch:\n{stdout}"
+            );
+            let expression_start = source.find(expression).expect("tail exists");
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                code,
+                message,
+                expression_start,
+                expression_start + expression.len(),
+            );
+        } else {
+            assert!(
+                !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+                "{context} must not invent a result mismatch:\n{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_left_non_boolean_tail_fields_do_not_infer_from_the_right_operand() {
+    let operators = [
+        ("add", "+", "I32"),
+        ("subtract", "-", "I32"),
+        ("multiply", "*", "I32"),
+        ("divide", "/", "I32"),
+        ("remainder", "%", "I32"),
+        ("wrap_add", "+%", "I32"),
+        ("wrap_subtract", "-%", "I32"),
+        ("wrap_multiply", "*%", "I32"),
+        ("bit_and", "&", "I32"),
+        ("bit_or", "|", "I32"),
+        ("bit_xor", "^", "I32"),
+        ("shift_left", "<<", "U32"),
+        ("shift_right", ">>", "U32"),
+    ];
+    for (name, operator, right_type) in operators {
+        let unknown_name = format!("missing_{name}");
+        let source = format!(
+            "type User {{ count: I32 }}\n\
+             impl User {{\n\
+             pub fn recover(self: borrow Self, right: {right_type}) -> Bool {{\n\
+             self.{unknown_name} {operator} right\n\
+             }}\n\
+             }}\n"
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{name}:\n{stdout}");
+        assert!(output.stderr.is_empty(), "{name}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{name}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{name} must not infer a result from the known right operand:\n{stdout}"
+        );
+        let field_start = source
+            .find(&format!("self.{unknown_name}"))
+            .expect("unknown field access exists")
+            + "self.".len();
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            &format!("`User` has no field `{unknown_name}`"),
+            field_start,
+            field_start + unknown_name.len(),
+        );
+    }
+}
+
+#[test]
+fn unknown_direct_self_fields_in_both_non_boolean_tail_operands_do_not_infer_a_result() {
+    let operators = [
+        ("add", "+"),
+        ("subtract", "-"),
+        ("multiply", "*"),
+        ("divide", "/"),
+        ("remainder", "%"),
+        ("wrap_add", "+%"),
+        ("wrap_subtract", "-%"),
+        ("wrap_multiply", "*%"),
+        ("bit_and", "&"),
+        ("bit_or", "|"),
+        ("bit_xor", "^"),
+        ("shift_left", "<<"),
+        ("shift_right", ">>"),
+    ];
+    for (name, operator) in operators {
+        let left_name = format!("missing_left_{name}");
+        let right_name = format!("missing_right_{name}");
+        let source = format!(
+            "type User {{ count: I32 }}\n\
+             impl User {{\n\
+             pub fn recover(self: borrow Self) -> Bool {{\n\
+             self.{left_name} {operator} self.{right_name}\n\
+             }}\n\
+             }}\n"
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{name}:\n{stdout}");
+        assert!(output.stderr.is_empty(), "{name}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            2,
+            "{name}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{name} has no recoverable result type:\n{stdout}"
+        );
+        for unknown_name in [&left_name, &right_name] {
+            let field_start = source
+                .find(&format!("self.{unknown_name}"))
+                .expect("unknown field access exists")
+                + "self.".len();
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "UNKNOWN_FIELD",
+                &format!("`User` has no field `{unknown_name}`"),
+                field_start,
+                field_start + unknown_name.len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_left_shift_field_keeps_independent_shift_count_mismatch() {
+    let source = concat!(
+        "type User { count: I32 }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self, shift: I32) -> Bool {\n",
+        "        self.missing << shift\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty(), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the unknown left field must not block checking the known shift count:\n{stdout}"
+    );
+    let unknown_start = source.find("missing").expect("unknown name exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "UNKNOWN_FIELD",
+        "`User` has no field `missing`",
+        unknown_start,
+        unknown_start + "missing".len(),
+    );
+    let shift_start = source.find("shift\n").expect("shift parameter use exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U32`, found `I32`",
+        shift_start,
+        shift_start + "shift".len(),
+    );
+}
+
+#[test]
+fn unknown_right_float_remainder_keeps_independent_operator_and_return_diagnostics() {
+    let source = concat!(
+        "type User { ratio: F64 }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self) -> I32 {\n",
+        "        self.ratio % self.missing\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty(), "{stdout}");
+    for (code, message) in [
+        ("UNKNOWN_FIELD", "`User` has no field `missing`"),
+        (
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `%` is not defined for `F64`",
+        ),
+        ("TYPE_MISMATCH", "expected `I32`, found `F64`"),
+    ] {
+        assert_eq!(
+            stdout.matches(&format!("\"code\":\"{code}\"")).count(),
+            1,
+            "{code}:\n{stdout}"
+        );
+        let (start, end) = if code == "UNKNOWN_FIELD" {
+            let start = source.find("missing").expect("unknown name exists");
+            (start, start + "missing".len())
+        } else {
+            let start = source
+                .find("self.ratio % self.missing")
+                .expect("tail exists");
+            (start, start + "self.ratio % self.missing".len())
+        };
+        assert_json_diagnostic_primary_span(&stdout, code, message, start, end);
+    }
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a missing right field must retain independent remainder and return diagnostics:\n{stdout}"
+    );
+}
+
+#[test]
 fn unknown_direct_self_field_operator_method_tail_stays_gated() {
     let cases = [
         concat!(
@@ -6619,14 +7034,6 @@ fn unknown_direct_self_field_operator_method_tail_stays_gated() {
             "impl Counter {\n",
             "    pub fn current_count(self: borrow Self) -> I32 {\n",
             "        self.missing + 1\n",
-            "    }\n",
-            "}\n",
-        ),
-        concat!(
-            "type Counter { marker: I32 }\n",
-            "impl Counter {\n",
-            "    pub fn current_count(self: borrow Self) -> I32 {\n",
-            "        self.missing + self.marker\n",
             "    }\n",
             "}\n",
         ),
@@ -6699,6 +7106,30 @@ fn unknown_direct_self_field_operator_method_tail_stays_gated() {
             "impl Counter {\n",
             "    pub fn current_count(self: borrow Self) -> Bool {\n",
             "        self.missing == absent\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> I32 {\n",
+            "        self.missing + absent\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32, other: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> I32 {\n",
+            "        self.missing + (self.marker + self.other)\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> I32 {\n",
+            "        self.missing + self.enabled\n",
             "    }\n",
             "}\n",
         ),
