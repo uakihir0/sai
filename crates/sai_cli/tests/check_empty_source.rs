@@ -3659,6 +3659,88 @@ fn public_inherent_method_not_and_neg_read_direct_primitive_fields() {
 }
 
 #[test]
+fn public_inherent_method_logical_not_tail_reads_direct_bool_field() {
+    let sources = [
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn invert(self: borrow Self) -> Bool {\n",
+            "        not self.enabled\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn invert(self: borrow Self) -> Bool {\n",
+            "        let ready = true\n",
+            "        not self.enabled\n",
+            "    }\n",
+            "}\n",
+        ),
+    ];
+    for source in sources {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_inherent_method_logical_not_tail_errors_keep_precise_spans() {
+    let cases = [
+        (
+            concat!(
+                "type Counter { amount: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self) -> Bool {\n",
+                "        not self.amount\n",
+                "    }\n",
+                "}\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `Bool`, found `I32`",
+            "self.amount",
+        ),
+        (
+            concat!(
+                "type Counter { enabled: Bool }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self) -> I32 {\n",
+                "        not self.enabled\n",
+                "    }\n",
+                "}\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `I32`, found `Bool`",
+            "not self.enabled",
+        ),
+    ];
+    for (source, code, message, expression) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            stdout.matches(&format!("\"code\":\"{code}\"")).count(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "a supported logical-not tail error must not be hidden by a feature gate:\n{stdout}"
+        );
+        let start = source.find(expression).expect("tail expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            code,
+            message,
+            start,
+            start + expression.len(),
+        );
+    }
+}
+
+#[test]
 fn public_inherent_method_not_and_neg_field_errors_keep_precise_spans() {
     let cases = [
         (
@@ -3788,24 +3870,48 @@ fn unsupported_direct_self_field_not_and_neg_shapes_stay_gated() {
             false,
         ),
         (
-            "logical-not tail",
-            concat!(
-                "type Counter { enabled: Bool }\n",
-                "impl Counter {\n",
-                "    pub fn invert(self: borrow Self) -> Bool {\n",
-                "        not self.enabled\n",
-                "    }\n",
-                "}\n",
-            ),
-            false,
-        ),
-        (
             "negation tail",
             concat!(
                 "type Counter { amount: I32 }\n",
                 "impl Counter {\n",
                 "    pub fn negate(self: borrow Self) -> I32 {\n",
                 "        -self.amount\n",
+                "    }\n",
+                "}\n",
+            ),
+            false,
+        ),
+        (
+            "unknown logical-not tail field",
+            concat!(
+                "type Counter { enabled: Bool }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self) -> Bool {\n",
+                "        not self.missing\n",
+                "    }\n",
+                "}\n",
+            ),
+            true,
+        ),
+        (
+            "computed logical-not tail operand",
+            concat!(
+                "type Counter { enabled: Bool, other: Bool }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self) -> Bool {\n",
+                "        not (self.enabled and self.other)\n",
+                "    }\n",
+                "}\n",
+            ),
+            false,
+        ),
+        (
+            "logical-not tail over a local path",
+            concat!(
+                "type Counter { enabled: Bool }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self, value: Bool) -> Bool {\n",
+                "        not value\n",
                 "    }\n",
                 "}\n",
             ),
