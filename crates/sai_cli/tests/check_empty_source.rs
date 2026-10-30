@@ -6056,16 +6056,165 @@ fn unknown_direct_self_field_operator_method_tail_stays_gated() {
             "    }\n",
             "}\n",
         ),
+        concat!(
+            "type Counter { marker: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        self.missing == self.marker\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        self.missing and true\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        self.missing and (self.marker and true)\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        self.missing and absent\n",
+            "    }\n",
+            "}\n",
+        ),
     ];
     for source in cases {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            output.stderr.is_empty(),
+            "a rejected binary tail must not leak staged diagnostics to stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
                 && !stdout.contains("\"code\":\"UNKNOWN_FIELD\"")
                 && !stdout.contains("\"type\":\"result\""),
             "an unknown field in a rejected binary tail must not leak a field diagnostic:\n{stdout}"
         );
+    }
+}
+
+#[test]
+fn unknown_direct_self_fields_in_logical_method_tails_are_diagnosed() {
+    let cases = [
+        (
+            "unknown left side of and with independent return mismatch",
+            concat!(
+                "type User { enabled: Bool }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        self.enabld and self.enabled\n",
+                "    }\n",
+                "}\n",
+            ),
+            "enabld",
+            Some((
+                "TYPE_MISMATCH",
+                "expected `I32`, found `Bool`",
+                "self.enabld and self.enabled",
+            )),
+        ),
+        (
+            "unknown right side of or with independent operand mismatch",
+            concat!(
+                "type User { count: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        self.count or self.cont\n",
+                "    }\n",
+                "}\n",
+            ),
+            "cont",
+            Some((
+                "TYPE_MISMATCH",
+                "expected `Bool`, found `I32`",
+                "self.count",
+            )),
+        ),
+        (
+            "two unknown operands",
+            concat!(
+                "type User { name: Bool }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        self.naem and self.nam\n",
+                "    }\n",
+                "}\n",
+            ),
+            "naem",
+            None,
+        ),
+    ];
+
+    for (context, source, first_unknown_name, independent_mismatch) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        let expected_unknown_count = if context == "two unknown operands" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            expected_unknown_count,
+            "{context}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} should be checked without reporting a successful result:\n{stdout}"
+        );
+
+        let first_unknown_start = source
+            .find(first_unknown_name)
+            .expect("first unknown field exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            if first_unknown_name == "enabld" {
+                "`User` has no field `enabld`"
+            } else if first_unknown_name == "cont" {
+                "`User` has no field `cont`"
+            } else {
+                "`User` has no field `naem`"
+            },
+            first_unknown_start,
+            first_unknown_start + first_unknown_name.len(),
+        );
+
+        if let Some((code, message, expression)) = independent_mismatch {
+            assert_eq!(
+                stdout.matches(&format!("\"code\":\"{code}\"")).count(),
+                1,
+                "{context} retains exactly one independent mismatch:\n{stdout}"
+            );
+            let expression_start = source.find(expression).expect("mismatch expression exists");
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                code,
+                message,
+                expression_start,
+                expression_start + expression.len(),
+            );
+        } else {
+            assert!(
+                !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+                "{context} must not invent operand mismatches:\n{stdout}"
+            );
+        }
     }
 }
 
