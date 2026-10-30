@@ -3350,6 +3350,153 @@ fn public_inherent_method_body_reads_primitive_field() {
 }
 
 #[test]
+fn public_inherent_method_binary_operators_read_direct_primitive_fields() {
+    let source = concat!(
+        "type Counter { count: I32, enabled: Bool, shift: U32 }\n",
+        "impl Counter {\n",
+        "    pub fn exercise(self: borrow Self) -> I32 {\n",
+        "        let left = self.count + 1\n",
+        "        let right = 1 + self.count\n",
+        "        let pair = self.count + self.count\n",
+        "        let remainder = self.count % self.count\n",
+        "        let wrapped = self.count +% self.count\n",
+        "        let bits = self.count & self.count\n",
+        "        let shifted = self.count << self.shift\n",
+        "        let compared = self.count < self.count\n",
+        "        let logical = self.enabled and self.enabled\n",
+        "        pair\n",
+        "    }\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn public_inherent_method_binary_field_errors_keep_precise_spans() {
+    let cases = [
+        (
+            concat!(
+                "type Counter { count: I32, ratio: F32 }\n",
+                "impl Counter {\n",
+                "    pub fn operand_mismatch(self: borrow Self) -> I32 {\n",
+                "        let result = self.count + self.ratio\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            "expected `I32`, found `F32`",
+            "self.ratio",
+        ),
+        (
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn annotation_mismatch(self: borrow Self) -> Bool {\n",
+                "        let result: Bool = self.count + 1\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            "expected `Bool`, found `I32`",
+            "self.count + 1",
+        ),
+    ];
+    for (source, message, expression) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "each method should report its one expected mismatch:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "known field operand errors remain in the supported type-checking slice:\n{stdout}"
+        );
+
+        let start = source
+            .find(expression)
+            .expect("mismatched expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            message,
+            start,
+            start + expression.len(),
+        );
+    }
+}
+
+#[test]
+fn public_inherent_method_known_char_field_keeps_operator_trait_diagnostic() {
+    let source = concat!(
+        "type Counter { letter: Char }\n",
+        "impl Counter {\n",
+        "    pub fn bitwise(self: borrow Self) -> Char {\n",
+        "        let result = self.letter & 1\n",
+        "        result\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "a concrete Char field establishes the missing bitwise trait:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the unsupported operator is a semantic diagnostic, not a shape gate:\n{stdout}"
+    );
+    let expression_start = source
+        .find("self.letter & 1")
+        .expect("unsupported bitwise expression exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+        expression_start,
+        expression_start + "self.letter & 1".len(),
+    );
+}
+
+#[test]
+fn unknown_self_field_binary_keeps_known_direct_field_sibling() {
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn recover(self: borrow Self) -> I32 {\n",
+        "        let result = self.missing + self.count\n",
+        "        result\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "the missing field remains a hard field-resolution error:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\""),
+        "the known sibling keeps the binary in the error-tainted checker without inventing an error:\n{stdout}"
+    );
+}
+
+#[test]
 fn public_inherent_method_returns_primitive_field_as_tail() {
     let source = concat!(
         "type Counter { count: I32 }\n",
@@ -4310,12 +4457,36 @@ fn unsupported_inherent_method_shapes_remain_gated() {
             ),
         ),
         (
-            "known receiver field in an operator",
+            "known receiver field in an unsupported operator shape",
             concat!(
                 "type Counter { marker: I32 }\n",
                 "impl Counter {\n",
                 "    pub fn add_one(self: borrow Self) -> I32 {\n",
-                "        let result = self.marker + 1\n",
+                "        let result = self.marker + true\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "nested binary operand",
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn add_one(self: borrow Self) -> I32 {\n",
+                "        let result = (self.marker + 1) + 2\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "unary receiver field operand",
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn negate(self: borrow Self) -> I32 {\n",
+                "        let result = -self.marker\n",
                 "        result\n",
                 "    }\n",
                 "}\n",
@@ -4328,6 +4499,17 @@ fn unsupported_inherent_method_shapes_remain_gated() {
                 "impl Counter {\n",
                 "    pub fn current_count(self: borrow Self) -> I32 {\n",
                 "        self.missing + 1\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "known receiver binary operator as the method tail",
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn current_count(self: borrow Self) -> I32 {\n",
+                "        self.marker + 1\n",
                 "    }\n",
                 "}\n",
             ),
