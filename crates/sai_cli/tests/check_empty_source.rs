@@ -3384,6 +3384,101 @@ fn public_inherent_method_direct_call_field_mismatch_uses_field_span() {
 }
 
 #[test]
+fn direct_call_unary_known_self_fields_accept_root_and_nested_positions() {
+    let source = concat!(
+        "type Counter { amount: I32, bits: U8 }\n",
+        "impl Counter {\n",
+        "    pub fn pass_unary_fields(self: borrow Self) -> I32 {\n",
+        "        let negated = identity(-self.amount)\n",
+        "        let inverted = identity_u8(~self.bits)\n",
+        "        let nested_negated = identity(identity(-self.amount))\n",
+        "        let nested_inverted = identity_u8(identity_u8(~self.bits))\n",
+        "        combine(negated, nested_negated, inverted, nested_inverted)\n",
+        "    }\n",
+        "}\n",
+        "pub fn identity(value: I32) -> I32 { value }\n",
+        "pub fn identity_u8(value: U8) -> U8 { value }\n",
+        "pub fn combine(first: I32, second: I32, third: U8, fourth: U8) -> I32 {\n",
+        "    let result = first + second\n",
+        "    result\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn direct_call_unary_known_self_field_errors_keep_precise_spans() {
+    let cases = [
+        (
+            concat!(
+                "type Counter { amount: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn mismatch(self: borrow Self) -> Bool {\n",
+                "        identity_bool(-self.amount)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_bool(value: Bool) -> Bool { value }\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `Bool`, found `I32`",
+            "-self.amount",
+        ),
+        (
+            concat!(
+                "type Counter { amount: U32 }\n",
+                "impl Counter {\n",
+                "    pub fn unsupported(self: borrow Self) -> U32 {\n",
+                "        identity_u32(-self.amount)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_u32(value: U32) -> U32 { value }\n",
+            ),
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `-` has no `Neg` implementation for `U32`",
+            "-self.amount",
+        ),
+        (
+            concat!(
+                "type Counter { enabled: Bool }\n",
+                "impl Counter {\n",
+                "    pub fn unsupported(self: borrow Self) -> Bool {\n",
+                "        identity_bool(~self.enabled)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_bool(value: Bool) -> Bool { value }\n",
+            ),
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `~` has no `BitNot` implementation for `Bool`",
+            "~self.enabled",
+        ),
+    ];
+    for (source, code, message, expression) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            stdout.matches(&format!("\"code\":\"{code}\"")).count(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "a supported direct-call unary field error must remain a semantic diagnostic:\n{stdout}"
+        );
+        let start = source.find(expression).expect("unary argument exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            code,
+            message,
+            start,
+            start + expression.len(),
+        );
+    }
+}
+
+#[test]
 fn inherent_method_direct_calls_keep_unsupported_trailing_items_gated() {
     let cases = [
         (
@@ -3453,6 +3548,42 @@ fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
                 "    }\n",
                 "}\n",
                 "pub fn identity(value: Bool) -> Bool { value }\n",
+            ),
+        ),
+        (
+            "unknown field under negation in a call argument",
+            concat!(
+                "type Counter { amount: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(-self.missing)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "unknown field under bitwise not in a call argument",
+            concat!(
+                "type Counter { bits: U8 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> U8 {\n",
+                "        identity_u8(~self.missing)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_u8(value: U8) -> U8 { value }\n",
+            ),
+        ),
+        (
+            "computed negation operand in a call argument",
+            concat!(
+                "type Counter { amount: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(-(-self.amount))\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value }\n",
             ),
         ),
         (
