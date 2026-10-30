@@ -208,8 +208,9 @@ Fixed-point and `fmt --check` checks apply only to `fmt` pass fixtures.
 
 `python3 -B tools/conformance/run_explanation_smoke.py --iut /absolute/path/to/sai`
 checks the currently selected complete explanation records:
-`DUPLICATE_BINDING` and `INVALID_ESCAPE` (Stage 0), plus `TYPE_MISMATCH`
-(Stage 1). It verifies their `--list` entries, JSON metadata, Markdown
+`DUPLICATE_BINDING`, `INVALID_ESCAPE`, and `LITERAL_OUT_OF_RANGE` (Stage 0),
+plus `TYPE_MISMATCH` (Stage 1). It verifies their `--list` entries, JSON
+metadata, Markdown
 heading/table/section structure, and marked Example and Fix fences. It checks
 each Example with the generated single-file package,
 tries `sai check` before the documented `sai build` fallback, checks each Fix
@@ -220,6 +221,8 @@ For `INVALID_ESCAPE`, the runner accepts only the current `sai check`
 `FEATURE_NOT_IMPLEMENTED` gate alongside the required diagnostic. It still
 rejects every other unmarked diagnostic. This reflects the present Stage 0
 checker boundary; the Example must produce `INVALID_ESCAPE` itself.
+`LITERAL_OUT_OF_RANGE` has no gate allowance: its Example must produce only the
+marked diagnostic.
 
 This runner does not check the remaining registered records, general staged
 applicability, diagnostic tables, or the registry requirements in `impl/15`

@@ -718,6 +718,8 @@ These tests live in `tests/impl/` and use the reference implementation's crates 
 
 **Explanation-record smoke extension (IR-1063):** The same non-claim runner also checks the complete Stage 1 `TYPE_MISMATCH` record. It tests two Stage 0 records and one Stage 1 record; it does not validate stage applicability generally or the other registered records.
 
+**Explanation-record smoke extension (IR-1064):** The non-claim runner also checks the complete Stage 0 `LITERAL_OUT_OF_RANGE` record. Its canonical Example must emit exactly the marked range error without an unrelated feature gate, its Fix must pass, and both must remain formatter-canonical. The selected set now covers three Stage 0 records and one Stage 1 record; it still does not validate stage applicability generally or the other registered records.
+
 ### N-J-41 Expected diagnostics are matched by line and code
 
 - **Rule:** Diagnostics are compared as multisets of `(file, line, severity, code)`. Acceptance and rejection must always be correct. The reference implementation must match exactly; other implementations get deviations for missing and unexpected codes, which do not fail a claim but are reported with it. An internal compiler error always fails.
