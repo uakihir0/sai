@@ -4624,6 +4624,192 @@ fn public_inherent_method_negation_and_bitwise_not_tails_read_direct_fields() {
 }
 
 #[test]
+fn public_inherent_method_unary_tails_accept_local_paths() {
+    let sources = [
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn invert(self: borrow Self, enabled: Bool) -> Bool {\n",
+            "        not enabled\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn negate(self: borrow Self, amount: I32) -> I32 {\n",
+            "        -amount\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn invert(self: borrow Self, bits: U8) -> U8 {\n",
+            "        ~bits\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn negate(self: borrow Self, amount: I32) -> I32 {\n",
+            "        let copy: I32 = amount\n",
+            "        -copy\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn invert(self: borrow Self, enabled: Bool) -> Bool {\n",
+            "        let copy = enabled\n",
+            "        not copy\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn invert(self: borrow Self, bits: U8) -> U8 {\n",
+            "        let copy: U8 = bits\n",
+            "        ~copy\n",
+            "    }\n",
+            "}\n",
+        ),
+    ];
+    for source in sources {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_inherent_method_unary_local_path_tail_errors_keep_precise_spans() {
+    let cases = [
+        (
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self, amount: I32) -> Bool {\n",
+                "        not amount\n",
+                "    }\n",
+                "}\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `Bool`, found `I32`",
+            "amount",
+        ),
+        (
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn negate(self: borrow Self, amount: U32) -> U32 {\n",
+                "        -amount\n",
+                "    }\n",
+                "}\n",
+            ),
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `-` has no `Neg` implementation for `U32`",
+            "-amount",
+        ),
+        (
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self, enabled: Bool) -> Bool {\n",
+                "        ~enabled\n",
+                "    }\n",
+                "}\n",
+            ),
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `~` has no `BitNot` implementation for `Bool`",
+            "~enabled",
+        ),
+        (
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self, enabled: Bool) -> I32 {\n",
+                "        not enabled\n",
+                "    }\n",
+                "}\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `I32`, found `Bool`",
+            "not enabled",
+        ),
+        (
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self) -> Bool {\n",
+                "        let amount = 1\n",
+                "        not amount\n",
+                "    }\n",
+                "}\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `Bool`, found `I64`",
+            "amount",
+        ),
+        (
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self) -> Bool {\n",
+                "        let amount = 1.0\n",
+                "        not amount\n",
+                "    }\n",
+                "}\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `Bool`, found `F64`",
+            "amount",
+        ),
+        (
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self) -> Bool {\n",
+                "        let amount = 1 + 2\n",
+                "        not amount\n",
+                "    }\n",
+                "}\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `Bool`, found `I64`",
+            "amount",
+        ),
+    ];
+    for (source, code, message, expression) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            stdout.matches(&format!("\"code\":\"{code}\"")).count(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "a supported unary local-path tail error must not be hidden by a feature gate:\n{stdout}"
+        );
+        let start = source
+            .rfind(expression)
+            .expect("unary tail expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            code,
+            message,
+            start,
+            start + expression.len(),
+        );
+    }
+}
+
+#[test]
 fn public_inherent_method_negation_and_bitwise_not_tail_errors_keep_precise_spans() {
     let cases = [
         (
@@ -4927,36 +5113,36 @@ fn unsupported_direct_self_field_unary_computed_shapes_stay_gated() {
             false,
         ),
         (
-            "negation tail over a local path",
+            "computed negation tail over a local path",
             concat!(
                 "type Counter { amount: I32 }\n",
                 "impl Counter {\n",
                 "    pub fn negate(self: borrow Self, value: I32) -> I32 {\n",
-                "        -value\n",
+                "        -(value + 1)\n",
                 "    }\n",
                 "}\n",
             ),
             false,
         ),
         (
-            "bitwise-not tail over a local path",
+            "nested bitwise-not tail over a local path",
             concat!(
                 "type Counter { bits: U8 }\n",
                 "impl Counter {\n",
                 "    pub fn invert(self: borrow Self, value: U8) -> U8 {\n",
-                "        ~value\n",
+                "        ~~value\n",
                 "    }\n",
                 "}\n",
             ),
             false,
         ),
         (
-            "logical-not tail over a local path",
+            "nested logical-not tail over a local path",
             concat!(
                 "type Counter { enabled: Bool }\n",
                 "impl Counter {\n",
                 "    pub fn invert(self: borrow Self, value: Bool) -> Bool {\n",
-                "        not value\n",
+                "        not not value\n",
                 "    }\n",
                 "}\n",
             ),
