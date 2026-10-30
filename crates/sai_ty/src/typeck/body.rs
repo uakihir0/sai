@@ -3154,7 +3154,27 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.record_expression_type(operand.hir_id, bool_type);
                 Ok(bool_type)
             }
-            ExprKind::Path(_) => self.check_logical_not(operand),
+            ExprKind::Path(_) => match self.check_local_path(operand)? {
+                LocalType::Error(_) => {
+                    if let Some(operand_type) = self.known_recovery_operand_type(operand) {
+                        match primitive_bool_operand_result(operand_type) {
+                            PrimitiveBoolOperandResult::Bool => {}
+                            PrimitiveBoolOperandResult::TypeMismatch { found } => {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: operand.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                        expected: PrimTy::Bool,
+                                        found,
+                                    },
+                                });
+                            }
+                            PrimitiveBoolOperandResult::Unsupported => return Err(()),
+                        }
+                    }
+                    Ok(LocalType::Concrete(PrimTy::Bool))
+                }
+                _ => self.check_logical_not(operand),
+            },
             ExprKind::Field { .. } if self.expression_has_unknown_field_error(operand) => {
                 Ok(LocalType::Concrete(PrimTy::Bool))
             }
