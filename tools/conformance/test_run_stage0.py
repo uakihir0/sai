@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from run_stage0 import (
     FMT_LAYOUT_VARIANT_COUNT,
+    FMT_SOURCE_MAX_BYTES,
     ROOT_ID,
     SmokeError,
     _generate_fmt_layout_variants,
@@ -40,6 +41,13 @@ class Stage0SmokeRunnerTests(unittest.TestCase):
         self.refusal_code = "EXPECTED_TOKEN"
         self.refusal_line = None
         self.expected_format = None
+        self.probe_limit = 31
+        self.fmt_source_max_bytes_patch = patch(
+            "run_stage0.FMT_SOURCE_MAX_BYTES",
+            self.probe_limit,
+        )
+        self.fmt_source_max_bytes_patch.start()
+        self.addCleanup(self.fmt_source_max_bytes_patch.stop)
         self.layout_variants = [f"mock layout {index}\n".encode("utf-8") for index in range(16)]
         self.layout_variants_patch = patch(
             "run_stage0._generate_fmt_layout_variants",
@@ -63,6 +71,8 @@ ROOT = {ROOT_ID!r}
 REFUSAL_CODE = {self.refusal_code!r}
 REFUSAL_LINE = {self.refusal_line!r}
 EXPECTED_FORMATTED = {self.expected_format!r}
+EXPECTED_SIZE_PROBE_LENGTH = {self.probe_limit + 1}
+EXPECTED_SIZE_PROBE = b"/*" + b" " * (EXPECTED_SIZE_PROBE_LENGTH - 2)
 
 def line(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\\n"
@@ -87,6 +97,7 @@ if args == ["--format=json", "explain", "--list"]:
         codes = [
             "EXPECTED_TOKEN",
             "FEATURE_NOT_IMPLEMENTED",
+            "IMPLEMENTATION_LIMIT_EXCEEDED",
             "INTERNAL_COMPILER_ERROR",
             "INVALID_ASSIGN_TARGET",
             "INVARIANT_OUTSIDE_DEFINING_MODULE",
@@ -450,6 +461,62 @@ if args == [
     "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
 ]:
     formatter_input = sys.stdin.buffer.read()
+    if formatter_input == EXPECTED_SIZE_PROBE:
+        if MODE.startswith("fmt_size_refusal"):
+            try:
+                receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                receipt = {{}}
+            receipt["size_refusal_probe"] = {{
+                "argv":args,
+                "input_length":len(formatter_input),
+                "prefix":formatter_input[:2].decode("ascii"),
+            }}
+            receipt.setdefault("calls", []).append("fmt-size-refusal")
+            Path(RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
+        diagnostic = {{
+            "type":"diagnostic","code":"IMPLEMENTATION_LIMIT_EXCEEDED",
+            "severity":"error","level":None,
+            "message":f"source file is {{len(formatter_input)}} bytes, exceeding the 16 MiB limit",
+            "primary":{{
+                "file":{{"path":"<stdin>","package":None,"snapshot":None}},
+                "start":{{"byte":0,"line":1,"col":1,"utf16_col":1}},
+                "end":{{"byte":0,"line":1,"col":1,"utf16_col":1}}
+            }},"primary_label":"","labels":[],"children":[],"fixes":[],
+            "related":[],"data":{{
+                "limit":"size of a source file","value":len(formatter_input)
+            }},"node":None,"symbol":None,"package":None
+        }}
+        diagnostics = [diagnostic]
+        if MODE == "fmt_size_refusal_accepts":
+            diagnostics = []
+            result_data = {{
+                "check":False,"files":1,"changed":[],
+                "refused":[],"output":formatter_input.decode("utf-8")
+            }}
+            status = 0
+        else:
+            if MODE == "fmt_size_refusal_wrong_length":
+                diagnostic["data"]["value"] -= 1
+            if MODE == "fmt_size_refusal_extra_lexical_error":
+                lexical = json.loads(json.dumps(diagnostic))
+                lexical["code"] = "UNTERMINATED_COMMENT"
+                lexical["message"] = "unterminated block comment"
+                diagnostics.append(lexical)
+            result_data = {{
+                "check":False,"files":1,"changed":[],
+                "refused":["<stdin>"],"output":None
+            }}
+            if MODE == "fmt_size_refusal_wrong_result":
+                result_data["refused"] = []
+            status = 1
+        errors = sum(item["severity"] == "error" for item in diagnostics)
+        print(line(header("fmt", None)).rstrip("\\n"))
+        for item in diagnostics:
+            print(line(item).rstrip("\\n"))
+        print(line({{"type":"result","kind":"fmt","data":result_data}}).rstrip("\\n"))
+        print(line(summary(errors=errors, exit_code=status)).rstrip("\\n"))
+        raise SystemExit(status)
     try:
         receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -1009,6 +1076,47 @@ raise SystemExit(exit_code)
         self.assertEqual(receipt["calls"], ["fmt"])
         self.assertEqual(receipt["formatter_inputs"], [original.decode("utf-8")])
         self.assertEqual(self.source.read_bytes(), original)
+
+    def test_source_size_refusal_probe_uses_documented_limit(self):
+        self.assertEqual(FMT_SOURCE_MAX_BYTES, 16 * 1024 * 1024)
+        self._fixture()
+        self.mode = "fmt_size_refusal"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "pass", report)
+        self.assertEqual(report["tests"], 2)
+        self.assertEqual(report["results"][-1]["test"],
+                         "generated/impl-14-formatter/source-size-refusal")
+        self.assertEqual(report["results"][-1]["outcome"], "pass")
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"][-1], "fmt-size-refusal")
+        self.assertEqual(receipt["size_refusal_probe"]["argv"], [
+            "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
+        ])
+        self.assertEqual(receipt["size_refusal_probe"]["input_length"],
+                         self.probe_limit + 1)
+        self.assertEqual(receipt["size_refusal_probe"]["prefix"], "/*")
+
+    def test_source_size_refusal_probe_rejects_acceptance_wrong_value_and_result(self):
+        for mode, expected in (
+            ("fmt_size_refusal_accepts", "was accepted by the formatter"),
+            ("fmt_size_refusal_wrong_length", "exact size-limit diagnostic"),
+            ("fmt_size_refusal_wrong_result", "formatter result is invalid"),
+            ("fmt_size_refusal_extra_lexical_error", "beyond the size refusal"),
+        ):
+            with self.subTest(mode=mode):
+                self._fixture()
+                self.mode = mode
+                self._write_fake()
+                report = self._run()
+
+                self.assertEqual(report["outcome"], "fail")
+                self.assertIn(
+                    expected,
+                    " ".join(report["results"][-1]["failures"]),
+                )
 
     def test_layout_generator_passes_test_path_and_fixture_bytes(self):
         variants = [f"variant-{index}".encode("utf-8") for index in range(16)]

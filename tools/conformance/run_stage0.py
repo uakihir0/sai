@@ -35,6 +35,7 @@ PACKAGE_MANIFEST = (
 )
 TIMEOUT_SECONDS = 600
 FMT_LAYOUT_VARIANT_COUNT = 16
+FMT_SOURCE_MAX_BYTES = 16 * 1024 * 1024
 ALLOWED_DIRECTIVES = {"kind", "stage", "spec", "diag"}
 SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+\Z")
@@ -929,6 +930,124 @@ def _validate_fmt_refusal(
         raise SmokeError("formatter refusal does not match the expected error multiset")
 
 
+def _validate_fmt_source_size_refusal(
+    completed: subprocess.CompletedProcess,
+    *,
+    input_length: int,
+    registered_codes: set[str],
+) -> None:
+    actual, data, summary, diagnostics = _formatter_envelope(
+        completed,
+        registered_codes=registered_codes,
+    )
+    if completed.returncode == 0:
+        raise SmokeError("oversized source was accepted by the formatter")
+    if completed.returncode != 1 or summary["exit_code"] != 1:
+        raise SmokeError("oversized source formatter refusal returned an abnormal exit code")
+    if (
+        type(data["check"]) is not bool
+        or data["check"] is not False
+        or type(data["files"]) is not int
+        or data["files"] != 1
+        or not isinstance(data["changed"], list)
+        or data["changed"] != []
+        or not isinstance(data["refused"], list)
+        or data["refused"] != ["<stdin>"]
+        or data["output"] is not None
+    ):
+        raise SmokeError("oversized source formatter result is invalid")
+    if len(actual) != 1 or len(diagnostics) != 1:
+        raise SmokeError("oversized source produced diagnostics beyond the size refusal")
+    if (
+        summary["errors"] != 1
+        or summary["warnings"] != 0
+        or summary["infos"] != 0
+        or summary["shown_errors"] != 1
+        or summary["suppressed"] != {
+            "cascade": 0,
+            "duplicate": 0,
+            "dependency": 0,
+        }
+    ):
+        raise SmokeError("oversized source formatter summary is invalid")
+
+    diagnostic = diagnostics[0]
+    primary = diagnostic["primary"]
+    if (
+        diagnostic["code"] != "IMPLEMENTATION_LIMIT_EXCEEDED"
+        or diagnostic["severity"] != "error"
+        or diagnostic["message"]
+        != f"source file is {input_length} bytes, exceeding the 16 MiB limit"
+        or diagnostic["data"] != {
+            "limit": "size of a source file",
+            "value": input_length,
+        }
+        or primary is None
+        or primary["file"]
+        != {"path": "<stdin>", "package": None, "snapshot": None}
+        or primary["start"] != {"byte": 0, "line": 1, "col": 1, "utf16_col": 1}
+        or primary["end"] != {"byte": 0, "line": 1, "col": 1, "utf16_col": 1}
+    ):
+        raise SmokeError("oversized source did not report the exact size-limit diagnostic")
+
+
+def _run_fmt_source_size_refusal(
+    iut: Path,
+    registered_codes: set[str],
+    *,
+    timeout: float,
+) -> dict:
+    test = "generated/impl-14-formatter/source-size-refusal"
+    output = {
+        "type": "test",
+        "test": test,
+        "mode": "partial-smoke",
+        "claim": False,
+        "configuration": {"target": None, "profile": None},
+        "compatibility_execution": None,
+        "outcome": "fail",
+        "deviations": [],
+        "failures": [],
+    }
+    try:
+        # An unterminated comment would produce a lexical refusal if the size
+        # check did not run first. The payload stays valid UTF-8 and is generated
+        # in memory so the repository does not need a 16 MiB fixture.
+        source = b"/*" + b" " * (FMT_SOURCE_MAX_BYTES - 1)
+        if len(source) != FMT_SOURCE_MAX_BYTES + 1:
+            raise SmokeError("generated source-size probe has the wrong byte length")
+        with tempfile.TemporaryDirectory(prefix="sai-stage0-fmt-size-") as temporary:
+            sandbox_root = Path(temporary)
+            package_root = sandbox_root / "package"
+            package_root.mkdir()
+            completed = _run_iut(
+                iut,
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "fmt",
+                    "--stdin-kind",
+                    "source",
+                    "-",
+                ],
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+                stdin_data=source,
+            )
+        _validate_fmt_source_size_refusal(
+            completed,
+            input_length=len(source),
+            registered_codes=registered_codes,
+        )
+        output["outcome"] = "pass"
+    except (SmokeError, ValueError, ndjson_stream.StreamError) as error:
+        output["failures"] = [str(error)]
+    except Exception:
+        output["failures"] = ["unexpected source-size smoke-runner failure"]
+    return output
+
+
 def _actual_diagnostics(records: list[dict], codes: set[str]) -> list[dict]:
     actual = []
     for record in records:
@@ -1492,7 +1611,8 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "Formatter coverage is limited to single-file source fmt goldens, their "
             "fixed-point, 16 reference-lexer-derived deterministic layout variants, "
             "source-stdin, generated package-wide, and fmt --check with one explicit "
-            "path, and refusal cases. Package-contract formatting variants and goldens, "
+            "path, refusal fixtures, and a generated 16 MiB + 1 byte size-limit case. "
+            "Package-contract formatting variants and goldens, "
             "workspaces, multi-source package checks, multiple explicit path arguments, "
             "and complete "
             "formatter-rule coverage are not covered.",
@@ -1520,6 +1640,9 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
                          timeout=timeout, docs_root=docs_root)
             for fixture in fixtures
         ]
+        results.append(
+            _run_fmt_source_size_refusal(iut_path, codes, timeout=timeout)
+        )
         report["results"] = results
         report["tests"] = len(results)
         report["passed"] = sum(result["outcome"] in ("pass", "pass-with-deviations")
