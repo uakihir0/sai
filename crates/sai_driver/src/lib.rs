@@ -8174,6 +8174,27 @@ fn check_inherent_method_body_type(
                     }
                 }
             }
+            ExprKind::Unary(UnOp::BitNot, operand)
+                if matches!(operand.kind, ExprKind::Field { .. }) =>
+            {
+                if !matches!(
+                    primitive_self_field_type(operand, &field_types.fields, symbols),
+                    Some(Ok(_))
+                ) || !collect_inherent_method_self_field(
+                    method_owner.id,
+                    operand,
+                    true,
+                    &field_types,
+                    &mut self_field_projections,
+                    &mut unknown_self_fields,
+                    &mut diagnostics,
+                    symbols,
+                    inputs,
+                    snapshot,
+                )? {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+            }
             _ => {}
         }
     }
@@ -8821,16 +8842,21 @@ fn check_function_body_primitive_local_block(
                 if !is_direct_function_integer_literal(operand)
                     && !matches!(operand.kind, ExprKind::Lit(Lit::Byte(_)))
                 {
-                    let ExprKind::Path(path) = operand.kind else {
-                        return Ok(None);
-                    };
-                    let Some(source_binding) =
-                        resolved_plain_local_path_binding(path, locals, inputs)
-                    else {
-                        return Ok(None);
-                    };
-                    if !preceding_bindings.contains(&source_binding) {
-                        return Ok(None);
+                    match operand.kind {
+                        ExprKind::Path(path) => {
+                            let Some(source_binding) =
+                                resolved_plain_local_path_binding(path, locals, inputs)
+                            else {
+                                return Ok(None);
+                            };
+                            if !preceding_bindings.contains(&source_binding) {
+                                return Ok(None);
+                            }
+                        }
+                        ExprKind::Field { .. }
+                            if self_field_projections
+                                .is_some_and(|fields| fields.contains_key(&operand.hir_id)) => {}
+                        _ => return Ok(None),
                     }
                 }
             }
