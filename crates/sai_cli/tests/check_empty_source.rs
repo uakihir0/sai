@@ -6191,7 +6191,23 @@ fn unknown_direct_self_field_operator_method_tail_stays_gated() {
             "type Counter { marker: Bool }\n",
             "impl Counter {\n",
             "    pub fn current_count(self: borrow Self) -> Bool {\n",
-            "        self.missing == self.marker\n",
+            "        self.missing < self.marker\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        self.missing == 1\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        self.missing == (self.marker == 1)\n",
             "    }\n",
             "}\n",
         ),
@@ -6216,6 +6232,14 @@ fn unknown_direct_self_field_operator_method_tail_stays_gated() {
             "impl Counter {\n",
             "    pub fn current_count(self: borrow Self) -> Bool {\n",
             "        self.missing and absent\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        self.missing == absent\n",
             "    }\n",
             "}\n",
         ),
@@ -6344,6 +6368,107 @@ fn unknown_direct_self_fields_in_logical_method_tails_are_diagnosed() {
             assert!(
                 !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
                 "{context} must not invent operand mismatches:\n{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_direct_self_fields_in_equality_method_tails_are_diagnosed() {
+    let cases = [
+        (
+            "unknown left equality field with independent return mismatch",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        self.naem == self.name\n",
+                "    }\n",
+                "}\n",
+            ),
+            &["naem"][..],
+            Some((
+                "TYPE_MISMATCH",
+                "expected `I32`, found `Bool`",
+                "self.naem == self.name",
+            )),
+        ),
+        (
+            "unknown right inequality field",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        self.name != self.naem\n",
+                "    }\n",
+                "}\n",
+            ),
+            &["naem"][..],
+            None,
+        ),
+        (
+            "two unknown fields in inequality",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        self.naem != self.nam\n",
+                "    }\n",
+                "}\n",
+            ),
+            &["naem", "nam"][..],
+            None,
+        ),
+    ];
+
+    for (context, source, unknown_names, independent_mismatch) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert!(output.stderr.is_empty(), "{context}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            unknown_names.len(),
+            "{context}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} should report field errors without a feature gate or successful result:\n{stdout}"
+        );
+
+        for unknown_name in unknown_names {
+            let field_start = source
+                .find(&format!("self.{unknown_name}"))
+                .expect("unknown field access exists")
+                + "self.".len();
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "UNKNOWN_FIELD",
+                &format!("`User` has no field `{unknown_name}`"),
+                field_start,
+                field_start + unknown_name.len(),
+            );
+        }
+
+        if let Some((code, message, expression)) = independent_mismatch {
+            assert_eq!(
+                stdout.matches(&format!("\"code\":\"{code}\"")).count(),
+                1,
+                "{context} retains exactly one independent mismatch:\n{stdout}"
+            );
+            let expression_start = source.find(expression).expect("tail expression exists");
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                code,
+                message,
+                expression_start,
+                expression_start + expression.len(),
+            );
+        } else {
+            assert!(
+                !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+                "{context} must not invent operand mismatches for unknown fields:\n{stdout}"
             );
         }
     }
