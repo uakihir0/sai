@@ -3444,6 +3444,18 @@ fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
             ),
         ),
         (
+            "unknown field under logical not in a call argument",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(not self.missing)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: Bool) -> Bool { value }\n",
+            ),
+        ),
+        (
             "unknown field before a computed field argument",
             concat!(
                 "type Counter { count: I32 }\n",
@@ -4249,19 +4261,6 @@ fn public_inherent_method_not_and_neg_field_errors_keep_precise_spans() {
 fn unsupported_direct_self_field_unary_initializer_and_tail_shapes_stay_gated() {
     let cases = [
         (
-            "unknown field under not",
-            concat!(
-                "type Counter { enabled: Bool }\n",
-                "impl Counter {\n",
-                "    pub fn invert(self: borrow Self) -> Bool {\n",
-                "        let result = not self.missing\n",
-                "        result\n",
-                "    }\n",
-                "}\n",
-            ),
-            true,
-        ),
-        (
             "unknown field under negation",
             concat!(
                 "type Counter { amount: I32 }\n",
@@ -4280,12 +4279,12 @@ fn unsupported_direct_self_field_unary_initializer_and_tail_shapes_stay_gated() 
                 "type Counter { enabled: Bool, other: Bool }\n",
                 "impl Counter {\n",
                 "    pub fn invert(self: borrow Self) -> Bool {\n",
-                "        let result = not (self.enabled and self.other)\n",
+                "        let result = not (self.missing and self.other)\n",
                 "        result\n",
                 "    }\n",
                 "}\n",
             ),
-            false,
+            true,
         ),
         (
             "computed negation operand",
@@ -4301,28 +4300,16 @@ fn unsupported_direct_self_field_unary_initializer_and_tail_shapes_stay_gated() 
             false,
         ),
         (
-            "unknown logical-not tail field",
-            concat!(
-                "type Counter { enabled: Bool }\n",
-                "impl Counter {\n",
-                "    pub fn invert(self: borrow Self) -> Bool {\n",
-                "        not self.missing\n",
-                "    }\n",
-                "}\n",
-            ),
-            true,
-        ),
-        (
             "computed logical-not tail operand",
             concat!(
                 "type Counter { enabled: Bool, other: Bool }\n",
                 "impl Counter {\n",
                 "    pub fn invert(self: borrow Self) -> Bool {\n",
-                "        not (self.enabled and self.other)\n",
+                "        not (self.missing and self.other)\n",
                 "    }\n",
                 "}\n",
             ),
-            false,
+            true,
         ),
         (
             "unknown negation tail field",
@@ -5143,6 +5130,104 @@ fn unknown_direct_self_field_recovers_through_supported_unary_aliases() {
                 && !stdout.contains("\"type\":\"result\""),
             "{label} should preserve an earlier Error without adding a feature gate:\n{stdout}"
         );
+    }
+}
+
+#[test]
+fn unknown_direct_self_field_under_logical_not_recovers_bool_diagnostics() {
+    let cases = [
+        (
+            "inferred local",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
+                "        let inferred = not self.naem\n",
+                "        inferred\n",
+                "    }\n",
+                "}\n",
+            ),
+            None,
+        ),
+        (
+            "annotated local",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        let annotated: I32 = not self.naem\n",
+                "        annotated\n",
+                "    }\n",
+                "}\n",
+            ),
+            Some(("expected `I32`, found `Bool`", "not self.naem")),
+        ),
+        (
+            "method tail",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover(self: borrow Self) -> I32 {\n",
+                "        not self.naem\n",
+                "    }\n",
+                "}\n",
+            ),
+            Some(("expected `I32`, found `Bool`", "not self.naem")),
+        ),
+    ];
+    for (context, source, expected_mismatch) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{context}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} should report the unknown field without a feature gate or success record:\n{stdout}"
+        );
+        let field_start = source.find("naem").expect("unknown field exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            "`User` has no field `naem`",
+            field_start,
+            field_start + "naem".len(),
+        );
+        let unknown_field = stdout
+            .lines()
+            .find(|record| record.contains("\"field\":\"naem\""))
+            .expect("unknown-field diagnostic exists");
+        assert!(
+            unknown_field.contains("\"type_name\":\"User\"")
+                && unknown_field.contains("\"candidates\":[\"name\"]"),
+            "{context} retains the type name and candidate data:\n{unknown_field}"
+        );
+        if let Some((message, expression)) = expected_mismatch {
+            assert_eq!(
+                stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+                1,
+                "{context} should retain the independent Bool result mismatch:\n{stdout}"
+            );
+            let expression_start = source
+                .find(expression)
+                .expect("logical-not expression exists");
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                message,
+                expression_start,
+                expression_start + expression.len(),
+            );
+        } else {
+            assert!(
+                !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+                "{context} has no independent type mismatch:\n{stdout}"
+            );
+        }
     }
 }
 
