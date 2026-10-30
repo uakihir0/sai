@@ -4580,7 +4580,7 @@ fn public_inherent_method_not_and_neg_field_errors_keep_precise_spans() {
 }
 
 #[test]
-fn unsupported_direct_self_field_unary_computed_and_tail_shapes_stay_gated() {
+fn unsupported_direct_self_field_unary_computed_shapes_stay_gated() {
     let cases = [
         (
             "nested logical-not operand",
@@ -4615,30 +4615,6 @@ fn unsupported_direct_self_field_unary_computed_and_tail_shapes_stay_gated() {
                 "impl Counter {\n",
                 "    pub fn invert(self: borrow Self) -> Bool {\n",
                 "        not (self.missing and self.other)\n",
-                "    }\n",
-                "}\n",
-            ),
-            true,
-        ),
-        (
-            "unknown negation tail field",
-            concat!(
-                "type Counter { amount: I32 }\n",
-                "impl Counter {\n",
-                "    pub fn negate(self: borrow Self) -> I32 {\n",
-                "        -self.missing\n",
-                "    }\n",
-                "}\n",
-            ),
-            true,
-        ),
-        (
-            "unknown bitwise-not tail field",
-            concat!(
-                "type Counter { bits: U8 }\n",
-                "impl Counter {\n",
-                "    pub fn invert(self: borrow Self) -> U8 {\n",
-                "        ~self.missing\n",
                 "    }\n",
                 "}\n",
             ),
@@ -5659,14 +5635,14 @@ fn unknown_direct_self_field_under_neg_and_bitnot_initializers_recovers_without_
 }
 
 #[test]
-fn unknown_direct_self_field_under_neg_and_bitnot_outside_initializer_stays_gated() {
+fn unknown_direct_self_field_under_neg_and_bitnot_method_tails_recovers_without_type_cascades() {
     let cases = [
         (
             "negation method tail",
             concat!(
                 "type User { name: I32 }\n",
                 "impl User {\n",
-                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
                 "        -self.naem\n",
                 "    }\n",
                 "}\n",
@@ -5677,12 +5653,53 @@ fn unknown_direct_self_field_under_neg_and_bitnot_outside_initializer_stays_gate
             concat!(
                 "type User { name: I32 }\n",
                 "impl User {\n",
-                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "    pub fn recover(self: borrow Self) -> Bool {\n",
                 "        ~self.naem\n",
                 "    }\n",
                 "}\n",
             ),
         ),
+    ];
+
+    for (context, source) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{context}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} reports only the missing field because the unary result is unknown:\n{stdout}"
+        );
+        let field_start = source.find("naem").expect("unknown field exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            "`User` has no field `naem`",
+            field_start,
+            field_start + "naem".len(),
+        );
+        let unknown_field = stdout
+            .lines()
+            .find(|record| record.contains("\"field\":\"naem\""))
+            .expect("unknown-field diagnostic exists");
+        assert!(
+            unknown_field.contains("\"type_name\":\"User\"")
+                && unknown_field.contains("\"candidates\":[\"name\"]"),
+            "{context} retains the receiver type and candidate data:\n{unknown_field}"
+        );
+    }
+}
+
+#[test]
+fn unknown_direct_self_field_under_neg_and_bitnot_nested_and_call_arguments_remain_gated() {
+    let cases = [
         (
             "nested negation initializer",
             concat!(
@@ -5703,6 +5720,28 @@ fn unknown_direct_self_field_under_neg_and_bitnot_outside_initializer_stays_gate
                 "    pub fn unsupported(self: borrow Self) -> I32 {\n",
                 "        let recovered = ~(self.naem & 1)\n",
                 "        recovered\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "nested negation method tail",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        -(self.naem + 1)\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "nested bitwise not method tail",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        ~(self.naem & 1)\n",
                 "    }\n",
                 "}\n",
             ),
