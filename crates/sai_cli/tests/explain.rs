@@ -21,6 +21,10 @@ const LITERAL_OUT_OF_RANGE_SUMMARY: &str = "Literal out of range for its type";
 const MALFORMED_NUMBER_MARKDOWN: &str =
     include_str!("../../sai_diagnostics/src/explanations/malformed_number.md");
 const MALFORMED_NUMBER_SUMMARY: &str = "Malformed numeric literal";
+const UNKNOWN_FIELD_MARKDOWN: &str =
+    include_str!("../../sai_diagnostics/src/explanations/unknown_field.md");
+const UNKNOWN_FIELD_SUMMARY: &str =
+    "A field name that the record, variant or tuple type does not have";
 
 struct TestDirectory(PathBuf);
 
@@ -237,6 +241,51 @@ fn explain_type_mismatch_serializes_the_exact_json_record() {
 }
 
 #[test]
+fn explain_unknown_field_prints_the_exact_markdown_record() {
+    let output = run_explain(&["explain", "UNKNOWN_FIELD"]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(stdout, UNKNOWN_FIELD_MARKDOWN);
+}
+
+#[test]
+fn explain_unknown_field_serializes_the_exact_json_record() {
+    let output = run_explain(&["--format=json", "explain", "UNKNOWN_FIELD"]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expected_result = format!(
+        concat!(
+            "{{\"type\":\"result\",\"kind\":\"explain\",\"data\":{{",
+            "\"code\":\"UNKNOWN_FIELD\",\"class\":\"hard\",\"severity\":\"error\",",
+            "\"default_level\":null,\"stage\":1,\"owner\":\"spec/06-expressions-and-statements.md\",",
+            "\"since\":\"0.1.0\",\"status\":\"active\",\"superseded_by\":null,",
+            "\"summary\":{},\"markdown\":{}",
+            "}}}}"
+        ),
+        json_string(UNKNOWN_FIELD_SUMMARY),
+        json_string(UNKNOWN_FIELD_MARKDOWN),
+    );
+    let expected = format!(
+        concat!(
+            "{{\"type\":\"header\",\"format\":\"sai-diagnostics\",\"version\":1,",
+            "\"tool\":{{\"name\":\"sai\",\"version\":\"{}\"}},",
+            "\"command\":\"explain\",\"root\":null}}\n",
+            "{}\n",
+            "{{\"type\":\"summary\",\"errors\":0,\"warnings\":0,\"infos\":0,",
+            "\"shown_errors\":0,\"suppressed\":{{\"cascade\":0,\"duplicate\":0,",
+            "\"dependency\":0}},\"exit_code\":0}}\n"
+        ),
+        env!("CARGO_PKG_VERSION"),
+        expected_result,
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(stdout, expected);
+}
+
+#[test]
 fn explain_duplicate_binding_prints_the_exact_markdown_record() {
     let output = run_explain(&["explain", "DUPLICATE_BINDING"]);
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
@@ -424,6 +473,51 @@ fn explanation_example_is_rejected_and_fix_is_semantically_checked() {
             Some(0),
             "{label} source is not formatter-canonical:\n{stdout}"
         );
+        assert!(
+            !stdout.contains("\"code\":\"UNFORMATTED_FILE\""),
+            "{label} source is not formatter-canonical:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn unknown_field_explanation_example_is_rejected_and_fix_is_clean_and_canonical() {
+    let example = source_block(UNKNOWN_FIELD_MARKDOWN, "Example");
+    let fix = source_block(UNKNOWN_FIELD_MARKDOWN, "Fix");
+
+    let rejected = run_check(&example);
+    let rejected_stdout = String::from_utf8(rejected.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(rejected.status.code(), Some(1), "{rejected_stdout}");
+    assert!(rejected.stderr.is_empty());
+    assert_eq!(
+        rejected_stdout
+            .matches("\"code\":\"UNKNOWN_FIELD\"")
+            .count(),
+        1,
+        "{rejected_stdout}"
+    );
+    assert!(!rejected_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+    assert!(!rejected_stdout.contains("\"type\":\"result\""));
+
+    let accepted = run_check(&fix);
+    let accepted_stdout = String::from_utf8(accepted.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(accepted.status.code(), Some(0), "{accepted_stdout}");
+    assert!(accepted.stderr.is_empty());
+    assert!(
+        accepted_stdout.contains("\"kind\":\"check\""),
+        "{accepted_stdout}"
+    );
+    assert!(!accepted_stdout.contains("\"type\":\"diagnostic\""));
+
+    for (label, source) in [("Example", example), ("Fix", fix)] {
+        let formatted = run_fmt_check(&source);
+        let stdout = String::from_utf8(formatted.stdout).expect("formatter stdout is UTF-8");
+        assert_eq!(
+            formatted.status.code(),
+            Some(0),
+            "{label} source is not formatter-canonical:\n{stdout}"
+        );
+        assert!(formatted.stderr.is_empty());
         assert!(
             !stdout.contains("\"code\":\"UNFORMATTED_FILE\""),
             "{label} source is not formatter-canonical:\n{stdout}"
@@ -802,8 +896,8 @@ fn malformed_number_explanation_refuses_and_fix_is_clean_and_canonical() {
 }
 
 #[test]
-fn explain_keeps_other_individual_codes_gated_and_preserves_list() {
-    let gated = run_explain(&["--format=json", "explain", "UNKNOWN_FIELD"]);
+fn explain_keeps_unwritten_individual_codes_gated_and_preserves_list() {
+    let gated = run_explain(&["--format=json", "explain", "UNKNOWN_MODULE"]);
     let gated_stdout = String::from_utf8(gated.stdout).expect("CLI stdout is UTF-8");
     assert_eq!(gated.status.code(), Some(1), "{gated_stdout}");
     assert!(gated.stderr.is_empty());
@@ -817,6 +911,18 @@ fn explain_keeps_other_individual_codes_gated_and_preserves_list() {
     assert!(list.stderr.is_empty());
     assert!(list_stdout.contains("\"kind\":\"explain.list\""));
     assert!(list_stdout.contains("\"code\":\"DUPLICATE_BINDING\",\"class\":\"hard\""));
+    let unknown_field_list_entry = "{\"code\":\"UNKNOWN_FIELD\",\"class\":\"hard\",".to_owned()
+        + "\"summary\":\"A field name that the record, variant or tuple type does not have\"}";
+    let previous_unknown_field = list_stdout
+        .find("\"code\":\"UNKNOWN_EXPORT_WORLD\"")
+        .expect("list contains the preceding unknown-code entry");
+    let unknown_field = list_stdout
+        .find(&unknown_field_list_entry)
+        .expect("list contains the exact UNKNOWN_FIELD entry");
+    let next_unknown_field = list_stdout
+        .find("\"code\":\"UNKNOWN_FORMAT_SPEC\"")
+        .expect("list contains the following unknown-code entry");
+    assert!(previous_unknown_field < unknown_field && unknown_field < next_unknown_field);
     let invalid_escape_list_entry =
         "{\"code\":\"INVALID_ESCAPE\",\"class\":\"hard\",\"summary\":\"Invalid escape sequence\"}";
     let previous_code = list_stdout

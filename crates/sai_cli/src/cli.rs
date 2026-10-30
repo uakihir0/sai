@@ -22015,7 +22015,7 @@ mod tests {
             "explain",
             "--directory",
             "--list",
-            "UNKNOWN_FIELD",
+            "UNKNOWN_MODULE",
         ]);
 
         assert_eq!(exit_code, 1);
