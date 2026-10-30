@@ -3372,6 +3372,151 @@ fn public_inherent_method_binary_operators_read_direct_primitive_fields() {
 }
 
 #[test]
+fn public_inherent_method_binary_tails_accept_paths_and_known_fields() {
+    let cases = [
+        concat!(
+            "type Counter { left: I32, right: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn add(self: borrow Self) -> I32 {\n",
+            "        self.left + self.right\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { left: I32, right: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn remainder(self: borrow Self) -> I32 {\n",
+            "        self.left % self.right\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { left: I32, right: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn wrapping_add(self: borrow Self) -> I32 {\n",
+            "        self.left +% self.right\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { left: I32, right: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn bitwise(self: borrow Self) -> I32 {\n",
+            "        self.left & self.right\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { left: I32, shift: U32 }\n",
+            "impl Counter {\n",
+            "    pub fn shifted(self: borrow Self) -> I32 {\n",
+            "        self.left << self.shift\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { left: I32, right: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn less_than(self: borrow Self) -> Bool {\n",
+            "        self.left < self.right\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool, ready: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn both(self: borrow Self) -> Bool {\n",
+            "        self.enabled and self.ready\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { left: I32, right: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn add_via_local(self: borrow Self) -> I32 {\n",
+            "        let left = self.left\n",
+            "        left + self.right\n",
+            "    }\n",
+            "}\n",
+        ),
+    ];
+    for source in cases {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_inherent_method_binary_tail_errors_keep_precise_spans() {
+    let cases = [
+        (
+            concat!(
+                "type Counter { left: U8, right: U8 }\n",
+                "impl Counter {\n",
+                "    pub fn add(self: borrow Self) -> I32 {\n",
+                "        self.left + self.right\n",
+                "    }\n",
+                "}\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `I32`, found `U8`",
+            "self.left + self.right",
+        ),
+        (
+            concat!(
+                "type Counter { left: I32, right: F32 }\n",
+                "impl Counter {\n",
+                "    pub fn add(self: borrow Self) -> I32 {\n",
+                "        self.left + self.right\n",
+                "    }\n",
+                "}\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `I32`, found `F32`",
+            "self.right",
+        ),
+        (
+            concat!(
+                "type Counter { left: Char, right: Char }\n",
+                "impl Counter {\n",
+                "    pub fn bitwise(self: borrow Self) -> Char {\n",
+                "        self.left & self.right\n",
+                "    }\n",
+                "}\n",
+            ),
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `&` has no `BitAnd<Char>` implementation for `Char`",
+            "self.left & self.right",
+        ),
+    ];
+    for (source, code, message, expression) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            stdout.matches(&format!("\"code\":\"{code}\"")).count(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "a supported binary tail error must remain a semantic diagnostic:\n{stdout}"
+        );
+        let start = source
+            .find(expression)
+            .expect("binary tail expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            code,
+            message,
+            start,
+            start + expression.len(),
+        );
+    }
+}
+
+#[test]
 fn public_inherent_method_bitwise_not_reads_direct_primitive_field() {
     let source = concat!(
         "type Counter { bits: U8 }\n",
@@ -4619,12 +4764,23 @@ fn unsupported_inherent_method_shapes_remain_gated() {
             ),
         ),
         (
-            "known receiver binary operator as the method tail",
+            "binary tail with a literal sibling",
             concat!(
                 "type Counter { marker: I32 }\n",
                 "impl Counter {\n",
                 "    pub fn current_count(self: borrow Self) -> I32 {\n",
                 "        self.marker + 1\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "nested binary method tail",
+            concat!(
+                "type Counter { marker: I32, other: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn current_count(self: borrow Self) -> I32 {\n",
+                "        (self.marker + self.other) + self.marker\n",
                 "    }\n",
                 "}\n",
             ),
@@ -4781,21 +4937,42 @@ fn unsupported_inherent_method_shapes_remain_gated() {
 
 #[test]
 fn unknown_direct_self_field_operator_method_tail_stays_gated() {
-    let source = concat!(
-        "type Counter { marker: I32 }\n",
-        "impl Counter {\n",
-        "    pub fn current_count(self: borrow Self) -> I32 {\n",
-        "        self.missing + 1\n",
-        "    }\n",
-        "}\n",
-    );
-    let output = run_check(source, "", &[], &[]);
-    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
-    assert!(
-        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
-            && !stdout.contains("\"code\":\"UNKNOWN_FIELD\"")
-            && !stdout.contains("\"type\":\"result\""),
-        "a binary method tail must remain outside the direct field-tail checker:\n{stdout}"
+    let cases = [
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> I32 {\n",
+            "        self.missing + 1\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> I32 {\n",
+            "        self.missing + self.marker\n",
+            "    }\n",
+            "}\n",
+        ),
+    ];
+    for source in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"code\":\"UNKNOWN_FIELD\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "an unknown field in a rejected binary tail must not leak a field diagnostic:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn top_level_function_binary_tails_remain_behind_the_stage_gate() {
+    let source = "pub fn add(left: I32, right: I32) -> I32 { left + right }\n";
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(source, "", &[], &[]),
+        "top-level binary tail",
     );
 }
 
