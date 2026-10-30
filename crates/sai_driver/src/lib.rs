@@ -86540,6 +86540,77 @@ property "shared"() {}
     }
 
     #[test]
+    fn inherent_method_direct_call_not_tainted_local_has_no_tainted_facts() {
+        let root = concat!(
+            "type User { enabled: Bool }\n",
+            "impl User {\n",
+            "  pub fn inspect(self: borrow Self) -> Bool {\n",
+            "    let known = self.enabled\n",
+            "    let absent = self.missing\n",
+            "    identity(not absent)\n",
+            "  }\n",
+            "}\n",
+            "pub fn identity(value: Bool) -> Bool { value }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("method and direct helper collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let method = &results.owners()[0].members()[0];
+        let FunctionBodyTypeCheck::Supported { diagnostics } = method
+            .body_type_check()
+            .expect("method body check has an independent result")
+        else {
+            panic!("`not` over an unknown-field-tainted local should recover as a call argument");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::UnknownField,
+            "{diagnostics:#?}"
+        );
+        let type_results = method
+            .primitive_body_type_results()
+            .expect("method type results have no resolution error")
+            .expect("a supported tainted call keeps its partial projection");
+        assert_eq!(
+            type_results
+                .expression_types()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [sai_resolve::prelude::PrimTy::Bool],
+            "the known field initializer stays typed while the tainted path, `not`, and call facts are omitted"
+        );
+        assert_eq!(
+            type_results
+                .binding_types()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [sai_resolve::prelude::PrimTy::Bool],
+            "only the independent known local retains a binding type"
+        );
+        assert_eq!(
+            type_results
+                .partial_results()
+                .canonical_expression_types()
+                .len(),
+            1,
+            "canonical publication omits every unknown-dependent argument and call fact"
+        );
+    }
+
+    #[test]
     fn inherent_method_equality_tail_recovers_unknown_fields_without_tainted_facts() {
         let root = concat!(
             "type User { enabled: Bool }\n",

@@ -4008,6 +4008,236 @@ fn direct_call_logical_not_ignores_arguments_beyond_the_parameter_prefix() {
 }
 
 #[test]
+fn direct_call_logical_not_recovers_unknown_field_tainted_local_aliases() {
+    let source = concat!(
+        "type User { enabled: Bool }\n",
+        "impl User {\n",
+        "    pub fn inspect(self: borrow Self) -> Bool {\n",
+        "        let enabled = self.enabled\n",
+        "        let missing = self.naem\n",
+        "        let absent = missing\n",
+        "        consume_i32(not absent)\n",
+        "    }\n",
+        "}\n",
+        "pub fn consume_i32(value: I32) -> I32 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty(), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "the original unknown field is reported exactly once:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the known Bool call parameter and I32 call result are checked independently:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the tainted local alias recovers as a Bool call argument:\n{stdout}"
+    );
+
+    let field_start = source.find("naem").expect("unknown field exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "UNKNOWN_FIELD",
+        "`User` has no field `naem`",
+        field_start,
+        field_start + "naem".len(),
+    );
+    let argument = "not absent";
+    let argument_start = source.rfind(argument).expect("unary argument exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        argument_start,
+        argument_start + argument.len(),
+    );
+    let call = "consume_i32(not absent)";
+    let call_start = source.rfind(call).expect("call tail exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        call_start,
+        call_start + call.len(),
+    );
+}
+
+#[test]
+fn direct_call_logical_not_checks_known_tainted_local_annotations() {
+    let source = concat!(
+        "type User { enabled: Bool }\n",
+        "impl User {\n",
+        "    pub fn inspect(self: borrow Self) -> Bool {\n",
+        "        let absent: I32 = self.naem\n",
+        "        consume_bool(not absent)\n",
+        "    }\n",
+        "}\n",
+        "pub fn consume_bool(value: Bool) -> Bool { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty(), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the local's known annotation produces an independent Bool-operand mismatch:\n{stdout}"
+    );
+    let operand = "absent";
+    let operand_start = source
+        .rfind(operand)
+        .expect("annotated local operand exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        operand_start,
+        operand_start + operand.len(),
+    );
+}
+
+#[test]
+fn direct_call_logical_not_recovers_tainted_local_at_one_nested_call_level() {
+    let source = concat!(
+        "type User { enabled: Bool }\n",
+        "impl User {\n",
+        "    pub fn inspect(self: borrow Self) -> Bool {\n",
+        "        let absent = self.naem\n",
+        "        wrap(identity(not absent))\n",
+        "    }\n",
+        "}\n",
+        "pub fn identity(value: Bool) -> Bool { value }\n",
+        "pub fn wrap(value: Bool) -> Bool { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty(), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the existing one-level nested direct call keeps its Bool result:\n{stdout}"
+    );
+}
+
+#[test]
+fn direct_call_logical_not_tainted_local_out_of_prefix_keeps_arity_only() {
+    let source = concat!(
+        "type User { enabled: Bool }\n",
+        "impl User {\n",
+        "    pub fn inspect(self: borrow Self) -> Bool {\n",
+        "        let absent = self.naem\n",
+        "        identity_bool(true, not absent)\n",
+        "    }\n",
+        "}\n",
+        "pub fn identity_bool(value: Bool) -> Bool { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"WRONG_ARGUMENT_COUNT\""),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "only the preceding initializer reports its missing field:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the argument beyond the checked parameter prefix is left alone:\n{stdout}"
+    );
+}
+
+#[test]
+fn direct_call_logical_not_unsupported_tainted_locals_remain_gated() {
+    let cases = [
+        (
+            "negation",
+            concat!(
+                "type User { enabled: Bool }\n",
+                "impl User {\n",
+                "    pub fn inspect(self: borrow Self) -> I32 {\n",
+                "        let absent = self.naem\n",
+                "        identity_i32(-absent)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_i32(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "bitwise not",
+            concat!(
+                "type User { enabled: Bool }\n",
+                "impl User {\n",
+                "    pub fn inspect(self: borrow Self) -> I32 {\n",
+                "        let absent = self.naem\n",
+                "        identity_i32(~absent)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_i32(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "unresolved error literal",
+            concat!(
+                "type User { enabled: Bool }\n",
+                "impl User {\n",
+                "    pub fn inspect(self: borrow Self) -> Bool {\n",
+                "        let absent: F32 = self.naem\n",
+                "        let quotient = 128 / absent\n",
+                "        identity_bool(not quotient)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity_bool(value: Bool) -> Bool { value }\n",
+            ),
+        ),
+    ];
+
+    for (context, source) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert!(output.stderr.is_empty(), "{context}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} stays behind the feature gate:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"UNKNOWN_FIELD\""),
+            "{context} does not leak a partial field diagnostic:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn direct_call_unknown_unary_self_fields_ignore_arguments_beyond_the_parameter_prefix() {
     let cases = [
         (
