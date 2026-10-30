@@ -3200,6 +3200,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sai_test_harness"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "sai_fmt",
+ "sai_syntax",
+ "sai_vfs",
+ "serde_json",
+]
+
+[[package]]
 name = "sai_ty"
 version = "0.1.0"
 dependencies = [

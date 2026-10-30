@@ -34,6 +34,7 @@ PACKAGE_MANIFEST = (
     "targets { wasm32-core }\n"
 )
 TIMEOUT_SECONDS = 600
+FMT_LAYOUT_VARIANT_COUNT = 16
 ALLOWED_DIRECTIVES = {"kind", "stage", "spec", "diag"}
 SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+\Z")
@@ -390,6 +391,55 @@ def _validate_fmt_output(
         raise SmokeError("sai fmt summary reports an unsuccessful command")
 
 
+def _generate_fmt_layout_variants(
+    test_path: str,
+    input_bytes: bytes,
+    *,
+    timeout: float,
+) -> list[bytes]:
+    """Use the reference lexer/parser to derive the normative F6 input layouts."""
+    repository_root = Path(__file__).resolve().parents[2]
+    command = [
+        "cargo",
+        "run",
+        "--quiet",
+        "--locked",
+        "--package",
+        "sai_test_harness",
+        "--bin",
+        "fmt-layout-variants",
+        "--",
+        test_path,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=repository_root,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise SmokeError("reference formatter layout generator timed out") from None
+    except OSError:
+        raise SmokeError("could not start the reference formatter layout generator") from None
+    if completed.returncode != 0:
+        raise SmokeError("reference formatter layout generator failed")
+    try:
+        variants = json.loads(completed.stdout.decode("utf-8", "strict"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise SmokeError("reference formatter layout generator returned invalid JSON") from None
+    if (
+        not isinstance(variants, list)
+        or len(variants) != FMT_LAYOUT_VARIANT_COUNT
+        or any(not isinstance(variant, str) for variant in variants)
+    ):
+        raise SmokeError("reference formatter layout generator returned the wrong variant set")
+    return [variant.encode("utf-8") for variant in variants]
+
+
 def _run_fmt_fixture(
     source_path: Path,
     fixture_path: str,
@@ -400,6 +450,11 @@ def _run_fmt_fixture(
     timeout: float,
 ) -> None:
     expected_output = _read_expected_format(source_path, fixture_path)
+    layout_variants = _generate_fmt_layout_variants(
+        fixture_path,
+        source_bytes,
+        timeout=timeout,
+    )
     command = [
         "--format=json",
         "--max-errors=0",
@@ -427,6 +482,22 @@ def _run_fmt_fixture(
             registered_codes=registered_codes,
             fixed_point=False,
         )
+        for variant in layout_variants:
+            laid_out = _run_iut(
+                iut,
+                command,
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+                stdin_data=variant,
+            )
+            _validate_fmt_output(
+                laid_out,
+                expected_output=expected_output,
+                input_bytes=variant,
+                registered_codes=registered_codes,
+                fixed_point=False,
+            )
         second = _run_iut(
             iut,
             command,
@@ -1402,10 +1473,11 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "The caller must supply this repository's reference sai binary; the runner "
             "cannot verify the identity of the executable passed with --iut.",
             "Formatter coverage is limited to single-file source fmt goldens, their "
-            "fixed-point, source-stdin, generated package-wide, and fmt --check with "
-            "one explicit path, and refusal cases. Package-contract formatting "
-            "variants and goldens, workspaces, multi-source package checks, multiple "
-            "explicit path arguments, layout variants, and complete "
+            "fixed-point, 16 reference-lexer-derived deterministic layout variants, "
+            "source-stdin, generated package-wide, and fmt --check with one explicit "
+            "path, and refusal cases. Package-contract formatting variants and goldens, "
+            "workspaces, multi-source package checks, multiple explicit path arguments, "
+            "and complete "
             "formatter-rule coverage are not covered.",
             "This smoke subset does not establish section, diagnostic, or suite coverage "
             "and cannot substantiate a conformance claim.",

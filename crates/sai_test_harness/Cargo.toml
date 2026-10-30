@@ -1,0 +1,13 @@
+[package]
+name = "sai_test_harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3.workspace = true
+serde_json.workspace = true
+sai_fmt = { path = "../sai_fmt" }
+sai_syntax = { path = "../sai_syntax" }
+sai_vfs = { path = "../sai_vfs" }
+

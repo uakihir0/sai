@@ -140,6 +140,20 @@ For a `fmt` fixture it passes the unchanged source bytes on standard input to
 `sai --format=json --max-errors=0 fmt --stdin-kind source -`, compares the JSON
 `output` bytes with `<name>.expected.sai`, then formats the expected bytes again
 and requires the same output with an empty `changed` list. It then runs
+sai_test_harness's `fmt-layout-variants` binary through `cargo run --locked` to
+derive 16 deterministic layouts from the fixture path relative to `tests/`.
+The reference lexer selects safe token boundaries and the syntax tree supplies
+parser-skipped positions across signatures, declaration clauses and bodies,
+match-arm lists, tests, and properties. It varies eligible breaks in both
+directions: inserting a safe newline or compacting an optional existing
+newline. The reference parser validates each generated layout against the
+original syntax tree. The pseudo-random stream is seeded with BLAKE3 of the
+test path. Comments and blank lines are retained. Sources without mutable
+layout positions may yield repeated entries; the runner still submits all 16
+inputs to the IUT and compares each result with the expected bytes. A Rust
+toolchain with `cargo` must be available when the runner processes a `fmt`
+fixture.
+It then runs
 `sai --format=json --max-errors=0 fmt --check --stdin-kind source -` on the
 input and expected bytes. Expected bytes must pass without diagnostics; an input
 that differs must report exactly one `UNFORMATTED_FILE` on the first differing

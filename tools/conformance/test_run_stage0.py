@@ -9,8 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from run_stage0 import (
+    FMT_LAYOUT_VARIANT_COUNT,
     ROOT_ID,
     SmokeError,
+    _generate_fmt_layout_variants,
     _first_differing_lf_line,
     _formatter_refusal_codes,
     _resolve_spec_reference,
@@ -36,6 +38,13 @@ class Stage0SmokeRunnerTests(unittest.TestCase):
         self.receipt = self.base / "receipt.json"
         self.mode = "normal"
         self.expected_format = None
+        self.layout_variants = [f"mock layout {index}\n".encode("utf-8") for index in range(16)]
+        self.layout_variants_patch = patch(
+            "run_stage0._generate_fmt_layout_variants",
+            return_value=self.layout_variants,
+        )
+        self.layout_variants_patch.start()
+        self.addCleanup(self.layout_variants_patch.stop)
         self._write_fake()
 
     def _write_fake(self):
@@ -530,7 +539,9 @@ if args == [
         output_bytes = EXPECTED_FORMATTED
         if MODE == "fmt_output_mismatch":
             output_bytes = b"different output\\n"
-        if MODE == "fmt_fixed_point_failure" and len(receipt["formatter_inputs"]) > 1:
+        if MODE == "fmt_layout_output_mismatch" and len(receipt["formatter_inputs"]) == 2:
+            output_bytes = b"different layout output\\n"
+        if MODE == "fmt_fixed_point_failure" and formatter_input == EXPECTED_FORMATTED:
             output_bytes = EXPECTED_FORMATTED + b" "
         output = output_bytes.decode("utf-8")
         changed = [] if formatter_input == output_bytes else ["<stdin>"]
@@ -964,6 +975,87 @@ raise SystemExit(exit_code)
         self.mode = "fmt_refuse"
         self._write_fake()
 
+    def test_layout_generator_passes_test_path_and_fixture_bytes(self):
+        variants = [f"variant-{index}".encode("utf-8") for index in range(16)]
+        completed = subprocess.CompletedProcess(
+            ["cargo"], 0, json.dumps([value.decode("utf-8") for value in variants]).encode(), b"",
+        )
+        with patch("run_stage0.subprocess.run", return_value=completed) as process:
+            result = _generate_fmt_layout_variants(
+                "conformance/impl-14-formatter/function-spacing.sai",
+                b"source fixture",
+                timeout=12,
+            )
+
+        self.assertEqual(result, variants)
+        arguments = process.call_args
+        self.assertEqual(arguments.args[0], [
+            "cargo", "run", "--quiet", "--locked", "--package", "sai_test_harness",
+            "--bin", "fmt-layout-variants", "--",
+            "conformance/impl-14-formatter/function-spacing.sai",
+        ])
+        self.assertEqual(arguments.kwargs["input"], b"source fixture")
+        self.assertEqual(arguments.kwargs["timeout"], 12)
+        self.assertEqual(arguments.kwargs["cwd"], Path(__file__).resolve().parents[2])
+
+    def test_layout_generator_rejects_incomplete_variant_sets(self):
+        completed = subprocess.CompletedProcess(["cargo"], 0, b"[]", b"")
+        with patch("run_stage0.subprocess.run", return_value=completed):
+            with self.assertRaises(SmokeError):
+                _generate_fmt_layout_variants(
+                    "conformance/impl-14-formatter/function-spacing.sai",
+                    b"source fixture",
+                    timeout=12,
+                )
+
+    def test_layout_generator_allows_repeated_source_layouts(self):
+        payload = json.dumps(["same"] * FMT_LAYOUT_VARIANT_COUNT).encode("utf-8")
+        completed = subprocess.CompletedProcess(["cargo"], 0, payload, b"")
+        with patch("run_stage0.subprocess.run", return_value=completed):
+            variants = _generate_fmt_layout_variants(
+                "conformance/impl-14-formatter/function-spacing.sai",
+                b"source fixture",
+                timeout=12,
+            )
+
+        self.assertEqual(variants, [b"same"] * FMT_LAYOUT_VARIANT_COUNT)
+
+    def test_fmt_fixture_runs_all_sixteen_deterministic_layout_variants(self):
+        self._fmt_fixture()
+        original = self.source.read_bytes()
+        variants = [f"layout {index}\n".encode("utf-8") for index in range(16)]
+        with patch("run_stage0._generate_fmt_layout_variants", return_value=variants) as generate:
+            report = self._run()
+
+        self.assertEqual(report["outcome"], "pass")
+        generate.assert_called_once_with(
+            "conformance/spec-02-lexical-structure/case.sai",
+            original,
+            timeout=1,
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(
+            receipt["formatter_inputs"][1:1 + FMT_LAYOUT_VARIANT_COUNT],
+            [variant.decode("utf-8") for variant in variants],
+        )
+
+    def test_wrong_output_for_one_layout_variant_fails_fmt_fixture(self):
+        self._fmt_fixture()
+        variants = [f"layout {index}\n".encode("utf-8") for index in range(16)]
+        self.mode = "fmt_layout_output_mismatch"
+        self._write_fake()
+        with patch("run_stage0._generate_fmt_layout_variants", return_value=variants):
+            report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "sai fmt output does not match the expected bytes",
+            " ".join(report["results"][0]["failures"]),
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(len(receipt["formatter_inputs"]), 2)
+        self.assertEqual(receipt["formatter_inputs"][1], variants[0].decode("utf-8"))
+
     def test_fmt_refuse_accepts_exact_error_multiset_without_preflight_or_check(self):
         self._fmt_refuse_fixture()
         original = self.source.read_bytes()
@@ -1061,6 +1153,10 @@ raise SystemExit(exit_code)
             "fmt --check with one explicit path",
             report["limitations"][2],
         )
+        self.assertIn(
+            "16 reference-lexer-derived deterministic layout variants",
+            report["limitations"][2],
+        )
         self.assertIn("workspaces, multi-source package checks", report["limitations"][2])
         self.assertIn("multiple explicit path arguments", report["limitations"][2])
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
@@ -1069,19 +1165,11 @@ raise SystemExit(exit_code)
         ])
         self.assertEqual(
             receipt["calls"],
-            [
-                "fmt",
-                "fmt",
-                "fmt-check",
-                "fmt-check",
-                "fmt-check",
-                "fmt-check",
-                "fmt-check",
-                "fmt-check",
-            ],
+            ["fmt"] * (FMT_LAYOUT_VARIANT_COUNT + 2) + ["fmt-check"] * 6,
         )
         self.assertEqual(receipt["formatter_inputs"], [
             original.decode("utf-8"),
+            *[variant.decode("utf-8") for variant in self.layout_variants],
             self.expected_format.decode("utf-8"),
         ])
         stdin_check_argv = [
@@ -1352,7 +1440,10 @@ raise SystemExit(exit_code)
         self.assertIn("not a fixed point",
                       " ".join(report["results"][0]["failures"]))
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(len(receipt["formatter_inputs"]), 2)
+        self.assertEqual(
+            len(receipt["formatter_inputs"]),
+            FMT_LAYOUT_VARIANT_COUNT + 2,
+        )
 
     def test_fmt_malformed_refused_diagnostic_and_schema_fail_closed(self):
         for mode, reason in (
