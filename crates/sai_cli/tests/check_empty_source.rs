@@ -3432,18 +3432,6 @@ fn inherent_method_direct_calls_keep_unsupported_trailing_items_gated() {
 fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
     let cases = [
         (
-            "unknown field argument",
-            concat!(
-                "type Counter { count: I32 }\n",
-                "impl Counter {\n",
-                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
-                "        identity(self.missing)\n",
-                "    }\n",
-                "}\n",
-                "pub fn identity(value: I32) -> I32 { value }\n",
-            ),
-        ),
-        (
             "computed field argument",
             concat!(
                 "type Counter { count: I32 }\n",
@@ -3453,6 +3441,21 @@ fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
                 "    }\n",
                 "}\n",
                 "pub fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "unknown field before a computed field argument",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        combine(self.missing, self.count + 1)\n",
+                "    }\n",
+                "}\n",
+                "pub fn combine(first: I32, second: I32) -> I32 {\n",
+                "    let result = first + second\n",
+                "    result\n",
+                "}\n",
             ),
         ),
         (
@@ -3473,7 +3476,19 @@ fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
                 "type Counter { count: I32 }\n",
                 "impl Counter {\n",
                 "    pub fn pass_field(self: borrow Self) -> I32 {\n",
-                "        identity(identity(identity(self.count)))\n",
+                "        identity(identity(identity(self.missing)))\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "named unknown field argument",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(value: self.missing)\n",
                 "    }\n",
                 "}\n",
                 "pub fn identity(value: I32) -> I32 { value }\n",
@@ -3489,6 +3504,127 @@ fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
             "{context}: rejected field arguments must not leak a partial unknown-field diagnostic:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn direct_call_unknown_self_field_arguments_report_without_cascading() {
+    let root_source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn read(self: borrow Self) -> Bool {\n",
+        "        identity(self.naem)\n",
+        "    }\n",
+        "}\n",
+        "pub fn identity(value: I32) -> I32 { value }\n",
+    );
+    let nested_source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn read(self: borrow Self) -> I32 {\n",
+        "        identity(identity(self.naem))\n",
+        "    }\n",
+        "}\n",
+        "pub fn identity(value: I32) -> I32 { value }\n",
+    );
+
+    for (context, source, expression) in [
+        ("root call", root_source, "identity(self.naem)"),
+        ("nested call", nested_source, "identity(self.naem)"),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{context}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} should report its field error without a feature gate or success record:\n{stdout}"
+        );
+
+        let field_start = source.find("naem").expect("unknown field argument exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            "`User` has no field `naem`",
+            field_start,
+            field_start + "naem".len(),
+        );
+        let unknown_field = stdout
+            .lines()
+            .find(|record| record.contains("\"field\":\"naem\""))
+            .expect("unknown-field diagnostic exists");
+        assert!(
+            unknown_field.contains("\"type_name\":\"User\"")
+                && unknown_field.contains("\"candidates\":[\"name\"]"),
+            "{context} retains the type name and candidate data:\n{unknown_field}"
+        );
+
+        if context == "root call" {
+            assert_eq!(
+                stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+                1,
+                "the known call output remains available for the independent method return check:\n{stdout}"
+            );
+            let call_start = source.find(expression).expect("tail call exists");
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                "expected `Bool`, found `I32`",
+                call_start,
+                call_start + expression.len(),
+            );
+        } else {
+            assert!(
+                !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+                "an unknown argument has no fabricated argument-type mismatch:\n{stdout}"
+            );
+        }
+    }
+
+    let sibling_source = concat!(
+        "type User { name: I32, flag: Bool }\n",
+        "impl User {\n",
+        "    pub fn preserve_known_sibling(self: borrow Self) -> I32 {\n",
+        "        combine(self.naem, self.flag)\n",
+        "    }\n",
+        "}\n",
+        "pub fn combine(first: I32, second: I32) -> I32 {\n",
+        "    let result = first + second\n",
+        "    result\n",
+        "}\n",
+    );
+    let sibling_output = run_check(sibling_source, "", &[], &[]);
+    let sibling_stdout = String::from_utf8(sibling_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(sibling_output.status.code(), Some(1), "{sibling_stdout}");
+    assert_eq!(
+        sibling_stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{sibling_stdout}"
+    );
+    assert_eq!(
+        sibling_stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the known field sibling keeps its own type error:\n{sibling_stdout}"
+    );
+    assert!(
+        !sibling_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !sibling_stdout.contains("\"type\":\"result\""),
+        "the unknown field and independent known sibling are both checked:\n{sibling_stdout}"
+    );
+    let known_field_start = sibling_source
+        .find("self.flag")
+        .expect("known sibling argument exists");
+    assert_json_diagnostic_primary_span(
+        &sibling_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        known_field_start,
+        known_field_start + "self.flag".len(),
+    );
 }
 
 #[test]
