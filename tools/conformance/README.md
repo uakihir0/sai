@@ -184,7 +184,13 @@ refusal codes from the lexical error table and parser-only rows in the
 syntactic-validation table; parser severities come from the implementation
 diagnostics table, and unknown severities fail closed. Validation and mixed
 parser/validation codes are excluded. This kind also bypasses canonical-input
-preflight and `sai check`. A timeout is a failure, never a pass.
+preflight and `sai check`. The runner also generates a valid-UTF-8 source input
+of 16 MiB + 1 byte beginning with an unterminated block comment and requires
+the exact `IMPLEMENTATION_LIMIT_EXCEEDED` diagnostic, actual byte length,
+one refused `<stdin>` input, no changed files, no output, and no other
+diagnostic. The malformed prefix makes the probe verify that the size check
+precedes lexing. The input is created in memory and is not stored as a fixture.
+A timeout is a failure, never a pass.
 
 The runner treats the supplied executable as the repository's reference
 implementation, but cannot verify its identity from the black-box protocol.
@@ -202,8 +208,8 @@ coverage, goldens, all directive applicability, or the complete conformance
 protocol, and cannot substantiate a conformance claim.
 Formatter coverage is limited to single-file source `fmt` byte comparisons,
 fixed-point checks, 16 deterministic layout variants, source-stdin, generated
-package-wide `fmt --check` and `fmt --check` with one explicit path, and
-exact-diagnostic `fmt-refuse` cases.
+package-wide `fmt --check` and `fmt --check` with one explicit path,
+exact-diagnostic `fmt-refuse` cases, and a generated source-size refusal probe.
 Fixed-point and `fmt --check` checks apply only to `fmt` pass fixtures.
 
 ## Stage 0 and Stage 1 explanation-record partial smoke
