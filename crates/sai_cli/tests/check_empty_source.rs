@@ -7267,7 +7267,15 @@ fn unknown_direct_self_field_operator_method_tail_stays_gated() {
             "type Counter { marker: Bool }\n",
             "impl Counter {\n",
             "    pub fn current_count(self: borrow Self) -> Bool {\n",
-            "        self.missing and true\n",
+            "        self.missing and 1\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { marker: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        self.marker and true\n",
             "    }\n",
             "}\n",
         ),
@@ -7335,6 +7343,34 @@ fn unknown_direct_self_field_operator_method_tail_stays_gated() {
             "an unknown field in a rejected binary tail must not leak a field diagnostic:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn unknown_logical_bool_literal_in_local_initializer_stays_gated_without_field_diagnostic() {
+    let source = concat!(
+        "type Counter { marker: Bool }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> Bool {\n",
+        "        let result = self.enabld and true\n",
+        "        result\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty(), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            .count(),
+        1,
+        "only the unsupported local-initializer shape should be gated:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"UNKNOWN_FIELD\"") && !stdout.contains("\"type\":\"result\""),
+        "a rejected local initializer must not leak a staged field diagnostic or success:\n{stdout}"
+    );
 }
 
 #[test]
@@ -7444,6 +7480,122 @@ fn unknown_direct_self_fields_in_logical_method_tails_are_diagnosed() {
             assert!(
                 !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
                 "{context} must not invent operand mismatches:\n{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_logical_method_tails_accept_direct_bool_literal_siblings() {
+    let cases = [
+        (
+            "unknown-left and true",
+            "self.enabld and true",
+            "enabld",
+            "I32",
+            Some("self.enabld and true"),
+        ),
+        (
+            "false and unknown-right",
+            "false and self.enabld",
+            "enabld",
+            "Bool",
+            None,
+        ),
+        (
+            "unknown-left and false",
+            "self.enabld and false",
+            "enabld",
+            "Bool",
+            None,
+        ),
+        (
+            "true and unknown-right",
+            "true and self.enabld",
+            "enabld",
+            "Bool",
+            None,
+        ),
+        (
+            "unknown-left or false",
+            "self.enabld or false",
+            "enabld",
+            "Bool",
+            None,
+        ),
+        (
+            "true or unknown-right",
+            "true or self.enabld",
+            "enabld",
+            "Bool",
+            None,
+        ),
+        (
+            "unknown-left or true",
+            "self.enabld or true",
+            "enabld",
+            "Bool",
+            None,
+        ),
+        (
+            "false or unknown-right",
+            "false or self.enabld",
+            "enabld",
+            "Bool",
+            None,
+        ),
+    ];
+
+    for (context, expression, unknown_name, return_type, return_mismatch_expression) in cases {
+        let source = format!(
+            "type User {{ enabled: Bool }}\n\
+             impl User {{\n\
+                 pub fn recover(self: borrow Self) -> {return_type} {{\n\
+                     {expression}\n\
+                 }}\n\
+             }}\n",
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{context}:\n{stdout}");
+        assert!(output.stderr.is_empty(), "{context}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{context} reports exactly the missing field:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{context} is checked without a feature gate or successful result:\n{stdout}"
+        );
+        let unknown_start = source.find(unknown_name).expect("unknown field exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "UNKNOWN_FIELD",
+            "`User` has no field `enabld`",
+            unknown_start,
+            unknown_start + unknown_name.len(),
+        );
+
+        if let Some(expression) = return_mismatch_expression {
+            assert_eq!(
+                stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+                1,
+                "{context} retains the independent return mismatch:\n{stdout}"
+            );
+            let expression_start = source.find(expression).expect("tail exists");
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                "expected `I32`, found `Bool`",
+                expression_start,
+                expression_start + expression.len(),
+            );
+        } else {
+            assert!(
+                !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+                "{context} has Bool operands and return type:\n{stdout}"
             );
         }
     }
