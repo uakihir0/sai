@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a narrow, non-claim smoke for the implemented Stage 0 explain records."""
+"""Run a narrow, non-claim smoke for selected Stage 0 and Stage 1 explain records."""
 
 from __future__ import annotations
 
@@ -29,6 +29,12 @@ RECORDS = {
         "severity": "error",
         "stage": 0,
         "owner": "spec/02-lexical-structure.md",
+    },
+    "TYPE_MISMATCH": {
+        "class": "hard",
+        "severity": "error",
+        "stage": 1,
+        "owner": "spec/05-types.md",
     },
 }
 DATA_FIELDS = {
@@ -187,7 +193,7 @@ def _parse_record(
     sections, table = _section_map(markdown, code=code)
     example, example_info = _source_fence(sections["Example"], role="Example")
     if "Fix" not in sections:
-        raise SmokeError("implemented Stage 0 explanation record has no Fix")
+        raise SmokeError("selected explanation record has no Fix")
     fix, _ = _source_fence(sections["Fix"], role="Fix")
     return table, sections["Summary"], example, example_info, fix
 
@@ -259,7 +265,7 @@ def _validate_record(
         or not data["summary"]
         or not isinstance(data["markdown"], str)
     ):
-        raise SmokeError("sai explain metadata does not match its list entry or Stage 0 record")
+        raise SmokeError("sai explain metadata does not match its list entry or selected record")
     if data["summary"] != _appendix_summary(docs_root, code=code):
         raise SmokeError("sai explain full summary does not match Appendix A")
     if _compact_summary(data["summary"]) != list_entry["summary"]:
@@ -736,7 +742,7 @@ def _run_record(
 
 
 def run_suite(iut: str | Path, *, timeout: float = TIMEOUT_SECONDS) -> dict:
-    """Smoke the two complete Stage 0 explanation records without a claim."""
+    """Smoke selected complete Stage 0 and Stage 1 explanation records without a claim."""
     report = {
         "type": "summary",
         "mode": "partial-smoke",
@@ -749,8 +755,8 @@ def run_suite(iut: str | Path, *, timeout: float = TIMEOUT_SECONDS) -> dict:
         "results": [],
         "failures": [],
         "limitations": [
-            "Only the two currently complete Stage 0 hard-error explanation records "
-            "DUPLICATE_BINDING and INVALID_ESCAPE are checked.",
+            "Only DUPLICATE_BINDING and INVALID_ESCAPE (Stage 0) and TYPE_MISMATCH "
+            "(Stage 1) are checked; other registered explanation records are not checked.",
             "This runner does not validate other registered explanation records, "
             "staged applicability, diagnostic tables, or the full registry checks "
             "required by impl/15 §§15.8.4–15.8.5.",
@@ -770,7 +776,7 @@ def run_suite(iut: str | Path, *, timeout: float = TIMEOUT_SECONDS) -> dict:
         registry = run_stage0._read_registry_entries(iut_path, timeout=timeout)
         missing = sorted(set(RECORDS) - set(registry))
         if missing:
-            raise SmokeError("Stage 0 explanation codes are missing from --list: "
+            raise SmokeError("selected explanation codes are missing from --list: "
                              + ", ".join(missing))
         docs_root = Path(__file__).resolve().parents[2] / "docs"
         report["results"] = [

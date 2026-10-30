@@ -89,7 +89,7 @@ def _stdout(*records):
 
 
 class ExplanationMarkdownTests(unittest.TestCase):
-    def test_current_stage0_records_have_expected_structure(self):
+    def test_current_selected_records_have_expected_structure(self):
         for code, expected in RECORDS.items():
             with self.subTest(code=code):
                 markdown = (EXPLANATIONS / f"{code.lower()}.md").read_text(encoding="utf-8")
@@ -330,6 +330,8 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
         if failed:
             if code == "DUPLICATE_BINDING":
                 diagnostics.append(_diagnostic(code, line=2))
+            elif code == "TYPE_MISMATCH":
+                diagnostics.append(_diagnostic(code, line=1))
             else:
                 diagnostics.append(_diagnostic(code, line=1))
         exit_code = 1 if diagnostics else 0
@@ -403,6 +405,8 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
                 if self.build_duplicate:
                     return self._check_response("DUPLICATE_BINDING", failed=False)
                 return self._check_response("DUPLICATE_BINDING", failed=True)
+            if b"COUNT: I32 = true" in source:
+                return self._check_response("TYPE_MISMATCH", failed=True)
             if b"\\q" in source:
                 return self._check_response(
                     "INVALID_ESCAPE", failed=True, include_gate=True,
@@ -410,8 +414,13 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
             return self._check_response("DUPLICATE_BINDING", failed=False)
         if len(argv) >= 2 and argv[-2:] == ["--target", "wasm32-core"]:
             source = (Path(cwd) / "src" / "lib.sai").read_bytes()
-            code = "DUPLICATE_BINDING" if b"VALUE: U32 = 1" in source else "INVALID_ESCAPE"
-            diagnostic = _diagnostic(code, line=2 if code == "DUPLICATE_BINDING" else 1)
+            if b"VALUE: U32 = 1" in source:
+                code, line = "DUPLICATE_BINDING", 2
+            elif b"COUNT: I32 = true" in source:
+                code, line = "TYPE_MISMATCH", 1
+            else:
+                code, line = "INVALID_ESCAPE", 1
+            diagnostic = _diagnostic(code, line=line)
             return CompletedProcess(
                 [], 1,
                 _stdout(
@@ -423,12 +432,17 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
             )
         raise AssertionError(f"unexpected command: {argv!r}")
 
-    def test_runs_both_records_through_check_fix_and_formatter(self):
+    def test_runs_stage0_and_stage1_records_through_check_fix_and_formatter(self):
         with patch.object(run_stage0, "_run_iut", side_effect=self._run_iut):
             report = run_suite(self.iut)
         self.assertEqual(report["mode"], "partial-smoke")
         self.assertIs(report["claim"], False)
-        self.assertEqual((report["tests"], report["passed"], report["failed"]), (2, 2, 0))
+        self.assertEqual((report["tests"], report["passed"], report["failed"]), (3, 3, 0))
+        self.assertEqual(
+            [result["test"] for result in report["results"]],
+            [f"sai explain {code}" for code in RECORDS],
+        )
+        self.assertEqual({metadata["stage"] for metadata in RECORDS.values()}, {0, 1})
         self.assertEqual(report["outcome"], "pass")
         self.assertTrue(any(call[1:3] == ("explain", "--list") for call in self.calls))
         self.assertFalse(any("build" in call for call in self.calls))

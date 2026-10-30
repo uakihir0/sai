@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the partial Stage 0 `sai explain` record smoke."""
+"""Run the partial Stage 0 and Stage 1 `sai explain` record smoke."""
 
 from explanation_smoke import main
 
