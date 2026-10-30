@@ -42,6 +42,8 @@ jobs:
         run: cargo build -p sai_cli --locked
       - name: Run partial Stage 0 smoke (claim=false)
         run: python -B tools/conformance/run_stage0.py --iut "$GITHUB_WORKSPACE/target/debug/sai" tests/conformance
+      - name: Run partial explanation-record smoke (claim=false)
+        run: python -B tools/conformance/run_explanation_smoke.py --iut "$GITHUB_WORKSPACE/target/debug/sai"
 
   check:
     name: Check (${{ matrix.os }})

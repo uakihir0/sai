@@ -714,6 +714,8 @@ These tests live in `tests/impl/` and use the reference implementation's crates 
 
 **Formatter smoke status update (IR-1051–IR-1052):** The earlier coverage sentence above predates these changes. Source `fmt` pass fixtures now run 16 deterministic reference-lexer/parser-derived layout variants, and the Stage 0 smoke includes one lexical-error and one parser-error `fmt-refuse` fixture. The smoke still does not cover every formatter rule or refusal condition.
 
+**Explanation-record smoke status (IR-1062):** `tools/conformance/run_explanation_smoke.py` checks only the complete Stage 0 `DUPLICATE_BINDING` and `INVALID_ESCAPE` records. It validates their list and JSON metadata, Markdown structure, Example and Fix compilation, and formatter behavior, including the marked lexical refusal. The `INVALID_ESCAPE` Example may carry only the existing `sai check` Stage 0 feature gate in addition to its expected diagnostic. The report remains `partial-smoke` with `claim: false`; other registered records, staged applicability, diagnostic tables, and the registry-wide checks of §§15.8.4–15.8.5 are not covered.
+
 ### N-J-41 Expected diagnostics are matched by line and code
 
 - **Rule:** Diagnostics are compared as multisets of `(file, line, severity, code)`. Acceptance and rejection must always be correct. The reference implementation must match exactly; other implementations get deviations for missing and unexpected codes, which do not fail a claim but are reported with it. An internal compiler error always fails.
