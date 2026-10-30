@@ -8259,8 +8259,21 @@ fn check_inherent_method_body_type(
                 if is_function_primitive_local_binary_operator(operator) =>
             {
                 let operands = [left, right];
+                let is_unknown_direct_field = |operand: &HirExpr<'_>| {
+                    matches!(operand.kind, ExprKind::Field { .. })
+                        && matches!(
+                            primitive_self_field_type(operand, &field_types.fields, symbols),
+                            Some(Err(_))
+                        )
+                };
+                let allow_bool_literal_sibling = matches!(operator, BinOp::And | BinOp::Or)
+                    && operands
+                        .iter()
+                        .any(|operand| is_unknown_direct_field(operand));
                 if operands.iter().any(|operand| {
                     !matches!(operand.kind, ExprKind::Path(_) | ExprKind::Field { .. })
+                        && !(allow_bool_literal_sibling
+                            && matches!(operand.kind, ExprKind::Lit(Lit::Bool(_))))
                 }) {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
@@ -9313,7 +9326,12 @@ fn check_function_body_primitive_local_block(
     if tail_binding.is_some_and(|binding| !preceding_bindings.contains(&binding)) {
         return Ok(None);
     }
-    if let (true, ExprKind::Binary(_, left, right)) = (is_supported_binary_tail, tail.kind) {
+    if let (true, ExprKind::Binary(operator, left, right)) = (is_supported_binary_tail, tail.kind) {
+        let operands = [left, right];
+        let is_unknown_self_field = |operand: &HirExpr<'_>| {
+            matches!(operand.kind, ExprKind::Field { .. })
+                && unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+        };
         let is_preceding_path_or_field = |operand: &HirExpr<'_>| match operand.kind {
             ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
                 .is_some_and(|binding| preceding_bindings.contains(&binding)),
@@ -9323,7 +9341,13 @@ fn check_function_body_primitive_local_block(
             }
             _ => false,
         };
-        if !is_preceding_path_or_field(left) || !is_preceding_path_or_field(right) {
+        let shape_is_supported = operands.iter().enumerate().all(|(index, operand)| {
+            is_preceding_path_or_field(operand)
+                || (matches!(operator, BinOp::And | BinOp::Or)
+                    && matches!(operand.kind, ExprKind::Lit(Lit::Bool(_)))
+                    && is_unknown_self_field(operands[if index == 0 { 1 } else { 0 }]))
+        });
+        if !shape_is_supported {
             return Ok(None);
         }
     }
@@ -86377,13 +86401,13 @@ property "shared"() {}
     }
 
     #[test]
-    fn inherent_method_logical_tail_recovers_unknown_fields_without_tainted_facts() {
+    fn inherent_method_logical_tail_bool_literal_sibling_has_no_tainted_facts() {
         let root = concat!(
             "type User { enabled: Bool }\n",
             "impl User {\n",
             "  pub fn is_enabled(self: borrow Self) -> Bool {\n",
             "    let known = self.enabled\n",
-            "    self.enabld and self.enabled\n",
+            "    self.enabld and true\n",
             "  }\n",
             "}\n",
         );

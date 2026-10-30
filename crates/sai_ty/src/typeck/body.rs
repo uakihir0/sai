@@ -2478,17 +2478,26 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             .is_some_and(|fields| fields.contains(&operand.hir_id))
             );
             let is_supported_unknown_field_binary_tail = match expression.kind {
-                ExprKind::Binary(_, left, right) => {
+                ExprKind::Binary(operator, left, right) => {
                     let operands = [left, right];
-                    operands.iter().all(|operand| {
-                        matches!(operand.kind, ExprKind::Path(_) | ExprKind::Field { .. })
-                    }) && operands.iter().any(|operand| {
+                    let is_unknown_self_field = |operand: &Expr<'hir>| {
                         matches!(operand.kind, ExprKind::Field { .. })
                             && self
                                 .input
                                 .unknown_self_fields
                                 .is_some_and(|fields| fields.contains(&operand.hir_id))
-                    })
+                    };
+                    let has_unknown_self_field = operands
+                        .iter()
+                        .any(|operand| is_unknown_self_field(operand));
+                    let is_logical_operator = matches!(operator, BinOp::And | BinOp::Or);
+                    let shape_is_supported = operands.iter().enumerate().all(|(index, operand)| {
+                        matches!(operand.kind, ExprKind::Path(_) | ExprKind::Field { .. })
+                            || (is_logical_operator
+                                && matches!(operand.kind, ExprKind::Lit(Lit::Bool(_)))
+                                && is_unknown_self_field(operands[if index == 0 { 1 } else { 0 }]))
+                    });
+                    shape_is_supported && has_unknown_self_field
                 }
                 _ => false,
             };
@@ -3446,7 +3455,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match operator {
             BinOp::And | BinOp::Or => {
                 for operand in [left, right] {
-                    if let Some(operand_type) = self.known_recovery_operand_type(operand) {
+                    if let Some(operand_type) = self.known_recovery_logical_operand_type(operand) {
                         match primitive_bool_operand_result(operand_type) {
                             PrimitiveBoolOperandResult::Bool => {}
                             PrimitiveBoolOperandResult::TypeMismatch { found } => {
@@ -3750,6 +3759,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     .unknown_self_fields
                     .is_some_and(|fields| fields.contains(&expression.hir_id))
         };
+        let is_bool_literal =
+            |expression: &Expr<'hir>| matches!(expression.kind, ExprKind::Lit(Lit::Bool(_)));
         let is_known_self_field = |expression: &Expr<'hir>| {
             matches!(expression.kind, ExprKind::Field { .. })
                 && self
@@ -3810,7 +3821,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
 
         let shape_is_supported = match operator {
-            BinOp::And | BinOp::Or => is_path_or_self_field(left) && is_path_or_self_field(right),
+            BinOp::And | BinOp::Or => {
+                (is_path_or_self_field(left)
+                    || (is_bool_literal(left) && is_unknown_self_field(right)))
+                    && (is_path_or_self_field(right)
+                        || (is_bool_literal(right) && is_unknown_self_field(left)))
+            }
             BinOp::Shl | BinOp::Shr => {
                 let supported_left_literal = matches!(
                     left.kind,
@@ -3871,12 +3887,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             )
                         })
                     } else {
-                        self.known_recovery_operand_type(operand).is_some_and(|ty| {
-                            !matches!(
-                                primitive_bool_operand_result(ty),
-                                PrimitiveBoolOperandResult::Unsupported
-                            )
-                        })
+                        self.known_recovery_logical_operand_type(operand)
+                            .is_some_and(|ty| {
+                                !matches!(
+                                    primitive_bool_operand_result(ty),
+                                    PrimitiveBoolOperandResult::Unsupported
+                                )
+                            })
                     }
                 }),
             BinOp::Shl | BinOp::Shr => {
@@ -3928,6 +3945,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .and_then(|fields| fields.get(&expression.hir_id))
                 .copied(),
             _ => None,
+        }
+    }
+
+    fn known_recovery_logical_operand_type(&self, expression: &Expr<'hir>) -> Option<PrimTy> {
+        match expression.kind {
+            ExprKind::Lit(Lit::Bool(_)) => Some(PrimTy::Bool),
+            _ => self.known_recovery_operand_type(expression),
         }
     }
 
