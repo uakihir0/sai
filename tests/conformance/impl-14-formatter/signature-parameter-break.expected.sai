@@ -1,0 +1,8 @@
+//@ kind: fmt
+//@ stage: 0
+//@ spec: impl/14 §14.5.3, impl/14 §14.7.4
+pub fn connect_replica_cluster(
+    connection_pool: borrow ConnectionPool,
+    transaction_context: borrow Transaction,
+    retry_limit: U32,
+) -> Result<Connection, DatabaseError> {}
