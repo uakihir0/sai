@@ -3,3 +3,4 @@ INVALID_ESCAPE|hard|error||0|spec/02-lexical-structure.md|0.1.0|active||explanat
 LITERAL_OUT_OF_RANGE|hard|error||0|spec/02-lexical-structure.md|0.1.0|active||explanations/literal_out_of_range.md
 MALFORMED_NUMBER|hard|error||0|spec/02-lexical-structure.md|0.1.0|active||explanations/malformed_number.md
 TYPE_MISMATCH|hard|error||1|spec/05-types.md|0.1.0|active||explanations/type_mismatch.md
+UNKNOWN_FIELD|hard|error||1|spec/06-expressions-and-statements.md|0.1.0|active||explanations/unknown_field.md
