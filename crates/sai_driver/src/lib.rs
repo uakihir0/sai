@@ -7646,6 +7646,7 @@ fn check_function_body_type(
             locals,
             type_paths,
             direct_call_signatures,
+            false,
             semantic_types,
             symbols,
             None,
@@ -8199,21 +8200,55 @@ fn check_inherent_method_body_type(
         }
     }
     if let Some(tail) = method_block.tail {
-        if matches!(tail.kind, ExprKind::Field { .. }) {
-            if !collect_inherent_method_self_field(
-                method_owner.id,
-                tail,
-                true,
-                &field_types,
-                &mut self_field_projections,
-                &mut unknown_self_fields,
-                &mut diagnostics,
-                symbols,
-                inputs,
-                snapshot,
-            )? {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
+        match tail.kind {
+            ExprKind::Field { .. } => {
+                if !collect_inherent_method_self_field(
+                    method_owner.id,
+                    tail,
+                    true,
+                    &field_types,
+                    &mut self_field_projections,
+                    &mut unknown_self_fields,
+                    &mut diagnostics,
+                    symbols,
+                    inputs,
+                    snapshot,
+                )? {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
             }
+            ExprKind::Binary(operator, left, right)
+                if is_function_primitive_local_binary_operator(operator) =>
+            {
+                let operands = [left, right];
+                if operands.iter().any(|operand| {
+                    !matches!(operand.kind, ExprKind::Path(_) | ExprKind::Field { .. })
+                }) {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+                for operand in operands {
+                    if matches!(operand.kind, ExprKind::Field { .. }) {
+                        if !matches!(
+                            primitive_self_field_type(operand, &field_types.fields, symbols),
+                            Some(Ok(_))
+                        ) || !collect_inherent_method_self_field(
+                            method_owner.id,
+                            operand,
+                            true,
+                            &field_types,
+                            &mut self_field_projections,
+                            &mut unknown_self_fields,
+                            &mut diagnostics,
+                            symbols,
+                            inputs,
+                            snapshot,
+                        )? {
+                            return Ok(FunctionBodyTypeCheck::Unsupported);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -8232,6 +8267,7 @@ fn check_inherent_method_body_type(
         locals,
         type_paths,
         None,
+        true,
         semantic_types,
         symbols,
         Some(&self_field_projections),
@@ -8597,6 +8633,7 @@ fn check_function_body_primitive_local_block(
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    allow_binary_tail: bool,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
@@ -8667,6 +8704,12 @@ fn check_function_body_primitive_local_block(
     let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
     let is_supported_literal_tail = is_direct_function_scalar_literal(tail);
+    let is_supported_binary_tail = allow_binary_tail
+        && matches!(
+            tail.kind,
+            ExprKind::Binary(operator, _, _)
+                if is_function_primitive_local_binary_operator(operator)
+        );
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8678,12 +8721,14 @@ fn check_function_body_primitive_local_block(
         ExprKind::Field { .. } if is_supported_field_tail => None,
         ExprKind::Call { .. } if is_supported_call_tail => None,
         ExprKind::Lit(_) if is_supported_literal_tail => None,
+        ExprKind::Binary(..) if is_supported_binary_tail => None,
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
         && !is_supported_field_tail
         && !is_supported_call_tail
         && !is_supported_literal_tail
+        && !is_supported_binary_tail
     {
         return Ok(None);
     }
@@ -8975,6 +9020,19 @@ fn check_function_body_primitive_local_block(
     }
     if tail_binding.is_some_and(|binding| !preceding_bindings.contains(&binding)) {
         return Ok(None);
+    }
+    if let (true, ExprKind::Binary(_, left, right)) = (is_supported_binary_tail, tail.kind) {
+        let is_preceding_path_or_known_field = |operand: &HirExpr<'_>| match operand.kind {
+            ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding)),
+            ExprKind::Field { .. } => {
+                self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+            }
+            _ => false,
+        };
+        if !is_preceding_path_or_known_field(left) || !is_preceding_path_or_known_field(right) {
+            return Ok(None);
+        }
     }
     if let (
         true,

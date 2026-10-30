@@ -531,10 +531,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .call_signatures
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
         let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some());
+        let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
             && !is_supported_literal_tail
+            && !is_supported_binary_tail
         {
             return Err(());
         }
@@ -2445,6 +2447,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         .copied()
                         .ok_or(())?,
                 ),
+                ExprKind::Binary(operator, left, right) => {
+                    if matches!(
+                        operator,
+                        BinOp::Add
+                            | BinOp::Sub
+                            | BinOp::Mul
+                            | BinOp::Div
+                            | BinOp::Rem
+                            | BinOp::WrapAdd
+                            | BinOp::WrapSub
+                            | BinOp::WrapMul
+                    ) {
+                        self.check_arithmetic(operator, left, right, expression.hir_id)?
+                    } else if matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
+                        self.check_bitwise(operator, left, right, expression.hir_id)?
+                    } else if matches!(operator, BinOp::Shl | BinOp::Shr) {
+                        self.check_shift(operator, left, right, expression.hir_id, false)?
+                    } else if matches!(operator, BinOp::And | BinOp::Or) {
+                        self.check_logical(operator, left, right)?
+                    } else {
+                        self.check_comparison(operator, left, right)?
+                    }
+                }
                 _ => self.check_local_path(expression)?,
             }
         };
