@@ -898,6 +898,128 @@ mod tests {
     }
 
     #[test]
+    fn semicolons_separate_statements_without_parser_cascades() {
+        let source = "fn f() {\nlet first = 1; let second = 2\nsecond\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output.errors.is_empty(),
+            "semicolon recovery should not add parser diagnostics: {:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2,
+            "both semicolon-separated statements should remain in the syntax tree"
+        );
+        assert!(
+            root.descendants().any(|node| {
+                node.kind() == SyntaxKind::ERROR
+                    && &source
+                        [node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+                        == ";"
+            }),
+            "the lexically invalid semicolon must remain in an ERROR node"
+        );
+    }
+
+    #[test]
+    fn stray_semicolon_after_newline_preserves_following_statement() {
+        let source = "fn f() {\na\n; b\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output.errors.is_empty(),
+            "the lexical semicolon should not cause parser cascades: {:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            2,
+            "both statements should remain in the syntax tree"
+        );
+        assert!(
+            root.descendants().any(|node| {
+                node.kind() == SyntaxKind::ERROR
+                    && &source
+                        [node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+                        == ";"
+            }),
+            "the lexically invalid semicolon must remain in an ERROR node"
+        );
+    }
+
+    #[test]
+    fn semicolons_separate_top_level_items_without_parser_cascades() {
+        let source = "pub const FIRST: I32 = 1;; pub const SECOND: I32 = 2\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output.errors.is_empty(),
+            "semicolon recovery should not add parser diagnostics: {:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            2,
+            "both semicolon-separated items should remain in the syntax tree"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| {
+                    node.kind() == SyntaxKind::ERROR
+                        && &source[node.text_range().start().to_usize()
+                            ..node.text_range().end().to_usize()]
+                            == ";"
+                })
+                .count(),
+            2,
+            "both lexically invalid semicolons must remain in ERROR nodes"
+        );
+    }
+
+    #[test]
+    fn repeated_semicolons_between_block_statements_do_not_cascade() {
+        let source = "fn f() {\nlet first = 1;; let second = 2\nsecond\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output.errors.is_empty(),
+            "repeated semicolon recovery should not add parser diagnostics: {:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2,
+            "both semicolon-separated statements should remain in the syntax tree"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| {
+                    node.kind() == SyntaxKind::ERROR
+                        && &source[node.text_range().start().to_usize()
+                            ..node.text_range().end().to_usize()]
+                            == ";"
+                })
+                .count(),
+            2,
+            "each lexically invalid semicolon must remain in an ERROR node"
+        );
+    }
+
+    #[test]
     fn module_header_and_use_accessors_expose_docs_visibility_and_aliases() {
         use crate::ast::{AstNode, AstToken, SourceFile, UseDecl, Visibility};
 

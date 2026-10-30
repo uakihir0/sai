@@ -5223,6 +5223,20 @@ mod tests {
                 usize::from(expected_semicolon_newline),
                 "unexpected semicolon newline behavior for {text:?}"
             );
+            if text == "a; b" {
+                assert_eq!(
+                    kinds(&output),
+                    [
+                        SyntaxKind::LIDENT,
+                        SyntaxKind::ERROR,
+                        SyntaxKind::NEWLINE,
+                        SyntaxKind::LIDENT,
+                        SyntaxKind::NEWLINE,
+                        SyntaxKind::EOF,
+                    ],
+                    "the semicolon remains an error token before its generated newline"
+                );
+            }
             if text == "a\n; b" {
                 assert_eq!(
                     output

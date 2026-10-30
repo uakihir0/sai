@@ -1,0 +1,8 @@
+//@ kind: fmt-refuse
+//@ stage: 0
+//@ spec: spec/02 §2.8, impl/02 §2.4.9, impl/14 §14.2.2
+//@ diag: error NO_SEMICOLON at src/lib.sai:6
+pub fn value() -> I32 {
+    let first: I32 = 1; let second: I32 = 2
+    second
+}

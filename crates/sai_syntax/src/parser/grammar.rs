@@ -180,6 +180,33 @@ enum ImplTargetKind {
 }
 
 impl Parser<'_, '_> {
+    fn eat_nl_or_semicolon(&mut self) -> Result<bool, ParserError> {
+        if self.eat_nl() {
+            return Ok(true);
+        }
+        if self.current() != SyntaxKind::ERROR
+            || self.current_text() != ";"
+            || self.nth(1) != SyntaxKind::NEWLINE
+        {
+            return Ok(false);
+        }
+
+        self.eat_semicolon_error()?;
+        self.eat_nl();
+        Ok(true)
+    }
+
+    fn eat_semicolon_error(&mut self) -> Result<bool, ParserError> {
+        if self.current() != SyntaxKind::ERROR || self.current_text() != ";" {
+            return Ok(false);
+        }
+
+        let semicolon = self.start();
+        self.bump();
+        semicolon.complete(self, SyntaxKind::ERROR)?;
+        Ok(true)
+    }
+
     /// Parses the currently implemented source-file grammar into parser events.
     ///
     /// A token that no item production accepts returns
@@ -235,7 +262,10 @@ impl Parser<'_, '_> {
                 }
                 Err(error) => return Err(error),
             }
-            if !self.at(SyntaxKind::EOF) && !self.eat_nl() && !self.line_starts_top_level_item() {
+            if !self.at(SyntaxKind::EOF)
+                && !self.eat_nl_or_semicolon()?
+                && !self.line_starts_top_level_item()
+            {
                 if self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER]) {
                     while self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER]) {
                         self.misplaced_doc_comment()?;
@@ -4053,13 +4083,18 @@ impl Parser<'_, '_> {
                     && self.at_physical_line_start()
                     && self.statement_starts_at_after_attributes(self.position);
                 let newline = self.current_token().map(|token| token.range);
-                if self.eat_nl() {
+                if self.eat_nl_or_semicolon()? {
                     if statement_ends_with_expression && self.starts_binary_only_operator() {
                         let newline = newline.ok_or(ParserError::InvalidDiagnosticSpan)?;
                         self.emit_operator_continuation_diagnostic(newline)?;
                         self.recover_operator_continuation()?;
                     }
                     while self.eat_nl() {}
+                    // A run of semicolons can leave later ERROR tokens at the
+                    // next statement boundary without their own NEWLINE.
+                    while self.eat_semicolon_error()? {
+                        while self.eat_nl() {}
+                    }
                     continue;
                 }
                 if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
