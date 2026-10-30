@@ -2732,11 +2732,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Unary(UnOp::BitNot, operand)
-                    if is_supported_direct_call_bitwise_not_operand(operand) =>
+                    if is_supported_direct_call_bitwise_not_operand(
+                        operand,
+                        self.input.self_field_projections,
+                    ) =>
                 {
                     let local_type = match operand.kind {
                         ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)) => {
                             self.check_direct_call_bitwise_not_literal(operand, *expected)?
+                        }
+                        ExprKind::Field { .. } => {
+                            self.check_direct_call_bitwise_not_field(operand, argument.expr.hir_id)?
                         }
                         _ => self.check_bitwise_not_path(operand, argument.expr.hir_id)?,
                     };
@@ -2744,10 +2750,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Unary(UnOp::Neg, operand)
-                    if is_supported_direct_call_neg_operand(operand) =>
+                    if is_supported_direct_call_neg_operand(
+                        operand,
+                        self.input.self_field_projections,
+                    ) =>
                 {
-                    let local_type =
-                        self.check_direct_call_neg_path(operand, argument.expr.hir_id)?;
+                    let local_type = match operand.kind {
+                        ExprKind::Field { .. } => {
+                            self.check_direct_call_neg_field(operand, argument.expr.hir_id)?
+                        }
+                        _ => self.check_direct_call_neg_path(operand, argument.expr.hir_id)?,
+                    };
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
@@ -2823,6 +2836,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
+    fn check_direct_call_bitwise_not_field(
+        &mut self,
+        operand: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<LocalType, ()> {
+        let operand_type = self
+            .check_binary_operand(operand)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+        if !is_bitwise_primitive(operand_type) {
+            self.errors.push(PrimitiveBodyError {
+                node: expression,
+                kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                    operator: UnOp::BitNot,
+                    operand: operand_type,
+                },
+            });
+        }
+        Ok(LocalType::Concrete(operand_type))
+    }
+
     fn check_direct_call_neg_path(
         &mut self,
         operand: &'hir Expr<'hir>,
@@ -2830,6 +2866,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     ) -> Result<LocalType, ()> {
         let operand_type = self
             .check_local_path(operand)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+        if !is_neg_primitive(operand_type) {
+            self.errors.push(PrimitiveBodyError {
+                node: expression,
+                kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                    operator: UnOp::Neg,
+                    operand: operand_type,
+                },
+            });
+        }
+        Ok(LocalType::Concrete(operand_type))
+    }
+
+    fn check_direct_call_neg_field(
+        &mut self,
+        operand: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<LocalType, ()> {
+        let operand_type = self
+            .check_binary_operand(operand)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
@@ -5597,15 +5656,24 @@ fn is_supported_direct_call_not_operand(
             || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))))
 }
 
-fn is_supported_direct_call_bitwise_not_operand(operand: &Expr<'_>) -> bool {
+fn is_supported_direct_call_bitwise_not_operand(
+    operand: &Expr<'_>,
+    self_field_projections: Option<&HashMap<HirId, PrimTy>>,
+) -> bool {
     matches!(
         operand.kind,
         ExprKind::Path(_) | ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_))
-    )
+    ) || (matches!(operand.kind, ExprKind::Field { .. })
+        && self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)))
 }
 
-fn is_supported_direct_call_neg_operand(operand: &Expr<'_>) -> bool {
+fn is_supported_direct_call_neg_operand(
+    operand: &Expr<'_>,
+    self_field_projections: Option<&HashMap<HirId, PrimTy>>,
+) -> bool {
     matches!(operand.kind, ExprKind::Path(_))
+        || (matches!(operand.kind, ExprKind::Field { .. })
+            && self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)))
 }
 
 fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {

@@ -8497,6 +8497,27 @@ fn collect_inherent_method_direct_call_self_fields(
                     return Ok(false);
                 }
             }
+            ExprKind::Unary(UnOp::BitNot | UnOp::Neg, operand)
+                if matches!(operand.kind, ExprKind::Field { .. }) =>
+            {
+                if !matches!(
+                    primitive_self_field_type(operand, &fields.fields, symbols),
+                    Some(Ok(_))
+                ) || !collect_inherent_method_self_field(
+                    owner,
+                    operand,
+                    true,
+                    fields,
+                    self_field_projections,
+                    unknown_self_fields,
+                    diagnostics,
+                    symbols,
+                    inputs,
+                    snapshot,
+                )? {
+                    return Ok(false);
+                }
+            }
             ExprKind::Call { base: None, .. } if !nested => {
                 if !collect_inherent_method_direct_call_self_fields(
                     owner,
@@ -9434,12 +9455,14 @@ fn is_supported_direct_call_argument_shape(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         ExprKind::Unary(UnOp::Neg, _) => is_supported_direct_call_neg_argument_shape(
             expression,
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         ExprKind::Binary(BinOp::Rem, left, right) => {
             is_supported_direct_call_remainder_argument_shape(
@@ -9607,12 +9630,14 @@ fn is_supported_direct_call_arithmetic_argument_shape(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         ExprKind::Unary(UnOp::Neg, _) => is_supported_direct_call_neg_argument_shape(
             expression,
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         _ => is_supported_direct_call_leaf_argument_shape(
             expression,
@@ -9651,6 +9676,7 @@ fn is_supported_direct_call_bitwise_not_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     let ExprKind::Unary(UnOp::BitNot, operand) = expression.kind else {
         return false;
@@ -9659,6 +9685,9 @@ fn is_supported_direct_call_bitwise_not_argument_shape(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)) => true,
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+        }
         _ => false,
     }
 }
@@ -9668,15 +9697,19 @@ fn is_supported_direct_call_neg_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     let ExprKind::Unary(UnOp::Neg, operand) = expression.kind else {
         return false;
     };
-    let ExprKind::Path(path) = operand.kind else {
-        return false;
-    };
-    resolved_plain_local_path_binding(path, locals, inputs)
-        .is_some_and(|binding| preceding_bindings.contains(&binding))
+    match operand.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+        }
+        _ => false,
+    }
 }
 
 fn is_supported_direct_call_remainder_argument_shape(
