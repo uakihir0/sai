@@ -2607,8 +2607,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Field { .. } => {
-                    let local_type = self.check_binary_operand(argument.expr)?;
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    if !self
+                        .input
+                        .unknown_self_fields
+                        .is_some_and(|fields| fields.contains(&argument.expr.hir_id))
+                    {
+                        let local_type = self.check_binary_operand(argument.expr)?;
+                        self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    }
                 }
                 ExprKind::Call { .. } if !nested => {
                     let local_type = self.check_direct_call(argument.expr, true)?;

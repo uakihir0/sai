@@ -8406,23 +8406,25 @@ fn collect_inherent_method_direct_call_self_fields(
     };
 
     for argument in args.iter().take(signature.parameters.len()) {
+        if argument.name.is_some() {
+            continue;
+        }
         match argument.expr.kind {
             ExprKind::Field { .. } => {
-                if !matches!(
-                    primitive_self_field_type(argument.expr, &fields.fields, symbols),
-                    Some(Ok(_))
-                ) || !collect_inherent_method_self_field(
-                    owner,
-                    argument.expr,
-                    true,
-                    fields,
-                    self_field_projections,
-                    unknown_self_fields,
-                    diagnostics,
-                    symbols,
-                    inputs,
-                    snapshot,
-                )? {
+                if primitive_self_field_type(argument.expr, &fields.fields, symbols).is_none()
+                    || !collect_inherent_method_self_field(
+                        owner,
+                        argument.expr,
+                        true,
+                        fields,
+                        self_field_projections,
+                        unknown_self_fields,
+                        diagnostics,
+                        symbols,
+                        inputs,
+                        snapshot,
+                    )?
+                {
                     return Ok(false);
                 }
             }
@@ -8999,6 +9001,7 @@ fn check_function_body_primitive_local_block(
                                 inputs,
                                 direct_call_signatures,
                                 self_field_projections,
+                                unknown_self_fields,
                             )
                         })
                 }) => {}
@@ -9217,6 +9220,7 @@ fn check_function_body_primitive_local_block(
                     inputs,
                     direct_call_signatures,
                     self_field_projections,
+                    unknown_self_fields,
                 )
             })
         {
@@ -9326,6 +9330,7 @@ fn is_supported_direct_call_argument_shape(
     inputs: &CurrentOwnerInputs,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
 ) -> bool {
     match expression.kind {
         ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
@@ -9333,6 +9338,7 @@ fn is_supported_direct_call_argument_shape(
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&expression.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&expression.hir_id))
         }
         ExprKind::Unary(UnOp::Not, _) => is_supported_direct_call_not_argument_shape(
             expression,
@@ -9428,6 +9434,7 @@ fn is_supported_direct_call_argument_shape(
                         locals,
                         inputs,
                         self_field_projections,
+                        unknown_self_fields,
                     )
                 })
         }
@@ -9441,10 +9448,12 @@ fn is_supported_direct_call_arithmetic_argument_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
 ) -> bool {
     match expression.kind {
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&expression.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&expression.hir_id))
         }
         ExprKind::Binary(BinOp::Rem, left, right) => {
             is_supported_direct_call_remainder_argument_shape(
@@ -85777,10 +85786,13 @@ property "shared"() {}
             "    let error_source = self.naem\n",
             "    let copied_error = error_source\n",
             "    let propagated = copied_error + 1\n",
+            "    let inferred_call = identity(self.naem)\n",
+            "    let annotated_call: I32 = identity(self.naem)\n",
             "    let name = self.name\n",
             "    name\n",
             "  }\n",
             "}\n",
+            "pub fn identity(value: I32) -> I32 { value }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -85825,7 +85837,7 @@ property "shared"() {}
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
             panic!("a direct unknown self-field initializer should be checked: {check:#?}");
         };
-        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+        assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
         assert!(
             diagnostics
                 .iter()
@@ -85866,6 +85878,7 @@ property "shared"() {}
             "error_source",
             "copied_error",
             "propagated",
+            "inferred_call",
         ] {
             assert_eq!(
                 type_results.binding_type(binding_named(name)),
@@ -85915,6 +85928,18 @@ property "shared"() {}
                 .canonical_binding_type(binding_named("name"))
                 .is_some(),
             "a valid sibling keeps its canonical type beside field errors"
+        );
+        assert_eq!(
+            type_results.binding_type(binding_named("annotated_call")),
+            Some(sai_resolve::prelude::PrimTy::I32),
+            "an explicit call-result annotation remains authoritative despite an unknown argument"
+        );
+        assert!(
+            type_results
+                .partial_results()
+                .canonical_binding_type(binding_named("annotated_call"))
+                .is_some(),
+            "the explicit call-result annotation keeps its canonical fact"
         );
     }
 
