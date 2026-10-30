@@ -4258,6 +4258,8 @@ The direct integer-literal pair extension for wrapping operators is recorded in 
 
 **IR-1070 direct known fields under logical `not` as method tails.** In the same bounded inherent-method body slice, the complete method tail may be `not self.field` when the operand is one exact direct field projection validated against the method's nominal struct and supported primitive field types. Reuse the existing logical-not operand check and method return-type check, preserving their established spans. This includes a body with no preceding statements. Unknown fields, nested or computed operands, a plain local path under `not`, unary `-` or `~` tails, and all non-method unary tails remain gated without partial field diagnostics. This does not add general field lookup, lowering, or runtime behavior.
 
+**IR-1071 direct known fields under unary `-` and `~` as method tails.** In that same bounded inherent-method body slice, the complete method tail may also be `-self.field` or `~self.field` when the operand is one exact direct field projection validated against the method's nominal struct and supported primitive field types. Reuse the existing negation or BitNot operand check and method return-type check, preserving their established diagnostic spans. These forms work in otherwise empty bodies. Unknown fields, nested or computed operands, a plain local path under any unary operator, method tails other than the exact direct-field `not`, `-`, and `~` forms, and all top-level function unary tails remain gated without partial field diagnostics. This does not add general field lookup, lowering, or runtime behavior.
+
 ### 3.10.2 Coercions and adjustments
 
 ```rust
