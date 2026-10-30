@@ -443,6 +443,27 @@ let good = 1 //~ error TRUE_ERROR
             with self.subTest(source=source), self.assertRaisesRegex(ValueError, "lone CR"):
                 extract(source, "src/lib.sai")
 
+    def test_invalid_escape_is_supported_only_in_a_fmt_refuse_fixture(self):
+        source = r"""//@ kind: fmt-refuse
+//@ stage: 0
+//@ spec: spec/02 §2.6.4, impl/14 §14.2.2
+//@ diag: error INVALID_ESCAPE at src/lib.sai:5
+pub fn invalid_escape() -> Str { "\q" }
+"""
+        result = extract_with_directives(source, "src/lib.sai")
+        self.assertEqual(result["expected"], [
+            expected(5, "error", "INVALID_ESCAPE"),
+        ])
+        self.assertEqual(result["directives"]["kind"], "fmt-refuse")
+        for kind in ("fmt", "check-fail"):
+            with self.subTest(kind=kind), self.assertRaisesRegex(
+                ValueError, "invalid or unsupported escape"
+            ):
+                extract_with_directives(
+                    source.replace("kind: fmt-refuse", f"kind: {kind}"),
+                    "src/lib.sai",
+                )
+
     def test_valid_escapes_and_raw_strings_are_preserved(self):
         source = (r'''let a = "\u{41}\n\" // not a comment"''' + '\n' +
                   r'''let b = b"\x41\n\" // not a comment"''' + '\n' +

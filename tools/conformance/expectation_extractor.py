@@ -15,7 +15,9 @@ ill-formed tests whose comment boundaries cannot be established are
 unsupported. Non-ASCII code outside comments and literals is
 unsupported; the scanner does not depend on Python's Unicode identifier tables.
 Invalid UTF-8 is supported only as isolated bytes outside comments and literals.
-Invalid escapes, manifest line continuations, and a backslash immediately
+Invalid escapes are rejected except inside a strictly headed `fmt-refuse`
+fixture, where the scanner skips the malformed literal escape while retaining the
+string boundary. Manifest line continuations and a backslash immediately
 followed by a lone CR (including in comments and raw strings) are rejected.
 Outside manifests, only complete package paths with unambiguous boundaries are
 supported. Ambiguous newline or bracket recovery causes conservative rejection.
@@ -377,6 +379,7 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
     code_on_line = False
     seen_token = False
     seen_directives = set()
+    allow_invalid_refusal_escapes = False
     expected = []
     previous_introducer = None
     line_break_since_previous = False
@@ -399,6 +402,7 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
         expected.append({"file": target_file, "line": target_line, "severity": severity, "code": code})
 
     def process_comment(comment: str) -> None:
+        nonlocal allow_invalid_refusal_escapes
         if comment.startswith("//~"):
             value = comment[3:]
             caret_count = len(value) - len(value.lstrip("^"))
@@ -451,6 +455,8 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
                     emit(parsed["severity"], parsed["code"], parsed["file"], parsed["line"])
                 else:
                     directive_values.setdefault(name, []).append(parsed)
+                    if name == "kind" and parsed == "fmt-refuse":
+                        allow_invalid_refusal_escapes = True
 
     def skip_escape(start: int, limit: int, *, byte: bool, continuation: bool) -> int:
         if start + 1 >= limit:
@@ -470,6 +476,8 @@ def _extract(source: str, path: str, *, directives: bool, lint_levels: dict | No
                     return match.end()
         if escaped == "x" and byte and start + 4 <= limit and re.fullmatch(r"[0-9a-fA-F]{2}", source[start + 2:start + 4]):
             return start + 4
+        if allow_invalid_refusal_escapes:
+            return start + 2
         fail("invalid or unsupported escape")
 
     def skip_literal(start: int, quote: str, *, byte: bool = False) -> int:

@@ -1,0 +1,5 @@
+//@ kind: fmt-refuse
+//@ stage: 0
+//@ spec: spec/02 §2.6.4, impl/14 §14.2.2
+//@ diag: error INVALID_ESCAPE at src/lib.sai:5
+pub fn invalid_escape() -> Str { "\q" }

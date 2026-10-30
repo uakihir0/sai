@@ -62,7 +62,10 @@ omitted default such as `targets` from an explicitly written value.
 The scanner is deliberately incomplete: it rejects package paths with
 ambiguous boundaries or newline contexts, format strings, execution
 expectations, non-ASCII code outside literals and comments, and ambiguous
-malformed inputs. Expectation-only mode checks directive placement and
+malformed inputs. A strictly validated leading `fmt-refuse` header permits
+invalid literal escapes so the refusal fixture can reach the IUT; malformed
+literal boundaries and other unsupported escapes still fail closed.
+Expectation-only mode checks directive placement and
 repetition but does not validate values. Strict mode validates directive
 names, repeatability, placement and the documented value forms, including the
 allowed target/profile/option names, comma-separated section-reference syntax,
@@ -196,12 +199,13 @@ This runner is useful as smoke evidence only; it does not validate suite
 coverage, goldens, all directive applicability, or the complete conformance
 protocol, and cannot substantiate a conformance claim.
 Formatter coverage is limited to single-file source `fmt` byte comparisons,
-fixed-point checks, source-stdin, generated package-wide `fmt --check` and
-`fmt --check` with one explicit path, and exact-diagnostic `fmt-refuse` cases.
+fixed-point checks, 16 deterministic layout variants, source-stdin, generated
+package-wide `fmt --check` and `fmt --check` with one explicit path, and
+exact-diagnostic `fmt-refuse` cases.
 Fixed-point and `fmt --check` checks apply only to `fmt` pass fixtures.
 Package-contract formatting variants and goldens, package workspaces,
-multi-source package checks, multiple explicit path arguments, layout variants,
-and complete rule coverage remain unsupported.
+multi-source package checks, multiple explicit path arguments, complete
+formatter-rule coverage, and every refusal condition remain unsupported.
 
 The subprocess environment mapping contains exactly the three listed entries.
 On macOS, Python test executables may add `LC_CTYPE` and
