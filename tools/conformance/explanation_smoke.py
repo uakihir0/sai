@@ -30,6 +30,12 @@ RECORDS = {
         "stage": 0,
         "owner": "spec/02-lexical-structure.md",
     },
+    "LITERAL_OUT_OF_RANGE": {
+        "class": "hard",
+        "severity": "error",
+        "stage": 0,
+        "owner": "spec/02-lexical-structure.md",
+    },
     "TYPE_MISMATCH": {
         "class": "hard",
         "severity": "error",
@@ -755,8 +761,9 @@ def run_suite(iut: str | Path, *, timeout: float = TIMEOUT_SECONDS) -> dict:
         "results": [],
         "failures": [],
         "limitations": [
-            "Only DUPLICATE_BINDING and INVALID_ESCAPE (Stage 0) and TYPE_MISMATCH "
-            "(Stage 1) are checked; other registered explanation records are not checked.",
+            "Only DUPLICATE_BINDING, INVALID_ESCAPE, and LITERAL_OUT_OF_RANGE "
+            "(Stage 0) and TYPE_MISMATCH (Stage 1) are checked; other registered "
+            "explanation records are not checked.",
             "This runner does not validate other registered explanation records, "
             "staged applicability, diagnostic tables, or the full registry checks "
             "required by impl/15 §§15.8.4–15.8.5.",

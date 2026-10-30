@@ -147,6 +147,30 @@ class ExplanationMarkdownTests(unittest.TestCase):
 
 
 class ExampleDiagnosticTests(unittest.TestCase):
+    def test_literal_out_of_range_does_not_accept_the_check_stage_gate(self):
+        expected = [{
+            "file": "src/lib.sai",
+            "line": 1,
+            "severity": "error",
+            "code": "LITERAL_OUT_OF_RANGE",
+        }]
+        records = [
+            _diagnostic("LITERAL_OUT_OF_RANGE", line=1),
+            _diagnostic(
+                "FEATURE_NOT_IMPLEMENTED",
+                path=None,
+                data={"stage": 0, "feature": "sai check"},
+                message="stage 0 feature `sai check` is not implemented",
+            ),
+        ]
+        with self.assertRaisesRegex(ValueError, "not marked by the Example"):
+            _validate_example_diagnostics(
+                records,
+                code="LITERAL_OUT_OF_RANGE",
+                command="check",
+                expected=expected,
+            )
+
     def test_invalid_escape_allows_only_the_known_check_stage_gate(self):
         expected = [{
             "file": "src/lib.sai",
@@ -411,6 +435,8 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
                 return self._check_response(
                     "INVALID_ESCAPE", failed=True, include_gate=True,
                 )
+            if b"VALUE: U8 = 999" in source:
+                return self._check_response("LITERAL_OUT_OF_RANGE", failed=True)
             return self._check_response("DUPLICATE_BINDING", failed=False)
         if len(argv) >= 2 and argv[-2:] == ["--target", "wasm32-core"]:
             source = (Path(cwd) / "src" / "lib.sai").read_bytes()
@@ -432,12 +458,12 @@ class ExplanationSmokeRunnerTests(unittest.TestCase):
             )
         raise AssertionError(f"unexpected command: {argv!r}")
 
-    def test_runs_stage0_and_stage1_records_through_check_fix_and_formatter(self):
+    def test_runs_selected_records_through_check_fix_and_formatter(self):
         with patch.object(run_stage0, "_run_iut", side_effect=self._run_iut):
             report = run_suite(self.iut)
         self.assertEqual(report["mode"], "partial-smoke")
         self.assertIs(report["claim"], False)
-        self.assertEqual((report["tests"], report["passed"], report["failed"]), (3, 3, 0))
+        self.assertEqual((report["tests"], report["passed"], report["failed"]), (4, 4, 0))
         self.assertEqual(
             [result["test"] for result in report["results"]],
             [f"sai explain {code}" for code in RECORDS],
