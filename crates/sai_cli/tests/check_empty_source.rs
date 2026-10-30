@@ -3324,6 +3324,174 @@ fn public_inherent_method_body_emits_check_result() {
 }
 
 #[test]
+fn public_inherent_method_direct_calls_accept_known_field_arguments() {
+    let source = concat!(
+        "type Counter { count: I32, enabled: Bool }\n",
+        "impl Counter {\n",
+        "    pub fn pass_fields(self: borrow Self) -> I32 {\n",
+        "        let direct = identity(self.count)\n",
+        "        let nested = identity(identity(self.count))\n",
+        "        let enabled = identity_bool(self.enabled)\n",
+        "        direct + nested\n",
+        "    }\n",
+        "}\n",
+        "pub fn identity(value: I32) -> I32 { value }\n",
+        "pub fn identity_bool(value: Bool) -> Bool { value }\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+
+    let tail_source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+        "        identity(self.count)\n",
+        "    }\n",
+        "}\n",
+        "pub fn identity(value: I32) -> I32 { value }\n",
+    );
+    assert_success_result(run_check(tail_source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn public_inherent_method_direct_call_field_mismatch_uses_field_span() {
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn pass_field(self: borrow Self) -> Bool {\n",
+        "        identity_bool(self.count)\n",
+        "    }\n",
+        "}\n",
+        "pub fn identity_bool(value: Bool) -> Bool { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a supported field argument mismatch is reported without a feature gate:\n{stdout}"
+    );
+    let start = source
+        .find("self.count")
+        .expect("mismatched field argument exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        start,
+        start + "self.count".len(),
+    );
+}
+
+#[test]
+fn inherent_method_direct_calls_keep_unsupported_trailing_items_gated() {
+    let cases = [
+        (
+            "private helper",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(self.count)\n",
+                "    }\n",
+                "}\n",
+                "fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "unsupported public helper body",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(self.count)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value + 1 }\n",
+            ),
+        ),
+        (
+            "non-function item",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn current_count(self: borrow Self) -> I32 {\n",
+                "        self.count\n",
+                "    }\n",
+                "}\n",
+                "const EXTRA: I32 = 1\n",
+            ),
+        ),
+    ];
+    for (context, source) in cases {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), context);
+    }
+}
+
+#[test]
+fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
+    let cases = [
+        (
+            "unknown field argument",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(self.missing)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "computed field argument",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(self.count + 1)\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "computed field argument in a nested call",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(identity(self.count + 1))\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
+        (
+            "field argument beyond the supported call nesting depth",
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn pass_field(self: borrow Self) -> I32 {\n",
+                "        identity(identity(identity(self.count)))\n",
+                "    }\n",
+                "}\n",
+                "pub fn identity(value: I32) -> I32 { value }\n",
+            ),
+        ),
+    ];
+    for (context, source) in cases {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated_without_syntax_errors(&output, context);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"UNKNOWN_FIELD\""),
+            "{context}: rejected field arguments must not leak a partial unknown-field diagnostic:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn public_inherent_method_body_reads_primitive_field() {
     for source in [
         concat!(
