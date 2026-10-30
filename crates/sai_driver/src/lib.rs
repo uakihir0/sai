@@ -8264,7 +8264,8 @@ fn check_inherent_method_body_type(
                 }) {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
-                let allow_unknown_fields = matches!(operator, BinOp::And | BinOp::Or);
+                let allow_unknown_fields =
+                    matches!(operator, BinOp::And | BinOp::Or | BinOp::Eq | BinOp::Ne);
                 for operand in operands {
                     if matches!(operand.kind, ExprKind::Field { .. }) {
                         let field_type =
@@ -9283,13 +9284,14 @@ fn check_function_body_primitive_local_block(
         return Ok(None);
     }
     if let (true, ExprKind::Binary(operator, left, right)) = (is_supported_binary_tail, tail.kind) {
-        let allow_unknown_logical_fields = matches!(operator, BinOp::And | BinOp::Or);
+        let allow_unknown_fields =
+            matches!(operator, BinOp::And | BinOp::Or | BinOp::Eq | BinOp::Ne);
         let is_preceding_path_or_field = |operand: &HirExpr<'_>| match operand.kind {
             ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
                 .is_some_and(|binding| preceding_bindings.contains(&binding)),
             ExprKind::Field { .. } => {
                 self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
-                    || (allow_unknown_logical_fields
+                    || (allow_unknown_fields
                         && unknown_self_fields
                             .is_some_and(|fields| fields.contains(&operand.hir_id)))
             }
@@ -86164,6 +86166,75 @@ property "shared"() {}
                 .len(),
             1,
             "canonical publication also omits the tainted logical tail"
+        );
+    }
+
+    #[test]
+    fn inherent_method_equality_tail_recovers_unknown_fields_without_tainted_facts() {
+        let root = concat!(
+            "type User { enabled: Bool }\n",
+            "impl User {\n",
+            "  pub fn is_enabled(self: borrow Self) -> Bool {\n",
+            "    let known = self.enabled\n",
+            "    self.enabld == self.enabled\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single inherent method collects");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let method = &results.owners()[0].members()[0];
+        let FunctionBodyTypeCheck::Supported { diagnostics } = method
+            .body_type_check()
+            .expect("method body check has an independent result")
+        else {
+            panic!("a direct unknown field in an equality tail should be recovered");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::UnknownField,
+            "{diagnostics:#?}"
+        );
+        let type_results = method
+            .primitive_body_type_results()
+            .expect("method type results have no resolution error")
+            .expect("a supported equality tail keeps its partial projection");
+        assert_eq!(
+            type_results
+                .expression_types()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [sai_resolve::prelude::PrimTy::Bool],
+            "the preceding known field initializer remains typed while the tainted equality tail is omitted"
+        );
+        assert_eq!(
+            type_results
+                .binding_types()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [sai_resolve::prelude::PrimTy::Bool],
+            "the independent inferred binding remains available"
+        );
+        assert_eq!(
+            type_results
+                .partial_results()
+                .canonical_expression_types()
+                .len(),
+            1,
+            "canonical publication also omits the tainted equality tail"
         );
     }
 

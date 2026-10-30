@@ -2457,8 +2457,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         && self.input.unknown_self_fields
                             .is_some_and(|fields| fields.contains(&operand.hir_id))
             );
-            let is_supported_unknown_logical_field_tail = match expression.kind {
-                ExprKind::Binary(BinOp::And | BinOp::Or, left, right) => {
+            let is_supported_unknown_logical_or_equality_field_tail = match expression.kind {
+                ExprKind::Binary(BinOp::And | BinOp::Or | BinOp::Eq | BinOp::Ne, left, right) => {
                     let operands = [left, right];
                     operands.iter().all(|operand| {
                         matches!(operand.kind, ExprKind::Path(_) | ExprKind::Field { .. })
@@ -2474,7 +2474,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             };
             if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. })
                 && !is_supported_unknown_not_field
-                && !is_supported_unknown_logical_field_tail
+                && !is_supported_unknown_logical_or_equality_field_tail
             {
                 return Err(());
             }
