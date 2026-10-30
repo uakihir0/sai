@@ -8248,6 +8248,27 @@ fn check_inherent_method_body_type(
                     }
                 }
             }
+            ExprKind::Unary(UnOp::Not, operand)
+                if matches!(operand.kind, ExprKind::Field { .. }) =>
+            {
+                if !matches!(
+                    primitive_self_field_type(operand, &field_types.fields, symbols),
+                    Some(Ok(_))
+                ) || !collect_inherent_method_self_field(
+                    method_owner.id,
+                    operand,
+                    true,
+                    &field_types,
+                    &mut self_field_projections,
+                    &mut unknown_self_fields,
+                    &mut diagnostics,
+                    symbols,
+                    inputs,
+                    snapshot,
+                )? {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+            }
             _ => {}
         }
     }
@@ -8710,6 +8731,13 @@ fn check_function_body_primitive_local_block(
             ExprKind::Binary(operator, _, _)
                 if is_function_primitive_local_binary_operator(operator)
         );
+    let is_supported_unary_field_tail = matches!(
+        tail.kind,
+        ExprKind::Unary(UnOp::Not, operand)
+            if matches!(operand.kind, ExprKind::Field { .. })
+                && self_field_projections
+                    .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+    );
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8722,6 +8750,7 @@ fn check_function_body_primitive_local_block(
         ExprKind::Call { .. } if is_supported_call_tail => None,
         ExprKind::Lit(_) if is_supported_literal_tail => None,
         ExprKind::Binary(..) if is_supported_binary_tail => None,
+        ExprKind::Unary(UnOp::Not, _) if is_supported_unary_field_tail => None,
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
@@ -8729,6 +8758,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_call_tail
         && !is_supported_literal_tail
         && !is_supported_binary_tail
+        && !is_supported_unary_field_tail
     {
         return Ok(None);
     }
