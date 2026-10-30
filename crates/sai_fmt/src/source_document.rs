@@ -11362,6 +11362,29 @@ mod tests {
     }
 
     #[test]
+    fn breaks_long_generic_return_type_after_the_arrow() {
+        let input = concat!(
+            "fn create()->",
+            "Result<ConnectionPoolWithReplicaRoutingMetadata,",
+            "DatabaseErrorWithReplicaConsistencyDetails>{}",
+        );
+        let expected = concat!(
+            "fn create() -> Result<\n",
+            "    ConnectionPoolWithReplicaRoutingMetadata,\n",
+            "    DatabaseErrorWithReplicaConsistencyDetails,\n",
+            "> {}\n",
+        );
+
+        let parsed = parse_source(input.as_bytes()).expect("input parses");
+        let output = format_shape(input.as_bytes()).expect("generic return type is supported");
+        assert_eq!(output, expected);
+        assert!(output.starts_with("fn create() -> Result<\n"));
+        let reparsed = parse_source(output.as_bytes()).expect("output parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
     fn formats_compound_parameter_and_return_types() {
         for (input, expected) in [
             (

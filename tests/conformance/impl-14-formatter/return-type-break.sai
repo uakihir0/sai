@@ -1,0 +1,4 @@
+//@ kind: fmt
+//@ stage: 0
+//@ spec: impl/14 §14.5.3, impl/14 §14.7.4
+fn create()->Result<ConnectionPoolWithReplicaRoutingMetadata,DatabaseErrorWithReplicaConsistencyDetails>{}
