@@ -532,9 +532,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
         let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some());
         let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
-        let is_supported_not_field_tail = matches!(
+        let is_supported_unary_field_tail = matches!(
             tail.kind,
-            ExprKind::Unary(UnOp::Not, operand)
+            ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand)
                 if matches!(operand.kind, ExprKind::Field { .. })
                     && self.input.self_field_projections
                         .is_some_and(|fields| fields.contains_key(&operand.hir_id))
@@ -544,7 +544,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             && !is_supported_call_tail
             && !is_supported_literal_tail
             && !is_supported_binary_tail
-            && !is_supported_not_field_tail
+            && !is_supported_unary_field_tail
         {
             return Err(());
         }
@@ -2486,6 +2486,26 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             .is_some_and(|fields| fields.contains_key(&operand.hir_id)) =>
                 {
                     self.check_logical_not(operand)?
+                }
+                ExprKind::Unary(UnOp::Neg, operand)
+                    if matches!(operand.kind, ExprKind::Field { .. })
+                        && self
+                            .input
+                            .self_field_projections
+                            .is_some_and(|fields| fields.contains_key(&operand.hir_id)) =>
+                {
+                    self.check_local_initializer_neg_path(operand, expression.hir_id)?
+                        .0
+                }
+                ExprKind::Unary(UnOp::BitNot, operand)
+                    if matches!(operand.kind, ExprKind::Field { .. })
+                        && self
+                            .input
+                            .self_field_projections
+                            .is_some_and(|fields| fields.contains_key(&operand.hir_id)) =>
+                {
+                    self.check_local_initializer_bitwise_not_path(operand, expression.hir_id)?
+                        .0
                 }
                 _ => self.check_local_path(expression)?,
             }

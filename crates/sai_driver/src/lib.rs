@@ -8248,7 +8248,7 @@ fn check_inherent_method_body_type(
                     }
                 }
             }
-            ExprKind::Unary(UnOp::Not, operand)
+            ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand)
                 if matches!(operand.kind, ExprKind::Field { .. }) =>
             {
                 if !matches!(
@@ -8733,7 +8733,7 @@ fn check_function_body_primitive_local_block(
         );
     let is_supported_unary_field_tail = matches!(
         tail.kind,
-        ExprKind::Unary(UnOp::Not, operand)
+        ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand)
             if matches!(operand.kind, ExprKind::Field { .. })
                 && self_field_projections
                     .is_some_and(|fields| fields.contains_key(&operand.hir_id))
@@ -8750,7 +8750,11 @@ fn check_function_body_primitive_local_block(
         ExprKind::Call { .. } if is_supported_call_tail => None,
         ExprKind::Lit(_) if is_supported_literal_tail => None,
         ExprKind::Binary(..) if is_supported_binary_tail => None,
-        ExprKind::Unary(UnOp::Not, _) if is_supported_unary_field_tail => None,
+        ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, _)
+            if is_supported_unary_field_tail =>
+        {
+            None
+        }
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
