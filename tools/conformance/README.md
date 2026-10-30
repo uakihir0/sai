@@ -62,9 +62,11 @@ omitted default such as `targets` from an explicitly written value.
 The scanner is deliberately incomplete: it rejects package paths with
 ambiguous boundaries or newline contexts, format strings, execution
 expectations, non-ASCII code outside literals and comments, and ambiguous
-malformed inputs. A strictly validated leading `fmt-refuse` header permits
-invalid literal escapes so the refusal fixture can reach the IUT; malformed
-literal boundaries and other unsupported escapes still fail closed.
+malformed inputs. In a strictly validated leading `fmt-refuse` fixture, the
+scanner permits invalid literal escapes so the refusal fixture can reach the
+IUT. It also permits an unterminated block comment only when the explicit error
+expectation is `UNTERMINATED_COMMENT` at that comment's opening line; malformed
+literal boundaries and other unsupported inputs still fail closed.
 Expectation-only mode checks directive placement and
 repetition but does not validate values. Strict mode validates directive
 names, repeatability, placement and the documented value forms, including the
