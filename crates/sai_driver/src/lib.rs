@@ -8263,24 +8263,13 @@ fn check_inherent_method_body_type(
                 }) {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
-                let allow_unknown_fields = matches!(
-                    operator,
-                    BinOp::And
-                        | BinOp::Or
-                        | BinOp::Eq
-                        | BinOp::Ne
-                        | BinOp::Lt
-                        | BinOp::Le
-                        | BinOp::Gt
-                        | BinOp::Ge
-                );
                 for operand in operands {
                     if matches!(operand.kind, ExprKind::Field { .. }) {
                         let field_type =
                             primitive_self_field_type(operand, &field_types.fields, symbols);
                         let is_known_field = matches!(field_type.as_ref(), Some(Ok(_)));
                         let is_unknown_field = matches!(field_type.as_ref(), Some(Err(_)));
-                        if !is_known_field && !(allow_unknown_fields && is_unknown_field) {
+                        if !is_known_field && !is_unknown_field {
                             return Ok(FunctionBodyTypeCheck::Unsupported);
                         }
                     }
@@ -9296,26 +9285,13 @@ fn check_function_body_primitive_local_block(
     if tail_binding.is_some_and(|binding| !preceding_bindings.contains(&binding)) {
         return Ok(None);
     }
-    if let (true, ExprKind::Binary(operator, left, right)) = (is_supported_binary_tail, tail.kind) {
-        let allow_unknown_fields = matches!(
-            operator,
-            BinOp::And
-                | BinOp::Or
-                | BinOp::Eq
-                | BinOp::Ne
-                | BinOp::Lt
-                | BinOp::Le
-                | BinOp::Gt
-                | BinOp::Ge
-        );
+    if let (true, ExprKind::Binary(_, left, right)) = (is_supported_binary_tail, tail.kind) {
         let is_preceding_path_or_field = |operand: &HirExpr<'_>| match operand.kind {
             ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
                 .is_some_and(|binding| preceding_bindings.contains(&binding)),
             ExprKind::Field { .. } => {
                 self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
-                    || (allow_unknown_fields
-                        && unknown_self_fields
-                            .is_some_and(|fields| fields.contains(&operand.hir_id)))
+                    || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
             }
             _ => false,
         };
@@ -86480,6 +86456,89 @@ property "shared"() {}
                 .len(),
             1,
             "canonical publication also omits the tainted ordering tail"
+        );
+    }
+
+    #[test]
+    fn inherent_method_arithmetic_tail_recovers_unknown_fields_without_tainted_facts() {
+        let root = concat!(
+            "type User { count: I64 }\n",
+            "impl User {\n",
+            "  pub fn recover(self: borrow Self) -> I32 {\n",
+            "    let known = self.count\n",
+            "    self.count + self.cout\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single inherent method collects");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let method = &results.owners()[0].members()[0];
+        let FunctionBodyTypeCheck::Supported { diagnostics } = method
+            .body_type_check()
+            .expect("method body check has an independent result")
+        else {
+            panic!("an unknown direct field in a supported arithmetic tail should be recovered");
+        };
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
+            "{diagnostics:#?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch),
+            "the known left operand determines an independent method-return mismatch: {diagnostics:#?}"
+        );
+
+        let type_results = method
+            .primitive_body_type_results()
+            .expect("method type results have no resolution error")
+            .expect("a supported arithmetic tail keeps its partial projection");
+        assert_primitive_type_result_parity(&database, type_results);
+        assert_eq!(
+            type_results.expression_types().len(),
+            1,
+            "the tainted binary tail must not publish a primitive expression fact"
+        );
+        assert_eq!(
+            type_results
+                .expression_types()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [sai_resolve::prelude::PrimTy::I64],
+            "the preceding known field initializer remains typed"
+        );
+        assert_eq!(
+            type_results
+                .binding_types()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [sai_resolve::prelude::PrimTy::I64],
+            "the independent inferred local remains typed"
+        );
+        assert_eq!(
+            type_results
+                .partial_results()
+                .canonical_expression_types()
+                .len(),
+            1,
+            "canonical publication also omits the tainted arithmetic tail"
         );
     }
 

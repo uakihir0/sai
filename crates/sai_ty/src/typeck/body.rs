@@ -2470,19 +2470,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             .unknown_self_fields
                             .is_some_and(|fields| fields.contains(&operand.hir_id))
             );
-            let is_supported_unknown_bool_comparison_field_tail = match expression.kind {
-                ExprKind::Binary(
-                    BinOp::And
-                    | BinOp::Or
-                    | BinOp::Eq
-                    | BinOp::Ne
-                    | BinOp::Lt
-                    | BinOp::Le
-                    | BinOp::Gt
-                    | BinOp::Ge,
-                    left,
-                    right,
-                ) => {
+            let is_supported_unknown_field_binary_tail = match expression.kind {
+                ExprKind::Binary(_, left, right) => {
                     let operands = [left, right];
                     operands.iter().all(|operand| {
                         matches!(operand.kind, ExprKind::Path(_) | ExprKind::Field { .. })
@@ -2499,7 +2488,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. })
                 && !is_supported_unknown_not_field
                 && !is_supported_unknown_neg_or_bitnot_field
-                && !is_supported_unknown_bool_comparison_field_tail
+                && !is_supported_unknown_field_binary_tail
             {
                 return Err(());
             }
@@ -3536,10 +3525,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
             BinOp::Rem => {
-                if let (Some(left_type), Some(right_type)) = (
-                    self.known_recovery_operand_type(left),
-                    self.known_recovery_operand_type(right),
-                ) {
+                let left_type = self.known_recovery_operand_type(left);
+                let right_type = self.known_recovery_operand_type(right);
+                if let (Some(left_type), Some(right_type)) = (left_type, right_type) {
                     if !is_arithmetic_primitive(left_type) || !is_arithmetic_primitive(right_type) {
                         return Err(());
                     }
@@ -3553,6 +3541,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         });
                     }
                     if !is_integer_primitive(left_type) {
+                        self.report_unsupported_float_remainder(expression.hir_id, left_type);
+                    }
+                } else if right_has_error {
+                    if let Some(left_type) = left_type.filter(|left_type| {
+                        is_arithmetic_primitive(*left_type) && !is_integer_primitive(*left_type)
+                    }) {
                         self.report_unsupported_float_remainder(expression.hir_id, left_type);
                     }
                 }
