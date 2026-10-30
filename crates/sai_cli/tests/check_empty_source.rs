@@ -3444,12 +3444,12 @@ fn unsupported_direct_call_self_field_argument_shapes_stay_gated() {
             ),
         ),
         (
-            "unknown field under logical not in a call argument",
+            "computed logical-not operand in a call argument",
             concat!(
                 "type Counter { count: I32 }\n",
                 "impl Counter {\n",
                 "    pub fn pass_field(self: borrow Self) -> I32 {\n",
-                "        identity(not self.missing)\n",
+                "        identity(not (self.count == 1))\n",
                 "    }\n",
                 "}\n",
                 "pub fn identity(value: Bool) -> Bool { value }\n",
@@ -3636,6 +3636,220 @@ fn direct_call_unknown_self_field_arguments_report_without_cascading() {
         "expected `I32`, found `Bool`",
         known_field_start,
         known_field_start + "self.flag".len(),
+    );
+}
+
+#[test]
+fn direct_call_logical_not_ignores_arguments_beyond_the_parameter_prefix() {
+    let source = concat!(
+        "type User { enabled: Bool }\n",
+        "impl User {\n",
+        "    pub fn inspect(self: borrow Self) -> Bool {\n",
+        "        identity(true, not self.missing)\n",
+        "    }\n",
+        "}\n",
+        "pub fn identity(value: Bool) -> Bool { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
+        1,
+        "the existing arity diagnostic is retained:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"UNKNOWN_FIELD\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "an argument beyond the parameter prefix must not be field-validated or typechecked:\n{stdout}"
+    );
+    let call = "identity(true, not self.missing)";
+    let call_start = source.find(call).expect("wrong-arity call exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "WRONG_ARGUMENT_COUNT",
+        "function expects 1 argument but found 2",
+        call_start,
+        call_start + call.len(),
+    );
+}
+
+#[test]
+fn direct_call_logical_not_accepts_exact_self_fields_at_bounded_depth() {
+    let known_bool_source = concat!(
+        "type User { enabled: Bool }\n",
+        "impl User {\n",
+        "    pub fn invert(self: borrow Self) -> Bool {\n",
+        "        accept_bool(not self.enabled)\n",
+        "    }\n",
+        "}\n",
+        "pub fn accept_bool(value: Bool) -> Bool { value }\n",
+    );
+    assert_success_result(
+        run_check(known_bool_source, "", &[], &[]),
+        "wasm32-core",
+        "dev",
+    );
+
+    let known_non_bool_source = concat!(
+        "type User { count: I32 }\n",
+        "impl User {\n",
+        "    pub fn reject_non_bool(self: borrow Self) -> Bool {\n",
+        "        accept_bool(not self.count)\n",
+        "    }\n",
+        "}\n",
+        "pub fn accept_bool(value: Bool) -> Bool { value }\n",
+    );
+    let known_non_bool_output = run_check(known_non_bool_source, "", &[], &[]);
+    let known_non_bool_stdout =
+        String::from_utf8(known_non_bool_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        known_non_bool_output.status.code(),
+        Some(1),
+        "{known_non_bool_stdout}"
+    );
+    assert_eq!(
+        known_non_bool_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "a known non-Bool field reports the ordinary logical-not operand mismatch:\n{known_non_bool_stdout}"
+    );
+    assert!(
+        !known_non_bool_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "a direct field operand is inside the supported shape:\n{known_non_bool_stdout}"
+    );
+    let known_field_start = known_non_bool_source
+        .find("self.count")
+        .expect("known non-Bool field exists");
+    assert_json_diagnostic_primary_span(
+        &known_non_bool_stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        known_field_start,
+        known_field_start + "self.count".len(),
+    );
+
+    let root_unknown_source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self) -> I32 {\n",
+        "        identity(not self.naem)\n",
+        "    }\n",
+        "}\n",
+        "pub fn identity(value: I32) -> Bool { true }\n",
+    );
+    let root_unknown_output = run_check(root_unknown_source, "", &[], &[]);
+    let root_unknown_stdout =
+        String::from_utf8(root_unknown_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        root_unknown_output.status.code(),
+        Some(1),
+        "{root_unknown_stdout}"
+    );
+    assert_eq!(
+        root_unknown_stdout
+            .matches("\"code\":\"UNKNOWN_FIELD\"")
+            .count(),
+        1,
+        "{root_unknown_stdout}"
+    );
+    assert_eq!(
+        root_unknown_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        2,
+        "the Bool result still checks against the call parameter and the method return:\n{root_unknown_stdout}"
+    );
+    assert!(
+        !root_unknown_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !root_unknown_stdout.contains("\"type\":\"result\""),
+        "the exact unknown-field Not argument is recovered:\n{root_unknown_stdout}"
+    );
+    let unknown_field_start = root_unknown_source
+        .find("naem")
+        .expect("unknown field exists");
+    assert_json_diagnostic_primary_span(
+        &root_unknown_stdout,
+        "UNKNOWN_FIELD",
+        "`User` has no field `naem`",
+        unknown_field_start,
+        unknown_field_start + "naem".len(),
+    );
+    let unknown_not_start = root_unknown_source
+        .find("not self.naem")
+        .expect("unknown Not operand exists");
+    assert_json_diagnostic_primary_span(
+        &root_unknown_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        unknown_not_start,
+        unknown_not_start + "not self.naem".len(),
+    );
+    let root_call_start = root_unknown_source
+        .find("identity(not self.naem)")
+        .expect("root call exists");
+    assert_json_diagnostic_primary_span(
+        &root_unknown_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        root_call_start,
+        root_call_start + "identity(not self.naem)".len(),
+    );
+    let unknown_field = root_unknown_stdout
+        .lines()
+        .find(|record| record.contains("\"field\":\"naem\""))
+        .expect("unknown-field diagnostic exists");
+    assert!(
+        unknown_field.contains("\"type_name\":\"User\"")
+            && unknown_field.contains("\"candidates\":[\"name\"]"),
+        "the unknown field diagnostic preserves candidates and declaration evidence:\n{unknown_field}"
+    );
+
+    let nested_unknown_source = concat!(
+        "type User { enabled: Bool }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self) -> I32 {\n",
+        "        to_int(accept_bool(not self.missing))\n",
+        "    }\n",
+        "}\n",
+        "pub fn accept_bool(value: Bool) -> Bool { value }\n",
+        "pub fn to_int(value: Bool) -> I32 { 1 }\n",
+    );
+    let nested_unknown_output = run_check(nested_unknown_source, "", &[], &[]);
+    let nested_unknown_stdout =
+        String::from_utf8(nested_unknown_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        nested_unknown_output.status.code(),
+        Some(1),
+        "{nested_unknown_stdout}"
+    );
+    assert_eq!(
+        nested_unknown_stdout
+            .matches("\"code\":\"UNKNOWN_FIELD\"")
+            .count(),
+        1,
+        "{nested_unknown_stdout}"
+    );
+    assert!(
+        !nested_unknown_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !nested_unknown_stdout.contains("\"type\":\"result\""),
+        "an exact Not field in the existing one-level nested call form is recovered:\n{nested_unknown_stdout}"
+    );
+    assert!(
+        !nested_unknown_stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+        "the recovered Bool agrees with both call signatures and the method return:\n{nested_unknown_stdout}"
+    );
+    let nested_field_start = nested_unknown_source
+        .find("missing")
+        .expect("nested unknown field exists");
+    assert_json_diagnostic_primary_span(
+        &nested_unknown_stdout,
+        "UNKNOWN_FIELD",
+        "`User` has no field `missing`",
+        nested_field_start,
+        nested_field_start + "missing".len(),
     );
 }
 
