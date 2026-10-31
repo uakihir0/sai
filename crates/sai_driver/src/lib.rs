@@ -9379,7 +9379,16 @@ fn check_function_body_primitive_local_block(
         let is_comparison_only_tail = gates.allow_comparison_tail
             && is_function_primitive_local_comparison_operator(operator);
         let shape_is_supported = if is_comparison_only_tail {
-            operands.iter().all(|operand| is_preceding_path(operand))
+            let preceding_paths = operands
+                .iter()
+                .filter(|operand| is_preceding_path(operand))
+                .count();
+            let scalar_literals = operands
+                .iter()
+                .filter(|operand| is_direct_function_scalar_literal(operand))
+                .count();
+            (preceding_paths == 2 && scalar_literals == 0)
+                || (preceding_paths == 1 && scalar_literals == 1)
         } else {
             operands.iter().enumerate().all(|(index, operand)| {
                 is_preceding_path_or_field(operand)
@@ -75587,6 +75596,68 @@ property "shared"() {}
                 .count(),
             3,
             "the local initializer and both comparison operand paths have I32 facts"
+        );
+        assert_eq!(
+            expression_types
+                .filter(|ty| *ty == sai_resolve::prelude::PrimTy::Bool)
+                .count(),
+            1,
+            "the comparison result has a Bool fact"
+        );
+        assert_eq!(
+            type_results
+                .partial_results()
+                .canonical_expression_types()
+                .len(),
+            4,
+            "each trusted primitive fact has a canonical projection"
+        );
+    }
+
+    #[test]
+    fn function_body_type_check_publishes_comparison_literal_tail_facts() {
+        let root = concat!(
+            "pub fn compare(left: I32) -> Bool {\n",
+            "    let copy = left\n",
+            "    copy < 10\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 1);
+        let owner = &resolved.owners()[0];
+        assert!(
+            matches!(
+                owner.body_type_check().expect("body result is available"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "a comparison tail over a preceding local and direct scalar literal is checked"
+        );
+
+        let type_results = owner
+            .primitive_body_type_results()
+            .expect("function type results have no resolution error")
+            .expect("a supported comparison literal tail publishes primitive facts");
+        assert_primitive_type_result_parity(&database, type_results);
+        let expression_types = type_results.expression_types().values().copied();
+        assert_eq!(
+            expression_types
+                .clone()
+                .filter(|ty| *ty == sai_resolve::prelude::PrimTy::I32)
+                .count(),
+            3,
+            "the local initializer path, comparison path, and scalar literal have I32 facts"
         );
         assert_eq!(
             expression_types

@@ -8692,6 +8692,34 @@ fn top_level_function_comparison_tails_accept_direct_local_paths() {
 }
 
 #[test]
+fn top_level_function_comparison_tails_accept_one_direct_scalar_literal() {
+    for source in [
+        "pub fn equal_right(value: I32) -> Bool { value == 1 }\n",
+        "pub fn not_equal_left(value: I32) -> Bool { 1 != value }\n",
+        "pub fn less_right(value: I32) -> Bool { value < 2 }\n",
+        "pub fn less_equal_left(value: I32) -> Bool { 2 <= value }\n",
+        "pub fn greater_right(value: I32) -> Bool { value > 0 }\n",
+        "pub fn greater_equal_left(value: I32) -> Bool { 0 >= value }\n",
+        "pub fn bool_right(value: Bool) -> Bool { value == true }\n",
+        "pub fn bool_left(value: Bool) -> Bool { false < value }\n",
+        "pub fn char_right(value: Char) -> Bool { value <= 'z' }\n",
+        "pub fn char_left(value: Char) -> Bool { 'a' < value }\n",
+        "pub fn byte_right(value: Byte) -> Bool { value == b'Z' }\n",
+        "pub fn byte_left(value: Byte) -> Bool { b'A' < value }\n",
+        "pub fn float_right(value: F64) -> Bool { value >= 1.5 }\n",
+        "pub fn float_left(value: F32) -> Bool { 1.5 < value }\n",
+        concat!(
+            "pub fn preceding_local(value: I16) -> Bool {\n",
+            "    let source: I16 = value\n",
+            "    source != 0\n",
+            "}\n",
+        ),
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
 fn top_level_function_comparison_tails_report_operand_and_return_mismatches() {
     let source = "pub fn mismatch(left: I32, right: U8) -> I32 { left == right }\n";
     let output = run_check(source, "", &[], &[]);
@@ -8729,10 +8757,102 @@ fn top_level_function_comparison_tails_report_operand_and_return_mismatches() {
 }
 
 #[test]
+fn top_level_function_comparison_tail_literal_mismatches_report_operand_and_return_spans() {
+    let source = "pub fn mismatch(value: I32) -> I32 { value == true }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal_start = source.find("true").expect("Bool literal exists");
+    let expression_start = source
+        .find("value == true")
+        .expect("comparison tail exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the literal operand and independently known Bool result both need diagnostics:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "supported comparison-tail errors remain semantic diagnostics:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found a Bool literal",
+        literal_start,
+        literal_start + "true".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        expression_start,
+        expression_start + "value == true".len(),
+    );
+
+    let source = "pub fn family_mismatch(value: F32) -> Bool { 1 < value }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let path_start = source.find("value }").expect("right operand path exists");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the path family mismatch should be reported once:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a literal-family mismatch still recovers as Bool:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F32`",
+        path_start,
+        path_start + "value".len(),
+    );
+}
+
+#[test]
+fn top_level_function_comparison_tail_literal_range_uses_the_selected_pointer_width() {
+    let source = "pub fn pointer_sized(value: USize) -> Bool { 4294967296 <= value }\n";
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let output = run_check(source, manifest, &[], &["--target", "wasm32-core"]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal_start = source
+        .find("4294967296")
+        .expect("pointer-sized literal exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && stdout.contains("\"message\":\"integer literal is out of range for `USize`\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a 32-bit pointer-sized comparison literal should be out of range:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `USize`",
+        literal_start,
+        literal_start + "4294967296".len(),
+    );
+
+    assert_success_result(
+        run_check(source, manifest, &[], &["--target", "wasm64-core"]),
+        "wasm64-core",
+        "dev",
+    );
+}
+
+#[test]
 fn top_level_function_comparison_tail_rejects_unsupported_shapes() {
     for source in [
-        "pub fn literal_right(left: I32) -> Bool { left == 1 }\n",
-        "pub fn literal_left(right: I32) -> Bool { 1 == right }\n",
+        "pub fn literal_pair() -> Bool { 1 == 2 }\n",
         "pub fn computed(left: I32, right: I32) -> Bool { (left + right) == left }\n",
         "pub fn nested(left: I32, right: I32) -> Bool { (left == right) == true }\n",
         "pub fn unresolved(left: I32) -> Bool { left == missing }\n",
@@ -8823,7 +8943,6 @@ fn unsupported_top_level_logical_tail_shapes_remain_gated() {
     for source in [
         "pub fn nested(left: Bool, right: Bool) -> Bool { (left and right) or left }\n",
         "pub fn computed(left: Bool, right: Bool) -> Bool { left or (right and left) }\n",
-        "pub fn comparison_literal(flag: Bool) -> Bool { flag == true }\n",
         "pub fn unresolved(enabled: Bool) -> Bool { missing and enabled }\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(
