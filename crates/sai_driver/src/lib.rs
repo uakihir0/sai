@@ -8396,7 +8396,7 @@ fn check_inherent_method_body_type(
         true,
         true,
         false,
-        false,
+        true,
         semantic_types,
         symbols,
         Some(&self_field_projections),
@@ -86610,6 +86610,172 @@ property "shared"() {}
                 "{operator}: an unknown operand leaves the unary tail without a canonical type"
             );
         }
+    }
+
+    #[test]
+    fn inherent_method_bool_literal_logical_initializers_publish_primitive_facts() {
+        let root = concat!(
+            "type User { enabled: Bool }\n",
+            "impl User {\n",
+            "  pub fn field_and_literal(self: borrow Self) -> Bool {\n",
+            "    let result = self.enabled and true\n",
+            "    result\n",
+            "  }\n",
+            "  pub fn literal_and_field(self: borrow Self) -> Bool {\n",
+            "    let result = false and self.enabled\n",
+            "    result\n",
+            "  }\n",
+            "  pub fn field_or_literal(self: borrow Self) -> Bool {\n",
+            "    let result = self.enabled or false\n",
+            "    result\n",
+            "  }\n",
+            "  pub fn literal_or_field(self: borrow Self) -> Bool {\n",
+            "    let result = true or self.enabled\n",
+            "    result\n",
+            "  }\n",
+            "  pub fn preceding_local_and_literal(self: borrow Self) -> Bool {\n",
+            "    let prior = self.enabled\n",
+            "    let result = prior and true\n",
+            "    result\n",
+            "  }\n",
+            "  pub fn literal_pair(self: borrow Self) -> Bool {\n",
+            "    let result = true and false\n",
+            "    result\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single inherent implementation collects");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let methods = &results.owners()[0].members();
+        assert_eq!(methods.len(), 6);
+
+        for (name, method, expected_expression_count, expected_binding_count) in [
+            ("field and literal", &methods[0], 4, 1),
+            ("literal and field", &methods[1], 4, 1),
+            ("field or literal", &methods[2], 4, 1),
+            ("literal or field", &methods[3], 4, 1),
+            ("preceding local and literal", &methods[4], 5, 2),
+            ("literal pair", &methods[5], 4, 1),
+        ] {
+            let check = method.body_type_check().expect("body check is available");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "{name}: {check:#?}"
+            );
+            let type_results = method
+                .primitive_body_type_results()
+                .expect("method type results have no resolution error")
+                .expect("a supported initializer publishes primitive facts");
+            assert_primitive_type_result_parity(&database, type_results);
+            assert_eq!(
+                type_results.expression_types().len(),
+                expected_expression_count,
+                "{name}: all supported operand, initializer, and tail expressions should be typed"
+            );
+            assert!(
+                type_results
+                    .expression_types()
+                    .values()
+                    .all(|ty| *ty == sai_resolve::prelude::PrimTy::Bool),
+                "{name}: {:?}",
+                type_results.expression_types()
+            );
+            assert_eq!(
+                type_results
+                    .partial_results()
+                    .canonical_expression_types()
+                    .len(),
+                expected_expression_count,
+                "{name}: every trusted expression fact should have a canonical projection"
+            );
+            assert_eq!(
+                type_results.binding_types().len(),
+                expected_binding_count,
+                "{name}: every trusted local initializer should keep its primitive fact"
+            );
+        }
+    }
+
+    #[test]
+    fn inherent_method_unknown_field_in_bool_literal_initializer_omits_tainted_facts() {
+        let root = concat!(
+            "type User { enabled: Bool }\n",
+            "impl User {\n",
+            "  pub fn recover(self: borrow Self) -> I32 {\n",
+            "    let result = self.enabld and true\n",
+            "    result\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single inherent method collects");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let method = &results.owners()[0].members()[0];
+        let FunctionBodyTypeCheck::Supported { diagnostics } = method
+            .body_type_check()
+            .expect("method body check has an independent result")
+        else {
+            panic!("an unknown field beside a Bool literal should be recovered");
+        };
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::UnknownField,
+            "{diagnostics:#?}"
+        );
+        assert_eq!(
+            diagnostics[1].code,
+            sai_diagnostics::Code::TypeMismatch,
+            "{diagnostics:#?}"
+        );
+        let type_results = method
+            .primitive_body_type_results()
+            .expect("method type results have no resolution error")
+            .expect("recovered method keeps independent type facts");
+        assert_primitive_type_result_parity(&database, type_results);
+        assert!(
+            type_results.expression_types().is_empty(),
+            "neither the unknown field, its Bool literal sibling, nor the tainted logical initializer has a primitive fact"
+        );
+        assert!(
+            type_results.binding_types().is_empty(),
+            "the inferred local depending on the unknown field is omitted"
+        );
+        assert!(
+            type_results
+                .partial_results()
+                .canonical_expression_types()
+                .is_empty(),
+            "canonical publication also omits every tainted expression fact"
+        );
+        assert!(
+            type_results
+                .partial_results()
+                .canonical_binding_types()
+                .is_empty(),
+            "canonical publication omits the tainted inferred binding"
+        );
     }
 
     #[test]

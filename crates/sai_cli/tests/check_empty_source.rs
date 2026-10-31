@@ -7758,11 +7758,11 @@ fn unknown_direct_self_field_operator_method_tail_stays_gated() {
 }
 
 #[test]
-fn unknown_logical_bool_literal_in_local_initializer_stays_gated_without_field_diagnostic() {
+fn unknown_logical_bool_literal_in_method_initializer_reports_field_and_return_mismatch() {
     let source = concat!(
         "type Counter { marker: Bool }\n",
         "impl Counter {\n",
-        "    pub fn current_count(self: borrow Self) -> Bool {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
         "        let result = self.enabld and true\n",
         "        result\n",
         "    }\n",
@@ -7773,16 +7773,265 @@ fn unknown_logical_bool_literal_in_local_initializer_stays_gated_without_field_d
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     assert!(output.stderr.is_empty(), "{stdout}");
     assert_eq!(
-        stdout
-            .matches("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
-            .count(),
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
         1,
-        "only the unsupported local-initializer shape should be gated:\n{stdout}"
+        "the missing field is diagnosed once:\n{stdout}"
     );
     assert!(
-        !stdout.contains("\"code\":\"UNKNOWN_FIELD\"") && !stdout.contains("\"type\":\"result\""),
-        "a rejected local initializer must not leak a staged field diagnostic or success:\n{stdout}"
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the admitted local initializer must not be gated or reported as success:\n{stdout}"
     );
+    let unknown_start = source.find("enabld").expect("unknown field exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "UNKNOWN_FIELD",
+        "`Counter` has no field `enabld`",
+        unknown_start,
+        unknown_start + "enabld".len(),
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "Bool recovery retains the independent method return mismatch:\n{stdout}"
+    );
+    let tail_start = source.rfind("result").expect("method tail exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        tail_start,
+        tail_start + "result".len(),
+    );
+}
+
+#[test]
+fn primitive_logical_method_local_initializers_accept_bool_literals() {
+    let cases = [
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = self.enabled and true\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self, flag: Bool) -> Bool {\n",
+            "        let result: Bool = false or flag\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = false and self.enabled\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = true or self.enabled\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = self.enabled or false\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let prior = self.enabled\n",
+            "        let result = prior and true\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = true and false\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+    ];
+
+    for source in cases {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_logical_method_initializer_annotation_and_return_mismatches_are_checked() {
+    let source = concat!(
+        "type Counter { enabled: Bool }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
+        "        let annotated: I32 = true and self.enabled\n",
+        "        let result: Bool = false or true\n",
+        "        result\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the initializer annotation and method return mismatches are independent:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "supported Bool literal logical initializers must reach semantic checks:\n{stdout}"
+    );
+    let annotation_start = source
+        .find("true and self.enabled")
+        .expect("annotated initializer exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        annotation_start,
+        annotation_start + "true and self.enabled".len(),
+    );
+    let tail_start = source.rfind("result").expect("method tail exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        tail_start,
+        tail_start + "result".len(),
+    );
+}
+
+#[test]
+fn primitive_logical_method_literal_mismatch_is_checked_without_a_feature_gate() {
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> Bool {\n",
+        "        let result = self.count and true\n",
+        "        result\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let operand_start = source
+        .find("self.count")
+        .expect("integer field operand exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the known non-Bool field operand receives a semantic mismatch:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the supported method initializer must not be gated or reported as success:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        operand_start,
+        operand_start + "self.count".len(),
+    );
+}
+
+#[test]
+fn unsupported_method_logical_local_initializer_literals_remain_gated() {
+    for source in [
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = self.enabled and 1\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = (self.enabled and true) or false\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = self.enabled and true or false\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = (not self.enabled) and true\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = true and missing\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let result = later and true\n",
+            "        let later = true\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { enabled: Bool }\n",
+            "impl Counter {\n",
+            "    pub fn current_count(self: borrow Self) -> Bool {\n",
+            "        let mut flag = true\n",
+            "        let result = flag and true\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
 }
 
 #[test]
