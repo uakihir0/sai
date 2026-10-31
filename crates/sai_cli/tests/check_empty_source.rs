@@ -8297,7 +8297,6 @@ fn unsupported_top_level_logical_tail_shapes_remain_gated() {
         "pub fn computed(left: Bool, right: Bool) -> Bool { left or (right and left) }\n",
         "pub fn comparison(left: Bool, right: Bool) -> Bool { left == right }\n",
         "pub fn unresolved(enabled: Bool) -> Bool { missing and enabled }\n",
-        "pub fn local_initializer(left: Bool) -> Bool {\n    let result = left and true\n    result\n}\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(
             &run_check(source, "", &[], &[]),
@@ -13677,6 +13676,19 @@ fn primitive_logical_local_initializers_accept_parameter_and_local_paths() {
 }
 
 #[test]
+fn primitive_logical_local_initializers_accept_bool_literals() {
+    for source in [
+        "pub fn literal_right(flag: Bool) -> Bool {\n    let result = flag and true\n    result\n}\n",
+        "pub fn literal_left(flag: Bool) -> Bool {\n    let result: Bool = false or flag\n    result\n}\n",
+        "pub fn literal_pair() -> Bool {\n    let result: Bool = true and false\n    result\n}\n",
+        "pub fn other_literal_pair(flag: Bool) -> Bool {\n    let result = flag or false\n    result\n}\n",
+        "pub fn literal_with_local(flag: Bool) -> Bool {\n    let local: Bool = flag\n    let result = local and true\n    result\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
 fn primitive_logical_local_reports_each_non_bool_operand_in_source_order() {
     let source = "pub fn logical(left: I32, right: U32) -> Bool {\n    let result = left and right\n    result\n}\n";
     let output = run_check(source, "", &[], &[]);
@@ -13756,11 +13768,76 @@ fn primitive_logical_non_bool_annotation_reports_and_recovers_as_bool() {
 }
 
 #[test]
+fn primitive_logical_bool_literal_errors_recover_without_gating() {
+    let source =
+        "pub fn logical(left: I32) -> Bool {\n    let result = left and true\n    result\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let operand_start = source.find("left and").expect("path operand exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the non-Bool path should be diagnosed while the Bool literal fixes the other operand:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a supported logical initializer with a bad operand remains a semantic error:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        operand_start,
+        operand_start + "left".len(),
+    );
+
+    let source =
+        "pub fn logical(left: Bool) -> I32 {\n    let result: I32 = true or left\n    result\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let initializer_start = source
+        .find("true or left")
+        .expect("logical initializer exists");
+    let tail_start = source.rfind("result").expect("result tail exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the annotation and function return each mismatch the recovered Bool result:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "both independent mismatch checks remain available:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        initializer_start,
+        initializer_start + "true or left".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        tail_start,
+        tail_start + "result".len(),
+    );
+}
+
+#[test]
 fn unsupported_primitive_logical_local_initializer_shapes_remain_gated() {
     for source in [
         "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = (left and right) or right\n    result\n}\n",
         "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = not left and right\n    result\n}\n",
-        "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and true\n    result\n}\n",
+        "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and 1\n    result\n}\n",
+        "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = true and 1\n    result\n}\n",
+        "pub fn logical(flag: Bool) -> Bool {\n    let result = true and missing\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let inferred = 1\n    let result = inferred and flag\n    result\n}\n",
         "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and (right == left)\n    result\n}\n",
         "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and right + true\n    result\n}\n",

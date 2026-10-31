@@ -7649,6 +7649,7 @@ fn check_function_body_type(
             false,
             true,
             true,
+            true,
             semantic_types,
             symbols,
             None,
@@ -8395,6 +8396,7 @@ fn check_inherent_method_body_type(
         true,
         true,
         false,
+        false,
         semantic_types,
         symbols,
         Some(&self_field_projections),
@@ -8887,6 +8889,7 @@ fn check_function_body_primitive_local_block(
     allow_binary_tail: bool,
     allow_unary_path_tail: bool,
     allow_logical_tail: bool,
+    allow_bool_literal_logical_initializer: bool,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
@@ -9235,10 +9238,15 @@ fn check_function_body_primitive_local_block(
                             && self_field_projections
                                 .is_some_and(|fields| fields.contains_key(&operand.hir_id)))
                 };
+                let is_supported_logical_initializer_operand = |operand: &HirExpr<'_>| {
+                    is_preceding_path_or_self_field(operand)
+                        || (allow_bool_literal_logical_initializer
+                            && matches!(operand.kind, ExprKind::Lit(Lit::Bool(_))))
+                };
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => {
-                        is_preceding_path_or_self_field(left)
-                            && is_preceding_path_or_self_field(right)
+                        is_supported_logical_initializer_operand(left)
+                            && is_supported_logical_initializer_operand(right)
                     }
                     BinOp::Shl | BinOp::Shr => {
                         (is_preceding_path_or_self_field(left)
@@ -75299,6 +75307,64 @@ property "shared"() {}
                 .len(),
             3,
             "every logical expression fact has its canonical projection"
+        );
+    }
+
+    #[test]
+    fn function_body_type_check_publishes_bool_literal_logical_initializer_facts() {
+        let root = concat!(
+            "pub fn logical_initializer(flag: Bool) -> Bool {\n",
+            "    let result = flag and true\n",
+            "    result\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 1);
+        let owner = &resolved.owners()[0];
+        assert!(
+            matches!(
+                owner.body_type_check().expect("body result is available"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "a Bool-literal logical initializer is checked without diagnostics"
+        );
+
+        let type_results = owner
+            .primitive_body_type_results()
+            .expect("function type results have no resolution error")
+            .expect("a supported Bool-literal initializer publishes primitive facts");
+        assert_primitive_type_result_parity(&database, type_results);
+        assert_eq!(
+            type_results.expression_types().len(),
+            4,
+            "initializer path, Bool literal, logical initializer, and result tail have facts"
+        );
+        assert!(
+            type_results
+                .expression_types()
+                .values()
+                .all(|ty| *ty == sai_resolve::prelude::PrimTy::Bool),
+            "every logical initializer fact has Bool type"
+        );
+        assert_eq!(
+            type_results
+                .partial_results()
+                .canonical_expression_types()
+                .len(),
+            4,
+            "every trusted initializer and tail fact has a canonical projection"
         );
     }
 
