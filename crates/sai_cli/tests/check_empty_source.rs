@@ -6990,6 +6990,15 @@ fn unsupported_inherent_method_shapes_remain_gated() {
             ),
         ),
         (
+            "Bool literal not-tail stays method-gated",
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self) -> Bool { not true }\n",
+                "}\n",
+            ),
+        ),
+        (
             "receiver used in body",
             concat!(
                 "type Counter { marker: I32 }\n",
@@ -8731,6 +8740,44 @@ fn top_level_function_unary_path_tails_accept_parameters_and_preceding_locals() 
 }
 
 #[test]
+fn top_level_function_not_bool_literal_tails_accept_both_values() {
+    let sources = [
+        "pub fn invert_true() -> Bool { not true }\n",
+        "pub fn invert_false() -> Bool { not false }\n",
+    ];
+    for source in sources {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn top_level_function_not_bool_literal_tail_checks_return_type_span() {
+    let source = "pub fn invert_true() -> I32 { not true }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let tail_start = source.find("not true").expect("unary tail exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the supported Bool result keeps its independent return mismatch:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        tail_start,
+        tail_start + "not true".len(),
+    );
+}
+
+#[test]
 fn top_level_function_unary_path_tail_errors_keep_precise_spans() {
     let source = "pub fn bad_not(value: I32) -> I32 { not value }\n";
     let output = run_check(source, "", &[], &[]);
@@ -8803,7 +8850,9 @@ fn unsupported_top_level_unary_tail_shapes_remain_gated() {
         "pub fn nested(value: I32) -> I32 { -(-value) }\n",
         "pub fn computed(value: I32) -> I32 { -(value + 1) }\n",
         "pub fn computed_not(left: Bool, right: Bool) -> Bool { not (left or right) }\n",
-        "pub fn literal_not() -> Bool { not true }\n",
+        "pub fn literal_not_non_bool() -> Bool { not 1 }\n",
+        "pub fn nested_literal_not() -> Bool { not not true }\n",
+        "pub fn literal_not_initializer() -> Bool {\n    let result = not true\n    result\n}\n",
         "pub fn literal_bitnot() -> I32 { ~1 }\n",
         "pub fn unresolved(value: I32) -> I32 { -missing }\n",
         "pub fn qualified(value: U8) -> U8 { ~module.value }\n",

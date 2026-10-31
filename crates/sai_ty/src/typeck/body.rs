@@ -563,6 +563,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             _ => false,
         };
+        let is_supported_unary_bool_literal_tail = matches!(
+            tail.kind,
+            ExprKind::Unary(UnOp::Not, operand)
+                if matches!(operand.kind, ExprKind::Lit(Lit::Bool(_)))
+        );
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
@@ -570,6 +575,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             && !is_supported_binary_tail
             && !is_supported_unary_field_tail
             && !is_supported_unary_path_tail
+            && !is_supported_unary_bool_literal_tail
         {
             return Err(());
         }
@@ -2562,6 +2568,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     } else {
                         self.check_comparison(operator, left, right)?
                     }
+                }
+                ExprKind::Unary(UnOp::Not, operand)
+                    if matches!(operand.kind, ExprKind::Lit(Lit::Bool(_))) =>
+                {
+                    self.check_direct_call_logical_not(operand)?
                 }
                 ExprKind::Unary(UnOp::Not, operand)
                     if matches!(operand.kind, ExprKind::Field { .. })

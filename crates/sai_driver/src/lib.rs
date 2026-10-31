@@ -7650,6 +7650,7 @@ fn check_function_body_type(
             true,
             true,
             true,
+            true,
             semantic_types,
             symbols,
             None,
@@ -8388,6 +8389,7 @@ fn check_inherent_method_body_type(
         direct_call_signatures,
         true,
         true,
+        false,
         true,
         true,
         semantic_types,
@@ -8881,6 +8883,7 @@ fn check_function_body_primitive_local_block(
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
     allow_binary_tail: bool,
     allow_unary_path_tail: bool,
+    allow_bool_literal_not_tail: bool,
     allow_logical_tail: bool,
     allow_bool_literal_logical_initializer: bool,
     semantic_types: &sai_ty::ty::TyInterner,
@@ -8983,6 +8986,12 @@ fn check_function_body_primitive_local_block(
         _ => None,
     };
     let is_supported_unary_path_tail = allow_unary_path_tail && unary_path_binding.is_some();
+    let is_supported_bool_literal_not_tail = allow_bool_literal_not_tail
+        && matches!(
+            tail.kind,
+            ExprKind::Unary(UnOp::Not, operand)
+                if matches!(operand.kind, ExprKind::Lit(Lit::Bool(_)))
+        );
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -9005,6 +9014,7 @@ fn check_function_body_primitive_local_block(
         {
             unary_path_binding
         }
+        ExprKind::Unary(UnOp::Not, _) if is_supported_bool_literal_not_tail => None,
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
@@ -9014,6 +9024,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_binary_tail
         && !is_supported_unary_field_tail
         && !is_supported_unary_path_tail
+        && !is_supported_bool_literal_not_tail
     {
         return Ok(None);
     }
@@ -75446,6 +75457,62 @@ property "shared"() {}
                     .len(),
                 expression_types.len(),
                 "{operator}: every trusted path and unary result has a canonical fact"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_publishes_bool_literal_not_tail_facts() {
+        for literal in ["true", "false"] {
+            let root = format!("pub fn invert() -> Bool {{ not {literal} }}\n");
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("current-snapshot Phase 1 collection succeeds");
+            let resolved = database
+                .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+                .expect("function owner analyses succeed");
+            assert_eq!(resolved.owners().len(), 1);
+            let owner = &resolved.owners()[0];
+            assert!(
+                matches!(
+                    owner.body_type_check().expect("body result is available"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ),
+                "{literal}: an exact Bool literal not-tail is checked without diagnostics: {:?}",
+                owner.body_type_check().expect("body result is available")
+            );
+
+            let type_results = owner
+                .primitive_body_type_results()
+                .expect("function type results have no resolution error")
+                .expect("supported Bool literal not-tails publish primitive facts");
+            assert_primitive_type_result_parity(&database, type_results);
+            assert_eq!(
+                type_results.expression_types().len(),
+                2,
+                "{literal}: the Bool operand and unary result both have facts"
+            );
+            assert!(
+                type_results
+                    .expression_types()
+                    .values()
+                    .all(|ty| *ty == sai_resolve::prelude::PrimTy::Bool),
+                "{literal}: every expression fact has Bool type"
+            );
+            assert_eq!(
+                type_results
+                    .partial_results()
+                    .canonical_expression_types()
+                    .len(),
+                2,
+                "{literal}: each primitive fact has a canonical projection"
             );
         }
     }
