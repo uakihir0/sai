@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1091 (2026-10-30): support direct Bool logical tails in top-level functions
+
+- **Decision — review required:** In the existing bounded public top-level function body checker, accept a complete tail that is exactly one `and` or `or` whose immediate operands are Bool literals or one-segment plain local paths resolving to parameters or preceding accepted locals. Reuse the existing logical operand and function return checks.
+- **Reason:** Spec/06 §6.8.8 defines both operators as checking each operand against `Bool` and producing `Bool`. The body checker already checks logical local initializers and direct-call arguments, while top-level function tails were still behind the stage gate.
+- **Boundary and judgment:** Give logical tails a separate driver admission flag; enabling the existing general binary-tail flag would also admit arithmetic, comparison, shift, and bitwise tails. Validate both operands before body checking and keep nested/computed/chained expressions, unresolved or qualified paths, calls, fields, nonlogical binary tails, unary tails, and direct logical local initializers gated. Preserve left-to-right operand diagnostics, independent function-return mismatch checks, and primitive/canonical facts for valid Bool literal and path operands plus the tail. This operator-only admission, exact operand set, recovery behavior, and fact publication are **Review required**.
+- **Review required:** Challenge the driver and type-checker gates for parity. Verify `and` and `or`, path/path, literal/path in both orientations, literal/literal, and preceding locals; exact operand and complete-tail mismatch spans; independent operand and return errors; owner-checked canonical facts; and rejection of nested/computed/chained, unresolved, qualified, nonlogical, unary, call/field, and initializer shapes without accidental general tail typing.
+- **Verification:** Focused CLI coverage passed for accepted and rejected top-level forms and exact operand/return mismatch spans. The driver fact-publication regression passed. `cargo test --workspace --locked --quiet`, `cargo fmt --all -- --check`, and `git diff --check` passed; the workspace suite reported two ignored tests.
+- **Hostile review:** Pending.
+
 ### IR-1080 (2026-10-30): explain unknown field diagnostics
 
 - **Decision:** Register a complete `sai explain UNKNOWN_FIELD` record with the normative stage, owner, summary, metadata, and a source example plus correction. Describe unknown fields in access, construction, and pattern positions; distinguish inaccessible fields (`PRIVATE_FIELD`), tuple indices outside the arity (`TUPLE_INDEX_OUT_OF_RANGE`), and enum payload access before matching the variant.
