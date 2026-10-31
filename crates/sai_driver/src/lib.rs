@@ -7647,7 +7647,7 @@ fn check_function_body_type(
             type_paths,
             direct_call_signatures,
             false,
-            false,
+            true,
             true,
             semantic_types,
             symbols,
@@ -75300,6 +75300,95 @@ property "shared"() {}
             3,
             "every logical expression fact has its canonical projection"
         );
+    }
+
+    #[test]
+    fn function_body_type_check_publishes_unary_path_tail_facts() {
+        let cases = [
+            (
+                "logical not",
+                sai_resolve::prelude::PrimTy::Bool,
+                concat!(
+                    "pub fn unary_tail(enabled: Bool) -> Bool {\n",
+                    "    let copy = enabled\n",
+                    "    not copy\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "negation",
+                sai_resolve::prelude::PrimTy::I32,
+                concat!(
+                    "pub fn unary_tail(amount: I32) -> I32 {\n",
+                    "    let copy: I32 = amount\n",
+                    "    -copy\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "bitwise not",
+                sai_resolve::prelude::PrimTy::U8,
+                concat!(
+                    "pub fn unary_tail(bits: U8) -> U8 {\n",
+                    "    let copy: U8 = bits\n",
+                    "    ~copy\n",
+                    "}\n",
+                ),
+            ),
+        ];
+
+        for (operator, expected_type, root) in cases {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("current-snapshot Phase 1 collection succeeds");
+            let resolved = database
+                .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+                .expect("function owner analyses succeed");
+            assert_eq!(resolved.owners().len(), 1);
+            let owner = &resolved.owners()[0];
+            assert!(
+                matches!(
+                    owner.body_type_check().expect("body result is available"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ),
+                "{operator}: a direct unary path tail is checked without diagnostics"
+            );
+
+            let type_results = owner
+                .primitive_body_type_results()
+                .expect("function type results have no resolution error")
+                .expect("supported unary path tails publish primitive facts");
+            assert_primitive_type_result_parity(&database, type_results);
+            let expression_types = type_results
+                .expression_types()
+                .values()
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                expression_types.len(),
+                3,
+                "{operator}: initializer path, unary operand path, and tail"
+            );
+            assert!(
+                expression_types.iter().all(|found| *found == expected_type),
+                "{operator}: {expression_types:?}"
+            );
+            assert_eq!(
+                type_results
+                    .partial_results()
+                    .canonical_expression_types()
+                    .len(),
+                expression_types.len(),
+                "{operator}: every trusted path and unary result has a canonical fact"
+            );
+        }
     }
 
     #[test]
