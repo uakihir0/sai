@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run a deliberately partial Stage 0 smoke suite against a black-box IUT.
+"""Run a deliberately partial smoke suite against a black-box IUT.
 
-This runner accepts only reference-implementation, single-file Stage 0
-check-pass/check-fail and source-fmt/fmt-refuse tests. Its results are useful
-smoke evidence only; it never reports a conformance claim.
+This runner accepts reference-implementation, single-file Stage 0
+check-pass/check-fail and source-fmt/fmt-refuse tests, plus Stage 3 package
+formatter directory tests. Its results are useful smoke evidence only; it
+never reports a conformance claim.
 """
 
 from __future__ import annotations
@@ -191,7 +192,12 @@ def _resolve_spec_reference(reference: dict, docs_root: Path) -> None:
         raise SmokeError(f"spec section does not resolve: {document} §{section}")
 
 
-def _validate_directives(extracted: dict, docs_root: Path) -> tuple[dict, list[dict], dict]:
+def _validate_directives(
+    extracted: dict,
+    docs_root: Path,
+    *,
+    package_fmt: bool = False,
+) -> tuple[dict, list[dict], dict]:
     if not isinstance(extracted, dict) or set(extracted) != {"expected", "directives"}:
         raise SmokeError("expectation extractor returned an invalid value")
     expected = extracted["expected"]
@@ -214,12 +220,14 @@ def _validate_directives(extracted: dict, docs_root: Path) -> tuple[dict, list[d
     if unsupported:
         raise SmokeError("unsupported directive(s): " + ", ".join(sorted(unsupported)))
     if not {"kind", "stage", "spec"} <= set(specified):
-        raise SmokeError("Stage 0 tests require kind, stage, and spec directives")
+        raise SmokeError("smoke fixtures require kind, stage, and spec directives")
     kind = directives.get("kind")
     if kind not in ("check-pass", "check-fail", "fmt", "fmt-refuse"):
         raise SmokeError("only check-pass, check-fail, fmt, and fmt-refuse are supported")
-    if directives.get("stage") != 0:
-        raise SmokeError("only Stage 0 tests are supported")
+    expected_stage = 3 if package_fmt else 0
+    if directives.get("stage") != expected_stage:
+        supported = "Stage 3 package fmt directory tests" if package_fmt else "Stage 0 tests"
+        raise SmokeError(f"only {supported} are supported for this fixture")
     if not isinstance(directives.get("spec"), list) or not directives["spec"]:
         raise SmokeError("at least one spec section reference is required")
     for reference in directives["spec"]:
@@ -301,12 +309,36 @@ def _reject_sidecars(source: Path, fixture_path: str, *, allow_expected: bool = 
                     raise SmokeError("sidecars are unsupported by the Stage 0 smoke runner")
 
 
-def _read_expected_format(source: Path, fixture_path: str) -> bytes:
-    expected = source.with_name(source.stem + ".expected.sai")
+def _read_expected_format(
+    source: Path,
+    fixture_path: str,
+    *,
+    input_kind: str = "source",
+) -> bytes:
+    if input_kind == "package":
+        expected_directory = source.parent / "expected"
+        try:
+            directory_info = expected_directory.lstat()
+        except OSError:
+            raise SmokeError("package fmt fixture requires expected/sai.package") from None
+        if stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(directory_info.st_mode):
+            raise SmokeError("package formatter expected-output directory is not a directory")
+        try:
+            entries = list(expected_directory.iterdir())
+        except OSError:
+            raise SmokeError("could not inspect package formatter expected-output directory") from None
+        if len(entries) != 1 or entries[0].name != "sai.package":
+            raise SmokeError("package fmt fixture requires only expected/sai.package")
+        expected = entries[0]
+    else:
+        expected = source.with_name(source.stem + ".expected.sai")
     try:
         info = expected.lstat()
     except OSError:
-        raise SmokeError(f"source fmt fixture requires {source.stem}.expected.sai: {fixture_path}") from None
+        required = "expected/sai.package" if input_kind == "package" else (
+            source.stem + ".expected.sai"
+        )
+        raise SmokeError(f"fmt fixture requires {required}: {fixture_path}") from None
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise SmokeError("formatter expected-output sidecar is not a regular file")
     try:
@@ -317,6 +349,30 @@ def _read_expected_format(source: Path, fixture_path: str) -> bytes:
     return contents
 
 
+def _validate_package_fmt_fixture_directory(source: Path) -> None:
+    if source.name != "sai.package":
+        raise SmokeError("package fmt fixture root must be sai.package")
+    try:
+        entries = list(source.parent.iterdir())
+    except OSError:
+        raise SmokeError("could not inspect package fmt fixture directory") from None
+    if {entry.name for entry in entries} != {"sai.package", "expected"}:
+        raise SmokeError("package fmt fixture directory must contain only sai.package and expected")
+    expected_directory = source.parent / "expected"
+    for path in (source, expected_directory):
+        try:
+            info = path.lstat()
+        except OSError:
+            raise SmokeError("package fmt fixture has a missing required entry") from None
+        is_expected_kind = (
+            stat.S_ISDIR(info.st_mode)
+            if path == expected_directory
+            else stat.S_ISREG(info.st_mode)
+        )
+        if stat.S_ISLNK(info.st_mode) or not is_expected_kind:
+            raise SmokeError("package fmt fixture has an invalid required entry")
+
+
 def _validate_fmt_output(
     completed: subprocess.CompletedProcess,
     *,
@@ -324,6 +380,7 @@ def _validate_fmt_output(
     input_bytes: bytes,
     registered_codes: set[str],
     fixed_point: bool,
+    input_label: str = "source",
 ) -> None:
     records = _records(
         completed.stdout,
@@ -374,7 +431,7 @@ def _validate_fmt_output(
         or data["refused"] not in ([], ["<stdin>"])
         or (data["output"] is not None and not isinstance(data["output"], str))
     ):
-        raise SmokeError("sai fmt result does not match the source stdin fixture")
+        raise SmokeError(f"sai fmt result does not match the {input_label} stdin fixture")
     if completed.returncode != 0:
         if completed.returncode != 1:
             raise SmokeError("sai fmt returned an abnormal exit code")
@@ -386,11 +443,11 @@ def _validate_fmt_output(
             or any(item["severity"] != "error" for item in actual_diagnostics)
         ):
             raise SmokeError("sai fmt returned an invalid refusal")
-        raise SmokeError("source fmt fixture was refused by the formatter")
+        raise SmokeError(f"{input_label} fmt fixture was refused by the formatter")
     if actual_diagnostics:
-        raise SmokeError("source fmt returned unexpected diagnostics")
+        raise SmokeError(f"{input_label} fmt returned unexpected diagnostics")
     if data["refused"] or data["output"] is None:
-        raise SmokeError("sai fmt refused the source stdin fixture")
+        raise SmokeError(f"sai fmt refused the {input_label} stdin fixture")
     try:
         actual_output = data["output"].encode("utf-8", "strict")
     except UnicodeError:
@@ -413,9 +470,10 @@ def _generate_fmt_layout_variants(
     test_path: str,
     input_bytes: bytes,
     *,
+    input_kind: str = "source",
     timeout: float,
 ) -> list[bytes]:
-    """Use the reference lexer/parser to derive the normative F6 input layouts."""
+    """Use the reference lexer/parser to derive normative F6 input layouts."""
     repository_root = Path(__file__).resolve().parents[2]
     command = [
         "cargo",
@@ -427,8 +485,10 @@ def _generate_fmt_layout_variants(
         "--bin",
         "fmt-layout-variants",
         "--",
-        test_path,
     ]
+    if input_kind != "source":
+        command.extend(["--stdin-kind", input_kind])
+    command.append(test_path)
     try:
         completed = subprocess.run(
             command,
@@ -465,20 +525,35 @@ def _run_fmt_fixture(
     iut: Path,
     registered_codes: set[str],
     *,
+    input_kind: str = "source",
+    expected_output: bytes | None = None,
     timeout: float,
 ) -> None:
-    expected_output = _read_expected_format(source_path, fixture_path)
-    layout_variants = _generate_fmt_layout_variants(
-        fixture_path,
-        source_bytes,
-        timeout=timeout,
-    )
+    if expected_output is None:
+        expected_output = _read_expected_format(
+            source_path,
+            fixture_path,
+            input_kind=input_kind,
+        )
+    if input_kind == "source":
+        layout_variants = _generate_fmt_layout_variants(
+            fixture_path,
+            source_bytes,
+            timeout=timeout,
+        )
+    else:
+        layout_variants = _generate_fmt_layout_variants(
+            fixture_path,
+            source_bytes,
+            input_kind=input_kind,
+            timeout=timeout,
+        )
     command = [
         "--format=json",
         "--max-errors=0",
         "fmt",
         "--stdin-kind",
-        "source",
+        input_kind,
         "-",
     ]
     with tempfile.TemporaryDirectory(prefix="sai-stage0-fmt-") as temporary:
@@ -499,6 +574,7 @@ def _run_fmt_fixture(
             input_bytes=source_bytes,
             registered_codes=registered_codes,
             fixed_point=False,
+            input_label=input_kind,
         )
         for variant in layout_variants:
             laid_out = _run_iut(
@@ -515,6 +591,7 @@ def _run_fmt_fixture(
                 input_bytes=variant,
                 registered_codes=registered_codes,
                 fixed_point=False,
+                input_label=input_kind,
             )
         second = _run_iut(
             iut,
@@ -530,6 +607,7 @@ def _run_fmt_fixture(
             input_bytes=expected_output,
             registered_codes=registered_codes,
             fixed_point=True,
+            input_label=input_kind,
         )
         check_command = [
             "--format=json",
@@ -537,7 +615,7 @@ def _run_fmt_fixture(
             "fmt",
             "--check",
             "--stdin-kind",
-            "source",
+            input_kind,
             "-",
         ]
         for check_input in (source_bytes, expected_output):
@@ -555,6 +633,40 @@ def _run_fmt_fixture(
                 expected_output=expected_output,
                 registered_codes=registered_codes,
             )
+
+        if input_kind == "package":
+            manifest_file = package_root / "sai.package"
+            check_command = [
+                "--format=json",
+                "--max-errors=0",
+                "fmt",
+                "--check",
+                "sai.package",
+            ]
+            for check_input in (source_bytes, expected_output):
+                manifest_file.write_bytes(check_input)
+                manifest_state = _file_state(manifest_file)
+                checked = _run_iut(
+                    iut,
+                    check_command,
+                    package_root,
+                    timeout,
+                    state_root=sandbox_root,
+                )
+                _validate_fmt_check(
+                    checked,
+                    input_bytes=check_input,
+                    expected_output=expected_output,
+                    registered_codes=registered_codes,
+                    file_path="sai.package",
+                )
+                if _file_state(manifest_file) != manifest_state:
+                    raise SmokeError(
+                        "sai fmt --check modified or replaced the package fixture"
+                    )
+                if manifest_file.read_bytes() != check_input:
+                    raise SmokeError("sai fmt --check modified the package fixture")
+            return
 
         source_dir = package_root / "src"
         source_dir.mkdir()
@@ -1448,8 +1560,8 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
         "failures": [],
     }
     try:
-        if fixture["kind"] != "single-file":
-            raise SmokeError("directory fixtures are unsupported")
+        if fixture["kind"] not in ("single-file", "directory"):
+            raise SmokeError("discovery returned an unsupported fixture kind")
         parts = PurePosixPath(fixture["root_file"]).parts
         if not parts or parts[0] != "conformance":
             raise SmokeError("discovery returned an invalid fixture path")
@@ -1465,12 +1577,43 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
         except OSError:
             raise SmokeError(f"could not read fixture source: {path}") from None
         extracted = expectation_extractor.extract_bytes_with_directives(
-            source_bytes, "src/lib.sai"
+            source_bytes,
+            "sai.package" if fixture["kind"] == "directory" else "src/lib.sai",
         )
-        directives, expected, selection = _validate_directives(extracted, docs_root)
+        extracted_kind = (
+            extracted.get("directives", {}).get("kind")
+            if isinstance(extracted, dict)
+            and isinstance(extracted.get("directives"), dict)
+            else None
+        )
+        package_fmt = fixture["kind"] == "directory" and extracted_kind == "fmt"
+        directives, expected, selection = _validate_directives(
+            extracted,
+            docs_root,
+            package_fmt=package_fmt,
+        )
         output["configuration"] = selection["configurations"][0]
         output["reference_only"] = directives["reference_only"] is not None
         if directives["kind"] == "fmt":
+            if fixture["kind"] == "directory":
+                _validate_package_fmt_fixture_directory(source_path)
+                expected_output = _read_expected_format(
+                    source_path,
+                    path,
+                    input_kind="package",
+                )
+                _run_fmt_fixture(
+                    source_path,
+                    path,
+                    source_bytes,
+                    iut,
+                    codes,
+                    input_kind="package",
+                    expected_output=expected_output,
+                    timeout=timeout,
+                )
+                output["outcome"] = "pass"
+                return output
             _reject_sidecars(source_path, path, allow_expected=True)
             _run_fmt_fixture(
                 source_path,
@@ -1482,6 +1625,8 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
             )
             output["outcome"] = "pass"
             return output
+        if fixture["kind"] == "directory":
+            raise SmokeError("only package fmt directory fixtures are supported")
         if directives["kind"] == "fmt-refuse":
             _reject_sidecars(source_path, path)
             refusal_codes = _formatter_refusal_codes(docs_root)
@@ -1591,7 +1736,7 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
 
 def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
               *, timeout: float = TIMEOUT_SECONDS) -> dict:
-    """Run discovered Stage 0 check and source-fmt fixtures without a claim."""
+    """Run the supported partial Stage 0 and package-formatter smoke fixtures."""
     report = {
         "type": "summary",
         "mode": "partial-smoke",
@@ -1608,11 +1753,11 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "uses the generated package's wasm32-core/dev defaults for execution.",
             "The caller must supply this repository's reference sai binary; the runner "
             "cannot verify the identity of the executable passed with --iut.",
-            "Formatter coverage is limited to single-file source fmt goldens, their "
+            "Formatter coverage is limited to single-file source fmt goldens and "
+            "Stage 3 package fmt directory goldens, their "
             "fixed-point, 16 reference-lexer-derived deterministic layout variants, "
             "source-stdin, generated package-wide, and fmt --check with one explicit "
             "path, refusal fixtures, and a generated 16 MiB + 1 byte size-limit case. "
-            "Package-contract formatting variants and goldens, "
             "workspaces, multi-source package checks, multiple explicit path arguments, "
             "and complete "
             "formatter-rule coverage are not covered.",
@@ -1632,7 +1777,7 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
         conformance_root = Path(conformance_directory)
         fixtures = fixture_discovery.discover(conformance_root)
         if not fixtures:
-            raise SmokeError("no Stage 0 smoke fixtures were discovered")
+            raise SmokeError("no supported smoke fixtures were discovered")
         codes = _read_registry(iut_path, timeout=timeout)
         docs_root = Path(__file__).resolve().parents[2] / "docs"
         results = [

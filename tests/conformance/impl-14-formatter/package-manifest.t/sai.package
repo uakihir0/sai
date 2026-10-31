@@ -1,0 +1,13 @@
+//@ kind: fmt
+//@ stage: 3
+//@ spec: impl/14 §14.12.2
+package acme:photo-service@1.3.0
+targets{wasm32-core, wasm32-wasi, wasm64-core, wasm64-wasi, wasm32-wasi-preview1, wasm32-wasi-preview2, wasm32-unknown-unknown, wasm32-unknown-unknown-threads, from}
+requires {
+    sai:http @ ^ 1.4
+        from git "https://github.com/sai-lang/http"
+    sai:wasi @ ^0.2 from git "https://github.com/sai-lang/wasi-bindings-for-the-sai-language-runtime" only { wasm32-wasi }
+    acme:exif @ >=0.7.1 , <0.8 from git "https://github.com/acme/exif" grant { }
+}
+
+profile tiny { budget { wasm <= 64 KiB } }

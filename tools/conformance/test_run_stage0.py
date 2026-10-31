@@ -121,18 +121,32 @@ stdin_check_args = [
     "--format=json", "--max-errors=0", "fmt", "--check",
     "--stdin-kind", "source", "-",
 ]
+package_stdin_check_args = [
+    "--format=json", "--max-errors=0", "fmt", "--check",
+    "--stdin-kind", "package", "-",
+]
 package_check_args = ["--format=json", "--max-errors=0", "fmt", "--check"]
 path_check_args = [
     "--format=json", "--max-errors=0", "fmt", "--check", "src/lib.sai",
 ]
+package_manifest_check_args = [
+    "--format=json", "--max-errors=0", "fmt", "--check", "sai.package",
+]
 is_package_check = args == package_check_args
 is_path_check = args == path_check_args
-if args == stdin_check_args or is_package_check or is_path_check:
+is_package_manifest_check = args == package_manifest_check_args
+is_stdin_check = args in (stdin_check_args, package_stdin_check_args)
+if is_stdin_check or is_package_check or is_path_check or is_package_manifest_check:
     formatter_input = (
-        Path("src/lib.sai").read_bytes() if is_package_check or is_path_check
+        Path("sai.package").read_bytes() if is_package_manifest_check
+        else Path("src/lib.sai").read_bytes() if is_package_check or is_path_check
         else sys.stdin.buffer.read()
     )
-    formatter_path = "src/lib.sai" if is_package_check or is_path_check else "<stdin>"
+    formatter_path = (
+        "sai.package" if is_package_manifest_check
+        else "src/lib.sai" if is_package_check or is_path_check
+        else "<stdin>"
+    )
     formatter_file_count = 2 if is_package_check else 1
     try:
         receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
@@ -213,7 +227,7 @@ if args == stdin_check_args or is_package_check or is_path_check:
         forced_canonical_diagnostic = (
             MODE == "fmt_check_canonical_diagnostic"
             or (
-                is_package_check
+                (is_package_check or is_package_manifest_check)
                 and MODE == "fmt_check_package_manifest_diagnostic"
                 and formatter_input == EXPECTED_FORMATTED
             )
@@ -457,11 +471,15 @@ if args == stdin_check_args or is_package_check or is_path_check:
     print(line(summary(errors=errors, exit_code=status)).rstrip("\\n"))
     raise SystemExit(status)
 
-if args == [
+source_fmt_args = [
     "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
-]:
+]
+package_fmt_args = [
+    "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "package", "-",
+]
+if args in (source_fmt_args, package_fmt_args):
     formatter_input = sys.stdin.buffer.read()
-    if formatter_input == EXPECTED_SIZE_PROBE:
+    if args == source_fmt_args and formatter_input == EXPECTED_SIZE_PROBE:
         if MODE.startswith("fmt_size_refusal"):
             try:
                 receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
@@ -1036,6 +1054,60 @@ raise SystemExit(exit_code)
         self.mode = "fmt_fixture"
         self._write_fake()
 
+    def _package_fmt_fixture(self):
+        self.package_fixture = self.conformance / "package-manifest.t"
+        expected_directory = self.package_fixture / "expected"
+        expected_directory.mkdir(parents=True)
+        self.package_source = self.package_fixture / "sai.package"
+        self.package_source.write_text(
+            "//@ kind: fmt\n"
+            "//@ stage: 3\n"
+            "//@ spec: impl/14 §14.12.2\n"
+            "package acme:photo-service@1.3.0\n"
+            "targets {\n"
+            "    wasm32-core,\n"
+            "    wasm32-wasi,\n"
+            "}\n"
+            "requires {\n"
+            "    sai:http @ ^ 1.4\n"
+            "        from git \"https://github.com/sai-lang/http\"\n"
+            "    sai:wasi @ ^0.2 from git "
+            "\"https://github.com/sai-lang/wasi-bindings-for-the-sai-language-runtime\" "
+            "only { wasm32-wasi }\n"
+            "    acme:exif @ >=0.7.1 , <0.8 from git "
+            "\"https://github.com/acme/exif\" grant { }\n"
+            "}\n"
+            "\n"
+            "profile tiny { budget { wasm <= 64 KiB } }\n",
+            encoding="utf-8",
+        )
+        expected = (
+            "//@ kind: fmt\n"
+            "//@ stage: 3\n"
+            "//@ spec: impl/14 §14.12.2\n"
+            "package acme:photo-service @ 1.3.0\n"
+            "targets { wasm32-core, wasm32-wasi }\n"
+            "requires {\n"
+            "    sai:http @ ^1.4\n"
+            "        from git \"https://github.com/sai-lang/http\"\n"
+            "    sai:wasi @ ^0.2\n"
+            "        from git \"https://github.com/sai-lang/wasi-bindings-for-the-sai-language-runtime\"\n"
+            "        only { wasm32-wasi }\n"
+            "    acme:exif @ >=0.7.1, <0.8\n"
+            "        from git \"https://github.com/acme/exif\"\n"
+            "        grant {}\n"
+            "}\n"
+            "\n"
+            "profile tiny {\n"
+            "    budget { wasm <= 64 KiB }\n"
+            "}\n"
+        ).encode("utf-8")
+        (expected_directory / "sai.package").write_bytes(expected)
+        self.package_expected = expected
+        self.expected_format = expected
+        self.mode = "fmt_fixture"
+        self._write_fake()
+
     def _fmt_refuse_fixture(
         self, *, expected_line=6, extra="", body="pub fn broken() -> Bool { true\n",
         code="EXPECTED_TOKEN",
@@ -1141,6 +1213,25 @@ raise SystemExit(exit_code)
         self.assertEqual(arguments.kwargs["timeout"], 12)
         self.assertEqual(arguments.kwargs["cwd"], Path(__file__).resolve().parents[2])
 
+    def test_layout_generator_passes_package_kind(self):
+        payload = json.dumps(["same"] * FMT_LAYOUT_VARIANT_COUNT).encode("utf-8")
+        completed = subprocess.CompletedProcess(["cargo"], 0, payload, b"")
+        with patch("run_stage0.subprocess.run", return_value=completed) as process:
+            variants = _generate_fmt_layout_variants(
+                "conformance/impl-14-formatter/package-manifest.t",
+                b"package fixture",
+                input_kind="package",
+                timeout=12,
+            )
+
+        self.assertEqual(variants, [b"same"] * FMT_LAYOUT_VARIANT_COUNT)
+        self.assertEqual(process.call_args.args[0], [
+            "cargo", "run", "--quiet", "--locked", "--package", "sai_test_harness",
+            "--bin", "fmt-layout-variants", "--", "--stdin-kind", "package",
+            "conformance/impl-14-formatter/package-manifest.t",
+        ])
+        self.assertEqual(process.call_args.kwargs["input"], b"package fixture")
+
     def test_layout_generator_rejects_incomplete_variant_sets(self):
         completed = subprocess.CompletedProcess(["cargo"], 0, b"[]", b"")
         with patch("run_stage0.subprocess.run", return_value=completed):
@@ -1182,6 +1273,136 @@ raise SystemExit(exit_code)
             [variant.decode("utf-8") for variant in variants],
         )
 
+    def test_package_fmt_directory_runs_package_variants_and_check_paths(self):
+        self._package_fmt_fixture()
+        original = self.package_source.read_bytes()
+        variants = [f"package layout {index}\n".encode("utf-8") for index in range(16)]
+        with patch("run_stage0._generate_fmt_layout_variants", return_value=variants) as generate:
+            report = self._run()
+
+        self.assertEqual(report["outcome"], "pass")
+        generate.assert_called_once_with(
+            "conformance/package-manifest.t",
+            original,
+            input_kind="package",
+            timeout=1,
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(
+            receipt["formatter_inputs"][1:1 + FMT_LAYOUT_VARIANT_COUNT],
+            [variant.decode("utf-8") for variant in variants],
+        )
+        self.assertEqual(
+            receipt["fmt_argv"],
+            [
+                "--format=json",
+                "--max-errors=0",
+                "fmt",
+                "--stdin-kind",
+                "package",
+                "-",
+            ],
+        )
+        self.assertEqual(
+            receipt["formatter_check_argvs"],
+            [
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "fmt",
+                    "--check",
+                    "--stdin-kind",
+                    "package",
+                    "-",
+                ],
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "fmt",
+                    "--check",
+                    "--stdin-kind",
+                    "package",
+                    "-",
+                ],
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "fmt",
+                    "--check",
+                    "sai.package",
+                ],
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "fmt",
+                    "--check",
+                    "sai.package",
+                ],
+            ],
+        )
+        self.assertEqual(self.package_source.read_bytes(), original)
+        self.assertEqual(
+            (self.package_fixture / "expected" / "sai.package").read_bytes(),
+            self.package_expected,
+        )
+
+    def test_package_fmt_requires_expected_manifest_sidecar(self):
+        self._package_fmt_fixture()
+        (self.package_fixture / "expected" / "sai.package").unlink()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "requires only expected/sai.package",
+            " ".join(report["results"][0]["failures"]),
+        )
+
+    def test_package_fmt_requires_stage_three(self):
+        self._package_fmt_fixture()
+        self.package_source.write_text(
+            self.package_source.read_text(encoding="utf-8").replace(
+                "//@ stage: 3\n",
+                "//@ stage: 0\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "only Stage 3 package fmt directory tests are supported",
+            " ".join(report["results"][0]["failures"]),
+        )
+
+    def test_package_fmt_fixture_rejects_unlisted_files_and_symlinked_goldens(self):
+        with self.subTest("unlisted package entry"):
+            self._package_fmt_fixture()
+            (self.package_fixture / "unexpected.txt").write_text("ignored\n", encoding="utf-8")
+            report = self._run()
+            self.assertEqual(report["outcome"], "fail")
+            self.assertIn(
+                "must contain only sai.package and expected",
+                " ".join(report["results"][0]["failures"]),
+            )
+
+        with self.subTest("symlinked expected manifest"):
+            shutil.rmtree(self.package_fixture)
+            self._package_fmt_fixture()
+            expected = self.package_fixture / "expected" / "sai.package"
+            expected.unlink()
+            target = self.package_fixture / "expected" / "target"
+            target.write_bytes(self.package_expected)
+            expected.symlink_to(target)
+            report = self._run()
+            self.assertEqual(report["outcome"], "fail")
+            self.assertIn(
+                "symlink or special file",
+                " ".join(report["failures"]),
+            )
+
     def test_wrong_output_for_one_layout_variant_fails_fmt_fixture(self):
         self._fmt_fixture()
         variants = [f"layout {index}\n".encode("utf-8") for index in range(16)]
@@ -1198,6 +1419,51 @@ raise SystemExit(exit_code)
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual(len(receipt["formatter_inputs"]), 2)
         self.assertEqual(receipt["formatter_inputs"][1], variants[0].decode("utf-8"))
+
+    def test_wrong_output_for_one_package_layout_variant_fails_fmt_fixture(self):
+        self._package_fmt_fixture()
+        variants = [f"package layout {index}\n".encode("utf-8") for index in range(16)]
+        self.mode = "fmt_layout_output_mismatch"
+        self._write_fake()
+        with patch("run_stage0._generate_fmt_layout_variants", return_value=variants):
+            report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "sai fmt output does not match the expected bytes",
+            " ".join(report["results"][0]["failures"]),
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(len(receipt["formatter_inputs"]), 2)
+        self.assertEqual(receipt["formatter_inputs"][1], variants[0].decode("utf-8"))
+
+    def test_package_fmt_refusal_is_reported_as_package_input(self):
+        self._package_fmt_fixture()
+        self.mode = "fmt_refused"
+        self._write_fake()
+        variants = [f"package layout {index}\n".encode("utf-8") for index in range(16)]
+        with patch("run_stage0._generate_fmt_layout_variants", return_value=variants):
+            report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "package fmt fixture was refused by the formatter",
+            " ".join(report["results"][0]["failures"]),
+        )
+
+    def test_package_fmt_unexpected_diagnostics_are_attributed_to_package(self):
+        self._package_fmt_fixture()
+        self.mode = "fmt_unexpected_diagnostic"
+        self._write_fake()
+        variants = [f"package layout {index}\n".encode("utf-8") for index in range(16)]
+        with patch("run_stage0._generate_fmt_layout_variants", return_value=variants):
+            report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "package fmt returned unexpected diagnostics",
+            " ".join(report["results"][0]["failures"]),
+        )
 
     def test_fmt_refuse_accepts_exact_error_multiset_without_preflight_or_check(self):
         self._fmt_refuse_fixture()
@@ -1682,10 +1948,16 @@ raise SystemExit(exit_code)
         self._fixture()
         directory_fixture = self.conformance / "other.t"
         directory_fixture.mkdir()
-        (directory_fixture / "sai.package").write_text(PACKAGE_FOR_DISCOVERY, encoding="utf-8")
+        (directory_fixture / "sai.package").write_text(
+            "//@ kind: check-pass\n"
+            "//@ stage: 0\n"
+            "//@ spec: impl/14 §14.12\n"
+            + PACKAGE_FOR_DISCOVERY,
+            encoding="utf-8",
+        )
         report = self._run()
         self.assertEqual(report["failed"], 1)
-        self.assertIn("directory fixtures are unsupported",
+        self.assertIn("only package fmt directory fixtures are supported",
                       report["results"][0]["failures"][0])
 
     def test_wit_and_mir_sidecar_directories_fail_closed(self):
@@ -1712,7 +1984,7 @@ raise SystemExit(exit_code)
         report = self._run()
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(report["tests"], 0)
-        self.assertIn("no Stage 0 smoke fixtures", report["failures"][0])
+        self.assertIn("no supported smoke fixtures", report["failures"][0])
 
     def test_malformed_stream_missing_result_and_bad_result_schema_fail(self):
         self._fixture()

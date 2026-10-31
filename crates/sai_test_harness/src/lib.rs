@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use sai_fmt::parse_source;
+use sai_package::lexer::{PackageTokenKind, lex_tokens};
+use sai_package::manifest::{PackageRole, parse_for_role};
 use sai_syntax::{
     LexOutput, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TokenFlags, TriviaKind, lex,
 };
@@ -11,7 +13,7 @@ use sai_vfs::{FileId, SnapshotFile, SourceDecodeError, SourceFile, TextRange, Wo
 const SOURCE_PATH: &str = "src/lib.sai";
 const MAX_LAYOUT_VARIANTS: usize = 16;
 
-/// Failure while deriving formatter layout variants from a source fixture.
+/// Failure while deriving formatter layout variants from a fixture.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LayoutVariantError {
     /// The test path must be a nonempty repository-relative path using `/`.
@@ -20,6 +22,8 @@ pub enum LayoutVariantError {
     InvalidSource,
     /// The source was not accepted by the reference formatter parser.
     RefusedSource,
+    /// A generated candidate was refused or changed significant tokens.
+    InvalidVariant,
     /// The requested variant count exceeds the conformance contract.
     TooManyVariants { requested: usize, maximum: usize },
 }
@@ -32,6 +36,8 @@ impl std::fmt::Display for LayoutVariantError {
             }
             Self::InvalidSource => formatter.write_str("source could not be decoded or lexed"),
             Self::RefusedSource => formatter.write_str("source is refused by the reference parser"),
+            Self::InvalidVariant => formatter
+                .write_str("generated layout variant was refused or changed significant tokens"),
             Self::TooManyVariants { requested, maximum } => write!(
                 formatter,
                 "requested {requested} variants, maximum is {maximum}"
@@ -124,6 +130,135 @@ pub fn generate_layout_variants(
     }
 
     Ok(variants)
+}
+
+/// Derive deterministic, meaning-preserving `sai.package` layout variants.
+///
+/// The reference package lexer supplies token boundaries. Horizontal
+/// whitespace is varied throughout; line breaks are added or removed only
+/// before package continuation words and next to braces, where the package
+/// grammar guarantees that they do not alter the parsed contract. Comments
+/// and blank-line gaps remain byte-for-byte intact. Candidates must retain
+/// the significant token sequence and be accepted by the package parser.
+pub fn generate_package_layout_variants(
+    test_path: &str,
+    input: &[u8],
+    count: usize,
+) -> Result<Vec<Vec<u8>>, LayoutVariantError> {
+    if !is_normalized_test_path(test_path) {
+        return Err(LayoutVariantError::InvalidTestPath);
+    }
+    if count > MAX_LAYOUT_VARIANTS {
+        return Err(LayoutVariantError::TooManyVariants {
+            requested: count,
+            maximum: MAX_LAYOUT_VARIANTS,
+        });
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let baseline = package_signature(input).ok_or(LayoutVariantError::RefusedSource)?;
+    let lexed = lex_tokens(input);
+    let tokens = lexed
+        .tokens
+        .iter()
+        .filter(|token| {
+            token.kind != PackageTokenKind::Eof && token.kind != PackageTokenKind::Newline
+        })
+        .collect::<Vec<_>>();
+    let gaps = tokens
+        .windows(2)
+        .filter_map(|pair| {
+            let left = pair[0];
+            let right = pair[1];
+            let original = input.get(left.span.end..right.span.start)?;
+            let horizontal_only = original.iter().all(|byte| matches!(byte, b' ' | b'\t'));
+            let single_line_break = original.iter().filter(|byte| **byte == b'\n').count() == 1
+                && original
+                    .iter()
+                    .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'));
+            let right_text = input.get(right.span.clone())?;
+            let safe_newline = right_text == b"from"
+                || right_text == b"dir"
+                || right_text == b"only"
+                || right_text == b"grant"
+                || left.kind
+                    == PackageTokenKind::Punctuator(
+                        sai_package::lexer::PackagePunctuator::LeftBrace,
+                    )
+                || right.kind
+                    == PackageTokenKind::Punctuator(
+                        sai_package::lexer::PackagePunctuator::RightBrace,
+                    );
+            (horizontal_only || (single_line_break && safe_newline)).then_some((
+                left.span.end,
+                right.span.start,
+                safe_newline,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut random = Xoshiro256::from_seed(*blake3::hash(test_path.as_bytes()).as_bytes());
+    let mut variants = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let mut changes = Vec::new();
+        for (start, end, safe_newline) in &gaps {
+            if random.next_u64() % 100 >= 45 {
+                continue;
+            }
+            let choose_newline = *safe_newline && random.next_u64() % 2 == 0;
+            let replacement = if choose_newline {
+                let indent = (random.next_u64() % 9) as usize;
+                let mut replacement = Vec::with_capacity(1 + indent);
+                replacement.push(b'\n');
+                replacement.resize(1 + indent, b' ');
+                replacement
+            } else {
+                let spaces = 1 + (random.next_u64() % 8) as usize;
+                vec![b' '; spaces]
+            };
+            if input.get(*start..*end) != Some(replacement.as_slice()) {
+                changes.push((*start, *end, replacement));
+            }
+        }
+
+        let candidate = if changes.is_empty() {
+            input.to_vec()
+        } else {
+            apply_changes(input, changes)
+        };
+        let accepted = package_signature(&candidate).is_some_and(|signature| signature == baseline);
+        if !accepted {
+            return Err(LayoutVariantError::InvalidVariant);
+        }
+        variants.push(candidate);
+    }
+
+    Ok(variants)
+}
+
+fn package_signature(input: &[u8]) -> Option<Vec<(PackageTokenKind, Vec<u8>)>> {
+    let lexed = lex_tokens(input);
+    if lexed.invalid_utf8 || lexed.error_count != 0 {
+        return None;
+    }
+    let parsed = parse_for_role(input, PackageRole::Root);
+    if parsed.lexical_error_count() != 0 || parsed.refusing_error_count() != 0 {
+        return None;
+    }
+    lexed
+        .tokens
+        .iter()
+        .filter(|token| {
+            token.kind != PackageTokenKind::Eof && token.kind != PackageTokenKind::Newline
+        })
+        .map(|token| {
+            input
+                .get(token.span.clone())
+                .map(|text| (token.kind, text.to_vec()))
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -497,11 +632,18 @@ impl Xoshiro256 {
 
 #[cfg(test)]
 mod tests {
-    use sai_fmt::format_source;
+    use sai_fmt::{format_package, format_source};
 
-    use super::{LayoutVariantError, MAX_LAYOUT_VARIANTS, generate_layout_variants};
+    use super::{
+        LayoutVariantError, MAX_LAYOUT_VARIANTS, generate_layout_variants,
+        generate_package_layout_variants,
+    };
 
     const TEST_PATH: &str = "conformance/impl-14-formatter/function-spacing.sai";
+    const PACKAGE_TEST_PATH: &str = "conformance/impl-14-formatter/package-manifest.t";
+    const PACKAGE_INPUT: &[u8] = include_bytes!(
+        "../../../tests/conformance/impl-14-formatter/package-manifest.t/sai.package"
+    );
 
     fn fixture() -> (Vec<u8>, Vec<u8>) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -573,6 +715,47 @@ mod tests {
     }
 
     #[test]
+    fn generates_sixteen_deterministic_package_layouts() {
+        let variants = generate_package_layout_variants(PACKAGE_TEST_PATH, PACKAGE_INPUT, 16)
+            .expect("generate package layout variants");
+        let repeated = generate_package_layout_variants(PACKAGE_TEST_PATH, PACKAGE_INPUT, 16)
+            .expect("repeat package variant generation");
+        let expected = format_package(PACKAGE_INPUT)
+            .expect("format package fixture")
+            .into_bytes();
+
+        assert_eq!(variants, repeated);
+        assert_eq!(variants.len(), 16);
+        assert_eq!(
+            variants
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            16,
+            "tracked package fixture did not produce sixteen distinct layouts"
+        );
+        assert!(
+            variants.iter().any(|variant| variant != PACKAGE_INPUT),
+            "no package layout variant changed a gap"
+        );
+        assert!(
+            variants.iter().any(|variant| {
+                variant.iter().filter(|byte| **byte == b'\n').count()
+                    != PACKAGE_INPUT.iter().filter(|byte| **byte == b'\n').count()
+            }),
+            "no package layout variant added or removed a safe line break"
+        );
+        for variant in variants {
+            assert_eq!(
+                format_package(&variant)
+                    .expect("format package layout variant")
+                    .as_bytes(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn rejects_absolute_and_parent_relative_test_paths() {
         let (input, _) = fixture();
         for path in [
@@ -587,6 +770,25 @@ mod tests {
                 "accepted invalid fixture path {path}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_invalid_package_layout_inputs_and_excessive_counts() {
+        assert_eq!(
+            generate_package_layout_variants(PACKAGE_TEST_PATH, b"package {", 1),
+            Err(LayoutVariantError::RefusedSource)
+        );
+        assert_eq!(
+            generate_package_layout_variants(PACKAGE_TEST_PATH, PACKAGE_INPUT, 17),
+            Err(LayoutVariantError::TooManyVariants {
+                requested: 17,
+                maximum: MAX_LAYOUT_VARIANTS,
+            })
+        );
+        assert_eq!(
+            generate_package_layout_variants("../package.sai", PACKAGE_INPUT, 1),
+            Err(LayoutVariantError::InvalidTestPath)
+        );
     }
 
     #[test]
