@@ -7646,11 +7646,14 @@ fn check_function_body_type(
             locals,
             type_paths,
             direct_call_signatures,
-            false,
-            true,
-            true,
-            true,
-            true,
+            PrimitiveLocalBlockGates {
+                allow_binary_tail: false,
+                allow_unary_path_tail: true,
+                allow_bool_literal_not_tail: true,
+                allow_logical_tail: true,
+                allow_bool_literal_logical_initializer: true,
+                allow_comparison_tail: true,
+            },
             semantic_types,
             symbols,
             None,
@@ -8387,11 +8390,14 @@ fn check_inherent_method_body_type(
         locals,
         type_paths,
         direct_call_signatures,
-        true,
-        true,
-        false,
-        true,
-        true,
+        PrimitiveLocalBlockGates {
+            allow_binary_tail: true,
+            allow_unary_path_tail: true,
+            allow_bool_literal_not_tail: false,
+            allow_logical_tail: true,
+            allow_bool_literal_logical_initializer: true,
+            allow_comparison_tail: false,
+        },
         semantic_types,
         symbols,
         Some(&self_field_projections),
@@ -8874,6 +8880,16 @@ fn unknown_self_field_diagnostic(
         .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
 }
 
+#[derive(Clone, Copy)]
+struct PrimitiveLocalBlockGates {
+    allow_binary_tail: bool,
+    allow_unary_path_tail: bool,
+    allow_bool_literal_not_tail: bool,
+    allow_logical_tail: bool,
+    allow_bool_literal_logical_initializer: bool,
+    allow_comparison_tail: bool,
+}
+
 fn check_function_body_primitive_local_block(
     owner: &HirOwner<'_>,
     sig: sai_hir::body::FnSig<'_>,
@@ -8881,11 +8897,7 @@ fn check_function_body_primitive_local_block(
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
-    allow_binary_tail: bool,
-    allow_unary_path_tail: bool,
-    allow_bool_literal_not_tail: bool,
-    allow_logical_tail: bool,
-    allow_bool_literal_logical_initializer: bool,
+    gates: PrimitiveLocalBlockGates,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
@@ -8959,8 +8971,10 @@ fn check_function_body_primitive_local_block(
     let is_supported_binary_tail = matches!(
         tail.kind,
         ExprKind::Binary(operator, _, _)
-            if (allow_binary_tail && is_function_primitive_local_binary_operator(operator))
-                || (allow_logical_tail && matches!(operator, BinOp::And | BinOp::Or))
+            if (gates.allow_binary_tail && is_function_primitive_local_binary_operator(operator))
+                || (gates.allow_logical_tail && matches!(operator, BinOp::And | BinOp::Or))
+                || (gates.allow_comparison_tail
+                    && is_function_primitive_local_comparison_operator(operator))
     );
     let is_supported_unary_field_tail = match tail.kind {
         ExprKind::Unary(UnOp::Not, operand) if matches!(operand.kind, ExprKind::Field { .. }) => {
@@ -8985,8 +8999,8 @@ fn check_function_body_primitive_local_block(
         }
         _ => None,
     };
-    let is_supported_unary_path_tail = allow_unary_path_tail && unary_path_binding.is_some();
-    let is_supported_bool_literal_not_tail = allow_bool_literal_not_tail
+    let is_supported_unary_path_tail = gates.allow_unary_path_tail && unary_path_binding.is_some();
+    let is_supported_bool_literal_not_tail = gates.allow_bool_literal_not_tail
         && matches!(
             tail.kind,
             ExprKind::Unary(UnOp::Not, operand)
@@ -9244,7 +9258,7 @@ fn check_function_body_primitive_local_block(
                 };
                 let is_supported_logical_initializer_operand = |operand: &HirExpr<'_>| {
                     is_preceding_path_or_self_field(operand)
-                        || (allow_bool_literal_logical_initializer
+                        || (gates.allow_bool_literal_logical_initializer
                             && matches!(operand.kind, ExprKind::Lit(Lit::Bool(_))))
                 };
                 let supported_shape = match operator {
@@ -9343,26 +9357,38 @@ fn check_function_body_primitive_local_block(
     }
     if let (true, ExprKind::Binary(operator, left, right)) = (is_supported_binary_tail, tail.kind) {
         let operands = [left, right];
+        let is_preceding_path = |operand: &HirExpr<'_>| {
+            let ExprKind::Path(path) = operand.kind else {
+                return false;
+            };
+            resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding))
+        };
         let is_unknown_self_field = |operand: &HirExpr<'_>| {
             matches!(operand.kind, ExprKind::Field { .. })
                 && unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
         };
         let is_preceding_path_or_field = |operand: &HirExpr<'_>| match operand.kind {
-            ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
-                .is_some_and(|binding| preceding_bindings.contains(&binding)),
+            ExprKind::Path(_) => is_preceding_path(operand),
             ExprKind::Field { .. } => {
                 self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
                     || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
             }
             _ => false,
         };
-        let shape_is_supported = operands.iter().enumerate().all(|(index, operand)| {
-            is_preceding_path_or_field(operand)
-                || (matches!(operator, BinOp::And | BinOp::Or)
-                    && matches!(operand.kind, ExprKind::Lit(Lit::Bool(_)))
-                    && (allow_logical_tail
-                        || is_unknown_self_field(operands[if index == 0 { 1 } else { 0 }])))
-        });
+        let is_comparison_only_tail = gates.allow_comparison_tail
+            && is_function_primitive_local_comparison_operator(operator);
+        let shape_is_supported = if is_comparison_only_tail {
+            operands.iter().all(|operand| is_preceding_path(operand))
+        } else {
+            operands.iter().enumerate().all(|(index, operand)| {
+                is_preceding_path_or_field(operand)
+                    || (matches!(operator, BinOp::And | BinOp::Or)
+                        && matches!(operand.kind, ExprKind::Lit(Lit::Bool(_)))
+                        && (gates.allow_logical_tail
+                            || is_unknown_self_field(operands[if index == 0 { 1 } else { 0 }])))
+            })
+        };
         if !shape_is_supported {
             return Ok(None);
         }
@@ -75515,6 +75541,68 @@ property "shared"() {}
                 "{literal}: each primitive fact has a canonical projection"
             );
         }
+    }
+
+    #[test]
+    fn function_body_type_check_publishes_comparison_tail_facts() {
+        let root = concat!(
+            "pub fn compare(left: I32, right: I32) -> Bool {\n",
+            "    let copy = left\n",
+            "    copy < right\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 1);
+        let owner = &resolved.owners()[0];
+        assert!(
+            matches!(
+                owner.body_type_check().expect("body result is available"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "a direct comparison tail over a preceding local and parameter is checked"
+        );
+
+        let type_results = owner
+            .primitive_body_type_results()
+            .expect("function type results have no resolution error")
+            .expect("a supported comparison tail publishes primitive facts");
+        assert_primitive_type_result_parity(&database, type_results);
+        let expression_types = type_results.expression_types().values().copied();
+        assert_eq!(
+            expression_types
+                .clone()
+                .filter(|ty| *ty == sai_resolve::prelude::PrimTy::I32)
+                .count(),
+            3,
+            "the local initializer and both comparison operand paths have I32 facts"
+        );
+        assert_eq!(
+            expression_types
+                .filter(|ty| *ty == sai_resolve::prelude::PrimTy::Bool)
+                .count(),
+            1,
+            "the comparison result has a Bool fact"
+        );
+        assert_eq!(
+            type_results
+                .partial_results()
+                .canonical_expression_types()
+                .len(),
+            4,
+            "each trusted primitive fact has a canonical projection"
+        );
     }
 
     #[test]

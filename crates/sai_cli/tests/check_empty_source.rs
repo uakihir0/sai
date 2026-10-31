@@ -8649,11 +8649,120 @@ fn unknown_direct_self_fields_in_ordering_method_tails_are_diagnosed() {
 
 #[test]
 fn top_level_function_binary_tails_remain_behind_the_stage_gate() {
-    let source = "pub fn add(left: I32, right: I32) -> I32 { left + right }\n";
-    assert_check_stays_gated_without_syntax_errors(
-        &run_check(source, "", &[], &[]),
-        "top-level binary tail",
+    for source in [
+        "pub fn add(left: I32, right: I32) -> I32 { left + right }\n",
+        "pub fn bitand(left: U8, right: U8) -> U8 { left & right }\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(
+            &run_check(source, "", &[], &[]),
+            "top-level arithmetic or bitwise binary tail",
+        );
+    }
+}
+
+#[test]
+fn top_level_function_comparison_tails_accept_direct_local_paths() {
+    for (name, operator) in [
+        ("equal", "=="),
+        ("not_equal", "!="),
+        ("less", "<"),
+        ("less_equal", "<="),
+        ("greater", ">"),
+        ("greater_equal", ">="),
+    ] {
+        let source =
+            format!("pub fn {name}(left: I32, right: I32) -> Bool {{ left {operator} right }}\n");
+        assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+    }
+
+    for source in [
+        concat!(
+            "pub fn compare_local(left: I32, right: I32) -> Bool {\n",
+            "    let copy: I32 = left\n",
+            "    copy == right\n",
+            "}\n",
+        ),
+        "pub fn bool_order(left: Bool, right: Bool) -> Bool { left < right }\n",
+        "pub fn float_order(left: F64, right: F64) -> Bool { left >= right }\n",
+        "pub fn char_order(left: Char, right: Char) -> Bool { left <= right }\n",
+        "pub fn byte_order(left: Byte, right: Byte) -> Bool { left > right }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn top_level_function_comparison_tails_report_operand_and_return_mismatches() {
+    let source = "pub fn mismatch(left: I32, right: U8) -> I32 { left == right }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let right_start = source.find("right }").expect("right operand exists");
+    let expression_start = source
+        .find("left == right")
+        .expect("comparison tail exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the operand and independently known Bool result both need diagnostics:\n{stdout}"
     );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "supported comparison-tail errors remain semantic diagnostics:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `U8`",
+        right_start,
+        right_start + "right".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        expression_start,
+        expression_start + "left == right".len(),
+    );
+}
+
+#[test]
+fn top_level_function_comparison_tail_rejects_unsupported_shapes() {
+    for source in [
+        "pub fn literal_right(left: I32) -> Bool { left == 1 }\n",
+        "pub fn literal_left(right: I32) -> Bool { 1 == right }\n",
+        "pub fn computed(left: I32, right: I32) -> Bool { (left + right) == left }\n",
+        "pub fn nested(left: I32, right: I32) -> Bool { (left == right) == true }\n",
+        "pub fn unresolved(left: I32) -> Bool { left == missing }\n",
+        "pub fn qualified(left: I32, right: I32) -> Bool { left == package.right }\n",
+        concat!(
+            "pub fn unresolved_integer_literals() -> Bool {\n",
+            "    let left = 1\n",
+            "    let right = 2\n",
+            "    left < right\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn unresolved_float_literals() -> Bool {\n",
+            "    let left = 1.0\n",
+            "    let right = 2.0\n",
+            "    left < right\n",
+            "}\n",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated_without_syntax_errors(
+            &output,
+            "an unsupported top-level comparison-tail shape",
+        );
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+            "a rejected comparison-tail shape must not leak comparison or return diagnostics:\n{stdout}"
+        );
+    }
 }
 
 #[test]
@@ -8714,7 +8823,7 @@ fn unsupported_top_level_logical_tail_shapes_remain_gated() {
     for source in [
         "pub fn nested(left: Bool, right: Bool) -> Bool { (left and right) or left }\n",
         "pub fn computed(left: Bool, right: Bool) -> Bool { left or (right and left) }\n",
-        "pub fn comparison(left: Bool, right: Bool) -> Bool { left == right }\n",
+        "pub fn comparison_literal(flag: Bool) -> Bool { flag == true }\n",
         "pub fn unresolved(enabled: Bool) -> Bool { missing and enabled }\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(
