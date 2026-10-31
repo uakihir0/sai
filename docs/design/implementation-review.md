@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1097 (2026-10-31): allow exact Bool-literal `not` tails in top-level functions
+
+- **Decision — review required:** Extend the existing bounded public top-level function body checker to accept a complete tail that is exactly `not true` or `not false`.
+- **Reason:** Spec/06 §6.8.8 defines `not` as checking its operand against `Bool` and producing `Bool`. The checker already handles exact unary local-path tails in this owner slice, but direct Bool-literal operands were still behind the feature gate.
+- **Boundary and judgment:** Admit only this exact unary shape as a complete top-level function tail. Reuse the Bool operand, result, return-mismatch, and primitive/canonical fact checks. Keep non-Bool literals, nested `not`, logical/computed operands, local-initializer forms, inherent-method tails, and unsupported owners gated. This adds no general unary-literal typing, lowering, or runtime behavior. The exact owner and expression-shape exception, method and initializer boundary, and fact behavior are **Review required**.
+- **Review required:** Verify both Bool literal values, operand/result facts and canonical parity, full-tail return mismatch span, and continued rejection of non-Bool, nested, initializer, and method forms without leaked type facts or diagnostics.
+- **Verification:** Focused driver fact-publication coverage passed for both literals. `cargo test --workspace --locked --quiet` passed across all workspace crates and doctests, including all 452 `check_empty_source` tests and 812 driver tests (two tests remain ignored in their existing suite). `cargo fmt --all -- --check` and `git diff --check` passed.
+- **Hostile review:** The first independent pass confirmed code and tests are consistent, but found the CLI current-summary gate sentence omitted this new exception. The summary now names IR-1097; independent re-review found no remaining actionable issues.
+
 ### IR-1096 (2026-10-31): allow Bool literals in known logical method tails
 
 - **Decision — review required:** Extend one exact `and` or `or` tail in the bounded inherent-method body checker so each immediate operand may be an exact Bool literal, an eligible parameter or preceding-local path, or a supported direct `self.field`.
