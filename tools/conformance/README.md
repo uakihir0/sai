@@ -123,15 +123,17 @@ conformance claim.
 ## Stage 0 partial smoke runner
 
 `python3 -B tools/conformance/run_stage0.py --iut /absolute/path/to/sai tests/conformance`
-runs a deliberately limited set of Stage 0 checks and source formatter cases
-through the IUT's command line. It accepts single-file `check-pass`,
-`check-fail`, `fmt`, and `fmt-refuse` fixtures with `kind`, `stage`, and
-resolvable `spec` directives. A `fmt` fixture must have exactly one sibling
-`<name>.expected.sai`; `fmt-refuse` requires explicit, nonempty expected error
-diagnostics and rejects every sidecar. Other sidecars remain unsupported. The
-runner rejects explicit target/profile restrictions, unsupported directives,
-directory fixtures, an empty fixture set, and inputs whose specification
-references do not resolve beneath `docs/`.
+runs a deliberately limited set of Stage 0 checks and formatter cases through
+the IUT's command line. It accepts single-file `check-pass`, `check-fail`,
+source `fmt`, and source `fmt-refuse` fixtures with `kind`, `stage`, and
+resolvable `spec` directives, plus a Stage 3 package `fmt` directory fixture
+rooted at `sai.package`. Source `fmt` fixtures require exactly one sibling
+`<name>.expected.sai`; the package fixture requires exactly
+`expected/sai.package`. `fmt-refuse` requires explicit, nonempty expected
+error diagnostics and rejects every sidecar. Other sidecars and directory
+fixtures remain unsupported. The runner rejects explicit target/profile
+restrictions, unsupported directives, an empty fixture set, and inputs whose
+specification references do not resolve beneath `docs/`.
 
 Every accepted fixture runs in a fresh sandbox with only `NO_COLOR=1`,
 `SAI_CACHE_DIR=<sandbox>/cache`, and `HOME=<sandbox>/home` in the IUT
@@ -192,6 +194,17 @@ diagnostic. The malformed prefix makes the probe verify that the size check
 precedes lexing. The input is created in memory and is not stored as a fixture.
 A timeout is a failure, never a pass.
 
+For the package `fmt` directory fixture, the runner pipes the `sai.package`
+bytes to `fmt --stdin-kind package -`, compares the exact output with
+`expected/sai.package`, and checks the expected fixed point. Its package
+reference generator varies whitespace and safe line breaks before `from`,
+`dir`, `only`, and `grant`, and next to braces. It preserves comments and
+blank-line gaps, requires the same significant token sequence, and checks that
+the package parser accepts every variant. The runner submits 16 variants,
+checks both input byte sequences with package-stdin `fmt --check`, and checks
+the disk fixture through `fmt --check sai.package`; every explicit-path check
+must leave the manifest bytes and file identity unchanged.
+
 The runner treats the supplied executable as the repository's reference
 implementation, but cannot verify its identity from the black-box protocol.
 Callers must supply the reference binary, and the report sets
@@ -206,8 +219,9 @@ execution and always sets `mode` to `partial-smoke` and `claim` to `false`.
 This runner is useful as smoke evidence only; it does not validate suite
 coverage, goldens, all directive applicability, or the complete conformance
 protocol, and cannot substantiate a conformance claim.
-Formatter coverage is limited to single-file source `fmt` byte comparisons,
-fixed-point checks, 16 deterministic layout variants, source-stdin, generated
+Formatter coverage is limited to single-file source and one package-manifest
+`fmt` fixture's byte comparisons, fixed-point checks, 16 deterministic layout
+variants, source-stdin, generated
 package-wide `fmt --check` and `fmt --check` with one explicit path,
 exact-diagnostic `fmt-refuse` cases, and a generated source-size refusal probe.
 Fixed-point and `fmt --check` checks apply only to `fmt` pass fixtures.
