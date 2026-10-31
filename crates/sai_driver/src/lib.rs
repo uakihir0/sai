@@ -8261,20 +8261,13 @@ fn check_inherent_method_body_type(
                 if is_function_primitive_local_binary_operator(operator) =>
             {
                 let operands = [left, right];
-                let is_unknown_direct_field = |operand: &HirExpr<'_>| {
-                    matches!(operand.kind, ExprKind::Field { .. })
-                        && matches!(
-                            primitive_self_field_type(operand, &field_types.fields, symbols),
-                            Some(Err(_))
-                        )
-                };
-                let allow_bool_literal_sibling = matches!(operator, BinOp::And | BinOp::Or)
+                let allow_bool_literal_operand = matches!(operator, BinOp::And | BinOp::Or)
                     && operands
                         .iter()
-                        .any(|operand| is_unknown_direct_field(operand));
+                        .any(|operand| matches!(operand.kind, ExprKind::Lit(Lit::Bool(_))));
                 if operands.iter().any(|operand| {
                     !matches!(operand.kind, ExprKind::Path(_) | ExprKind::Field { .. })
-                        && !(allow_bool_literal_sibling
+                        && !(allow_bool_literal_operand
                             && matches!(operand.kind, ExprKind::Lit(Lit::Bool(_))))
                 }) {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8395,7 +8388,7 @@ fn check_inherent_method_body_type(
         direct_call_signatures,
         true,
         true,
-        false,
+        true,
         true,
         semantic_types,
         symbols,
@@ -86775,6 +86768,65 @@ property "shared"() {}
                 .canonical_binding_types()
                 .is_empty(),
             "canonical publication omits the tainted inferred binding"
+        );
+    }
+
+    #[test]
+    fn inherent_method_logical_tail_bool_literals_with_known_fields_publish_facts() {
+        let root = concat!(
+            "type User { enabled: Bool }\n",
+            "impl User {\n",
+            "  pub fn is_enabled(self: borrow Self) -> Bool {\n",
+            "    self.enabled and true\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single inherent method collects");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let method = &results.owners()[0].members()[0];
+        assert!(
+            matches!(
+                method.body_type_check().expect("body result is available"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "a Bool literal paired with a known field is a clean logical tail"
+        );
+
+        let type_results = method
+            .primitive_body_type_results()
+            .expect("method type results have no resolution error")
+            .expect("a supported logical tail publishes primitive facts");
+        assert_primitive_type_result_parity(&database, type_results);
+        assert_eq!(
+            type_results.expression_types().len(),
+            3,
+            "the direct Bool field, Bool literal, and logical tail all have facts"
+        );
+        assert!(
+            type_results
+                .expression_types()
+                .values()
+                .all(|ty| *ty == sai_resolve::prelude::PrimTy::Bool),
+            "both operands and the logical result have Bool type"
+        );
+        assert_eq!(
+            type_results
+                .partial_results()
+                .canonical_expression_types()
+                .len(),
+            3,
+            "every clean logical expression fact has its canonical projection"
         );
     }
 
