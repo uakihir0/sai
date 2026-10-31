@@ -2272,11 +2272,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // Typecheck in written order without lowering or reordering the
         // operands, preserving the source operator's short-circuit behavior.
         for operand in [left, right] {
-            let operand_type = self
-                .check_binary_operand(operand)
-                .ok()
-                .and_then(|local_type| self.concrete_local_type(local_type))
-                .ok_or(())?;
+            let operand_type = match operand.kind {
+                ExprKind::Lit(Lit::Bool(_)) => {
+                    self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Bool));
+                    PrimTy::Bool
+                }
+                _ => self
+                    .check_binary_operand(operand)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                    .ok_or(())?,
+            };
             self.check_logical_operand_type(operand, operand_type)?;
         }
 

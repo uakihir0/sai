@@ -8238,6 +8238,75 @@ fn top_level_function_binary_tails_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn top_level_function_logical_tails_accept_direct_bool_operands() {
+    for source in [
+        "pub fn both(left: Bool, right: Bool) -> Bool { left and right }\n",
+        "pub fn either(left: Bool, right: Bool) -> Bool { left or right }\n",
+        "pub fn literal_left(flag: Bool) -> Bool { false and flag }\n",
+        "pub fn literal_right(flag: Bool) -> Bool { flag or true }\n",
+        "pub fn literal_pair() -> Bool { true and false }\n",
+        "pub fn local_path(flag: Bool) -> Bool {\n    let copy: Bool = flag\n    copy or false\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn top_level_function_logical_tails_report_operand_and_return_mismatches() {
+    let source = "pub fn mismatch(value: I32, enabled: Bool) -> I32 { value and enabled }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let operand_start = source
+        .find("value and")
+        .expect("non-Bool logical operand exists");
+    let expression_start = source
+        .find("value and enabled")
+        .expect("logical tail exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the operand and independently known Bool result both need diagnostics:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "supported logical-tail errors remain semantic diagnostics:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        operand_start,
+        operand_start + "value".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        expression_start,
+        expression_start + "value and enabled".len(),
+    );
+}
+
+#[test]
+fn unsupported_top_level_logical_tail_shapes_remain_gated() {
+    for source in [
+        "pub fn nested(left: Bool, right: Bool) -> Bool { (left and right) or left }\n",
+        "pub fn computed(left: Bool, right: Bool) -> Bool { left or (right and left) }\n",
+        "pub fn comparison(left: Bool, right: Bool) -> Bool { left == right }\n",
+        "pub fn unresolved(enabled: Bool) -> Bool { missing and enabled }\n",
+        "pub fn local_initializer(left: Bool) -> Bool {\n    let result = left and true\n    result\n}\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(
+            &run_check(source, "", &[], &[]),
+            "an unsupported top-level logical tail shape",
+        );
+    }
+}
+
+#[test]
 fn top_level_function_unary_tails_remain_behind_the_stage_gate() {
     let sources = [
         "pub fn negate(value: I32) -> I32 { -value }\n",

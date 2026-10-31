@@ -7648,6 +7648,7 @@ fn check_function_body_type(
             direct_call_signatures,
             false,
             false,
+            true,
             semantic_types,
             symbols,
             None,
@@ -8393,6 +8394,7 @@ fn check_inherent_method_body_type(
         direct_call_signatures,
         true,
         true,
+        false,
         semantic_types,
         symbols,
         Some(&self_field_projections),
@@ -8884,6 +8886,7 @@ fn check_function_body_primitive_local_block(
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
     allow_binary_tail: bool,
     allow_unary_path_tail: bool,
+    allow_logical_tail: bool,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
@@ -8954,12 +8957,12 @@ fn check_function_body_primitive_local_block(
     let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
     let is_supported_literal_tail = is_direct_function_scalar_literal(tail);
-    let is_supported_binary_tail = allow_binary_tail
-        && matches!(
-            tail.kind,
-            ExprKind::Binary(operator, _, _)
-                if is_function_primitive_local_binary_operator(operator)
-        );
+    let is_supported_binary_tail = matches!(
+        tail.kind,
+        ExprKind::Binary(operator, _, _)
+            if (allow_binary_tail && is_function_primitive_local_binary_operator(operator))
+                || (allow_logical_tail && matches!(operator, BinOp::And | BinOp::Or))
+    );
     let is_supported_unary_field_tail = match tail.kind {
         ExprKind::Unary(UnOp::Not, operand) if matches!(operand.kind, ExprKind::Field { .. }) => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
@@ -9345,7 +9348,8 @@ fn check_function_body_primitive_local_block(
             is_preceding_path_or_field(operand)
                 || (matches!(operator, BinOp::And | BinOp::Or)
                     && matches!(operand.kind, ExprKind::Lit(Lit::Bool(_)))
-                    && is_unknown_self_field(operands[if index == 0 { 1 } else { 0 }]))
+                    && (allow_logical_tail
+                        || is_unknown_self_field(operands[if index == 0 { 1 } else { 0 }])))
         });
         if !shape_is_supported {
             return Ok(None);
@@ -75243,6 +75247,59 @@ property "shared"() {}
                 "function owner {index} unexpectedly passed the mixed condition slice: {check:?}"
             );
         }
+    }
+
+    #[test]
+    fn function_body_type_check_publishes_bool_logical_tail_facts() {
+        let root = "pub fn logical_tail(flag: Bool) -> Bool { flag or true }\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 1);
+        let owner = &resolved.owners()[0];
+        assert!(
+            matches!(
+                owner.body_type_check().expect("body result is available"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "a direct logical tail is checked with no diagnostics"
+        );
+
+        let type_results = owner
+            .primitive_body_type_results()
+            .expect("function type results have no resolution error")
+            .expect("a supported logical tail publishes primitive facts");
+        assert_primitive_type_result_parity(&database, type_results);
+        assert_eq!(
+            type_results.expression_types().len(),
+            3,
+            "the direct Bool path, Bool literal, and logical tail all have facts"
+        );
+        assert!(
+            type_results
+                .expression_types()
+                .values()
+                .all(|ty| *ty == sai_resolve::prelude::PrimTy::Bool),
+            "all logical operands and the tail have Bool type"
+        );
+        assert_eq!(
+            type_results
+                .partial_results()
+                .canonical_expression_types()
+                .len(),
+            3,
+            "every logical expression fact has its canonical projection"
+        );
     }
 
     #[test]
