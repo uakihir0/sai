@@ -7296,6 +7296,7 @@ pub struct ConstOwnerResolution {
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
+    const_value_type: Option<ConstValueShape>,
     literal_check: Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
     const_value: Result<Option<ConstValue>, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
@@ -7337,7 +7338,8 @@ impl ConstOwnerResolution {
             .map(|resolution| resolution.as_ref())
     }
 
-    /// Checks the narrow direct-literal subset handled by the driver.
+    /// Checks the narrow direct-literal and direct-const-reference subset
+    /// handled by the driver.
     ///
     /// `Unsupported` means the caller must keep the feature gate in place.
     /// `Supported` carries any hard type or range diagnostics produced by
@@ -7346,9 +7348,8 @@ impl ConstOwnerResolution {
         self.literal_check.as_ref()
     }
 
-    /// Evaluates the narrow constant subset currently handled by the driver.
-    /// Other otherwise-supported literal forms do not yet produce a value
-    /// here.
+    /// Evaluates the narrow constant subset currently handled by the driver,
+    /// including copies from supported direct const references.
     pub fn const_value(&self) -> Result<Option<ConstValue>, &OwnerControlFlowResolutionError> {
         self.const_value.as_ref().map(Clone::clone)
     }
@@ -7495,6 +7496,14 @@ pub enum ConstLiteralCheck {
     SupportedTuple { diagnostics: Vec<Diagnostic> },
     /// A flat array whose elements each have a supported literal or unit expression.
     SupportedArray { diagnostics: Vec<Diagnostic> },
+    /// One direct path to another supported constant value.
+    ///
+    /// `blocked` means evaluation depends on an invalid or cyclic constant.
+    /// A cycle diagnostic is emitted once on the first constant in the cycle.
+    SupportedConstReference {
+        diagnostics: Vec<Diagnostic>,
+        blocked: bool,
+    },
 }
 
 impl ConstLiteralCheck {
@@ -7507,6 +7516,7 @@ impl ConstLiteralCheck {
                 | Self::SupportedUnit { .. }
                 | Self::SupportedTuple { .. }
                 | Self::SupportedArray { .. }
+                | Self::SupportedConstReference { .. }
         )
     }
 
@@ -7543,7 +7553,8 @@ impl ConstLiteralCheck {
             Self::SupportedStr { .. } | Self::SupportedByteStr { .. } => true,
             Self::SupportedUnit { .. }
             | Self::SupportedTuple { .. }
-            | Self::SupportedArray { .. } => true,
+            | Self::SupportedArray { .. }
+            | Self::SupportedConstReference { .. } => true,
             Self::Unsupported => false,
         }
     }
@@ -7556,6 +7567,10 @@ impl ConstLiteralCheck {
             | Self::SupportedUnit { diagnostics }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics } => diagnostics.is_empty(),
+            Self::SupportedConstReference {
+                diagnostics,
+                blocked,
+            } => diagnostics.is_empty() && !blocked,
             Self::Unsupported => false,
         }
     }
@@ -7568,7 +7583,8 @@ impl ConstLiteralCheck {
             | Self::SupportedByteStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
             | Self::SupportedTuple { diagnostics }
-            | Self::SupportedArray { diagnostics } => diagnostics,
+            | Self::SupportedArray { diagnostics }
+            | Self::SupportedConstReference { diagnostics, .. } => diagnostics,
         }
     }
 }
@@ -7885,7 +7901,7 @@ fn evaluate_const_value(
                 elements: values.into(),
             })
         }
-        ConstLiteralCheck::Unsupported => None,
+        ConstLiteralCheck::SupportedConstReference { .. } | ConstLiteralCheck::Unsupported => None,
     }
 }
 
@@ -8071,12 +8087,391 @@ enum ConstLiteralType {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum ConstValueShape {
+    Literal(ConstLiteralType),
+    Tuple(Vec<ConstLiteralType>),
+    Array {
+        element_type: ConstLiteralType,
+        length: u128,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ConstLiteralAggregateType {
     Tuple(Vec<ConstLiteralType>),
     Array {
         element_type: ConstLiteralType,
         length: u128,
     },
+}
+
+struct PendingConstReference {
+    source_index: usize,
+    target: DefId,
+    location: sai_diagnostics::Location,
+    package: Option<String>,
+    name: String,
+}
+
+fn resolve_const_value_shape(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    target_cfg: &TargetCfg,
+) -> Option<ConstValueShape> {
+    if let TyKind::Tuple(elements) = ty.kind {
+        if elements.is_empty() {
+            return Some(ConstValueShape::Literal(ConstLiteralType::Unit));
+        }
+        return Some(ConstValueShape::Tuple(
+            elements
+                .iter()
+                .map(|element| {
+                    resolve_const_aggregate_literal_type(*element, type_paths, symbols, inputs)
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ));
+    }
+
+    if let Some((element_type, length)) =
+        resolve_const_array_type(ty, type_paths, symbols, inputs, target_cfg)
+    {
+        return Some(ConstValueShape::Array {
+            element_type,
+            length,
+        });
+    }
+
+    if resolve_const_byte_str_type(ty, type_paths, symbols, inputs) {
+        return Some(ConstValueShape::Literal(ConstLiteralType::ByteStr));
+    }
+
+    resolve_const_literal_type(ty, type_paths, symbols, inputs).map(ConstValueShape::Literal)
+}
+
+fn const_value_shape_name(shape: &ConstValueShape) -> String {
+    match shape {
+        ConstValueShape::Literal(literal_type) => {
+            local_enum_variant_type_name(*literal_type).to_owned()
+        }
+        ConstValueShape::Tuple(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| local_enum_variant_type_name(*field))
+                .collect::<Vec<_>>();
+            if fields.len() == 1 {
+                format!("({},)", fields[0])
+            } else {
+                format!("({})", fields.join(", "))
+            }
+        }
+        ConstValueShape::Array {
+            element_type,
+            length,
+        } => format!(
+            "Array<{}, {length}>",
+            local_enum_variant_type_name(*element_type)
+        ),
+    }
+}
+
+fn const_reference_diagnostic(
+    owner: OwnerId,
+    location: sai_diagnostics::Location,
+    package: Option<&str>,
+    snapshot: &WorkspaceSnapshot,
+    code: sai_diagnostics::Code,
+    message: String,
+    primary_label: &str,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let mut diagnostic = Diagnostic::new(
+        code,
+        sai_diagnostics::Severity::Error,
+        message,
+        Some(location),
+    );
+    diagnostic.primary_label = primary_label.to_owned();
+    diagnostic.package = package.map(str::to_owned);
+    diagnostic
+        .with_workspace_snapshot(snapshot)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
+}
+
+fn pending_const_reference_target<'hir>(
+    owner: &HirOwner<'hir>,
+    module_resolution: &ModuleResolution,
+    def_paths: &DefPathInterner,
+    value_type: &Option<ConstValueShape>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<(DefId, sai_hir::Span, String)> {
+    if value_type.is_none() || !owner.raw_attrs.is_empty() {
+        return None;
+    }
+    let OwnerNode::Item(item) = owner.node else {
+        return None;
+    };
+    if item.vis != Visibility::Pub || !matches!(item.kind, ItemKind::Const { .. }) {
+        return None;
+    }
+    let name = symbols.resolve(item.name.sym).ok()?;
+    let written_name = inputs
+        .source
+        .text()
+        .get(item.name.span.range.start().to_usize()..item.name.span.range.end().to_usize())?;
+    if !is_supported_const_name_convention(&name, written_name) {
+        return None;
+    }
+    let Some(body) = owner.body else {
+        return None;
+    };
+    let ExprKind::Path(path) = body.value.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return None;
+    }
+    let resolution = module_resolution.paths.get(&path.hir_id)?;
+    if resolution.resolved_segments != 1 || resolution.segment_count != 1 {
+        return None;
+    }
+    let Res::Def(DefKind::Const, target) = resolution.base else {
+        return None;
+    };
+    if target.package != owner.id.def_id.package()
+        || const_reference_uses_renamed_const_spelling(&path, target, def_paths)
+    {
+        return None;
+    }
+    Some((target, path.span, name.to_string()))
+}
+
+fn const_reference_uses_renamed_const_spelling(
+    path: &HirPath<'_>,
+    target: DefId,
+    def_paths: &DefPathInterner,
+) -> bool {
+    let Some(segment) = path.segments.first() else {
+        return true;
+    };
+    let Ok(Some(target_path)) = def_paths.resolve_def_id(target) else {
+        return true;
+    };
+    let Some(target_name) = target_path
+        .data()
+        .last()
+        .and_then(|component| match &component.data {
+            DefPathData::ValueNs(name) => Some(*name),
+            _ => None,
+        })
+    else {
+        return true;
+    };
+    segment.name.sym != target_name
+}
+
+fn const_def_id_order(def_id: DefId) -> (sai_hir::PackageId, sai_hir::DefIndex) {
+    (def_id.package, def_id.index)
+}
+
+fn set_const_reference_blocked(check: &mut ConstLiteralCheck) {
+    if let ConstLiteralCheck::SupportedConstReference { blocked, .. } = check {
+        *blocked = true;
+    }
+}
+
+fn resolve_const_references(
+    owners: &mut [ConstOwnerResolution],
+    pending: Vec<PendingConstReference>,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<(), OwnerControlFlowResolutionError> {
+    let owner_indices = owners
+        .iter()
+        .enumerate()
+        .map(|(index, owner)| (owner.owner.def_id.to_def_id(), index))
+        .collect::<HashMap<_, _>>();
+    let mut references = HashMap::with_capacity(pending.len());
+    let mut edges = vec![None; owners.len()];
+
+    for reference in pending {
+        let source_index = reference.source_index;
+        let Some(source) = owners.get(source_index) else {
+            continue;
+        };
+        if source.owner.def_id.package() != reference.target.package {
+            continue;
+        }
+        let Some(&target_index) = owner_indices.get(&reference.target) else {
+            owners[source_index].literal_check = Ok(ConstLiteralCheck::Unsupported);
+            continue;
+        };
+        let Some(source_shape) = source.const_value_type.as_ref() else {
+            owners[source_index].literal_check = Ok(ConstLiteralCheck::Unsupported);
+            continue;
+        };
+        let Some(target_shape) = owners[target_index].const_value_type.as_ref() else {
+            owners[source_index].literal_check = Ok(ConstLiteralCheck::Unsupported);
+            continue;
+        };
+        let target_supported = owners[target_index]
+            .literal_check
+            .as_ref()
+            .is_ok_and(ConstLiteralCheck::is_supported);
+        if !target_supported {
+            owners[source_index].literal_check = Ok(ConstLiteralCheck::Unsupported);
+            continue;
+        }
+
+        let source_owner = owners[source_index].owner;
+        if source_shape != target_shape {
+            let diagnostic = const_reference_diagnostic(
+                source_owner,
+                reference.location.clone(),
+                reference.package.as_deref(),
+                snapshot,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected `{}`, found `{}`",
+                    const_value_shape_name(source_shape),
+                    const_value_shape_name(target_shape)
+                ),
+                "constant reference has a different type",
+            )?;
+            owners[source_index].literal_check = Ok(ConstLiteralCheck::SupportedConstReference {
+                diagnostics: vec![diagnostic],
+                blocked: false,
+            });
+        }
+
+        edges[source_index] = Some(target_index);
+        references.insert(source_index, reference);
+    }
+
+    // Each supported direct reference has one dependency. Walk those edges
+    // iteratively so cycles are diagnosed without recursing through queries.
+    let mut traversal_order = edges
+        .iter()
+        .enumerate()
+        .filter_map(|(index, edge)| edge.map(|_| index))
+        .collect::<Vec<_>>();
+    traversal_order
+        .sort_by_key(|&index| const_def_id_order(owners[index].owner.def_id.to_def_id()));
+    let mut state = vec![0_u8; owners.len()];
+    let mut cycle_nodes = HashSet::new();
+    for start in traversal_order.iter().copied() {
+        if state[start] != 0 {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut positions = HashMap::new();
+        let mut current = Some(start);
+        while let Some(index) = current {
+            match state[index] {
+                0 => {
+                    state[index] = 1;
+                    positions.insert(index, path.len());
+                    path.push(index);
+                    current = edges[index];
+                }
+                1 => {
+                    if let Some(&cycle_start) = positions.get(&index) {
+                        let cycle = &path[cycle_start..];
+                        cycle_nodes.extend(cycle.iter().copied());
+                        let first = cycle
+                            .iter()
+                            .copied()
+                            .min_by_key(|&cycle_index| {
+                                const_def_id_order(owners[cycle_index].owner.def_id.to_def_id())
+                            })
+                            .expect("a detected const cycle has at least one owner");
+                        let mut names = Vec::with_capacity(cycle.len() + 1);
+                        let mut cycle_index = first;
+                        loop {
+                            names.push(references[&cycle_index].name.as_str().to_owned());
+                            cycle_index = edges[cycle_index]
+                                .expect("a const cycle node has a reference edge");
+                            if cycle_index == first {
+                                names.push(references[&first].name.clone());
+                                break;
+                            }
+                        }
+                        let diagnostic = const_reference_diagnostic(
+                            owners[first].owner,
+                            references[&first].location.clone(),
+                            references[&first].package.as_deref(),
+                            snapshot,
+                            sai_diagnostics::Code::ConstCycle,
+                            format!("constant cycle: {}", names.join(" -> ")),
+                            "constant cycle starts here",
+                        )?;
+                        if let Ok(ConstLiteralCheck::SupportedConstReference {
+                            diagnostics, ..
+                        }) = &mut owners[first].literal_check
+                        {
+                            diagnostics.push(diagnostic);
+                        }
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        for index in path {
+            state[index] = 2;
+        }
+    }
+    for index in cycle_nodes {
+        if let Ok(check) = &mut owners[index].literal_check {
+            set_const_reference_blocked(check);
+        }
+    }
+
+    // A reverse dependency walk copies already evaluated values into each
+    // dependency walk copies evaluated values into each reference. Iteration
+    // also propagates invalidity through chains that were visited out of order.
+    for _ in 0..owners.len() {
+        let mut changed = false;
+        for source_index in traversal_order.iter().copied() {
+            let Some(target_index) = edges[source_index] else {
+                continue;
+            };
+            let source_valid = owners[source_index]
+                .literal_check
+                .as_ref()
+                .is_ok_and(ConstLiteralCheck::is_valid);
+            if !source_valid {
+                continue;
+            }
+            let target_valid = owners[target_index]
+                .literal_check
+                .as_ref()
+                .is_ok_and(ConstLiteralCheck::is_valid);
+            if !target_valid {
+                if let Ok(check) = &mut owners[source_index].literal_check {
+                    set_const_reference_blocked(check);
+                    changed = true;
+                }
+                continue;
+            }
+            let value = owners[target_index]
+                .const_value
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .cloned();
+            if let Some(value) = value {
+                if owners[source_index].const_value.as_ref().ok() != Some(&Some(value.clone())) {
+                    owners[source_index].const_value = Ok(Some(value));
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn resolve_const_array_type(
@@ -22743,6 +23138,7 @@ impl RootDatabase {
             .copied()
             .collect::<Vec<_>>();
         let mut owners = Vec::with_capacity(descriptors.len());
+        let mut pending_const_references = Vec::new();
         let mut group_start = 0;
         while group_start < descriptors.len() {
             let file = descriptors[group_start].file;
@@ -22760,6 +23156,7 @@ impl RootDatabase {
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
+                                const_value_type: None,
                                 literal_check: Err(error.clone()),
                                 const_value: Err(error.clone()),
                                 module_path_diagnostics: Err(error.clone()),
@@ -22779,6 +23176,7 @@ impl RootDatabase {
             };
 
             for descriptor in &descriptors[group_start..group_end] {
+                let source_index = owners.len();
                 let mut lowering_diagnostics = Vec::new();
                 let mut module_path_diagnostics = None;
                 let analysis: Result<
@@ -22793,6 +23191,8 @@ impl RootDatabase {
                         Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
                         Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
                         Result<Option<ConstValue>, OwnerControlFlowResolutionError>,
+                        Option<ConstValueShape>,
+                        Option<PendingConstReference>,
                     ),
                     OwnerControlFlowResolutionError,
                 > = (|| {
@@ -22806,6 +23206,7 @@ impl RootDatabase {
                     let def_paths = self
                         .def_paths
                         .get(&descriptor.owner.def_id.package())
+                        .cloned()
                         .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
                             descriptor.owner,
                         ))?;
@@ -22823,7 +23224,7 @@ impl RootDatabase {
                         &inputs.root,
                         &arena,
                         &self.symbols,
-                        def_paths,
+                        &def_paths,
                     );
                     let (hir_owner, source_map) = lower_top_level_owner(
                         owner_descriptor,
@@ -22883,8 +23284,21 @@ impl RootDatabase {
                             ),
                             (_, _, Err(error)) => Err(error),
                         };
+                    let const_value_type = match (&hir_owner.node, type_path_resolution.as_ref()) {
+                        (OwnerNode::Item(item), Ok(Some(type_paths))) => match item.kind {
+                            ItemKind::Const { ty } => resolve_const_value_shape(
+                                *ty,
+                                Some(type_paths),
+                                &self.symbols,
+                                &inputs,
+                                &collection.target_cfg,
+                            ),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
                     let mut aggregate_type = None;
-                    let literal_check = check_const_literal_owner(
+                    let mut literal_check = check_const_literal_owner(
                         &hir_owner,
                         type_path_resolution
                             .as_ref()
@@ -22935,6 +23349,8 @@ impl RootDatabase {
                             non_expression_diagnostics,
                             literal_check,
                             const_value,
+                            const_value_type,
+                            None,
                         ));
                     };
                     let locals = match &module_aliases {
@@ -22958,6 +23374,45 @@ impl RootDatabase {
                                 ))),
                                 Err(error) => Err(error.clone()),
                             };
+                            let mut pending_reference = None;
+                            if matches!(literal_check, Ok(ConstLiteralCheck::Unsupported)) {
+                                if let Ok(Some(module_resolution)) = &module_resolution {
+                                    if let Some((target, span, name)) =
+                                        pending_const_reference_target(
+                                            &hir_owner,
+                                            module_resolution,
+                                            &def_paths,
+                                            &const_value_type,
+                                            &self.symbols,
+                                            &inputs,
+                                        )
+                                    {
+                                        let location =
+                                            sai_diagnostics::Location::from_decoded_source(
+                                                inputs.source_ref.clone(),
+                                                sai_diagnostics::Span::new(span.file, span.range),
+                                                &inputs.source,
+                                            )
+                                            .ok_or(
+                                                OwnerControlFlowResolutionError::InvalidSourceLocation(
+                                                    descriptor.owner,
+                                                ),
+                                            )?;
+                                        literal_check =
+                                            Ok(ConstLiteralCheck::SupportedConstReference {
+                                                diagnostics: Vec::new(),
+                                                blocked: false,
+                                            });
+                                        pending_reference = Some(PendingConstReference {
+                                            source_index,
+                                            target,
+                                            location,
+                                            package: inputs.source_ref.package.clone(),
+                                            name,
+                                        });
+                                    }
+                                }
+                            }
                             let expression_diagnostics = match &module_scope {
                                 Ok(module_scope) => match &mut module_resolution {
                                     Ok(Some(module_resolution)) => {
@@ -22992,6 +23447,8 @@ impl RootDatabase {
                                 test_only_diagnostics,
                                 literal_check,
                                 const_value,
+                                const_value_type,
+                                pending_reference,
                             ))
                         }
                         Err(error) => Ok((
@@ -23002,6 +23459,8 @@ impl RootDatabase {
                             non_expression_diagnostics,
                             literal_check,
                             const_value,
+                            const_value_type,
+                            None,
                         )),
                     }
                 })();
@@ -23013,6 +23472,8 @@ impl RootDatabase {
                     test_only_diagnostics,
                     literal_check,
                     const_value,
+                    const_value_type,
+                    pending_reference,
                 ) = analysis.unwrap_or_else(|error| {
                     (
                         Err(error.clone()),
@@ -23022,8 +23483,13 @@ impl RootDatabase {
                         Err(error.clone()),
                         Err(error.clone()),
                         Err(error),
+                        None,
+                        None,
                     )
                 });
+                if let Some(reference) = pending_reference {
+                    pending_const_references.push(reference);
+                }
                 let module_path_diagnostics =
                     module_path_diagnostics.unwrap_or_else(|| match &type_path_resolution {
                         Err(error) => Err(error.clone()),
@@ -23034,6 +23500,7 @@ impl RootDatabase {
                     local_resolution,
                     module_resolution,
                     type_path_resolution,
+                    const_value_type,
                     literal_check,
                     const_value,
                     module_path_diagnostics,
@@ -23044,6 +23511,7 @@ impl RootDatabase {
             }
             group_start = group_end;
         }
+        resolve_const_references(&mut owners, pending_const_references, snapshot)?;
         Ok(ConstOwnerResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
@@ -81469,6 +81937,190 @@ property "shared"() {}
                     .expect("unsupported array shape does not evaluate"),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn direct_const_references_copy_supported_values_through_chains_and_aggregates() {
+        let root = concat!(
+            "pub const EARLY: I32 = LATER\n",
+            "pub const MIDDLE: I32 = EARLY\n",
+            "pub const LATER: I32 = 7\n",
+            "pub const TEXT: Str = \"hello\"\n",
+            "pub const TEXT_COPY: Str = TEXT\n",
+            "pub const BYTES: Slice<Byte> = b\"A\\0\\xff\"\n",
+            "pub const BYTES_COPY: Slice<Byte> = BYTES\n",
+            "pub const PAIR: (Bool, Slice<Byte>) = (true, b\"x\")\n",
+            "pub const PAIR_COPY: (Bool, Slice<Byte>) = PAIR\n",
+            "pub const EMPTY: Array<Slice<Byte>, 0> = []\n",
+            "pub const EMPTY_COPY: Array<Slice<Byte>, 0> = EMPTY\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        let expected = [
+            ConstValue::Int {
+                value: 7,
+                ty: sai_ty::ty::IntTy::I32,
+            },
+            ConstValue::Int {
+                value: 7,
+                ty: sai_ty::ty::IntTy::I32,
+            },
+            ConstValue::Int {
+                value: 7,
+                ty: sai_ty::ty::IntTy::I32,
+            },
+            ConstValue::Str(
+                database
+                    .symbols
+                    .intern("hello")
+                    .expect("string value is interned"),
+            ),
+            ConstValue::Str(
+                database
+                    .symbols
+                    .intern("hello")
+                    .expect("copied string value is interned"),
+            ),
+            ConstValue::ByteStr(Arc::from([b'A', 0, 0xff])),
+            ConstValue::ByteStr(Arc::from([b'A', 0, 0xff])),
+            ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([
+                    ConstValue::Bool(true),
+                    ConstValue::ByteStr(Arc::from([b'x'])),
+                ]),
+            },
+            ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([
+                    ConstValue::Bool(true),
+                    ConstValue::ByteStr(Arc::from([b'x'])),
+                ]),
+            },
+            ConstValue::Array {
+                element_type: ConstValueType::ByteStr,
+                elements: Arc::from([]),
+            },
+            ConstValue::Array {
+                element_type: ConstValueType::ByteStr,
+                elements: Arc::from([]),
+            },
+        ];
+        assert_eq!(resolved.owners().len(), expected.len());
+        for (index, expected_value) in expected.into_iter().enumerate() {
+            let owner = &resolved.owners()[index];
+            let check = owner
+                .literal_check()
+                .expect("const check uses the current owner snapshot");
+            assert!(check.is_supported(), "owner {index} is supported");
+            assert!(check.is_valid(), "owner {index} is valid");
+            assert!(
+                check.requires_const_value(),
+                "owner {index} requires a copied value"
+            );
+            assert_eq!(
+                owner.const_value().expect("const evaluation succeeds"),
+                Some(expected_value),
+                "owner {index} has the direct target's value"
+            );
+        }
+    }
+
+    #[test]
+    fn renamed_const_item_imports_remain_gated() {
+        for (root, child, renamed) in [
+            (
+                "use acme:phase1/child.{VALUE}\npub const COPY: I32 = VALUE\n",
+                "pub const VALUE: I32 = 7\n",
+                false,
+            ),
+            (
+                "use acme:phase1/child.{VALUE as ALIAS}\npub const COPY: I32 = ALIAS\n",
+                "pub const VALUE: I32 = 7\n",
+                true,
+            ),
+            (
+                concat!(
+                    "pub const VALUE: I32 = 7\n",
+                    "use acme:phase1/child.{RENAMED}\n",
+                    "pub const COPY: I32 = RENAMED\n",
+                ),
+                "pub use acme:phase1.{VALUE as RENAMED}\n",
+                true,
+            ),
+        ] {
+            let (mut database, module_tree, snapshot, package) =
+                phase1_fixture(root.as_bytes(), child.as_bytes());
+            let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+            let owners = resolved.owners();
+            assert_eq!(owners.len(), 2);
+
+            let copy_name = database
+                .symbols
+                .intern("COPY")
+                .expect("copy const name interns");
+            let def_paths = database
+                .def_paths
+                .get(&package)
+                .expect("package definition paths exist");
+            let copy_owner = owners
+                .iter()
+                .find(|owner| {
+                    def_paths
+                        .resolve_def_id(owner.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| path.data().last().cloned())
+                        .is_some_and(|component| {
+                            matches!(
+                                &component.data,
+                                DefPathData::ValueNs(name) if *name == copy_name
+                            )
+                        })
+                })
+                .expect("COPY owner exists");
+            let check = copy_owner
+                .literal_check()
+                .expect("literal check uses the current owner snapshot");
+            assert_eq!(check.is_supported(), !renamed);
+            assert_eq!(check.requires_const_value(), !renamed);
+            let copied_value = copy_owner
+                .const_value()
+                .expect("const evaluation uses the current owner snapshot");
+            assert_eq!(copied_value.is_some(), !renamed);
+            if let Some(value) = copied_value {
+                assert!(matches!(
+                    value,
+                    ConstValue::Int {
+                        value: 7,
+                        ty: sai_ty::ty::IntTy::I32,
+                    }
+                ));
+            }
         }
     }
 
