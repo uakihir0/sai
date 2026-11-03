@@ -16842,6 +16842,18 @@ fn public_direct_const_references_emit_check_results() {
 }
 
 #[test]
+fn public_flat_tuple_and_array_const_references_emit_check_results() {
+    let source = concat!(
+        "pub const BASE: I32 = 1\n",
+        "pub const READY: Bool = true\n",
+        "pub const PAIR: (I32, Bool) = (BASE, READY)\n",
+        "pub const VALUES: Array<I32, 3> = [BASE, LATER, BASE]\n",
+        "pub const LATER: I32 = 2\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
 fn unknown_enum_variant_in_const_initializer_is_reported() {
     let source = "enum Color { Red }\npub const MISSING: Color = Color.Missing\n";
     let output = run_check(source, "", &[], &[]);
@@ -17020,6 +17032,63 @@ fn direct_const_reference_type_mismatch_reports_the_reference_span() {
 }
 
 #[test]
+fn flat_aggregate_const_reference_mismatches_report_each_reference_span() {
+    for source in [
+        "pub const SOURCE: Bool = true\npub const BAD: (I32,) = (SOURCE,)\n",
+        "pub const SOURCE: Bool = true\npub const BAD: Array<I32, 1> = [SOURCE]\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let reference_start = source.rfind("SOURCE").expect("reference is present");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "a leaf type mismatch suppresses the aggregate result without a feature gate:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            reference_start,
+            reference_start + "SOURCE".len(),
+        );
+    }
+}
+
+#[test]
+fn wrong_length_flat_array_still_reports_const_reference_type_mismatch() {
+    let source = "pub const SOURCE: Bool = true\npub const BAD: Array<I32, 2> = [SOURCE]\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let reference_start = source.rfind("SOURCE").expect("array reference is present");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"ARRAY_LENGTH_MISMATCH\"").count(),
+        1,
+        "the declared and actual array lengths should be compared:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "a supplied reference element should be checked even when the array length is wrong:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "both errors should suppress the result without a feature gate:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_byte_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        reference_start,
+        reference_start + "SOURCE".len(),
+    );
+}
+
+#[test]
 fn direct_const_cycles_report_one_cycle_error_and_suppress_results() {
     for source in [
         "pub const SELF: I32 = SELF\n",
@@ -17066,6 +17135,39 @@ fn direct_const_cycles_report_one_cycle_error_and_suppress_results() {
                 },
         );
     }
+}
+
+#[test]
+fn branching_flat_aggregate_const_cycle_reports_one_deterministic_error() {
+    let source = concat!(
+        "pub const CYCLE_A: (I32, I32) = (CYCLE_B, CYCLE_C)\n",
+        "pub const CYCLE_B: I32 = CYCLE_A\n",
+        "pub const CYCLE_C: I32 = CYCLE_A\n",
+        "pub const DEPENDENT: I32 = CYCLE_B\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let reference_start = source.find("CYCLE_B").expect("cycle edge is present");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"CONST_CYCLE\"").count(),
+        1,
+        "a branching cycle component should emit one diagnostic:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("CYCLE_A -> CYCLE_B -> CYCLE_A")
+            && stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "the deterministic cycle and typed mismatch diagnostics should suppress the result without a feature gate:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_byte_span(
+        &stdout,
+        "CONST_CYCLE",
+        reference_start,
+        reference_start + "CYCLE_B".len(),
+    );
 }
 
 #[test]
@@ -17741,7 +17843,6 @@ fn public_flat_array_type_errors_suppress_the_check_result() {
 #[test]
 fn array_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
-        "pub const READY: I32 = 1\npub const PATH_ELEMENT: Array<I32, 1> = [READY]\n",
         "pub const COMPUTED_ELEMENT: Array<I32, 1> = [1 + 2]\n",
         "pub const NESTED: Array<Array<I32, 1>, 1> = [[1]]\n",
         "pub type Number = I32\npub const ALIAS_ELEMENT: Array<Number, 1> = [1]\n",
@@ -17754,6 +17855,16 @@ fn array_const_forms_outside_the_flat_literal_slice_remain_gated() {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);
     }
+
+    let source =
+        "use acme:empty/values as values\npub const PATH_ELEMENT: Array<I32, 1> = [values.VALUE]\n";
+    let output = run_check(
+        source,
+        "",
+        &[("src/values.sai", "pub const VALUE: I32 = 1\n")],
+        &[],
+    );
+    assert_check_stays_gated(&output, "qualified array element reference");
 }
 
 #[test]
