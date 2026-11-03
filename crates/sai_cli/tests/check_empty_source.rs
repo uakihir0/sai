@@ -17537,6 +17537,7 @@ fn public_byte_string_const_type_errors_suppress_the_check_result() {
         "pub const BAD_STRING: Slice<Byte> = \"text\"\n",
         "pub const BAD_BOOL: Slice<Byte> = true\n",
         "pub const BAD_INTEGER: Slice<Byte> = 1\n",
+        "pub const BAD_BITWISE_NOT: Slice<Byte> = ~1\n",
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
