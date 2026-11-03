@@ -16842,6 +16842,83 @@ fn public_direct_const_references_emit_check_results() {
 }
 
 #[test]
+fn unknown_enum_variant_in_const_initializer_is_reported() {
+    let source = "enum Color { Red }\npub const MISSING: Color = Color.Missing\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let variant_start = source.rfind("Missing").expect("unknown variant exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"UNKNOWN_VARIANT\""),
+        "the const path resolver diagnostic should reach the CLI:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_byte_span(
+        &stdout,
+        "UNKNOWN_VARIANT",
+        variant_start,
+        variant_start + "Missing".len(),
+    );
+}
+
+#[test]
+fn unknown_enum_variant_in_const_initializer_is_reported_with_dependency_graph() {
+    let source = "enum Color { Red }\npub const MISSING: Color = Color.Missing\n";
+    let output = run_check(
+        source,
+        "requires { acme:dep @ ^1 from path \"dep\" }\n",
+        &[
+            (
+                "dep/sai.package",
+                concat!(
+                    "package acme:dep @ 1.0.0\n",
+                    "compiler ^0.1\n",
+                    "source \"src\"\n",
+                    "targets { wasm32-core, wasm32-wasi }\n",
+                ),
+            ),
+            ("dep/src/lib.sai", "pub fn dep() {}\n"),
+            (
+                "sai.lock",
+                concat!(
+                    "lock 2\n",
+                    "\n",
+                    "root acme:empty @ 0.1.0\n",
+                    "    targets { wasm32-core, wasm32-wasi }\n",
+                    "    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n",
+                    "\n",
+                    "package acme:dep @ 1.0.0\n",
+                    "    source path \"dep\"\n",
+                ),
+            ),
+        ],
+        &["--locked", "--offline"],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let variant_start = source.rfind("Missing").expect("unknown variant exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    let diagnostic = stdout
+        .lines()
+        .find(|record| record.contains("\"code\":\"UNKNOWN_VARIANT\""))
+        .expect("package-graph check reports the unknown variant");
+    assert!(
+        diagnostic.contains("\"file\":{\"path\":\"src/lib.sai\",\"package\":\"acme:empty@0.1.0\""),
+        "the diagnostic should point at the root package source file:\n{diagnostic}"
+    );
+    assert!(
+        diagnostic.ends_with("\"package\":\"acme:empty@0.1.0\"}"),
+        "the diagnostic should retain the root package identity:\n{diagnostic}"
+    );
+    assert_json_diagnostic_primary_byte_span(
+        &stdout,
+        "UNKNOWN_VARIANT",
+        variant_start,
+        variant_start + "Missing".len(),
+    );
+}
+
+#[test]
 fn direct_const_reference_type_mismatch_reports_the_reference_span() {
     let source = "pub const SOURCE: I32 = 7\npub const MISMATCH: Bool = SOURCE\n";
     let output = run_check(source, "", &[], &[]);
