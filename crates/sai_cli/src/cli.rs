@@ -2721,7 +2721,7 @@ fn check_public_primitive_const_set_coverage(
         && const_resolutions.owners().iter().all(|owner| {
             owner.literal_check().is_ok_and(|check| {
                 check.is_supported()
-                    && (!check.is_valid_bool()
+                    && (!check.requires_const_value()
                         || owner.const_value().is_ok_and(|value| value.is_some()))
             })
         })

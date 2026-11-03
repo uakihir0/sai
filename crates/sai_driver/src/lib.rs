@@ -7346,9 +7346,9 @@ impl ConstOwnerResolution {
         self.literal_check.as_ref()
     }
 
-    /// Evaluates the narrow Bool constant subset currently handled by the
-    /// driver. Other otherwise-supported literal forms do not yet produce a
-    /// value here.
+    /// Evaluates the narrow constant subset currently handled by the driver.
+    /// Other otherwise-supported literal forms do not yet produce a value
+    /// here.
     pub fn const_value(&self) -> Result<Option<ConstValue>, &OwnerControlFlowResolutionError> {
         self.const_value.as_ref().map(|value| *value)
     }
@@ -7414,6 +7414,12 @@ pub enum ConstValue {
     /// A Bool direct literal, exact `not` of one, or one logical `and`/`or`
     /// with two direct Bool literal operands.
     Bool(bool),
+    /// A direct character literal.
+    Char(char),
+    /// A direct byte literal.
+    Byte(u8),
+    /// A direct string literal interned in the current session.
+    Str(Symbol),
 }
 
 /// Result of checking one public primitive, canonical `Str`, unit, or flat tuple constant.
@@ -7464,6 +7470,21 @@ impl ConstLiteralCheck {
                     primitive: sai_resolve::prelude::PrimTy::Bool,
                     ..
                 }
+            )
+    }
+
+    /// Returns whether this valid checked constant is expected to produce a
+    /// value in the current bounded evaluator slice.
+    pub fn requires_const_value(&self) -> bool {
+        self.is_valid()
+            && matches!(
+                self,
+                Self::Supported {
+                    primitive: sai_resolve::prelude::PrimTy::Bool
+                        | sai_resolve::prelude::PrimTy::Char
+                        | sai_resolve::prelude::PrimTy::Byte,
+                    ..
+                } | Self::SupportedStr { .. }
             )
     }
 
@@ -7658,40 +7679,59 @@ fn evaluate_const_value(
     owner: &HirOwner<'_>,
     literal_check: &ConstLiteralCheck,
 ) -> Option<ConstValue> {
-    if !literal_check.is_valid()
-        || !matches!(
-            literal_check,
-            ConstLiteralCheck::Supported {
-                primitive: sai_resolve::prelude::PrimTy::Bool,
-                ..
-            }
-        )
-    {
+    if !literal_check.is_valid() {
         return None;
     }
 
     let value = &owner.body?.value;
-    match value.kind {
-        ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(value)),
-        ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
-            ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(!value)),
+    match literal_check {
+        ConstLiteralCheck::Supported {
+            primitive: sai_resolve::prelude::PrimTy::Bool,
+            ..
+        } => match value.kind {
+            ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(value)),
+            ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
+                ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(!value)),
+                _ => None,
+            },
+            ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right) => {
+                let ExprKind::Lit(Lit::Bool(left)) = left.kind else {
+                    return None;
+                };
+                let ExprKind::Lit(Lit::Bool(right)) = right.kind else {
+                    return None;
+                };
+                let value = match operator {
+                    BinOp::And => left && right,
+                    BinOp::Or => left || right,
+                    _ => return None,
+                };
+                Some(ConstValue::Bool(value))
+            }
             _ => None,
         },
-        ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right) => {
-            let ExprKind::Lit(Lit::Bool(left)) = left.kind else {
-                return None;
-            };
-            let ExprKind::Lit(Lit::Bool(right)) = right.kind else {
-                return None;
-            };
-            let value = match operator {
-                BinOp::And => left && right,
-                BinOp::Or => left || right,
-                _ => return None,
-            };
-            Some(ConstValue::Bool(value))
-        }
-        _ => None,
+        ConstLiteralCheck::Supported {
+            primitive: sai_resolve::prelude::PrimTy::Char,
+            ..
+        } => match value.kind {
+            ExprKind::Lit(Lit::Char(value)) => Some(ConstValue::Char(value)),
+            _ => None,
+        },
+        ConstLiteralCheck::Supported {
+            primitive: sai_resolve::prelude::PrimTy::Byte,
+            ..
+        } => match value.kind {
+            ExprKind::Lit(Lit::Byte(value)) => Some(ConstValue::Byte(value)),
+            _ => None,
+        },
+        ConstLiteralCheck::SupportedStr { .. } => match value.kind {
+            ExprKind::Lit(Lit::Str(value)) => Some(ConstValue::Str(value)),
+            _ => None,
+        },
+        ConstLiteralCheck::Supported { .. }
+        | ConstLiteralCheck::SupportedUnit { .. }
+        | ConstLiteralCheck::SupportedTuple { .. }
+        | ConstLiteralCheck::Unsupported => None,
     }
 }
 
@@ -78678,6 +78718,13 @@ property "shared"() {}
             assert!(
                 resolved.owners()[index]
                     .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+                    .requires_const_value(),
+                "valid Bool const at owner index {index} requires an evaluator value"
+            );
+            assert!(
+                resolved.owners()[index]
+                    .literal_check()
                     .expect("literal check succeeds")
                     .is_valid(),
                 "supported Bool const at owner index {index}"
@@ -78819,6 +78866,13 @@ property "shared"() {}
                     .expect("literal check succeeds")
                     .is_valid_bool(),
                 "supported Bool logical const at owner index {index}"
+            );
+            assert!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check succeeds")
+                    .requires_const_value(),
+                "supported Bool logical const at owner index {index} requires an evaluator value"
             );
             assert_eq!(
                 resolved.owners()[index]
@@ -79062,6 +79116,27 @@ property "shared"() {}
                 "decoded literal at owner index {index} should fit its exact primitive"
             );
         }
+        for (index, expected) in [
+            (0, ConstValue::Char('a')),
+            (1, ConstValue::Char('\0')),
+            (2, ConstValue::Char('\u{e000}')),
+            (3, ConstValue::Char('\u{10ffff}')),
+            (4, ConstValue::Byte(b'z')),
+            (5, ConstValue::Byte(0)),
+            (6, ConstValue::Byte(u8::MAX)),
+        ] {
+            assert!(
+                checks[index].requires_const_value(),
+                "valid scalar const at owner index {index} requires an evaluator value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("const evaluation succeeds"),
+                Some(expected),
+                "decoded const value at owner index {index}"
+            );
+        }
         for index in 7..=11 {
             let ConstLiteralCheck::Supported {
                 primitive,
@@ -79086,6 +79161,16 @@ property "shared"() {}
             );
             assert!(diagnostics[0].has_workspace_snapshot());
             assert!(diagnostics[0].primary().is_some());
+            assert!(
+                !checks[index].requires_const_value(),
+                "invalid scalar const at owner index {index} does not require a value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid const evaluation does not fail resolution"),
+                None
+            );
         }
         assert_eq!(
             checks[12],
@@ -79093,6 +79178,21 @@ property "shared"() {}
                 diagnostics: Vec::new(),
             },
             "a direct canonical Str literal is supported"
+        );
+        assert!(checks[12].requires_const_value());
+        let Some(ConstValue::Str(text)) = resolved.owners()[12]
+            .const_value()
+            .expect("const evaluation succeeds")
+        else {
+            panic!("canonical Str const produces an interned string value");
+        };
+        assert_eq!(
+            database
+                .symbols
+                .resolve(text)
+                .expect("evaluated string symbol resolves")
+                .as_ref(),
+            "text"
         );
         assert_eq!(
             checks[13],
@@ -79152,6 +79252,28 @@ property "shared"() {}
                 },
                 "direct string literal at owner index {index} is supported"
             );
+            assert!(checks[index].requires_const_value());
+            let Some(ConstValue::Str(text)) = resolved.owners()[index]
+                .const_value()
+                .expect("const evaluation succeeds")
+            else {
+                panic!("direct canonical Str literal at owner index {index} produces a value");
+            };
+            let text = database
+                .symbols
+                .resolve(text)
+                .expect("evaluated string symbol resolves");
+            match index {
+                0 => assert_eq!(text.as_ref(), ""),
+                1 => assert_eq!(text.as_ref(), "line\nfeed"),
+                2 => assert_eq!(text.as_ref(), "raw { text }"),
+                3 => assert!(
+                    text.contains("first\n") && text.contains("second"),
+                    "multiline string value preserves both lines: {text:?}"
+                ),
+                4 => assert_eq!(text.as_ref(), "こんにちは"),
+                _ => unreachable!("the loop covers only direct string literals"),
+            }
         }
         for index in [5, 6] {
             let ConstLiteralCheck::SupportedStr { diagnostics } = checks[index] else {
@@ -79165,6 +79287,16 @@ property "shared"() {}
             );
             assert!(diagnostics[0].has_workspace_snapshot());
             assert!(diagnostics[0].primary().is_some());
+            assert!(
+                !checks[index].requires_const_value(),
+                "invalid Str const at owner index {index} does not require a value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid const evaluation does not fail resolution"),
+                None
+            );
         }
         let ConstLiteralCheck::Supported {
             primitive,
@@ -79176,6 +79308,13 @@ property "shared"() {}
         assert_eq!(*primitive, sai_resolve::prelude::PrimTy::I8);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert!(!checks[7].requires_const_value());
+        assert_eq!(
+            resolved.owners()[7]
+                .const_value()
+                .expect("invalid const evaluation does not fail resolution"),
+            None
+        );
         for index in [8, 9, 10, 11] {
             assert_eq!(
                 checks[index],
