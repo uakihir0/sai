@@ -80,8 +80,8 @@ use sai_hir::lower::{
 use sai_hir::patterns::{Pat as HirPat, PatKind, PatRangeEnd};
 use sai_hir::source_map::HirSourceMap;
 use sai_hir::types::{
-    Bound, BoundKind, EffectRef as HirEffectRef, GenericArg, GenericArgs, GenericParamKind, Name,
-    Path as HirPath, PathRoot, PathSegment, Ty, TyKind,
+    Bound, BoundKind, ConstArg, EffectRef as HirEffectRef, GenericArg, GenericArgs,
+    GenericParamKind, Name, Path as HirPath, PathRoot, PathSegment, Ty, TyKind,
 };
 use sai_hir::{DefId, DefPath, DefPathData, DefPathInterner, DefPathInternerError, Visibility};
 use sai_hir::{HirId, OwnerId};
@@ -7426,6 +7426,11 @@ pub enum ConstValue {
     Byte(u8),
     /// A direct string literal interned in the current session.
     Str(Symbol),
+    /// A flat array value with its element type and source-ordered elements.
+    Array {
+        element_type: ConstValueType,
+        elements: Arc<[ConstValue]>,
+    },
     /// A unit or tuple value. The current evaluator only constructs
     /// aggregates with no variant.
     Aggregate {
@@ -7434,14 +7439,30 @@ pub enum ConstValue {
     },
 }
 
-/// Result of checking one public primitive, canonical `Str`, unit, or flat tuple constant.
+/// Resolved element type carried by a constant array value.
+///
+/// This keeps even empty array values self-describing without retaining HIR.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConstValueType {
+    /// A resolved primitive type, including the resolved targets of `Int` and `UInt`.
+    Primitive(sai_resolve::prelude::PrimTy),
+    /// The canonical prelude string type.
+    Str,
+    /// The unit type.
+    Unit,
+}
+
+/// Result of checking one public primitive, canonical `Str`, unit, flat tuple,
+/// or flat array constant.
 ///
 /// This deliberately covers only direct literals of supported primitive
 /// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
 /// fields are supported direct scalar or unit literals or Bool literal-only
 /// `not`/`and`/`or` expressions and comparisons between direct Bool literals.
-/// Top-level Bool expressions use those same forms. It does not imply that
-/// other constant expressions are evaluated.
+/// Flat arrays use those same element forms and require an explicit built-in
+/// `Array<T, N>` type with a literal length. Top-level Bool expressions use
+/// those same forms. It does not imply that other constant expressions are
+/// evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -7462,6 +7483,8 @@ pub enum ConstLiteralCheck {
     SupportedUnit { diagnostics: Vec<Diagnostic> },
     /// A flat tuple whose fields each have a supported literal or unit expression.
     SupportedTuple { diagnostics: Vec<Diagnostic> },
+    /// A flat array whose elements each have a supported literal or unit expression.
+    SupportedArray { diagnostics: Vec<Diagnostic> },
 }
 
 impl ConstLiteralCheck {
@@ -7472,6 +7495,7 @@ impl ConstLiteralCheck {
                 | Self::SupportedStr { .. }
                 | Self::SupportedUnit { .. }
                 | Self::SupportedTuple { .. }
+                | Self::SupportedArray { .. }
         )
     }
 
@@ -7506,7 +7530,9 @@ impl ConstLiteralCheck {
                     )
             }
             Self::SupportedStr { .. } => true,
-            Self::SupportedUnit { .. } | Self::SupportedTuple { .. } => true,
+            Self::SupportedUnit { .. }
+            | Self::SupportedTuple { .. }
+            | Self::SupportedArray { .. } => true,
             Self::Unsupported => false,
         }
     }
@@ -7516,7 +7542,8 @@ impl ConstLiteralCheck {
             Self::Supported { diagnostics, .. }
             | Self::SupportedStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
-            | Self::SupportedTuple { diagnostics } => diagnostics.is_empty(),
+            | Self::SupportedTuple { diagnostics }
+            | Self::SupportedArray { diagnostics } => diagnostics.is_empty(),
             Self::Unsupported => false,
         }
     }
@@ -7527,7 +7554,8 @@ impl ConstLiteralCheck {
             Self::Supported { diagnostics, .. }
             | Self::SupportedStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
-            | Self::SupportedTuple { diagnostics } => diagnostics,
+            | Self::SupportedTuple { diagnostics }
+            | Self::SupportedArray { diagnostics } => diagnostics,
         }
     }
 }
@@ -7539,7 +7567,7 @@ fn check_const_literal_owner(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
-    tuple_element_types: &mut Option<Vec<ConstLiteralType>>,
+    aggregate_type: &mut Option<ConstLiteralAggregateType>,
 ) -> Result<ConstLiteralCheck, OwnerControlFlowResolutionError> {
     if !owner.raw_attrs.is_empty() {
         return Ok(ConstLiteralCheck::Unsupported);
@@ -7612,8 +7640,31 @@ fn check_const_literal_owner(
         else {
             return Ok(ConstLiteralCheck::Unsupported);
         };
-        *tuple_element_types = Some(resolved_element_types);
+        *aggregate_type = Some(ConstLiteralAggregateType::Tuple(resolved_element_types));
         return Ok(ConstLiteralCheck::SupportedTuple { diagnostics });
+    }
+
+    if let Some((element_type, expected_length)) =
+        resolve_const_array_type(*ty, type_paths, symbols, inputs, target_cfg)
+    {
+        let Some(diagnostics) = check_const_array_literal(
+            owner,
+            element_type,
+            expected_length,
+            &body.value,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(ConstLiteralCheck::Unsupported);
+        };
+        *aggregate_type = Some(ConstLiteralAggregateType::Array {
+            element_type,
+            length: expected_length,
+        });
+        return Ok(ConstLiteralCheck::SupportedArray { diagnostics });
     }
 
     let Some(literal_type) = resolve_const_literal_type(*ty, type_paths, symbols, inputs) else {
@@ -7734,7 +7785,7 @@ fn is_const_bool_literal_expression(value: &HirExpr<'_>) -> bool {
 fn evaluate_const_value(
     owner: &HirOwner<'_>,
     literal_check: &ConstLiteralCheck,
-    tuple_element_types: Option<&[ConstLiteralType]>,
+    aggregate_type: Option<&ConstLiteralAggregateType>,
     symbols: &Interner,
 ) -> Option<ConstValue> {
     if !literal_check.is_valid() {
@@ -7756,13 +7807,16 @@ fn evaluate_const_value(
             let ExprKind::Tuple(values) = value.kind else {
                 return None;
             };
+            let Some(ConstLiteralAggregateType::Tuple(tuple_element_types)) = aggregate_type else {
+                return None;
+            };
             if values.iter().any(|value| {
                 !is_direct_const_literal_or_unit(value) && !is_const_bool_literal_expression(value)
-            }) || values.len() != tuple_element_types?.len()
+            }) || values.len() != tuple_element_types.len()
             {
                 return None;
             }
-            let fields = tuple_element_types?
+            let fields = tuple_element_types
                 .iter()
                 .copied()
                 .zip(values)
@@ -7773,6 +7827,33 @@ fn evaluate_const_value(
             Some(ConstValue::Aggregate {
                 variant: None,
                 fields: fields.into(),
+            })
+        }
+        ConstLiteralCheck::SupportedArray { .. } => {
+            let ExprKind::Array(values) = value.kind else {
+                return None;
+            };
+            let Some(ConstLiteralAggregateType::Array {
+                element_type,
+                length,
+            }) = aggregate_type
+            else {
+                return None;
+            };
+            if u128::try_from(values.len()).ok() != Some(*length) {
+                return None;
+            }
+            let values = values
+                .iter()
+                .map(|value| evaluate_const_literal_value(*element_type, value, symbols))
+                .collect::<Option<Vec<_>>>()?;
+            Some(ConstValue::Array {
+                element_type: match element_type {
+                    ConstLiteralType::Primitive(primitive) => ConstValueType::Primitive(*primitive),
+                    ConstLiteralType::Str => ConstValueType::Str,
+                    ConstLiteralType::Unit => ConstValueType::Unit,
+                },
+                elements: values.into(),
             })
         }
         ConstLiteralCheck::Unsupported => None,
@@ -7953,6 +8034,143 @@ enum ConstLiteralType {
     Primitive(sai_resolve::prelude::PrimTy),
     Str,
     Unit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConstLiteralAggregateType {
+    Tuple(Vec<ConstLiteralType>),
+    Array {
+        element_type: ConstLiteralType,
+        length: u128,
+    },
+}
+
+fn resolve_const_array_type(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    target_cfg: &TargetCfg,
+) -> Option<(ConstLiteralType, u128)> {
+    let TyKind::Path(path) = ty.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 {
+        return None;
+    }
+    let segment = path.segments[0];
+    let type_paths = type_paths?;
+    let segment_count = u32::try_from(path.segments.len()).ok()?;
+    if !matches!(
+        type_paths.paths().get(&path.hir_id),
+        Some(PathRes {
+            base: Res::PrimTy(sai_resolve::prelude::PrimTy::Array),
+            resolved_segments,
+            segment_count: resolved_count,
+        }) if *resolved_segments == segment_count && *resolved_count == segment_count
+    ) {
+        return None;
+    }
+    let arguments = segment.args?;
+    let [
+        GenericArg::Type(element_ty),
+        GenericArg::Const(ConstArg::Int {
+            value: Some(length),
+            negated: false,
+        }),
+    ] = arguments.args
+    else {
+        return None;
+    };
+
+    let pointer_width = target_cfg.pointer_width();
+    let maximum_length = (1u128 << pointer_width) - 1;
+    if *length > maximum_length {
+        return None;
+    }
+    let element_type = resolve_const_literal_type(**element_ty, Some(type_paths), symbols, inputs)?;
+    Some((element_type, *length))
+}
+
+fn check_const_array_literal(
+    owner: &HirOwner<'_>,
+    element_type: ConstLiteralType,
+    expected_length: u128,
+    value: &HirExpr<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let ExprKind::Array(values) = value.kind else {
+        let found_type = match value.kind {
+            ExprKind::Lit(literal) => const_literal_found_type(literal),
+            ExprKind::Tuple(elements) if elements.is_empty() => "unit",
+            _ if is_const_bool_literal_expression(value) => "Bool",
+            _ => return Ok(None),
+        };
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected an array, found {found_type}"),
+            "type mismatch",
+        )?]));
+    };
+
+    if values.iter().any(|value| {
+        !is_direct_const_literal_or_unit(value) && !is_const_bool_literal_expression(value)
+    }) {
+        return Ok(None);
+    }
+
+    let mut diagnostics = Vec::new();
+    if u128::try_from(values.len()).ok() != Some(expected_length) {
+        diagnostics.push(const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::ArrayLengthMismatch,
+            format!(
+                "expected an array with {expected_length} elements, found {}",
+                values.len()
+            ),
+            "array length mismatch",
+        )?);
+    }
+
+    for value in values {
+        let mut element_diagnostics = match check_const_bool_expression_initializer(
+            owner.id,
+            element_type,
+            value,
+            inputs,
+            snapshot,
+        )? {
+            Some(diagnostics) => diagnostics,
+            None => {
+                let Some(diagnostics) = check_const_literal_against_type(
+                    owner.id,
+                    element_type,
+                    value,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics
+            }
+        };
+        diagnostics.append(&mut element_diagnostics);
+    }
+
+    Ok(Some(diagnostics))
 }
 
 fn resolve_const_literal_type(
@@ -22492,7 +22710,7 @@ impl RootDatabase {
                             ),
                             (_, _, Err(error)) => Err(error),
                         };
-                    let mut tuple_element_types = None;
+                    let mut aggregate_type = None;
                     let literal_check = check_const_literal_owner(
                         &hir_owner,
                         type_path_resolution
@@ -22503,13 +22721,13 @@ impl RootDatabase {
                         &inputs,
                         snapshot,
                         &collection.target_cfg,
-                        &mut tuple_element_types,
+                        &mut aggregate_type,
                     );
                     let const_value = match &literal_check {
                         Ok(check) => Ok(evaluate_const_value(
                             &hir_owner,
                             check,
-                            tuple_element_types.as_deref(),
+                            aggregate_type.as_ref(),
                             &self.symbols,
                         )),
                         Err(error) => Err(error.clone()),
@@ -80622,11 +80840,11 @@ property "shared"() {}
         );
         assert_primary_literal_span(&diagnostics[0], "pub const MULTIPLE_FIELD_ERRORS:", "128");
         assert_primary_literal_span(&diagnostics[1], "pub const MULTIPLE_FIELD_ERRORS:", "1");
-        for index in [8, 9, 10, 11] {
+        for index in [8, 10, 11] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "nested, array, expression, or alias form at owner index {index} stays gated"
+                "nested, expression, or alias form at owner index {index} stays gated"
             );
             assert!(!checks[index].requires_const_value());
             assert_eq!(
@@ -80636,6 +80854,13 @@ property "shared"() {}
                 None
             );
         }
+        assert_eq!(
+            checks[9],
+            &ConstLiteralCheck::SupportedArray {
+                diagnostics: Vec::new(),
+            },
+            "flat array constants are supported independently of tuple fields"
+        );
         for index in [12, 13, 14] {
             assert!(!checks[index].requires_const_value());
             assert_eq!(
@@ -80646,6 +80871,336 @@ property "shared"() {}
                 "unsupported tuple shape at owner index {index} stays valueless"
             );
         }
+    }
+
+    #[test]
+    fn const_flat_array_literal_check_preserves_types_order_and_all_diagnostics() {
+        let root = concat!(
+            "pub const VALUES: Array<I32, 3> = [-1, 0, 4]\n",
+            "pub const BOOLS: Array<Bool, 4> = [true and false, false or true, not (true and false), false < true]\n",
+            "pub const STRS: Array<Str, 2> = [\"a\", \"b\"]\n",
+            "pub const UNITS: Array<(), 1> = [()]\n",
+            "pub const EMPTY: Array<Bool, 0> = []\n",
+            "pub const U8_MAX: Array<U8, 1> = [255]\n",
+            "pub const SHORT: Array<I32, 2> = [1]\n",
+            "pub const LONG: Array<I32, 1> = [1, 2]\n",
+            "pub const LENGTH_AND_TYPE: Array<I32, 2> = [true]\n",
+            "pub const RANGE: Array<I8, 1> = [128]\n",
+            "pub const SCALAR_MISMATCH: Array<I32, 1> = false\n",
+            "pub const READY: I32 = 1\n",
+            "pub const PATH_ELEMENT: Array<I32, 1> = [READY]\n",
+            "pub const COMPUTED_ELEMENT: Array<I32, 1> = [1 + 2]\n",
+            "pub const NESTED: Array<Array<I32, 1>, 1> = [[1]]\n",
+            "pub type Number = I32\n",
+            "pub const ALIAS_ELEMENT: Array<Number, 1> = [1]\n",
+            "pub const EMPTY_I32: Array<I32, 0> = []\n",
+            "pub const CHARS: Array<Char, 1> = ['x']\n",
+            "pub const BYTES: Array<Byte, 1> = [b'\\xfe']\n",
+            "pub const F32_NEGATIVE_ZERO: Array<F32, 1> = [-0.0]\n",
+            "pub const INT_ALIAS: Array<Int, 1> = [-1]\n",
+            "pub const UINT_ALIAS: Array<UInt, 1> = [0]\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 22);
+        let assert_primary_literal_span =
+            |diagnostic: &Diagnostic, declaration: &str, literal: &str| {
+                let declaration_start = root
+                    .find(declaration)
+                    .unwrap_or_else(|| panic!("test source contains {declaration:?}"));
+                let value_start = root[declaration_start..]
+                    .find(" = ")
+                    .expect("const declaration has an initializer")
+                    + declaration_start
+                    + " = ".len();
+                let value_end = root[value_start..]
+                    .find('\n')
+                    .map_or(root.len(), |relative_end| value_start + relative_end);
+                let literal_start = root[value_start..value_end]
+                    .rfind(literal)
+                    .unwrap_or_else(|| panic!("initializer contains {literal:?}"))
+                    + value_start;
+                let expected_range = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(literal_start as u32),
+                    sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                )
+                .expect("literal span is ordered");
+                assert_eq!(
+                    diagnostic.primary().map(|location| location.span.range),
+                    Some(expected_range),
+                    "primary diagnostic span should cover literal {literal:?}"
+                );
+            };
+
+        for index in 0..6 {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::SupportedArray {
+                    diagnostics: Vec::new(),
+                },
+                "valid flat array at owner index {index} is supported"
+            );
+            assert!(
+                checks[index].requires_const_value(),
+                "valid array at owner index {index} requires a value"
+            );
+        }
+        assert_eq!(
+            resolved.owners()[0]
+                .const_value()
+                .expect("integer array evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::I32),
+                elements: Arc::from([
+                    ConstValue::Int {
+                        value: -1,
+                        ty: sai_ty::ty::IntTy::I32,
+                    },
+                    ConstValue::Int {
+                        value: 0,
+                        ty: sai_ty::ty::IntTy::I32,
+                    },
+                    ConstValue::Int {
+                        value: 4,
+                        ty: sai_ty::ty::IntTy::I32,
+                    },
+                ]),
+            }),
+            "array elements preserve source order and their declared integer type"
+        );
+        assert_eq!(
+            resolved.owners()[1]
+                .const_value()
+                .expect("Bool array evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::Bool),
+                elements: Arc::from([
+                    ConstValue::Bool(false),
+                    ConstValue::Bool(true),
+                    ConstValue::Bool(true),
+                    ConstValue::Bool(true),
+                ]),
+            }),
+            "Bool literal-only expressions evaluate in source order"
+        );
+        let Some(ConstValue::Array {
+            element_type: ConstValueType::Str,
+            elements: strings,
+        }) = resolved.owners()[2]
+            .const_value()
+            .expect("Str array evaluates")
+        else {
+            panic!("Str array yields an array value");
+        };
+        let resolved_strings = strings
+            .iter()
+            .map(|value| {
+                let ConstValue::Str(symbol) = value else {
+                    panic!("Str array elements are interned strings");
+                };
+                database
+                    .symbols
+                    .resolve(*symbol)
+                    .expect("array string symbol resolves")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(resolved_strings, ["a", "b"]);
+        assert_eq!(
+            resolved.owners()[3]
+                .const_value()
+                .expect("unit array evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Unit,
+                elements: Arc::from([ConstValue::Aggregate {
+                    variant: None,
+                    fields: Arc::from([]),
+                }]),
+            }),
+            "unit array elements use the existing unit value representation"
+        );
+        assert_eq!(
+            resolved.owners()[4]
+                .const_value()
+                .expect("empty array evaluates from its explicit element type"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::Bool),
+                elements: Arc::from([]),
+            }),
+            "empty array is valid when its explicit length is zero"
+        );
+        assert_eq!(
+            resolved.owners()[5]
+                .const_value()
+                .expect("unsigned array evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::U8),
+                elements: Arc::from([ConstValue::Uint {
+                    value: 255,
+                    ty: sai_ty::ty::UintTy::U8,
+                }]),
+            }),
+            "unsigned array elements retain their declared type"
+        );
+
+        let expected_diagnostics = [
+            (6, vec![sai_diagnostics::Code::ArrayLengthMismatch]),
+            (7, vec![sai_diagnostics::Code::ArrayLengthMismatch]),
+            (
+                8,
+                vec![
+                    sai_diagnostics::Code::ArrayLengthMismatch,
+                    sai_diagnostics::Code::TypeMismatch,
+                ],
+            ),
+            (9, vec![sai_diagnostics::Code::LiteralOutOfRange]),
+            (10, vec![sai_diagnostics::Code::TypeMismatch]),
+        ];
+        for (index, expected_codes) in expected_diagnostics {
+            assert!(
+                matches!(checks[index], ConstLiteralCheck::SupportedArray { .. }),
+                "supported array error at owner index {index} should be diagnosed"
+            );
+            assert_eq!(
+                checks[index]
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                expected_codes,
+                "array diagnostics are retained in length then source element order"
+            );
+            assert!(
+                !checks[index].requires_const_value(),
+                "invalid array at owner index {index} does not require a value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid array evaluation does not fail owner resolution"),
+                None,
+                "invalid array at owner index {index} remains valueless"
+            );
+        }
+        assert_primary_literal_span(&checks[6].diagnostics()[0], "pub const SHORT:", "[1]");
+        assert_primary_literal_span(
+            &checks[8].diagnostics()[1],
+            "pub const LENGTH_AND_TYPE:",
+            "true",
+        );
+        assert_primary_literal_span(&checks[9].diagnostics()[0], "pub const RANGE:", "128");
+        assert_primary_literal_span(
+            &checks[10].diagnostics()[0],
+            "pub const SCALAR_MISMATCH:",
+            "false",
+        );
+
+        for index in [12, 13, 14, 15] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "path, computed, nested, or aliased array form at owner index {index} stays gated"
+            );
+            assert!(!checks[index].requires_const_value());
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported array evaluation does not fail resolution"),
+                None
+            );
+        }
+        assert_eq!(
+            resolved.owners()[16]
+                .const_value()
+                .expect("second empty array evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::I32),
+                elements: Arc::from([]),
+            }),
+            "the element type makes empty arrays self-describing"
+        );
+        assert_eq!(
+            resolved.owners()[17]
+                .const_value()
+                .expect("character array evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::Char),
+                elements: Arc::from([ConstValue::Char('x')]),
+            })
+        );
+        assert_eq!(
+            resolved.owners()[18]
+                .const_value()
+                .expect("byte array evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::Byte),
+                elements: Arc::from([ConstValue::Byte(0xfe)]),
+            })
+        );
+        assert_eq!(
+            resolved.owners()[19]
+                .const_value()
+                .expect("float array evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::F32),
+                elements: Arc::from([ConstValue::Float {
+                    bits: (-0.0_f32).to_bits() as u64,
+                    ty: sai_ty::ty::FloatTy::F32,
+                }]),
+            })
+        );
+        assert_eq!(
+            resolved.owners()[20]
+                .const_value()
+                .expect("transparent Int alias array evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::I64),
+                elements: Arc::from([ConstValue::Int {
+                    value: -1,
+                    ty: sai_ty::ty::IntTy::I64,
+                }]),
+            })
+        );
+        assert_eq!(
+            checks[21],
+            &ConstLiteralCheck::SupportedArray {
+                diagnostics: Vec::new(),
+            },
+            "transparent UInt alias array is supported"
+        );
+        assert_eq!(
+            resolved.owners()[21]
+                .const_value()
+                .expect("transparent UInt alias array evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::U64),
+                elements: Arc::from([ConstValue::Uint {
+                    value: 0,
+                    ty: sai_ty::ty::UintTy::U64,
+                }]),
+            })
+        );
     }
 
     #[test]

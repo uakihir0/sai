@@ -17172,10 +17172,122 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
 }
 
 #[test]
+fn public_flat_array_const_literals_emit_check_results() {
+    let source = concat!(
+        "pub const VALUES: Array<I32, 3> = [-1, 0, 4]\n",
+        "pub const BOOLS: Array<Bool, 4> = [true and false, false or true, not (true and false), false < true]\n",
+        "pub const STRS: Array<Str, 2> = [\"a\", \"b\"]\n",
+        "pub const UNITS: Array<(), 1> = [()]\n",
+        "pub const EMPTY: Array<Bool, 0> = []\n",
+        "pub const EMPTY_I32: Array<I32, 0> = []\n",
+        "pub const CHARS: Array<Char, 1> = ['x']\n",
+        "pub const BYTES: Array<Byte, 1> = [b'\\xfe']\n",
+        "pub const F32_NEGATIVE_ZERO: Array<F32, 1> = [-0.0]\n",
+        "pub const INT_ALIAS: Array<Int, 1> = [-1]\n",
+        "pub const UINT_ALIAS: Array<UInt, 1> = [0]\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn public_flat_array_type_errors_suppress_the_check_result() {
+    for (source, expected_code) in [
+        (
+            "pub const SHORT: Array<I32, 2> = [1]\n",
+            "ARRAY_LENGTH_MISMATCH",
+        ),
+        (
+            "pub const LONG: Array<I32, 1> = [1, 2]\n",
+            "ARRAY_LENGTH_MISMATCH",
+        ),
+        (
+            "pub const LENGTH_AND_TYPE: Array<I32, 2> = [true]\n",
+            "ARRAY_LENGTH_MISMATCH",
+        ),
+        (
+            "pub const RANGE: Array<I8, 1> = [128]\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub const MISMATCH: Array<I32, 1> = [false]\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const MISMATCH: Array<I32, 1> = false\n",
+            "TYPE_MISMATCH",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: array const error should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected {expected_code} without a result or feature gate:\n{stdout}"
+        );
+        if source.contains("LENGTH_AND_TYPE") {
+            assert!(
+                stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+                "length and element type errors should both be reported:\n{stdout}"
+            );
+        }
+    }
+
+    for (target, length, supported) in [
+        ("wasm32-core", "4294967295", true),
+        ("wasm32-core", "4294967296", false),
+        ("wasm64-core", "18446744073709551615", true),
+        ("wasm64-core", "18446744073709551616", false),
+    ] {
+        let source = format!("pub const BOUNDARY: Array<I32, {length}> = []\n");
+        let manifest = format!("targets {{ {target} }}\n");
+        let output = run_check(&source, &manifest, &[], &["--target", target]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if supported {
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{target} accepts this USize length and diagnoses only the element count:\n{stdout}"
+            );
+            assert!(
+                stdout.contains("\"code\":\"ARRAY_LENGTH_MISMATCH\"")
+                    && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                    && !stdout.contains("\"type\":\"result\""),
+                "{target} USize maximum remains in the supported checker:\n{stdout}"
+            );
+        } else {
+            assert_check_stays_gated(&output, &source);
+        }
+    }
+}
+
+#[test]
+fn array_const_forms_outside_the_flat_literal_slice_remain_gated() {
+    for source in [
+        "pub const READY: I32 = 1\npub const PATH_ELEMENT: Array<I32, 1> = [READY]\n",
+        "pub const COMPUTED_ELEMENT: Array<I32, 1> = [1 + 2]\n",
+        "pub const NESTED: Array<Array<I32, 1>, 1> = [[1]]\n",
+        "pub type Number = I32\npub const ALIAS_ELEMENT: Array<Number, 1> = [1]\n",
+        "pub const READY: Bool = true\npub const BOOL_PATH: Array<Bool, 1> = [false and READY]\n",
+        "pub const NEGATIVE_LENGTH: Array<I32, -1> = []\n",
+        "pub const LENGTH: USize = 0\npub const SYMBOLIC_LENGTH: Array<I32, LENGTH> = []\n",
+        "pub const TOO_WIDE_LENGTH: Array<I32, 4294967296> = []\n",
+        "pub const TUPLE_ELEMENT: Array<(I32,), 1> = [(1,)]\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
 fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
         "pub const NESTED: ((I32,),) = ((1,),)\n",
-        "pub const ARRAY: Array<I32, 1> = [1]\n",
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
         "pub const EXPRESSION_FIELD: (I32,) = (1 + 2,)\n",
         "pub const READY: Bool = true\npub const LOGICAL_PATH_FIELD: (Bool,) = (false and READY,)\n",
