@@ -13,6 +13,7 @@ from run_stage0 import (
     FMT_SOURCE_MAX_BYTES,
     ROOT_ID,
     SmokeError,
+    USAGE_ERROR_CASES,
     _generate_fmt_layout_variants,
     _first_differing_lf_line,
     _formatter_refusal_codes,
@@ -21,6 +22,108 @@ from run_stage0 import (
     _run_iut,
     run_suite,
 )
+
+FAKE_USAGE_RESPONSES = {
+    ("--format=json",): (
+        "sai",
+        (("MISSING_ARGUMENT", 0, ""),),
+    ),
+    ("not-a-command", "--format=json"): (
+        "not-a-command",
+        (("UNKNOWN_COMMAND", 1, "not-a-command"),),
+    ),
+    ("component", "nonesuch", "--format=json"): (
+        "component nonesuch",
+        (("UNKNOWN_COMMAND", 2, "nonesuch"),),
+    ),
+    ("component", "--format=json"): (
+        "component",
+        (("MISSING_ARGUMENT", 0, ""),),
+    ),
+    ("check", "--format=json", "--bogus"): (
+        "check",
+        (("UNKNOWN_OPTION", 3, "--bogus"),),
+    ),
+    ("check", "--format=json", "--target"): (
+        "check",
+        (("MISSING_ARGUMENT", 0, ""),),
+    ),
+    ("--directory", "--format=json", "check"): (
+        "check",
+        (("MISSING_ARGUMENT", 0, ""),),
+    ),
+    ("--format=json", "new", "unused", "--name"): (
+        "new",
+        (("MISSING_ARGUMENT", 0, ""),),
+    ),
+    ("check", "--format=json", "--target", "--target"): (
+        "check",
+        (
+            ("CONFLICTING_OPTIONS", 4, "--target"),
+            ("MISSING_ARGUMENT", 0, ""),
+            ("MISSING_ARGUMENT", 0, ""),
+        ),
+    ),
+    ("check", "--format=json", "--bogus", "--target"): (
+        "check",
+        (
+            ("MISSING_ARGUMENT", 0, ""),
+            ("UNKNOWN_OPTION", 3, "--bogus"),
+        ),
+    ),
+    ("check", "--format=json", "--target=not-a-target"): (
+        "check",
+        (("INVALID_OPTION_VALUE", 3, "--target=not-a-target"),),
+    ),
+    ("check", "--format=json", "extra"): (
+        "check",
+        (("UNEXPECTED_ARGUMENT", 3, "extra"),),
+    ),
+    ("check", "--format=json", "--quiet", "--verbose"): (
+        "check",
+        (("CONFLICTING_OPTIONS", 4, "--verbose"),),
+    ),
+    (
+        "--format=json",
+        "--max-errors=1",
+        "check",
+        "--target=not-a-target",
+        "--bogus",
+    ): (
+        "check",
+        (
+            ("INVALID_OPTION_VALUE", 4, "--target=not-a-target"),
+            ("UNKNOWN_OPTION", 5, "--bogus"),
+        ),
+    ),
+    ("--format=json", "test", "--workspace", "--package", "--bogus"): (
+        "test",
+        (
+            ("CONFLICTING_OPTIONS", 4, "--package"),
+            ("MISSING_ARGUMENT", 0, ""),
+            ("UNKNOWN_OPTION", 5, "--bogus"),
+        ),
+    ),
+    ("add", "--format=json", "--path=.", "--version", "^1.0"): (
+        "add",
+        (("CONFLICTING_OPTIONS", 4, "--version"),),
+    ),
+    ("--format=json", "check"): (
+        "check",
+        (("NO_PACKAGE_FOUND", 0, ""),),
+    ),
+    ("--format=json", "fmt"): (
+        "fmt",
+        (("NO_PACKAGE_FOUND", 0, ""),),
+    ),
+}
+FAKE_USAGE_MESSAGES = {
+    ("check", "--format=json", "--target"): "missing value for `--target`",
+    ("--directory", "--format=json", "check"): "missing value for `--directory`",
+    ("--format=json", "new", "unused", "--name"): "missing value for `--name`",
+    ("check", "--format=json", "--target", "--target"): "missing value for `--target`",
+    ("check", "--format=json", "--bogus", "--target"): "missing value for `--target`",
+}
 
 
 class Stage0SmokeRunnerTests(unittest.TestCase):
@@ -73,6 +176,8 @@ REFUSAL_LINE = {self.refusal_line!r}
 EXPECTED_FORMATTED = {self.expected_format!r}
 EXPECTED_SIZE_PROBE_LENGTH = {self.probe_limit + 1}
 EXPECTED_SIZE_PROBE = b"/*" + b" " * (EXPECTED_SIZE_PROBE_LENGTH - 2)
+USAGE_RESPONSES = {FAKE_USAGE_RESPONSES!r}
+USAGE_MESSAGES = {FAKE_USAGE_MESSAGES!r}
 
 def line(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\\n"
@@ -89,24 +194,61 @@ def summary(errors=0, warnings=0, infos=0, exit_code=0):
             "exit_code":exit_code}}
 
 args = sys.argv[1:]
+for usage_argv, (command, expected_diagnostics) in USAGE_RESPONSES.items():
+    if args == list(usage_argv):
+        records = [header(command, None)]
+        diagnostics = list(expected_diagnostics)
+        message = USAGE_MESSAGES.get(usage_argv, "usage error")
+        if MODE == "usage_wrong_message" and usage_argv in USAGE_MESSAGES:
+            message = "missing required argument"
+        if (MODE == "usage_wrong_order"
+                and usage_argv == ("check", "--format=json", "--bogus", "--target")):
+            diagnostics.reverse()
+        for code, argument_index, argument in diagnostics:
+            if (MODE == "usage_wrong_argument"
+                    and usage_argv == ("check", "--format=json", "--target")):
+                argument_index = 9
+                argument = "--target"
+            records.append({{"type":"diagnostic","code":code,
+                "severity":"error","level":None,"message":message,
+                "primary":None,"primary_label":"","labels":[],"children":[],
+                "fixes":[],"related":[],
+                "data":{{"argument_index":argument_index,"argument":argument}},
+                "node":None,"symbol":None,"package":None}})
+        if MODE == "usage_extra_result":
+            records.append({{"type":"result","kind":"unexpected","data":{{}}}})
+        errors = len(diagnostics) + (MODE == "usage_wrong_summary")
+        records.append(summary(errors=errors, exit_code=2))
+        if MODE == "usage_side_effect":
+            (Path(os.environ["SAI_CACHE_DIR"]) / "usage-marker").write_text("unexpected")
+        for record in records:
+            sys.stdout.write(line(record))
+        raise SystemExit(2)
 if args == ["--format=json", "explain", "--list"]:
     if MODE == "bad_registry":
         code = "UNREGISTERED_EXAMPLE"
         codes = [code]
     else:
         codes = [
+            "CONFLICTING_OPTIONS",
             "EXPECTED_TOKEN",
             "FEATURE_NOT_IMPLEMENTED",
             "IMPLEMENTATION_LIMIT_EXCEEDED",
             "INTERNAL_COMPILER_ERROR",
             "INVALID_ASSIGN_TARGET",
+            "INVALID_OPTION_VALUE",
             "INVARIANT_OUTSIDE_DEFINING_MODULE",
             "LITERAL_OUT_OF_RANGE",
+            "MISSING_ARGUMENT",
             "MISSING_FN_BODY",
             "NAMED_ARGUMENT_ON_FUNCTION",
+            "NO_PACKAGE_FOUND",
             "OR_PATTERN_BINDING_MISMATCH",
+            "UNEXPECTED_ARGUMENT",
             "UNFORMATTED_FILE",
             "UNKNOWN_ATTRIBUTE",
+            "UNKNOWN_COMMAND",
+            "UNKNOWN_OPTION",
             "UNTERMINATED_COMMENT",
         ]
     print(line(header("explain", None)).rstrip("\\n"))
@@ -1158,7 +1300,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["tests"], 2)
+        self.assertEqual(report["tests"], 2 + len(USAGE_ERROR_CASES))
         self.assertEqual(report["results"][-1]["test"],
                          "generated/impl-14-formatter/source-size-refusal")
         self.assertEqual(report["results"][-1]["outcome"], "pass")
@@ -1170,6 +1312,88 @@ raise SystemExit(exit_code)
         self.assertEqual(receipt["size_refusal_probe"]["input_length"],
                          self.probe_limit + 1)
         self.assertEqual(receipt["size_refusal_probe"]["prefix"], "/*")
+
+    def test_usage_error_matrix_checks_required_cli_boundaries(self):
+        self._fixture()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "pass", report)
+        self.assertEqual(len(report["usage_results"]), len(USAGE_ERROR_CASES))
+        self.assertEqual(
+            {tuple(case["argv"]) for case in USAGE_ERROR_CASES},
+            set(FAKE_USAGE_RESPONSES),
+        )
+        self.assertEqual(
+            [result["test"].rsplit("/", 1)[-1] for result in report["usage_results"]],
+            [case["name"] for case in USAGE_ERROR_CASES],
+        )
+        self.assertTrue(all(result["outcome"] == "pass"
+                            for result in report["usage_results"]))
+        aggregate = next(
+            case for case in USAGE_ERROR_CASES
+            if case["name"] == "all-errors-ignore-max-errors"
+        )
+        self.assertEqual(len(aggregate["expected"]), 2)
+        self.assertIn("--max-errors=1", aggregate["argv"])
+        self.assertFalse(report["claim"])
+
+    def test_usage_error_matrix_rejects_mutated_diagnostics_and_records(self):
+        cases = (
+            (
+                "usage_wrong_argument",
+                "missing-option-value",
+                "diagnostic data",
+            ),
+            (
+                "usage_wrong_message",
+                "missing-option-value",
+                "message omits the missing option",
+            ),
+            (
+                "usage_wrong_order",
+                "mixed-errors-follow-diagnostic-order",
+                "diagnostic data",
+            ),
+            (
+                "usage_extra_result",
+                "missing-command",
+                "record count or a result",
+            ),
+            (
+                "usage_wrong_summary",
+                "missing-command",
+                "inconsistent diagnostic counts",
+            ),
+        )
+        for mode, case_name, expected_failure in cases:
+            with self.subTest(mode=mode):
+                self._fixture()
+                self.mode = mode
+                self._write_fake()
+
+                report = self._run()
+
+                self.assertEqual(report["outcome"], "fail")
+                result = next(
+                    result for result in report["usage_results"]
+                    if result["test"].endswith(f"/{case_name}")
+                )
+                self.assertEqual(result["outcome"], "fail")
+                self.assertIn(expected_failure, " ".join(result["failures"]))
+
+    def test_usage_error_matrix_rejects_nested_sandbox_side_effects(self):
+        self._fixture()
+        self.mode = "usage_side_effect"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "usage error performed work in its sandbox",
+            " ".join(report["usage_results"][0]["failures"]),
+        )
 
     def test_source_size_refusal_probe_rejects_acceptance_wrong_value_and_result(self):
         for mode, expected in (

@@ -42,6 +42,210 @@ SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+\Z")
 DOCUMENT_AREA = {"spec", "package", "impl"}
 SIDECAR_SUFFIXES = fixture_discovery.FILE_SIDECARS + fixture_discovery.SOURCE_FILE_SIDECARS
+USAGE_ERROR_CASES = (
+    {
+        "name": "missing-command",
+        "argv": ["--format=json"],
+        "command": "sai",
+        "expected": [
+            {"code": "MISSING_ARGUMENT", "argument_index": 0, "argument": ""},
+        ],
+    },
+    {
+        "name": "unknown-command",
+        "argv": ["not-a-command", "--format=json"],
+        "command": "not-a-command",
+        "expected": [
+            {
+                "code": "UNKNOWN_COMMAND",
+                "argument_index": 1,
+                "argument": "not-a-command",
+            },
+        ],
+    },
+    {
+        "name": "unknown-subcommand",
+        "argv": ["component", "nonesuch", "--format=json"],
+        "command": "component nonesuch",
+        "expected": [
+            {"code": "UNKNOWN_COMMAND", "argument_index": 2, "argument": "nonesuch"},
+        ],
+    },
+    {
+        "name": "missing-subcommand",
+        "argv": ["component", "--format=json"],
+        "command": "component",
+        "expected": [
+            {"code": "MISSING_ARGUMENT", "argument_index": 0, "argument": ""},
+        ],
+    },
+    {
+        "name": "unknown-option",
+        "argv": ["check", "--format=json", "--bogus"],
+        "command": "check",
+        "expected": [
+            {"code": "UNKNOWN_OPTION", "argument_index": 3, "argument": "--bogus"},
+        ],
+    },
+    {
+        "name": "missing-option-value",
+        "argv": ["check", "--format=json", "--target"],
+        "command": "check",
+        "expected": [
+            {
+                "code": "MISSING_ARGUMENT",
+                "argument_index": 0,
+                "argument": "",
+                "message_contains": "--target",
+            },
+        ],
+    },
+    {
+        "name": "missing-global-option-value",
+        "argv": ["--directory", "--format=json", "check"],
+        "command": "check",
+        "expected": [
+            {
+                "code": "MISSING_ARGUMENT",
+                "argument_index": 0,
+                "argument": "",
+                "message_contains": "--directory",
+            },
+        ],
+    },
+    {
+        "name": "missing-new-option-value",
+        "argv": ["--format=json", "new", "unused", "--name"],
+        "command": "new",
+        "expected": [
+            {
+                "code": "MISSING_ARGUMENT",
+                "argument_index": 0,
+                "argument": "",
+                "message_contains": "--name",
+            },
+        ],
+    },
+    {
+        "name": "repeated-missing-option-values",
+        "argv": ["check", "--format=json", "--target", "--target"],
+        "command": "check",
+        "expected": [
+            {"code": "CONFLICTING_OPTIONS", "argument_index": 4, "argument": "--target"},
+            {
+                "code": "MISSING_ARGUMENT",
+                "argument_index": 0,
+                "argument": "",
+                "message_contains": "--target",
+            },
+            {
+                "code": "MISSING_ARGUMENT",
+                "argument_index": 0,
+                "argument": "",
+                "message_contains": "--target",
+            },
+        ],
+    },
+    {
+        "name": "mixed-errors-follow-diagnostic-order",
+        "argv": ["check", "--format=json", "--bogus", "--target"],
+        "command": "check",
+        "expected": [
+            {
+                "code": "MISSING_ARGUMENT",
+                "argument_index": 0,
+                "argument": "",
+                "message_contains": "--target",
+            },
+            {"code": "UNKNOWN_OPTION", "argument_index": 3, "argument": "--bogus"},
+        ],
+    },
+    {
+        "name": "invalid-option-value",
+        "argv": ["check", "--format=json", "--target=not-a-target"],
+        "command": "check",
+        "expected": [
+            {
+                "code": "INVALID_OPTION_VALUE",
+                "argument_index": 3,
+                "argument": "--target=not-a-target",
+            },
+        ],
+    },
+    {
+        "name": "unexpected-positional",
+        "argv": ["check", "--format=json", "extra"],
+        "command": "check",
+        "expected": [
+            {"code": "UNEXPECTED_ARGUMENT", "argument_index": 3, "argument": "extra"},
+        ],
+    },
+    {
+        "name": "conflicting-global-options",
+        "argv": ["check", "--format=json", "--quiet", "--verbose"],
+        "command": "check",
+        "expected": [
+            {
+                "code": "CONFLICTING_OPTIONS",
+                "argument_index": 4,
+                "argument": "--verbose",
+            },
+        ],
+    },
+    {
+        "name": "all-errors-ignore-max-errors",
+        "argv": [
+            "--format=json",
+            "--max-errors=1",
+            "check",
+            "--target=not-a-target",
+            "--bogus",
+        ],
+        "command": "check",
+        "expected": [
+            {
+                "code": "INVALID_OPTION_VALUE",
+                "argument_index": 4,
+                "argument": "--target=not-a-target",
+            },
+            {"code": "UNKNOWN_OPTION", "argument_index": 5, "argument": "--bogus"},
+        ],
+    },
+    {
+        "name": "synthetic-conflict-uses-diagnostic-order",
+        "argv": ["--format=json", "test", "--workspace", "--package", "--bogus"],
+        "command": "test",
+        "expected": [
+            {"code": "CONFLICTING_OPTIONS", "argument_index": 4, "argument": "--package"},
+            {"code": "MISSING_ARGUMENT", "argument_index": 0, "argument": ""},
+            {"code": "UNKNOWN_OPTION", "argument_index": 5, "argument": "--bogus"},
+        ],
+    },
+    {
+        "name": "add-conflict-identifies-later-option",
+        "argv": ["add", "--format=json", "--path=.", "--version", "^1.0"],
+        "command": "add",
+        "expected": [
+            {"code": "CONFLICTING_OPTIONS", "argument_index": 4, "argument": "--version"},
+        ],
+    },
+    {
+        "name": "no-package-check",
+        "argv": ["--format=json", "check"],
+        "command": "check",
+        "expected": [
+            {"code": "NO_PACKAGE_FOUND", "argument_index": 0, "argument": ""},
+        ],
+    },
+    {
+        "name": "no-package-fmt",
+        "argv": ["--format=json", "fmt"],
+        "command": "fmt",
+        "expected": [
+            {"code": "NO_PACKAGE_FOUND", "argument_index": 0, "argument": ""},
+        ],
+    },
+)
 
 
 class SmokeError(ValueError):
@@ -1160,6 +1364,111 @@ def _run_fmt_source_size_refusal(
     return output
 
 
+def _validate_usage_error_case(
+    completed: subprocess.CompletedProcess,
+    case: dict,
+    *,
+    registered_codes: set[str],
+) -> None:
+    records = _records(
+        completed.stdout,
+        exit_code=completed.returncode,
+        stderr=completed.stderr,
+    )
+    if completed.returncode != 2:
+        raise SmokeError("usage error did not exit with status 2")
+    header = records[0]
+    if header["command"] != case["command"] or header["root"] is not None:
+        raise SmokeError("usage error returned the wrong JSON header")
+
+    diagnostics = [record for record in records if record["type"] == "diagnostic"]
+    results = [record for record in records if record["type"] == "result"]
+    summaries = [record for record in records if record["type"] == "summary"]
+    expected = case["expected"]
+    if (
+        len(diagnostics) != len(expected)
+        or results
+        or len(summaries) != 1
+        or len(records) != len(expected) + 2
+    ):
+        raise SmokeError("usage error returned the wrong record count or a result")
+
+    for diagnostic, expected_diagnostic in zip(diagnostics, expected, strict=True):
+        if diagnostic["code"] not in registered_codes:
+            raise SmokeError(f"usage error emitted unregistered code: {diagnostic['code']}")
+        if (
+            diagnostic["code"] != expected_diagnostic["code"]
+            or diagnostic["severity"] != "error"
+            or diagnostic["primary"] is not None
+            or diagnostic["data"]
+            != {
+                "argument_index": expected_diagnostic["argument_index"],
+                "argument": expected_diagnostic["argument"],
+            }
+        ):
+            raise SmokeError("usage error diagnostic data or primary location is incorrect")
+        if (
+            "message_contains" in expected_diagnostic
+            and expected_diagnostic["message_contains"] not in diagnostic["message"]
+        ):
+            raise SmokeError("usage error message omits the missing option")
+
+    summary = summaries[0]
+    if (
+        summary["errors"] != len(expected)
+        or summary["warnings"] != 0
+        or summary["infos"] != 0
+        or summary["shown_errors"] != len(expected)
+        or summary["suppressed"]
+        != {"cascade": 0, "duplicate": 0, "dependency": 0}
+        or summary["exit_code"] != 2
+    ):
+        raise SmokeError("usage error summary is incorrect")
+
+
+def _run_usage_error_case(
+    iut: Path,
+    case: dict,
+    registered_codes: set[str],
+    *,
+    timeout: float,
+) -> dict:
+    output = {
+        "type": "test",
+        "test": f"generated/impl-13-cli/usage/{case['name']}",
+        "mode": "partial-smoke",
+        "claim": False,
+        "configuration": {"target": None, "profile": None},
+        "argv": case["argv"],
+        "outcome": "fail",
+        "deviations": [],
+        "failures": [],
+    }
+    try:
+        with tempfile.TemporaryDirectory(prefix="sai-stage0-usage-") as temporary:
+            sandbox = Path(temporary)
+            completed = _run_iut(iut, case["argv"], sandbox, timeout)
+            _validate_usage_error_case(
+                completed,
+                case,
+                registered_codes=registered_codes,
+            )
+            sandbox_entries = {path.name: path for path in sandbox.iterdir()}
+            if set(sandbox_entries) != {"cache", "home"} or any(
+                not path.is_dir()
+                or path.is_symlink()
+                or next(path.iterdir(), None) is not None
+                for path in sandbox_entries.values()
+            ):
+                raise SmokeError("usage error performed work in its sandbox")
+        output["outcome"] = "pass"
+    except (SmokeError, ValueError, ndjson_stream.StreamError) as error:
+        output["failures"] = [str(error)]
+    except Exception:
+        output["failures"] = ["unexpected usage-error smoke-runner failure"]
+    return output
+
+
 def _actual_diagnostics(records: list[dict], codes: set[str]) -> list[dict]:
     actual = []
     for record in records:
@@ -1747,6 +2056,7 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
         "passed": 0,
         "failed": 0,
         "results": [],
+        "usage_results": [],
         "failures": [],
         "limitations": [
             "Stage 0 selects one targetless/profileless configuration; the current CLI "
@@ -1761,6 +2071,9 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "workspaces, multi-source package checks, multiple explicit path arguments, "
             "and complete "
             "formatter-rule coverage are not covered.",
+            "CLI usage coverage checks selected command, option, missing-value, "
+            "conflict, aggregate-reporting, and no-package cases only; it does not "
+            "cover every command shape, lint lifecycle, or every usage diagnostic.",
             "This smoke subset does not establish section, diagnostic, or suite coverage "
             "and cannot substantiate a conformance claim.",
         ],
@@ -1788,11 +2101,19 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
         results.append(
             _run_fmt_source_size_refusal(iut_path, codes, timeout=timeout)
         )
+        usage_results = [
+            _run_usage_error_case(iut_path, case, codes, timeout=timeout)
+            for case in USAGE_ERROR_CASES
+        ]
         report["results"] = results
-        report["tests"] = len(results)
-        report["passed"] = sum(result["outcome"] in ("pass", "pass-with-deviations")
-                               for result in results)
-        report["failed"] = len(results) - report["passed"]
+        report["usage_results"] = usage_results
+        all_results = [*results, *usage_results]
+        report["tests"] = len(all_results)
+        report["passed"] = sum(
+            result["outcome"] in ("pass", "pass-with-deviations")
+            for result in all_results
+        )
+        report["failed"] = len(all_results) - report["passed"]
         report["outcome"] = "pass" if report["failed"] == 0 else "fail"
     except (SmokeError, fixture_discovery.DiscoveryError, OSError, ValueError) as error:
         report["failures"] = [str(error)]
