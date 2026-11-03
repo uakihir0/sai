@@ -8146,6 +8146,7 @@ fn evaluate_const_value(
                     && !is_const_bool_literal_expression(value)
                     && !is_supported_const_bitnot_literal_expression(value)
                     && !is_supported_const_bitwise_literal_expression(value)
+                    && !is_supported_const_integer_shift_expression(value)
                     && !is_supported_const_integer_arithmetic_expression(value)
             }) || values.len() != tuple_element_types.len()
             {
@@ -8183,6 +8184,7 @@ fn evaluate_const_value(
                     && !is_const_bool_literal_expression(value)
                     && !is_supported_const_bitnot_literal_expression(value)
                     && !is_supported_const_bitwise_literal_expression(value)
+                    && !is_supported_const_integer_shift_expression(value)
                     && !is_supported_const_integer_arithmetic_expression(value)
             }) {
                 return None;
@@ -8292,6 +8294,12 @@ fn evaluate_const_literal_value(
     }
     if is_supported_const_bitwise_literal_expression(value) {
         return evaluate_const_bitwise_literal(literal_type, value, target_cfg);
+    }
+    if is_supported_const_integer_shift_expression(value) {
+        return match evaluate_const_integer_shift(literal_type, value, target_cfg)? {
+            ConstIntegerShiftResult::Value(value) => Some(value),
+            ConstIntegerShiftResult::Panic => None,
+        };
     }
     if is_supported_const_integer_arithmetic_expression(value) {
         let ConstLiteralType::Primitive(primitive) = literal_type else {
@@ -8409,6 +8417,192 @@ enum ConstBitwiseOp {
     And,
     Or,
     Xor,
+}
+
+#[derive(Clone, Copy)]
+enum ConstIntegerShiftOp {
+    Left,
+    Right,
+}
+
+impl ConstIntegerShiftOp {
+    fn syntax_kind(self) -> sai_syntax::SyntaxKind {
+        match self {
+            Self::Left => sai_syntax::SyntaxKind::SHL,
+            Self::Right => sai_syntax::SyntaxKind::SHR,
+        }
+    }
+}
+
+enum ConstIntegerShiftResult {
+    Value(ConstValue),
+    Panic,
+}
+
+fn const_integer_shift_operands<'hir>(
+    value: &HirExpr<'hir>,
+) -> Option<(
+    ConstIntegerShiftOp,
+    &'hir HirExpr<'hir>,
+    &'hir HirExpr<'hir>,
+)> {
+    let ExprKind::Binary(operator, left, right) = value.kind else {
+        return None;
+    };
+    let operator = match operator {
+        BinOp::Shl => ConstIntegerShiftOp::Left,
+        BinOp::Shr => ConstIntegerShiftOp::Right,
+        _ => return None,
+    };
+    (matches!(left.kind, ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)))
+        && matches!(right.kind, ExprKind::Lit(_)))
+    .then_some((operator, left, right))
+}
+
+fn is_supported_const_integer_shift_expression(value: &HirExpr<'_>) -> bool {
+    const_integer_shift_operands(value).is_some()
+}
+
+fn evaluate_const_integer_shift(
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    target_cfg: &TargetCfg,
+) -> Option<ConstIntegerShiftResult> {
+    use sai_resolve::prelude::PrimTy;
+
+    let (operator, left, right) = const_integer_shift_operands(value)?;
+    let ConstLiteralType::Primitive(primitive) = literal_type else {
+        return None;
+    };
+
+    let ExprKind::Lit(Lit::Int {
+        value: right_magnitude,
+        negated: right_negated,
+    }) = right.kind
+    else {
+        return None;
+    };
+    let shift = evaluate_const_integer_literal(PrimTy::U32, right_magnitude, right_negated)?;
+    let ConstValue::Uint {
+        value: shift,
+        ty: sai_ty::ty::UintTy::U32,
+    } = shift
+    else {
+        return None;
+    };
+
+    let shifted = match (primitive, left.kind) {
+        (PrimTy::Byte, ExprKind::Lit(Lit::Byte(value))) => {
+            let width = 8;
+            if shift >= width {
+                return Some(ConstIntegerShiftResult::Panic);
+            }
+            let shift = u32::try_from(shift).ok()?;
+            let value = match operator {
+                ConstIntegerShiftOp::Left => value.wrapping_shl(shift),
+                ConstIntegerShiftOp::Right => value.wrapping_shr(shift),
+            };
+            ConstValue::Byte(value)
+        }
+        (primitive, ExprKind::Lit(Lit::Int { .. }))
+            if sai_ty::typeck::literal::is_integer_primitive(primitive) =>
+        {
+            let ExprKind::Lit(Lit::Int {
+                value: left_magnitude,
+                negated: left_negated,
+            }) = left.kind
+            else {
+                return None;
+            };
+            let left = evaluate_const_integer_literal(primitive, left_magnitude, left_negated)?;
+            match left {
+                ConstValue::Int { value, ty } => {
+                    let width = const_signed_integer_width(ty, target_cfg.pointer_width());
+                    if shift >= u128::from(width) {
+                        return Some(ConstIntegerShiftResult::Panic);
+                    }
+                    let shift = u32::try_from(shift).ok()?;
+                    let shifted = match operator {
+                        ConstIntegerShiftOp::Left => {
+                            let mask = (1_u128 << width) - 1;
+                            let bits = (value as u128).wrapping_shl(shift) & mask;
+                            let sign_bit = 1_u128 << (width - 1);
+                            if bits & sign_bit == 0 {
+                                i128::try_from(bits).ok()?
+                            } else {
+                                i128::try_from(bits).ok()? - (1_i128 << width)
+                            }
+                        }
+                        ConstIntegerShiftOp::Right => value >> shift,
+                    };
+                    ConstValue::Int { value: shifted, ty }
+                }
+                ConstValue::Uint { value, ty } => {
+                    let width = const_unsigned_integer_width(ty, target_cfg.pointer_width());
+                    if shift >= u128::from(width) {
+                        return Some(ConstIntegerShiftResult::Panic);
+                    }
+                    let shift = u32::try_from(shift).ok()?;
+                    let shifted = match operator {
+                        ConstIntegerShiftOp::Left => {
+                            let mask = (1_u128 << width) - 1;
+                            value.wrapping_shl(shift) & mask
+                        }
+                        ConstIntegerShiftOp::Right => value >> shift,
+                    };
+                    ConstValue::Uint { value: shifted, ty }
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(ConstIntegerShiftResult::Value(shifted))
+}
+
+fn const_integer_shift_operator_span(
+    value: &HirExpr<'_>,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<sai_hir::Span, OwnerControlFlowResolutionError> {
+    let (operator, left, right) = const_integer_shift_operands(value)
+        .ok_or(OwnerControlFlowResolutionError::SnapshotMismatch)?;
+    if left.span.file != value.span.file
+        || right.span.file != value.span.file
+        || left.span.ctxt != value.span.ctxt
+        || right.span.ctxt != value.span.ctxt
+        || left.span.range.end() > right.span.range.start()
+    {
+        return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+    }
+    let lexed = sai_syntax::lex(snapshot, value.span.file)
+        .map_err(|_| OwnerControlFlowResolutionError::SnapshotMismatch)?;
+    let operator_tokens = lexed
+        .tokens
+        .iter()
+        .filter(|token| {
+            token.range.start() >= left.span.range.end()
+                && token.range.end() <= right.span.range.start()
+                && match operator {
+                    ConstIntegerShiftOp::Left => token.kind == sai_syntax::SyntaxKind::SHL,
+                    ConstIntegerShiftOp::Right => token.kind == sai_syntax::SyntaxKind::GT,
+                }
+        })
+        .collect::<Vec<_>>();
+    let operator_range = match (operator, operator_tokens.as_slice()) {
+        (ConstIntegerShiftOp::Left, [token]) if token.kind == operator.syntax_kind() => token.range,
+        (ConstIntegerShiftOp::Right, [first, second])
+            if first.range.end() == second.range.start() =>
+        {
+            sai_vfs::TextRange::new(first.range.start(), second.range.end())
+                .ok_or(OwnerControlFlowResolutionError::SnapshotMismatch)?
+        }
+        _ => return Err(OwnerControlFlowResolutionError::SnapshotMismatch),
+    };
+    Ok(sai_hir::Span {
+        file: value.span.file,
+        range: operator_range,
+        ctxt: value.span.ctxt,
+    })
 }
 
 fn const_bitwise_operands<'hir>(
@@ -9774,6 +9968,7 @@ fn check_const_byte_str_literal(
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if is_supported_const_bitnot_literal_expression(value)
         || is_supported_const_bitwise_literal_expression(value)
+        || is_supported_const_integer_shift_expression(value)
         || is_supported_const_integer_arithmetic_expression(value)
     {
         return check_const_literal_against_type(
@@ -9840,6 +10035,7 @@ fn check_const_array_literal(
             ExprKind::Lit(literal) => const_literal_found_type(literal),
             ExprKind::Tuple(elements) if elements.is_empty() => "unit",
             _ if is_supported_const_bitwise_literal_expression(value) => "a bitwise expression",
+            _ if is_supported_const_integer_shift_expression(value) => "a shift expression",
             _ if is_supported_const_integer_arithmetic_expression(value) => "an integer expression",
             _ if is_const_bool_literal_expression(value) => "Bool",
             _ => return Ok(None),
@@ -9860,6 +10056,7 @@ fn check_const_array_literal(
             && !is_const_bool_literal_expression(value)
             && !is_supported_const_bitnot_literal_expression(value)
             && !is_supported_const_bitwise_literal_expression(value)
+            && !is_supported_const_integer_shift_expression(value)
             && !is_supported_const_integer_arithmetic_expression(value)
             && !is_direct_const_reference_candidate(value)
     }) {
@@ -13256,6 +13453,7 @@ fn check_const_tuple_literal(
         let found_type = match value.kind {
             ExprKind::Lit(literal) => const_literal_found_type(literal),
             _ if is_supported_const_bitwise_literal_expression(value) => "a bitwise expression",
+            _ if is_supported_const_integer_shift_expression(value) => "a shift expression",
             _ if is_supported_const_integer_arithmetic_expression(value) => "an integer expression",
             _ => return Ok(None),
         };
@@ -13276,6 +13474,7 @@ fn check_const_tuple_literal(
             && !is_const_bool_literal_expression(value)
             && !is_supported_const_bitnot_literal_expression(value)
             && !is_supported_const_bitwise_literal_expression(value)
+            && !is_supported_const_integer_shift_expression(value)
             && !is_supported_const_integer_arithmetic_expression(value)
             && !is_direct_const_reference_candidate(value)
     }) {
@@ -14709,7 +14908,7 @@ fn check_const_literal_against_type(
 
         let mut diagnostics = Vec::new();
         for operand in [left, right] {
-            let ExprKind::Lit(literal @ (Lit::Int { .. } | Lit::Byte(_))) = operand.kind else {
+            let ExprKind::Lit(literal) = operand.kind else {
                 return Ok(None);
             };
             match sai_ty::typeck::literal::check_primitive_literal(
@@ -14746,6 +14945,80 @@ fn check_const_literal_against_type(
         }
         if evaluate_const_bitwise_literal(literal_type, value, target_cfg).is_none() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        return Ok(Some(diagnostics));
+    }
+
+    if let Some((_operator, left, right)) = const_integer_shift_operands(value) {
+        let ConstLiteralType::Primitive(primitive) = literal_type else {
+            return Ok(Some(vec![mismatch(
+                local_enum_variant_type_name(literal_type),
+                "a shift expression",
+            )?]));
+        };
+        if !is_integer_primitive(primitive) && primitive != sai_resolve::prelude::PrimTy::Byte {
+            return Ok(Some(vec![mismatch(
+                const_primitive_name(primitive),
+                "a shift expression",
+            )?]));
+        }
+
+        let mut diagnostics = Vec::new();
+        let left_primitive = primitive;
+        let right_primitive = sai_resolve::prelude::PrimTy::U32;
+        for (operand, expected_primitive) in [(left, left_primitive), (right, right_primitive)] {
+            let ExprKind::Lit(literal) = operand.kind else {
+                return Ok(None);
+            };
+            match sai_ty::typeck::literal::check_primitive_literal(
+                expected_primitive,
+                literal,
+                symbols,
+                target_cfg.pointer_width(),
+            ) {
+                sai_ty::typeck::literal::PrimitiveLiteralResult::Match => {}
+                sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => {
+                    diagnostics.push(mismatch(
+                        const_primitive_name(expected_primitive),
+                        const_literal_found_type(literal),
+                    )?);
+                }
+                sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
+                    diagnostics.push(const_literal_diagnostic(
+                        owner,
+                        inputs,
+                        snapshot,
+                        operand.span,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        format!(
+                            "integer literal is out of range for `{}`",
+                            const_primitive_name(expected_primitive)
+                        ),
+                        "literal out of range",
+                    )?);
+                }
+            }
+        }
+        if !diagnostics.is_empty() {
+            return Ok(Some(diagnostics));
+        }
+
+        match evaluate_const_integer_shift(literal_type, value, target_cfg) {
+            Some(ConstIntegerShiftResult::Value(_)) => {}
+            Some(ConstIntegerShiftResult::Panic) => {
+                let operator_span = const_integer_shift_operator_span(value, snapshot)?;
+                diagnostics.push(const_literal_diagnostic(
+                    owner,
+                    inputs,
+                    snapshot,
+                    operator_span,
+                    sai_diagnostics::Code::ConstEvalPanic,
+                    "constant evaluation would panic with ShiftOverflow: shift amount out of range"
+                        .to_owned(),
+                    "constant evaluation panic",
+                )?);
+            }
+            None => return Err(OwnerControlFlowResolutionError::SnapshotMismatch),
         }
         return Ok(Some(diagnostics));
     }
@@ -82185,6 +82458,454 @@ property "shared"() {}
                 expected,
                 "{target}"
             );
+        }
+    }
+
+    #[test]
+    fn const_direct_integer_shifts_use_u32_counts_target_width_and_gate_other_forms() {
+        use sai_resolve::prelude::PrimTy;
+        use sai_ty::ty::{IntTy, UintTy};
+
+        let root = concat!(
+            "pub const I8_LEFT: I8 = 64 << 1\n",
+            "pub const I8_RIGHT: I8 = -8 >> 2\n",
+            "pub const I16_LEFT: I16 = 16384 << 1\n",
+            "pub const I16_RIGHT: I16 = -1024 >> 3\n",
+            "pub const I32_LEFT: I32 = 1073741824 << 1\n",
+            "pub const I32_RIGHT: I32 = -256 >> 4\n",
+            "pub const I64_LEFT: I64 = 4611686018427387904 << 1\n",
+            "pub const I64_RIGHT: I64 = -4096 >> 6\n",
+            "pub const ISIZE_LEFT: ISize = 1 << 7\n",
+            "pub const ISIZE_RIGHT: ISize = -256 >> 7\n",
+            "pub const U8_LEFT: U8 = 1 << 7\n",
+            "pub const U8_RIGHT: U8 = 255 >> 7\n",
+            "pub const U16_LEFT: U16 = 1 << 15\n",
+            "pub const U16_RIGHT: U16 = 65535 >> 15\n",
+            "pub const U32_LEFT: U32 = 1 << 31\n",
+            "pub const U32_RIGHT: U32 = 4294967295 >> 31\n",
+            "pub const U64_LEFT: U64 = 4611686018427387904 << 1\n",
+            "pub const U64_RIGHT: U64 = 18446744073709551615 >> 63\n",
+            "pub const USIZE_LEFT: USize = 1 << 31\n",
+            "pub const USIZE_RIGHT: USize = 4294967295 >> 31\n",
+            "pub const BYTE_LEFT: Byte = b'\\x01' << 7\n",
+            "pub const BYTE_RIGHT: Byte = b'\\x80' >> 7\n",
+            "pub const NEGATIVE_ZERO_COUNT: U8 = 255 >> -0\n",
+            "pub const TUPLE_VALUE: (I8, U16, Byte) = (64 << 1, 1 << 15, b'\\x01' << 7)\n",
+            "pub const ARRAY_VALUE: Array<I8, 2> = [-8 >> 2, 64 << 1]\n",
+            "pub const BASE: I8 = 5\n",
+            "pub const MIXED_REFERENCE: (I8, I8) = (1 << 1, BASE)\n",
+            "pub const I8_OVERFLOW_COUNT: I8 = 1 << 8\n",
+            "pub const BYTE_OVERFLOW_COUNT: Byte = b'\\x01' << 8\n",
+            "pub const COMMENT_OVERFLOW: I8 = 1 /* << in comment */ << 8\n",
+            "pub const RIGHT_OVERFLOW_COUNT: I8 = -1 >> 8\n",
+            "pub const BAD_LEFT_RANGE: I8 = 128 << 1\n",
+            "pub const BAD_COUNT_RANGE: I8 = 1 << 4294967296\n",
+            "pub const BAD_NEGATIVE_COUNT: I8 = 1 << -1\n",
+            "pub const BAD_BYTE_COUNT: I8 = 1 << b'\\x01'\n",
+            "pub const BAD_BOOL: Bool = 1 << 1\n",
+            "pub const BAD_BYTE_STR: Slice<Byte> = 1 << 2\n",
+            "pub const BAD_TUPLE_LEAF: (Bool,) = (1 << 1,)\n",
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [1 << 1]\n",
+            "pub const BAD_TUPLE_SHAPE: (I8,) = 1 << 2\n",
+            "pub const BAD_ARRAY_SHAPE: Array<I8, 1> = 1 << 2\n",
+            "pub const PATH_OPERAND: I8 = 1 << BASE\n",
+            "pub const CHAINED: I8 = 1 << 2 << 1\n",
+            "pub const NESTED: I8 = (1 << 2) << 1\n",
+            "pub const BOOL_OPERANDS: Bool = true << 1\n",
+            "enum Bits { One(I8) }\n",
+            "pub const ENUM_PAYLOAD: Bits = Bits.One(1 << 2)\n",
+            "pub const BAD_BOOL_COUNT: I8 = 1 << true\n",
+            "pub const BAD_CHAR_COUNT: I8 = 1 << 'a'\n",
+            "pub const BAD_FLOAT_COUNT: I8 = 1 << 1.5\n",
+            "pub const U8_LEFT_DISCARD: U8 = 255 << 1\n",
+            "pub const BAD_STRING_COUNT: I8 = 1 << \"count\"\n",
+            "pub const BAD_BYTE_STRING_COUNT: I8 = 1 << b\"count\"\n",
+        );
+
+        for target in ["wasm32-core", "wasm64-core"] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+
+            let expected_scalars = [
+                ConstValue::Int {
+                    value: -128,
+                    ty: IntTy::I8,
+                },
+                ConstValue::Int {
+                    value: -2,
+                    ty: IntTy::I8,
+                },
+                ConstValue::Int {
+                    value: -32768,
+                    ty: IntTy::I16,
+                },
+                ConstValue::Int {
+                    value: -128,
+                    ty: IntTy::I16,
+                },
+                ConstValue::Int {
+                    value: i32::MIN.into(),
+                    ty: IntTy::I32,
+                },
+                ConstValue::Int {
+                    value: -16,
+                    ty: IntTy::I32,
+                },
+                ConstValue::Int {
+                    value: i64::MIN.into(),
+                    ty: IntTy::I64,
+                },
+                ConstValue::Int {
+                    value: -64,
+                    ty: IntTy::I64,
+                },
+                ConstValue::Int {
+                    value: 128,
+                    ty: IntTy::ISize,
+                },
+                ConstValue::Int {
+                    value: -2,
+                    ty: IntTy::ISize,
+                },
+                ConstValue::Uint {
+                    value: 128,
+                    ty: UintTy::U8,
+                },
+                ConstValue::Uint {
+                    value: 1,
+                    ty: UintTy::U8,
+                },
+                ConstValue::Uint {
+                    value: 32768,
+                    ty: UintTy::U16,
+                },
+                ConstValue::Uint {
+                    value: 1,
+                    ty: UintTy::U16,
+                },
+                ConstValue::Uint {
+                    value: 1_u128 << 31,
+                    ty: UintTy::U32,
+                },
+                ConstValue::Uint {
+                    value: 1,
+                    ty: UintTy::U32,
+                },
+                ConstValue::Uint {
+                    value: 1_u128 << 63,
+                    ty: UintTy::U64,
+                },
+                ConstValue::Uint {
+                    value: 1,
+                    ty: UintTy::U64,
+                },
+                ConstValue::Uint {
+                    value: 1_u128 << 31,
+                    ty: UintTy::USize,
+                },
+                ConstValue::Uint {
+                    value: 1,
+                    ty: UintTy::USize,
+                },
+                ConstValue::Byte(128),
+                ConstValue::Byte(1),
+                ConstValue::Uint {
+                    value: 255,
+                    ty: UintTy::U8,
+                },
+            ];
+            assert_eq!(resolved.owners().len(), 52);
+            for (index, expected) in expected_scalars.into_iter().enumerate() {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check uses the current owner snapshot");
+                assert!(
+                    check.is_valid() && check.requires_const_value(),
+                    "supported shift const at owner index {index}: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("const evaluation succeeds"),
+                    Some(expected),
+                    "shift result at owner index {index} for {target}"
+                );
+            }
+
+            assert_eq!(
+                resolved.owners()[23]
+                    .const_value()
+                    .expect("flat tuple evaluation succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![
+                        ConstValue::Int {
+                            value: -128,
+                            ty: IntTy::I8,
+                        },
+                        ConstValue::Uint {
+                            value: 32768,
+                            ty: UintTy::U16,
+                        },
+                        ConstValue::Byte(128),
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[24]
+                    .const_value()
+                    .expect("flat array evaluation succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::I8),
+                    elements: vec![
+                        ConstValue::Int {
+                            value: -2,
+                            ty: IntTy::I8,
+                        },
+                        ConstValue::Int {
+                            value: -128,
+                            ty: IntTy::I8,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[26]
+                    .const_value()
+                    .expect("mixed aggregate reference materialization succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![
+                        ConstValue::Int {
+                            value: 2,
+                            ty: IntTy::I8,
+                        },
+                        ConstValue::Int {
+                            value: 5,
+                            ty: IntTy::I8,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+
+            for index in [27, 28, 29, 30] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .unwrap_or_else(|error| panic!("shift overflow owner {index}: {error:?}"));
+                assert!(!check.is_valid(), "owner {index}: {check:?}");
+                assert_eq!(check.diagnostics().len(), 1);
+                assert_eq!(
+                    check.diagnostics()[0].code,
+                    sai_diagnostics::Code::ConstEvalPanic
+                );
+                assert!(
+                    check.diagnostics()[0].message.contains("ShiftOverflow"),
+                    "owner {index}: {:?}",
+                    check.diagnostics()[0].message
+                );
+                let (operator_start, operator_len) = match index {
+                    27 => (root.find("1 << 8").unwrap() + 2, "<<".len()),
+                    28 => (
+                        root.find("b'\\x01' << 8").unwrap() + "b'\\x01' ".len(),
+                        "<<".len(),
+                    ),
+                    29 => (
+                        root.find("1 /* << in comment */ << 8").unwrap()
+                            + "1 /* << in comment */ ".len(),
+                        "<<".len(),
+                    ),
+                    30 => (root.find("-1 >> 8").unwrap() + "-1 ".len(), ">>".len()),
+                    _ => unreachable!("only shift-overflow owners are checked"),
+                };
+                assert_eq!(
+                    check.diagnostics()[0]
+                        .primary()
+                        .unwrap()
+                        .span
+                        .range
+                        .start()
+                        .to_usize(),
+                    operator_start,
+                    "panic must point at the shift token for owner {index}"
+                );
+                assert_eq!(
+                    check.diagnostics()[0]
+                        .primary()
+                        .unwrap()
+                        .span
+                        .range
+                        .end()
+                        .to_usize(),
+                    operator_start + operator_len,
+                    "panic span must cover exactly the shift token for owner {index}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("panicking expression does not fail resolution"),
+                    None
+                );
+            }
+
+            for (index, code) in [
+                (31, sai_diagnostics::Code::LiteralOutOfRange),
+                (32, sai_diagnostics::Code::LiteralOutOfRange),
+                (33, sai_diagnostics::Code::LiteralOutOfRange),
+                (34, sai_diagnostics::Code::TypeMismatch),
+                (35, sai_diagnostics::Code::TypeMismatch),
+                (36, sai_diagnostics::Code::TypeMismatch),
+                (37, sai_diagnostics::Code::TypeMismatch),
+                (38, sai_diagnostics::Code::TypeMismatch),
+                (39, sai_diagnostics::Code::TypeMismatch),
+                (40, sai_diagnostics::Code::TypeMismatch),
+                (46, sai_diagnostics::Code::TypeMismatch),
+                (47, sai_diagnostics::Code::TypeMismatch),
+                (48, sai_diagnostics::Code::TypeMismatch),
+                (50, sai_diagnostics::Code::TypeMismatch),
+                (51, sai_diagnostics::Code::TypeMismatch),
+            ] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("invalid shift remains checked");
+                assert!(!check.is_valid(), "owner {index}: {check:?}");
+                assert_eq!(check.diagnostics().len(), 1, "owner {index}: {check:?}");
+                assert_eq!(check.diagnostics()[0].code, code);
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("invalid evaluation does not fail resolution"),
+                    None
+                );
+            }
+
+            for index in 41..46 {
+                assert_eq!(
+                    resolved.owners()[index]
+                        .literal_check()
+                        .expect("unsupported shift shape remains resolvable"),
+                    &ConstLiteralCheck::Unsupported,
+                    "paths, composed shifts, Bool operands, and enum payloads remain gated at owner index {index}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("unsupported evaluation does not fail resolution"),
+                    None
+                );
+            }
+
+            assert_eq!(
+                resolved.owners()[49]
+                    .const_value()
+                    .expect("left shift discards bits above the declared width"),
+                Some(ConstValue::Uint {
+                    value: 254,
+                    ty: UintTy::U8,
+                })
+            );
+        }
+
+        for (target, should_succeed) in [("wasm32-core", false), ("wasm64-core", true)] {
+            let source = concat!(
+                "pub const ISIZE_SHIFT_BOUNDARY: ISize = 1 << 32\n",
+                "pub const USIZE_SHIFT_BOUNDARY: USize = 1 << 32\n",
+            );
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+            for (index, owner) in resolved.owners().iter().enumerate() {
+                let check = owner
+                    .literal_check()
+                    .expect("pointer-sized shift check is available");
+                assert_eq!(check.is_valid(), should_succeed, "{target}: {check:?}");
+                if should_succeed {
+                    assert_eq!(
+                        owner.const_value().expect("64-bit pointer shift succeeds"),
+                        Some(if index == 0 {
+                            ConstValue::Int {
+                                value: 1_i128 << 32,
+                                ty: IntTy::ISize,
+                            }
+                        } else {
+                            ConstValue::Uint {
+                                value: 1_u128 << 32,
+                                ty: UintTy::USize,
+                            }
+                        })
+                    );
+                } else {
+                    assert_eq!(check.diagnostics().len(), 1);
+                    assert_eq!(
+                        check.diagnostics()[0].code,
+                        sai_diagnostics::Code::ConstEvalPanic
+                    );
+                }
+            }
+        }
+
+        for target in ["wasm32-core", "wasm64-core"] {
+            let source = concat!(
+                "pub const U64_SHIFT_BOUNDARY: U64 = 1 << 64\n",
+                "pub const USIZE_SHIFT_BOUNDARY: USize = 1 << 64\n",
+            );
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+
+            assert_eq!(resolved.owners().len(), 2);
+            for (index, owner) in resolved.owners().iter().enumerate() {
+                let check = owner.literal_check().expect("shift boundary is checked");
+                assert!(check.is_supported());
+                assert!(!check.is_valid(), "owner {index} on {target}: {check:?}");
+                assert_eq!(check.diagnostics().len(), 1);
+                assert_eq!(
+                    check.diagnostics()[0].code,
+                    sai_diagnostics::Code::ConstEvalPanic
+                );
+                assert!(
+                    check.diagnostics()[0].message.contains("ShiftOverflow"),
+                    "owner {index} on {target}: {:?}",
+                    check.diagnostics()[0].message
+                );
+                assert_eq!(
+                    owner.const_value().expect("panic does not fail resolution"),
+                    None
+                );
+            }
         }
     }
 
