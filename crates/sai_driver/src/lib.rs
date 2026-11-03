@@ -7411,6 +7411,10 @@ impl FunctionBodyTypeCheck {
 /// evaluation model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConstValue {
+    /// A direct integer literal, with its resolved signed integer type.
+    Int { value: i128, ty: sai_ty::ty::IntTy },
+    /// A direct integer literal, with its resolved unsigned integer type.
+    Uint { value: u128, ty: sai_ty::ty::UintTy },
     /// A Bool direct literal, exact `not` of one, or one logical `and`/`or`
     /// with two direct Bool literal operands.
     Bool(bool),
@@ -7476,16 +7480,23 @@ impl ConstLiteralCheck {
     /// Returns whether this valid checked constant is expected to produce a
     /// value in the current bounded evaluator slice.
     pub fn requires_const_value(&self) -> bool {
-        self.is_valid()
-            && matches!(
-                self,
-                Self::Supported {
-                    primitive: sai_resolve::prelude::PrimTy::Bool
-                        | sai_resolve::prelude::PrimTy::Char
-                        | sai_resolve::prelude::PrimTy::Byte,
-                    ..
-                } | Self::SupportedStr { .. }
-            )
+        if !self.is_valid() {
+            return false;
+        }
+
+        match self {
+            Self::Supported { primitive, .. } => {
+                sai_ty::typeck::literal::is_integer_primitive(*primitive)
+                    || matches!(
+                        primitive,
+                        sai_resolve::prelude::PrimTy::Bool
+                            | sai_resolve::prelude::PrimTy::Char
+                            | sai_resolve::prelude::PrimTy::Byte
+                    )
+            }
+            Self::SupportedStr { .. } => true,
+            Self::SupportedUnit { .. } | Self::SupportedTuple { .. } | Self::Unsupported => false,
+        }
     }
 
     pub fn is_valid(&self) -> bool {
@@ -7724,15 +7735,68 @@ fn evaluate_const_value(
             ExprKind::Lit(Lit::Byte(value)) => Some(ConstValue::Byte(value)),
             _ => None,
         },
+        ConstLiteralCheck::Supported { primitive, .. } => match value.kind {
+            ExprKind::Lit(Lit::Int { value, negated })
+                if sai_ty::typeck::literal::is_integer_primitive(*primitive) =>
+            {
+                evaluate_const_integer_literal(*primitive, value, negated)
+            }
+            _ => None,
+        },
         ConstLiteralCheck::SupportedStr { .. } => match value.kind {
             ExprKind::Lit(Lit::Str(value)) => Some(ConstValue::Str(value)),
             _ => None,
         },
-        ConstLiteralCheck::Supported { .. }
-        | ConstLiteralCheck::SupportedUnit { .. }
+        ConstLiteralCheck::SupportedUnit { .. }
         | ConstLiteralCheck::SupportedTuple { .. }
         | ConstLiteralCheck::Unsupported => None,
     }
+}
+
+fn evaluate_const_integer_literal(
+    primitive: sai_resolve::prelude::PrimTy,
+    value: Option<u128>,
+    negated: bool,
+) -> Option<ConstValue> {
+    use sai_resolve::prelude::PrimTy;
+    use sai_ty::ty::{IntTy, UintTy};
+
+    let magnitude = value?;
+    let signed_ty = match primitive {
+        PrimTy::I8 => Some(IntTy::I8),
+        PrimTy::I16 => Some(IntTy::I16),
+        PrimTy::I32 => Some(IntTy::I32),
+        PrimTy::I64 => Some(IntTy::I64),
+        PrimTy::ISize => Some(IntTy::ISize),
+        _ => None,
+    };
+    if let Some(ty) = signed_ty {
+        let magnitude = i128::try_from(magnitude).ok()?;
+        let value = if negated {
+            magnitude.checked_neg()?
+        } else {
+            magnitude
+        };
+        return Some(ConstValue::Int { value, ty });
+    }
+
+    let unsigned_ty = match primitive {
+        PrimTy::U8 => Some(UintTy::U8),
+        PrimTy::U16 => Some(UintTy::U16),
+        PrimTy::U32 => Some(UintTy::U32),
+        PrimTy::U64 => Some(UintTy::U64),
+        PrimTy::USize => Some(UintTy::USize),
+        _ => None,
+    }?;
+    let value = if negated {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    };
+    Some(ConstValue::Uint {
+        value,
+        ty: unsigned_ty,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79052,6 +79116,244 @@ property "shared"() {}
                 assert!(diagnostics[0].primary().is_some());
             }
         }
+    }
+
+    #[test]
+    fn const_integer_literals_produce_typed_values_at_every_primitive_width() {
+        use sai_ty::ty::{IntTy, UintTy};
+
+        for (target, isize_min, isize_max, usize_max) in [
+            ("wasm32-core", "-2147483648", "2147483647", "4294967295"),
+            (
+                "wasm64-core",
+                "-9223372036854775808",
+                "9223372036854775807",
+                "18446744073709551615",
+            ),
+        ] {
+            let root = format!(
+                concat!(
+                    "pub const I8_MIN: I8 = -128\n",
+                    "pub const I8_MAX: I8 = 127\n",
+                    "pub const I16_MIN: I16 = -32768\n",
+                    "pub const I16_MAX: I16 = 32767\n",
+                    "pub const I32_MIN: I32 = -2147483648\n",
+                    "pub const I32_MAX: I32 = 2147483647\n",
+                    "pub const I64_MIN: I64 = -9223372036854775808\n",
+                    "pub const I64_MAX: I64 = 9223372036854775807\n",
+                    "pub const ISIZE_MIN: ISize = {isize_min}\n",
+                    "pub const ISIZE_MAX: ISize = {isize_max}\n",
+                    "pub const U8_MIN: U8 = 0\n",
+                    "pub const U8_MAX: U8 = 255\n",
+                    "pub const U16_MIN: U16 = 0\n",
+                    "pub const U16_MAX: U16 = 65535\n",
+                    "pub const U32_MIN: U32 = 0\n",
+                    "pub const U32_MAX: U32 = 4294967295\n",
+                    "pub const U64_MIN: U64 = 0\n",
+                    "pub const U64_MAX: U64 = 18446744073709551615\n",
+                    "pub const USIZE_MIN: USize = 0\n",
+                    "pub const USIZE_MAX: USize = {usize_max}\n",
+                    "pub const INT_MIN: Int = -9223372036854775808\n",
+                    "pub const UINT_MAX: UInt = 18446744073709551615\n",
+                    "pub const U8_NEG_ZERO: U8 = -0\n",
+                ),
+                isize_min = isize_min,
+                isize_max = isize_max,
+                usize_max = usize_max,
+            );
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+            let expected_values = [
+                ConstValue::Int {
+                    value: -128,
+                    ty: IntTy::I8,
+                },
+                ConstValue::Int {
+                    value: 127,
+                    ty: IntTy::I8,
+                },
+                ConstValue::Int {
+                    value: -32768,
+                    ty: IntTy::I16,
+                },
+                ConstValue::Int {
+                    value: 32767,
+                    ty: IntTy::I16,
+                },
+                ConstValue::Int {
+                    value: -2147483648,
+                    ty: IntTy::I32,
+                },
+                ConstValue::Int {
+                    value: 2147483647,
+                    ty: IntTy::I32,
+                },
+                ConstValue::Int {
+                    value: -9223372036854775808,
+                    ty: IntTy::I64,
+                },
+                ConstValue::Int {
+                    value: 9223372036854775807,
+                    ty: IntTy::I64,
+                },
+                ConstValue::Int {
+                    value: isize_min.parse().expect("target minimum fits i64"),
+                    ty: IntTy::ISize,
+                },
+                ConstValue::Int {
+                    value: isize_max.parse().expect("target maximum fits i64"),
+                    ty: IntTy::ISize,
+                },
+                ConstValue::Uint {
+                    value: 0,
+                    ty: UintTy::U8,
+                },
+                ConstValue::Uint {
+                    value: 255,
+                    ty: UintTy::U8,
+                },
+                ConstValue::Uint {
+                    value: 0,
+                    ty: UintTy::U16,
+                },
+                ConstValue::Uint {
+                    value: 65535,
+                    ty: UintTy::U16,
+                },
+                ConstValue::Uint {
+                    value: 0,
+                    ty: UintTy::U32,
+                },
+                ConstValue::Uint {
+                    value: 4294967295,
+                    ty: UintTy::U32,
+                },
+                ConstValue::Uint {
+                    value: 0,
+                    ty: UintTy::U64,
+                },
+                ConstValue::Uint {
+                    value: 18446744073709551615,
+                    ty: UintTy::U64,
+                },
+                ConstValue::Uint {
+                    value: 0,
+                    ty: UintTy::USize,
+                },
+                ConstValue::Uint {
+                    value: usize_max.parse().expect("target maximum fits u64"),
+                    ty: UintTy::USize,
+                },
+                ConstValue::Int {
+                    value: -9223372036854775808,
+                    ty: IntTy::I64,
+                },
+                ConstValue::Uint {
+                    value: 18446744073709551615,
+                    ty: UintTy::U64,
+                },
+                ConstValue::Uint {
+                    value: 0,
+                    ty: UintTy::U8,
+                },
+            ];
+
+            assert_eq!(resolved.owners().len(), expected_values.len(), "{target}");
+            for (index, expected) in expected_values.into_iter().enumerate() {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot");
+                assert!(
+                    check.requires_const_value(),
+                    "valid integer const at owner index {index} requires a value on {target}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("const evaluation succeeds"),
+                    Some(expected),
+                    "typed integer value at owner index {index} on {target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn const_integer_literals_without_valid_direct_values_remain_unvalued() {
+        let root = concat!(
+            "pub const SIGNED_LOW: I8 = -129\n",
+            "pub const SIGNED_HIGH: I8 = 128\n",
+            "pub const UNSIGNED_HIGH: U8 = 256\n",
+            "pub const UNSIGNED_NEGATIVE: U8 = -1\n",
+            "pub const TOO_WIDE: I64 = 340282366920938463463374607431768211456\n",
+            "pub const COMPUTED: I32 = 1 + 2\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        for (index, name) in [
+            (0, "SIGNED_LOW"),
+            (1, "SIGNED_HIGH"),
+            (2, "UNSIGNED_HIGH"),
+            (3, "UNSIGNED_NEGATIVE"),
+            (4, "TOO_WIDE"),
+        ] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("literal checks use the current owner snapshot");
+            let ConstLiteralCheck::Supported { diagnostics, .. } = check else {
+                panic!("{name} remains a supported checked literal");
+            };
+            assert_eq!(diagnostics.len(), 1, "{name}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "{name}"
+            );
+            assert!(!check.requires_const_value(), "{name}");
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid const evaluation does not fail resolution"),
+                None,
+                "{name}"
+            );
+        }
+
+        assert_eq!(
+            resolved.owners()[5]
+                .literal_check()
+                .expect("computed form remains gated"),
+            &ConstLiteralCheck::Unsupported
+        );
+        assert_eq!(
+            resolved.owners()[5]
+                .const_value()
+                .expect("unsupported evaluation does not fail resolution"),
+            None
+        );
     }
 
     #[test]

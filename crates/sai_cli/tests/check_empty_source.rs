@@ -16803,6 +16803,34 @@ fn public_primitive_const_literals_emit_check_results() {
 }
 
 #[test]
+fn public_integer_const_values_cover_all_primitive_types() {
+    assert_success_result(
+        run_check(
+            concat!(
+                "pub const I8_VALUE: I8 = -128\n",
+                "pub const I16_VALUE: I16 = 32767\n",
+                "pub const I32_VALUE: I32 = -2147483648\n",
+                "pub const I64_VALUE: I64 = 9223372036854775807\n",
+                "pub const ISIZE_VALUE: ISize = -2147483648\n",
+                "pub const U8_VALUE: U8 = 255\n",
+                "pub const U16_VALUE: U16 = 65535\n",
+                "pub const U32_VALUE: U32 = 4294967295\n",
+                "pub const U64_VALUE: U64 = 18446744073709551615\n",
+                "pub const USIZE_VALUE: USize = 4294967295\n",
+                "pub const INT_ALIAS: Int = -9223372036854775808\n",
+                "pub const UINT_ALIAS: UInt = 18446744073709551615\n",
+                "pub const UNSIGNED_NEG_ZERO: U8 = -0\n",
+            ),
+            "",
+            &[],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
+}
+
+#[test]
 fn public_bool_logical_literal_consts_emit_check_results() {
     let source = concat!(
         "pub const AND_FALSE: Bool = true and false\n",
