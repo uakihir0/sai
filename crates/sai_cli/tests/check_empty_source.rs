@@ -16789,6 +16789,8 @@ fn unlocked_checks_validate_compiler_and_declared_targets() {
 fn public_primitive_const_literals_emit_check_results() {
     for source in [
         "pub const READY: Bool = true\n",
+        "pub const NOT_READY: Bool = not true\n",
+        "pub const READY_BY_NEGATION: Bool = not false\n",
         "pub const LOW: I8 = -128\n",
         "pub const HIGH: I8 = 127\n",
         "pub const MAX: U8 = 255\n",
@@ -17155,6 +17157,8 @@ fn public_float_const_errors_and_invalid_later_const_suppress_results() {
 fn public_primitive_const_type_errors_do_not_emit_results() {
     let cases = [
         ("pub const BAD: Bool = 1\n", "TYPE_MISMATCH"),
+        ("pub const BAD: I32 = not true\n", "TYPE_MISMATCH"),
+        ("pub const BAD: () = not true\n", "TYPE_MISMATCH"),
         ("pub const BAD: I8 = true\n", "TYPE_MISMATCH"),
         ("pub const BAD: I8 = -129\n", "LITERAL_OUT_OF_RANGE"),
         ("pub const BAD: I8 = 128\n", "LITERAL_OUT_OF_RANGE"),
@@ -17275,6 +17279,10 @@ fn const_forms_outside_literal_slice_remain_gated() {
     for source in [
         "const PRIVATE: I8 = 1\n",
         "pub const EXPRESSION: I8 = 1 + 2\n",
+        "pub const NESTED_NOT: Bool = not (not true)\n",
+        "pub const NOT_INTEGER: Bool = not 1\n",
+        "pub const NOT_PATH: Bool = not READY\n",
+        "pub const NOT_TUPLE: (Bool, Bool) = not true\n",
         "pub const ALIAS: MyInt = 1\n",
         "pub const BORROWED: &Bool = &true\n",
         "use missing;\npub const VALUE: I8 = 1\n",

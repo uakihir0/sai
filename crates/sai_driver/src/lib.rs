@@ -7297,6 +7297,7 @@ pub struct ConstOwnerResolution {
     module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
     literal_check: Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
+    const_value: Result<Option<ConstValue>, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
@@ -7343,6 +7344,13 @@ impl ConstOwnerResolution {
     /// this subset; an empty diagnostic list means the literal is valid.
     pub fn literal_check(&self) -> Result<&ConstLiteralCheck, &OwnerControlFlowResolutionError> {
         self.literal_check.as_ref()
+    }
+
+    /// Evaluates the narrow Bool constant subset currently handled by the
+    /// driver. Other otherwise-supported literal forms do not yet produce a
+    /// value here.
+    pub fn const_value(&self) -> Result<Option<ConstValue>, &OwnerControlFlowResolutionError> {
+        self.const_value.as_ref().map(|value| *value)
     }
 
     /// Returns snapshot-bound diagnostics for typed member failures when this
@@ -7397,12 +7405,23 @@ impl FunctionBodyTypeCheck {
     }
 }
 
+/// Value produced by the current bounded constant evaluator.
+///
+/// This is an initial Stage 0 slice, not the complete §6.27 constant
+/// evaluation model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConstValue {
+    /// A Bool direct literal or exact `not` of a Bool direct literal.
+    Bool(bool),
+}
+
 /// Result of checking one public primitive, canonical `Str`, unit, or flat tuple constant.
 ///
 /// This deliberately covers only direct literals of supported primitive
-/// types, canonical `Str`, the unit literal `()`, and flat tuple literals
-/// whose fields are supported direct scalar or unit literals. It does not
-/// imply that other constant expressions are evaluated.
+/// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
+/// fields are supported direct scalar or unit literals, and exact `not` of a
+/// Bool literal. It does not imply that other constant expressions are
+/// evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -7434,6 +7453,17 @@ impl ConstLiteralCheck {
                 | Self::SupportedUnit { .. }
                 | Self::SupportedTuple { .. }
         )
+    }
+
+    pub fn is_valid_bool(&self) -> bool {
+        self.is_valid()
+            && matches!(
+                self,
+                Self::Supported {
+                    primitive: sai_resolve::prelude::PrimTy::Bool,
+                    ..
+                }
+            )
     }
 
     pub fn is_valid(&self) -> bool {
@@ -7495,18 +7525,30 @@ fn check_const_literal_owner(
     };
     if let TyKind::Tuple(elements) = ty.kind {
         if elements.is_empty() {
-            let Some(diagnostics) = check_const_literal_leaf(
-                owner,
-                *ty,
+            let diagnostics = match check_const_bool_not_initializer(
+                owner.id,
+                ConstLiteralType::Unit,
                 &body.value,
-                type_paths,
-                symbols,
                 inputs,
                 snapshot,
-                target_cfg,
-            )?
-            else {
-                return Ok(ConstLiteralCheck::Unsupported);
+            )? {
+                Some(diagnostics) => diagnostics,
+                None => {
+                    let Some(diagnostics) = check_const_literal_leaf(
+                        owner,
+                        *ty,
+                        &body.value,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )?
+                    else {
+                        return Ok(ConstLiteralCheck::Unsupported);
+                    };
+                    diagnostics
+                }
             };
             return Ok(ConstLiteralCheck::SupportedUnit { diagnostics });
         }
@@ -7530,18 +7572,30 @@ fn check_const_literal_owner(
     let Some(literal_type) = resolve_const_literal_type(*ty, type_paths, symbols, inputs) else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
-    let Some(diagnostics) = check_const_literal_leaf(
-        owner,
-        *ty,
+    let diagnostics = match check_const_bool_not_initializer(
+        owner.id,
+        literal_type,
         &body.value,
-        type_paths,
-        symbols,
         inputs,
         snapshot,
-        target_cfg,
-    )?
-    else {
-        return Ok(ConstLiteralCheck::Unsupported);
+    )? {
+        Some(diagnostics) => diagnostics,
+        None => {
+            let Some(diagnostics) = check_const_literal_leaf(
+                owner,
+                *ty,
+                &body.value,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(ConstLiteralCheck::Unsupported);
+            };
+            diagnostics
+        }
     };
 
     Ok(match literal_type {
@@ -7552,6 +7606,70 @@ fn check_const_literal_owner(
         ConstLiteralType::Str => ConstLiteralCheck::SupportedStr { diagnostics },
         ConstLiteralType::Unit => ConstLiteralCheck::SupportedUnit { diagnostics },
     })
+}
+
+fn check_const_bool_not_initializer(
+    owner: OwnerId,
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let ExprKind::Unary(UnOp::Not, operand) = value.kind else {
+        return Ok(None);
+    };
+    if !matches!(operand.kind, ExprKind::Lit(Lit::Bool(_))) {
+        return Ok(None);
+    }
+
+    let (expected, is_bool) = match literal_type {
+        ConstLiteralType::Primitive(primitive) => (
+            const_primitive_name(primitive),
+            primitive == sai_resolve::prelude::PrimTy::Bool,
+        ),
+        ConstLiteralType::Str => ("Str", false),
+        ConstLiteralType::Unit => ("()", false),
+    };
+    if is_bool {
+        return Ok(Some(Vec::new()));
+    }
+
+    Ok(Some(vec![const_literal_diagnostic(
+        owner,
+        inputs,
+        snapshot,
+        value.span,
+        sai_diagnostics::Code::TypeMismatch,
+        format!("expected `{expected}`, found `Bool`"),
+        "type mismatch",
+    )?]))
+}
+
+fn evaluate_const_value(
+    owner: &HirOwner<'_>,
+    literal_check: &ConstLiteralCheck,
+) -> Option<ConstValue> {
+    if !literal_check.is_valid()
+        || !matches!(
+            literal_check,
+            ConstLiteralCheck::Supported {
+                primitive: sai_resolve::prelude::PrimTy::Bool,
+                ..
+            }
+        )
+    {
+        return None;
+    }
+
+    let value = &owner.body?.value;
+    match value.kind {
+        ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(value)),
+        ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
+            ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(!value)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21961,6 +22079,7 @@ impl RootDatabase {
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
                                 literal_check: Err(error.clone()),
+                                const_value: Err(error.clone()),
                                 module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
@@ -21991,6 +22110,7 @@ impl RootDatabase {
                         >,
                         Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
                         Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
+                        Result<Option<ConstValue>, OwnerControlFlowResolutionError>,
                     ),
                     OwnerControlFlowResolutionError,
                 > = (|| {
@@ -22092,6 +22212,10 @@ impl RootDatabase {
                         snapshot,
                         &collection.target_cfg,
                     );
+                    let const_value = match &literal_check {
+                        Ok(check) => Ok(evaluate_const_value(&hir_owner, check)),
+                        Err(error) => Err(error.clone()),
+                    };
                     module_path_diagnostics = match (member_scopes, type_path_resolution.as_ref()) {
                         (Some(member_scopes), Ok(Some(path_resolution))) => Some(
                             self.type_owner_module_path_diagnostics(
@@ -22121,6 +22245,7 @@ impl RootDatabase {
                             path_resolution,
                             non_expression_diagnostics,
                             literal_check,
+                            const_value,
                         ));
                     };
                     let locals = match &module_aliases {
@@ -22177,6 +22302,7 @@ impl RootDatabase {
                                 path_resolution,
                                 test_only_diagnostics,
                                 literal_check,
+                                const_value,
                             ))
                         }
                         Err(error) => Ok((
@@ -22186,6 +22312,7 @@ impl RootDatabase {
                             path_resolution,
                             non_expression_diagnostics,
                             literal_check,
+                            const_value,
                         )),
                     }
                 })();
@@ -22196,8 +22323,10 @@ impl RootDatabase {
                     test_only_path_resolution,
                     test_only_diagnostics,
                     literal_check,
+                    const_value,
                 ) = analysis.unwrap_or_else(|error| {
                     (
+                        Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
@@ -22217,6 +22346,7 @@ impl RootDatabase {
                     module_resolution,
                     type_path_resolution,
                     literal_check,
+                    const_value,
                     module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
@@ -78481,6 +78611,124 @@ property "shared"() {}
                 "aliases, non-literal expressions, private consts, raw identifiers and names outside the supported ASCII UPPER_SNAKE_CASE convention remain gated"
             );
         }
+    }
+
+    #[test]
+    fn const_bool_literals_and_exact_not_forms_produce_bool_values() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub const BOOL_TRUE: Bool = true\n",
+            "pub const BOOL_FALSE: Bool = false\n",
+            "pub const NOT_TRUE: Bool = not true\n",
+            "pub const NOT_FALSE: Bool = not false\n",
+            "pub const BAD_TYPE: I32 = not true\n",
+            "pub const NESTED_NOT: Bool = not (not true)\n",
+            "pub const NOT_INTEGER: Bool = not 1\n",
+            "pub const NOT_PATH: Bool = not BOOL_TRUE\n",
+            "pub const NOT_TUPLE: (Bool, Bool) = not true\n",
+            "pub const NOT_UNIT: () = not true\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        for (index, expected) in [
+            ConstValue::Bool(true),
+            ConstValue::Bool(false),
+            ConstValue::Bool(false),
+            ConstValue::Bool(true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check succeeds")
+                    .is_valid(),
+                "supported Bool const at owner index {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("const evaluation succeeds"),
+                Some(expected),
+                "evaluated Bool const at owner index {index}"
+            );
+        }
+
+        let bad_type = resolved.owners()[4]
+            .literal_check()
+            .expect("mismatched const remains in the supported subset");
+        let ConstLiteralCheck::Supported {
+            primitive: PrimTy::I32,
+            diagnostics,
+        } = bad_type
+        else {
+            panic!("wrong-result-type unary not remains in the checked subset");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        let primary = diagnostics[0]
+            .primary()
+            .expect("type mismatch points at the initializer");
+        let not_start = root
+            .find("pub const BAD_TYPE: I32 = not true")
+            .expect("mismatch source exists")
+            + "pub const BAD_TYPE: I32 = ".len();
+        assert_eq!(primary.span.range.start().to_usize(), not_start);
+        assert_eq!(
+            primary.span.range.end().to_usize(),
+            not_start + "not true".len()
+        );
+        assert_eq!(
+            resolved.owners()[4]
+                .const_value()
+                .expect("invalid const evaluation does not fail resolution"),
+            None
+        );
+
+        for index in [5, 6, 7, 8] {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("gated shapes remain resolvable"),
+                &ConstLiteralCheck::Unsupported,
+                "nested, non-Bool, path, and tuple-typed forms remain gated at owner index {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported evaluation does not fail resolution"),
+                None
+            );
+        }
+
+        let unit_mismatch = resolved.owners()[9]
+            .literal_check()
+            .expect("unit mismatch remains in the supported checker subset");
+        let ConstLiteralCheck::SupportedUnit { diagnostics } = unit_mismatch else {
+            panic!("unit-typed not form remains a checked mismatch");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(
+            resolved.owners()[9]
+                .const_value()
+                .expect("unit mismatch evaluation does not fail resolution"),
+            None
+        );
     }
 
     #[test]

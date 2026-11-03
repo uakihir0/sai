@@ -2719,9 +2719,11 @@ fn check_public_primitive_const_set_coverage(
         && resolved_owner_ids.len() == source_count
         && active_owner_ids == resolved_owner_ids
         && const_resolutions.owners().iter().all(|owner| {
-            owner
-                .literal_check()
-                .is_ok_and(sai_driver::ConstLiteralCheck::is_supported)
+            owner.literal_check().is_ok_and(|check| {
+                check.is_supported()
+                    && (!check.is_valid_bool()
+                        || owner.const_value().is_ok_and(|value| value.is_some()))
+            })
         })
 }
 
