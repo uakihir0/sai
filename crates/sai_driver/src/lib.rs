@@ -8847,7 +8847,7 @@ fn const_float_arithmetic_operands<'hir>(
     let ExprKind::Binary(operator, left, right) = value.kind else {
         return None;
     };
-    if !matches!(operator, BinOp::Add | BinOp::Sub) {
+    if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul) {
         return None;
     }
     (matches!(left.kind, ExprKind::Lit(Lit::Float { .. }))
@@ -8863,6 +8863,7 @@ fn const_float_arithmetic_description(value: &HirExpr<'_>) -> &'static str {
     match const_float_arithmetic_operands(value).map(|(operator, _, _)| operator) {
         Some(BinOp::Add) => "a floating-point addition expression",
         Some(BinOp::Sub) => "a floating-point subtraction expression",
+        Some(BinOp::Mul) => "a floating-point multiplication expression",
         _ => "a floating-point arithmetic expression",
     }
 }
@@ -8897,6 +8898,7 @@ fn evaluate_const_float_arithmetic(
             let result = match operator {
                 BinOp::Add => left + right,
                 BinOp::Sub => left - right,
+                BinOp::Mul => left * right,
                 _ => return None,
             };
             Some(ConstValue::Float {
@@ -8910,6 +8912,7 @@ fn evaluate_const_float_arithmetic(
             let result = match operator {
                 BinOp::Add => left + right,
                 BinOp::Sub => left - right,
+                BinOp::Mul => left * right,
                 _ => return None,
             };
             Some(ConstValue::Float {
@@ -15124,6 +15127,7 @@ fn check_const_literal_against_type(
         let expression_description = match operator {
             BinOp::Add => "a floating-point addition expression",
             BinOp::Sub => "a floating-point subtraction expression",
+            BinOp::Mul => "a floating-point multiplication expression",
             _ => return Ok(None),
         };
         let primitive = match literal_type {
@@ -87184,7 +87188,7 @@ property "shared"() {}
             "pub const PATH_OPERAND: F32 = 1.0 + BASE\n",
             "pub const CHAINED: F32 = 1.0 + 2.0 + 3.0\n",
             "pub const NESTED: F32 = (1.0 + 2.0) + 3.0\n",
-            "pub const OTHER_OPERATOR: F32 = 1.0 * 2.0\n",
+            "pub const OTHER_OPERATOR: F32 = 1.0 / 2.0\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -87252,7 +87256,7 @@ property "shared"() {}
             "pub const PATH_OPERAND: F32 = 1.0 - BASE\n",
             "pub const CHAINED: F32 = 1.0 - 2.0 - 3.0\n",
             "pub const NESTED: F32 = (1.0 - 2.0) - 3.0\n",
-            "pub const OTHER_OPERATOR: F32 = 1.0 * 2.0\n",
+            "pub const OTHER_OPERATOR: F32 = 1.0 / 2.0\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -87354,13 +87358,279 @@ property "shared"() {}
     }
 
     #[test]
+    fn const_direct_float_multiplication_rounds_at_the_declared_width() {
+        use sai_resolve::prelude::PrimTy;
+        use sai_ty::ty::FloatTy;
+
+        let root = concat!(
+            "pub const F32_BASIC: F32 = 1.5 * 2.0\n",
+            "pub const F32_LEFT_NEGATIVE: F32 = -1.5 * 2.0\n",
+            "pub const F32_RIGHT_NEGATIVE: F32 = 1.5 * -2.0\n",
+            "pub const F32_OPERAND_ROUNDING: F32 = 1.000000059604644775390625 * 3.0\n",
+            "pub const F32_PRODUCT_TIE_EVEN: F32 = 1.00000011920928955078125 * 1.5\n",
+            "pub const F32_NEGATIVE_ZERO: F32 = -0.0 * 2.0\n",
+            "pub const F32_POSITIVE_ZERO: F32 = 0.0 * 2.0\n",
+            "pub const F32_SUBNORMAL: F32 = 1e-45 * 1.0\n",
+            "pub const F32_UNDERFLOW: F32 = 1e-45 * 0.5\n",
+            "pub const F32_OVERFLOW: F32 = 3.4028235e38 * 2.0\n",
+            "pub const F32_NEGATIVE_OVERFLOW: F32 = -3.4028235e38 * 2.0\n",
+            "pub const F64_BASIC: F64 = 1.5 * 2.0\n",
+            "pub const F64_LEFT_NEGATIVE: F64 = -1.5 * 2.0\n",
+            "pub const F64_RIGHT_NEGATIVE: F64 = 1.5 * -2.0\n",
+            "pub const F64_OPERAND_ROUNDING: F64 = 1.00000000000000011102230246251565404236316680908203125 * 3.0\n",
+            "pub const F64_PRODUCT_TIE_EVEN: F64 = 1.0000000000000002220446049250313080847263336181640625 * 1.5\n",
+            "pub const F64_NEGATIVE_ZERO: F64 = -0.0 * 2.0\n",
+            "pub const F64_POSITIVE_ZERO: F64 = 0.0 * 2.0\n",
+            "pub const F64_SUBNORMAL: F64 = 5e-324 * 1.0\n",
+            "pub const F64_UNDERFLOW: F64 = 5e-324 * 0.5\n",
+            "pub const F64_OVERFLOW: F64 = 1.7976931348623157e308 * 2.0\n",
+            "pub const F64_NEGATIVE_OVERFLOW: F64 = -1.7976931348623157e308 * 2.0\n",
+            "pub const TUPLE_VALUE: (F32, F64) = (1.5 * 2.0, -2.0 * 3.0)\n",
+            "pub const ARRAY_VALUE: Array<F32, 2> = [2.0 * 1.5, 5.0 * 3.0]\n",
+            "pub const BASE: F32 = 4.0\n",
+            "pub const MIXED_REFERENCE: (F32, F32) = (1.0 * 2.0, BASE)\n",
+            "pub const MIXED_REFERENCE_ARRAY: Array<F32, 2> = [1.0 * 2.0, BASE]\n",
+        );
+
+        for target in ["wasm32-core", "wasm64-core"] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+
+            let f32_value = |value: f32| ConstValue::Float {
+                bits: value.to_bits().into(),
+                ty: FloatTy::F32,
+            };
+            let f64_value = |value: f64| ConstValue::Float {
+                bits: value.to_bits(),
+                ty: FloatTy::F64,
+            };
+            let expected_scalars = [
+                f32_value(3.0),
+                f32_value(-3.0),
+                f32_value(-3.0),
+                f32_value(3.0),
+                f32_value(f32::from_bits(1.5f32.to_bits() + 2)),
+                ConstValue::Float {
+                    bits: 0x8000_0000,
+                    ty: FloatTy::F32,
+                },
+                f32_value(0.0),
+                f32_value(f32::from_bits(1)),
+                f32_value(0.0),
+                f32_value(f32::INFINITY),
+                f32_value(f32::NEG_INFINITY),
+                f64_value(3.0),
+                f64_value(-3.0),
+                f64_value(-3.0),
+                f64_value(3.0),
+                f64_value(f64::from_bits(1.5f64.to_bits() + 2)),
+                ConstValue::Float {
+                    bits: 0x8000_0000_0000_0000,
+                    ty: FloatTy::F64,
+                },
+                f64_value(0.0),
+                f64_value(f64::from_bits(1)),
+                f64_value(0.0),
+                f64_value(f64::INFINITY),
+                f64_value(f64::NEG_INFINITY),
+            ];
+            assert_eq!(resolved.owners().len(), 27);
+            for (index, expected) in expected_scalars.into_iter().enumerate() {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check uses the current owner snapshot");
+                assert!(
+                    check.is_valid() && check.requires_const_value(),
+                    "supported float multiplication at owner index {index}: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("const evaluation succeeds"),
+                    Some(expected),
+                    "float multiplication result at owner index {index} for {target}"
+                );
+            }
+
+            assert_eq!(
+                resolved.owners()[22]
+                    .const_value()
+                    .expect("flat tuple evaluation succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![f32_value(3.0), f64_value(-6.0)].into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[23]
+                    .const_value()
+                    .expect("flat array evaluation succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::F32),
+                    elements: vec![f32_value(3.0), f32_value(15.0)].into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[25]
+                    .const_value()
+                    .expect("mixed-reference tuple materialization succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![f32_value(2.0), f32_value(4.0)].into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[26]
+                    .const_value()
+                    .expect("mixed-reference array materialization succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::F32),
+                    elements: vec![f32_value(2.0), f32_value(4.0)].into(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn const_direct_float_multiplication_checks_types_ranges_and_shape_boundaries() {
+        let root = concat!(
+            "pub const BAD_DESTINATION: I32 = 1.0 * 2.0\n",
+            "pub const BAD_TUPLE_LEAF: (Bool,) = (1.0 * 2.0,)\n",
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [1.0 * 2.0]\n",
+            "pub const F32_OUT_OF_RANGE: F32 = 3.4028236e38 * 0.0\n",
+            "pub const F64_OUT_OF_RANGE: F64 = 1.7976931348623159e308 * 0.0\n",
+            "pub const BOTH_F32_OUT_OF_RANGE: F32 = 3.4028236e38 * 3.4028236e38\n",
+            "pub const BASE: F32 = 4.0\n",
+            "pub const PATH_OPERAND: F32 = 1.0 * BASE\n",
+            "pub const CHAINED: F32 = 1.0 * 2.0 * 3.0\n",
+            "pub const NESTED: F32 = (1.0 * 2.0) * 3.0\n",
+            "pub const OTHER_OPERATOR: F32 = 1.0 / 2.0\n",
+            "pub const MIXED_LEFT: F32 = 1.0 * 2\n",
+            "pub const MIXED_RIGHT: F32 = 1 * 2.0\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        for (index, expected_code) in [
+            (0, sai_diagnostics::Code::TypeMismatch),
+            (1, sai_diagnostics::Code::TypeMismatch),
+            (2, sai_diagnostics::Code::TypeMismatch),
+            (3, sai_diagnostics::Code::LiteralOutOfRange),
+            (4, sai_diagnostics::Code::LiteralOutOfRange),
+        ] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("literal check uses the current owner snapshot");
+            let diagnostics = check.diagnostics();
+            if diagnostics.is_empty() {
+                panic!(
+                    "invalid float multiplication at owner index {index} remains checked: {check:?}"
+                );
+            }
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(diagnostics[0].code, expected_code, "owner index {index}");
+            assert!(!check.requires_const_value(), "owner index {index}");
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid const evaluation does not fail resolution"),
+                None,
+                "owner index {index}"
+            );
+        }
+
+        let both_range_check = resolved.owners()[5]
+            .literal_check()
+            .expect("both out-of-range operands remain checked");
+        let ConstLiteralCheck::Supported {
+            diagnostics: both_range_diagnostics,
+            ..
+        } = both_range_check
+        else {
+            panic!("both out-of-range operands remain a supported shape");
+        };
+        assert_eq!(both_range_diagnostics.len(), 2);
+        let both_range_expression = "3.4028236e38 * 3.4028236e38";
+        let both_range_start = root
+            .find(both_range_expression)
+            .expect("both out-of-range operands exist");
+        let operand_len = "3.4028236e38".len();
+        for (diagnostic, start) in [
+            (&both_range_diagnostics[0], both_range_start),
+            (
+                &both_range_diagnostics[1],
+                both_range_start + operand_len + " * ".len(),
+            ),
+        ] {
+            assert_eq!(diagnostic.code, sai_diagnostics::Code::LiteralOutOfRange);
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("range diagnostic has a span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + operand_len) as u32),
+                )
+                .expect("literal span is valid")
+            );
+        }
+        assert_eq!(
+            resolved.owners()[5]
+                .const_value()
+                .expect("invalid const evaluation does not fail resolution"),
+            None
+        );
+
+        for index in [7, 8, 9, 10, 11, 12] {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("unsupported forms remain gated"),
+                &ConstLiteralCheck::Unsupported,
+                "owner index {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported evaluation does not fail resolution"),
+                None,
+                "owner index {index}"
+            );
+        }
+    }
+
+    #[test]
     fn const_float_literals_without_valid_direct_values_remain_unvalued() {
         let root = concat!(
             "pub const F32_OVERFLOW: F32 = 3.4028236e38\n",
             "pub const F64_OVERFLOW: F64 = 1.7976931348623159e308\n",
             "pub const F32_TYPE_MISMATCH: F32 = true\n",
             "pub const F64_TYPE_MISMATCH: F64 = 1\n",
-            "pub const COMPUTED: F64 = 1.25 * 2.0\n",
+            "pub const COMPUTED: F64 = 1.25 / 2.0\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
