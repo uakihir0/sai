@@ -7350,7 +7350,7 @@ impl ConstOwnerResolution {
     /// Other otherwise-supported literal forms do not yet produce a value
     /// here.
     pub fn const_value(&self) -> Result<Option<ConstValue>, &OwnerControlFlowResolutionError> {
-        self.const_value.as_ref().map(|value| *value)
+        self.const_value.as_ref().map(Clone::clone)
     }
 
     /// Returns snapshot-bound diagnostics for typed member failures when this
@@ -7409,7 +7409,7 @@ impl FunctionBodyTypeCheck {
 ///
 /// This is an initial Stage 0 slice, not the complete §6.27 constant
 /// evaluation model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstValue {
     /// A direct integer literal, with its resolved signed integer type.
     Int { value: i128, ty: sai_ty::ty::IntTy },
@@ -7426,6 +7426,12 @@ pub enum ConstValue {
     Byte(u8),
     /// A direct string literal interned in the current session.
     Str(Symbol),
+    /// A unit or aggregate value. The current evaluator only constructs unit
+    /// values with no variant and no fields.
+    Aggregate {
+        variant: Option<DefId>,
+        fields: Arc<[ConstValue]>,
+    },
 }
 
 /// Result of checking one public primitive, canonical `Str`, unit, or flat tuple constant.
@@ -7499,7 +7505,8 @@ impl ConstLiteralCheck {
                     )
             }
             Self::SupportedStr { .. } => true,
-            Self::SupportedUnit { .. } | Self::SupportedTuple { .. } | Self::Unsupported => false,
+            Self::SupportedUnit { .. } => true,
+            Self::SupportedTuple { .. } | Self::Unsupported => false,
         }
     }
 
@@ -7770,9 +7777,14 @@ fn evaluate_const_value(
             ExprKind::Lit(Lit::Str(value)) => Some(ConstValue::Str(value)),
             _ => None,
         },
-        ConstLiteralCheck::SupportedUnit { .. }
-        | ConstLiteralCheck::SupportedTuple { .. }
-        | ConstLiteralCheck::Unsupported => None,
+        ConstLiteralCheck::SupportedUnit { .. } => match value.kind {
+            ExprKind::Tuple(elements) if elements.is_empty() => Some(ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([]),
+            }),
+            _ => None,
+        },
+        ConstLiteralCheck::SupportedTuple { .. } | ConstLiteralCheck::Unsupported => None,
     }
 }
 
@@ -79902,6 +79914,20 @@ property "shared"() {}
                 },
                 "direct unit literal at owner index {index} is supported"
             );
+            assert!(
+                checks[index].requires_const_value(),
+                "valid unit const at owner index {index} requires an evaluator value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unit const evaluation succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: Arc::from([]),
+                }),
+                "unit is represented as an empty aggregate at owner index {index}"
+            );
         }
         for index in [2, 3, 4] {
             let ConstLiteralCheck::SupportedUnit { diagnostics } = checks[index] else {
@@ -79915,12 +79941,29 @@ property "shared"() {}
             );
             assert!(diagnostics[0].has_workspace_snapshot());
             assert!(diagnostics[0].primary().is_some());
+            assert!(
+                !checks[index].requires_const_value(),
+                "invalid unit const at owner index {index} does not require a value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid unit evaluation does not fail resolution"),
+                None
+            );
         }
         for index in [5, 6, 7] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
                 "nonliteral unit form or alias at owner index {index} remains unsupported"
+            );
+            assert!(!checks[index].requires_const_value());
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported unit evaluation does not fail resolution"),
+                None
             );
         }
     }
