@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1114 (2026-11-03): evaluate direct flat tuple constants
+
+- **Decision — review required:** Produce `ConstValue::Aggregate { variant: None, fields }` for valid flat tuple literals whose fields are supported direct scalar/`Str` literals or exact unit literals, and require those values in the existing CLI success slice.
+- **Reason:** The Stage 0 checker already validates flat tuple arity and each field against its declared resolved type. Its existing expected-field-type resolution can be retained and reused to evaluate each field in source order, extending the aggregate representation from IR-1113 without adding general tuple inference or recursive expression evaluation.
+- **Boundary and judgment:** Keep `Aggregate.variant` as `None` for tuple aggregates; unit fields remain empty aggregates. Carry the private resolved field type descriptors from the tuple check into evaluation so type selection does not need to be recomputed or added to the public `ConstLiteralCheck` API. Only an exact tuple HIR expression with matching arity and supported direct fields produces a value. Mismatches remain valueless; nonempty nested tuples, aliases, arrays, blocks, computed fields, and all other unsupported forms stay gated. This is an inferred Stage 0 order because §3.7.15 has no numbered post-IR-1107 evaluator items.
+- **Review required:** Verify field order and typed values for signed/unsigned integers, F32/F64, Bool, Char, Byte, canonical `Str`, and unit; ensure invalid tuples cannot produce values or pass the CLI gate; preserve arity, range and mismatch diagnostics; confirm nested nonempty tuples, aliases, arrays, blocks and computed fields remain gated. Review the use of the shared aggregate representation for tuples and the private checked-type handoff.
+- **Verification:** Focused driver evaluation and CLI success/error/gate tests pass; the complete CLI integration suite passes (482 tests); the complete workspace suite passes, including 823 driver tests (two ignored); `cargo fmt --all -- --check` and `git diff --check` pass.
+- **Hostile review:** Read-only reviews found no semantic widening or remaining code/API/documentation consistency issues. One review recommended avoiding field-type re-resolution during evaluation and adding Char/Byte plus negative signed/F64 tuple fields; the implementation now threads private checked field descriptors into evaluation and the regression covers those values. The final review confirmed the fixes.
+
 ### IR-1113 (2026-11-03): evaluate direct unit constants
 
 - **Decision — review required:** Represent a valid direct unit literal as `ConstValue::Aggregate { variant: None, fields: [] }` and require a value for each valid unit constant in the CLI success slice.
