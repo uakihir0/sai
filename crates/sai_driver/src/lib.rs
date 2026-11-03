@@ -83,7 +83,10 @@ use sai_hir::types::{
     Bound, BoundKind, ConstArg, EffectRef as HirEffectRef, GenericArg, GenericArgs,
     GenericParamKind, Name, Path as HirPath, PathRoot, PathSegment, Ty, TyKind,
 };
-use sai_hir::{DefId, DefPath, DefPathData, DefPathInterner, DefPathInternerError, Visibility};
+use sai_hir::{
+    DefId, DefPath, DefPathData, DefPathInterner, DefPathInternerError, DisambiguatedDefPathData,
+    Visibility,
+};
 use sai_hir::{HirId, OwnerId};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
@@ -4031,6 +4034,7 @@ pub struct TypeOwnerResolutions {
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Option<Fingerprint>,
     wit_view_closure_fingerprint: Option<Fingerprint>,
+    flagged_enum_definitions: HashSet<DefId>,
     owners: Vec<TypeOwnerResolution>,
     session_token: SessionToken,
 }
@@ -4087,6 +4091,10 @@ impl TypeOwnerResolutions {
 
     pub fn owners(&self) -> &[TypeOwnerResolution] {
         &self.owners
+    }
+
+    fn is_flags_enum(&self, definition: DefId) -> bool {
+        self.flagged_enum_definitions.contains(&definition)
     }
 
     /// Returns one direct local record's field-type projection after checking
@@ -7299,6 +7307,7 @@ pub struct ConstOwnerResolution {
     const_value_type: Option<ConstValueShape>,
     literal_check: Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
     const_value: Result<Option<ConstValue>, OwnerControlFlowResolutionError>,
+    enum_variant_path_diagnostics: Vec<Diagnostic>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
@@ -7352,6 +7361,12 @@ impl ConstOwnerResolution {
     /// including copies from supported direct const references.
     pub fn const_value(&self) -> Result<Option<ConstValue>, &OwnerControlFlowResolutionError> {
         self.const_value.as_ref().map(Clone::clone)
+    }
+
+    /// Returns unknown-variant and non-enum diagnostics from the direct local
+    /// enum path resolver for this constant initializer.
+    pub fn enum_variant_path_diagnostics(&self) -> &[Diagnostic] {
+        &self.enum_variant_path_diagnostics
     }
 
     /// Returns snapshot-bound diagnostics for typed member failures when this
@@ -7434,8 +7449,10 @@ pub enum ConstValue {
         element_type: ConstValueType,
         elements: Arc<[ConstValue]>,
     },
-    /// A unit or tuple value. The current evaluator only constructs
-    /// aggregates with no variant.
+    /// A unit or tuple value, or a unit enum variant.
+    ///
+    /// Tuple and unit values have no variant. Enum unit values retain the
+    /// exact variant `DefId` and have no fields.
     Aggregate {
         variant: Option<DefId>,
         fields: Arc<[ConstValue]>,
@@ -7458,7 +7475,8 @@ pub enum ConstValueType {
 }
 
 /// Result of checking one public primitive, canonical `Str`, exact
-/// `Slice<Byte>`, unit, flat tuple, or flat array constant.
+/// `Slice<Byte>`, unit, flat tuple, flat array, or direct local unit enum
+/// variant constant.
 ///
 /// This deliberately covers only direct literals of supported primitive
 /// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
@@ -7492,6 +7510,14 @@ pub enum ConstLiteralCheck {
     /// The empty tuple type and direct unit literal, checked without general
     /// type resolution.
     SupportedUnit { diagnostics: Vec<Diagnostic> },
+    /// A direct path to a nongeneric unit variant of a local enum.
+    ///
+    /// The exact variant definition is retained for evaluation. A nonempty
+    /// diagnostic list represents a supported but invalid type mismatch.
+    SupportedEnumUnit {
+        diagnostics: Vec<Diagnostic>,
+        variant: DefId,
+    },
     /// A flat tuple whose fields each have a supported literal or unit expression.
     SupportedTuple { diagnostics: Vec<Diagnostic> },
     /// A flat array whose elements each have a supported literal or unit expression.
@@ -7514,6 +7540,7 @@ impl ConstLiteralCheck {
                 | Self::SupportedStr { .. }
                 | Self::SupportedByteStr { .. }
                 | Self::SupportedUnit { .. }
+                | Self::SupportedEnumUnit { .. }
                 | Self::SupportedTuple { .. }
                 | Self::SupportedArray { .. }
                 | Self::SupportedConstReference { .. }
@@ -7552,6 +7579,7 @@ impl ConstLiteralCheck {
             }
             Self::SupportedStr { .. } | Self::SupportedByteStr { .. } => true,
             Self::SupportedUnit { .. }
+            | Self::SupportedEnumUnit { .. }
             | Self::SupportedTuple { .. }
             | Self::SupportedArray { .. }
             | Self::SupportedConstReference { .. } => true,
@@ -7565,6 +7593,7 @@ impl ConstLiteralCheck {
             | Self::SupportedStr { diagnostics }
             | Self::SupportedByteStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
+            | Self::SupportedEnumUnit { diagnostics, .. }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics } => diagnostics.is_empty(),
             Self::SupportedConstReference {
@@ -7582,6 +7611,7 @@ impl ConstLiteralCheck {
             | Self::SupportedStr { diagnostics }
             | Self::SupportedByteStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
+            | Self::SupportedEnumUnit { diagnostics, .. }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics }
             | Self::SupportedConstReference { diagnostics, .. } => diagnostics,
@@ -7847,6 +7877,10 @@ fn evaluate_const_value(
         ConstLiteralCheck::SupportedUnit { .. } => {
             evaluate_const_literal_value(ConstLiteralType::Unit, value, symbols)
         }
+        ConstLiteralCheck::SupportedEnumUnit { variant, .. } => Some(ConstValue::Aggregate {
+            variant: Some(*variant),
+            fields: Arc::from([]),
+        }),
         ConstLiteralCheck::SupportedTuple { .. } => {
             let ExprKind::Tuple(values) = value.kind else {
                 return None;
@@ -8089,6 +8123,10 @@ enum ConstLiteralType {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ConstValueShape {
     Literal(ConstLiteralType),
+    Enum {
+        definition: DefId,
+        name: String,
+    },
     Tuple(Vec<ConstLiteralType>),
     Array {
         element_type: ConstLiteralType,
@@ -8147,7 +8185,52 @@ fn resolve_const_value_shape(
         return Some(ConstValueShape::Literal(ConstLiteralType::ByteStr));
     }
 
+    if let Some((definition, name)) = resolve_const_enum_type(ty, type_paths, inputs) {
+        return Some(ConstValueShape::Enum { definition, name });
+    }
+
     resolve_const_literal_type(ty, type_paths, symbols, inputs).map(ConstValueShape::Literal)
+}
+
+fn resolve_const_enum_type(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    inputs: &CurrentOwnerInputs,
+) -> Option<(DefId, String)> {
+    let TyKind::Path(path) = ty.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain
+        || path.segments.is_empty()
+        || path.segments.iter().any(|segment| segment.args.is_some())
+    {
+        return None;
+    }
+    let type_paths = type_paths?;
+    let Some(PathRes {
+        base: Res::Def(DefKind::Enum, definition),
+        resolved_segments,
+        segment_count,
+    }) = type_paths.paths().get(&path.hir_id)
+    else {
+        return None;
+    };
+    if *resolved_segments != path.segments.len() as u32
+        || *segment_count != path.segments.len() as u32
+        || definition.package != type_paths.owner().def_id.package()
+    {
+        return None;
+    }
+
+    let name = inputs
+        .source
+        .text()
+        .get(path.span.range.start().to_usize()..path.span.range.end().to_usize())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("enum {:?}:{:?}", definition.package, definition.index));
+    Some((*definition, name))
 }
 
 fn const_value_shape_name(shape: &ConstValueShape) -> String {
@@ -8155,6 +8238,7 @@ fn const_value_shape_name(shape: &ConstValueShape) -> String {
         ConstValueShape::Literal(literal_type) => {
             local_enum_variant_type_name(*literal_type).to_owned()
         }
+        ConstValueShape::Enum { name, .. } => name.clone(),
         ConstValueShape::Tuple(fields) => {
             let fields = fields
                 .iter()
@@ -8174,6 +8258,66 @@ fn const_value_shape_name(shape: &ConstValueShape) -> String {
             local_enum_variant_type_name(*element_type)
         ),
     }
+}
+
+fn const_value_shapes_match(left: &ConstValueShape, right: &ConstValueShape) -> bool {
+    match (left, right) {
+        (
+            ConstValueShape::Enum {
+                definition: left_definition,
+                ..
+            },
+            ConstValueShape::Enum {
+                definition: right_definition,
+                ..
+            },
+        ) => left_definition == right_definition,
+        _ => left == right,
+    }
+}
+
+fn local_enum_has_invariant(
+    collection: &Phase1PackageScopesCollection,
+    def_paths: &DefPathInterner,
+    enum_owner: OwnerId,
+) -> Result<bool, OwnerControlFlowResolutionError> {
+    let enum_def = enum_owner.def_id.to_def_id();
+    let enum_path = def_paths
+        .resolve_def_id(enum_def)
+        .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(enum_owner))?;
+    let Some(DisambiguatedDefPathData {
+        data: DefPathData::TypeNs(enum_name),
+        ..
+    }) = enum_path.data().last()
+    else {
+        return Ok(true);
+    };
+
+    for descriptor in &collection.scopes.invariant_owners {
+        let invariant_path = def_paths
+            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                descriptor.owner,
+            ))?;
+        let Some(DisambiguatedDefPathData {
+            data: DefPathData::Invariant(invariant_name),
+            ..
+        }) = invariant_path.data().last()
+        else {
+            return Ok(true);
+        };
+        if invariant_name == enum_name
+            && invariant_path.data().len() == enum_path.data().len()
+            && invariant_path.data()[..invariant_path.data().len() - 1]
+                == enum_path.data()[..enum_path.data().len() - 1]
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn const_reference_diagnostic(
@@ -8324,7 +8468,7 @@ fn resolve_const_references(
         }
 
         let source_owner = owners[source_index].owner;
-        if source_shape != target_shape {
+        if !const_value_shapes_match(source_shape, target_shape) {
             let diagnostic = const_reference_diagnostic(
                 source_owner,
                 reference.location.clone(),
@@ -18144,6 +18288,11 @@ fn resolve_local_enum_variant_paths(
             Res::Def(DefKind::Enum, enum_def)
                 if enum_def.package == collection.module_tree.package =>
             {
+                if type_owners.is_flags_enum(enum_def) {
+                    // Flags names denote singleton set values, not enum
+                    // variant identities. Their Stage 4 evaluator owns them.
+                    continue;
+                }
                 let Some(type_owner) = type_owners
                     .owners()
                     .iter()
@@ -23139,6 +23288,7 @@ impl RootDatabase {
             .collect::<Vec<_>>();
         let mut owners = Vec::with_capacity(descriptors.len());
         let mut pending_const_references = Vec::new();
+        let mut local_type_owners = None;
         let mut group_start = 0;
         while group_start < descriptors.len() {
             let file = descriptors[group_start].file;
@@ -23159,6 +23309,7 @@ impl RootDatabase {
                                 const_value_type: None,
                                 literal_check: Err(error.clone()),
                                 const_value: Err(error.clone()),
+                                enum_variant_path_diagnostics: Vec::new(),
                                 module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
@@ -23178,6 +23329,7 @@ impl RootDatabase {
             for descriptor in &descriptors[group_start..group_end] {
                 let source_index = owners.len();
                 let mut lowering_diagnostics = Vec::new();
+                let mut enum_variant_path_diagnostics = Vec::new();
                 let mut module_path_diagnostics = None;
                 let analysis: Result<
                     (
@@ -23310,7 +23462,7 @@ impl RootDatabase {
                         &collection.target_cfg,
                         &mut aggregate_type,
                     );
-                    let const_value = match &literal_check {
+                    let mut const_value = match &literal_check {
                         Ok(check) => Ok(evaluate_const_value(
                             &hir_owner,
                             check,
@@ -23375,6 +23527,122 @@ impl RootDatabase {
                                 Err(error) => Err(error.clone()),
                             };
                             let mut pending_reference = None;
+                            if matches!(literal_check, Ok(ConstLiteralCheck::Unsupported))
+                                && matches!(body.value.kind, ExprKind::Field { .. })
+                                && let (
+                                    Ok(Some(type_paths)),
+                                    Ok(Some(module_paths)),
+                                    Ok(module_scope),
+                                ) = (&type_path_resolution, &module_resolution, &module_scope)
+                            {
+                                if local_type_owners.is_none() {
+                                    local_type_owners = Some(self.resolve_type_owner_paths_inner(
+                                        collection,
+                                        module_tree,
+                                        snapshot,
+                                        Some(&module_members),
+                                        member_scopes,
+                                        wit_view_scopes,
+                                    )?);
+                                }
+                                let type_owners = local_type_owners
+                                    .as_ref()
+                                    .expect("local type owners were just initialized");
+                                let generic_resolutions =
+                                    owner_type_generic_resolutions(&hir_owner);
+                                let variant_paths = resolve_local_enum_variant_paths(
+                                    descriptor.owner,
+                                    &hir_owner,
+                                    body,
+                                    &source_map,
+                                    &locals,
+                                    Some(type_paths),
+                                    module_paths,
+                                    type_owners,
+                                    &self.semantic_types,
+                                    &generic_resolutions,
+                                    &self.symbols,
+                                    module_scope,
+                                    Some(&module_members),
+                                    source_graph_packages,
+                                    collection,
+                                    member_scopes,
+                                    wit_view_scopes,
+                                    &self.primitive_prelude,
+                                    &inputs,
+                                    snapshot,
+                                )?;
+                                enum_variant_path_diagnostics =
+                                    variant_paths.diagnostics().to_vec();
+                                if let Some(entry) =
+                                    variant_paths.value_type_for_field(body.value.hir_id)
+                                    && matches!(
+                                        entry.value_type(),
+                                        sai_ty::adt::LocalEnumVariantValueType::Unit(_)
+                                    )
+                                    && !local_enum_has_invariant(
+                                        collection,
+                                        &def_paths,
+                                        entry.enum_owner(),
+                                    )?
+                                    && let Some(expected_shape) = const_value_type.as_ref()
+                                {
+                                    let enum_type_name = match body.value.kind {
+                                        ExprKind::Field { base, .. } => inputs
+                                            .source
+                                            .text()
+                                            .get(
+                                                base.span.range.start().to_usize()
+                                                    ..base.span.range.end().to_usize(),
+                                            )
+                                            .map(str::trim)
+                                            .filter(|name| !name.is_empty())
+                                            .map(str::to_owned),
+                                        _ => None,
+                                    }
+                                    .unwrap_or_else(|| {
+                                        format!(
+                                            "enum {:?}:{:?}",
+                                            entry.enum_def().package,
+                                            entry.enum_def().index
+                                        )
+                                    });
+                                    let actual_shape = ConstValueShape::Enum {
+                                        definition: entry.enum_def(),
+                                        name: enum_type_name,
+                                    };
+                                    let diagnostics = if const_value_shapes_match(
+                                        expected_shape,
+                                        &actual_shape,
+                                    ) {
+                                        Vec::new()
+                                    } else {
+                                        vec![const_literal_diagnostic(
+                                            descriptor.owner,
+                                            &inputs,
+                                            snapshot,
+                                            body.value.span,
+                                            sai_diagnostics::Code::TypeMismatch,
+                                            format!(
+                                                "expected `{}`, found `{}`",
+                                                const_value_shape_name(expected_shape),
+                                                const_value_shape_name(&actual_shape)
+                                            ),
+                                            "type mismatch",
+                                        )?]
+                                    };
+                                    literal_check = Ok(ConstLiteralCheck::SupportedEnumUnit {
+                                        diagnostics,
+                                        variant: entry.variant(),
+                                    });
+                                    const_value = Ok(evaluate_const_value(
+                                        &hir_owner,
+                                        literal_check.as_ref().expect("enum value check is set"),
+                                        None,
+                                        &self.symbols,
+                                    ));
+                                }
+                            }
                             if matches!(literal_check, Ok(ConstLiteralCheck::Unsupported)) {
                                 if let Ok(Some(module_resolution)) = &module_resolution {
                                     if let Some((target, span, name)) =
@@ -23503,6 +23771,7 @@ impl RootDatabase {
                     const_value_type,
                     literal_check,
                     const_value,
+                    enum_variant_path_diagnostics,
                     module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
@@ -25851,6 +26120,11 @@ impl RootDatabase {
             &validated_unit_enum_definitions,
             &local_nominal_definitions,
         );
+        let mut flagged_enum_definitions = collection
+            .local_flags_adts
+            .iter()
+            .map(|flags| flags.adt_def().def_id())
+            .collect::<HashSet<_>>();
         let mut owners = Vec::with_capacity(descriptors.len());
 
         for descriptor in descriptors {
@@ -25860,7 +26134,20 @@ impl RootDatabase {
                 descriptor.file,
                 &collection.target_cfg,
             ) {
-                Ok(inputs) => inputs,
+                Ok(inputs) => {
+                    if descriptor.kind == TopLevelOwnerKind::Enum
+                        && inputs.filtered_item_tree.items.iter().any(|entry| {
+                            entry.ast_id == descriptor.item_id
+                                && entry.kind == ItemTreeKind::Enum
+                                && entry.raw_attrs.iter().any(|attribute| {
+                                    attribute.name == sai_hir::item_tree::AttrName::Flags
+                                })
+                        })
+                    {
+                        flagged_enum_definitions.insert(descriptor.owner.def_id.to_def_id());
+                    }
+                    inputs
+                }
                 Err(error) => {
                     owners.push(TypeOwnerResolution {
                         owner: descriptor.owner,
@@ -26198,6 +26485,7 @@ impl RootDatabase {
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
             wit_view_closure_fingerprint: wit_view_scopes.map(|scopes| scopes.closure_fingerprint),
+            flagged_enum_definitions,
             owners,
             session_token: self.session_token.clone(),
         })
@@ -82037,6 +82325,658 @@ property "shared"() {}
                 "owner {index} has the direct target's value"
             );
         }
+    }
+
+    #[test]
+    fn const_unit_enum_variants_preserve_identity_and_gate_other_shapes() {
+        let root = concat!(
+            "enum Color { Red, Green = 5, Blue }\n",
+            "enum Mixed { Bare, Tuple(Bool), Record(value: Bool) }\n",
+            "enum Generic<T> { Bare, Payload(T) }\n",
+            "enum Other { Red }\n",
+            "type ColorAlias = Color\n",
+            "pub const RED: Color = Color.Red\n",
+            "pub const RED_COPY: Color = RED\n",
+            "pub const GREEN: Color = Color.Green\n",
+            "pub const MISMATCH_OTHER: Other = Color.Red\n",
+            "pub const MISMATCH_INT: I32 = Color.Red\n",
+            "pub const MIXED_UNIT: Mixed = Mixed.Bare\n",
+            "pub const MIXED_TUPLE: Mixed = Mixed.Tuple\n",
+            "pub const MIXED_RECORD: Mixed = Mixed.Record\n",
+            "pub const GENERIC_UNIT: Generic<Bool> = Generic.Bare\n",
+            "pub const ALIAS_VARIANT: Color = ColorAlias.Red\n",
+            "pub const CYCLE_A: Color = CYCLE_B\n",
+            "pub const CYCLE_B: Color = CYCLE_A\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let types = database
+            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("local enum types resolve");
+        let color_owner = local_enum_owner_named(&database, &collection, "Color");
+        let color_variants = types
+            .local_enum_payload_types(&collection, color_owner)
+            .expect("type projection uses the current collection")
+            .expect("Color payload projection exists")
+            .variants()
+            .expect("Color payload projection is supported");
+        let variant_named = |wanted: &str| {
+            color_variants
+                .iter()
+                .find(|variant| {
+                    database
+                        .symbols
+                        .resolve(variant.name())
+                        .is_ok_and(|name| name.as_ref() == wanted)
+                })
+                .expect("the selected Color variant exists")
+                .def_id()
+        };
+        let red = variant_named("Red");
+        let green = variant_named("Green");
+        let mixed_owner = local_enum_owner_named(&database, &collection, "Mixed");
+        let mixed_variants = types
+            .local_enum_payload_types(&collection, mixed_owner)
+            .expect("type projection uses the current collection")
+            .expect("Mixed payload projection exists")
+            .variants()
+            .expect("Mixed payload projection is supported");
+        let mixed_bare = mixed_variants[0].def_id();
+
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let expected_red = ConstValue::Aggregate {
+            variant: Some(red),
+            fields: Arc::from([]),
+        };
+        assert_eq!(resolved.owners().len(), 12);
+        for (index, variant) in [(0, red), (2, green), (5, mixed_bare)] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("literal check uses the current owner snapshot");
+            assert_eq!(
+                check,
+                &ConstLiteralCheck::SupportedEnumUnit {
+                    diagnostics: Vec::new(),
+                    variant,
+                },
+                "owner {index} is a valid direct unit-variant path"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("valid enum constant evaluates"),
+                Some(ConstValue::Aggregate {
+                    variant: Some(variant),
+                    fields: Arc::from([]),
+                })
+            );
+        }
+
+        assert_eq!(
+            resolved.owners()[1]
+                .literal_check()
+                .expect("copy check uses the current owner snapshot"),
+            &ConstLiteralCheck::SupportedConstReference {
+                diagnostics: Vec::new(),
+                blocked: false,
+            },
+            "same-enum const copies stay supported"
+        );
+        assert_eq!(
+            resolved.owners()[1]
+                .const_value()
+                .expect("same-enum copy evaluates"),
+            Some(expected_red.clone())
+        );
+
+        for (index, declaration) in [(3, "MISMATCH_OTHER"), (4, "MISMATCH_INT")] {
+            let ConstLiteralCheck::SupportedEnumUnit {
+                diagnostics,
+                variant,
+            } = resolved.owners()[index]
+                .literal_check()
+                .expect("mismatch diagnostic uses the current owner snapshot")
+            else {
+                panic!("a mismatched unit enum variant remains in the supported diagnostic slice");
+            };
+            assert_eq!(*variant, red);
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            let declaration_start = root
+                .find(&format!("pub const {declaration}:"))
+                .expect("mismatch declaration is present");
+            let path_start =
+                root[declaration_start..].find("Color.Red").unwrap() + declaration_start;
+            let path_span = sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(path_start as u32),
+                sai_diagnostics::TextSize::new((path_start + "Color.Red".len()) as u32),
+            )
+            .expect("mismatch path span is ordered");
+            assert_eq!(
+                diagnostics[0].primary().map(|location| location.span.range),
+                Some(path_span),
+                "the type mismatch points at the full enum-variant path"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("mismatched enum constant is checked"),
+                None
+            );
+        }
+
+        for index in [6, 7, 8, 9] {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("unsupported enum shape is checked"),
+                &ConstLiteralCheck::Unsupported,
+                "tuple, record, generic, and type-alias paths remain gated at owner index {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported enum shape is checked"),
+                None,
+                "unsupported enum shape has no evaluator value at owner index {index}"
+            );
+        }
+
+        let cycle_checks = [10, 11].map(|index| {
+            resolved.owners()[index]
+                .literal_check()
+                .expect("cycle check uses the current owner snapshot")
+        });
+        assert!(cycle_checks.iter().all(|check| {
+            matches!(
+                check,
+                ConstLiteralCheck::SupportedConstReference { blocked: true, .. }
+            )
+        }));
+        assert_eq!(
+            cycle_checks
+                .iter()
+                .flat_map(|check| check.diagnostics())
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::ConstCycle)
+                .count(),
+            1,
+            "the enum-copy cycle is reported once"
+        );
+        for index in [10, 11] {
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("cyclic enum constant is checked"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn const_enum_variant_paths_preserve_unknown_variant_diagnostics() {
+        let root = "enum Color { Red }\npub const MISSING: Color = Color.Missing\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        assert_eq!(resolved.owners().len(), 1);
+        let owner = &resolved.owners()[0];
+        assert_eq!(
+            owner
+                .literal_check()
+                .expect("unsupported variant path remains gated"),
+            &ConstLiteralCheck::Unsupported
+        );
+        assert_eq!(
+            owner
+                .const_value()
+                .expect("unknown variant does not produce a value"),
+            None
+        );
+        let diagnostics = owner.enum_variant_path_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownVariant);
+        let variant_start = root
+            .rfind("Missing")
+            .expect("unknown variant name is present");
+        let variant_span = sai_diagnostics::TextRange::new(
+            sai_diagnostics::TextSize::new(variant_start as u32),
+            sai_diagnostics::TextSize::new((variant_start + "Missing".len()) as u32),
+        )
+        .expect("variant span is ordered");
+        assert_eq!(
+            diagnostics[0].primary().map(|location| location.span.range),
+            Some(variant_span),
+            "the unknown-variant diagnostic points at the unresolved suffix"
+        );
+    }
+
+    #[test]
+    fn const_enum_construction_with_invariants_stays_gated_until_proved() {
+        let root = concat!(
+            "enum GuardedFalse { Empty }\n",
+            "invariant GuardedFalse { false }\n",
+            "enum GuardedTrue { Empty }\n",
+            "invariant GuardedTrue { true }\n",
+            "enum Unrelated { Empty }\n",
+            "pub const FALSE_INVARIANT: GuardedFalse = GuardedFalse.Empty\n",
+            "pub const TRUE_INVARIANT: GuardedTrue = GuardedTrue.Empty\n",
+            "pub const NO_INVARIANT: Unrelated = Unrelated.Empty\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        assert_eq!(resolved.owners().len(), 3);
+        for index in [0, 1] {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("invariant enum remains conservatively gated"),
+                &ConstLiteralCheck::Unsupported,
+                "an invariant-bearing enum needs an integrated SFC proof"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invariant-bearing construction is not evaluated"),
+                None
+            );
+        }
+        assert!(
+            resolved.owners()[2]
+                .literal_check()
+                .expect("unrelated enum remains eligible")
+                .is_supported(),
+            "an invariant on another enum must not gate this enum"
+        );
+        assert!(
+            resolved.owners()[2]
+                .const_value()
+                .expect("unrelated enum is evaluated")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn const_enum_invariant_matching_is_scoped_to_the_enum_module() {
+        let root = concat!(
+            "enum Color { Empty }\n",
+            "pub const ROOT_COLOR: Color = Color.Empty\n",
+        );
+        let child = concat!(
+            "pub enum Color { Empty }\n",
+            "invariant Color { true }\n",
+            "pub const CHILD_COLOR: Color = Color.Empty\n",
+        );
+        let (mut database, module_tree, snapshot, package) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let def_paths = database
+            .def_paths
+            .get(&package)
+            .expect("package definition paths are available");
+        let const_name = |owner: &ConstOwnerResolution| {
+            let path = def_paths
+                .resolve_def_id(owner.owner().def_id.to_def_id())
+                .expect("constant definition path resolves")
+                .expect("constant definition path exists");
+            let Some(component) = path.data().last() else {
+                panic!("constant definition path has a name");
+            };
+            let DefPathData::ValueNs(name) = component.data else {
+                panic!("constant definition path ends in its value namespace");
+            };
+            database
+                .symbols
+                .resolve(name)
+                .expect("constant name resolves")
+        };
+        let root_color = resolved
+            .owners()
+            .iter()
+            .find(|owner| const_name(owner).as_ref() == "ROOT_COLOR")
+            .expect("root constant is resolved");
+        let child_color = resolved
+            .owners()
+            .iter()
+            .find(|owner| const_name(owner).as_ref() == "CHILD_COLOR")
+            .expect("child constant is resolved");
+
+        assert!(
+            root_color
+                .literal_check()
+                .expect("root const check is available")
+                .is_supported(),
+            "an invariant on child::Color must not gate root::Color"
+        );
+        assert!(
+            root_color
+                .const_value()
+                .expect("root const value is available")
+                .is_some()
+        );
+        assert_eq!(
+            child_color
+                .literal_check()
+                .expect("child const check is available"),
+            &ConstLiteralCheck::Unsupported,
+            "the invariant gates the enum it names in the child module"
+        );
+        assert_eq!(
+            child_color
+                .const_value()
+                .expect("child const value is available"),
+            None
+        );
+    }
+
+    #[test]
+    fn const_flags_paths_do_not_use_enum_variant_aggregate_values() {
+        let root = concat!(
+            "interface api {\n",
+            "@flags enum Perms { Read, Write }\n",
+            "}\n",
+            "pub const READ: api.Perms = api.Perms.Read\n",
+        );
+        let (mut database, module_tree, snapshot, collection) =
+            collect_package_inventory_with_accepted_flags_for_test(root.as_bytes());
+        let flags_def = collection
+            .scopes()
+            .interfaces
+            .values()
+            .find_map(|scope| {
+                scope
+                    .members
+                    .values()
+                    .find_map(|binding| match binding.res {
+                        sai_resolve::package_scopes::Res::Def(
+                            sai_resolve::package_scopes::DefKind::Enum,
+                            definition,
+                        ) => Some(definition),
+                        _ => None,
+                    })
+            })
+            .expect("the accepted interface flags enum is in the member scope");
+        assert!(
+            collection
+                .local_flags_adt_def(&snapshot, flags_def)
+                .expect("flags projection is tied to the current snapshot")
+                .is_some(),
+            "the source enum is recognized as a validated flags ADT"
+        );
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owner analysis stays within its bounded path resolver");
+        assert_eq!(resolved.owners().len(), 1);
+        assert_eq!(
+            resolved.owners()[0]
+                .literal_check()
+                .expect("flags path check uses the current owner snapshot"),
+            &ConstLiteralCheck::Unsupported,
+            "flags names remain owned by flags constant semantics"
+        );
+        assert_eq!(
+            resolved.owners()[0]
+                .const_value()
+                .expect("flags initializer is conservatively gated"),
+            None,
+            "a flags singleton is not encoded as an enum aggregate"
+        );
+    }
+
+    #[test]
+    fn const_unit_enum_paths_preserve_identity_through_local_import_aliases() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "use acme:phase1/child.{Color as Shade}\n",
+            "pub const MODULE_RED: child_alias.Color = child_alias.Color.Red\n",
+            "pub const ITEM_RED: Shade = Shade.Red\n",
+        );
+        let child = "pub enum Color { Red }\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let enum_owner = local_enum_owner_named(&database, &collection, "Color");
+        let types = database
+            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("local enum type resolves");
+        let variant = types
+            .local_enum_payload_types(&collection, enum_owner)
+            .expect("type projection uses the current collection")
+            .expect("Color payload projection exists")
+            .variants()
+            .expect("Color payload projection is supported")[0]
+            .def_id();
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        assert_eq!(resolved.owners().len(), 2);
+        for owner in resolved.owners() {
+            assert_eq!(
+                owner
+                    .literal_check()
+                    .expect("literal check uses the current owner snapshot"),
+                &ConstLiteralCheck::SupportedEnumUnit {
+                    diagnostics: Vec::new(),
+                    variant,
+                },
+                "module and item aliases resolve to the same local variant identity"
+            );
+            assert_eq!(
+                owner.const_value().expect("aliased enum path evaluates"),
+                Some(ConstValue::Aggregate {
+                    variant: Some(variant),
+                    fields: Arc::from([]),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn const_invalid_module_flags_attribute_fails_closed() {
+        let root = concat!(
+            "@flags enum Perms { Read, Write }\n",
+            "pub const READ: Perms = Perms.Read\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("invalid flags source does not break bounded const analysis");
+
+        assert_eq!(resolved.owners().len(), 1);
+        assert_eq!(
+            resolved.owners()[0]
+                .literal_check()
+                .expect("flags path check uses the current owner snapshot"),
+            &ConstLiteralCheck::Unsupported,
+            "a raw module-level @flags attribute cannot fall through as an enum variant"
+        );
+        assert_eq!(
+            resolved.owners()[0]
+                .const_value()
+                .expect("unsupported flags initializer stays unevaluated"),
+            None
+        );
+    }
+
+    #[test]
+    fn const_enum_unit_paths_follow_supported_projection_boundary() {
+        let root = concat!(
+            "@repr(U8)\n",
+            "enum Issues { Outside = 256, First = 0, Duplicate = 0 }\n",
+            "enum Unrepresentable { Huge = 170141183460469231731687303715884105728 }\n",
+            "pub const OUTSIDE: Issues = Issues.Outside\n",
+            "pub const DUPLICATE: Issues = Issues.Duplicate\n",
+            "pub const HUGE: Unrepresentable = Unrepresentable.Huge\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let type_owners = database
+            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("local enum type projections resolve");
+
+        let issues_owner = local_enum_owner_named(&database, &collection, "Issues");
+        let issues_projection = type_owners
+            .local_enum_adt(&collection, issues_owner)
+            .expect("projection uses the current collection")
+            .expect("Issues projection exists");
+        let issues = issues_projection
+            .definition()
+            .expect("range and duplicate issues do not discard a representable enum definition");
+        assert_eq!(
+            issues_projection.discriminant_issues().len(),
+            2,
+            "the projection retains its out-of-range and duplicate diagnostics"
+        );
+        assert!(
+            issues_projection.discriminant_issues().iter().any(|issue| {
+                matches!(issue.kind(), LocalEnumDiscriminantIssueKind::OutOfRange)
+            })
+        );
+        assert!(issues_projection.discriminant_issues().iter().any(|issue| {
+            matches!(
+                issue.kind(),
+                LocalEnumDiscriminantIssueKind::Duplicate { .. }
+            )
+        }));
+        let issue_variant = |wanted: &str| {
+            issues
+                .payloads()
+                .variants()
+                .iter()
+                .find(|variant| {
+                    database
+                        .symbols
+                        .resolve(variant.name())
+                        .is_ok_and(|name| name.as_ref() == wanted)
+                })
+                .expect("the selected Issues variant exists")
+                .def_id()
+        };
+        let outside = issue_variant("Outside");
+        let duplicate = issue_variant("Duplicate");
+
+        let unrepresentable_owner =
+            local_enum_owner_named(&database, &collection, "Unrepresentable");
+        let unrepresentable_projection = type_owners
+            .local_enum_adt(&collection, unrepresentable_owner)
+            .expect("projection uses the current collection")
+            .expect("Unrepresentable projection exists");
+        assert!(
+            unrepresentable_projection.definition().is_none(),
+            "an i128-overflowing explicit discriminant has no enum definition"
+        );
+        assert!(
+            unrepresentable_projection.build_error().is_some(),
+            "the unsupported projection retains the exact construction error"
+        );
+
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("unsupported projections fail closed during const-path resolution");
+        assert_eq!(resolved.owners().len(), 3);
+        for (index, variant) in [(0, outside), (1, duplicate)] {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check uses the current owner snapshot"),
+                &ConstLiteralCheck::SupportedEnumUnit {
+                    diagnostics: Vec::new(),
+                    variant,
+                },
+                "a representable exact variant identity is independent of discriminant diagnostics"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("supported enum identity evaluates"),
+                Some(ConstValue::Aggregate {
+                    variant: Some(variant),
+                    fields: Arc::from([]),
+                })
+            );
+        }
+        assert_eq!(
+            resolved.owners()[2]
+                .literal_check()
+                .expect("unrepresentable enum path remains gated"),
+            &ConstLiteralCheck::Unsupported,
+            "unrepresentable projections never produce a variant identity"
+        );
+        assert_eq!(
+            resolved.owners()[2]
+                .const_value()
+                .expect("unrepresentable enum constant stays unevaluated"),
+            None
+        );
     }
 
     #[test]
