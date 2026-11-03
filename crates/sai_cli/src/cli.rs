@@ -7200,6 +7200,13 @@ fn module_tree_workspace_check_diagnostics(
                 for owner in const_resolutions.owners() {
                     literal_diagnostics
                         .extend(owner.enum_variant_path_diagnostics().iter().cloned());
+                    if !matches!(
+                        owner.literal_check(),
+                        Ok(sai_driver::ConstLiteralCheck::SupportedEnumTuple { .. })
+                    ) {
+                        literal_diagnostics
+                            .extend(owner.enum_variant_call_diagnostics().iter().cloned());
+                    }
                     match owner.literal_check() {
                         Ok(literal_check) => {
                             literal_diagnostics.extend(literal_check.diagnostics().iter().cloned())
@@ -7742,6 +7749,13 @@ fn module_tree_workspace_check_diagnostics(
                 }
                 for owner in const_resolutions.owners() {
                     owner_diagnostics.extend(owner.enum_variant_path_diagnostics().iter().cloned());
+                    if !matches!(
+                        owner.literal_check(),
+                        Ok(sai_driver::ConstLiteralCheck::SupportedEnumTuple { .. })
+                    ) {
+                        owner_diagnostics
+                            .extend(owner.enum_variant_call_diagnostics().iter().cloned());
+                    }
                     match owner.module_path_diagnostics() {
                         Ok(Some(diagnostics_for_owner)) => {
                             owner_diagnostics.extend(diagnostics_for_owner.iter().cloned())
