@@ -4,6 +4,13 @@
 
 ## Open for review
 
+### IR-1126 (2026-11-03): direct bitwise-NOT constant values
+
+- **Decision — review required:** Extend the bounded constant evaluator to accept exactly one unary bitwise-NOT (`~`) applied directly to an integer or `Byte` literal. Support it in top-level scalar constants and scalar fields/elements of the existing flat tuple and array forms. Produce a typed value by complementing the operand at its declared primitive width; `ISize` and `USize` use the selected target's pointer width.
+- **Reason:** Spec/06 §§6.27 and 6.8.5 explicitly allow built-in `~` on integer primitives and `Byte`, with no panic case. The existing literal checker already validates operand type and target-dependent range, and the evaluator already preserves typed integer and byte values. Reusing those checks adds one constant operation without admitting general expression evaluation.
+- **Boundary and judgment:** Only direct `Lit::Int` and `Lit::Byte` operands are accepted. Nested or composed operators, paths (including const references), Bool/Char/float operands, enum-constructor payloads, nested aggregates, and other computed expressions remain gated. A direct integer/Byte operand checked against a different supported declared field type retains the existing type-mismatch diagnostic and produces no value; out-of-range operands retain the literal-range diagnostic and produce no value. Signed results are interpreted as the sign-extended two's-complement bit pattern at the exact width, unsigned results are masked to that width, and `Byte` complements in eight bits. The public const-owner and CLI success gates do not change.
+- **Review required:** Verify bit patterns for all ten integer primitives and `Byte`, including signed negative operands, width masking, 32/64-bit pointer-sized types, and tuple/array source order. Check mismatch/range diagnostics and no-value behavior, confirm paths/composition/nested forms and enum payloads remain gated, and ensure valid new constants still satisfy the CLI value-required gate.
+
 ### IR-1125 (2026-11-03): direct constant references in flat aggregates
 
 - **Decision — review required:** Extend the bounded constant evaluator so a supported flat tuple or array initializer may contain direct const references in scalar fields or elements alongside the existing literal forms. Resolve every leaf to an exact same-package const `DefId`, require its declared value shape to equal that leaf's resolved literal type, and retain source order and array element metadata when materializing the aggregate.
