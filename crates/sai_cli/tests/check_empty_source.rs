@@ -17208,11 +17208,77 @@ fn public_byte_string_flat_tuple_field_errors_suppress_the_check_result() {
 }
 
 #[test]
-fn byte_string_tuple_aliases_computed_fields_and_arrays_remain_gated() {
+fn byte_string_tuple_aliases_computed_fields_and_nested_arrays_remain_gated() {
     for source in [
         "pub type ByteSlice = Slice<Byte>\npub const ALIAS: (ByteSlice,) = (b\"bytes\",)\n",
         "pub const COMPUTED: (Slice<Byte>,) = (b\"left\" + b\"right\",)\n",
-        "pub const ARRAY: Array<Slice<Byte>, 1> = [b\"bytes\"]\n",
+        "pub const ARRAY_FIELD: (Array<Slice<Byte>, 1>,) = ([b\"bytes\"],)\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
+fn public_byte_string_flat_array_elements_emit_check_results() {
+    let source = concat!(
+        "pub const FIELDS: Array<Slice<Byte>, 2> = [b\"\", br#\"raw { bytes }\"#]\n",
+        "pub const ESCAPED: Array<Slice<Byte>, 1> = [b\"A\\0\\xff\"]\n",
+        "pub const EMPTY: Array<Slice<Byte>, 0> = []\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn public_byte_string_flat_array_type_errors_suppress_the_check_result() {
+    for (source, expected_codes) in [
+        (
+            "pub const SLICE_MISMATCH: Array<Slice<Byte>, 1> = [\"text\"]\n",
+            vec!["TYPE_MISMATCH"],
+        ),
+        (
+            "pub const STR_MISMATCH: Array<Str, 1> = [b\"bytes\"]\n",
+            vec!["TYPE_MISMATCH"],
+        ),
+        (
+            "pub const LENGTH_AND_TYPE: Array<Slice<Byte>, 2> = [\"text\"]\n",
+            vec!["ARRAY_LENGTH_MISMATCH", "TYPE_MISMATCH"],
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: array const error should exit 1:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: supported array errors suppress results without a feature gate:\n{stdout}"
+        );
+        let actual_codes = [
+            "ARRAY_LENGTH_MISMATCH",
+            "TYPE_MISMATCH",
+            "LITERAL_OUT_OF_RANGE",
+        ]
+        .into_iter()
+        .filter(|code| stdout.contains(&format!("\"code\":\"{code}\"")))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            actual_codes, expected_codes,
+            "{source:?}: supported array errors retain the expected diagnostic codes:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn byte_string_noncanonical_and_nested_array_types_remain_gated() {
+    for source in [
+        "pub type ByteSlice = Slice<Byte>\npub const ALIAS: Array<ByteSlice, 1> = [b\"bytes\"]\n",
+        "pub const OTHER_SLICE: Array<Slice<Char>, 1> = [b\"bytes\"]\n",
+        "pub const NESTED_ARRAY: Array<Array<Slice<Byte>, 1>, 1> = [[b\"bytes\"]]\n",
+        "pub const TUPLE_ARRAY: (Array<Slice<Byte>, 1>,) = ([b\"bytes\"],)\n",
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);

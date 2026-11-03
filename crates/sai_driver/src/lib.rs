@@ -7450,6 +7450,8 @@ pub enum ConstValueType {
     Primitive(sai_resolve::prelude::PrimTy),
     /// The canonical prelude string type.
     Str,
+    /// The canonical prelude `Slice<Byte>` type.
+    ByteStr,
     /// The unit type.
     Unit,
 }
@@ -7462,12 +7464,12 @@ pub enum ConstValueType {
 /// fields are supported direct scalar, byte-string, or unit literals or Bool
 /// literal-only `not`/`and`/`or` expressions and comparisons between direct
 /// Bool literals.
-/// Flat arrays still allow only the existing scalar, canonical `Str`, or unit
-/// element literals and Bool literal-only `not`/`and`/`or` expressions and
-/// comparisons between direct Bool literals. They require an explicit built-in
-/// `Array<T, N>` type with a literal length. Top-level Bool expressions use
-/// those same Bool forms. It does not imply that other constant expressions are
-/// evaluated.
+/// Flat arrays allow the existing scalar, canonical `Str`, canonical
+/// `Slice<Byte>`, or unit element literals and Bool literal-only `not`/`and`/`or`
+/// expressions and comparisons between direct Bool literals. They require an
+/// explicit built-in `Array<T, N>` type with a literal length. Top-level Bool
+/// expressions use those same Bool forms. It does not imply that other
+/// constant expressions are evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -7878,7 +7880,7 @@ fn evaluate_const_value(
                     ConstLiteralType::Primitive(primitive) => ConstValueType::Primitive(*primitive),
                     ConstLiteralType::Str => ConstValueType::Str,
                     ConstLiteralType::Unit => ConstValueType::Unit,
-                    ConstLiteralType::ByteStr => return None,
+                    ConstLiteralType::ByteStr => ConstValueType::ByteStr,
                 },
                 elements: values.into(),
             })
@@ -8120,7 +8122,8 @@ fn resolve_const_array_type(
     if *length > maximum_length {
         return None;
     }
-    let element_type = resolve_const_literal_type(**element_ty, Some(type_paths), symbols, inputs)?;
+    let element_type =
+        resolve_const_aggregate_literal_type(**element_ty, Some(type_paths), symbols, inputs)?;
     Some((element_type, *length))
 }
 
@@ -8316,7 +8319,7 @@ fn resolve_const_literal_type(
     }
 }
 
-fn resolve_const_tuple_field_type(
+fn resolve_const_aggregate_literal_type(
     ty: Ty<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
@@ -11612,7 +11615,7 @@ fn check_const_tuple_literal(
 ) -> Result<Option<(Vec<Diagnostic>, Vec<ConstLiteralType>)>, OwnerControlFlowResolutionError> {
     let Some(expected_types) = expected_elements
         .iter()
-        .map(|ty| resolve_const_tuple_field_type(*ty, type_paths, symbols, inputs))
+        .map(|ty| resolve_const_aggregate_literal_type(*ty, type_paths, symbols, inputs))
         .collect::<Option<Vec<_>>>()
     else {
         return Ok(None);
@@ -81173,7 +81176,7 @@ property "shared"() {}
             "pub type ByteSlice = Slice<Byte>\n",
             "pub const ALIAS_FIELD: (ByteSlice,) = (b\"bytes\",)\n",
             "pub const COMPUTED_FIELD: (Slice<Byte>,) = (b\"left\" + b\"right\",)\n",
-            "pub const BYTE_STRING_ARRAY: Array<Slice<Byte>, 1> = [b\"bytes\"]\n",
+            "pub const TUPLE_ARRAY: (Array<Slice<Byte>, 1>,) = ([b\"bytes\"],)\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -81295,12 +81298,175 @@ property "shared"() {}
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "aliases, computed fields, and byte-string arrays remain gated at owner index {index}"
+                "aliases, computed fields, and arrays nested in tuples remain gated at owner index {index}"
             );
             assert_eq!(
                 resolved.owners()[index]
                     .const_value()
                     .expect("unsupported aggregate shape does not evaluate"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn const_byte_strings_are_supported_only_as_flat_array_elements() {
+        let root = concat!(
+            "pub const FIELDS: Array<Slice<Byte>, 2> = [b\"\", br#\"raw { bytes }\"#]\n",
+            "pub const ESCAPED: Array<Slice<Byte>, 1> = [b\"A\\0\\xff\"]\n",
+            "pub const EMPTY: Array<Slice<Byte>, 0> = []\n",
+            "pub const SLICE_MISMATCH: Array<Slice<Byte>, 1> = [\"text\"]\n",
+            "pub const STR_MISMATCH: Array<Str, 1> = [b\"bytes\"]\n",
+            "pub const LENGTH_AND_TYPE: Array<Slice<Byte>, 2> = [\"text\"]\n",
+            "pub type ByteSlice = Slice<Byte>\n",
+            "pub const ALIAS: Array<ByteSlice, 1> = [b\"bytes\"]\n",
+            "pub const OTHER_SLICE: Array<Slice<Char>, 1> = [b\"bytes\"]\n",
+            "pub const NESTED_ARRAY: Array<Array<Slice<Byte>, 1>, 1> = [[b\"bytes\"]]\n",
+            "pub const TUPLE_ARRAY: (Array<Slice<Byte>, 1>,) = ([b\"bytes\"],)\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 10);
+        let assert_primary_literal_span =
+            |diagnostic: &Diagnostic, declaration: &str, literal: &str| {
+                let declaration_start = root
+                    .find(declaration)
+                    .unwrap_or_else(|| panic!("test source contains {declaration:?}"));
+                let value_start = root[declaration_start..]
+                    .find(" = ")
+                    .expect("const declaration has an initializer")
+                    + declaration_start
+                    + " = ".len();
+                let value_end = root[value_start..]
+                    .find('\n')
+                    .map_or(root.len(), |relative_end| value_start + relative_end);
+                let literal_start = root[value_start..value_end]
+                    .rfind(literal)
+                    .unwrap_or_else(|| panic!("initializer contains {literal:?}"))
+                    + value_start;
+                let expected_range = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(literal_start as u32),
+                    sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                )
+                .expect("literal span is ordered");
+                assert_eq!(
+                    diagnostic.primary().map(|location| location.span.range),
+                    Some(expected_range),
+                    "primary diagnostic span should cover literal {literal:?}"
+                );
+            };
+
+        for index in 0..3 {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::SupportedArray {
+                    diagnostics: Vec::new(),
+                },
+                "direct byte-string array elements are supported at owner index {index}"
+            );
+            let Some(ConstValue::Array {
+                element_type: ConstValueType::ByteStr,
+                elements,
+            }) = resolved.owners()[index]
+                .const_value()
+                .expect("valid byte-string array evaluates")
+            else {
+                panic!("valid byte-string array at owner index {index} produces a typed array");
+            };
+            match index {
+                0 => {
+                    assert_eq!(elements.len(), 2);
+                    let ConstValue::ByteStr(empty) = &elements[0] else {
+                        panic!("first element preserves the empty byte string");
+                    };
+                    assert!(empty.is_empty());
+                    let ConstValue::ByteStr(raw) = &elements[1] else {
+                        panic!("second element preserves the raw byte string");
+                    };
+                    assert_eq!(raw.as_ref(), b"raw { bytes }");
+                }
+                1 => {
+                    let ConstValue::ByteStr(escaped) = &elements[0] else {
+                        panic!("escaped element produces a byte-string value");
+                    };
+                    assert_eq!(escaped.as_ref(), &[b'A', 0, 0xff]);
+                }
+                2 => assert!(
+                    elements.is_empty(),
+                    "empty arrays retain their element type"
+                ),
+                _ => unreachable!("the loop covers only supported arrays"),
+            }
+        }
+
+        for (index, declaration, literal) in [
+            (3, "pub const SLICE_MISMATCH:", "\"text\""),
+            (4, "pub const STR_MISMATCH:", "b\"bytes\""),
+            (5, "pub const LENGTH_AND_TYPE:", "\"text\""),
+        ] {
+            let ConstLiteralCheck::SupportedArray { diagnostics } = &checks[index] else {
+                panic!("supported byte-string array mismatch at owner index {index} is diagnosed");
+            };
+            let expected_codes = if index == 5 {
+                vec![
+                    sai_diagnostics::Code::ArrayLengthMismatch,
+                    sai_diagnostics::Code::TypeMismatch,
+                ]
+            } else {
+                vec![sai_diagnostics::Code::TypeMismatch]
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                expected_codes,
+                "array diagnostics are preserved at owner index {index}"
+            );
+            assert_primary_literal_span(
+                &diagnostics[usize::from(index == 5)],
+                declaration,
+                literal,
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("mismatched array has no evaluator value"),
+                None
+            );
+        }
+
+        for index in [6, 7, 8, 9] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "aliases, other slices, and nested arrays remain gated at owner index {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported array shape does not evaluate"),
                 None
             );
         }
