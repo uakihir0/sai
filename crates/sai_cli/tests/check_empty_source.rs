@@ -4588,6 +4588,22 @@ fn public_inherent_method_binary_tails_accept_paths_and_known_fields() {
             "}\n",
         ),
         concat!(
+            "type Counter { left: I32, shift: U32 }\n",
+            "impl Counter {\n",
+            "    pub fn shift_left_paths(self: borrow Self, value: I32, amount: U32) -> I32 {\n",
+            "        value << amount\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { left: I32, shift: U32 }\n",
+            "impl Counter {\n",
+            "    pub fn shift_right_paths(self: borrow Self, value: I32, amount: U32) -> I32 {\n",
+            "        value >> amount\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
             "type Counter { left: I32, right: I32 }\n",
             "impl Counter {\n",
             "    pub fn less_than(self: borrow Self) -> Bool {\n",
@@ -9288,15 +9304,6 @@ fn unsupported_top_level_arithmetic_and_bitwise_tail_shapes_remain_gated() {
         ),
         "nonlocal bitwise operand",
     );
-    for source in [
-        "pub fn left_shift_tail(left: I32, amount: U32) -> I32 { left << amount }\n",
-        "pub fn right_shift_tail(left: I32, amount: U32) -> I32 { left >> amount }\n",
-    ] {
-        assert_check_stays_gated_without_syntax_errors(
-            &run_check(source, "", &[], &[]),
-            "unsupported top-level shift tail shape",
-        );
-    }
 }
 
 #[test]
@@ -17336,6 +17343,259 @@ fn top_level_function_bitwise_path_tails_accept_integer_and_byte_types() {
         ),
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn top_level_function_shift_path_tails_accept_integer_and_byte_types() {
+    let shift_types = [
+        "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize", "Byte",
+    ];
+    for primitive in shift_types {
+        let mut source = String::new();
+        for (operator, name) in [("<<", "left"), (">>", "right")] {
+            source.push_str(&format!(
+                "pub fn shift_{}_{name}(value: {primitive}, amount: U32) -> {primitive} {{ value {operator} amount }}\n",
+                primitive.to_ascii_lowercase(),
+            ));
+        }
+        assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+    }
+
+    for source in [
+        concat!(
+            "pub fn shift_preceding_locals(value: I32, amount: U32) -> I32 {\n",
+            "    let prior_value: I32 = value\n",
+            "    let prior_amount: U32 = amount\n",
+            "    prior_value << prior_amount\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn shift_shadow(value: U32, amount: U32) -> I32 {\n",
+            "    let value: I32 = 1\n",
+            "    value >> amount\n",
+            "}\n",
+        ),
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn top_level_function_shift_path_tails_reuse_shift_diagnostics() {
+    let mut source = String::new();
+    let mut unsupported_spans = Vec::new();
+    for primitive in ["Bool", "F32", "F64", "Char"] {
+        for (operator, name) in [("<<", "left"), (">>", "right")] {
+            let function = format!(
+                "pub fn unsupported_{name}_{}(value: {primitive}, amount: U32) -> {primitive} {{ value {operator} amount }}\n",
+                primitive.to_ascii_lowercase(),
+            );
+            let expression = format!("value {operator} amount");
+            let start = source.len()
+                + function
+                    .find(&expression)
+                    .expect("direct shift tail exists");
+            unsupported_spans.push((
+                format!("operator `{operator}` is not defined for `{primitive}`"),
+                start,
+                start + expression.len(),
+            ));
+            source.push_str(&function);
+        }
+    }
+
+    let output = run_check(&source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        unsupported_spans.len(),
+        "non-integer left paths should keep their unsupported shift diagnostics:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a U32 right path should leave only the unsupported-left error and recover:\n{stdout}"
+    );
+    for (message, start, end) in unsupported_spans {
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &message,
+            start,
+            end,
+        );
+    }
+
+    let mismatched_right_types = [
+        "I8", "I16", "I32", "I64", "U8", "U16", "U64", "ISize", "USize", "Byte", "Bool", "F32",
+        "F64", "Char",
+    ];
+    for left_type in ["I32", "Byte"] {
+        for (operator, operator_name) in [("<<", "left"), (">>", "right")] {
+            for right_type in mismatched_right_types {
+                let mismatch_source = format!(
+                    "pub fn shift_{operator_name}_{}_{}_mismatch(value: {left_type}, amount: {right_type}) -> {left_type} {{ value {operator} amount }}\n",
+                    left_type.to_ascii_lowercase(),
+                    right_type.to_ascii_lowercase(),
+                );
+                let expression = format!("value {operator} amount");
+                let start = mismatch_source
+                    .find(&expression)
+                    .expect("mismatched shift tail exists");
+                let right = start + format!("value {operator} ").len();
+                let mismatch_output = run_check(&mismatch_source, "", &[], &[]);
+                let mismatch_stdout =
+                    String::from_utf8(mismatch_output.stdout).expect("CLI stdout is UTF-8");
+                assert_eq!(
+                    mismatch_output.status.code(),
+                    Some(1),
+                    "{left_type} `{operator}` with {right_type} count:\n{mismatch_stdout}"
+                );
+                assert_eq!(
+                    mismatch_stdout
+                        .matches("\"code\":\"TYPE_MISMATCH\"")
+                        .count(),
+                    1,
+                    "a non-U32 right path should retain its mismatch for {left_type} `{operator}` tails:\n{mismatch_stdout}"
+                );
+                assert!(
+                    !mismatch_stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                        && !mismatch_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                        && !mismatch_stdout.contains("\"type\":\"result\""),
+                    "integer and Byte left paths should recover through the existing shift checks:\n{mismatch_stdout}"
+                );
+                assert_json_diagnostic_primary_span(
+                    &mismatch_stdout,
+                    "TYPE_MISMATCH",
+                    &format!("expected `U32`, found `{right_type}`"),
+                    right,
+                    right + "amount".len(),
+                );
+            }
+        }
+    }
+
+    let mismatch_cases = [
+        ("bool", "Bool", "I32", "<<"),
+        ("f32", "F32", "F64", ">>"),
+        ("f64", "F64", "Bool", "<<"),
+        ("char", "Char", "I16", ">>"),
+    ];
+    let mut mismatch_source = String::new();
+    let mut mismatch_spans = Vec::new();
+    let mut unsupported_mismatch_count = 0;
+    for (name, left_type, right_type, operator) in mismatch_cases {
+        let function = format!(
+            "pub fn {name}_right_mismatch(value: {left_type}, amount: {right_type}) -> {left_type} {{ value {operator} amount }}\n"
+        );
+        let expression = format!("value {operator} amount");
+        let start = mismatch_source.len()
+            + function
+                .find(&expression)
+                .expect("mismatched shift tail exists");
+        let right = start + format!("value {operator} ").len();
+        mismatch_spans.push((
+            "TYPE_MISMATCH",
+            format!("expected `U32`, found `{right_type}`"),
+            right,
+            right + "amount".len(),
+        ));
+        mismatch_spans.push((
+            "OPERATOR_NOT_SUPPORTED",
+            format!("operator `{operator}` is not defined for `{left_type}`"),
+            start,
+            start + expression.len(),
+        ));
+        unsupported_mismatch_count += 1;
+        mismatch_source.push_str(&function);
+    }
+    let return_mismatch =
+        "pub fn independent_return_mismatch(value: I32, amount: I16) -> Bool { value << amount }\n";
+    let return_expression = "value << amount";
+    let return_start = mismatch_source.len()
+        + return_mismatch
+            .find(return_expression)
+            .expect("return mismatch shift tail exists");
+    let return_right = return_start + "value << ".len();
+    mismatch_spans.push((
+        "TYPE_MISMATCH",
+        "expected `U32`, found `I16`".to_owned(),
+        return_right,
+        return_right + "amount".len(),
+    ));
+    mismatch_spans.push((
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`".to_owned(),
+        return_start,
+        return_start + return_expression.len(),
+    ));
+    mismatch_source.push_str(return_mismatch);
+
+    let mismatch_output = run_check(&mismatch_source, "", &[], &[]);
+    let mismatch_stdout = String::from_utf8(mismatch_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(mismatch_output.status.code(), Some(1), "{mismatch_stdout}");
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        mismatch_spans
+            .iter()
+            .filter(|(code, _, _, _)| *code == "TYPE_MISMATCH")
+            .count(),
+        "the U32 right-path mismatch and independent return mismatch should both be reported:\n{mismatch_stdout}"
+    );
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        unsupported_mismatch_count,
+        "non-integer left paths should keep their unsupported shift diagnostic alongside a bad right path:\n{mismatch_stdout}"
+    );
+    assert!(
+        !mismatch_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !mismatch_stdout.contains("\"type\":\"result\""),
+        "right-path and left-operator errors should recover through the existing shift checks:\n{mismatch_stdout}"
+    );
+    for (code, message, start, end) in mismatch_spans {
+        assert_json_diagnostic_primary_span(&mismatch_stdout, code, &message, start, end);
+    }
+}
+
+#[test]
+fn unsupported_top_level_shift_path_tail_shapes_remain_gated() {
+    for source in [
+        "pub fn shift_literal_right(value: I32) -> I32 { value << 1 }\n",
+        "pub fn shift_literal_left(amount: U32) -> I32 { 1 >> amount }\n",
+        "pub fn shift_literal_pair() -> I32 { 1 << 2 }\n",
+        "pub fn shift_computed_left(value: I32, amount: U32) -> I32 { (value + 1) << amount }\n",
+        "pub fn shift_computed_right(value: I32, amount: U32) -> I32 { value >> (amount + 1) }\n",
+        concat!(
+            "pub fn shift_unresolved_count(value: I32) -> I32 {\n",
+            "    let amount = 1\n",
+            "    value << amount\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn shift_forward_count(value: I32) -> I32 {\n",
+            "    let shifted = value >> amount\n",
+            "    let amount: U32 = 1\n",
+            "    shifted\n",
+            "}\n",
+        ),
+        concat!(
+            "const Count: U32 = 1\n",
+            "pub fn shift_module_constant(value: I32) -> I32 { value << Count }\n",
+        ),
+    ] {
+        assert_check_stays_gated_without_syntax_errors(
+            &run_check(source, "", &[], &[]),
+            "unsupported top-level shift tail shape",
+        );
     }
 }
 

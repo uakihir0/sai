@@ -7654,6 +7654,7 @@ fn check_function_body_type(
                 allow_remainder_path_tail: true,
                 allow_wrapping_path_tail: true,
                 allow_bitwise_path_tail: true,
+                allow_shift_path_tail: true,
                 allow_unary_path_tail: true,
                 allow_bool_literal_not_tail: true,
                 allow_logical_tail: true,
@@ -8404,6 +8405,7 @@ fn check_inherent_method_body_type(
             allow_remainder_path_tail: false,
             allow_wrapping_path_tail: false,
             allow_bitwise_path_tail: false,
+            allow_shift_path_tail: false,
             allow_unary_path_tail: true,
             allow_bool_literal_not_tail: false,
             allow_logical_tail: true,
@@ -8901,6 +8903,7 @@ struct PrimitiveLocalBlockGates {
     allow_remainder_path_tail: bool,
     allow_wrapping_path_tail: bool,
     allow_bitwise_path_tail: bool,
+    allow_shift_path_tail: bool,
     allow_unary_path_tail: bool,
     allow_bool_literal_not_tail: bool,
     allow_logical_tail: bool,
@@ -8998,6 +9001,7 @@ fn check_function_body_primitive_local_block(
                     && matches!(operator, BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul))
                 || (gates.allow_bitwise_path_tail
                     && matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor))
+                || (gates.allow_shift_path_tail && matches!(operator, BinOp::Shl | BinOp::Shr))
                 || (gates.allow_logical_tail && matches!(operator, BinOp::And | BinOp::Or))
                 || (gates.allow_comparison_tail
                     && is_function_primitive_local_comparison_operator(operator))
@@ -9412,6 +9416,8 @@ fn check_function_body_primitive_local_block(
             && matches!(operator, BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul);
         let is_bitwise_path_tail = gates.allow_bitwise_path_tail
             && matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor);
+        let is_shift_path_tail =
+            gates.allow_shift_path_tail && matches!(operator, BinOp::Shl | BinOp::Shr);
         let shape_is_supported = if is_comparison_only_tail {
             let preceding_paths = operands
                 .iter()
@@ -9430,6 +9436,8 @@ fn check_function_body_primitive_local_block(
         } else if is_wrapping_path_tail {
             operands.iter().all(|operand| is_preceding_path(operand))
         } else if is_bitwise_path_tail {
+            operands.iter().all(|operand| is_preceding_path(operand))
+        } else if is_shift_path_tail {
             operands.iter().all(|operand| is_preceding_path(operand))
         } else if is_addition_only_tail {
             operands.iter().all(|operand| is_preceding_path(operand))
@@ -75732,7 +75740,7 @@ property "shared"() {}
     }
 
     #[test]
-    fn function_body_type_check_publishes_binary_path_tail_facts() {
+    fn function_body_type_check_publishes_primitive_path_tail_facts() {
         let root = concat!(
             "pub fn add(left: I32, right: I32) -> I32 { left + right }\n",
             "pub fn add_after_local(left: I32, right: I32) -> I32 {\n",
@@ -75753,6 +75761,10 @@ property "shared"() {}
             "pub fn bitwise_and(left: I32, right: I32) -> I32 { left & right }\n",
             "pub fn bitwise_or(left: I32, right: I32) -> I32 { left | right }\n",
             "pub fn bitwise_xor(left: I32, right: I32) -> I32 { left ^ right }\n",
+            "pub fn shift_left(value: I32, amount: U32) -> I32 { value << amount }\n",
+            "pub fn shift_right(value: I32, amount: U32) -> I32 { value >> amount }\n",
+            "pub fn shift_byte_left(value: Byte, amount: U32) -> Byte { value << amount }\n",
+            "pub fn shift_byte_right(value: Byte, amount: U32) -> Byte { value >> amount }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -75767,11 +75779,12 @@ property "shared"() {}
         let resolved = database
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
-        assert_eq!(resolved.owners().len(), 16);
+        assert_eq!(resolved.owners().len(), 20);
 
-        for (index, expected_type_count) in [3, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
-            .into_iter()
-            .enumerate()
+        for (index, expected_type_count) in
+            [3, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+                .into_iter()
+                .enumerate()
         {
             let owner = &resolved.owners()[index];
             assert!(
@@ -75800,19 +75813,82 @@ property "shared"() {}
                 expected_type_count,
                 "every trusted primitive fact has a canonical projection"
             );
-            let expected_type = if index == 2 || index == 5 {
-                sai_resolve::prelude::PrimTy::F64
-            } else {
-                sai_resolve::prelude::PrimTy::I32
+            let expected_type = match index {
+                2 | 5 => sai_resolve::prelude::PrimTy::F64,
+                18 | 19 => sai_resolve::prelude::PrimTy::Byte,
+                _ => sai_resolve::prelude::PrimTy::I32,
             };
-            assert!(
-                type_results
-                    .expression_types()
-                    .values()
-                    .all(|ty| *ty == expected_type),
-                "all arithmetic operands and results carry the expected {expected_type:?} fact"
-            );
+            let mut expression_types = type_results.expression_types().values();
+            if index >= 16 {
+                assert_eq!(
+                    expression_types
+                        .clone()
+                        .filter(|ty| **ty == expected_type)
+                        .count(),
+                    2,
+                    "the shift left operand and result carry {expected_type:?} facts"
+                );
+                assert_eq!(
+                    expression_types
+                        .filter(|ty| **ty == sai_resolve::prelude::PrimTy::U32)
+                        .count(),
+                    1,
+                    "the shift amount carries a U32 fact"
+                );
+            } else {
+                assert!(
+                    expression_types.all(|ty| *ty == expected_type),
+                    "all arithmetic operands and results carry the expected {expected_type:?} fact"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn function_body_type_check_reports_shift_path_right_mismatch() {
+        let root = "pub fn shift_mismatch(value: I32, amount: I8) -> I32 { value << amount }\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owner = resolved.owners().first().expect("one function is resolved");
+        assert!(
+            owner
+                .local_resolution()
+                .expect("local resolution result is available")
+                .is_some_and(|locals| locals.diagnostics.is_empty()),
+            "the supported shift tail should resolve its local paths without errors"
+        );
+        assert!(
+            owner
+                .resolution()
+                .expect("function resolution result is available")
+                .diagnostics
+                .is_empty(),
+            "the supported shift tail should have no function resolution diagnostics"
+        );
+        assert!(
+            owner.lowering_diagnostics().is_empty(),
+            "the supported shift tail should have no lowering diagnostics"
+        );
+
+        assert!(
+            matches!(
+                owner.body_type_check().expect("body result is available"),
+                FunctionBodyTypeCheck::Supported { diagnostics }
+                    if !diagnostics.is_empty()
+            ),
+            "a shift path tail should retain its U32 right-operand mismatch"
+        );
     }
 
     #[test]
