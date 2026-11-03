@@ -28,6 +28,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Test standalone conformance components
         run: python -B -m unittest discover -s tools/conformance -p 'test_*.py'
+      - name: Generate report-only conformance coverage inventory
+        run: python -B tools/conformance/coverage.py --root "$GITHUB_WORKSPACE" --output target/conformance/coverage.json
 
   stage0-smoke:
     name: Stage 0 smoke (non-claim)
