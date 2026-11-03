@@ -17417,7 +17417,7 @@ fn integer_addition_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 1 + BASE\n",
         "pub const CHAINED: I8 = 1 + 2 + 3\n",
         "pub const NESTED: I8 = (1 + 2) + 3\n",
-        "pub const WRAPPING: I8 = 1 -% 2\n",
+        "pub const MIXED_WRAPPING: I8 = (1 +% 2) -% 3\n",
         "pub const MIXED: I8 = 1 + true\n",
         "pub const BYTE_OPERAND: I8 = 1 + b'\\0'\n",
         "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(1 + 2)\n",
@@ -17612,7 +17612,7 @@ fn integer_subtraction_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 2 - BASE\n",
         "pub const CHAINED: I8 = 1 - 2 - 3\n",
         "pub const NESTED: I8 = (1 - 2) - 3\n",
-        "pub const WRAPPING: I8 = -128 -% 1\n",
+        "pub const MIXED_WRAPPING: I8 = (1 +% 2) -% 3\n",
         "pub const MIXED: I8 = 1 - true\n",
         "pub const BYTE_OPERAND: I8 = 1 - b'\\0'\n",
         "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(1 - 2)\n",
@@ -17817,7 +17817,7 @@ fn integer_division_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 2 / BASE\n",
         "pub const CHAINED: I8 = 8 / 2 / 2\n",
         "pub const NESTED: I8 = (8 / 2) / 2\n",
-        "pub const WRAPPING: I8 = 1 -% 2\n",
+        "pub const MIXED_WRAPPING: I8 = (1 +% 2) -% 3\n",
         "pub const MIXED: I8 = 1 / true\n",
         "pub const FLOAT_DIVISION: F64 = 1.0 / 0.0\n",
         "pub const BYTE_OPERAND: I8 = 1 / b'\\0'\n",
@@ -18015,7 +18015,7 @@ fn integer_remainder_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 2 % BASE\n",
         "pub const CHAINED: I8 = 8 % 3 % 2\n",
         "pub const NESTED: I8 = (8 % 3) % 2\n",
-        "pub const WRAPPING: I8 = 1 -% 2\n",
+        "pub const MIXED_WRAPPING: I8 = (1 +% 2) -% 3\n",
         "pub const MIXED: I8 = 1 % true\n",
         "pub const FLOAT_REMAINDER: F64 = 1.0 % 2.0\n",
         "pub const BYTE_OPERAND: I8 = 1 % b'\\0'\n",
@@ -18083,6 +18083,189 @@ fn integer_remainder_uses_the_selected_pointer_width() {
     assert_success_result(
         run_check(
             unsigned_pointer_value,
+            manifest,
+            &[],
+            &["--target", "wasm64-core"],
+        ),
+        "wasm64-core",
+        "dev",
+    );
+}
+
+#[test]
+fn public_integer_wrapping_sub_const_values_cover_scalar_and_flat_aggregates() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub const I8_VALUE: I8 = -128 -% 1\n",
+        "pub const I16_VALUE: I16 = 32767 -% -1\n",
+        "pub const I32_VALUE: I32 = -2147483648 -% 1\n",
+        "pub const I64_VALUE: I64 = 9223372036854775807 -% -1\n",
+        "pub const ISIZE_VALUE: ISize = 2147483647 -% -1\n",
+        "pub const U8_VALUE: U8 = 0 -% 1\n",
+        "pub const U16_VALUE: U16 = 0 -% 1\n",
+        "pub const U32_VALUE: U32 = 0 -% 1\n",
+        "pub const U64_VALUE: U64 = 0 -% 1\n",
+        "pub const USIZE_VALUE: USize = 0 -% 1\n",
+        "pub const TUPLE_VALUE: (I8, U8, I16) = (-128 -% 1, 0 -% 1, 32767 -% -1)\n",
+        "pub const ARRAY_VALUE: Array<U16, 2> = [0 -% 1, 3 -% 5]\n",
+        "pub const BASE: I32 = 40\n",
+        "pub const MIXED_REFERENCE: (I32, I32) = (3 -% 5, BASE)\n",
+        "pub const MIXED_REFERENCE_ARRAY: Array<I32, 2> = [3 -% 5, BASE]\n",
+    );
+
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", target]),
+            target,
+            "dev",
+        );
+    }
+}
+
+#[test]
+fn integer_wrapping_sub_diagnostics_and_unsupported_forms_are_preserved() {
+    for (source, expected_code, diagnostic_expression) in [
+        (
+            "pub const BAD_LEFT: I8 = -129 -% 1\n",
+            "LITERAL_OUT_OF_RANGE",
+            None,
+        ),
+        (
+            "pub const BAD_RIGHT: I8 = 1 -% 128\n",
+            "LITERAL_OUT_OF_RANGE",
+            None,
+        ),
+        (
+            "pub const BAD_BOTH: I8 = 128 -% 129\n",
+            "LITERAL_OUT_OF_RANGE",
+            None,
+        ),
+        (
+            "pub const BAD_TYPE: Bool = 7 -% 1\n",
+            "TYPE_MISMATCH",
+            Some("7 -% 1"),
+        ),
+        (
+            "pub const BAD_BYTE_STR: Slice<Byte> = 1 -% 2\n",
+            "TYPE_MISMATCH",
+            Some("1 -% 2"),
+        ),
+        (
+            "pub const BAD_TUPLE_LEAF: (Bool,) = (1 -% 2,)\n",
+            "TYPE_MISMATCH",
+            Some("1 -% 2"),
+        ),
+        (
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [1 -% 2]\n",
+            "TYPE_MISMATCH",
+            Some("1 -% 2"),
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && !stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected wrapping-subtraction diagnostics without a panic or feature gate:\n{stdout}"
+        );
+        if let Some(expression) = diagnostic_expression {
+            let start = source
+                .find(expression)
+                .expect("diagnosed wrapping expression exists");
+            assert_json_diagnostic_primary_byte_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                start,
+                start + expression.len(),
+            );
+        }
+    }
+
+    for source in [
+        "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 2 -% BASE\n",
+        "pub const CHAINED: I8 = 1 -% 2 -% 3\n",
+        "pub const NESTED: I8 = (1 -% 2) -% 3\n",
+        "pub const MIXED_WRAPPING: I8 = (1 +% 2) -% 3\n",
+        "pub const WRAPPING_MULTIPLICATION: I8 = 1 *% 2\n",
+        "pub const MIXED: I8 = 1 -% true\n",
+        "pub const FLOAT_WRAPPING_SUB: F64 = 1.0 -% 2.0\n",
+        "pub const BYTE_OPERAND: I8 = b'\\0' -% 1\n",
+        "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(1 -% 2)\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn integer_wrapping_sub_uses_the_selected_pointer_width() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+
+    let signed_pointer_boundary = "pub const SIGNED_WRAP: ISize = 2147483647 -% -1\n";
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(
+                signed_pointer_boundary,
+                manifest,
+                &[],
+                &["--target", target],
+            ),
+            target,
+            "dev",
+        );
+    }
+
+    let unsigned_pointer_underflow = "pub const UNSIGNED_WRAP: USize = 0 -% 1\n";
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(
+                unsigned_pointer_underflow,
+                manifest,
+                &[],
+                &["--target", target],
+            ),
+            target,
+            "dev",
+        );
+    }
+
+    for (source, target) in [
+        (
+            "pub const SIGNED_OUT_OF_RANGE: ISize = 2147483648 -% 0\n",
+            "wasm32-core",
+        ),
+        (
+            "pub const UNSIGNED_OUT_OF_RANGE: USize = 4294967296 -% 0\n",
+            "wasm32-core",
+        ),
+    ] {
+        let output = run_check(source, manifest, &[], &["--target", target]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+                && !stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "pointer-sized operand range checking precedes wrapping subtraction:\n{stdout}"
+        );
+    }
+
+    assert_success_result(
+        run_check(
+            "pub const SIGNED_IN_RANGE: ISize = 2147483648 -% 0\n",
+            manifest,
+            &[],
+            &["--target", "wasm64-core"],
+        ),
+        "wasm64-core",
+        "dev",
+    );
+    assert_success_result(
+        run_check(
+            "pub const UNSIGNED_IN_RANGE: USize = 4294967296 -% 0\n",
             manifest,
             &[],
             &["--target", "wasm64-core"],
@@ -18188,7 +18371,7 @@ fn integer_wrapping_add_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 2 +% BASE\n",
         "pub const CHAINED: I8 = 1 +% 2 +% 3\n",
         "pub const NESTED: I8 = (1 +% 2) +% 3\n",
-        "pub const WRAPPING_SUBTRACTION: I8 = 1 -% 2\n",
+        "pub const MIXED_WRAPPING: I8 = (1 +% 2) -% 3\n",
         "pub const WRAPPING_MULTIPLICATION: I8 = 1 *% 2\n",
         "pub const MIXED: I8 = 1 +% true\n",
         "pub const FLOAT_WRAPPING_ADD: F64 = 1.0 +% 2.0\n",
