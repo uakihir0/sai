@@ -18232,7 +18232,7 @@ fn integer_division_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const NESTED: I8 = (8 / 2) / 2\n",
         "pub const MIXED_WRAPPING: I8 = (1 +% 2) -% 3\n",
         "pub const MIXED: I8 = 1 / true\n",
-        "pub const FLOAT_DIVISION: F64 = 1.0 / 0.0\n",
+        "pub const FLOAT_REMAINDER: F64 = 1.0 % 0.0\n",
         "pub const BYTE_OPERAND: I8 = 1 / b'\\0'\n",
         "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(1 / 2)\n",
     ] {
@@ -19516,7 +19516,7 @@ fn float_addition_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const BASE: F32 = 1.0\npub const PATH_OPERAND: F32 = 1.0 + BASE\n",
         "pub const CHAINED: F32 = 1.0 + 2.0 + 3.0\n",
         "pub const NESTED: F32 = (1.0 + 2.0) + 3.0\n",
-        "pub const OTHER_OPERATOR: F32 = 1.0 / 2.0\n",
+        "pub const OTHER_OPERATOR: F32 = 1.0 % 2.0\n",
         "enum Sum { Value(F32) }\npub const ENUM_PAYLOAD: Sum = Sum.Value(1.0 + 2.0)\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
@@ -19604,7 +19604,7 @@ fn float_subtraction_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const BASE: F32 = 1.0\npub const PATH_OPERAND: F32 = 2.0 - BASE\n",
         "pub const CHAINED: F32 = 5.0 - 2.0 - 1.0\n",
         "pub const NESTED: F32 = (5.0 - 2.0) - 1.0\n",
-        "pub const OTHER_OPERATOR: F32 = 1.0 / 2.0\n",
+        "pub const OTHER_OPERATOR: F32 = 1.0 % 2.0\n",
         "enum Difference { Value(F32) }\npub const ENUM_PAYLOAD: Difference = Difference.Value(1.0 - 2.0)\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
@@ -19698,10 +19698,119 @@ fn float_multiplication_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const BASE: F32 = 1.0\npub const PATH_OPERAND: F32 = 1.0 * BASE\n",
         "pub const CHAINED: F32 = 1.0 * 2.0 * 3.0\n",
         "pub const NESTED: F32 = (1.0 * 2.0) * 3.0\n",
-        "pub const OTHER_OPERATOR: F32 = 1.0 / 2.0\n",
+        "pub const OTHER_OPERATOR: F32 = 1.0 % 2.0\n",
         "pub const MIXED_LEFT: F32 = 1.0 * 2\n",
         "pub const MIXED_RIGHT: F32 = 1 * 2.0\n",
         "enum Product { Value(F32) }\npub const ENUM_PAYLOAD: Product = Product.Value(1.0 * 2.0)\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn public_float_division_const_values_cover_scalars_and_flat_aggregates() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub const F32_BASIC: F32 = 7.5 / 2.5\n",
+        "pub const F32_NEGATIVE: F32 = -6.0 / 2.0\n",
+        "pub const F32_HALF_OPERAND_TIE: F32 = 1.000000059604644775390625 / 1.5\n",
+        "pub const F32_POSITIVE_INFINITY: F32 = 1.0 / 0.0\n",
+        "pub const F32_NEGATIVE_INFINITY: F32 = -1.0 / 0.0\n",
+        "pub const F32_POSITIVE_INFINITY_NEGATIVE_ZERO: F32 = -1.0 / -0.0\n",
+        "pub const F32_NEGATIVE_INFINITY_NEGATIVE_ZERO: F32 = 1.0 / -0.0\n",
+        "pub const F32_NAN: F32 = 0.0 / 0.0\n",
+        "pub const F32_ROUNDED_OPERANDS_NAN: F32 = 1e-46 / 1e-46\n",
+        "pub const F32_SUBNORMAL: F32 = 1.40129846e-45 / 1.0\n",
+        "pub const F32_UNDERFLOW: F32 = 1e-45 / 2.0\n",
+        "pub const F64_BASIC: F64 = 7.5 / 2.5\n",
+        "pub const F64_NEGATIVE: F64 = -6.0 / 2.0\n",
+        "pub const F64_HALF_OPERAND_TIE: F64 = 1.00000000000000011102230246251565404236316680908203125 / 1.5\n",
+        "pub const F64_POSITIVE_INFINITY: F64 = 1.0 / 0.0\n",
+        "pub const F64_NEGATIVE_INFINITY: F64 = -1.0 / 0.0\n",
+        "pub const F64_POSITIVE_INFINITY_NEGATIVE_ZERO: F64 = -1.0 / -0.0\n",
+        "pub const F64_NEGATIVE_INFINITY_NEGATIVE_ZERO: F64 = 1.0 / -0.0\n",
+        "pub const F64_NAN: F64 = 0.0 / 0.0\n",
+        "pub const F64_ROUNDED_OPERANDS_NAN: F64 = 1e-325 / 1e-325\n",
+        "pub const F64_SUBNORMAL: F64 = 5e-324 / 1.0\n",
+        "pub const F64_UNDERFLOW: F64 = 5e-324 / 2.0\n",
+        "pub const TUPLE_VALUE: (F32, F64) = (6.0 / 2.0, -1.0 / 2.0)\n",
+        "pub const ARRAY_VALUE: Array<F32, 2> = [8.0 / 2.0, 5.0 / 5.0]\n",
+        "pub const BASE: F32 = 4.0\n",
+        "pub const MIXED_REFERENCE: (F32, F32) = (6.0 / 2.0, BASE)\n",
+        "pub const MIXED_REFERENCE_ARRAY: Array<F32, 2> = [6.0 / 2.0, BASE]\n",
+        "pub const F32_POSITIVE_OVERFLOW: F32 = 3.4028235e38 / 1e-45\n",
+        "pub const F32_NEGATIVE_OVERFLOW: F32 = -3.4028235e38 / 1e-45\n",
+        "pub const F64_POSITIVE_OVERFLOW: F64 = 1.7976931348623157e308 / 5e-324\n",
+        "pub const F64_NEGATIVE_OVERFLOW: F64 = -1.7976931348623157e308 / 5e-324\n",
+    );
+
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", target]),
+            target,
+            "dev",
+        );
+    }
+}
+
+#[test]
+fn float_division_diagnostics_and_unsupported_forms_are_preserved() {
+    for (source, expected_code, diagnostic_expression) in [
+        (
+            "pub const BAD_DESTINATION: I32 = 4.0 / 2.0\n",
+            "TYPE_MISMATCH",
+            "4.0 / 2.0",
+        ),
+        (
+            "pub const BAD_TUPLE_LEAF: (Bool,) = (4.0 / 2.0,)\n",
+            "TYPE_MISMATCH",
+            "4.0 / 2.0",
+        ),
+        (
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [4.0 / 2.0]\n",
+            "TYPE_MISMATCH",
+            "4.0 / 2.0",
+        ),
+        (
+            "pub const F32_OUT_OF_RANGE: F32 = 3.4028236e38 / 1.0\n",
+            "LITERAL_OUT_OF_RANGE",
+            "3.4028236e38",
+        ),
+        (
+            "pub const F64_OUT_OF_RANGE: F64 = 1.0 / 1.7976931348623159e308\n",
+            "LITERAL_OUT_OF_RANGE",
+            "1.7976931348623159e308",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"code\":\"CONST_EVAL_PANIC\""),
+            "{source:?}: expected a checked float division diagnostic without a value, feature gate, or panic:\n{stdout}"
+        );
+        let span_start = source
+            .find(diagnostic_expression)
+            .expect("diagnostic span text exists");
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            expected_code,
+            span_start,
+            span_start + diagnostic_expression.len(),
+        );
+    }
+
+    for source in [
+        "pub const BASE: F32 = 2.0\npub const PATH_OPERAND: F32 = 1.0 / BASE\n",
+        "pub const CHAINED: F32 = 8.0 / 2.0 / 2.0\n",
+        "pub const NESTED: F32 = (8.0 / 2.0) / 2.0\n",
+        "pub const REMAINDER: F32 = 5.0 % 2.0\n",
+        "pub const MIXED_LEFT: F32 = 1.0 / 2\n",
+        "pub const MIXED_RIGHT: F32 = 1 / 2.0\n",
+        "enum Quotient { Value(F32) }\npub const ENUM_PAYLOAD: Quotient = Quotient.Value(4.0 / 2.0)\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
     }
