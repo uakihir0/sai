@@ -17410,8 +17410,299 @@ fn integer_bitwise_const_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const CHAINED: I8 = 1 & 2 & 3\n",
         "pub const NESTED: I8 = (1 & 2) | 3\n",
         "pub const BOOL_OPERANDS: Bool = true & false\n",
-        "pub const SHIFT: I8 = 1 << 2\n",
+        "pub const BASE: U32 = 2\npub const SHIFT_PATH: I8 = 1 << BASE\n",
         "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(1 & 2)\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn public_integer_shift_const_values_cover_scalar_and_flat_aggregates() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub const I8_LEFT: I8 = 64 << 1\n",
+        "pub const I8_RIGHT: I8 = -8 >> 2\n",
+        "pub const I16_LEFT: I16 = 16384 << 1\n",
+        "pub const I16_RIGHT: I16 = -1024 >> 3\n",
+        "pub const I32_LEFT: I32 = 1073741824 << 1\n",
+        "pub const I32_RIGHT: I32 = -256 >> 4\n",
+        "pub const I64_LEFT: I64 = 4611686018427387904 << 1\n",
+        "pub const I64_RIGHT: I64 = -4096 >> 6\n",
+        "pub const ISIZE_LEFT: ISize = 1 << 7\n",
+        "pub const ISIZE_RIGHT: ISize = -256 >> 7\n",
+        "pub const U8_LEFT: U8 = 1 << 7\n",
+        "pub const U8_LEFT_DISCARD: U8 = 255 << 1\n",
+        "pub const U8_RIGHT: U8 = 255 >> 7\n",
+        "pub const U16_LEFT: U16 = 1 << 15\n",
+        "pub const U16_RIGHT: U16 = 65535 >> 15\n",
+        "pub const U32_LEFT: U32 = 1 << 31\n",
+        "pub const U32_RIGHT: U32 = 4294967295 >> 31\n",
+        "pub const U64_LEFT: U64 = 4611686018427387904 << 1\n",
+        "pub const U64_RIGHT: U64 = 18446744073709551615 >> 63\n",
+        "pub const USIZE_LEFT: USize = 1 << 31\n",
+        "pub const USIZE_RIGHT: USize = 4294967295 >> 31\n",
+        "pub const BYTE_LEFT: Byte = b'\\x01' << 7\n",
+        "pub const BYTE_RIGHT: Byte = b'\\x80' >> 7\n",
+        "pub const TUPLE_VALUE: (I8, U16, Byte) = (-8 >> 2, 1 << 15, b'\\x01' << 7)\n",
+        "pub const ARRAY_VALUE: Array<I8, 2> = [-8 >> 2, 64 << 1]\n",
+        "pub const BASE: I8 = 5\n",
+        "pub const MIXED_REFERENCE: (I8, I8) = (1 << 1, BASE)\n",
+    );
+
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", target]),
+            target,
+            "dev",
+        );
+    }
+}
+
+#[test]
+fn integer_shift_const_diagnostics_and_unsupported_forms_are_preserved() {
+    let overflow_source = "pub const OVERFLOW: I8 = 1 /* << is not the operator */ << 8\n";
+    let overflow_output = run_check(overflow_source, "", &[], &[]);
+    let overflow_stdout = String::from_utf8(overflow_output.stdout).expect("CLI stdout is UTF-8");
+    let operator_start = overflow_source.rfind("<<").expect("shift operator exists");
+    assert_eq!(
+        overflow_output.status.code(),
+        Some(1),
+        "oversized shift should fail the check:\n{overflow_stdout}"
+    );
+    assert!(
+        overflow_stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+            && overflow_stdout.contains("ShiftOverflow")
+            && overflow_stdout.contains("shift amount out of range")
+            && !overflow_stdout.contains("\"type\":\"result\"")
+            && !overflow_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "shift overflow is a checked const-evaluation panic, not a feature gate:\n{overflow_stdout}"
+    );
+    assert_json_diagnostic_primary_byte_span(
+        &overflow_stdout,
+        "CONST_EVAL_PANIC",
+        operator_start,
+        operator_start + "<<".len(),
+    );
+
+    let right_overflow_source = "pub const RIGHT_OVERFLOW: I8 = -1 >> 8\n";
+    let right_overflow_output = run_check(right_overflow_source, "", &[], &[]);
+    let right_overflow_stdout =
+        String::from_utf8(right_overflow_output.stdout).expect("CLI stdout is UTF-8");
+    let right_operator_start = right_overflow_source.rfind(">>").unwrap();
+    assert_eq!(
+        right_overflow_output.status.code(),
+        Some(1),
+        "oversized right shift should fail the check:\n{right_overflow_stdout}"
+    );
+    assert!(
+        right_overflow_stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+            && right_overflow_stdout.contains("ShiftOverflow")
+            && !right_overflow_stdout.contains("\"type\":\"result\"")
+            && !right_overflow_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "right shift overflow is a checked const-evaluation panic:\n{right_overflow_stdout}"
+    );
+    assert_json_diagnostic_primary_byte_span(
+        &right_overflow_stdout,
+        "CONST_EVAL_PANIC",
+        right_operator_start,
+        right_operator_start + ">>".len(),
+    );
+
+    for (source, bad_literal) in [
+        ("pub const BAD_LEFT: I8 = 128 << 1\n", "128"),
+        ("pub const BAD_COUNT: I8 = 1 << 4294967296\n", "4294967296"),
+        ("pub const NEGATIVE_COUNT: I8 = 1 << -1\n", "-1"),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let bad_start = source.find(bad_literal).expect("invalid literal exists");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected an operand range diagnostic and no evaluation:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            "LITERAL_OUT_OF_RANGE",
+            bad_start,
+            bad_start + bad_literal.len(),
+        );
+    }
+
+    let both_out_of_range = "pub const BAD_BOTH: I8 = 128 << 4294967296\n";
+    let both_output = run_check(both_out_of_range, "", &[], &[]);
+    let both_stdout = String::from_utf8(both_output.stdout).expect("CLI stdout is UTF-8");
+    let both_records = both_stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""))
+        .collect::<Vec<_>>();
+    let bad_left_start = both_out_of_range.find("128").unwrap();
+    let bad_count_start = both_out_of_range.find("4294967296").unwrap();
+    assert_eq!(both_output.status.code(), Some(1), "{both_stdout}");
+    assert_eq!(
+        both_records.len(),
+        2,
+        "both invalid operands retain range diagnostics:\n{both_stdout}"
+    );
+    let diagnostic_spans = both_records
+        .iter()
+        .map(|record| {
+            let primary = record
+                .split_once("\"primary\":")
+                .expect("range diagnostic has a primary span")
+                .1
+                .split_once(",\"primary_label\":")
+                .expect("primary span ends before the label")
+                .0;
+            let byte_offset = |marker: &str| {
+                primary
+                    .split_once(marker)
+                    .expect("primary span contains byte offset")
+                    .1
+                    .split_once(',')
+                    .expect("byte offset is followed by another field")
+                    .0
+                    .parse::<usize>()
+                    .expect("byte offset is an integer")
+            };
+            (
+                byte_offset("\"start\":{\"byte\":"),
+                byte_offset("\"end\":{\"byte\":"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        diagnostic_spans,
+        vec![
+            (bad_left_start, bad_left_start + "128".len()),
+            (bad_count_start, bad_count_start + "4294967296".len()),
+        ],
+        "operand range diagnostics are reported in source order:\n{both_stdout}"
+    );
+    assert!(
+        !both_stdout.contains("\"type\":\"result\"")
+            && !both_stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+            && !both_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "invalid operands suppress shift evaluation and the unsupported-form gate:\n{both_stdout}"
+    );
+
+    let pointer_boundary = concat!(
+        "pub const ISIZE_SHIFT_BOUNDARY: ISize = 1 << 32\n",
+        "pub const USIZE_SHIFT_BOUNDARY: USize = 1 << 32\n",
+    );
+    let wasm32 = run_check(
+        pointer_boundary,
+        "targets { wasm32-core, wasm64-core }\n",
+        &[],
+        &["--target", "wasm32-core"],
+    );
+    let wasm32_stdout = String::from_utf8(wasm32.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(wasm32.status.code(), Some(1), "{wasm32_stdout}");
+    assert_eq!(
+        wasm32_stdout
+            .matches("\"code\":\"CONST_EVAL_PANIC\"")
+            .count(),
+        2,
+        "both pointer-sized types use the selected 32-bit width:\n{wasm32_stdout}"
+    );
+    assert!(!wasm32_stdout.contains("\"type\":\"result\""));
+
+    assert_success_result(
+        run_check(
+            pointer_boundary,
+            "targets { wasm32-core, wasm64-core }\n",
+            &[],
+            &["--target", "wasm64-core"],
+        ),
+        "wasm64-core",
+        "dev",
+    );
+
+    let width_boundaries = concat!(
+        "pub const U64_SHIFT_BOUNDARY: U64 = 1 << 64\n",
+        "pub const USIZE_SHIFT_BOUNDARY: USize = 1 << 64\n",
+    );
+    for target in ["wasm32-core", "wasm64-core"] {
+        let output = run_check(
+            width_boundaries,
+            "targets { wasm32-core, wasm64-core }\n",
+            &[],
+            &["--target", target],
+        );
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{target}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"CONST_EVAL_PANIC\"").count(),
+            2,
+            "both 64-bit unsigned width boundaries panic for {target}:\n{stdout}"
+        );
+        assert!(!stdout.contains("\"type\":\"result\""));
+        assert!(!stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+    }
+
+    for (source, expression) in [
+        (
+            "pub const BAD_BYTE_COUNT: I8 = 1 << b'\\x01'\n",
+            "1 << b'\\x01'",
+        ),
+        ("pub const BAD_BOOL_COUNT: I8 = 1 << true\n", "1 << true"),
+        ("pub const BAD_CHAR_COUNT: I8 = 1 << 'a'\n", "1 << 'a'"),
+        ("pub const BAD_FLOAT_COUNT: I8 = 1 << 1.5\n", "1 << 1.5"),
+        (
+            "pub const BAD_STRING_COUNT: I8 = 1 << \"count\"\n",
+            "1 << \"count\"",
+        ),
+        (
+            "pub const BAD_BYTE_STRING_COUNT: I8 = 1 << b\"count\"\n",
+            "1 << b\"count\"",
+        ),
+        (
+            "pub const BAD_LEFT_TYPE: I8 = b'\\x01' << 1\n",
+            "b'\\x01' << 1",
+        ),
+        ("pub const BAD_BOOL: Bool = 1 << 1\n", "1 << 1"),
+        ("pub const BAD_BYTE_STR: Slice<Byte> = 1 << 2\n", "1 << 2"),
+        ("pub const BAD_TUPLE_LEAF: (Bool,) = (1 << 1,)\n", "1 << 1"),
+        (
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [1 << 1]\n",
+            "1 << 1",
+        ),
+        ("pub const BAD_TUPLE_SHAPE: (I8,) = 1 << 2\n", "1 << 2"),
+        (
+            "pub const BAD_ARRAY_SHAPE: Array<I8, 1> = 1 << 2\n",
+            "1 << 2",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let start = source
+            .find(expression)
+            .expect("diagnosed expression exists");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a checked mismatch without a result or feature gate:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            start,
+            start + expression.len(),
+        );
+    }
+
+    for source in [
+        "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 1 << BASE\n",
+        "pub const CHAINED: I8 = 1 << 2 << 1\n",
+        "pub const NESTED: I8 = (1 << 2) << 1\n",
+        "pub const BOOL_LEFT: Bool = true << 1\n",
+        "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(1 << 2)\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
     }
