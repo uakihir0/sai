@@ -8424,6 +8424,7 @@ enum ConstIntegerArithmeticOp {
     Sub,
     Mul,
     Div,
+    Rem,
 }
 
 impl ConstIntegerArithmeticOp {
@@ -8433,6 +8434,7 @@ impl ConstIntegerArithmeticOp {
             Self::Sub => sai_syntax::SyntaxKind::MINUS,
             Self::Mul => sai_syntax::SyntaxKind::STAR,
             Self::Div => sai_syntax::SyntaxKind::SLASH,
+            Self::Rem => sai_syntax::SyntaxKind::PERCENT,
         }
     }
 
@@ -8442,6 +8444,7 @@ impl ConstIntegerArithmeticOp {
             Self::Sub => "Overflow(Sub)",
             Self::Mul => "Overflow(Mul)",
             Self::Div => "Overflow(Div)",
+            Self::Rem => "RemByZero",
         }
     }
 
@@ -8451,6 +8454,7 @@ impl ConstIntegerArithmeticOp {
             Self::Sub => "integer overflow in subtraction",
             Self::Mul => "integer overflow in multiplication",
             Self::Div => "integer overflow in division",
+            Self::Rem => "remainder by zero",
         }
     }
 }
@@ -8459,6 +8463,7 @@ impl ConstIntegerArithmeticOp {
 enum ConstIntegerArithmeticPanic {
     Overflow,
     DivisionByZero,
+    RemainderByZero,
 }
 
 enum ConstIntegerArithmeticResult {
@@ -8481,6 +8486,7 @@ fn const_integer_arithmetic_operands<'hir>(
         BinOp::Sub => ConstIntegerArithmeticOp::Sub,
         BinOp::Mul => ConstIntegerArithmeticOp::Mul,
         BinOp::Div => ConstIntegerArithmeticOp::Div,
+        BinOp::Rem => ConstIntegerArithmeticOp::Rem,
         _ => return None,
     };
     (matches!(left.kind, ExprKind::Lit(Lit::Int { .. }))
@@ -8541,6 +8547,13 @@ fn evaluate_const_integer_arithmetic(
                     ));
                 }
                 ConstIntegerArithmeticOp::Div => left.checked_div(right),
+                ConstIntegerArithmeticOp::Rem if right == 0 => {
+                    return Some(ConstIntegerArithmeticResult::Panic(
+                        ConstIntegerArithmeticPanic::RemainderByZero,
+                    ));
+                }
+                ConstIntegerArithmeticOp::Rem if left == minimum && right == -1 => Some(0),
+                ConstIntegerArithmeticOp::Rem => left.checked_rem(right),
             };
             let Some(result) = arithmetic_result else {
                 return Some(ConstIntegerArithmeticResult::Panic(
@@ -8583,6 +8596,12 @@ fn evaluate_const_integer_arithmetic(
                     ));
                 }
                 ConstIntegerArithmeticOp::Div => left.checked_div(right),
+                ConstIntegerArithmeticOp::Rem if right == 0 => {
+                    return Some(ConstIntegerArithmeticResult::Panic(
+                        ConstIntegerArithmeticPanic::RemainderByZero,
+                    ));
+                }
+                ConstIntegerArithmeticOp::Rem => left.checked_rem(right),
             };
             let Some(result) = arithmetic_result else {
                 return Some(ConstIntegerArithmeticResult::Panic(
@@ -14553,6 +14572,9 @@ fn check_const_literal_against_type(
                     }
                     ConstIntegerArithmeticPanic::DivisionByZero => {
                         ("DivByZero", "division by zero")
+                    }
+                    ConstIntegerArithmeticPanic::RemainderByZero => {
+                        ("RemByZero", "remainder by zero")
                     }
                 };
                 diagnostics.push(const_literal_diagnostic(
@@ -82983,6 +83005,436 @@ property "shared"() {}
     }
 
     #[test]
+    fn const_direct_integer_remainder_checks_types_and_materializes_aggregates() {
+        use sai_resolve::prelude::PrimTy;
+        use sai_ty::ty::{IntTy, UintTy};
+
+        let root = concat!(
+            "pub const I8_VALUE: I8 = -7 % 3\n",
+            "pub const I16_VALUE: I16 = 7 % 3\n",
+            "pub const I32_VALUE: I32 = -7 % -3\n",
+            "pub const I64_VALUE: I64 = 7 % -3\n",
+            "pub const ISIZE_VALUE: ISize = -7 % -3\n",
+            "pub const U8_VALUE: U8 = 255 % 7\n",
+            "pub const U16_VALUE: U16 = 65535 % 256\n",
+            "pub const U32_VALUE: U32 = 4294967295 % 65536\n",
+            "pub const U64_VALUE: U64 = 18446744073709551615 % 10\n",
+            "pub const USIZE_VALUE: USize = 4294967295 % 10\n",
+            "pub const TUPLE_VALUE: (I8, U8, I32) = (-7 % 3, 255 % 10, 21 % -2)\n",
+            "pub const ARRAY_VALUE: Array<U16, 2> = [65535 % 256, 6 % 4]\n",
+            "pub const BASE: I32 = 40\n",
+            "pub const MIXED_REFERENCE: (I32, I32) = (3 % 5, BASE)\n",
+            "pub const MIXED_REFERENCE_ARRAY: Array<I32, 2> = [3 % 5, BASE]\n",
+        );
+
+        for target in ["wasm32-core", "wasm64-core"] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+
+            let expected_scalars = [
+                ConstValue::Int {
+                    value: -1,
+                    ty: IntTy::I8,
+                },
+                ConstValue::Int {
+                    value: 1,
+                    ty: IntTy::I16,
+                },
+                ConstValue::Int {
+                    value: -1,
+                    ty: IntTy::I32,
+                },
+                ConstValue::Int {
+                    value: 1,
+                    ty: IntTy::I64,
+                },
+                ConstValue::Int {
+                    value: -1,
+                    ty: IntTy::ISize,
+                },
+                ConstValue::Uint {
+                    value: 3,
+                    ty: UintTy::U8,
+                },
+                ConstValue::Uint {
+                    value: 255,
+                    ty: UintTy::U16,
+                },
+                ConstValue::Uint {
+                    value: 65_535,
+                    ty: UintTy::U32,
+                },
+                ConstValue::Uint {
+                    value: 5,
+                    ty: UintTy::U64,
+                },
+                ConstValue::Uint {
+                    value: 5,
+                    ty: UintTy::USize,
+                },
+            ];
+            assert_eq!(resolved.owners().len(), 15);
+            for (index, expected) in expected_scalars.into_iter().enumerate() {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check uses the current owner snapshot");
+                assert!(
+                    check.is_supported() && check.is_valid() && check.requires_const_value(),
+                    "supported integer remainder at owner index {index}: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("const evaluation succeeds"),
+                    Some(expected),
+                    "integer remainder result at owner index {index} for {target}"
+                );
+            }
+
+            assert_eq!(
+                resolved.owners()[10]
+                    .const_value()
+                    .expect("flat tuple evaluation succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![
+                        ConstValue::Int {
+                            value: -1,
+                            ty: IntTy::I8,
+                        },
+                        ConstValue::Uint {
+                            value: 5,
+                            ty: UintTy::U8,
+                        },
+                        ConstValue::Int {
+                            value: 1,
+                            ty: IntTy::I32,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[11]
+                    .const_value()
+                    .expect("flat array evaluation succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::U16),
+                    elements: vec![
+                        ConstValue::Uint {
+                            value: 255,
+                            ty: UintTy::U16,
+                        },
+                        ConstValue::Uint {
+                            value: 2,
+                            ty: UintTy::U16,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[13]
+                    .const_value()
+                    .expect("mixed tuple template materialization succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![
+                        ConstValue::Int {
+                            value: 3,
+                            ty: IntTy::I32,
+                        },
+                        ConstValue::Int {
+                            value: 40,
+                            ty: IntTy::I32,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[14]
+                    .const_value()
+                    .expect("mixed array template materialization succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::I32),
+                    elements: vec![
+                        ConstValue::Int {
+                            value: 3,
+                            ty: IntTy::I32,
+                        },
+                        ConstValue::Int {
+                            value: 40,
+                            ty: IntTy::I32,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn const_direct_integer_remainder_reports_zero_ranges_and_exact_operator() {
+        let root = concat!(
+            "pub const ZERO_SIGNED: I8 = 12 /* comment % is not operator */ % -0\n",
+            "pub const ZERO_UNSIGNED: U8 = 1 % 0\n",
+            "pub const I8_MIN: I8 = -128 % -1\n",
+            "pub const I16_MIN: I16 = -32768 % -1\n",
+            "pub const I32_MIN: I32 = -2147483648 % -1\n",
+            "pub const I64_MIN: I64 = -9223372036854775808 % -1\n",
+            "pub const ISIZE32_MIN: ISize = -2147483648 % -1\n",
+            "pub const ISIZE64_MIN: ISize = -9223372036854775808 % -1\n",
+            "pub const USIZE_OUT_OF_RANGE: USize = 4294967296 % 3\n",
+            "pub const BAD_LEFT: I8 = 128 % 0\n",
+            "pub const BAD_RIGHT: I8 = 1 % 128\n",
+            "pub const BAD_BOTH: I8 = 128 % 129\n",
+            "pub const BAD_BOOL: Bool = 7 % 1\n",
+            "pub const BAD_BYTE_STR: Slice<Byte> = 1 % 2\n",
+            "pub const BAD_TUPLE: (Bool,) = (1 % 2,)\n",
+            "pub const BAD_ARRAY: Array<Bool, 1> = [1 % 2]\n",
+            "pub const BASE: I8 = 1\n",
+            "pub const PATH_OPERAND: I8 = 2 % BASE\n",
+            "pub const CHAINED: I8 = 8 % 3 % 2\n",
+            "pub const NESTED: I8 = (8 % 3) % 2\n",
+            "pub const WRAPPING: I8 = 1 +% 2\n",
+            "pub const MIXED: I8 = 1 % true\n",
+            "pub const FLOAT_REMAINDER: F64 = 1.0 % 2.0\n",
+            "pub const BYTE_OPERAND: I8 = 1 % b'\\0'\n",
+            "enum Bits { One(I8) }\n",
+            "pub const ENUM_PAYLOAD: Bits = Bits.One(1 % 2)\n",
+        );
+
+        for target in ["wasm32-core", "wasm64-core"] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+
+            assert_eq!(resolved.owners().len(), 25);
+            for index in [0, 1] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("zero remainder remains a supported checked expression");
+                assert!(check.is_supported());
+                assert!(!check.is_valid());
+                assert_eq!(check.diagnostics().len(), 1);
+                assert_eq!(
+                    check.diagnostics()[0].code,
+                    sai_diagnostics::Code::ConstEvalPanic
+                );
+                assert!(
+                    check.diagnostics()[0].message.contains("RemByZero")
+                        && check.diagnostics()[0].message.contains("remainder by zero"),
+                    "zero remainder uses its specified panic kind and message: {:?}",
+                    check.diagnostics()[0]
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("zero remainder does not fail resolution"),
+                    None
+                );
+            }
+            let zero_remainder_range = resolved.owners()[0]
+                .literal_check()
+                .expect("zero remainder span check succeeds")
+                .diagnostics()[0]
+                .primary()
+                .expect("zero-remainder primary span points at the operator")
+                .span
+                .range;
+            let zero_remainder_start = root
+                .find("*/ % -0")
+                .expect("remainder before negative zero after comment exists")
+                + "*/ ".len();
+            assert_eq!(
+                zero_remainder_range.start().to_usize(),
+                zero_remainder_start
+            );
+            assert_eq!(
+                zero_remainder_range.end().to_usize(),
+                zero_remainder_start + 1
+            );
+
+            for index in 2..=6 {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("signed minimum remainder remains supported");
+                assert!(
+                    check.is_supported() && check.is_valid() && check.requires_const_value(),
+                    "signed MIN % -1 is a valid checked expression: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("signed minimum remainder evaluation succeeds"),
+                    Some(ConstValue::Int {
+                        value: 0,
+                        ty: match index {
+                            2 => sai_ty::ty::IntTy::I8,
+                            3 => sai_ty::ty::IntTy::I16,
+                            4 => sai_ty::ty::IntTy::I32,
+                            5 => sai_ty::ty::IntTy::I64,
+                            6 => sai_ty::ty::IntTy::ISize,
+                            _ => unreachable!(),
+                        },
+                    })
+                );
+            }
+
+            let isize64_min_check = resolved.owners()[7]
+                .literal_check()
+                .expect("pointer-width minimum remainder remains supported");
+            assert!(isize64_min_check.is_supported());
+            assert_eq!(
+                resolved.owners()[7]
+                    .const_value()
+                    .expect("pointer-width minimum remainder resolves"),
+                (target_cfg.pointer_width() == 64).then_some(ConstValue::Int {
+                    value: 0,
+                    ty: sai_ty::ty::IntTy::ISize,
+                })
+            );
+            assert_eq!(
+                isize64_min_check.diagnostics().len(),
+                usize::from(target_cfg.pointer_width() == 32)
+            );
+            if target_cfg.pointer_width() == 32 {
+                assert_eq!(
+                    isize64_min_check.diagnostics()[0].code,
+                    sai_diagnostics::Code::LiteralOutOfRange
+                );
+            }
+
+            let usize_range_check = resolved.owners()[8]
+                .literal_check()
+                .expect("pointer-width remainder operand check remains supported");
+            assert!(usize_range_check.is_supported());
+            assert_eq!(
+                resolved.owners()[8]
+                    .const_value()
+                    .expect("pointer-width remainder resolves"),
+                (target_cfg.pointer_width() == 64).then_some(ConstValue::Uint {
+                    value: 1,
+                    ty: sai_ty::ty::UintTy::USize,
+                })
+            );
+            assert_eq!(
+                usize_range_check.diagnostics().len(),
+                usize::from(target_cfg.pointer_width() == 32)
+            );
+            if target_cfg.pointer_width() == 32 {
+                assert_eq!(
+                    usize_range_check.diagnostics()[0].code,
+                    sai_diagnostics::Code::LiteralOutOfRange
+                );
+            }
+
+            for (index, expected_diagnostics) in [(9, 1), (10, 1), (11, 2)] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("invalid operand ranges remain checked");
+                assert!(check.is_supported());
+                assert!(!check.is_valid());
+                assert_eq!(check.diagnostics().len(), expected_diagnostics);
+                assert!(
+                    check
+                        .diagnostics()
+                        .iter()
+                        .all(|diagnostic| diagnostic.code
+                            == sai_diagnostics::Code::LiteralOutOfRange),
+                    "operand range errors suppress remainder panic diagnostics: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("invalid operand evaluation does not fail resolution"),
+                    None
+                );
+            }
+            let both_out_of_range = resolved.owners()[11]
+                .literal_check()
+                .expect("both operand range diagnostics are retained")
+                .diagnostics();
+            let first_bad_literal = root
+                .find("128 % 129")
+                .expect("both-invalid remainder exists");
+            for (diagnostic, expected_start, expected_length) in [
+                (&both_out_of_range[0], first_bad_literal, "128".len()),
+                (
+                    &both_out_of_range[1],
+                    first_bad_literal + "128 % ".len(),
+                    "129".len(),
+                ),
+            ] {
+                let range = diagnostic
+                    .primary()
+                    .expect("range diagnostic points at its operand")
+                    .span
+                    .range;
+                assert_eq!(range.start().to_usize(), expected_start);
+                assert_eq!(range.end().to_usize(), expected_start + expected_length);
+            }
+
+            for index in 12..=15 {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("wrong result type remains checked");
+                assert!(check.is_supported());
+                assert!(!check.is_valid());
+                assert_eq!(check.diagnostics().len(), 1);
+                assert_eq!(
+                    check.diagnostics()[0].code,
+                    sai_diagnostics::Code::TypeMismatch
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("type mismatch evaluation does not fail resolution"),
+                    None
+                );
+            }
+
+            for index in 17..=24 {
+                assert_eq!(
+                    resolved.owners()[index]
+                        .literal_check()
+                        .expect("unsupported expression remains resolvable"),
+                    &ConstLiteralCheck::Unsupported,
+                    "paths, composed/wrapping/remainder-float/mixed operands, and enum payloads remain gated at owner index {index}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("unsupported evaluation does not fail resolution"),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
     fn const_direct_integer_division_reports_zero_overflow_ranges_and_exact_operator() {
         let root = concat!(
             "pub const DIV_BY_ZERO: I8 = 12 /* comment / is not operator */ / 0\n",
@@ -83256,13 +83708,31 @@ property "shared"() {}
                 }
             );
 
-            for index in 12..=20 {
+            let remainder_check = resolved.owners()[16]
+                .literal_check()
+                .expect("direct integer remainder is supported after its implementation");
+            assert!(
+                remainder_check.is_supported()
+                    && remainder_check.is_valid()
+                    && remainder_check.requires_const_value()
+            );
+            assert_eq!(
+                resolved.owners()[16]
+                    .const_value()
+                    .expect("direct integer remainder evaluates"),
+                Some(ConstValue::Int {
+                    value: 1,
+                    ty: sai_ty::ty::IntTy::I8,
+                })
+            );
+
+            for index in [12, 13, 14, 15, 17, 18, 19, 20] {
                 assert_eq!(
                     resolved.owners()[index]
                         .literal_check()
                         .expect("unsupported expression remains resolvable"),
                     &ConstLiteralCheck::Unsupported,
-                    "paths, composed/wrapping/remainder/float/mixed operators, and enum payloads remain gated at owner index {index}"
+                    "paths, composed/wrapping/mixed/float operators, and enum payloads remain gated at owner index {index}"
                 );
                 assert_eq!(
                     resolved.owners()[index]
