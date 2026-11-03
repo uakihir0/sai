@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1111 (2026-11-03): evaluate direct integer literal constants
+
+- **Decision — review required:** Extend the bounded evaluator with typed `ConstValue::Int { value: i128, ty: IntTy }` and `ConstValue::Uint { value: u128, ty: UintTy }` values for valid direct HIR integer literals.
+- **Reason:** §3.7.15 defines exact typed integer values, while the existing literal checker already validates all ten integer primitive bounds and applies the selected target pointer width to `ISize`/`USize`. The HIR preserves a directly preceding minus as a magnitude plus `negated` flag, so the evaluator can reconstruct the mathematical value after validation without duplicating range checks.
+- **Boundary and judgment:** Require values for valid direct integer literals alongside Bool, Char, Byte, and canonical `Str` in the existing CLI success slice. Preserve the resolved semantic type in each value; `Int` and `UInt` therefore produce `I64` and `U64` values. Convert validated signed magnitudes to `i128` and use checked negation; convert validated unsigned magnitudes to `u128` and use checked negation so `-0` remains zero while negative nonzero values cannot produce a value. Other computed expressions and general unary evaluation remain gated. This is an inferred Stage 0 order because the plan has no numbered post-IR-1107 evaluator items.
+- **Review required:** Verify minimum and maximum values for fixed-width signed and unsigned types, zero and `-0`, the `Int`/`UInt` aliases, both `ISize`/`USize` target widths, safe handling of unrepresentable magnitudes, no values after range diagnostics, and no evaluation of computed integer expressions. Confirm floats, unit, and tuples retain their checked-only coverage.
+- **Verification:** The focused driver tests `const_integer_literals_produce_typed_values_at_every_primitive_width` and `const_integer_literals_without_valid_direct_values_remain_unvalued`, the complete 482-test `check_empty_source` CLI integration target, and `rtk proxy mise exec rust@1.99.1 -- cargo test --workspace --locked --offline --quiet` passed (including 821 driver tests; two existing tests remain ignored). `rtk proxy mise exec rust@1.99.1 -- cargo fmt --all -- --check` and `rtk git diff --check` passed.
+- **Hostile review:** One read-only review found no code or test defect. A second confirmed the value representation, bounds, aliases, and target-width behavior; it found one stale CLI value-gate sentence in §3.7.15, which was corrected and confirmed in a read-only follow-up. No actionable findings remain.
+
 ### IR-1110 (2026-11-03): evaluate direct Char, Byte, and canonical Str constants
 
 - **Decision — review required:** Extend the bounded evaluator with `ConstValue::Char`, `ConstValue::Byte`, and `ConstValue::Str` for matching direct HIR literals in the existing public, attribute-free, canonically named constant slice.
