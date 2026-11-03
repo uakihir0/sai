@@ -239,6 +239,37 @@ tries `sai check` before the documented `sai build` fallback, checks each Fix
 with `sai check`, and verifies formatter fixed points or the exact marked
 lexical refusal behavior.
 
+## Conformance coverage inventory (report-only)
+
+`python3 -B tools/conformance/coverage.py --root . --output target/conformance/coverage.json`
+validates the specification references and diagnostic expectations in every
+discovered fixture, inventories the lowest-level numbered headings in the covered
+document scopes of §15.9.2, and writes a deterministic JSON report containing
+section-to-test mappings and uncovered sections, diagnostic codes, and panic
+kinds. This initial inventory reads `tests/conformance`; generated tests in
+`tests/spec/` are not present yet. Directory fixtures use directives from
+their root `sai.package` and scan their source `.sai` files for diagnostic
+annotations; reserved `.expected.sai` and `.fixed.sai` outputs, `expected/`
+directories, and `.wit` and `.mir` trees do not count as tests.
+
+The inventory is intentionally report-only. It does not run the IUT, check the
+required-content matrix of §15.9.1, verify hard-code JSON goldens, generate or
+check the §1.5.4 limit tests, or substantiate a claim. The repository does not
+yet record its implemented stages, so coverage is not a CI merge gate.
+`run-panic` annotations identify a location but not a panic kind, and panic
+reports carry no kind field; therefore the report leaves every panic kind
+uncovered instead of inferring one from source text.
+
+The exemption-list files are required inputs; add rows only after review.
+Blank lines and `#` comments are ignored. A section exemption uses
+`<document> §<section> | <reason>`, where the reason is `informative`,
+`decisions`, `diagnostics`, or `generated §15.8.<n>`; generated-section anchors
+must resolve in `impl/15`. A diagnostic-code exemption uses
+`<CODE> | <reason> | §15.12.<section>` and is limited to
+`INTERNAL_COMPILER_ERROR` (§15.12.3), `SOURCE_READ_FAILED` (§15.12.5), and
+`IMPLEMENTATION_LIMIT_EXCEEDED` (§15.12.2). These formats make omissions
+explicit; they do not waive the need to review the exemption itself.
+
 For `INVALID_ESCAPE` and `MALFORMED_NUMBER`, the runner accepts only the exact
 current `sai check` `FEATURE_NOT_IMPLEMENTED` gate alongside the required
 diagnostic. It still rejects every other unmarked diagnostic. This reflects the
