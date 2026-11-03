@@ -7655,6 +7655,7 @@ fn check_function_body_type(
                 allow_wrapping_path_tail: true,
                 allow_bitwise_path_tail: true,
                 allow_shift_path_tail: true,
+                allow_shift_literal_count_tail: true,
                 allow_unary_path_tail: true,
                 allow_bool_literal_not_tail: true,
                 allow_logical_tail: true,
@@ -8406,6 +8407,7 @@ fn check_inherent_method_body_type(
             allow_wrapping_path_tail: false,
             allow_bitwise_path_tail: false,
             allow_shift_path_tail: false,
+            allow_shift_literal_count_tail: false,
             allow_unary_path_tail: true,
             allow_bool_literal_not_tail: false,
             allow_logical_tail: true,
@@ -8904,6 +8906,7 @@ struct PrimitiveLocalBlockGates {
     allow_wrapping_path_tail: bool,
     allow_bitwise_path_tail: bool,
     allow_shift_path_tail: bool,
+    allow_shift_literal_count_tail: bool,
     allow_unary_path_tail: bool,
     allow_bool_literal_not_tail: bool,
     allow_logical_tail: bool,
@@ -9002,6 +9005,8 @@ fn check_function_body_primitive_local_block(
                 || (gates.allow_bitwise_path_tail
                     && matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor))
                 || (gates.allow_shift_path_tail && matches!(operator, BinOp::Shl | BinOp::Shr))
+                || (gates.allow_shift_literal_count_tail
+                    && matches!(operator, BinOp::Shl | BinOp::Shr))
                 || (gates.allow_logical_tail && matches!(operator, BinOp::And | BinOp::Or))
                 || (gates.allow_comparison_tail
                     && is_function_primitive_local_comparison_operator(operator))
@@ -9418,6 +9423,8 @@ fn check_function_body_primitive_local_block(
             && matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor);
         let is_shift_path_tail =
             gates.allow_shift_path_tail && matches!(operator, BinOp::Shl | BinOp::Shr);
+        let is_shift_literal_count_tail =
+            gates.allow_shift_literal_count_tail && matches!(operator, BinOp::Shl | BinOp::Shr);
         let shape_is_supported = if is_comparison_only_tail {
             let preceding_paths = operands
                 .iter()
@@ -9437,8 +9444,11 @@ fn check_function_body_primitive_local_block(
             operands.iter().all(|operand| is_preceding_path(operand))
         } else if is_bitwise_path_tail {
             operands.iter().all(|operand| is_preceding_path(operand))
-        } else if is_shift_path_tail {
-            operands.iter().all(|operand| is_preceding_path(operand))
+        } else if is_shift_path_tail || is_shift_literal_count_tail {
+            (is_shift_path_tail && operands.iter().all(|operand| is_preceding_path(operand)))
+                || (is_shift_literal_count_tail
+                    && is_preceding_path(left)
+                    && is_direct_function_integer_literal(right))
         } else if is_addition_only_tail {
             operands.iter().all(|operand| is_preceding_path(operand))
                 || (gates.allow_addition_literal_tail
@@ -75841,6 +75851,75 @@ property "shared"() {}
                     "all arithmetic operands and results carry the expected {expected_type:?} fact"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_publishes_shift_integer_literal_tail_facts() {
+        let root = concat!(
+            "pub fn shift_left(value: I32) -> I32 { value << 1 }\n",
+            "pub fn shift_right(value: Byte) -> Byte { value >> 4294967295 }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 2);
+
+        for (owner, expected_left) in resolved.owners().iter().zip([
+            sai_resolve::prelude::PrimTy::I32,
+            sai_resolve::prelude::PrimTy::Byte,
+        ]) {
+            assert!(
+                matches!(
+                    owner.body_type_check().expect("body result is available"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ),
+                "a direct integer-literal shift tail is supported"
+            );
+            let type_results = owner
+                .primitive_body_type_results()
+                .expect("function type results have no resolution error")
+                .expect("a supported shift literal tail publishes primitive facts");
+            assert_primitive_type_result_parity(&database, type_results);
+            let expression_types = type_results.expression_types().values().copied();
+            assert_eq!(
+                expression_types.clone().count(),
+                3,
+                "both shift operand facts and the result fact are available"
+            );
+            assert_eq!(
+                expression_types
+                    .clone()
+                    .filter(|ty| *ty == expected_left)
+                    .count(),
+                2,
+                "the path and shift result retain the left primitive type"
+            );
+            assert_eq!(
+                expression_types
+                    .filter(|ty| *ty == sai_resolve::prelude::PrimTy::U32)
+                    .count(),
+                1,
+                "the direct integer literal is checked and published as U32"
+            );
+            assert_eq!(
+                type_results
+                    .partial_results()
+                    .canonical_expression_types()
+                    .len(),
+                3,
+                "each primitive operand/result fact has a canonical projection"
+            );
         }
     }
 
