@@ -7415,6 +7415,8 @@ pub enum ConstValue {
     Int { value: i128, ty: sai_ty::ty::IntTy },
     /// A direct integer literal, with its resolved unsigned integer type.
     Uint { value: u128, ty: sai_ty::ty::UintTy },
+    /// A direct floating-point literal rounded to its resolved primitive width.
+    Float { bits: u64, ty: sai_ty::ty::FloatTy },
     /// A Bool direct literal, exact `not` of one, or one logical `and`/`or`
     /// with two direct Bool literal operands.
     Bool(bool),
@@ -7492,6 +7494,8 @@ impl ConstLiteralCheck {
                         sai_resolve::prelude::PrimTy::Bool
                             | sai_resolve::prelude::PrimTy::Char
                             | sai_resolve::prelude::PrimTy::Byte
+                            | sai_resolve::prelude::PrimTy::F32
+                            | sai_resolve::prelude::PrimTy::F64
                     )
             }
             Self::SupportedStr { .. } => true,
@@ -7689,6 +7693,7 @@ fn check_const_bool_expression_initializer(
 fn evaluate_const_value(
     owner: &HirOwner<'_>,
     literal_check: &ConstLiteralCheck,
+    symbols: &Interner,
 ) -> Option<ConstValue> {
     if !literal_check.is_valid() {
         return None;
@@ -7735,6 +7740,24 @@ fn evaluate_const_value(
             ExprKind::Lit(Lit::Byte(value)) => Some(ConstValue::Byte(value)),
             _ => None,
         },
+        ConstLiteralCheck::Supported {
+            primitive:
+                primitive @ (sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64),
+            ..
+        } => {
+            let ExprKind::Lit(Lit::Float { text, negated }) = value.kind else {
+                return None;
+            };
+            let text = symbols.resolve(text).ok()?;
+            let bits =
+                sai_ty::typeck::literal::round_float_literal_to_bits(*primitive, &text, negated)?;
+            let ty = match primitive {
+                sai_resolve::prelude::PrimTy::F32 => sai_ty::ty::FloatTy::F32,
+                sai_resolve::prelude::PrimTy::F64 => sai_ty::ty::FloatTy::F64,
+                _ => return None,
+            };
+            Some(ConstValue::Float { bits, ty })
+        }
         ConstLiteralCheck::Supported { primitive, .. } => match value.kind {
             ExprKind::Lit(Lit::Int { value, negated })
                 if sai_ty::typeck::literal::is_integer_primitive(*primitive) =>
@@ -22340,7 +22363,7 @@ impl RootDatabase {
                         &collection.target_cfg,
                     );
                     let const_value = match &literal_check {
-                        Ok(check) => Ok(evaluate_const_value(&hir_owner, check)),
+                        Ok(check) => Ok(evaluate_const_value(&hir_owner, check, &self.symbols)),
                         Err(error) => Err(error.clone()),
                     };
                     module_path_diagnostics = match (member_scopes, type_path_resolution.as_ref()) {
@@ -79350,6 +79373,190 @@ property "shared"() {}
         );
         assert_eq!(
             resolved.owners()[5]
+                .const_value()
+                .expect("unsupported evaluation does not fail resolution"),
+            None
+        );
+    }
+
+    #[test]
+    fn const_float_literals_produce_typed_bits_after_direct_width_rounding() {
+        use sai_ty::ty::FloatTy;
+
+        let root = concat!(
+            "pub const F32_POSITIVE: F32 = 1.25\n",
+            "pub const F32_NEGATIVE: F32 = -1.25\n",
+            "pub const F32_SEPARATORS: F32 = 1_234.5_0e+1_0\n",
+            "pub const F32_TIE_EVEN: F32 = 1.000000059604644775390625\n",
+            "pub const F32_ABOVE_TIE: F32 = 1.000000059604644775390626\n",
+            "pub const F32_UNDERFLOW: F32 = 1e-50\n",
+            "pub const F32_NEGATIVE_UNDERFLOW: F32 = -1e-50\n",
+            "pub const F32_NEGATIVE_ZERO: F32 = -0.0\n",
+            "pub const F32_MAX: F32 = 3.4028235e38\n",
+            "pub const F64_POSITIVE: F64 = 1.25\n",
+            "pub const F64_NEGATIVE: F64 = -1.25\n",
+            "pub const F64_TIE_EVEN: F64 = 1.00000000000000011102230246251565404236316680908203125\n",
+            "pub const F64_ABOVE_TIE: F64 = 1.00000000000000011102230246251565404236316680908203126\n",
+            "pub const F64_UNDERFLOW: F64 = 1e-400\n",
+            "pub const F64_NEGATIVE_UNDERFLOW: F64 = -1e-400\n",
+            "pub const F64_MAX: F64 = 1.7976931348623157e308\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let f32_above_tie = f32::from_bits(1.0f32.to_bits() + 1).to_bits();
+        let f64_above_tie = f64::from_bits(1.0f64.to_bits() + 1).to_bits();
+        let expected_values = [
+            ConstValue::Float {
+                bits: 1.25f32.to_bits().into(),
+                ty: FloatTy::F32,
+            },
+            ConstValue::Float {
+                bits: (-1.25f32).to_bits().into(),
+                ty: FloatTy::F32,
+            },
+            ConstValue::Float {
+                bits: "1234.50e+10".parse::<f32>().unwrap().to_bits().into(),
+                ty: FloatTy::F32,
+            },
+            ConstValue::Float {
+                bits: 1.0f32.to_bits().into(),
+                ty: FloatTy::F32,
+            },
+            ConstValue::Float {
+                bits: f32_above_tie.into(),
+                ty: FloatTy::F32,
+            },
+            ConstValue::Float {
+                bits: 0,
+                ty: FloatTy::F32,
+            },
+            ConstValue::Float {
+                bits: 0x8000_0000,
+                ty: FloatTy::F32,
+            },
+            ConstValue::Float {
+                bits: 0x8000_0000,
+                ty: FloatTy::F32,
+            },
+            ConstValue::Float {
+                bits: f32::MAX.to_bits().into(),
+                ty: FloatTy::F32,
+            },
+            ConstValue::Float {
+                bits: 1.25f64.to_bits(),
+                ty: FloatTy::F64,
+            },
+            ConstValue::Float {
+                bits: (-1.25f64).to_bits(),
+                ty: FloatTy::F64,
+            },
+            ConstValue::Float {
+                bits: 1.0f64.to_bits(),
+                ty: FloatTy::F64,
+            },
+            ConstValue::Float {
+                bits: f64_above_tie,
+                ty: FloatTy::F64,
+            },
+            ConstValue::Float {
+                bits: 0,
+                ty: FloatTy::F64,
+            },
+            ConstValue::Float {
+                bits: 0x8000_0000_0000_0000,
+                ty: FloatTy::F64,
+            },
+            ConstValue::Float {
+                bits: f64::MAX.to_bits(),
+                ty: FloatTy::F64,
+            },
+        ];
+
+        assert_eq!(resolved.owners().len(), expected_values.len());
+        for (index, expected) in expected_values.into_iter().enumerate() {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("literal checks use the current owner snapshot");
+            assert!(
+                check.requires_const_value(),
+                "valid float const at owner index {index} requires a value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("const evaluation succeeds"),
+                Some(expected),
+                "rounded float bits at owner index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn const_float_literals_without_valid_direct_values_remain_unvalued() {
+        let root = concat!(
+            "pub const F32_OVERFLOW: F32 = 3.4028236e38\n",
+            "pub const F64_OVERFLOW: F64 = 1.7976931348623159e308\n",
+            "pub const F32_TYPE_MISMATCH: F32 = true\n",
+            "pub const F64_TYPE_MISMATCH: F64 = 1\n",
+            "pub const COMPUTED: F64 = 1.25 + 2.0\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        for (index, expected_code) in [
+            (0, sai_diagnostics::Code::LiteralOutOfRange),
+            (1, sai_diagnostics::Code::LiteralOutOfRange),
+            (2, sai_diagnostics::Code::TypeMismatch),
+            (3, sai_diagnostics::Code::TypeMismatch),
+        ] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("literal checks use the current owner snapshot");
+            let ConstLiteralCheck::Supported { diagnostics, .. } = check else {
+                panic!("invalid float const at owner index {index} remains checked");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(diagnostics[0].code, expected_code, "owner index {index}");
+            assert!(!check.requires_const_value(), "owner index {index}");
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid const evaluation does not fail resolution"),
+                None,
+                "owner index {index}"
+            );
+        }
+
+        assert_eq!(
+            resolved.owners()[4]
+                .literal_check()
+                .expect("computed form remains gated"),
+            &ConstLiteralCheck::Unsupported
+        );
+        assert_eq!(
+            resolved.owners()[4]
                 .const_value()
                 .expect("unsupported evaluation does not fail resolution"),
             None

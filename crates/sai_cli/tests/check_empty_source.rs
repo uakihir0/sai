@@ -16970,17 +16970,23 @@ fn public_char_and_byte_const_literals_emit_check_results() {
 }
 
 #[test]
-fn public_float_const_literals_emit_check_results() {
+fn public_float_const_values_emit_check_results() {
     for source in [
         "pub const POSITIVE: F32 = 1.25\n",
         "pub const NEGATIVE: F32 = -1.25\n",
         "pub const SEPARATORS: F32 = 1_234.5_0e+1_0\n",
         "pub const TIE_EVEN: F32 = 1.000000059604644775390625\n",
+        "pub const ABOVE_TIE: F32 = 1.000000059604644775390626\n",
         "pub const UNDERFLOW: F32 = 1e-50\n",
+        "pub const NEGATIVE_UNDERFLOW: F32 = -1e-50\n",
+        "pub const MAX_FINITE: F32 = 3.4028235e38\n",
         "pub const POSITIVE: F64 = 1.25\n",
         "pub const NEGATIVE: F64 = -1.25\n",
         "pub const TIE_EVEN: F64 = 1.00000000000000011102230246251565404236316680908203125\n",
+        "pub const ABOVE_TIE: F64 = 1.00000000000000011102230246251565404236316680908203126\n",
         "pub const UNDERFLOW: F64 = 1e-400\n",
+        "pub const NEGATIVE_UNDERFLOW: F64 = -1e-400\n",
+        "pub const MAX_FINITE: F64 = 1.7976931348623157e308\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }

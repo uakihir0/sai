@@ -160,11 +160,23 @@ fn round_float_literal(primitive: PrimTy, text: &str, negated: bool) -> Option<F
     }
 }
 
+/// Parse a decimal literal directly at its declared float width and return
+/// the resulting IEEE 754 bits.
+///
+/// The caller is responsible for rejecting non-finite results when the
+/// language context requires a finite literal.
+pub fn round_float_literal_to_bits(primitive: PrimTy, text: &str, negated: bool) -> Option<u64> {
+    match round_float_literal(primitive, text, negated)? {
+        FloatLiteralValue::F32(value) => Some(u64::from(value.to_bits())),
+        FloatLiteralValue::F64(value) => Some(value.to_bits()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         FloatLiteralValue, PrimitiveLiteralResult, check_primitive_literal, integer_literal_fits,
-        round_float_literal,
+        round_float_literal, round_float_literal_to_bits,
     };
     use sai_hir::literals::Lit;
     use sai_intern::Interner;
@@ -522,6 +534,47 @@ mod tests {
                 .expect("valid F64 decimal parses")
                 .is_finite(),
             "rounding a finite decimal to infinity is diagnosed"
+        );
+    }
+
+    #[test]
+    fn float_literal_bits_preserve_declared_width_and_signed_zero() {
+        assert_eq!(
+            round_float_literal_to_bits(PrimTy::F32, "1.25", false),
+            Some(1.25f32.to_bits().into())
+        );
+        assert_eq!(
+            round_float_literal_to_bits(PrimTy::F32, "1.25", true),
+            Some((-1.25f32).to_bits().into())
+        );
+        assert_eq!(
+            round_float_literal_to_bits(PrimTy::F32, "1e-50", true),
+            Some(0x8000_0000)
+        );
+        assert_eq!(
+            round_float_literal_to_bits(PrimTy::F64, "1e-400", true),
+            Some(0x8000_0000_0000_0000)
+        );
+        assert_eq!(
+            round_float_literal_to_bits(PrimTy::F32, "1.000000059604644775390625", false),
+            Some(1.0f32.to_bits().into())
+        );
+        assert_eq!(
+            round_float_literal_to_bits(PrimTy::F32, "1.000000059604644775390626", false),
+            Some((f32::from_bits(1.0f32.to_bits() + 1)).to_bits().into())
+        );
+        assert_eq!(
+            round_float_literal_to_bits(PrimTy::F64, "1.25", false),
+            Some(1.25f64.to_bits())
+        );
+        assert_eq!(
+            round_float_literal_to_bits(PrimTy::F32, "1.25", false),
+            Some(u64::from(1.25f32.to_bits())),
+            "F32 values occupy the low 32 bits"
+        );
+        assert_eq!(
+            round_float_literal_to_bits(PrimTy::I32, "1.25", false),
+            None
         );
     }
 }
