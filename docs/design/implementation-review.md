@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1120 (2026-11-03): byte strings in flat tuple constants
+
+- **Decision — review required:** Allow direct byte-string literals as fields in flat tuple constants when the field type is the exact canonical prelude `Slice<Byte>` path. Store each value as `ConstValue::ByteStr(Arc<[u8]>)` in its source-order aggregate position.
+- **Reason:** IR-1119 already validates and evaluates the exact byte-string leaf. The flat tuple checker resolves each field type and carries field descriptors into evaluation, so this extension reuses existing aggregate behavior without adding another evaluator pass.
+- **Boundary and judgment:** Keep byte strings inside flat tuples only in this increment. Arrays would need a new public `ConstValueType` case to describe `Slice<Byte>` even for empty arrays; nested aggregates would require recursive aggregate type/evaluation work. User aliases, computed fields, arrays, nested aggregates, and other slice element types remain gated. Exact decoded bytes, including empty, NUL, and high-byte values, are retained with no UTF-8 conversion or terminator. Supported field mismatches report `TYPE_MISMATCH` on the field and leave the tuple valueless.
+- **Review required:** Verify canonical `Slice<Byte>` identity in tuple field types, exact byte retention and source order, empty/NUL/high-byte values, direct mismatch codes/spans and no value, and continued gates for aliases, computed fields, and arrays.
+- **Verification:** The focused tests `const_byte_strings_are_supported_only_as_flat_tuple_fields` and `const_unit_literal_check_accepts_only_empty_tuple_type_and_literal` pass. The complete driver suite passes (827 tests), the complete CLI integration suite passes (491 tests), and `cargo test --workspace --locked --offline` passes. `cargo fmt --all -- --check` and `git diff --check` pass.
+- **Hostile review:** A read-only review found an unrelated unit-test index regression and wording that could imply byte strings were accepted in arrays. Both were fixed; a follow-up review found no remaining actionable issues.
+
 ### IR-1119 (2026-11-03): evaluate direct byte-string constants
 
 - **Decision — review required:** Extend the bounded constant evaluator to accept one direct byte-string literal when its declared type is the exact canonical prelude `Slice<Byte>`. Produce `ConstValue::ByteStr(Arc<[u8]>)` with the decoded bytes preserved exactly, including empty, NUL-containing, and high-byte values.
