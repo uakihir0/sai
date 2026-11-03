@@ -7494,9 +7494,10 @@ pub enum ConstValueType {
 /// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
 /// fields are supported direct scalar, byte-string, or unit literals or Bool
 /// literal-only `not`/`and`/`or` expressions and comparisons between direct
-/// Bool literals. A direct unary bitwise-NOT over an integer or `Byte` literal
-/// and a direct addition of two integer literals are also supported in scalar
-/// constants and flat tuple/array leaves. Flat tuple and array scalar leaves
+/// Bool literals. Direct unary bitwise-NOT over an integer or `Byte` literal,
+/// direct bitwise binary operations over two matching integer or `Byte` literals,
+/// and direct integer arithmetic are also supported in scalar constants and
+/// flat tuple/array leaves. Flat tuple and array scalar leaves
 /// may also use direct references to other supported constants. Flat arrays
 /// allow the existing scalar, canonical `Str`, canonical `Slice<Byte>`, or
 /// unit element literals and Bool literal-only `not`/`and`/`or` expressions
@@ -8144,6 +8145,7 @@ fn evaluate_const_value(
                 !is_direct_const_literal_or_unit(value)
                     && !is_const_bool_literal_expression(value)
                     && !is_supported_const_bitnot_literal_expression(value)
+                    && !is_supported_const_bitwise_literal_expression(value)
                     && !is_supported_const_integer_arithmetic_expression(value)
             }) || values.len() != tuple_element_types.len()
             {
@@ -8180,6 +8182,7 @@ fn evaluate_const_value(
                 !is_direct_const_literal_or_unit(value)
                     && !is_const_bool_literal_expression(value)
                     && !is_supported_const_bitnot_literal_expression(value)
+                    && !is_supported_const_bitwise_literal_expression(value)
                     && !is_supported_const_integer_arithmetic_expression(value)
             }) {
                 return None;
@@ -8287,6 +8290,9 @@ fn evaluate_const_literal_value(
     if let ExprKind::Unary(UnOp::BitNot, operand) = value.kind {
         return evaluate_const_bitwise_not_literal(literal_type, operand, symbols, target_cfg);
     }
+    if is_supported_const_bitwise_literal_expression(value) {
+        return evaluate_const_bitwise_literal(literal_type, value, target_cfg);
+    }
     if is_supported_const_integer_arithmetic_expression(value) {
         let ConstLiteralType::Primitive(primitive) = literal_type else {
             return None;
@@ -8393,6 +8399,130 @@ fn evaluate_const_bitwise_not_literal(
                 value: (!value) & mask,
                 ty,
             })
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConstBitwiseOp {
+    And,
+    Or,
+    Xor,
+}
+
+fn const_bitwise_operands<'hir>(
+    value: &HirExpr<'hir>,
+) -> Option<(ConstBitwiseOp, &'hir HirExpr<'hir>, &'hir HirExpr<'hir>)> {
+    let ExprKind::Binary(operator, left, right) = value.kind else {
+        return None;
+    };
+    let operator = match operator {
+        BinOp::BitAnd => ConstBitwiseOp::And,
+        BinOp::BitOr => ConstBitwiseOp::Or,
+        BinOp::BitXor => ConstBitwiseOp::Xor,
+        _ => return None,
+    };
+    (matches!(left.kind, ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)))
+        && matches!(right.kind, ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_))))
+    .then_some((operator, left, right))
+}
+
+fn is_supported_const_bitwise_literal_expression(value: &HirExpr<'_>) -> bool {
+    const_bitwise_operands(value).is_some()
+}
+
+fn evaluate_const_bitwise_literal(
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    target_cfg: &TargetCfg,
+) -> Option<ConstValue> {
+    use sai_resolve::prelude::PrimTy;
+
+    let (operator, left, right) = const_bitwise_operands(value)?;
+    let ConstLiteralType::Primitive(primitive) = literal_type else {
+        return None;
+    };
+    match (left.kind, right.kind, primitive) {
+        (ExprKind::Lit(Lit::Byte(left)), ExprKind::Lit(Lit::Byte(right)), PrimTy::Byte) => {
+            Some(ConstValue::Byte(match operator {
+                ConstBitwiseOp::And => left & right,
+                ConstBitwiseOp::Or => left | right,
+                ConstBitwiseOp::Xor => left ^ right,
+            }))
+        }
+        (
+            ExprKind::Lit(Lit::Int {
+                value: left_magnitude,
+                negated: left_negated,
+            }),
+            ExprKind::Lit(Lit::Int {
+                value: right_magnitude,
+                negated: right_negated,
+            }),
+            primitive,
+        ) if sai_ty::typeck::literal::is_integer_primitive(primitive) => {
+            let left = evaluate_const_integer_literal(primitive, left_magnitude, left_negated)?;
+            let right = evaluate_const_integer_literal(primitive, right_magnitude, right_negated)?;
+            match (left, right) {
+                (
+                    ConstValue::Int {
+                        value: left,
+                        ty: left_ty,
+                    },
+                    ConstValue::Int {
+                        value: right,
+                        ty: right_ty,
+                    },
+                ) if left_ty == right_ty => {
+                    let width = const_signed_integer_width(left_ty, target_cfg.pointer_width());
+                    if width == 0 || width >= 128 {
+                        return None;
+                    }
+                    let mask = (1_u128 << width) - 1;
+                    let bits = match operator {
+                        ConstBitwiseOp::And => (left as u128) & (right as u128),
+                        ConstBitwiseOp::Or => (left as u128) | (right as u128),
+                        ConstBitwiseOp::Xor => (left as u128) ^ (right as u128),
+                    } & mask;
+                    let sign_bit = 1_u128 << (width - 1);
+                    let signed = if bits & sign_bit == 0 {
+                        i128::try_from(bits).ok()?
+                    } else {
+                        i128::try_from(bits).ok()? - (1_i128 << width)
+                    };
+                    Some(ConstValue::Int {
+                        value: signed,
+                        ty: left_ty,
+                    })
+                }
+                (
+                    ConstValue::Uint {
+                        value: left,
+                        ty: left_ty,
+                    },
+                    ConstValue::Uint {
+                        value: right,
+                        ty: right_ty,
+                    },
+                ) if left_ty == right_ty => {
+                    let width = const_unsigned_integer_width(left_ty, target_cfg.pointer_width());
+                    if width == 0 || width >= 128 {
+                        return None;
+                    }
+                    let mask = (1_u128 << width) - 1;
+                    let bits = match operator {
+                        ConstBitwiseOp::And => left & right,
+                        ConstBitwiseOp::Or => left | right,
+                        ConstBitwiseOp::Xor => left ^ right,
+                    } & mask;
+                    Some(ConstValue::Uint {
+                        value: bits,
+                        ty: left_ty,
+                    })
+                }
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -9643,6 +9773,7 @@ fn check_const_byte_str_literal(
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if is_supported_const_bitnot_literal_expression(value)
+        || is_supported_const_bitwise_literal_expression(value)
         || is_supported_const_integer_arithmetic_expression(value)
     {
         return check_const_literal_against_type(
@@ -9708,6 +9839,7 @@ fn check_const_array_literal(
         let found_type = match value.kind {
             ExprKind::Lit(literal) => const_literal_found_type(literal),
             ExprKind::Tuple(elements) if elements.is_empty() => "unit",
+            _ if is_supported_const_bitwise_literal_expression(value) => "a bitwise expression",
             _ if is_supported_const_integer_arithmetic_expression(value) => "an integer expression",
             _ if is_const_bool_literal_expression(value) => "Bool",
             _ => return Ok(None),
@@ -9727,6 +9859,7 @@ fn check_const_array_literal(
         !is_direct_const_literal_or_unit(value)
             && !is_const_bool_literal_expression(value)
             && !is_supported_const_bitnot_literal_expression(value)
+            && !is_supported_const_bitwise_literal_expression(value)
             && !is_supported_const_integer_arithmetic_expression(value)
             && !is_direct_const_reference_candidate(value)
     }) {
@@ -13122,6 +13255,7 @@ fn check_const_tuple_literal(
     let ExprKind::Tuple(values) = value.kind else {
         let found_type = match value.kind {
             ExprKind::Lit(literal) => const_literal_found_type(literal),
+            _ if is_supported_const_bitwise_literal_expression(value) => "a bitwise expression",
             _ if is_supported_const_integer_arithmetic_expression(value) => "an integer expression",
             _ => return Ok(None),
         };
@@ -13141,6 +13275,7 @@ fn check_const_tuple_literal(
         !is_direct_const_literal_or_unit(value)
             && !is_const_bool_literal_expression(value)
             && !is_supported_const_bitnot_literal_expression(value)
+            && !is_supported_const_bitwise_literal_expression(value)
             && !is_supported_const_integer_arithmetic_expression(value)
             && !is_direct_const_reference_candidate(value)
     }) {
@@ -14557,6 +14692,63 @@ fn check_const_literal_against_type(
             "type mismatch",
         )
     };
+
+    if let Some((_operator, left, right)) = const_bitwise_operands(value) {
+        let ConstLiteralType::Primitive(primitive) = literal_type else {
+            return Ok(Some(vec![mismatch(
+                local_enum_variant_type_name(literal_type),
+                "a bitwise expression",
+            )?]));
+        };
+        if !is_integer_primitive(primitive) && primitive != sai_resolve::prelude::PrimTy::Byte {
+            return Ok(Some(vec![mismatch(
+                const_primitive_name(primitive),
+                "a bitwise expression",
+            )?]));
+        }
+
+        let mut diagnostics = Vec::new();
+        for operand in [left, right] {
+            let ExprKind::Lit(literal @ (Lit::Int { .. } | Lit::Byte(_))) = operand.kind else {
+                return Ok(None);
+            };
+            match sai_ty::typeck::literal::check_primitive_literal(
+                primitive,
+                literal,
+                symbols,
+                target_cfg.pointer_width(),
+            ) {
+                sai_ty::typeck::literal::PrimitiveLiteralResult::Match => {}
+                sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => {
+                    diagnostics.push(mismatch(
+                        const_primitive_name(primitive),
+                        const_literal_found_type(literal),
+                    )?);
+                }
+                sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
+                    diagnostics.push(const_literal_diagnostic(
+                        owner,
+                        inputs,
+                        snapshot,
+                        operand.span,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        format!(
+                            "integer literal is out of range for `{}`",
+                            const_primitive_name(primitive)
+                        ),
+                        "literal out of range",
+                    )?);
+                }
+            }
+        }
+        if !diagnostics.is_empty() {
+            return Ok(Some(diagnostics));
+        }
+        if evaluate_const_bitwise_literal(literal_type, value, target_cfg).is_none() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        return Ok(Some(diagnostics));
+    }
 
     if let Some((operator, left, right)) = const_integer_arithmetic_operands(value) {
         let ConstLiteralType::Primitive(primitive) = literal_type else {
@@ -81718,6 +81910,280 @@ property "shared"() {}
                     .const_value()
                     .expect("mismatched byte-string evaluation does not fail resolution"),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn const_direct_bitwise_literals_use_declared_width_and_gate_other_forms() {
+        use sai_resolve::prelude::PrimTy;
+        use sai_ty::ty::{IntTy, UintTy};
+
+        let root = concat!(
+            "pub const I8_AND: I8 = -2 & 3\n",
+            "pub const I16_OR: I16 = -2 | 1\n",
+            "pub const I32_XOR: I32 = -1 ^ 5\n",
+            "pub const I64_AND: I64 = -8 & 3\n",
+            "pub const ISIZE_OR: ISize = -2 | 1\n",
+            "pub const U8_XOR: U8 = 15 ^ 5\n",
+            "pub const U16_AND: U16 = 65535 & 255\n",
+            "pub const U32_OR: U32 = 2147483648 | 1\n",
+            "pub const U64_XOR: U64 = 15 ^ 5\n",
+            "pub const USIZE_AND: USize = 4294967295 & 255\n",
+            "pub const BYTE_AND: Byte = b'\\x0f' & b'\\x03'\n",
+            "pub const BYTE_OR: Byte = b'\\x08' | b'\\x01'\n",
+            "pub const BYTE_XOR: Byte = b'\\x0f' ^ b'\\x05'\n",
+            "pub const TUPLE_VALUE: (I8, U8, Byte) = (-2 & 3, 15 | 1, b'\\x0f' ^ b'\\x05')\n",
+            "pub const ARRAY_VALUE: Array<I16, 2> = [-1 ^ 1, 255 & 3]\n",
+            "pub const BASE: I8 = 5\n",
+            "pub const MIXED_REFERENCE: (I8, I8) = (1 ^ 3, BASE)\n",
+            "pub const BAD_LEFT: I8 = 128 & 1\n",
+            "pub const BAD_RIGHT: I8 = 1 | 128\n",
+            "pub const BAD_BOTH: I8 = 128 ^ 129\n",
+            "pub const BAD_TYPE: Bool = 1 ^ 2\n",
+            "pub const BAD_BYTE_TYPE: Byte = 1 & b'\\x01'\n",
+            "pub const BAD_BYTE_STR: Slice<Byte> = 1 | 2\n",
+            "pub const PATH_OPERAND: I8 = 1 & BASE\n",
+            "pub const CHAINED: I8 = 1 & 2 & 3\n",
+            "pub const NESTED: I8 = (1 & 2) | 3\n",
+            "pub const BOOL_OPERANDS: Bool = true & false\n",
+            "pub const BAD_TUPLE_SHAPE: (I8,) = 1 & 2\n",
+            "pub const BAD_ARRAY_SHAPE: Array<I8, 1> = 1 | 2\n",
+        );
+
+        for target in ["wasm32-core", "wasm64-core"] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+
+            let expected_values = [
+                ConstValue::Int {
+                    value: 2,
+                    ty: IntTy::I8,
+                },
+                ConstValue::Int {
+                    value: -1,
+                    ty: IntTy::I16,
+                },
+                ConstValue::Int {
+                    value: -6,
+                    ty: IntTy::I32,
+                },
+                ConstValue::Int {
+                    value: 0,
+                    ty: IntTy::I64,
+                },
+                ConstValue::Int {
+                    value: -1,
+                    ty: IntTy::ISize,
+                },
+                ConstValue::Uint {
+                    value: 10,
+                    ty: UintTy::U8,
+                },
+                ConstValue::Uint {
+                    value: 255,
+                    ty: UintTy::U16,
+                },
+                ConstValue::Uint {
+                    value: 2_147_483_649,
+                    ty: UintTy::U32,
+                },
+                ConstValue::Uint {
+                    value: 10,
+                    ty: UintTy::U64,
+                },
+                ConstValue::Uint {
+                    value: 255,
+                    ty: UintTy::USize,
+                },
+                ConstValue::Byte(3),
+                ConstValue::Byte(9),
+                ConstValue::Byte(10),
+            ];
+            assert_eq!(resolved.owners().len(), 29);
+            for (index, expected) in expected_values.into_iter().enumerate() {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check uses the current owner snapshot");
+                assert!(
+                    check.is_valid() && check.requires_const_value(),
+                    "supported bitwise const at owner index {index}: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("const evaluation succeeds"),
+                    Some(expected),
+                    "bitwise result at owner index {index} for {target}"
+                );
+            }
+
+            assert_eq!(
+                resolved.owners()[13]
+                    .const_value()
+                    .expect("flat tuple evaluation succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![
+                        ConstValue::Int {
+                            value: 2,
+                            ty: IntTy::I8,
+                        },
+                        ConstValue::Uint {
+                            value: 15,
+                            ty: UintTy::U8,
+                        },
+                        ConstValue::Byte(10),
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[14]
+                    .const_value()
+                    .expect("flat array evaluation succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::I16),
+                    elements: vec![
+                        ConstValue::Int {
+                            value: -2,
+                            ty: IntTy::I16,
+                        },
+                        ConstValue::Int {
+                            value: 3,
+                            ty: IntTy::I16,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[16]
+                    .const_value()
+                    .expect("mixed aggregate reference materialization succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![
+                        ConstValue::Int {
+                            value: 2,
+                            ty: IntTy::I8,
+                        },
+                        ConstValue::Int {
+                            value: 5,
+                            ty: IntTy::I8,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+
+            for (index, code) in [
+                (17, sai_diagnostics::Code::LiteralOutOfRange),
+                (18, sai_diagnostics::Code::LiteralOutOfRange),
+                (20, sai_diagnostics::Code::TypeMismatch),
+                (21, sai_diagnostics::Code::TypeMismatch),
+                (22, sai_diagnostics::Code::TypeMismatch),
+                (27, sai_diagnostics::Code::TypeMismatch),
+                (28, sai_diagnostics::Code::TypeMismatch),
+            ] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("invalid bitwise const remains checked");
+                assert!(!check.is_valid(), "owner {index}: {check:?}");
+                assert_eq!(check.diagnostics().len(), 1, "owner {index}: {check:?}");
+                assert_eq!(check.diagnostics()[0].code, code);
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("invalid evaluation does not fail resolution"),
+                    None
+                );
+            }
+            let both_out_of_range = resolved.owners()[19]
+                .literal_check()
+                .expect("both out-of-range operands remain checked");
+            assert!(!both_out_of_range.is_valid());
+            assert_eq!(both_out_of_range.diagnostics().len(), 2);
+            assert!(
+                both_out_of_range
+                    .diagnostics()
+                    .iter()
+                    .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::LiteralOutOfRange)
+            );
+            assert_eq!(
+                both_out_of_range
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| diagnostic.primary().unwrap().span.range.start().to_usize())
+                    .collect::<Vec<_>>(),
+                [
+                    root.find("128 ^ 129").unwrap(),
+                    root.find("128 ^ 129").unwrap() + "128 ^ ".len()
+                ]
+            );
+            for index in 23..27 {
+                assert_eq!(
+                    resolved.owners()[index]
+                        .literal_check()
+                        .expect("unsupported expression remains resolvable"),
+                    &ConstLiteralCheck::Unsupported,
+                    "paths, chained/nested operators, and Bool bitwise operations remain gated at owner index {index}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("unsupported evaluation does not fail resolution"),
+                    None
+                );
+            }
+        }
+
+        for (target, should_succeed, expected) in [
+            ("wasm32-core", false, None),
+            (
+                "wasm64-core",
+                true,
+                Some(ConstValue::Uint {
+                    value: 0,
+                    ty: UintTy::USize,
+                }),
+            ),
+        ] {
+            let source = b"pub const USIZE_HIGH: USize = 18446744073709551615 & 0\n";
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(source, b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+            let check = resolved.owners()[0]
+                .literal_check()
+                .expect("literal check uses the current owner snapshot");
+            assert_eq!(check.is_valid(), should_succeed, "{target}: {check:?}");
+            assert_eq!(
+                resolved.owners()[0]
+                    .const_value()
+                    .expect("const evaluation succeeds"),
+                expected,
+                "{target}"
             );
         }
     }
