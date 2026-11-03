@@ -1013,11 +1013,14 @@ The order does not depend on the order in which producers reported diagnostics. 
 
 Two diagnostics are **duplicates** if they have the same code, severity, primary location, and message. Of a set of duplicates, only the one whose serialization sorts first is kept, and the others are counted in `suppressed.duplicate`. Duplicates arise mainly when one generic body is checked for several instantiations, or when one condition is found by two analyses. Producers SHOULD avoid them, but correctness does not depend on it.
 
+Usage errors (§13.3.5) are exempt from deduplication. Every usage error found in the command line is retained, even if it has the same code, severity, primary location, and message as another usage error.
+
 ### 11.11.3 Limits
 
 `--max-errors <N>` ([13-cli.md](13-cli.md) §13.4.5) limits how many **error** diagnostics are rendered. The default is 50, and 0 means no limit (N-H-15).
 
 - The rendered errors are the first `N` errors in the order of §11.11.1. Warnings and info diagnostics are not limited.
+- Usage errors (§13.3.5) are exempt: all usage errors are rendered, regardless of this limit. The command stops before doing other work when it reports them.
 - The limit affects output only. The toolchain runs every analysis it would run without the limit. The counts in the summary, the exit code, and the fixes applied by `--fix` are the same as without the limit. An implementation MAY stop early only if it can guarantee identical output.
 - The LSP server ([12-semantic-tooling.md](12-semantic-tooling.md) §12.10) applies no limit.
 

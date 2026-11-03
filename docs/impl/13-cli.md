@@ -170,7 +170,7 @@ On interrupt, the command stops at the next safe point, leaves no partially writ
 
 ### 13.3.5 Usage errors
 
-A **usage error** is an error found in the command line before any work is done. It is reported as a diagnostic with `primary: null` and the `data` object `{ "argument_index": <n>, "argument": "<text>" }`, where `argument_index` is the 1-based position of the offending argument (0 if the problem is a missing argument), and `argument` is its text (empty if missing). When a usage error occurs, the command does nothing else and exits with 2. All usage errors of one command line are reported, not only the first.
+A **usage error** is an error found in the command line before any work is done. It is reported as a diagnostic with `primary: null` and the `data` object `{ "argument_index": <n>, "argument": "<text>" }`, where `argument_index` is the 1-based position of the offending argument, or 0 when there is no offending argument. `argument` is the offending text, or empty when there is no offending argument. This includes a missing argument and a command-level failure with no offending token, such as `NO_PACKAGE_FOUND`. A missing value option's message identifies the option, while its data uses `argument_index: 0` and an empty `argument`. When a usage error occurs, the command does nothing else and exits with 2. All usage errors of one command line are reported, not only the first, and usage errors are not deduplicated (§11.11.2). When exactly two options conflict, the diagnostic identifies the later option in argv order.
 
 The usage error codes are exactly these:
 
@@ -278,7 +278,7 @@ Every building command, `sai add`, `sai remove`, `sai update`, `sai lock`, and `
 
 ### 13.4.5 `--max-errors <n>`, `--jobs <n>`
 
-- `--max-errors <n>` limits the number of error diagnostics that are printed ([11-diagnostics.md](11-diagnostics.md) §11.11.3). The default is 50, and 0 means no limit. The limit never changes the exit code, the summary counts, or the work done. It is a global option (§13.3.1).
+- `--max-errors <n>` limits the number of error diagnostics that are printed ([11-diagnostics.md](11-diagnostics.md) §11.11.3), except that it never suppresses usage errors (§13.3.5). The default is 50, and 0 means no limit. The limit never changes the exit code, the summary counts, or the work done. It is a global option (§13.3.1).
 - `--jobs <n>` sets the maximum number of worker threads. `n` MUST be at least 1. The default is the number of logical processors available to the process. The value never changes any output (P8).
 
 `--fix` is accepted only by `sai check` (§13.6.2).

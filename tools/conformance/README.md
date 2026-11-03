@@ -226,6 +226,21 @@ package-wide `fmt --check` and `fmt --check` with one explicit path,
 exact-diagnostic `fmt-refuse` cases, and a generated source-size refusal probe.
 Fixed-point and `fmt --check` checks apply only to `fmt` pass fixtures.
 
+The same run also executes a table of 18 selected CLI usage-error cases from
+`impl/13-cli.md` §13.3.5: missing and unknown commands, missing and unknown
+subcommands, unknown option, missing command-specific, global, and `new`
+option values, invalid option values, mixed errors whose order follows the
+canonical diagnostic key rather than argv order, synthetic option conflicts
+that identify the later option, repeated missing option values that must not be
+deduplicated, an unexpected positional, conflicting global options, all-error
+reporting with `--max-errors=1`, and `NO_PACKAGE_FOUND` from both `check` and
+`fmt`. Each case requires status 2,
+empty stderr, a valid JSON stream with the expected command header and
+diagnostics, `primary: null`, exact `data.argument_index` and
+`data.argument`, missing option names in their messages, a matching summary, no result record, and empty isolated
+cache and home directories. The coverage is deliberately selected; it does
+not replace the full command-line and lint coverage required by §15.9.1.
+
 ## Stage 0 and Stage 1 explanation-record partial smoke
 
 `python3 -B tools/conformance/run_explanation_smoke.py --iut /absolute/path/to/sai`
