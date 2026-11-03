@@ -19435,6 +19435,95 @@ fn public_float_const_values_emit_check_results() {
 }
 
 #[test]
+fn public_float_addition_const_values_cover_scalars_and_flat_aggregates() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub const F32_BASIC: F32 = 1.25 + 2.5\n",
+        "pub const F32_TIE_EVEN: F32 = 1.0 + 0.000000059604644775390625\n",
+        "pub const F32_NEGATIVE_ZERO: F32 = -0.0 + -0.0\n",
+        "pub const F32_FINITE_INPUT_OVERFLOW: F32 = 3.4028235e38 + 3.4028235e38\n",
+        "pub const F64_BASIC: F64 = 1.25 + 2.5\n",
+        "pub const F64_TIE_EVEN: F64 = 1.0 + 0.00000000000000011102230246251565404236316680908203125\n",
+        "pub const F64_NEGATIVE_ZERO: F64 = -0.0 + -0.0\n",
+        "pub const F64_FINITE_INPUT_OVERFLOW: F64 = 1.7976931348623157e308 + 1.7976931348623157e308\n",
+        "pub const TUPLE_VALUE: (F32, F64) = (1.25 + 2.5, 1.0 + 0.00000000000000011102230246251565404236316680908203125)\n",
+        "pub const ARRAY_VALUE: Array<F32, 2> = [1.0 + 2.0, 3.0 + 4.0]\n",
+        "pub const BASE: F32 = 4.0\n",
+        "pub const MIXED_REFERENCE: (F32, F32) = (1.0 + 2.0, BASE)\n",
+        "pub const MIXED_REFERENCE_ARRAY: Array<F32, 2> = [1.0 + 2.0, BASE]\n",
+    );
+
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", target]),
+            target,
+            "dev",
+        );
+    }
+}
+
+#[test]
+fn float_addition_diagnostics_and_unsupported_forms_are_preserved() {
+    for (source, expected_code, diagnostic_expression) in [
+        (
+            "pub const BAD_DESTINATION: I32 = 1.0 + 2.0\n",
+            "TYPE_MISMATCH",
+            Some("1.0 + 2.0"),
+        ),
+        (
+            "pub const BAD_TUPLE_LEAF: (Bool,) = (1.0 + 2.0,)\n",
+            "TYPE_MISMATCH",
+            Some("1.0 + 2.0"),
+        ),
+        (
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [1.0 + 2.0]\n",
+            "TYPE_MISMATCH",
+            Some("1.0 + 2.0"),
+        ),
+        (
+            "pub const F32_OUT_OF_RANGE: F32 = 3.4028236e38 + 0.0\n",
+            "LITERAL_OUT_OF_RANGE",
+            Some("3.4028236e38"),
+        ),
+        (
+            "pub const F64_OUT_OF_RANGE: F64 = 0.0 + 1.7976931348623159e308\n",
+            "LITERAL_OUT_OF_RANGE",
+            Some("1.7976931348623159e308"),
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a checked float addition diagnostic without a result or feature gate:\n{stdout}"
+        );
+        let diagnostic_expression = diagnostic_expression.expect("each case has a primary span");
+        let span_start = source
+            .find(diagnostic_expression)
+            .expect("diagnostic span text exists");
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            expected_code,
+            span_start,
+            span_start + diagnostic_expression.len(),
+        );
+    }
+
+    for source in [
+        "pub const BASE: F32 = 1.0\npub const PATH_OPERAND: F32 = 1.0 + BASE\n",
+        "pub const CHAINED: F32 = 1.0 + 2.0 + 3.0\n",
+        "pub const NESTED: F32 = (1.0 + 2.0) + 3.0\n",
+        "pub const OTHER_OPERATOR: F32 = 1.0 * 2.0\n",
+        "enum Sum { Value(F32) }\npub const ENUM_PAYLOAD: Sum = Sum.Value(1.0 + 2.0)\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_str_const_literals_emit_check_results() {
     let source = concat!(
         "pub const EMPTY: Str = \"\"\n",
