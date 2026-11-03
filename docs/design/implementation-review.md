@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1104 (2026-11-03): allow wrapping integer path-pair tails in top-level functions
+
+- **Decision — review required:** Extend supported public top-level function tails to accept one direct `+%`, `-%`, or `*%` whose two immediate operands are plain one-segment local paths resolving by `BindingId` to parameters or preceding accepted locals.
+- **Reason:** Spec/06 §6.8.4 defines these operators for primitive integers, and the existing primitive body checker already applies their integer-only type rules, mismatch recovery, unsupported-operator diagnostics, and expression facts. Reusing it adds the tail shape without creating a second wrapping-arithmetic type-checking path.
+- **Boundary and judgment:** Enable a dedicated wrapping path-tail gate only for top-level functions and require both immediate operands to be preceding resolved paths. The existing checker accepts matching pairs of all ten integer primitives and reports `OPERATOR_NOT_SUPPORTED` for other primitive types, including `F32`, `F64`, `Bool`, `Byte`, and `Char`. Keep literal operands and pairs, unresolved literal-derived paths, nonlocal paths, nested or computed operands, fields, and qualified paths gated. Preserve the broader existing inherent-method tail behavior and local-initializer rules; add no lowering, wrapping evaluation, or runtime behavior. The exact owner/shape boundary and reuse of the current noninteger diagnostic behavior are **Review required**.
+- **Review required:** Cover all ten integer types and three operators, preceding locals and shadowed `BindingId`s, operand and independent return mismatch spans, noninteger operator diagnostics, literal/unresolved/computed/nonlocal gate cases, primitive/canonical fact parity, and unchanged inherent-method and local-initializer behavior.
+- **Verification:** The positive acceptance test first failed under the prior gate with `FEATURE_NOT_IMPLEMENTED`. The wrapping-tail acceptance, mismatch, noninteger, and rejected-shape CLI tests passed; the driver fact-parity test and existing inherent-method binary-tail regression passed. All 471 `check_empty_source` integration tests and `cargo test --workspace --locked --quiet` passed. Formatting and diff checks passed.
+- **Hostile review:** An independent read-only review found no actionable implementation, diagnostic, fact, or scope issues.
+
 ### IR-1103 (2026-11-03): allow integer remainder path-pair tails in top-level functions
 
 - **Decision — review required:** Extend supported public top-level function tails to accept one direct `%` whose two immediate operands are plain one-segment local paths resolving by `BindingId` to parameters or preceding accepted locals.
