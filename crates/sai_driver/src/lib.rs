@@ -7426,8 +7426,8 @@ pub enum ConstValue {
     Byte(u8),
     /// A direct string literal interned in the current session.
     Str(Symbol),
-    /// A unit or aggregate value. The current evaluator only constructs unit
-    /// values with no variant and no fields.
+    /// A unit or tuple value. The current evaluator only constructs
+    /// aggregates with no variant.
     Aggregate {
         variant: Option<DefId>,
         fields: Arc<[ConstValue]>,
@@ -7505,8 +7505,8 @@ impl ConstLiteralCheck {
                     )
             }
             Self::SupportedStr { .. } => true,
-            Self::SupportedUnit { .. } => true,
-            Self::SupportedTuple { .. } | Self::Unsupported => false,
+            Self::SupportedUnit { .. } | Self::SupportedTuple { .. } => true,
+            Self::Unsupported => false,
         }
     }
 
@@ -7538,6 +7538,7 @@ fn check_const_literal_owner(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    tuple_element_types: &mut Option<Vec<ConstLiteralType>>,
 ) -> Result<ConstLiteralCheck, OwnerControlFlowResolutionError> {
     if !owner.raw_attrs.is_empty() {
         return Ok(ConstLiteralCheck::Unsupported);
@@ -7597,7 +7598,7 @@ fn check_const_literal_owner(
             return Ok(ConstLiteralCheck::SupportedUnit { diagnostics });
         }
 
-        let Some(diagnostics) = check_const_tuple_literal(
+        let Some((diagnostics, resolved_element_types)) = check_const_tuple_literal(
             owner,
             elements,
             &body.value,
@@ -7610,6 +7611,7 @@ fn check_const_literal_owner(
         else {
             return Ok(ConstLiteralCheck::Unsupported);
         };
+        *tuple_element_types = Some(resolved_element_types);
         return Ok(ConstLiteralCheck::SupportedTuple { diagnostics });
     }
 
@@ -7700,6 +7702,7 @@ fn check_const_bool_expression_initializer(
 fn evaluate_const_value(
     owner: &HirOwner<'_>,
     literal_check: &ConstLiteralCheck,
+    tuple_element_types: Option<&[ConstLiteralType]>,
     symbols: &Interner,
 ) -> Option<ConstValue> {
     if !literal_check.is_valid() {
@@ -7708,10 +7711,50 @@ fn evaluate_const_value(
 
     let value = &owner.body?.value;
     match literal_check {
-        ConstLiteralCheck::Supported {
-            primitive: sai_resolve::prelude::PrimTy::Bool,
-            ..
-        } => match value.kind {
+        ConstLiteralCheck::Supported { primitive, .. } => {
+            evaluate_const_literal_value(ConstLiteralType::Primitive(*primitive), value, symbols)
+        }
+        ConstLiteralCheck::SupportedStr { .. } => {
+            evaluate_const_literal_value(ConstLiteralType::Str, value, symbols)
+        }
+        ConstLiteralCheck::SupportedUnit { .. } => {
+            evaluate_const_literal_value(ConstLiteralType::Unit, value, symbols)
+        }
+        ConstLiteralCheck::SupportedTuple { .. } => {
+            let ExprKind::Tuple(values) = value.kind else {
+                return None;
+            };
+            if values
+                .iter()
+                .any(|value| !is_direct_const_literal_or_unit(value))
+                || values.len() != tuple_element_types?.len()
+            {
+                return None;
+            }
+            let fields = tuple_element_types?
+                .iter()
+                .copied()
+                .zip(values)
+                .map(|(literal_type, value)| {
+                    evaluate_const_literal_value(literal_type, value, symbols)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(ConstValue::Aggregate {
+                variant: None,
+                fields: fields.into(),
+            })
+        }
+        ConstLiteralCheck::Unsupported => None,
+    }
+}
+
+fn evaluate_const_literal_value(
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    symbols: &Interner,
+) -> Option<ConstValue> {
+    match literal_type {
+        ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool) => match value.kind {
             ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(value)),
             ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
                 ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(!value)),
@@ -7733,31 +7776,23 @@ fn evaluate_const_value(
             }
             _ => None,
         },
-        ConstLiteralCheck::Supported {
-            primitive: sai_resolve::prelude::PrimTy::Char,
-            ..
-        } => match value.kind {
+        ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Char) => match value.kind {
             ExprKind::Lit(Lit::Char(value)) => Some(ConstValue::Char(value)),
             _ => None,
         },
-        ConstLiteralCheck::Supported {
-            primitive: sai_resolve::prelude::PrimTy::Byte,
-            ..
-        } => match value.kind {
+        ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Byte) => match value.kind {
             ExprKind::Lit(Lit::Byte(value)) => Some(ConstValue::Byte(value)),
             _ => None,
         },
-        ConstLiteralCheck::Supported {
-            primitive:
-                primitive @ (sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64),
-            ..
-        } => {
+        ConstLiteralType::Primitive(
+            primitive @ (sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64),
+        ) => {
             let ExprKind::Lit(Lit::Float { text, negated }) = value.kind else {
                 return None;
             };
             let text = symbols.resolve(text).ok()?;
             let bits =
-                sai_ty::typeck::literal::round_float_literal_to_bits(*primitive, &text, negated)?;
+                sai_ty::typeck::literal::round_float_literal_to_bits(primitive, &text, negated)?;
             let ty = match primitive {
                 sai_resolve::prelude::PrimTy::F32 => sai_ty::ty::FloatTy::F32,
                 sai_resolve::prelude::PrimTy::F64 => sai_ty::ty::FloatTy::F64,
@@ -7765,26 +7800,26 @@ fn evaluate_const_value(
             };
             Some(ConstValue::Float { bits, ty })
         }
-        ConstLiteralCheck::Supported { primitive, .. } => match value.kind {
-            ExprKind::Lit(Lit::Int { value, negated })
-                if sai_ty::typeck::literal::is_integer_primitive(*primitive) =>
-            {
-                evaluate_const_integer_literal(*primitive, value, negated)
-            }
-            _ => None,
-        },
-        ConstLiteralCheck::SupportedStr { .. } => match value.kind {
+        ConstLiteralType::Primitive(primitive)
+            if sai_ty::typeck::literal::is_integer_primitive(primitive) =>
+        {
+            let ExprKind::Lit(Lit::Int { value, negated }) = value.kind else {
+                return None;
+            };
+            evaluate_const_integer_literal(primitive, value, negated)
+        }
+        ConstLiteralType::Primitive(_) => None,
+        ConstLiteralType::Str => match value.kind {
             ExprKind::Lit(Lit::Str(value)) => Some(ConstValue::Str(value)),
             _ => None,
         },
-        ConstLiteralCheck::SupportedUnit { .. } => match value.kind {
+        ConstLiteralType::Unit => match value.kind {
             ExprKind::Tuple(elements) if elements.is_empty() => Some(ConstValue::Aggregate {
                 variant: None,
                 fields: Arc::from([]),
             }),
             _ => None,
         },
-        ConstLiteralCheck::SupportedTuple { .. } | ConstLiteralCheck::Unsupported => None,
     }
 }
 
@@ -11154,8 +11189,8 @@ fn check_const_tuple_literal(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
-) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    let Some(_expected_types) = expected_elements
+) -> Result<Option<(Vec<Diagnostic>, Vec<ConstLiteralType>)>, OwnerControlFlowResolutionError> {
+    let Some(expected_types) = expected_elements
         .iter()
         .map(|ty| resolve_const_literal_type(*ty, type_paths, symbols, inputs))
         .collect::<Option<Vec<_>>>()
@@ -11167,7 +11202,7 @@ fn check_const_tuple_literal(
         let ExprKind::Lit(literal) = value.kind else {
             return Ok(None);
         };
-        return Ok(Some(vec![const_literal_diagnostic(
+        let diagnostics = vec![const_literal_diagnostic(
             owner.id,
             inputs,
             snapshot,
@@ -11178,7 +11213,8 @@ fn check_const_tuple_literal(
                 const_literal_found_type(literal)
             ),
             "type mismatch",
-        )?]));
+        )?];
+        return Ok(Some((diagnostics, expected_types)));
     };
 
     if values
@@ -11188,7 +11224,7 @@ fn check_const_tuple_literal(
         return Ok(None);
     }
     if values.len() != expected_elements.len() {
-        return Ok(Some(vec![const_literal_diagnostic(
+        let diagnostics = vec![const_literal_diagnostic(
             owner.id,
             inputs,
             snapshot,
@@ -11200,7 +11236,8 @@ fn check_const_tuple_literal(
                 values.len()
             ),
             "type mismatch",
-        )?]));
+        )?];
+        return Ok(Some((diagnostics, expected_types)));
     }
 
     let mut diagnostics = Vec::new();
@@ -11220,7 +11257,7 @@ fn check_const_tuple_literal(
         };
         diagnostics.append(&mut field_diagnostics);
     }
-    Ok(Some(diagnostics))
+    Ok(Some((diagnostics, expected_types)))
 }
 
 fn is_direct_const_literal_or_unit(value: &HirExpr<'_>) -> bool {
@@ -22363,6 +22400,7 @@ impl RootDatabase {
                             ),
                             (_, _, Err(error)) => Err(error),
                         };
+                    let mut tuple_element_types = None;
                     let literal_check = check_const_literal_owner(
                         &hir_owner,
                         type_path_resolution
@@ -22373,9 +22411,15 @@ impl RootDatabase {
                         &inputs,
                         snapshot,
                         &collection.target_cfg,
+                        &mut tuple_element_types,
                     );
                     let const_value = match &literal_check {
-                        Ok(check) => Ok(evaluate_const_value(&hir_owner, check, &self.symbols)),
+                        Ok(check) => Ok(evaluate_const_value(
+                            &hir_owner,
+                            check,
+                            tuple_element_types.as_deref(),
+                            &self.symbols,
+                        )),
                         Err(error) => Err(error.clone()),
                     };
                     module_path_diagnostics = match (member_scopes, type_path_resolution.as_ref()) {
@@ -79973,7 +80017,7 @@ property "shared"() {}
         let root = concat!(
             "pub const PAIR: (I32, Bool) = (1, true)\n",
             "pub const SINGLE: (U8,) = (255,)\n",
-            "pub const MIXED: (F32, Str, ()) = (1.25, \"text\", ())\n",
+            "pub const MIXED: (F32, Str, (), Char, Byte, I16, F64) = (1.25, \"text\", (), 'x', b'\\xfe', -32768, -1.5)\n",
             "pub const FIELD_MISMATCH: (I32, Bool) = (1, 2)\n",
             "pub const FIELD_RANGE: (I8,) = (128,)\n",
             "pub const ARITY_SHORT: (I32, Bool) = (1,)\n",
@@ -80049,6 +80093,99 @@ property "shared"() {}
                 },
                 "direct flat tuple at owner index {index} is supported"
             );
+            assert!(
+                checks[index].requires_const_value(),
+                "valid flat tuple at owner index {index} requires an evaluator value"
+            );
+            let Some(ConstValue::Aggregate { variant, fields }) = resolved.owners()[index]
+                .const_value()
+                .expect("tuple const evaluation succeeds")
+            else {
+                panic!("valid flat tuple at owner index {index} produces an aggregate");
+            };
+            assert_eq!(variant, None, "tuple aggregate has no enum variant");
+            match index {
+                0 => assert_eq!(
+                    fields.as_ref(),
+                    &[
+                        ConstValue::Int {
+                            value: 1,
+                            ty: sai_ty::ty::IntTy::I32,
+                        },
+                        ConstValue::Bool(true),
+                    ],
+                    "tuple fields retain their resolved primitive types and values"
+                ),
+                1 => assert_eq!(
+                    fields.as_ref(),
+                    &[ConstValue::Uint {
+                        value: 255,
+                        ty: sai_ty::ty::UintTy::U8,
+                    }],
+                    "one-element tuples preserve the trailing-comma tuple type"
+                ),
+                2 => {
+                    assert_eq!(
+                        fields[0],
+                        ConstValue::Float {
+                            bits: 1.25_f32.to_bits() as u64,
+                            ty: sai_ty::ty::FloatTy::F32,
+                        },
+                        "float tuple field keeps F32 width and bits"
+                    );
+                    let ConstValue::Str(text) = &fields[1] else {
+                        panic!("canonical Str tuple field produces an interned string");
+                    };
+                    assert_eq!(
+                        database
+                            .symbols
+                            .resolve(*text)
+                            .expect("tuple string symbol resolves")
+                            .as_ref(),
+                        "text"
+                    );
+                    assert_eq!(
+                        fields[2],
+                        ConstValue::Aggregate {
+                            variant: None,
+                            fields: Arc::from([]),
+                        },
+                        "unit tuple field is represented as an empty aggregate"
+                    );
+                    assert_eq!(fields[3], ConstValue::Char('x'));
+                    assert_eq!(fields[4], ConstValue::Byte(0xfe));
+                    assert_eq!(
+                        fields[5],
+                        ConstValue::Int {
+                            value: -32768,
+                            ty: sai_ty::ty::IntTy::I16,
+                        },
+                        "negative integer fields retain their sign and declared width"
+                    );
+                    assert_eq!(
+                        fields[6],
+                        ConstValue::Float {
+                            bits: (-1.5_f64).to_bits(),
+                            ty: sai_ty::ty::FloatTy::F64,
+                        },
+                        "negative F64 fields retain their exact bits and width"
+                    );
+                }
+                _ => unreachable!("the loop covers only supported direct tuples"),
+            }
+        }
+        for index in [3, 4, 5, 6, 7, 15] {
+            assert!(
+                !checks[index].requires_const_value(),
+                "invalid tuple at owner index {index} does not require a value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid tuple evaluation does not fail resolution"),
+                None,
+                "invalid tuple at owner index {index} remains valueless"
+            );
         }
         for index in [3, 5, 6, 7] {
             let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[index] else {
@@ -80110,6 +80247,23 @@ property "shared"() {}
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
                 "nested, array, expression, or alias form at owner index {index} stays gated"
+            );
+            assert!(!checks[index].requires_const_value());
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported tuple evaluation does not fail resolution"),
+                None
+            );
+        }
+        for index in [12, 13, 14] {
+            assert!(!checks[index].requires_const_value());
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported tuple evaluation does not fail resolution"),
+                None,
+                "unsupported tuple shape at owner index {index} stays valueless"
             );
         }
     }
