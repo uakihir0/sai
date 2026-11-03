@@ -7751,8 +7751,14 @@ fn check_const_literal_owner(
     }
 
     if resolve_const_byte_str_type(*ty, type_paths, symbols, inputs) {
-        let Some(diagnostics) =
-            check_const_byte_str_literal(owner.id, &body.value, inputs, snapshot)?
+        let Some(diagnostics) = check_const_byte_str_literal(
+            owner.id,
+            &body.value,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
         else {
             return Ok(ConstLiteralCheck::Unsupported);
         };
@@ -9332,9 +9338,23 @@ fn resolve_const_byte_str_type(
 fn check_const_byte_str_literal(
     owner: OwnerId,
     value: &HirExpr<'_>,
+    symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if is_supported_const_bitnot_literal_expression(value) {
+        return check_const_literal_against_type(
+            owner,
+            ConstLiteralType::ByteStr,
+            value,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        );
+    }
+
     match value.kind {
         ExprKind::Lit(Lit::ByteStr(_)) => Ok(Some(Vec::new())),
         ExprKind::Lit(literal) => Ok(Some(vec![const_literal_diagnostic(
@@ -81070,6 +81090,7 @@ property "shared"() {}
             "pub const FLOAT_OPERAND: I32 = ~1.0\n",
             "enum Bits { One(I8) }\n",
             "pub const ENUM_PAYLOAD: Bits = Bits.One(~1)\n",
+            "pub const BAD_BYTE_STR: Slice<Byte> = ~1\n",
         );
 
         for target in ["wasm32-core", "wasm64-core"] {
@@ -81139,7 +81160,7 @@ property "shared"() {}
                     ty: IntTy::I8,
                 },
             ];
-            assert_eq!(resolved.owners().len(), 24);
+            assert_eq!(resolved.owners().len(), 25);
             for (index, expected) in expected_scalars.into_iter().enumerate() {
                 let check = resolved.owners()[index]
                     .literal_check()
@@ -81277,6 +81298,39 @@ property "shared"() {}
                     None
                 );
             }
+
+            let byte_string_mismatch = resolved.owners()[24]
+                .literal_check()
+                .expect("byte-string type mismatch remains checked");
+            assert!(!byte_string_mismatch.is_valid());
+            assert_eq!(byte_string_mismatch.diagnostics().len(), 1);
+            assert_eq!(
+                byte_string_mismatch.diagnostics()[0].code,
+                sai_diagnostics::Code::TypeMismatch
+            );
+            let byte_string_mismatch_span = byte_string_mismatch.diagnostics()[0]
+                .primary()
+                .expect("byte-string type mismatch points at the initializer")
+                .span
+                .range;
+            let byte_string_mismatch_start = root
+                .find("pub const BAD_BYTE_STR: Slice<Byte> = ~1")
+                .expect("byte-string type-mismatched bitwise-NOT const exists")
+                + "pub const BAD_BYTE_STR: Slice<Byte> = ".len();
+            assert_eq!(
+                byte_string_mismatch_span.start().to_usize(),
+                byte_string_mismatch_start
+            );
+            assert_eq!(
+                byte_string_mismatch_span.end().to_usize(),
+                byte_string_mismatch_start + "~1".len()
+            );
+            assert_eq!(
+                resolved.owners()[24]
+                    .const_value()
+                    .expect("mismatched byte-string evaluation does not fail resolution"),
+                None
+            );
         }
     }
 
