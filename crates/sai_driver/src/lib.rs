@@ -7308,6 +7308,7 @@ pub struct ConstOwnerResolution {
     literal_check: Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
     const_value: Result<Option<ConstValue>, OwnerControlFlowResolutionError>,
     enum_variant_path_diagnostics: Vec<Diagnostic>,
+    enum_variant_call_diagnostics: Vec<Diagnostic>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
@@ -7367,6 +7368,17 @@ impl ConstOwnerResolution {
     /// enum path resolver for this constant initializer.
     pub fn enum_variant_path_diagnostics(&self) -> &[Diagnostic] {
         &self.enum_variant_path_diagnostics
+    }
+
+    /// Returns diagnostics from direct local enum-variant constructor calls
+    /// in this constant initializer.
+    ///
+    /// When the initializer is a supported tuple-variant constant, these
+    /// diagnostics are also included in `literal_check().diagnostics()` so
+    /// they invalidate evaluation. Callers should emit them separately only
+    /// when the literal check is not `SupportedEnumTuple`.
+    pub fn enum_variant_call_diagnostics(&self) -> &[Diagnostic] {
+        &self.enum_variant_call_diagnostics
     }
 
     /// Returns snapshot-bound diagnostics for typed member failures when this
@@ -7449,10 +7461,10 @@ pub enum ConstValue {
         element_type: ConstValueType,
         elements: Arc<[ConstValue]>,
     },
-    /// A unit or tuple value, or a unit enum variant.
+    /// A unit or tuple value, or a local enum variant value.
     ///
-    /// Tuple and unit values have no variant. Enum unit values retain the
-    /// exact variant `DefId` and have no fields.
+    /// Tuple and unit values have no variant. Enum values retain the exact
+    /// variant `DefId`; tuple-variant fields preserve source order.
     Aggregate {
         variant: Option<DefId>,
         fields: Arc<[ConstValue]>,
@@ -7475,8 +7487,8 @@ pub enum ConstValueType {
 }
 
 /// Result of checking one public primitive, canonical `Str`, exact
-/// `Slice<Byte>`, unit, flat tuple, flat array, or direct local unit enum
-/// variant constant.
+/// `Slice<Byte>`, unit, flat tuple, flat array, direct local unit enum, or
+/// direct local tuple enum variant constant.
 ///
 /// This deliberately covers only direct literals of supported primitive
 /// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
@@ -7518,6 +7530,14 @@ pub enum ConstLiteralCheck {
         diagnostics: Vec<Diagnostic>,
         variant: DefId,
     },
+    /// A direct call to a tuple variant of a nongeneric local enum.
+    ///
+    /// The exact variant definition is retained for evaluation. The
+    /// diagnostics include constructor arity and literal argument failures.
+    SupportedEnumTuple {
+        diagnostics: Vec<Diagnostic>,
+        variant: DefId,
+    },
     /// A flat tuple whose fields each have a supported literal or unit expression.
     SupportedTuple { diagnostics: Vec<Diagnostic> },
     /// A flat array whose elements each have a supported literal or unit expression.
@@ -7541,6 +7561,7 @@ impl ConstLiteralCheck {
                 | Self::SupportedByteStr { .. }
                 | Self::SupportedUnit { .. }
                 | Self::SupportedEnumUnit { .. }
+                | Self::SupportedEnumTuple { .. }
                 | Self::SupportedTuple { .. }
                 | Self::SupportedArray { .. }
                 | Self::SupportedConstReference { .. }
@@ -7580,6 +7601,7 @@ impl ConstLiteralCheck {
             Self::SupportedStr { .. } | Self::SupportedByteStr { .. } => true,
             Self::SupportedUnit { .. }
             | Self::SupportedEnumUnit { .. }
+            | Self::SupportedEnumTuple { .. }
             | Self::SupportedTuple { .. }
             | Self::SupportedArray { .. }
             | Self::SupportedConstReference { .. } => true,
@@ -7594,6 +7616,7 @@ impl ConstLiteralCheck {
             | Self::SupportedByteStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
             | Self::SupportedEnumUnit { diagnostics, .. }
+            | Self::SupportedEnumTuple { diagnostics, .. }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics } => diagnostics.is_empty(),
             Self::SupportedConstReference {
@@ -7612,6 +7635,7 @@ impl ConstLiteralCheck {
             | Self::SupportedByteStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
             | Self::SupportedEnumUnit { diagnostics, .. }
+            | Self::SupportedEnumTuple { diagnostics, .. }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics }
             | Self::SupportedConstReference { diagnostics, .. } => diagnostics,
@@ -7628,31 +7652,15 @@ fn check_const_literal_owner(
     target_cfg: &TargetCfg,
     aggregate_type: &mut Option<ConstLiteralAggregateType>,
 ) -> Result<ConstLiteralCheck, OwnerControlFlowResolutionError> {
-    if !owner.raw_attrs.is_empty() {
+    if !is_supported_const_owner(owner, symbols, inputs) {
         return Ok(ConstLiteralCheck::Unsupported);
     }
     let OwnerNode::Item(item) = owner.node else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
-    if item.vis != Visibility::Pub {
-        return Ok(ConstLiteralCheck::Unsupported);
-    }
     let ItemKind::Const { ty } = item.kind else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
-    let Ok(name) = symbols.resolve(item.name.sym) else {
-        return Ok(ConstLiteralCheck::Unsupported);
-    };
-    let Some(written_name) = inputs
-        .source
-        .text()
-        .get(item.name.span.range.start().to_usize()..item.name.span.range.end().to_usize())
-    else {
-        return Ok(ConstLiteralCheck::Unsupported);
-    };
-    if !is_supported_const_name_convention(&name, written_name) {
-        return Ok(ConstLiteralCheck::Unsupported);
-    }
     let Some(body) = owner.body else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
@@ -7775,6 +7783,187 @@ fn check_const_literal_owner(
     })
 }
 
+fn is_supported_const_owner(
+    owner: &HirOwner<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    if !owner.raw_attrs.is_empty() {
+        return false;
+    }
+    let OwnerNode::Item(item) = owner.node else {
+        return false;
+    };
+    if item.vis != Visibility::Pub || !matches!(item.kind, ItemKind::Const { .. }) {
+        return false;
+    }
+    let Ok(name) = symbols.resolve(item.name.sym) else {
+        return false;
+    };
+    let Some(written_name) = inputs
+        .source
+        .text()
+        .get(item.name.span.range.start().to_usize()..item.name.span.range.end().to_usize())
+    else {
+        return false;
+    };
+    is_supported_const_name_convention(&name, written_name)
+}
+
+fn check_const_enum_tuple_variant_call(
+    owner: OwnerId,
+    call: &HirExpr<'_>,
+    call_entry: &LocalEnumVariantCallEntry,
+    value_type_entry: &LocalEnumVariantPathTypeEntry,
+    expected_shape: &ConstValueShape,
+    existing_call_diagnostics: &[Diagnostic],
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    symbols: &Interner,
+) -> Result<Option<(ConstLiteralCheck, Vec<ConstLiteralType>)>, OwnerControlFlowResolutionError> {
+    let ExprKind::Call {
+        callee,
+        args,
+        base: None,
+    } = call.kind
+    else {
+        return Ok(None);
+    };
+    let ExprKind::Field { base, .. } = callee.kind else {
+        return Ok(None);
+    };
+    if call_entry.call() != call.hir_id
+        || call_entry.callee_field() != callee.hir_id
+        || value_type_entry.field() != callee.hir_id
+        || call_entry.enum_owner() != value_type_entry.enum_owner()
+        || call_entry.enum_def() != value_type_entry.enum_def()
+        || call_entry.variant() != value_type_entry.variant()
+        || call_entry.arguments().len() != args.len()
+        || call_entry
+            .arguments()
+            .iter()
+            .zip(args)
+            .any(|(argument, hir_argument)| *argument != hir_argument.expr.hir_id)
+    {
+        return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+    }
+    let sai_ty::adt::LocalEnumVariantValueType::TupleConstructor {
+        function_item,
+        signature,
+    } = value_type_entry.value_type()
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        function_item.kind(),
+        sai_ty::ty::TyKind::FnDef(definition, generic_args)
+            if *definition == call_entry.variant() && generic_args.is_empty()
+    ) || !signature.generic_params().is_empty()
+        || !matches!(
+            signature.output().kind(),
+            sai_ty::ty::TyKind::Adt(definition, generic_args)
+                if *definition == call_entry.enum_def() && generic_args.is_empty()
+        )
+        || signature.inputs().len()
+            != match call_entry.outcome() {
+                LocalEnumVariantCallOutcome::TupleVariantArityMatches { expected }
+                | LocalEnumVariantCallOutcome::WrongArgumentCount { expected, .. } => expected,
+                LocalEnumVariantCallOutcome::UnitVariantCalled { .. } => return Ok(None),
+            }
+    {
+        return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+    }
+
+    let Some(field_types) = signature
+        .inputs()
+        .iter()
+        .map(local_enum_variant_literal_type)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+
+    let mut diagnostics = existing_call_diagnostics.to_vec();
+    for (field_type, argument) in field_types.iter().copied().zip(args) {
+        let field_diagnostics = match check_const_bool_expression_initializer(
+            owner,
+            field_type,
+            &argument.expr,
+            inputs,
+            snapshot,
+        )? {
+            Some(diagnostics) => diagnostics,
+            None => {
+                if !is_direct_const_literal_or_unit(&argument.expr) {
+                    return Ok(None);
+                }
+                let Some(diagnostics) = check_const_literal_against_type(
+                    owner,
+                    field_type,
+                    &argument.expr,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics
+            }
+        };
+        for diagnostic in field_diagnostics {
+            if !diagnostics.contains(&diagnostic) {
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
+
+    let actual_enum_name = inputs
+        .source
+        .text()
+        .get(base.span.range.start().to_usize()..base.span.range.end().to_usize())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "enum {:?}:{:?}",
+                call_entry.enum_def().package,
+                call_entry.enum_def().index
+            )
+        });
+    let actual_shape = ConstValueShape::Enum {
+        definition: call_entry.enum_def(),
+        name: actual_enum_name,
+    };
+    if !const_value_shapes_match(expected_shape, &actual_shape) {
+        diagnostics.push(const_literal_diagnostic(
+            owner,
+            inputs,
+            snapshot,
+            call.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found `{}`",
+                const_value_shape_name(expected_shape),
+                const_value_shape_name(&actual_shape)
+            ),
+            "type mismatch",
+        )?);
+    }
+    sort_phase1_diagnostics(&mut diagnostics);
+
+    Ok(Some((
+        ConstLiteralCheck::SupportedEnumTuple {
+            diagnostics,
+            variant: call_entry.variant(),
+        },
+        field_types,
+    )))
+}
+
 fn check_const_bool_expression_initializer(
     owner: OwnerId,
     literal_type: ConstLiteralType,
@@ -7881,6 +8070,42 @@ fn evaluate_const_value(
             variant: Some(*variant),
             fields: Arc::from([]),
         }),
+        ConstLiteralCheck::SupportedEnumTuple { variant, .. } => {
+            let ExprKind::Call {
+                callee,
+                args,
+                base: None,
+            } = value.kind
+            else {
+                return None;
+            };
+            let ExprKind::Field { .. } = callee.kind else {
+                return None;
+            };
+            let Some(ConstLiteralAggregateType::EnumVariant(field_types)) = aggregate_type else {
+                return None;
+            };
+            if args.len() != field_types.len()
+                || args.iter().any(|argument| {
+                    !is_direct_const_literal_or_unit(&argument.expr)
+                        && !is_const_bool_literal_expression(&argument.expr)
+                })
+            {
+                return None;
+            }
+            let fields = field_types
+                .iter()
+                .copied()
+                .zip(args)
+                .map(|(literal_type, argument)| {
+                    evaluate_const_literal_value(literal_type, &argument.expr, symbols)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(ConstValue::Aggregate {
+                variant: Some(*variant),
+                fields: fields.into(),
+            })
+        }
         ConstLiteralCheck::SupportedTuple { .. } => {
             let ExprKind::Tuple(values) = value.kind else {
                 return None;
@@ -8141,6 +8366,7 @@ enum ConstLiteralAggregateType {
         element_type: ConstLiteralType,
         length: u128,
     },
+    EnumVariant(Vec<ConstLiteralType>),
 }
 
 struct PendingConstReference {
@@ -23310,6 +23536,7 @@ impl RootDatabase {
                                 literal_check: Err(error.clone()),
                                 const_value: Err(error.clone()),
                                 enum_variant_path_diagnostics: Vec::new(),
+                                enum_variant_call_diagnostics: Vec::new(),
                                 module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
@@ -23330,6 +23557,7 @@ impl RootDatabase {
                 let source_index = owners.len();
                 let mut lowering_diagnostics = Vec::new();
                 let mut enum_variant_path_diagnostics = Vec::new();
+                let mut enum_variant_call_diagnostics = Vec::new();
                 let mut module_path_diagnostics = None;
                 let analysis: Result<
                     (
@@ -23527,8 +23755,16 @@ impl RootDatabase {
                                 Err(error) => Err(error.clone()),
                             };
                             let mut pending_reference = None;
+                            let enum_variant_field = match body.value.kind {
+                                ExprKind::Field { .. } => Some(body.value),
+                                ExprKind::Call {
+                                    callee, base: None, ..
+                                } if matches!(callee.kind, ExprKind::Field { .. }) => Some(callee),
+                                _ => None,
+                            };
                             if matches!(literal_check, Ok(ConstLiteralCheck::Unsupported))
-                                && matches!(body.value.kind, ExprKind::Field { .. })
+                                && is_supported_const_owner(&hir_owner, &self.symbols, &inputs)
+                                && let Some(variant_field) = enum_variant_field
                                 && let (
                                     Ok(Some(type_paths)),
                                     Ok(Some(module_paths)),
@@ -23574,12 +23810,10 @@ impl RootDatabase {
                                 )?;
                                 enum_variant_path_diagnostics =
                                     variant_paths.diagnostics().to_vec();
+                                enum_variant_call_diagnostics =
+                                    variant_paths.call_diagnostics().to_vec();
                                 if let Some(entry) =
-                                    variant_paths.value_type_for_field(body.value.hir_id)
-                                    && matches!(
-                                        entry.value_type(),
-                                        sai_ty::adt::LocalEnumVariantValueType::Unit(_)
-                                    )
+                                    variant_paths.value_type_for_field(variant_field.hir_id)
                                     && !local_enum_has_invariant(
                                         collection,
                                         &def_paths,
@@ -23587,60 +23821,104 @@ impl RootDatabase {
                                     )?
                                     && let Some(expected_shape) = const_value_type.as_ref()
                                 {
-                                    let enum_type_name = match body.value.kind {
-                                        ExprKind::Field { base, .. } => inputs
-                                            .source
-                                            .text()
-                                            .get(
-                                                base.span.range.start().to_usize()
-                                                    ..base.span.range.end().to_usize(),
-                                            )
-                                            .map(str::trim)
-                                            .filter(|name| !name.is_empty())
-                                            .map(str::to_owned),
-                                        _ => None,
+                                    match (body.value.kind, entry.value_type()) {
+                                        (
+                                            ExprKind::Field { base, .. },
+                                            sai_ty::adt::LocalEnumVariantValueType::Unit(_),
+                                        ) => {
+                                            let enum_type_name = inputs
+                                                .source
+                                                .text()
+                                                .get(
+                                                    base.span.range.start().to_usize()
+                                                        ..base.span.range.end().to_usize(),
+                                                )
+                                                .map(str::trim)
+                                                .filter(|name| !name.is_empty())
+                                                .map(str::to_owned)
+                                                .unwrap_or_else(|| {
+                                                    format!(
+                                                        "enum {:?}:{:?}",
+                                                        entry.enum_def().package,
+                                                        entry.enum_def().index
+                                                    )
+                                                });
+                                            let actual_shape = ConstValueShape::Enum {
+                                                definition: entry.enum_def(),
+                                                name: enum_type_name,
+                                            };
+                                            let diagnostics = if const_value_shapes_match(
+                                                expected_shape,
+                                                &actual_shape,
+                                            ) {
+                                                Vec::new()
+                                            } else {
+                                                vec![const_literal_diagnostic(
+                                                    descriptor.owner,
+                                                    &inputs,
+                                                    snapshot,
+                                                    body.value.span,
+                                                    sai_diagnostics::Code::TypeMismatch,
+                                                    format!(
+                                                        "expected `{}`, found `{}`",
+                                                        const_value_shape_name(expected_shape),
+                                                        const_value_shape_name(&actual_shape)
+                                                    ),
+                                                    "type mismatch",
+                                                )?]
+                                            };
+                                            literal_check =
+                                                Ok(ConstLiteralCheck::SupportedEnumUnit {
+                                                    diagnostics,
+                                                    variant: entry.variant(),
+                                                });
+                                            const_value = Ok(evaluate_const_value(
+                                                &hir_owner,
+                                                literal_check
+                                                    .as_ref()
+                                                    .expect("enum value check is set"),
+                                                None,
+                                                &self.symbols,
+                                            ));
+                                        }
+                                        (
+                                            ExprKind::Call { .. },
+                                            sai_ty::adt::LocalEnumVariantValueType::TupleConstructor { .. },
+                                        ) => {
+                                            if let Some(call_entry) =
+                                                variant_paths.call_for_expr(body.value.hir_id)
+                                                && let Some((check, field_types)) =
+                                                    check_const_enum_tuple_variant_call(
+                                                    descriptor.owner,
+                                                    &body.value,
+                                                    call_entry,
+                                                    entry,
+                                                    expected_shape,
+                                                    variant_paths.call_diagnostics(),
+                                                    &inputs,
+                                                    snapshot,
+                                                    &collection.target_cfg,
+                                                    &self.symbols,
+                                                )?
+                                            {
+                                                aggregate_type = Some(
+                                                    ConstLiteralAggregateType::EnumVariant(
+                                                        field_types,
+                                                    ),
+                                                );
+                                                literal_check = Ok(check);
+                                                const_value = Ok(evaluate_const_value(
+                                                    &hir_owner,
+                                                    literal_check
+                                                        .as_ref()
+                                                        .expect("enum tuple check is set"),
+                                                    aggregate_type.as_ref(),
+                                                    &self.symbols,
+                                                ));
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                    .unwrap_or_else(|| {
-                                        format!(
-                                            "enum {:?}:{:?}",
-                                            entry.enum_def().package,
-                                            entry.enum_def().index
-                                        )
-                                    });
-                                    let actual_shape = ConstValueShape::Enum {
-                                        definition: entry.enum_def(),
-                                        name: enum_type_name,
-                                    };
-                                    let diagnostics = if const_value_shapes_match(
-                                        expected_shape,
-                                        &actual_shape,
-                                    ) {
-                                        Vec::new()
-                                    } else {
-                                        vec![const_literal_diagnostic(
-                                            descriptor.owner,
-                                            &inputs,
-                                            snapshot,
-                                            body.value.span,
-                                            sai_diagnostics::Code::TypeMismatch,
-                                            format!(
-                                                "expected `{}`, found `{}`",
-                                                const_value_shape_name(expected_shape),
-                                                const_value_shape_name(&actual_shape)
-                                            ),
-                                            "type mismatch",
-                                        )?]
-                                    };
-                                    literal_check = Ok(ConstLiteralCheck::SupportedEnumUnit {
-                                        diagnostics,
-                                        variant: entry.variant(),
-                                    });
-                                    const_value = Ok(evaluate_const_value(
-                                        &hir_owner,
-                                        literal_check.as_ref().expect("enum value check is set"),
-                                        None,
-                                        &self.symbols,
-                                    ));
                                 }
                             }
                             if matches!(literal_check, Ok(ConstLiteralCheck::Unsupported)) {
@@ -23772,6 +24050,7 @@ impl RootDatabase {
                     literal_check,
                     const_value,
                     enum_variant_path_diagnostics,
+                    enum_variant_call_diagnostics,
                     module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
@@ -82517,6 +82796,223 @@ property "shared"() {}
                 resolved.owners()[index]
                     .const_value()
                     .expect("cyclic enum constant is checked"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn const_local_tuple_enum_variants_evaluate_checked_literal_fields() {
+        let root = concat!(
+            "enum Payload { Number(I8), Pair(Bool, ()), Flag(Bool), Nested((Bool,)) }\n",
+            "enum Other { Number(I8) }\n",
+            "enum Generic<T> { Value(T) }\n",
+            "type PayloadAlias = Payload\n",
+            "enum Guarded { Value(I8) }\n",
+            "invariant Guarded { true }\n",
+            "pub const NUMBER: Payload = Payload.Number(7)\n",
+            "pub const PAIR: Payload = Payload.Pair(true, ())\n",
+            "pub const FLAG: Payload = Payload.Flag(false and true)\n",
+            "pub const NUMBER_COPY: Payload = NUMBER\n",
+            "pub const MISMATCH_ENUM: Other = Payload.Number(1)\n",
+            "pub const MISMATCH_INT: I32 = Payload.Number(1)\n",
+            "pub const BAD_ARITY: Payload = Payload.Number()\n",
+            "pub const BAD_TYPE: Payload = Payload.Number(true)\n",
+            "pub const BAD_RANGE: Payload = Payload.Number(128)\n",
+            "pub const PATH_ARGUMENT: Payload = Payload.Number(NUMBER)\n",
+            "pub const NESTED_ARGUMENT: Payload = Payload.Nested((true,))\n",
+            "pub const GENERIC_VARIANT: Generic<Bool> = Generic.Value(true)\n",
+            "pub const ALIAS_VARIANT: Payload = PayloadAlias.Number(1)\n",
+            "pub const INVARIANT_VARIANT: Guarded = Guarded.Value(1)\n",
+            "const PRIVATE_VARIANT: Payload = Payload.Number(1)\n",
+            "pub const MixedCase: Payload = Payload.Number(1)\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let types = database
+            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("local enum types resolve");
+        let payload_owner = local_enum_owner_named(&database, &collection, "Payload");
+        let payload_variants = types
+            .local_enum_payload_types(&collection, payload_owner)
+            .expect("type projection uses the current collection")
+            .expect("Payload projection exists")
+            .variants()
+            .expect("Payload variants project successfully");
+        let variant_named = |wanted: &str| {
+            payload_variants
+                .iter()
+                .find(|variant| {
+                    database
+                        .symbols
+                        .resolve(variant.name())
+                        .is_ok_and(|name| name.as_ref() == wanted)
+                })
+                .expect("the selected Payload variant exists")
+                .def_id()
+        };
+        let number = variant_named("Number");
+        let pair = variant_named("Pair");
+        let flag = variant_named("Flag");
+
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        assert_eq!(resolved.owners().len(), 16);
+        for (index, variant, fields) in [
+            (
+                0,
+                number,
+                vec![ConstValue::Int {
+                    value: 7,
+                    ty: sai_ty::ty::IntTy::I8,
+                }],
+            ),
+            (
+                1,
+                pair,
+                vec![
+                    ConstValue::Bool(true),
+                    ConstValue::Aggregate {
+                        variant: None,
+                        fields: Arc::from([]),
+                    },
+                ],
+            ),
+            (2, flag, vec![ConstValue::Bool(false)]),
+        ] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("constructor literal check succeeds");
+            assert_eq!(
+                check,
+                &ConstLiteralCheck::SupportedEnumTuple {
+                    diagnostics: Vec::new(),
+                    variant,
+                },
+                "owner {index} is a valid tuple-variant constant"
+            );
+            assert!(
+                check.requires_const_value(),
+                "valid tuple-variant constant requires an evaluator value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("tuple-variant evaluation succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: Some(variant),
+                    fields: fields.into(),
+                }),
+                "variant identity and payload order are retained at owner {index}"
+            );
+            assert!(
+                resolved.owners()[index]
+                    .enum_variant_call_diagnostics()
+                    .is_empty(),
+                "supported call diagnostics are owned by the literal check"
+            );
+        }
+
+        assert_eq!(
+            resolved.owners()[3]
+                .const_value()
+                .expect("same-enum tuple value copies"),
+            resolved.owners()[0]
+                .const_value()
+                .expect("original tuple value is available")
+        );
+
+        for index in [4, 5] {
+            let ConstLiteralCheck::SupportedEnumTuple {
+                diagnostics,
+                variant,
+            } = resolved.owners()[index]
+                .literal_check()
+                .expect("enum-type mismatch is checked")
+            else {
+                panic!("mismatched tuple-variant constructor remains checkable");
+            };
+            assert_eq!(*variant, number);
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+                    .count(),
+                1,
+                "a declared-type mismatch is reported once at owner {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("mismatched constructor has no value"),
+                None
+            );
+        }
+
+        let wrong_arity = resolved.owners()[6]
+            .literal_check()
+            .expect("wrong constructor arity is checked");
+        assert!(
+            matches!(
+                wrong_arity,
+                ConstLiteralCheck::SupportedEnumTuple { diagnostics, .. }
+                    if diagnostics.iter().any(|diagnostic| diagnostic.code == sai_diagnostics::Code::WrongArgumentCount)
+            ),
+            "wrong variant arity is retained in the bounded constructor check"
+        );
+        assert_eq!(
+            resolved.owners()[6]
+                .const_value()
+                .expect("wrong arity has no value"),
+            None
+        );
+
+        for (index, expected_code) in [
+            (7, sai_diagnostics::Code::TypeMismatch),
+            (8, sai_diagnostics::Code::LiteralOutOfRange),
+        ] {
+            let ConstLiteralCheck::SupportedEnumTuple { diagnostics, .. } = resolved.owners()
+                [index]
+                .literal_check()
+                .expect("bad direct literal argument is diagnosed")
+            else {
+                panic!("direct literal payload remains in the checked subset");
+            };
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == expected_code),
+                "owner {index} retains {expected_code:?}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid payload has no value"),
+                None
+            );
+        }
+
+        for index in [9, 10, 11, 12, 13, 14, 15] {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("unsupported constructor form is checked"),
+                &ConstLiteralCheck::Unsupported,
+                "paths, nested fields, generic enums, aliases, invariant enums, and ineligible const owners remain gated at owner index {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported constructor does not evaluate"),
                 None
             );
         }
