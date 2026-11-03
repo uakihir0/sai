@@ -278,6 +278,34 @@ fn assert_json_diagnostic_primary_span(
     );
 }
 
+fn assert_json_diagnostic_primary_byte_span(stdout: &str, code: &str, start: usize, end: usize) {
+    let matching_records = stdout
+        .lines()
+        .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching_records.len(),
+        1,
+        "expected exactly one {code} diagnostic:\n{stdout}"
+    );
+    let diagnostic = matching_records[0];
+    let primary = diagnostic
+        .split_once("\"primary\":")
+        .expect("diagnostic has a primary field")
+        .1
+        .split_once(",\"primary_label\":")
+        .expect("primary span ends before the primary label")
+        .0;
+    assert!(
+        primary.contains(&format!("\"start\":{{\"byte\":{start},")),
+        "{code} diagnostic has the wrong primary start span:\n{diagnostic}"
+    );
+    assert!(
+        primary.contains(&format!("\"end\":{{\"byte\":{end},")),
+        "{code} diagnostic has the wrong primary end span:\n{diagnostic}"
+    );
+}
+
 fn assert_success_result(output: Output, target: &str, profile: &str) {
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert_eq!(
@@ -16800,6 +16828,122 @@ fn public_primitive_const_literals_emit_check_results() {
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
+}
+
+#[test]
+fn public_direct_const_references_emit_check_results() {
+    let source = concat!(
+        "pub const FORWARD: I32 = LATER\n",
+        "pub const LATER: I32 = 7\n",
+        "pub const EARLIER: I32 = 9\n",
+        "pub const BACKWARD: I32 = EARLIER\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn direct_const_reference_type_mismatch_reports_the_reference_span() {
+    let source = "pub const SOURCE: I32 = 7\npub const MISMATCH: Bool = SOURCE\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let reference_start = source.rfind("SOURCE").expect("reference exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "a supported reference type mismatch should suppress the result without a feature gate:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_byte_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        reference_start,
+        reference_start + "SOURCE".len(),
+    );
+}
+
+#[test]
+fn direct_const_cycles_report_one_cycle_error_and_suppress_results() {
+    for source in [
+        "pub const SELF: I32 = SELF\n",
+        "pub const FIRST: I32 = SECOND\npub const SECOND: I32 = FIRST\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let (reference, expected_cycle) = if source.contains("FIRST") {
+            (
+                source.find("SECOND").expect("FIRST refers to SECOND"),
+                "FIRST -> SECOND -> FIRST",
+            )
+        } else {
+            (
+                source.rfind("SELF").expect("SELF refers to itself"),
+                "SELF -> SELF",
+            )
+        };
+
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"CONST_CYCLE\"").count(),
+            1,
+            "{source:?}: each cycle should produce one diagnostic:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: cyclic consts should suppress the check result without a feature gate:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(expected_cycle),
+            "{source:?}: the diagnostic should list the cycle from its first DefId:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            "CONST_CYCLE",
+            reference,
+            reference
+                + if source.contains("FIRST") {
+                    "SECOND".len()
+                } else {
+                    "SELF".len()
+                },
+        );
+    }
+}
+
+#[test]
+fn unsupported_direct_const_reference_forms_remain_gated() {
+    let qualified = run_check(
+        "use acme:empty/values as values\npub const QUALIFIED: I32 = values.VALUE\n",
+        "",
+        &[("src/values.sai", "pub const VALUE: I32 = 7\n")],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&qualified, "qualified const reference");
+
+    let computed = run_check(
+        "pub const SOURCE: I32 = 7\npub const COMPUTED: I32 = SOURCE + 1\n",
+        "",
+        &[],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&computed, "computed const reference");
+
+    let unsupported_destination = run_check(
+        concat!(
+            "pub type Count = I32\n",
+            "pub const SOURCE: Count = 7\n",
+            "pub const COPY: Count = SOURCE\n",
+        ),
+        "",
+        &[],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &unsupported_destination,
+        "const reference with an unsupported destination type",
+    );
 }
 
 #[test]
