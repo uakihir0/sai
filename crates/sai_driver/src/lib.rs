@@ -7487,14 +7487,15 @@ pub enum ConstValueType {
 }
 
 /// Result of checking one public primitive, canonical `Str`, exact
-/// `Slice<Byte>`, unit, flat tuple, flat array, direct local unit enum, or
-/// direct local tuple enum variant constant.
+/// `Slice<Byte>`, unit, flat tuple or array, direct local unit enum, or direct
+/// local tuple enum variant constant.
 ///
 /// This deliberately covers only direct literals of supported primitive
 /// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
 /// fields are supported direct scalar, byte-string, or unit literals or Bool
 /// literal-only `not`/`and`/`or` expressions and comparisons between direct
-/// Bool literals.
+/// Bool literals. Flat tuple and array scalar leaves may also use direct
+/// references to other supported constants.
 /// Flat arrays allow the existing scalar, canonical `Str`, canonical
 /// `Slice<Byte>`, or unit element literals and Bool literal-only `not`/`and`/`or`
 /// expressions and comparisons between direct Bool literals. They require an
@@ -7542,6 +7543,13 @@ pub enum ConstLiteralCheck {
     SupportedTuple { diagnostics: Vec<Diagnostic> },
     /// A flat array whose elements each have a supported literal or unit expression.
     SupportedArray { diagnostics: Vec<Diagnostic> },
+    /// A flat tuple or array with direct constant-reference leaves.
+    ///
+    /// `blocked` means evaluation depends on an invalid or cyclic constant.
+    SupportedConstAggregateReference {
+        diagnostics: Vec<Diagnostic>,
+        blocked: bool,
+    },
     /// One direct path to another supported constant value.
     ///
     /// `blocked` means evaluation depends on an invalid or cyclic constant.
@@ -7564,6 +7572,7 @@ impl ConstLiteralCheck {
                 | Self::SupportedEnumTuple { .. }
                 | Self::SupportedTuple { .. }
                 | Self::SupportedArray { .. }
+                | Self::SupportedConstAggregateReference { .. }
                 | Self::SupportedConstReference { .. }
         )
     }
@@ -7604,6 +7613,7 @@ impl ConstLiteralCheck {
             | Self::SupportedEnumTuple { .. }
             | Self::SupportedTuple { .. }
             | Self::SupportedArray { .. }
+            | Self::SupportedConstAggregateReference { .. }
             | Self::SupportedConstReference { .. } => true,
             Self::Unsupported => false,
         }
@@ -7619,6 +7629,10 @@ impl ConstLiteralCheck {
             | Self::SupportedEnumTuple { diagnostics, .. }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics } => diagnostics.is_empty(),
+            Self::SupportedConstAggregateReference {
+                diagnostics,
+                blocked,
+            } => diagnostics.is_empty() && !blocked,
             Self::SupportedConstReference {
                 diagnostics,
                 blocked,
@@ -7638,6 +7652,7 @@ impl ConstLiteralCheck {
             | Self::SupportedEnumTuple { diagnostics, .. }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics }
+            | Self::SupportedConstAggregateReference { diagnostics, .. }
             | Self::SupportedConstReference { diagnostics, .. } => diagnostics,
         }
     }
@@ -8161,6 +8176,77 @@ fn evaluate_const_value(
             })
         }
         ConstLiteralCheck::SupportedConstReference { .. } | ConstLiteralCheck::Unsupported => None,
+        ConstLiteralCheck::SupportedConstAggregateReference { .. } => None,
+    }
+}
+
+fn const_literal_value_type(literal_type: ConstLiteralType) -> ConstValueType {
+    match literal_type {
+        ConstLiteralType::Primitive(primitive) => ConstValueType::Primitive(primitive),
+        ConstLiteralType::Str => ConstValueType::Str,
+        ConstLiteralType::Unit => ConstValueType::Unit,
+        ConstLiteralType::ByteStr => ConstValueType::ByteStr,
+    }
+}
+
+fn const_value_template(
+    owner: &HirOwner<'_>,
+    aggregate_type: Option<&ConstLiteralAggregateType>,
+    reference_slots: &HashSet<usize>,
+    symbols: &Interner,
+) -> Option<ConstValueTemplate> {
+    let value = &owner.body?.value;
+    match (aggregate_type?, value.kind) {
+        (ConstLiteralAggregateType::Tuple(field_types), ExprKind::Tuple(values))
+            if field_types.len() == values.len() =>
+        {
+            Some(ConstValueTemplate::Tuple(
+                field_types
+                    .iter()
+                    .copied()
+                    .zip(values)
+                    .enumerate()
+                    .map(|(index, (literal_type, value))| {
+                        if reference_slots.contains(&index) {
+                            ConstValueTemplatePart::Reference
+                        } else {
+                            ConstValueTemplatePart::Literal(evaluate_const_literal_value(
+                                literal_type,
+                                value,
+                                symbols,
+                            ))
+                        }
+                    })
+                    .collect(),
+            ))
+        }
+        (
+            ConstLiteralAggregateType::Array {
+                element_type,
+                length,
+            },
+            ExprKind::Array(values),
+        ) if usize::try_from(*length).ok() == Some(values.len()) => {
+            Some(ConstValueTemplate::Array {
+                element_type: const_literal_value_type(*element_type),
+                elements: values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        if reference_slots.contains(&index) {
+                            ConstValueTemplatePart::Reference
+                        } else {
+                            ConstValueTemplatePart::Literal(evaluate_const_literal_value(
+                                *element_type,
+                                value,
+                                symbols,
+                            ))
+                        }
+                    })
+                    .collect(),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -8369,12 +8455,31 @@ enum ConstLiteralAggregateType {
     EnumVariant(Vec<ConstLiteralType>),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConstValueTemplatePart {
+    Literal(Option<ConstValue>),
+    Reference,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConstValueTemplate {
+    Tuple(Vec<ConstValueTemplatePart>),
+    Array {
+        element_type: ConstValueType,
+        elements: Vec<ConstValueTemplatePart>,
+    },
+}
+
+#[derive(Clone)]
 struct PendingConstReference {
     source_index: usize,
     target: DefId,
     location: sai_diagnostics::Location,
     package: Option<String>,
     name: String,
+    expected_shape: ConstValueShape,
+    slot: Option<usize>,
+    template: Option<ConstValueTemplate>,
 }
 
 fn resolve_const_value_shape(
@@ -8576,7 +8681,25 @@ fn pending_const_reference_target<'hir>(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
 ) -> Option<(DefId, sai_hir::Span, String)> {
-    if value_type.is_none() || !owner.raw_attrs.is_empty() {
+    value_type.as_ref()?;
+    let Some(body) = owner.body else {
+        return None;
+    };
+    let ExprKind::Path(path) = body.value.kind else {
+        return None;
+    };
+    pending_const_reference_path_target(owner, module_resolution, def_paths, path, symbols, inputs)
+}
+
+fn pending_const_reference_path_target(
+    owner: &HirOwner<'_>,
+    module_resolution: &ModuleResolution,
+    def_paths: &DefPathInterner,
+    path: HirPath<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<(DefId, sai_hir::Span, String)> {
+    if !owner.raw_attrs.is_empty() {
         return None;
     }
     let OwnerNode::Item(item) = owner.node else {
@@ -8593,12 +8716,6 @@ fn pending_const_reference_target<'hir>(
     if !is_supported_const_name_convention(&name, written_name) {
         return None;
     }
-    let Some(body) = owner.body else {
-        return None;
-    };
-    let ExprKind::Path(path) = body.value.kind else {
-        return None;
-    };
     if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
         return None;
     }
@@ -8646,9 +8763,81 @@ fn const_def_id_order(def_id: DefId) -> (sai_hir::PackageId, sai_hir::DefIndex) 
 }
 
 fn set_const_reference_blocked(check: &mut ConstLiteralCheck) {
-    if let ConstLiteralCheck::SupportedConstReference { blocked, .. } = check {
-        *blocked = true;
+    match check {
+        ConstLiteralCheck::SupportedConstReference { blocked, .. }
+        | ConstLiteralCheck::SupportedConstAggregateReference { blocked, .. } => {
+            *blocked = true;
+        }
+        _ => {}
     }
+}
+
+fn push_const_reference_diagnostic(check: &mut ConstLiteralCheck, diagnostic: Diagnostic) {
+    match check {
+        ConstLiteralCheck::SupportedConstReference { diagnostics, .. }
+        | ConstLiteralCheck::SupportedConstAggregateReference { diagnostics, .. } => {
+            diagnostics.push(diagnostic);
+        }
+        _ => {}
+    }
+}
+
+fn const_reference_edge_order(
+    owners: &[ConstOwnerResolution],
+    edge: &(usize, PendingConstReference),
+) -> ((sai_hir::PackageId, sai_hir::DefIndex), usize) {
+    (
+        const_def_id_order(owners[edge.0].owner.def_id.to_def_id()),
+        edge.1.slot.unwrap_or(usize::MAX),
+    )
+}
+
+fn const_owner_reference_name(edges: &[(usize, PendingConstReference)]) -> Option<&str> {
+    edges.first().map(|(_, reference)| reference.name.as_str())
+}
+
+fn deterministic_const_cycle_return_path(
+    owners: &[ConstOwnerResolution],
+    edges: &[Vec<(usize, PendingConstReference)>],
+    start: usize,
+    goal: usize,
+    component: &HashSet<usize>,
+) -> Option<Vec<usize>> {
+    let mut predecessor = vec![None; owners.len()];
+    let mut visited = vec![false; owners.len()];
+    let mut queue = std::collections::VecDeque::new();
+    visited[start] = true;
+    queue.push_back(start);
+
+    while let Some(current) = queue.pop_front() {
+        if current == goal {
+            break;
+        }
+        let mut outgoing = edges[current]
+            .iter()
+            .filter(|(target, _)| component.contains(target))
+            .collect::<Vec<_>>();
+        outgoing.sort_by_key(|edge| const_reference_edge_order(owners, edge));
+        for (target, _) in outgoing {
+            if !visited[*target] {
+                visited[*target] = true;
+                predecessor[*target] = Some(current);
+                queue.push_back(*target);
+            }
+        }
+    }
+
+    if !visited[goal] {
+        return None;
+    }
+    let mut path = vec![goal];
+    let mut current = goal;
+    while current != start {
+        current = predecessor[current]?;
+        path.push(current);
+    }
+    path.reverse();
+    Some(path)
 }
 
 fn resolve_const_references(
@@ -8661,8 +8850,8 @@ fn resolve_const_references(
         .enumerate()
         .map(|(index, owner)| (owner.owner.def_id.to_def_id(), index))
         .collect::<HashMap<_, _>>();
-    let mut references = HashMap::with_capacity(pending.len());
-    let mut edges = vec![None; owners.len()];
+    let mut edges = vec![Vec::new(); owners.len()];
+    let mut unsupported_sources = HashSet::new();
 
     for reference in pending {
         let source_index = reference.source_index;
@@ -8670,18 +8859,15 @@ fn resolve_const_references(
             continue;
         };
         if source.owner.def_id.package() != reference.target.package {
+            unsupported_sources.insert(source_index);
             continue;
         }
         let Some(&target_index) = owner_indices.get(&reference.target) else {
-            owners[source_index].literal_check = Ok(ConstLiteralCheck::Unsupported);
-            continue;
-        };
-        let Some(source_shape) = source.const_value_type.as_ref() else {
-            owners[source_index].literal_check = Ok(ConstLiteralCheck::Unsupported);
+            unsupported_sources.insert(source_index);
             continue;
         };
         let Some(target_shape) = owners[target_index].const_value_type.as_ref() else {
-            owners[source_index].literal_check = Ok(ConstLiteralCheck::Unsupported);
+            unsupported_sources.insert(source_index);
             continue;
         };
         let target_supported = owners[target_index]
@@ -8689,12 +8875,12 @@ fn resolve_const_references(
             .as_ref()
             .is_ok_and(ConstLiteralCheck::is_supported);
         if !target_supported {
-            owners[source_index].literal_check = Ok(ConstLiteralCheck::Unsupported);
+            unsupported_sources.insert(source_index);
             continue;
         }
 
         let source_owner = owners[source_index].owner;
-        if !const_value_shapes_match(source_shape, target_shape) {
+        if !const_value_shapes_match(&reference.expected_shape, target_shape) {
             let diagnostic = const_reference_diagnostic(
                 source_owner,
                 reference.location.clone(),
@@ -8703,92 +8889,146 @@ fn resolve_const_references(
                 sai_diagnostics::Code::TypeMismatch,
                 format!(
                     "expected `{}`, found `{}`",
-                    const_value_shape_name(source_shape),
+                    const_value_shape_name(&reference.expected_shape),
                     const_value_shape_name(target_shape)
                 ),
-                "constant reference has a different type",
+                "constant reference has a different field or element type",
             )?;
-            owners[source_index].literal_check = Ok(ConstLiteralCheck::SupportedConstReference {
-                diagnostics: vec![diagnostic],
-                blocked: false,
-            });
+            if let Ok(check) = &mut owners[source_index].literal_check {
+                push_const_reference_diagnostic(check, diagnostic);
+            }
         }
 
-        edges[source_index] = Some(target_index);
-        references.insert(source_index, reference);
+        edges[source_index].push((target_index, reference));
     }
 
-    // Each supported direct reference has one dependency. Walk those edges
-    // iteratively so cycles are diagnosed without recursing through queries.
+    for source_index in unsupported_sources {
+        owners[source_index].literal_check = Ok(ConstLiteralCheck::Unsupported);
+        owners[source_index].const_value = Ok(None);
+        edges[source_index].clear();
+    }
+
+    // Traverse the multi-edge graph iteratively; const evaluation must not
+    // recurse through query cycles.
     let mut traversal_order = edges
         .iter()
         .enumerate()
-        .filter_map(|(index, edge)| edge.map(|_| index))
+        .filter_map(|(index, outgoing)| (!outgoing.is_empty()).then_some(index))
         .collect::<Vec<_>>();
     traversal_order
         .sort_by_key(|&index| const_def_id_order(owners[index].owner.def_id.to_def_id()));
-    let mut state = vec![0_u8; owners.len()];
-    let mut cycle_nodes = HashSet::new();
+
+    let mut reverse_edges = vec![Vec::new(); owners.len()];
+    for (source, outgoing) in edges.iter().enumerate() {
+        for (target, _) in outgoing {
+            reverse_edges[*target].push(source);
+        }
+    }
+    let mut visited = vec![false; owners.len()];
+    let mut finish_order = Vec::new();
     for start in traversal_order.iter().copied() {
-        if state[start] != 0 {
+        if visited[start] {
             continue;
         }
-        let mut path = Vec::new();
-        let mut positions = HashMap::new();
-        let mut current = Some(start);
-        while let Some(index) = current {
-            match state[index] {
-                0 => {
-                    state[index] = 1;
-                    positions.insert(index, path.len());
-                    path.push(index);
-                    current = edges[index];
+        visited[start] = true;
+        let mut stack = vec![(start, 0_usize)];
+        while !stack.is_empty() {
+            let stack_index = stack.len() - 1;
+            let current = stack[stack_index].0;
+            let next_edge = stack[stack_index].1;
+            if next_edge < edges[current].len() {
+                let target = edges[current][next_edge].0;
+                stack[stack_index].1 += 1;
+                if !visited[target] {
+                    visited[target] = true;
+                    stack.push((target, 0));
                 }
-                1 => {
-                    if let Some(&cycle_start) = positions.get(&index) {
-                        let cycle = &path[cycle_start..];
-                        cycle_nodes.extend(cycle.iter().copied());
-                        let first = cycle
-                            .iter()
-                            .copied()
-                            .min_by_key(|&cycle_index| {
-                                const_def_id_order(owners[cycle_index].owner.def_id.to_def_id())
-                            })
-                            .expect("a detected const cycle has at least one owner");
-                        let mut names = Vec::with_capacity(cycle.len() + 1);
-                        let mut cycle_index = first;
-                        loop {
-                            names.push(references[&cycle_index].name.as_str().to_owned());
-                            cycle_index = edges[cycle_index]
-                                .expect("a const cycle node has a reference edge");
-                            if cycle_index == first {
-                                names.push(references[&first].name.clone());
-                                break;
-                            }
-                        }
-                        let diagnostic = const_reference_diagnostic(
-                            owners[first].owner,
-                            references[&first].location.clone(),
-                            references[&first].package.as_deref(),
-                            snapshot,
-                            sai_diagnostics::Code::ConstCycle,
-                            format!("constant cycle: {}", names.join(" -> ")),
-                            "constant cycle starts here",
-                        )?;
-                        if let Ok(ConstLiteralCheck::SupportedConstReference {
-                            diagnostics, ..
-                        }) = &mut owners[first].literal_check
-                        {
-                            diagnostics.push(diagnostic);
-                        }
-                    }
-                    break;
-                }
-                _ => break,
+            } else {
+                finish_order.push(current);
+                stack.pop();
             }
         }
-        for index in path {
-            state[index] = 2;
+    }
+
+    visited.fill(false);
+    let mut components = Vec::<Vec<usize>>::new();
+    for start in finish_order.into_iter().rev() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut component = Vec::new();
+        let mut stack = vec![start];
+        while let Some(current) = stack.pop() {
+            component.push(current);
+            for target in reverse_edges[current].iter().copied() {
+                if !visited[target] {
+                    visited[target] = true;
+                    stack.push(target);
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    let mut cycle_nodes = HashSet::new();
+    for mut component in components {
+        let component_set = component.iter().copied().collect::<HashSet<_>>();
+        let cyclic = component.len() > 1
+            || component
+                .first()
+                .is_some_and(|index| edges[*index].iter().any(|(target, _)| target == index));
+        if !cyclic {
+            continue;
+        }
+        component.sort_by_key(|&index| const_def_id_order(owners[index].owner.def_id.to_def_id()));
+        cycle_nodes.extend(component.iter().copied());
+        let first = component[0];
+        let mut outgoing = edges[first]
+            .iter()
+            .filter(|(target, _)| component_set.contains(target))
+            .collect::<Vec<_>>();
+        outgoing.sort_by_key(|edge| const_reference_edge_order(owners, edge));
+        let witness = outgoing.iter().find_map(|(target, reference)| {
+            deterministic_const_cycle_return_path(owners, &edges, *target, first, &component_set)
+                .map(|path| (reference.clone(), path))
+        });
+        let Some((first_reference, return_path)) = witness else {
+            continue;
+        };
+        let mut cycle_names = Vec::with_capacity(return_path.len() + 1);
+        cycle_names.push(
+            const_owner_reference_name(&edges[first])
+                .unwrap_or("<constant>")
+                .to_owned(),
+        );
+        for index in return_path
+            .iter()
+            .copied()
+            .take(return_path.len().saturating_sub(1))
+        {
+            cycle_names.push(
+                const_owner_reference_name(&edges[index])
+                    .unwrap_or("<constant>")
+                    .to_owned(),
+            );
+        }
+        cycle_names.push(
+            const_owner_reference_name(&edges[first])
+                .unwrap_or("<constant>")
+                .to_owned(),
+        );
+        let diagnostic = const_reference_diagnostic(
+            owners[first].owner,
+            first_reference.location.clone(),
+            first_reference.package.as_deref(),
+            snapshot,
+            sai_diagnostics::Code::ConstCycle,
+            format!("constant cycle: {}", cycle_names.join(" -> ")),
+            "constant cycle starts here",
+        )?;
+        if let Ok(check) = &mut owners[first].literal_check {
+            push_const_reference_diagnostic(check, diagnostic);
         }
     }
     for index in cycle_nodes {
@@ -8797,44 +9037,89 @@ fn resolve_const_references(
         }
     }
 
-    // A reverse dependency walk copies already evaluated values into each
-    // dependency walk copies evaluated values into each reference. Iteration
-    // also propagates invalidity through chains that were visited out of order.
+    // Propagate values and invalidity until every reference reaches a stable
+    // state. Multiple fields may depend on different earlier or later owners.
     for _ in 0..owners.len() {
         let mut changed = false;
         for source_index in traversal_order.iter().copied() {
-            let Some(target_index) = edges[source_index] else {
-                continue;
-            };
+            let outgoing = &edges[source_index];
             let source_valid = owners[source_index]
                 .literal_check
                 .as_ref()
                 .is_ok_and(ConstLiteralCheck::is_valid);
-            if !source_valid {
+            if !source_valid || outgoing.is_empty() {
                 continue;
             }
-            let target_valid = owners[target_index]
-                .literal_check
-                .as_ref()
-                .is_ok_and(ConstLiteralCheck::is_valid);
-            if !target_valid {
+            let mut target_values = Vec::with_capacity(outgoing.len());
+            let mut blocked = false;
+            let mut waiting = false;
+            for (target_index, reference) in outgoing {
+                let target_valid = owners[*target_index]
+                    .literal_check
+                    .as_ref()
+                    .is_ok_and(ConstLiteralCheck::is_valid);
+                let target_value = owners[*target_index]
+                    .const_value
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .cloned();
+                if !target_valid {
+                    blocked = true;
+                    break;
+                }
+                let Some(target_value) = target_value else {
+                    waiting = true;
+                    break;
+                };
+                target_values.push((reference.slot, target_value));
+            }
+            if blocked {
                 if let Ok(check) = &mut owners[source_index].literal_check {
                     set_const_reference_blocked(check);
                     changed = true;
                 }
                 continue;
             }
-            let value = owners[target_index]
-                .const_value
-                .as_ref()
-                .ok()
-                .and_then(Option::as_ref)
-                .cloned();
-            if let Some(value) = value {
-                if owners[source_index].const_value.as_ref().ok() != Some(&Some(value.clone())) {
-                    owners[source_index].const_value = Ok(Some(value));
-                    changed = true;
+            if waiting {
+                continue;
+            }
+
+            let value = if outgoing
+                .iter()
+                .all(|(_, reference)| reference.slot.is_none())
+            {
+                (outgoing.len() == 1).then(|| target_values[0].1.clone())
+            } else {
+                let template = outgoing
+                    .iter()
+                    .find_map(|(_, reference)| reference.template.as_ref());
+                match template {
+                    Some(ConstValueTemplate::Tuple(parts)) => {
+                        fill_const_value_template(parts, &target_values).map(|values| {
+                            ConstValue::Aggregate {
+                                variant: None,
+                                fields: values.into(),
+                            }
+                        })
+                    }
+                    Some(ConstValueTemplate::Array {
+                        element_type,
+                        elements,
+                    }) => fill_const_value_template(elements, &target_values).map(|values| {
+                        ConstValue::Array {
+                            element_type: *element_type,
+                            elements: values.into(),
+                        }
+                    }),
+                    None => None,
                 }
+            };
+            if let Some(value) = value
+                && owners[source_index].const_value.as_ref().ok() != Some(&Some(value.clone()))
+            {
+                owners[source_index].const_value = Ok(Some(value));
+                changed = true;
             }
         }
         if !changed {
@@ -8842,6 +9127,27 @@ fn resolve_const_references(
         }
     }
     Ok(())
+}
+
+fn fill_const_value_template(
+    template: &[ConstValueTemplatePart],
+    references: &[(Option<usize>, ConstValue)],
+) -> Option<Vec<ConstValue>> {
+    let reference_values = references
+        .iter()
+        .filter_map(|(slot, value)| slot.map(|slot| (slot, value)))
+        .collect::<HashMap<_, _>>();
+    template
+        .iter()
+        .enumerate()
+        .map(|(index, part)| match part {
+            ConstValueTemplatePart::Literal(Some(value)) => Some(value.clone()),
+            ConstValueTemplatePart::Literal(None) => None,
+            ConstValueTemplatePart::Reference => {
+                reference_values.get(&index).map(|value| (*value).clone())
+            }
+        })
+        .collect()
 }
 
 fn resolve_const_array_type(
@@ -8998,7 +9304,9 @@ fn check_const_array_literal(
     };
 
     if values.iter().any(|value| {
-        !is_direct_const_literal_or_unit(value) && !is_const_bool_literal_expression(value)
+        !is_direct_const_literal_or_unit(value)
+            && !is_const_bool_literal_expression(value)
+            && !is_direct_const_reference_candidate(value)
     }) {
         return Ok(None);
     }
@@ -9020,6 +9328,9 @@ fn check_const_array_literal(
     }
 
     for value in values {
+        if is_direct_const_reference_candidate(value) {
+            continue;
+        }
         let mut element_diagnostics = match check_const_bool_expression_initializer(
             owner.id,
             element_type,
@@ -12406,7 +12717,9 @@ fn check_const_tuple_literal(
     };
 
     if values.iter().any(|value| {
-        !is_direct_const_literal_or_unit(value) && !is_const_bool_literal_expression(value)
+        !is_direct_const_literal_or_unit(value)
+            && !is_const_bool_literal_expression(value)
+            && !is_direct_const_reference_candidate(value)
     }) {
         return Ok(None);
     }
@@ -12429,6 +12742,9 @@ fn check_const_tuple_literal(
 
     let mut diagnostics = Vec::new();
     for (literal_type, value) in expected_types.iter().zip(values) {
+        if is_direct_const_reference_candidate(value) {
+            continue;
+        }
         let mut field_diagnostics = match check_const_bool_expression_initializer(
             owner.id,
             *literal_type,
@@ -12464,6 +12780,13 @@ fn is_direct_const_literal_or_unit(value: &HirExpr<'_>) -> bool {
         ExprKind::Tuple(elements) => elements.is_empty(),
         _ => false,
     }
+}
+
+fn is_direct_const_reference_candidate(value: &HirExpr<'_>) -> bool {
+    let ExprKind::Path(path) = value.kind else {
+        return false;
+    };
+    path.root == PathRoot::Plain && path.segments.len() == 1 && path.segments[0].args.is_none()
 }
 
 fn check_const_literal_leaf(
@@ -23572,7 +23895,7 @@ impl RootDatabase {
                         Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
                         Result<Option<ConstValue>, OwnerControlFlowResolutionError>,
                         Option<ConstValueShape>,
-                        Option<PendingConstReference>,
+                        Vec<PendingConstReference>,
                     ),
                     OwnerControlFlowResolutionError,
                 > = (|| {
@@ -23730,7 +24053,7 @@ impl RootDatabase {
                             literal_check,
                             const_value,
                             const_value_type,
-                            None,
+                            Vec::new(),
                         ));
                     };
                     let locals = match &module_aliases {
@@ -23754,7 +24077,7 @@ impl RootDatabase {
                                 ))),
                                 Err(error) => Err(error.clone()),
                             };
-                            let mut pending_reference = None;
+                            let mut pending_references = Vec::new();
                             let enum_variant_field = match body.value.kind {
                                 ExprKind::Field { .. } => Some(body.value),
                                 ExprKind::Call {
@@ -23949,13 +24272,147 @@ impl RootDatabase {
                                                 diagnostics: Vec::new(),
                                                 blocked: false,
                                             });
-                                        pending_reference = Some(PendingConstReference {
+                                        pending_references.push(PendingConstReference {
                                             source_index,
                                             target,
                                             location,
                                             package: inputs.source_ref.package.clone(),
                                             name,
+                                            expected_shape: const_value_type
+                                                .clone()
+                                                .expect("reference target requires a supported source shape"),
+                                            slot: None,
+                                            template: None,
                                         });
+                                    }
+                                }
+                            }
+                            if matches!(
+                                literal_check,
+                                Ok(ConstLiteralCheck::SupportedTuple { .. }
+                                    | ConstLiteralCheck::SupportedArray { .. })
+                            ) && let Ok(Some(module_paths)) = &module_resolution
+                            {
+                                let aggregate_fields =
+                                    match (aggregate_type.as_ref(), body.value.kind) {
+                                        (
+                                            Some(ConstLiteralAggregateType::Tuple(field_types)),
+                                            ExprKind::Tuple(values),
+                                        ) if field_types.len() == values.len() => Some(
+                                            field_types
+                                                .iter()
+                                                .copied()
+                                                .zip(values)
+                                                .enumerate()
+                                                .map(|(index, (field_type, value))| {
+                                                    (index, field_type, value)
+                                                })
+                                                .collect::<Vec<_>>(),
+                                        ),
+                                        (
+                                            Some(ConstLiteralAggregateType::Array {
+                                                element_type,
+                                                length: _,
+                                            }),
+                                            ExprKind::Array(values),
+                                        ) => Some(
+                                            values
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(index, value)| (index, *element_type, value))
+                                                .collect::<Vec<_>>(),
+                                        ),
+                                        _ => None,
+                                    };
+                                if let Some(fields) = aggregate_fields {
+                                    let path_slots = fields
+                                        .iter()
+                                        .filter_map(|(index, _, value)| {
+                                            is_direct_const_reference_candidate(value)
+                                                .then_some(*index)
+                                        })
+                                        .collect::<HashSet<_>>();
+                                    if !path_slots.is_empty() {
+                                        let mut aggregate_references = Vec::new();
+                                        let mut unsupported_reference = false;
+                                        for (slot, literal_type, value) in &fields {
+                                            if !path_slots.contains(slot) {
+                                                continue;
+                                            }
+                                            let ExprKind::Path(path) = value.kind else {
+                                                unsupported_reference = true;
+                                                break;
+                                            };
+                                            let Some((target, span, name)) =
+                                                pending_const_reference_path_target(
+                                                    &hir_owner,
+                                                    module_paths,
+                                                    &def_paths,
+                                                    path,
+                                                    &self.symbols,
+                                                    &inputs,
+                                                )
+                                            else {
+                                                unsupported_reference = true;
+                                                break;
+                                            };
+                                            let location =
+                                                sai_diagnostics::Location::from_decoded_source(
+                                                    inputs.source_ref.clone(),
+                                                    sai_diagnostics::Span::new(
+                                                        span.file,
+                                                        span.range,
+                                                    ),
+                                                    &inputs.source,
+                                                )
+                                                .ok_or(
+                                                    OwnerControlFlowResolutionError::InvalidSourceLocation(
+                                                        descriptor.owner,
+                                                    ),
+                                                )?;
+                                            aggregate_references.push(PendingConstReference {
+                                                source_index,
+                                                target,
+                                                location,
+                                                package: inputs.source_ref.package.clone(),
+                                                name,
+                                                expected_shape: ConstValueShape::Literal(
+                                                    *literal_type,
+                                                ),
+                                                slot: Some(*slot),
+                                                template: None,
+                                            });
+                                        }
+
+                                        if unsupported_reference {
+                                            literal_check = Ok(ConstLiteralCheck::Unsupported);
+                                            const_value = Ok(None);
+                                        } else {
+                                            let template = const_value_template(
+                                                &hir_owner,
+                                                aggregate_type.as_ref(),
+                                                &path_slots,
+                                                &self.symbols,
+                                            );
+                                            let diagnostics = literal_check
+                                                .as_ref()
+                                                .expect("aggregate check is set")
+                                                .diagnostics()
+                                                .to_vec();
+                                            literal_check = Ok(
+                                                ConstLiteralCheck::SupportedConstAggregateReference {
+                                                    diagnostics,
+                                                    blocked: false,
+                                                },
+                                            );
+                                            const_value = Ok(None);
+                                            if let (Some(template), Some(first)) =
+                                                (template, aggregate_references.first_mut())
+                                            {
+                                                first.template = Some(template);
+                                            }
+                                            pending_references.extend(aggregate_references);
+                                        }
                                     }
                                 }
                             }
@@ -23994,7 +24451,7 @@ impl RootDatabase {
                                 literal_check,
                                 const_value,
                                 const_value_type,
-                                pending_reference,
+                                pending_references,
                             ))
                         }
                         Err(error) => Ok((
@@ -24006,7 +24463,7 @@ impl RootDatabase {
                             literal_check,
                             const_value,
                             const_value_type,
-                            None,
+                            Vec::new(),
                         )),
                     }
                 })();
@@ -24019,7 +24476,7 @@ impl RootDatabase {
                     literal_check,
                     const_value,
                     const_value_type,
-                    pending_reference,
+                    pending_references,
                 ) = analysis.unwrap_or_else(|error| {
                     (
                         Err(error.clone()),
@@ -24030,12 +24487,10 @@ impl RootDatabase {
                         Err(error.clone()),
                         Err(error),
                         None,
-                        None,
+                        Vec::new(),
                     )
                 });
-                if let Some(reference) = pending_reference {
-                    pending_const_references.push(reference);
-                }
+                pending_const_references.extend(pending_references);
                 let module_path_diagnostics =
                     module_path_diagnostics.unwrap_or_else(|| match &type_path_resolution {
                         Err(error) => Err(error.clone()),
@@ -82607,6 +83062,317 @@ property "shared"() {}
     }
 
     #[test]
+    fn direct_const_references_fill_flat_tuple_and_array_leaves_in_source_order() {
+        let root = concat!(
+            "pub const BASE: I32 = 12\n",
+            "pub const FLAG: Bool = true and false\n",
+            "pub const TEXT: Str = \"flat\"\n",
+            "pub const BYTES: Slice<Byte> = b\"A\\0\\xff\"\n",
+            "pub const NOTHING: () = ()\n",
+            "pub const MIXED: (I32, Bool, Str, Slice<Byte>, ()) = (LATER, FLAG, TEXT, BYTES, NOTHING)\n",
+            "pub const VALUES: Array<I32, 4> = [BASE, LATER, 0, CHAIN]\n",
+            "pub const DUPLICATE: (I32, I32) = (BASE, BASE)\n",
+            "pub const LATER: I32 = 5\n",
+            "pub const CHAIN: I32 = LAST\n",
+            "pub const LAST: I32 = 7\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let expected = [
+            ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([
+                    ConstValue::Int {
+                        value: 5,
+                        ty: sai_ty::ty::IntTy::I32,
+                    },
+                    ConstValue::Bool(false),
+                    ConstValue::Str(
+                        database
+                            .symbols
+                            .intern("flat")
+                            .expect("string value is interned"),
+                    ),
+                    ConstValue::ByteStr(Arc::from([b'A', 0, 0xff])),
+                    ConstValue::Aggregate {
+                        variant: None,
+                        fields: Arc::from([]),
+                    },
+                ]),
+            },
+            ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::I32),
+                elements: Arc::from([
+                    ConstValue::Int {
+                        value: 12,
+                        ty: sai_ty::ty::IntTy::I32,
+                    },
+                    ConstValue::Int {
+                        value: 5,
+                        ty: sai_ty::ty::IntTy::I32,
+                    },
+                    ConstValue::Int {
+                        value: 0,
+                        ty: sai_ty::ty::IntTy::I32,
+                    },
+                    ConstValue::Int {
+                        value: 7,
+                        ty: sai_ty::ty::IntTy::I32,
+                    },
+                ]),
+            },
+            ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([
+                    ConstValue::Int {
+                        value: 12,
+                        ty: sai_ty::ty::IntTy::I32,
+                    },
+                    ConstValue::Int {
+                        value: 12,
+                        ty: sai_ty::ty::IntTy::I32,
+                    },
+                ]),
+            },
+        ];
+        for (index, expected_value) in expected.into_iter().enumerate() {
+            let owner = &resolved.owners()[index + 5];
+            let check = owner
+                .literal_check()
+                .expect("aggregate reference check uses the current snapshot");
+            assert!(
+                check.is_supported(),
+                "owner {} remains supported",
+                index + 5
+            );
+            assert!(
+                check.is_valid(),
+                "owner {} is valid: {:?}",
+                index + 5,
+                check.diagnostics()
+            );
+            assert!(check.requires_const_value());
+            assert!(
+                matches!(
+                    check,
+                    ConstLiteralCheck::SupportedConstAggregateReference { blocked: false, .. }
+                ),
+                "owner {} is a resolved aggregate reference",
+                index + 5
+            );
+            assert_eq!(
+                owner.const_value().expect("aggregate value is resolved"),
+                Some(expected_value),
+                "owner {} preserves source order and leaf value types",
+                index + 5
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_const_reference_mismatches_and_invalid_targets_suppress_values() {
+        let root = concat!(
+            "pub const INTEGER: I32 = 3\n",
+            "pub const BOOLEAN: Bool = true\n",
+            "pub const BAD_RANGE: I8 = 128\n",
+            "pub const TYPE_MISMATCH: (I32, Bool) = (BOOLEAN, INTEGER)\n",
+            "pub const INVALID_TARGET: (I8, I32) = (BAD_RANGE, INTEGER)\n",
+            "pub const WRONG_LENGTH: Array<I32, 2> = [BOOLEAN]\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        let mismatch = resolved.owners()[3]
+            .literal_check()
+            .expect("mismatch check uses the current snapshot");
+        assert!(matches!(
+            mismatch,
+            ConstLiteralCheck::SupportedConstAggregateReference { .. }
+        ));
+        assert_eq!(mismatch.diagnostics().len(), 2);
+        assert!(
+            mismatch
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+        );
+        assert!(!mismatch.is_valid());
+        assert_eq!(
+            resolved.owners()[3]
+                .const_value()
+                .expect("mismatched references remain checked"),
+            None
+        );
+
+        let invalid_target = resolved.owners()[4]
+            .literal_check()
+            .expect("invalid-target propagation check uses the current snapshot");
+        assert_eq!(
+            invalid_target,
+            &ConstLiteralCheck::SupportedConstAggregateReference {
+                diagnostics: Vec::new(),
+                blocked: true,
+            }
+        );
+        assert!(invalid_target.diagnostics().is_empty());
+        assert_eq!(
+            resolved.owners()[4]
+                .const_value()
+                .expect("invalid dependency suppresses the aggregate value"),
+            None
+        );
+
+        let wrong_length = resolved.owners()[5]
+            .literal_check()
+            .expect("wrong-length array diagnostics use the current snapshot");
+        assert_eq!(
+            wrong_length
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::ArrayLengthMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+            "array length and reference element type errors are both preserved"
+        );
+        let array_start = root.rfind("[BOOLEAN]").expect("array literal is present");
+        assert_eq!(
+            wrong_length.diagnostics()[0]
+                .primary()
+                .map(|location| location.span.range),
+            Some(
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(array_start as u32),
+                    sai_diagnostics::TextSize::new((array_start + "[BOOLEAN]".len()) as u32,),
+                )
+                .expect("array range is ordered")
+            ),
+            "array length mismatch points at the supplied array literal"
+        );
+        let reference_start = root.rfind("BOOLEAN").expect("array reference is present");
+        assert_eq!(
+            wrong_length.diagnostics()[1]
+                .primary()
+                .map(|location| location.span.range),
+            Some(
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(reference_start as u32),
+                    sai_diagnostics::TextSize::new((reference_start + "BOOLEAN".len()) as u32),
+                )
+                .expect("reference range is ordered")
+            ),
+            "reference type mismatch points at the array leaf"
+        );
+        assert_eq!(
+            resolved.owners()[5]
+                .const_value()
+                .expect("invalid wrong-length array has no value"),
+            None
+        );
+    }
+
+    #[test]
+    fn branching_aggregate_const_cycles_are_reported_once_per_component() {
+        let root = concat!(
+            "pub const CYCLE_A: (I32, I32) = (CYCLE_B, CYCLE_C)\n",
+            "pub const CYCLE_B: I32 = CYCLE_A\n",
+            "pub const CYCLE_C: I32 = CYCLE_A\n",
+            "pub const DEPENDENT: I32 = CYCLE_B\n",
+            "pub const INDEPENDENT: (I32, I32) = (1, 2)\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        assert_eq!(resolved.owners().len(), 5);
+
+        let cycle_diagnostics = resolved
+            .owners()
+            .iter()
+            .flat_map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal check uses the current snapshot")
+                    .diagnostics()
+                    .iter()
+            })
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::ConstCycle)
+            .collect::<Vec<_>>();
+        assert_eq!(cycle_diagnostics.len(), 1);
+        assert!(
+            cycle_diagnostics[0]
+                .message
+                .contains("CYCLE_A -> CYCLE_B -> CYCLE_A"),
+            "the witness uses the lowest DefId and sorted reference edges: {}",
+            cycle_diagnostics[0].message
+        );
+        for index in [0, 1, 2, 3] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("cycle check uses the current snapshot");
+            assert!(
+                matches!(
+                    check,
+                    ConstLiteralCheck::SupportedConstAggregateReference { blocked: true, .. }
+                        | ConstLiteralCheck::SupportedConstReference { blocked: true, .. }
+                ),
+                "owner {index} is blocked: {check:?}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("cycle or dependent value is checked"),
+                None
+            );
+        }
+        assert!(
+            resolved.owners()[4]
+                .literal_check()
+                .expect("independent check uses the current snapshot")
+                .is_valid()
+        );
+        assert!(
+            resolved.owners()[4]
+                .const_value()
+                .expect("independent aggregate still evaluates")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn const_unit_enum_variants_preserve_identity_and_gate_other_shapes() {
         let root = concat!(
             "enum Color { Red, Green = 5, Blue }\n",
@@ -83803,11 +84569,33 @@ property "shared"() {}
             "false",
         );
 
-        for index in [12, 13, 14, 15] {
+        assert_eq!(
+            checks[12],
+            &ConstLiteralCheck::SupportedConstAggregateReference {
+                diagnostics: Vec::new(),
+                blocked: false,
+            },
+            "a direct same-package const path in a flat array is supported"
+        );
+        assert!(checks[12].requires_const_value());
+        assert_eq!(
+            resolved.owners()[12]
+                .const_value()
+                .expect("direct array path evaluates"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::I32),
+                elements: Arc::from([ConstValue::Int {
+                    value: 1,
+                    ty: sai_ty::ty::IntTy::I32,
+                }]),
+            })
+        );
+
+        for index in [13, 14, 15] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "path, computed, nested, or aliased array form at owner index {index} stays gated"
+                "computed, nested, or aliased array form at owner index {index} stays gated"
             );
             assert!(!checks[index].requires_const_value());
             assert_eq!(
