@@ -4534,6 +4534,30 @@ fn public_inherent_method_binary_tails_accept_paths_and_known_fields() {
         concat!(
             "type Counter { left: I32, right: I32 }\n",
             "impl Counter {\n",
+            "    pub fn subtract(self: borrow Self) -> I32 {\n",
+            "        self.left - self.right\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { left: I32, right: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn multiply(self: borrow Self) -> I32 {\n",
+            "        self.left * self.right\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { left: I32, right: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn divide(self: borrow Self) -> I32 {\n",
+            "        self.left / self.right\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { left: I32, right: I32 }\n",
+            "impl Counter {\n",
             "    pub fn remainder(self: borrow Self) -> I32 {\n",
             "        self.left % self.right\n",
             "    }\n",
@@ -8682,6 +8706,83 @@ fn top_level_function_addition_tails_accept_concrete_numeric_paths() {
 }
 
 #[test]
+fn top_level_function_subtract_multiply_divide_tails_accept_numeric_paths() {
+    let mut functions = Vec::new();
+    for (name, ty) in [
+        ("i8", "I8"),
+        ("i16", "I16"),
+        ("i32", "I32"),
+        ("i64", "I64"),
+        ("isize", "ISize"),
+        ("u8", "U8"),
+        ("u16", "U16"),
+        ("u32", "U32"),
+        ("u64", "U64"),
+        ("usize", "USize"),
+        ("f32", "F32"),
+        ("f64", "F64"),
+    ] {
+        for (name_operator, operator) in [("subtract", "-"), ("multiply", "*"), ("divide", "/")] {
+            functions.push(format!(
+                "pub fn {name_operator}_{name}(left: {ty}, right: {ty}) -> {ty} {{ left {operator} right }}"
+            ));
+        }
+    }
+    functions.push(
+        concat!(
+            "pub fn subtract_preceding_local(left: I32, right: I32) -> I32 {\n",
+            "    let copy: I32 = left\n",
+            "    copy - right\n",
+            "}\n",
+        )
+        .to_owned(),
+    );
+    let source = functions.join("\n");
+
+    assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn top_level_function_subtract_multiply_divide_tails_report_operand_and_return_mismatches() {
+    for operator in ["-", "*", "/"] {
+        let source =
+            format!("pub fn mismatch(left: I32, right: U8) -> Bool {{ left {operator} right }}\n");
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let right_start = source.find("right }").expect("right operand exists");
+        let expression_start = source
+            .find(&format!("left {operator} right"))
+            .expect("arithmetic tail exists");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            2,
+            "the operand and independently known result both need diagnostics:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "supported arithmetic-tail errors remain semantic diagnostics:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            "expected `I32`, found `U8`",
+            right_start,
+            right_start + "right".len(),
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            "expected `Bool`, found `I32`",
+            expression_start,
+            expression_start + format!("left {operator} right").len(),
+        );
+    }
+}
+
+#[test]
 fn top_level_function_addition_tails_accept_one_direct_numeric_literal() {
     let mut functions = Vec::new();
     for (name, ty) in [
@@ -8826,7 +8927,8 @@ fn top_level_function_addition_literal_reports_family_and_range_errors() {
 #[test]
 fn unsupported_top_level_arithmetic_and_bitwise_tail_shapes_remain_gated() {
     for source in [
-        "pub fn subtract(left: I32, right: I32) -> I32 { left - right }\n",
+        "pub fn remainder(left: I32, right: I32) -> I32 { left % right }\n",
+        "pub fn subtract_literal(left: I32) -> I32 { left - 1 }\n",
         "pub fn bitand(left: U8, right: U8) -> U8 { left & right }\n",
         "pub fn bool_literal_right(left: I32) -> I32 { left + true }\n",
         "pub fn bool_literal_left(right: I32) -> I32 { true + right }\n",
@@ -8845,6 +8947,24 @@ fn unsupported_top_level_arithmetic_and_bitwise_tail_shapes_remain_gated() {
             &run_check(source, "", &[], &[]),
             "unsupported top-level arithmetic or bitwise binary tail",
         );
+    }
+    for operator in ["-", "*", "/"] {
+        for source in [
+            format!("pub fn literal_right(left: I32, right: I32) -> I32 {{ left {operator} 1 }}\n"),
+            format!("pub fn literal_left(left: I32, right: I32) -> I32 {{ 1 {operator} right }}\n"),
+            format!("pub fn literal_pair() -> I32 {{ 1 {operator} 2 }}\n"),
+            format!(
+                "pub fn nonnumeric(left: Bool, right: Bool) -> Bool {{ left {operator} right }}\n"
+            ),
+            format!(
+                "pub fn computed(left: I32, right: I32) -> I32 {{ (left + 1) {operator} right }}\n"
+            ),
+        ] {
+            assert_check_stays_gated_without_syntax_errors(
+                &run_check(&source, "", &[], &[]),
+                "unsupported subtraction, multiplication, or division tail shape",
+            );
+        }
     }
 }
 
