@@ -245,17 +245,24 @@ lexical refusal behavior.
 validates the specification references and diagnostic expectations in every
 discovered fixture, inventories the lowest-level numbered headings in the covered
 document scopes of §15.9.2, and writes a deterministic JSON report containing
-section-to-test mappings and uncovered sections, diagnostic codes, and panic
-kinds. This initial inventory reads `tests/conformance`; generated tests in
+section-to-test mappings and uncovered sections, diagnostic codes, panic kinds,
+and hard diagnostic codes without a JSON golden. It reads the lint list from
+spec/15 §15.17.2, selects ordinary and target/profile-specialized JSON sidecars
+for configurations allowed by each fixture's directives using §15.2.5's
+first-existing precedence, validates their common NDJSON envelope and registered
+diagnostic codes, and keeps this nonportable golden accounting separate from
+portable annotation coverage. Reference-only fixtures' selected goldens still
+count. This initial inventory reads `tests/conformance`; generated tests in
 `tests/spec/` are not present yet. Directory fixtures use directives from
 their root `sai.package` and scan their source `.sai` files for diagnostic
 annotations; reserved `.expected.sai` and `.fixed.sai` outputs, `expected/`
 directories, and `.wit` and `.mir` trees do not count as tests.
 
 The inventory is intentionally report-only. It does not run the IUT, check the
-required-content matrix of §15.9.1, verify hard-code JSON goldens, generate or
-check the §1.5.4 limit tests, or substantiate a claim. The repository does not
-yet record its implemented stages, so coverage is not a CI merge gate.
+required-content matrix of §15.9.1, compare goldens with IUT output, verify
+code-specific diagnostic data shapes, generate or check the §1.5.4 limit tests,
+or substantiate a claim. The repository does not yet record its implemented
+stages, so coverage is not a CI merge gate.
 `run-panic` annotations identify a location but not a panic kind, and panic
 reports carry no kind field; therefore the report leaves every panic kind
 uncovered instead of inferring one from source text.
