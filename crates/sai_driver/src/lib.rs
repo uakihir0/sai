@@ -7459,11 +7459,14 @@ pub enum ConstValueType {
 ///
 /// This deliberately covers only direct literals of supported primitive
 /// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
-/// fields are supported direct scalar or unit literals or Bool literal-only
-/// `not`/`and`/`or` expressions and comparisons between direct Bool literals.
-/// Flat arrays use those same element forms and require an explicit built-in
+/// fields are supported direct scalar, byte-string, or unit literals or Bool
+/// literal-only `not`/`and`/`or` expressions and comparisons between direct
+/// Bool literals.
+/// Flat arrays still allow only the existing scalar, canonical `Str`, or unit
+/// element literals and Bool literal-only `not`/`and`/`or` expressions and
+/// comparisons between direct Bool literals. They require an explicit built-in
 /// `Array<T, N>` type with a literal length. Top-level Bool expressions use
-/// those same forms. It does not imply that other constant expressions are
+/// those same Bool forms. It does not imply that other constant expressions are
 /// evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
@@ -7719,6 +7722,7 @@ fn check_const_literal_owner(
             diagnostics,
         },
         ConstLiteralType::Str => ConstLiteralCheck::SupportedStr { diagnostics },
+        ConstLiteralType::ByteStr => ConstLiteralCheck::SupportedByteStr { diagnostics },
         ConstLiteralType::Unit => ConstLiteralCheck::SupportedUnit { diagnostics },
     })
 }
@@ -7756,6 +7760,7 @@ fn check_const_bool_expression_initializer(
             primitive == sai_resolve::prelude::PrimTy::Bool,
         ),
         ConstLiteralType::Str => ("Str", false),
+        ConstLiteralType::ByteStr => ("Slice<Byte>", false),
         ConstLiteralType::Unit => ("()", false),
     };
     if is_bool {
@@ -7873,6 +7878,7 @@ fn evaluate_const_value(
                     ConstLiteralType::Primitive(primitive) => ConstValueType::Primitive(*primitive),
                     ConstLiteralType::Str => ConstValueType::Str,
                     ConstLiteralType::Unit => ConstValueType::Unit,
+                    ConstLiteralType::ByteStr => return None,
                 },
                 elements: values.into(),
             })
@@ -7925,6 +7931,10 @@ fn evaluate_const_literal_value(
         ConstLiteralType::Primitive(_) => None,
         ConstLiteralType::Str => match value.kind {
             ExprKind::Lit(Lit::Str(value)) => Some(ConstValue::Str(value)),
+            _ => None,
+        },
+        ConstLiteralType::ByteStr => match value.kind {
+            ExprKind::Lit(Lit::ByteStr(bytes)) => Some(ConstValue::ByteStr(Arc::from(bytes))),
             _ => None,
         },
         ConstLiteralType::Unit => match value.kind {
@@ -8054,6 +8064,7 @@ fn evaluate_const_integer_literal(
 enum ConstLiteralType {
     Primitive(sai_resolve::prelude::PrimTy),
     Str,
+    ByteStr,
     Unit,
 }
 
@@ -8302,6 +8313,19 @@ fn resolve_const_literal_type(
             }
         }
         _ => None,
+    }
+}
+
+fn resolve_const_tuple_field_type(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<ConstLiteralType> {
+    if resolve_const_byte_str_type(ty, type_paths, symbols, inputs) {
+        Some(ConstLiteralType::ByteStr)
+    } else {
+        resolve_const_literal_type(ty, type_paths, symbols, inputs)
     }
 }
 
@@ -11458,6 +11482,7 @@ fn resolve_function_direct_type(
     match resolve_const_literal_type(ty, type_paths, symbols, inputs)? {
         ConstLiteralType::Primitive(primitive) => Some(FunctionDirectType::Primitive(primitive)),
         ConstLiteralType::Str => Some(FunctionDirectType::Str),
+        ConstLiteralType::ByteStr => None,
         ConstLiteralType::Unit => Some(FunctionDirectType::Unit),
     }
 }
@@ -11587,7 +11612,7 @@ fn check_const_tuple_literal(
 ) -> Result<Option<(Vec<Diagnostic>, Vec<ConstLiteralType>)>, OwnerControlFlowResolutionError> {
     let Some(expected_types) = expected_elements
         .iter()
-        .map(|ty| resolve_const_literal_type(*ty, type_paths, symbols, inputs))
+        .map(|ty| resolve_const_tuple_field_type(*ty, type_paths, symbols, inputs))
         .collect::<Option<Vec<_>>>()
     else {
         return Ok(None);
@@ -11635,9 +11660,7 @@ fn check_const_tuple_literal(
     }
 
     let mut diagnostics = Vec::new();
-    for ((expected_ty, literal_type), value) in
-        expected_elements.iter().zip(&expected_types).zip(values)
-    {
+    for (literal_type, value) in expected_types.iter().zip(values) {
         let mut field_diagnostics = match check_const_bool_expression_initializer(
             owner.id,
             *literal_type,
@@ -11647,11 +11670,10 @@ fn check_const_tuple_literal(
         )? {
             Some(diagnostics) => diagnostics,
             None => {
-                let Some(diagnostics) = check_const_literal_leaf(
-                    owner,
-                    *expected_ty,
+                let Some(diagnostics) = check_const_literal_against_type(
+                    owner.id,
+                    *literal_type,
                     value,
-                    type_paths,
                     symbols,
                     inputs,
                     snapshot,
@@ -11869,7 +11891,7 @@ fn local_enum_variant_annotated_local_primitive(
     match local_enum_variant_annotated_local_type(value, body, locals, type_paths, symbols, inputs)?
     {
         ConstLiteralType::Primitive(primitive) => Some(primitive),
-        ConstLiteralType::Str | ConstLiteralType::Unit => None,
+        ConstLiteralType::Str | ConstLiteralType::ByteStr | ConstLiteralType::Unit => None,
     }
 }
 
@@ -12733,6 +12755,7 @@ fn local_enum_variant_type_name(literal_type: ConstLiteralType) -> &'static str 
     match literal_type {
         ConstLiteralType::Primitive(primitive) => const_primitive_name(primitive),
         ConstLiteralType::Str => "Str",
+        ConstLiteralType::ByteStr => "Slice<Byte>",
         ConstLiteralType::Unit => "()",
     }
 }
@@ -13034,6 +13057,7 @@ fn check_const_literal_against_type(
                 Some(mismatch(const_primitive_name(primitive), "unit")?)
             }
             ConstLiteralType::Str => Some(mismatch("Str", "unit")?),
+            ConstLiteralType::ByteStr => Some(mismatch("Slice<Byte>", "unit")?),
         };
         return Ok(Some(diagnostic.into_iter().collect()));
     };
@@ -13051,6 +13075,10 @@ fn check_const_literal_against_type(
         ConstLiteralType::Str => match literal {
             Lit::Str(_) => Vec::new(),
             literal => vec![mismatch("Str", const_literal_found_type(literal))?],
+        },
+        ConstLiteralType::ByteStr => match literal {
+            Lit::ByteStr(_) => Vec::new(),
+            literal => vec![mismatch("Slice<Byte>", const_literal_found_type(literal))?],
         },
         ConstLiteralType::Primitive(primitive) => {
             match sai_ty::typeck::literal::check_primitive_literal(
@@ -81131,6 +81159,149 @@ property "shared"() {}
                     .expect("unsupported tuple evaluation does not fail resolution"),
                 None,
                 "unsupported tuple shape at owner index {index} stays valueless"
+            );
+        }
+    }
+
+    #[test]
+    fn const_byte_strings_are_supported_only_as_flat_tuple_fields() {
+        let root = concat!(
+            "pub const FIELDS: (Slice<Byte>, I32, Slice<Byte>) = (b\"\", -1, br#\"raw { bytes }\"#)\n",
+            "pub const ESCAPED: (Slice<Byte>,) = (b\"A\\0\\xff\",)\n",
+            "pub const SLICE_MISMATCH: (Slice<Byte>,) = (\"text\",)\n",
+            "pub const STR_MISMATCH: (Str,) = (b\"bytes\",)\n",
+            "pub type ByteSlice = Slice<Byte>\n",
+            "pub const ALIAS_FIELD: (ByteSlice,) = (b\"bytes\",)\n",
+            "pub const COMPUTED_FIELD: (Slice<Byte>,) = (b\"left\" + b\"right\",)\n",
+            "pub const BYTE_STRING_ARRAY: Array<Slice<Byte>, 1> = [b\"bytes\"]\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 7);
+        let assert_primary_literal_span =
+            |diagnostic: &Diagnostic, declaration: &str, literal: &str| {
+                let declaration_start = root
+                    .find(declaration)
+                    .unwrap_or_else(|| panic!("test source contains {declaration:?}"));
+                let value_start = root[declaration_start..]
+                    .find(" = ")
+                    .expect("const declaration has an initializer")
+                    + declaration_start
+                    + " = ".len();
+                let value_end = root[value_start..]
+                    .find('\n')
+                    .map_or(root.len(), |relative_end| value_start + relative_end);
+                let literal_start = root[value_start..value_end]
+                    .rfind(literal)
+                    .unwrap_or_else(|| panic!("initializer contains {literal:?}"))
+                    + value_start;
+                let expected_range = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(literal_start as u32),
+                    sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                )
+                .expect("literal span is ordered");
+                assert_eq!(
+                    diagnostic.primary().map(|location| location.span.range),
+                    Some(expected_range),
+                    "primary diagnostic span should cover literal {literal:?}"
+                );
+            };
+        for index in [0, 1] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::SupportedTuple {
+                    diagnostics: Vec::new(),
+                },
+                "direct byte strings in flat tuple fields are supported at owner index {index}"
+            );
+            let Some(ConstValue::Aggregate {
+                variant: None,
+                fields,
+            }) = resolved.owners()[index]
+                .const_value()
+                .expect("valid byte-string tuple evaluates")
+            else {
+                panic!("valid byte-string tuple at owner index {index} produces an aggregate");
+            };
+            match index {
+                0 => {
+                    assert_eq!(fields.len(), 3);
+                    let ConstValue::ByteStr(empty) = &fields[0] else {
+                        panic!("first field preserves the empty byte string");
+                    };
+                    assert!(empty.is_empty());
+                    assert_eq!(
+                        fields[1],
+                        ConstValue::Int {
+                            value: -1,
+                            ty: sai_ty::ty::IntTy::I32,
+                        }
+                    );
+                    let ConstValue::ByteStr(raw) = &fields[2] else {
+                        panic!("last field preserves the raw byte string");
+                    };
+                    assert_eq!(raw.as_ref(), b"raw { bytes }");
+                }
+                1 => {
+                    let ConstValue::ByteStr(escaped) = &fields[0] else {
+                        panic!("escaped field produces a byte-string value");
+                    };
+                    assert_eq!(escaped.as_ref(), &[b'A', 0, 0xff]);
+                }
+                _ => unreachable!("the loop covers only supported tuples"),
+            }
+        }
+
+        for (index, declaration, literal) in [
+            (2, "pub const SLICE_MISMATCH:", "\"text\""),
+            (3, "pub const STR_MISMATCH:", "b\"bytes\""),
+        ] {
+            let ConstLiteralCheck::SupportedTuple { diagnostics } = &checks[index] else {
+                panic!("direct byte-string field mismatch at owner index {index} is diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            assert_primary_literal_span(&diagnostics[0], declaration, literal);
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("mismatched tuple field has no evaluator value"),
+                None
+            );
+        }
+
+        for index in [4, 5, 6] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "aliases, computed fields, and byte-string arrays remain gated at owner index {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported aggregate shape does not evaluate"),
+                None
             );
         }
     }
