@@ -17233,6 +17233,69 @@ fn public_integer_const_values_cover_all_primitive_types() {
 }
 
 #[test]
+fn public_bitwise_not_const_values_cover_scalar_and_flat_aggregates() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub const I8_NOT: I8 = ~1\n",
+        "pub const I16_NOT: I16 = ~1\n",
+        "pub const I32_NOT: I32 = ~1\n",
+        "pub const I64_NOT: I64 = ~1\n",
+        "pub const ISIZE_NOT: ISize = ~1\n",
+        "pub const U8_NOT: U8 = ~1\n",
+        "pub const U16_NOT: U16 = ~1\n",
+        "pub const U32_NOT: U32 = ~1\n",
+        "pub const U64_NOT: U64 = ~1\n",
+        "pub const USIZE_NOT: USize = ~1\n",
+        "pub const BYTE_NOT: Byte = ~b'\\0'\n",
+        "pub const NEGATIVE_OPERAND: I8 = ~-1\n",
+        "pub const TUPLE_NOT: (I8, U8, Byte) = (~1, ~0, ~b'\\0')\n",
+        "pub const ARRAY_NOT: Array<I16, 2> = [~-1, ~1]\n",
+    );
+
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", target]),
+            target,
+            "dev",
+        );
+    }
+}
+
+#[test]
+fn bitwise_not_const_diagnostics_and_unsupported_forms_are_preserved() {
+    for (source, expected_code) in [
+        (
+            "pub const OUT_OF_RANGE: I8 = ~128\n",
+            "\"code\":\"LITERAL_OUT_OF_RANGE\"",
+        ),
+        (
+            "pub const BAD_TYPE: Bool = ~1\n",
+            "\"code\":\"TYPE_MISMATCH\"",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(expected_code)
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a checked bitwise-NOT diagnostic and no result:\n{stdout}"
+        );
+    }
+
+    for source in [
+        "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = ~BASE\n",
+        "pub const DOUBLE_NOT: I8 = ~~1\n",
+        "pub const BOOL_OPERAND: Bool = ~true\n",
+        "pub const FLOAT_OPERAND: F32 = ~1.0\n",
+        "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(~1)\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_bool_logical_literal_consts_emit_check_results() {
     let source = concat!(
         "pub const AND_FALSE: Bool = true and false\n",
