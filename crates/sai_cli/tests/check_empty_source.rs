@@ -17296,6 +17296,181 @@ fn bitwise_not_const_diagnostics_and_unsupported_forms_are_preserved() {
 }
 
 #[test]
+fn public_integer_addition_const_values_cover_scalar_and_flat_aggregates() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub const I8_VALUE: I8 = -127 + 1\n",
+        "pub const I16_VALUE: I16 = -32768 + 32767\n",
+        "pub const I32_VALUE: I32 = 2147483646 + 1\n",
+        "pub const I64_VALUE: I64 = 9223372036854775806 + 1\n",
+        "pub const ISIZE_VALUE: ISize = -2147483648 + 2147483647\n",
+        "pub const U8_VALUE: U8 = 254 + 1\n",
+        "pub const U16_VALUE: U16 = 65534 + 1\n",
+        "pub const U32_VALUE: U32 = 4294967294 + 1\n",
+        "pub const U64_VALUE: U64 = 18446744073709551614 + 1\n",
+        "pub const USIZE_VALUE: USize = 4294967294 + 1\n",
+        "pub const TUPLE_VALUE: (I8, U8, I32) = (-100 + 99, 254 + 1, 40 + 2)\n",
+        "pub const ARRAY_VALUE: Array<U16, 2> = [65534 + 1, 3 + 2]\n",
+        "pub const BASE: I32 = 40\n",
+        "pub const MIXED_REFERENCE: (I32, I32) = (1 + 2, BASE)\n",
+        "pub const MIXED_REFERENCE_ARRAY: Array<I32, 2> = [1 + 2, BASE]\n",
+    );
+
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", target]),
+            target,
+            "dev",
+        );
+    }
+}
+
+#[test]
+fn integer_addition_diagnostics_and_unsupported_forms_are_preserved() {
+    let overflow_source = "pub const OVERFLOW: I8 = 127 /* comment + is not the operator */ + 1\n";
+    let overflow_output = run_check(overflow_source, "", &[], &[]);
+    let overflow_stdout = String::from_utf8(overflow_output.stdout).expect("CLI stdout is UTF-8");
+    let operator_start = overflow_source
+        .rfind('+')
+        .expect("addition operator exists");
+    assert_eq!(
+        overflow_output.status.code(),
+        Some(1),
+        "overflowing addition should fail the check:\n{overflow_stdout}"
+    );
+    assert!(
+        overflow_stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+            && overflow_stdout.contains("Overflow(Add)")
+            && !overflow_stdout.contains("\"type\":\"result\"")
+            && !overflow_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "overflow is a checked const-evaluation panic, not a feature gate:\n{overflow_stdout}"
+    );
+    assert_json_diagnostic_primary_byte_span(
+        &overflow_stdout,
+        "CONST_EVAL_PANIC",
+        operator_start,
+        operator_start + 1,
+    );
+
+    for (source, expected_code, forbidden_code, diagnostic_expression) in [
+        (
+            "pub const OUT_OF_RANGE: I8 = 128 + 1\n",
+            "LITERAL_OUT_OF_RANGE",
+            "CONST_EVAL_PANIC",
+            None,
+        ),
+        (
+            "pub const BOTH_OUT_OF_RANGE: I8 = 128 + 129\n",
+            "LITERAL_OUT_OF_RANGE",
+            "CONST_EVAL_PANIC",
+            None,
+        ),
+        (
+            "pub const BAD_TYPE: Bool = 127 + 1\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("127 + 1"),
+        ),
+        (
+            "pub const BAD_BYTE_STR: Slice<Byte> = 1 + 2\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("1 + 2"),
+        ),
+        (
+            "pub const BAD_TUPLE_LEAF: (Bool,) = (1 + 2,)\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("1 + 2"),
+        ),
+        (
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [1 + 2]\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("1 + 2"),
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && !stdout.contains(&format!("\"code\":\"{forbidden_code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a checked addition diagnostic without a feature gate:\n{stdout}"
+        );
+        if let Some(expression) = diagnostic_expression {
+            let start = source
+                .find(expression)
+                .expect("diagnosed addition expression exists");
+            assert_json_diagnostic_primary_byte_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                start,
+                start + expression.len(),
+            );
+        }
+    }
+
+    for source in [
+        "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 1 + BASE\n",
+        "pub const CHAINED: I8 = 1 + 2 + 3\n",
+        "pub const NESTED: I8 = (1 + 2) + 3\n",
+        "pub const WRAPPING: I8 = 127 +% 1\n",
+        "pub const MIXED: I8 = 1 + true\n",
+        "pub const BYTE_OPERAND: I8 = 1 + b'\\0'\n",
+        "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(1 + 2)\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn pointer_sized_integer_addition_overflow_uses_the_selected_target_width() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+
+    for (name, source) in [
+        (
+            "signed",
+            "pub const POINTER_OVERFLOW: ISize = 2147483647 + 1\n",
+        ),
+        (
+            "unsigned",
+            "pub const POINTER_OVERFLOW: USize = 4294967295 + 1\n",
+        ),
+    ] {
+        let wasm32 = run_check(source, manifest, &[], &["--target", "wasm32-core"]);
+        let wasm32_stdout = String::from_utf8(wasm32.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            wasm32.status.code(),
+            Some(1),
+            "{name} 32-bit pointer-sized addition should overflow:\n{wasm32_stdout}"
+        );
+        assert!(
+            wasm32_stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+                && wasm32_stdout.contains("Overflow(Add)")
+                && !wasm32_stdout.contains("\"type\":\"result\"")
+                && !wasm32_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{name} pointer overflow is a checked panic, not a feature gate:\n{wasm32_stdout}"
+        );
+        let operator_start = source.find('+').expect("addition operator exists");
+        assert_json_diagnostic_primary_byte_span(
+            &wasm32_stdout,
+            "CONST_EVAL_PANIC",
+            operator_start,
+            operator_start + 1,
+        );
+
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", "wasm64-core"]),
+            "wasm64-core",
+            "dev",
+        );
+    }
+}
+
+#[test]
 fn public_bool_logical_literal_consts_emit_check_results() {
     let source = concat!(
         "pub const AND_FALSE: Bool = true and false\n",
@@ -17907,8 +18082,9 @@ fn public_flat_array_type_errors_suppress_the_check_result() {
 #[test]
 fn array_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
-        "pub const COMPUTED_ELEMENT: Array<I32, 1> = [1 + 2]\n",
+        "pub const CHAINED_ELEMENT: Array<I32, 1> = [1 + 2 + 3]\n",
         "pub const NESTED: Array<Array<I32, 1>, 1> = [[1]]\n",
+        "pub const NESTED_COMPUTED: Array<Array<I32, 1>, 1> = [[1 + 2]]\n",
         "pub type Number = I32\npub const ALIAS_ELEMENT: Array<Number, 1> = [1]\n",
         "pub const READY: Bool = true\npub const BOOL_PATH: Array<Bool, 1> = [false and READY]\n",
         "pub const NEGATIVE_LENGTH: Array<I32, -1> = []\n",
@@ -17936,7 +18112,7 @@ fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
         "pub const NESTED: ((I32,),) = ((1,),)\n",
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
-        "pub const EXPRESSION_FIELD: (I32,) = (1 + 2,)\n",
+        "pub const CHAINED_EXPRESSION_FIELD: (I32,) = (1 + 2 + 3,)\n",
         "pub const READY: Bool = true\npub const LOGICAL_PATH_FIELD: (Bool,) = (false and READY,)\n",
         "pub const LOGICAL_PATH_COMPARISON_FIELD: (Bool,) = (READY == false,)\n",
         "pub const LOGICAL_NON_BOOL_COMPARISON_FIELD: (Bool,) = (true == 1,)\n",
@@ -18111,7 +18287,7 @@ fn duplicate_public_primitive_const_names_report_a_duplicate_without_a_result() 
 fn const_forms_outside_literal_slice_remain_gated() {
     for source in [
         "const PRIVATE: I8 = 1\n",
-        "pub const EXPRESSION: I8 = 1 + 2\n",
+        "pub const CHAINED_EXPRESSION: I8 = 1 + 2 + 3\n",
         "pub const LOGICAL_PATH: Bool = true and READY\n",
         "pub const NESTED_LOGICAL_PATH: Bool = false and (true or READY)\n",
         "pub const NESTED_NOT_PATH: Bool = not (not READY)\n",
