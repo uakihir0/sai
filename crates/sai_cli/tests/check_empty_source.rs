@@ -17050,7 +17050,64 @@ fn str_const_forms_outside_the_literal_slice_remain_gated() {
         "pub const ALIAS: Text = \"text\"\n",
         "pub type Text = Str\npub const ALIAS: Text = \"text\"\n",
         "pub const RAW_TYPE: r#Str = \"text\"\n",
-        "pub const BYTE_SLICE: Slice<Byte> = b\"bytes\"\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
+fn public_byte_string_const_literals_emit_check_results() {
+    let source = concat!(
+        "pub const EMPTY: Slice<Byte> = b\"\"\n",
+        "pub const ESCAPED: Slice<Byte> = b\"A\\0\\xff\"\n",
+        "pub const RAW: Slice<Byte> = br#\"raw { text }\"#\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn public_byte_string_const_type_errors_suppress_the_check_result() {
+    for source in [
+        "pub const BAD_STRING: Slice<Byte> = \"text\"\n",
+        "pub const BAD_BOOL: Slice<Byte> = true\n",
+        "pub const BAD_INTEGER: Slice<Byte> = 1\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: byte-string type mismatch should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a supported byte-string type mismatch without a result or feature gate:\n{stdout}"
+        );
+    }
+
+    let invalid_escape = "pub const INVALID: Slice<Byte> = b\"\\q\"\n";
+    let output = run_check(invalid_escape, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an invalid byte-string escape should fail the check:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"INVALID_ESCAPE\"") && !stdout.contains("\"type\":\"result\""),
+        "lexer diagnostics remain authoritative for invalid byte strings:\n{stdout}"
+    );
+}
+
+#[test]
+fn byte_string_const_forms_outside_the_literal_slice_remain_gated() {
+    for source in [
+        "pub type ByteSlice = Slice<Byte>\npub const ALIAS: ByteSlice = b\"bytes\"\n",
+        "pub const OTHER_ELEMENT: Slice<Bool> = b\"bytes\"\n",
+        "pub const BLOCK: Slice<Byte> = { b\"bytes\" }\n",
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);

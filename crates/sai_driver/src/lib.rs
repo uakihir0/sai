@@ -7426,6 +7426,8 @@ pub enum ConstValue {
     Byte(u8),
     /// A direct string literal interned in the current session.
     Str(Symbol),
+    /// A direct byte-string literal with its exact decoded bytes.
+    ByteStr(Arc<[u8]>),
     /// A flat array value with its element type and source-ordered elements.
     Array {
         element_type: ConstValueType,
@@ -7452,8 +7454,8 @@ pub enum ConstValueType {
     Unit,
 }
 
-/// Result of checking one public primitive, canonical `Str`, unit, flat tuple,
-/// or flat array constant.
+/// Result of checking one public primitive, canonical `Str`, exact
+/// `Slice<Byte>`, unit, flat tuple, or flat array constant.
 ///
 /// This deliberately covers only direct literals of supported primitive
 /// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
@@ -7478,6 +7480,9 @@ pub enum ConstLiteralCheck {
     /// A direct string literal checked against the canonical `Str` prelude
     /// item whose early name resolution is intentionally deferred.
     SupportedStr { diagnostics: Vec<Diagnostic> },
+    /// A direct byte-string literal checked against the exact built-in
+    /// `Slice<Byte>` type.
+    SupportedByteStr { diagnostics: Vec<Diagnostic> },
     /// The empty tuple type and direct unit literal, checked without general
     /// type resolution.
     SupportedUnit { diagnostics: Vec<Diagnostic> },
@@ -7493,6 +7498,7 @@ impl ConstLiteralCheck {
             self,
             Self::Supported { .. }
                 | Self::SupportedStr { .. }
+                | Self::SupportedByteStr { .. }
                 | Self::SupportedUnit { .. }
                 | Self::SupportedTuple { .. }
                 | Self::SupportedArray { .. }
@@ -7529,7 +7535,7 @@ impl ConstLiteralCheck {
                             | sai_resolve::prelude::PrimTy::F64
                     )
             }
-            Self::SupportedStr { .. } => true,
+            Self::SupportedStr { .. } | Self::SupportedByteStr { .. } => true,
             Self::SupportedUnit { .. }
             | Self::SupportedTuple { .. }
             | Self::SupportedArray { .. } => true,
@@ -7541,6 +7547,7 @@ impl ConstLiteralCheck {
         match self {
             Self::Supported { diagnostics, .. }
             | Self::SupportedStr { diagnostics }
+            | Self::SupportedByteStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics } => diagnostics.is_empty(),
@@ -7553,6 +7560,7 @@ impl ConstLiteralCheck {
             Self::Unsupported => &[],
             Self::Supported { diagnostics, .. }
             | Self::SupportedStr { diagnostics }
+            | Self::SupportedByteStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics } => diagnostics,
@@ -7665,6 +7673,15 @@ fn check_const_literal_owner(
             length: expected_length,
         });
         return Ok(ConstLiteralCheck::SupportedArray { diagnostics });
+    }
+
+    if resolve_const_byte_str_type(*ty, type_paths, symbols, inputs) {
+        let Some(diagnostics) =
+            check_const_byte_str_literal(owner.id, &body.value, inputs, snapshot)?
+        else {
+            return Ok(ConstLiteralCheck::Unsupported);
+        };
+        return Ok(ConstLiteralCheck::SupportedByteStr { diagnostics });
     }
 
     let Some(literal_type) = resolve_const_literal_type(*ty, type_paths, symbols, inputs) else {
@@ -7800,6 +7817,10 @@ fn evaluate_const_value(
         ConstLiteralCheck::SupportedStr { .. } => {
             evaluate_const_literal_value(ConstLiteralType::Str, value, symbols)
         }
+        ConstLiteralCheck::SupportedByteStr { .. } => match value.kind {
+            ExprKind::Lit(Lit::ByteStr(bytes)) => Some(ConstValue::ByteStr(Arc::from(bytes))),
+            _ => None,
+        },
         ConstLiteralCheck::SupportedUnit { .. } => {
             evaluate_const_literal_value(ConstLiteralType::Unit, value, symbols)
         }
@@ -8090,6 +8111,83 @@ fn resolve_const_array_type(
     }
     let element_type = resolve_const_literal_type(**element_ty, Some(type_paths), symbols, inputs)?;
     Some((element_type, *length))
+}
+
+fn resolve_const_byte_str_type(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let TyKind::Path(path) = ty.kind else {
+        return false;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 {
+        return false;
+    }
+    let Some(type_paths) = type_paths else {
+        return false;
+    };
+    if !is_deferred_canonical_slice_path(path, type_paths, symbols, inputs) {
+        return false;
+    }
+    let segment = path.segments[0];
+    let Some(arguments) = segment.args else {
+        return false;
+    };
+    let [GenericArg::Type(element_ty)] = arguments.args else {
+        return false;
+    };
+    matches!(
+        resolve_const_literal_type(**element_ty, Some(type_paths), symbols, inputs),
+        Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::Byte
+        ))
+    )
+}
+
+fn check_const_byte_str_literal(
+    owner: OwnerId,
+    value: &HirExpr<'_>,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    match value.kind {
+        ExprKind::Lit(Lit::ByteStr(_)) => Ok(Some(Vec::new())),
+        ExprKind::Lit(literal) => Ok(Some(vec![const_literal_diagnostic(
+            owner,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected a byte string literal, found {}",
+                const_literal_found_type(literal)
+            ),
+            "type mismatch",
+        )?])),
+        ExprKind::Tuple(elements) if elements.is_empty() => {
+            Ok(Some(vec![const_literal_diagnostic(
+                owner,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected a byte string literal, found unit".to_owned(),
+                "type mismatch",
+            )?]))
+        }
+        _ if is_const_bool_literal_expression(value) => Ok(Some(vec![const_literal_diagnostic(
+            owner,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            "expected a byte string literal, found Bool".to_owned(),
+            "type mismatch",
+        )?])),
+        _ => Ok(None),
+    }
 }
 
 fn check_const_array_literal(
@@ -13033,6 +13131,50 @@ fn is_deferred_canonical_str_path(
         .text()
         .get(range.start().to_usize()..range.end().to_usize())
         == Some("Str")
+}
+
+fn is_deferred_canonical_slice_path(
+    path: HirPath<'_>,
+    type_paths: &TypeOwnerPathResolution,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    if path.root != PathRoot::Plain || path.segments.len() != 1 {
+        return false;
+    }
+
+    let symbol = path.segments[0].name.sym;
+    if symbols.resolve(symbol).ok().as_deref() != Some("Slice")
+        || !type_paths
+            .deferred_paths()
+            .iter()
+            .any(|deferred| deferred.hir_id == path.hir_id && deferred.name == symbol)
+    {
+        return false;
+    }
+
+    let canonical_slice = CANONICAL_PRELUDE_ITEMS.iter().any(|item| {
+        item.name == "Slice"
+            && item.path.package == "sai:core"
+            && item.path.kind == CanonicalPreludeKind::Type
+            && matches!(
+                item.path.segments,
+                [
+                    CanonicalPreludeSegment::Module("slice"),
+                    CanonicalPreludeSegment::Type("Slice")
+                ]
+            )
+    });
+    if !canonical_slice {
+        return false;
+    }
+
+    let range = path.segments[0].name.span.range;
+    inputs
+        .source
+        .text()
+        .get(range.start().to_usize()..range.end().to_usize())
+        == Some("Slice")
 }
 
 fn is_supported_const_name_convention(name: &str, written_name: &str) -> bool {
@@ -80420,6 +80562,126 @@ property "shared"() {}
                 .expect("literal checks use the current owner snapshot"),
             &ConstLiteralCheck::Unsupported,
             "a source type binding named Str must not use the canonical prelude fallback"
+        );
+    }
+
+    #[test]
+    fn const_byte_string_literals_preserve_exact_bytes_for_canonical_slice_byte() {
+        let root = concat!(
+            "pub const EMPTY: Slice<Byte> = b\"\"\n",
+            "pub const ESCAPED: Slice<Byte> = b\"A\\0\\xff\"\n",
+            "pub const RAW: Slice<Byte> = br#\"raw { text }\"#\n",
+            "pub const BOOL_MISMATCH: Slice<Byte> = true\n",
+            "pub const STRING_MISMATCH: Slice<Byte> = \"text\"\n",
+            "pub const INTEGER_MISMATCH: Slice<Byte> = 1\n",
+            "pub type ByteSlice = Slice<Byte>\n",
+            "pub const ALIAS: ByteSlice = b\"bytes\"\n",
+            "pub const OTHER_ELEMENT: Slice<Bool> = b\"bytes\"\n",
+            "pub const BLOCK: Slice<Byte> = { b\"bytes\" }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(checks.len(), 9);
+        for index in 0..3 {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::SupportedByteStr {
+                    diagnostics: Vec::new(),
+                },
+                "direct byte string at owner index {index} is supported"
+            );
+            assert!(checks[index].requires_const_value());
+        }
+        for (index, expected) in [
+            (0, &b""[..]),
+            (1, &b"A\0\xff"[..]),
+            (2, &b"raw { text }"[..]),
+        ] {
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("const evaluation succeeds"),
+                Some(ConstValue::ByteStr(Arc::from(expected))),
+                "decoded bytes are preserved at owner index {index}"
+            );
+        }
+        for index in 3..=5 {
+            let ConstLiteralCheck::SupportedByteStr { diagnostics } = checks[index] else {
+                panic!("byte string type mismatch at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+            assert!(!checks[index].requires_const_value());
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid const evaluation does not fail resolution"),
+                None
+            );
+        }
+        for index in 6..9 {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "alias, non-Byte slice, and computed form remain outside the slice at {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported const evaluation does not fail resolution"),
+                None
+            );
+        }
+
+        let shadowed = concat!(
+            "pub type Slice = Str\n",
+            "pub const SHADOWED: Slice<Byte> = b\"bytes\"\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(shadowed.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("shadowing const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("shadowing const owners resolve");
+        assert_eq!(
+            resolved.owners()[0]
+                .literal_check()
+                .expect("literal checks use the current owner snapshot"),
+            &ConstLiteralCheck::Unsupported,
+            "a source type binding named Slice must not use the canonical prelude fallback"
         );
     }
 
