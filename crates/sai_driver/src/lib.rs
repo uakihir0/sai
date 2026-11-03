@@ -8147,7 +8147,7 @@ fn evaluate_const_value(
                     && !is_supported_const_bitnot_literal_expression(value)
                     && !is_supported_const_bitwise_literal_expression(value)
                     && !is_supported_const_integer_shift_expression(value)
-                    && !is_supported_const_float_addition_expression(value)
+                    && !is_supported_const_float_arithmetic_expression(value)
                     && !is_supported_const_integer_arithmetic_expression(value)
             }) || values.len() != tuple_element_types.len()
             {
@@ -8186,7 +8186,7 @@ fn evaluate_const_value(
                     && !is_supported_const_bitnot_literal_expression(value)
                     && !is_supported_const_bitwise_literal_expression(value)
                     && !is_supported_const_integer_shift_expression(value)
-                    && !is_supported_const_float_addition_expression(value)
+                    && !is_supported_const_float_arithmetic_expression(value)
                     && !is_supported_const_integer_arithmetic_expression(value)
             }) {
                 return None;
@@ -8303,11 +8303,11 @@ fn evaluate_const_literal_value(
             ConstIntegerShiftResult::Panic => None,
         };
     }
-    if is_supported_const_float_addition_expression(value) {
+    if is_supported_const_float_arithmetic_expression(value) {
         let ConstLiteralType::Primitive(primitive) = literal_type else {
             return None;
         };
-        return evaluate_const_float_addition(primitive, value, symbols);
+        return evaluate_const_float_arithmetic(primitive, value, symbols);
     }
     if is_supported_const_integer_arithmetic_expression(value) {
         let ConstLiteralType::Primitive(primitive) = literal_type else {
@@ -8841,19 +8841,30 @@ fn const_integer_arithmetic_operands<'hir>(
     .then_some((operator, left, right))
 }
 
-fn const_float_addition_operands<'hir>(
+fn const_float_arithmetic_operands<'hir>(
     value: &HirExpr<'hir>,
-) -> Option<(&'hir HirExpr<'hir>, &'hir HirExpr<'hir>)> {
-    let ExprKind::Binary(BinOp::Add, left, right) = value.kind else {
+) -> Option<(BinOp, &'hir HirExpr<'hir>, &'hir HirExpr<'hir>)> {
+    let ExprKind::Binary(operator, left, right) = value.kind else {
         return None;
     };
+    if !matches!(operator, BinOp::Add | BinOp::Sub) {
+        return None;
+    }
     (matches!(left.kind, ExprKind::Lit(Lit::Float { .. }))
         && matches!(right.kind, ExprKind::Lit(Lit::Float { .. })))
-    .then_some((left, right))
+    .then_some((operator, left, right))
 }
 
-fn is_supported_const_float_addition_expression(value: &HirExpr<'_>) -> bool {
-    const_float_addition_operands(value).is_some()
+fn is_supported_const_float_arithmetic_expression(value: &HirExpr<'_>) -> bool {
+    const_float_arithmetic_operands(value).is_some()
+}
+
+fn const_float_arithmetic_description(value: &HirExpr<'_>) -> &'static str {
+    match const_float_arithmetic_operands(value).map(|(operator, _, _)| operator) {
+        Some(BinOp::Add) => "a floating-point addition expression",
+        Some(BinOp::Sub) => "a floating-point subtraction expression",
+        _ => "a floating-point arithmetic expression",
+    }
 }
 
 fn evaluate_const_float_literal_bits(
@@ -8868,7 +8879,7 @@ fn evaluate_const_float_literal_bits(
     sai_ty::typeck::literal::round_float_literal_to_bits(primitive, &text, negated)
 }
 
-fn evaluate_const_float_addition(
+fn evaluate_const_float_arithmetic(
     primitive: sai_resolve::prelude::PrimTy,
     value: &HirExpr<'_>,
     symbols: &Interner,
@@ -8876,23 +8887,33 @@ fn evaluate_const_float_addition(
     use sai_resolve::prelude::PrimTy;
     use sai_ty::ty::FloatTy;
 
-    let (left, right) = const_float_addition_operands(value)?;
+    let (operator, left, right) = const_float_arithmetic_operands(value)?;
     let left_bits = evaluate_const_float_literal_bits(primitive, left, symbols)?;
     let right_bits = evaluate_const_float_literal_bits(primitive, right, symbols)?;
     match primitive {
         PrimTy::F32 => {
             let left = f32::from_bits(u32::try_from(left_bits).ok()?);
             let right = f32::from_bits(u32::try_from(right_bits).ok()?);
+            let result = match operator {
+                BinOp::Add => left + right,
+                BinOp::Sub => left - right,
+                _ => return None,
+            };
             Some(ConstValue::Float {
-                bits: (left + right).to_bits().into(),
+                bits: result.to_bits().into(),
                 ty: FloatTy::F32,
             })
         }
         PrimTy::F64 => {
             let left = f64::from_bits(left_bits);
             let right = f64::from_bits(right_bits);
+            let result = match operator {
+                BinOp::Add => left + right,
+                BinOp::Sub => left - right,
+                _ => return None,
+            };
             Some(ConstValue::Float {
-                bits: (left + right).to_bits(),
+                bits: result.to_bits(),
                 ty: FloatTy::F64,
             })
         }
@@ -10036,7 +10057,7 @@ fn check_const_byte_str_literal(
     if is_supported_const_bitnot_literal_expression(value)
         || is_supported_const_bitwise_literal_expression(value)
         || is_supported_const_integer_shift_expression(value)
-        || is_supported_const_float_addition_expression(value)
+        || is_supported_const_float_arithmetic_expression(value)
         || is_supported_const_integer_arithmetic_expression(value)
     {
         return check_const_literal_against_type(
@@ -10104,8 +10125,8 @@ fn check_const_array_literal(
             ExprKind::Tuple(elements) if elements.is_empty() => "unit",
             _ if is_supported_const_bitwise_literal_expression(value) => "a bitwise expression",
             _ if is_supported_const_integer_shift_expression(value) => "a shift expression",
-            _ if is_supported_const_float_addition_expression(value) => {
-                "a floating-point addition expression"
+            _ if is_supported_const_float_arithmetic_expression(value) => {
+                const_float_arithmetic_description(value)
             }
             _ if is_supported_const_integer_arithmetic_expression(value) => "an integer expression",
             _ if is_const_bool_literal_expression(value) => "Bool",
@@ -10128,7 +10149,7 @@ fn check_const_array_literal(
             && !is_supported_const_bitnot_literal_expression(value)
             && !is_supported_const_bitwise_literal_expression(value)
             && !is_supported_const_integer_shift_expression(value)
-            && !is_supported_const_float_addition_expression(value)
+            && !is_supported_const_float_arithmetic_expression(value)
             && !is_supported_const_integer_arithmetic_expression(value)
             && !is_direct_const_reference_candidate(value)
     }) {
@@ -13526,8 +13547,8 @@ fn check_const_tuple_literal(
             ExprKind::Lit(literal) => const_literal_found_type(literal),
             _ if is_supported_const_bitwise_literal_expression(value) => "a bitwise expression",
             _ if is_supported_const_integer_shift_expression(value) => "a shift expression",
-            _ if is_supported_const_float_addition_expression(value) => {
-                "a floating-point addition expression"
+            _ if is_supported_const_float_arithmetic_expression(value) => {
+                const_float_arithmetic_description(value)
             }
             _ if is_supported_const_integer_arithmetic_expression(value) => "an integer expression",
             _ => return Ok(None),
@@ -13550,7 +13571,7 @@ fn check_const_tuple_literal(
             && !is_supported_const_bitnot_literal_expression(value)
             && !is_supported_const_bitwise_literal_expression(value)
             && !is_supported_const_integer_shift_expression(value)
-            && !is_supported_const_float_addition_expression(value)
+            && !is_supported_const_float_arithmetic_expression(value)
             && !is_supported_const_integer_arithmetic_expression(value)
             && !is_direct_const_reference_candidate(value)
     }) {
@@ -15099,7 +15120,12 @@ fn check_const_literal_against_type(
         return Ok(Some(diagnostics));
     }
 
-    if let Some((left, right)) = const_float_addition_operands(value) {
+    if let Some((operator, left, right)) = const_float_arithmetic_operands(value) {
+        let expression_description = match operator {
+            BinOp::Add => "a floating-point addition expression",
+            BinOp::Sub => "a floating-point subtraction expression",
+            _ => return Ok(None),
+        };
         let primitive = match literal_type {
             ConstLiteralType::Primitive(
                 primitive @ (sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64),
@@ -15107,13 +15133,13 @@ fn check_const_literal_against_type(
             ConstLiteralType::Primitive(primitive) => {
                 return Ok(Some(vec![mismatch(
                     const_primitive_name(primitive),
-                    "a floating-point addition expression",
+                    expression_description,
                 )?]));
             }
             other => {
                 return Ok(Some(vec![mismatch(
                     local_enum_variant_type_name(other),
-                    "a floating-point addition expression",
+                    expression_description,
                 )?]));
             }
         };
@@ -15155,7 +15181,7 @@ fn check_const_literal_against_type(
         if !diagnostics.is_empty() {
             return Ok(Some(diagnostics));
         }
-        if evaluate_const_float_addition(primitive, value, symbols).is_none() {
+        if evaluate_const_float_arithmetic(primitive, value, symbols).is_none() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
         return Ok(Some(diagnostics));
@@ -87016,6 +87042,139 @@ property "shared"() {}
     }
 
     #[test]
+    fn const_direct_float_subtraction_rounds_at_the_declared_width() {
+        use sai_resolve::prelude::PrimTy;
+        use sai_ty::ty::FloatTy;
+
+        let root = concat!(
+            "pub const F32_BASIC: F32 = 1.25 - 2.5\n",
+            "pub const F32_LEFT_NEGATIVE: F32 = -1.0 - 2.0\n",
+            "pub const F32_RIGHT_NEGATIVE: F32 = 1.0 - -2.0\n",
+            "pub const F32_TIE_EVEN: F32 = 1.0 - 0.0000000298023223876953125\n",
+            "pub const F32_OPERAND_ROUNDING: F32 = 1.000000059604644775390626 - 1.000000059604644775390625\n",
+            "pub const F32_NEGATIVE_ZERO: F32 = -0.0 - 0.0\n",
+            "pub const F32_POSITIVE_ZERO: F32 = 0.0 - 0.0\n",
+            "pub const F32_OVERFLOW: F32 = 3.4028235e38 - -3.4028235e38\n",
+            "pub const F64_BASIC: F64 = 1.25 - 2.5\n",
+            "pub const F64_LEFT_NEGATIVE: F64 = -1.0 - 2.0\n",
+            "pub const F64_RIGHT_NEGATIVE: F64 = 1.0 - -2.0\n",
+            "pub const F64_TIE_EVEN: F64 = 1.0 - 0.000000000000000055511151231257827021181583404541015625\n",
+            "pub const F64_OPERAND_ROUNDING: F64 = 1.00000000000000011102230246251565404236316680908203126 - 1.00000000000000011102230246251565404236316680908203125\n",
+            "pub const F64_NEGATIVE_ZERO: F64 = -0.0 - 0.0\n",
+            "pub const F64_POSITIVE_ZERO: F64 = 0.0 - 0.0\n",
+            "pub const F64_OVERFLOW: F64 = 1.7976931348623157e308 - -1.7976931348623157e308\n",
+            "pub const TUPLE_VALUE: (F32, F64) = (1.25 - 2.5, 1.0 - 0.000000000000000055511151231257827021181583404541015625)\n",
+            "pub const ARRAY_VALUE: Array<F32, 2> = [2.0 - 1.0, 5.0 - 3.0]\n",
+            "pub const BASE: F32 = 4.0\n",
+            "pub const MIXED_REFERENCE: (F32, F32) = (1.0 - 2.0, BASE)\n",
+            "pub const MIXED_REFERENCE_ARRAY: Array<F32, 2> = [1.0 - 2.0, BASE]\n",
+        );
+
+        for target in ["wasm32-core", "wasm64-core"] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+
+            let f32_value = |value: f32| ConstValue::Float {
+                bits: value.to_bits().into(),
+                ty: FloatTy::F32,
+            };
+            let f64_value = |value: f64| ConstValue::Float {
+                bits: value.to_bits(),
+                ty: FloatTy::F64,
+            };
+            let expected_scalars = [
+                f32_value(-1.25),
+                f32_value(-3.0),
+                f32_value(3.0),
+                f32_value(1.0),
+                f32_value(f32::from_bits(1.0f32.to_bits() + 1) - 1.0),
+                ConstValue::Float {
+                    bits: 0x8000_0000,
+                    ty: FloatTy::F32,
+                },
+                f32_value(0.0),
+                f32_value(f32::INFINITY),
+                f64_value(-1.25),
+                f64_value(-3.0),
+                f64_value(3.0),
+                f64_value(1.0),
+                f64_value(f64::from_bits(1.0f64.to_bits() + 1) - 1.0),
+                ConstValue::Float {
+                    bits: 0x8000_0000_0000_0000,
+                    ty: FloatTy::F64,
+                },
+                f64_value(0.0),
+                f64_value(f64::INFINITY),
+            ];
+            assert_eq!(resolved.owners().len(), 21);
+            for (index, expected) in expected_scalars.into_iter().enumerate() {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check uses the current owner snapshot");
+                assert!(
+                    check.is_valid() && check.requires_const_value(),
+                    "supported float subtraction at owner index {index}: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("const evaluation succeeds"),
+                    Some(expected),
+                    "float subtraction result at owner index {index} for {target}"
+                );
+            }
+
+            assert_eq!(
+                resolved.owners()[16]
+                    .const_value()
+                    .expect("flat tuple evaluation succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![f32_value(-1.25), f64_value(1.0)].into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[17]
+                    .const_value()
+                    .expect("flat array evaluation succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::F32),
+                    elements: vec![f32_value(1.0), f32_value(2.0)].into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[19]
+                    .const_value()
+                    .expect("mixed-reference tuple materialization succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![f32_value(-1.0), f32_value(4.0)].into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[20]
+                    .const_value()
+                    .expect("mixed-reference array materialization succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::F32),
+                    elements: vec![f32_value(-1.0), f32_value(4.0)].into(),
+                })
+            );
+        }
+    }
+
+    #[test]
     fn const_direct_float_addition_checks_types_ranges_and_shape_boundaries() {
         let root = concat!(
             "pub const BAD_DESTINATION: I32 = 1.0 + 2.0\n",
@@ -87065,6 +87224,118 @@ property "shared"() {}
         }
 
         for index in [4, 5, 6, 7] {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("unsupported forms remain gated"),
+                &ConstLiteralCheck::Unsupported,
+                "owner index {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported evaluation does not fail resolution"),
+                None,
+                "owner index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn const_direct_float_subtraction_checks_types_ranges_and_shape_boundaries() {
+        let root = concat!(
+            "pub const BAD_DESTINATION: I32 = 1.0 - 2.0\n",
+            "pub const F32_OUT_OF_RANGE: F32 = 3.4028236e38 - 0.0\n",
+            "pub const F64_OUT_OF_RANGE: F64 = 0.0 - 1.7976931348623159e308\n",
+            "pub const BOTH_F32_OUT_OF_RANGE: F32 = 3.4028236e38 - 3.4028236e38\n",
+            "pub const BASE: F32 = 4.0\n",
+            "pub const PATH_OPERAND: F32 = 1.0 - BASE\n",
+            "pub const CHAINED: F32 = 1.0 - 2.0 - 3.0\n",
+            "pub const NESTED: F32 = (1.0 - 2.0) - 3.0\n",
+            "pub const OTHER_OPERATOR: F32 = 1.0 * 2.0\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        for (index, expected_code) in [
+            (0, sai_diagnostics::Code::TypeMismatch),
+            (1, sai_diagnostics::Code::LiteralOutOfRange),
+            (2, sai_diagnostics::Code::LiteralOutOfRange),
+        ] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("literal check uses the current owner snapshot");
+            let ConstLiteralCheck::Supported { diagnostics, .. } = check else {
+                panic!("invalid float subtraction at owner index {index} remains checked");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(diagnostics[0].code, expected_code, "owner index {index}");
+            assert!(!check.requires_const_value(), "owner index {index}");
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid const evaluation does not fail resolution"),
+                None,
+                "owner index {index}"
+            );
+        }
+
+        let both_range_check = resolved.owners()[3]
+            .literal_check()
+            .expect("both out-of-range operands remain checked");
+        let ConstLiteralCheck::Supported {
+            diagnostics: both_range_diagnostics,
+            ..
+        } = both_range_check
+        else {
+            panic!("both out-of-range operands remain a supported shape");
+        };
+        assert_eq!(both_range_diagnostics.len(), 2);
+        let both_range_expression = "3.4028236e38 - 3.4028236e38";
+        let both_range_start = root
+            .find(both_range_expression)
+            .expect("both out-of-range operands exist");
+        let operand_len = "3.4028236e38".len();
+        for (diagnostic, start) in [
+            (&both_range_diagnostics[0], both_range_start),
+            (
+                &both_range_diagnostics[1],
+                both_range_start + operand_len + " - ".len(),
+            ),
+        ] {
+            assert_eq!(diagnostic.code, sai_diagnostics::Code::LiteralOutOfRange);
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("range diagnostic has a span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + operand_len) as u32),
+                )
+                .expect("literal span is valid")
+            );
+        }
+        assert_eq!(
+            resolved.owners()[3]
+                .const_value()
+                .expect("invalid const evaluation does not fail resolution"),
+            None
+        );
+
+        for index in [5, 6, 7, 8] {
             assert_eq!(
                 resolved.owners()[index]
                     .literal_check()
