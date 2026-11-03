@@ -7652,6 +7652,7 @@ fn check_function_body_type(
                 allow_addition_literal_tail: true,
                 allow_numeric_arithmetic_path_tail: true,
                 allow_remainder_path_tail: true,
+                allow_wrapping_path_tail: true,
                 allow_unary_path_tail: true,
                 allow_bool_literal_not_tail: true,
                 allow_logical_tail: true,
@@ -8400,6 +8401,7 @@ fn check_inherent_method_body_type(
             allow_addition_literal_tail: false,
             allow_numeric_arithmetic_path_tail: false,
             allow_remainder_path_tail: false,
+            allow_wrapping_path_tail: false,
             allow_unary_path_tail: true,
             allow_bool_literal_not_tail: false,
             allow_logical_tail: true,
@@ -8895,6 +8897,7 @@ struct PrimitiveLocalBlockGates {
     allow_addition_literal_tail: bool,
     allow_numeric_arithmetic_path_tail: bool,
     allow_remainder_path_tail: bool,
+    allow_wrapping_path_tail: bool,
     allow_unary_path_tail: bool,
     allow_bool_literal_not_tail: bool,
     allow_logical_tail: bool,
@@ -8988,6 +8991,8 @@ fn check_function_body_primitive_local_block(
                 || (gates.allow_numeric_arithmetic_path_tail
                     && matches!(operator, BinOp::Sub | BinOp::Mul | BinOp::Div))
                 || (gates.allow_remainder_path_tail && operator == BinOp::Rem)
+                || (gates.allow_wrapping_path_tail
+                    && matches!(operator, BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul))
                 || (gates.allow_logical_tail && matches!(operator, BinOp::And | BinOp::Or))
                 || (gates.allow_comparison_tail
                     && is_function_primitive_local_comparison_operator(operator))
@@ -9398,6 +9403,8 @@ fn check_function_body_primitive_local_block(
         let is_numeric_arithmetic_path_tail = gates.allow_numeric_arithmetic_path_tail
             && matches!(operator, BinOp::Sub | BinOp::Mul | BinOp::Div);
         let is_remainder_path_tail = gates.allow_remainder_path_tail && operator == BinOp::Rem;
+        let is_wrapping_path_tail = gates.allow_wrapping_path_tail
+            && matches!(operator, BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul);
         let shape_is_supported = if is_comparison_only_tail {
             let preceding_paths = operands
                 .iter()
@@ -9412,6 +9419,8 @@ fn check_function_body_primitive_local_block(
         } else if is_numeric_arithmetic_path_tail {
             operands.iter().all(|operand| is_preceding_path(operand))
         } else if is_remainder_path_tail {
+            operands.iter().all(|operand| is_preceding_path(operand))
+        } else if is_wrapping_path_tail {
             operands.iter().all(|operand| is_preceding_path(operand))
         } else if is_addition_only_tail {
             operands.iter().all(|operand| is_preceding_path(operand))
@@ -75729,6 +75738,9 @@ property "shared"() {}
             "pub fn multiply(left: I32, right: I32) -> I32 { left * right }\n",
             "pub fn divide(left: I32, right: I32) -> I32 { left / right }\n",
             "pub fn remainder(left: I32, right: I32) -> I32 { left % right }\n",
+            "pub fn wrapping_add(left: I32, right: I32) -> I32 { left +% right }\n",
+            "pub fn wrapping_subtract(left: I32, right: I32) -> I32 { left -% right }\n",
+            "pub fn wrapping_multiply(left: I32, right: I32) -> I32 { left *% right }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -75743,9 +75755,12 @@ property "shared"() {}
         let resolved = database
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
-        assert_eq!(resolved.owners().len(), 10);
+        assert_eq!(resolved.owners().len(), 13);
 
-        for (index, expected_type_count) in [3, 4, 3, 3, 3, 3, 3, 3, 3, 3].into_iter().enumerate() {
+        for (index, expected_type_count) in [3, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+            .into_iter()
+            .enumerate()
+        {
             let owner = &resolved.owners()[index];
             assert!(
                 matches!(

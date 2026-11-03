@@ -8877,6 +8877,177 @@ fn top_level_function_float_remainder_tail_reports_operator_error() {
 }
 
 #[test]
+fn top_level_function_wrapping_tails_accept_integer_paths() {
+    let primitives = [
+        "I8", "I16", "I32", "I64", "ISize", "U8", "U16", "U32", "U64", "USize",
+    ];
+    let operators = [("add", "+%"), ("sub", "-%"), ("mul", "*%")];
+    let mut functions = Vec::new();
+    for (name, operator) in operators {
+        for primitive in primitives {
+            let lower = primitive.to_ascii_lowercase();
+            functions.push(format!(
+                "pub fn wrapping_{name}_{lower}(left: {primitive}, right: {primitive}) -> {primitive} {{ left {operator} right }}"
+            ));
+        }
+    }
+    functions.push(
+        concat!(
+            "pub fn wrapping_after_local(left: I32, right: I32) -> I32 {\n",
+            "    let copy: I32 = left\n",
+            "    copy +% right\n",
+            "}\n",
+        )
+        .to_owned(),
+    );
+    functions.push(
+        concat!(
+            "pub fn wrapping_shadowed_path(left: I32, right: I32) -> I32 {\n",
+            "    let left: I32 = right\n",
+            "    left *% right\n",
+            "}\n",
+        )
+        .to_owned(),
+    );
+    let source = functions.join("\n");
+
+    assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn top_level_function_wrapping_tails_report_operand_and_return_mismatches() {
+    for operator in ["+%", "-%", "*%"] {
+        let source =
+            format!("pub fn mismatch(left: I32, right: U32) -> Bool {{ left {operator} right }}\n");
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let right_start = source.find("right }").expect("right operand exists");
+        let expression = format!("left {operator} right");
+        let expression_start = source.find(&expression).expect("wrapping tail exists");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            2,
+            "the operand and independent result both need diagnostics:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "supported wrapping-tail errors remain semantic diagnostics:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            "expected `I32`, found `U32`",
+            right_start,
+            right_start + "right".len(),
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            "expected `Bool`, found `I32`",
+            expression_start,
+            expression_start + expression.len(),
+        );
+    }
+}
+
+#[test]
+fn top_level_function_non_integer_wrapping_tails_report_operator_errors() {
+    for (operator_name, operator) in [("add", "+%"), ("sub", "-%"), ("mul", "*%")] {
+        for primitive in ["F32", "F64", "Bool", "Byte", "Char"] {
+            let source = format!(
+                "pub fn wrapping_{operator_name}(left: {primitive}, right: {primitive}) -> {primitive} {{ left {operator} right }}\n"
+            );
+            let output = run_check(&source, "", &[], &[]);
+            let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+            let expression = format!("left {operator} right");
+            let expression_start = source.find(&expression).expect("wrapping tail exists");
+
+            assert_eq!(output.status.code(), Some(1), "{stdout}");
+            assert_eq!(
+                stdout
+                    .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                    .count(),
+                1,
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                    && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                    && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                    && !stdout.contains("\"type\":\"result\""),
+                "known non-integer `{primitive}` operands should reach the operator checker:\n{source}\n{stdout}"
+            );
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "OPERATOR_NOT_SUPPORTED",
+                &format!("operator `{operator}` is not defined for `{primitive}`"),
+                expression_start,
+                expression_start + expression.len(),
+            );
+        }
+    }
+
+    let source = "pub fn float_mismatch(left: F32, right: F64) -> F32 { left *% right }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "float operand recovery remains in the existing wrapping checker:\n{stdout}"
+    );
+}
+
+#[test]
+fn unsupported_top_level_wrapping_tail_shapes_remain_gated() {
+    for operator in ["+%", "-%", "*%"] {
+        for source in [
+            format!("pub fn literal_right(left: I32) -> I32 {{ left {operator} 1 }}\n"),
+            format!("pub fn literal_left(right: I32) -> I32 {{ 1 {operator} right }}\n"),
+            format!("pub fn literal_pair() -> I32 {{ 1 {operator} 2 }}\n"),
+            format!(
+                "pub fn computed(left: I32, right: I32) -> I32 {{ (left + 1) {operator} right }}\n"
+            ),
+            format!(
+                "pub fn computed_right(left: I32, right: I32) -> I32 {{ left {operator} (right + 1) }}\n"
+            ),
+            format!(
+                "pub fn unresolved_literal(left: I32) -> I32 {{ let one = 1\nleft {operator} one }}\n"
+            ),
+        ] {
+            assert_check_stays_gated_without_syntax_errors(
+                &run_check(&source, "", &[], &[]),
+                "unsupported top-level wrapping tail shape",
+            );
+        }
+    }
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(
+            "const One: I32 = 1\npub fn wrapping_module_constant(left: I32) -> I32 { left +% One }\n",
+            "",
+            &[],
+            &[],
+        ),
+        "nonlocal wrapping operand",
+    );
+}
+
+#[test]
 fn top_level_function_addition_tails_accept_one_direct_numeric_literal() {
     let mut functions = Vec::new();
     for (name, ty) in [
