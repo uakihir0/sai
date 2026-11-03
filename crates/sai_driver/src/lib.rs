@@ -7661,17 +7661,10 @@ fn check_const_bool_expression_initializer(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    let is_supported_bool_expression = match value.kind {
-        ExprKind::Unary(UnOp::Not, operand) => {
-            matches!(operand.kind, ExprKind::Lit(Lit::Bool(_)))
-        }
-        ExprKind::Binary(BinOp::And | BinOp::Or, left, right) => {
-            let left_is_bool = matches!(left.kind, ExprKind::Lit(Lit::Bool(_)));
-            let right_is_bool = matches!(right.kind, ExprKind::Lit(Lit::Bool(_)));
-            left_is_bool && right_is_bool
-        }
-        _ => false,
-    };
+    let is_supported_bool_expression = matches!(
+        value.kind,
+        ExprKind::Unary(UnOp::Not, _) | ExprKind::Binary(BinOp::And | BinOp::Or, _, _)
+    ) && is_const_bool_literal_expression(value);
     if !is_supported_bool_expression {
         return Ok(None);
     }
@@ -7697,6 +7690,22 @@ fn check_const_bool_expression_initializer(
         format!("expected `{expected}`, found `Bool`"),
         "type mismatch",
     )?]))
+}
+
+fn is_const_bool_literal_expression(value: &HirExpr<'_>) -> bool {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value.kind {
+            ExprKind::Lit(Lit::Bool(_)) => {}
+            ExprKind::Unary(UnOp::Not, operand) => pending.push(operand),
+            ExprKind::Binary(BinOp::And | BinOp::Or, left, right) => {
+                pending.push(right);
+                pending.push(left);
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn evaluate_const_value(
@@ -7754,28 +7763,9 @@ fn evaluate_const_literal_value(
     symbols: &Interner,
 ) -> Option<ConstValue> {
     match literal_type {
-        ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool) => match value.kind {
-            ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(value)),
-            ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
-                ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(!value)),
-                _ => None,
-            },
-            ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right) => {
-                let ExprKind::Lit(Lit::Bool(left)) = left.kind else {
-                    return None;
-                };
-                let ExprKind::Lit(Lit::Bool(right)) = right.kind else {
-                    return None;
-                };
-                let value = match operator {
-                    BinOp::And => left && right,
-                    BinOp::Or => left || right,
-                    _ => return None,
-                };
-                Some(ConstValue::Bool(value))
-            }
-            _ => None,
-        },
+        ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool) => {
+            evaluate_const_bool_literal_expression(value).map(ConstValue::Bool)
+        }
         ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Char) => match value.kind {
             ExprKind::Lit(Lit::Char(value)) => Some(ConstValue::Char(value)),
             _ => None,
@@ -7821,6 +7811,47 @@ fn evaluate_const_literal_value(
             _ => None,
         },
     }
+}
+
+fn evaluate_const_bool_literal_expression(value: &HirExpr<'_>) -> Option<bool> {
+    let mut pending = vec![(value, false)];
+    let mut values = Vec::new();
+    while let Some((value, visited)) = pending.pop() {
+        if !visited {
+            match value.kind {
+                ExprKind::Lit(Lit::Bool(value)) => values.push(value),
+                ExprKind::Unary(UnOp::Not, operand) => {
+                    pending.push((value, true));
+                    pending.push((operand, false));
+                }
+                ExprKind::Binary(BinOp::And | BinOp::Or, left, right) => {
+                    pending.push((value, true));
+                    pending.push((right, false));
+                    pending.push((left, false));
+                }
+                _ => return None,
+            }
+            continue;
+        }
+
+        match value.kind {
+            ExprKind::Unary(UnOp::Not, _) => {
+                let operand = values.pop()?;
+                values.push(!operand);
+            }
+            ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), _, _) => {
+                let right = values.pop()?;
+                let left = values.pop()?;
+                values.push(match operator {
+                    BinOp::And => left && right,
+                    BinOp::Or => left || right,
+                    _ => return None,
+                });
+            }
+            _ => return None,
+        }
+    }
+    (values.len() == 1).then(|| values[0])
 }
 
 fn evaluate_const_integer_literal(
@@ -78881,6 +78912,14 @@ property "shared"() {}
             );
         }
 
+        assert_eq!(
+            resolved.owners()[5]
+                .const_value()
+                .expect("nested not evaluation succeeds"),
+            Some(ConstValue::Bool(true)),
+            "nested exact not expressions evaluate to their Bool value"
+        );
+
         let bad_type = resolved.owners()[4]
             .literal_check()
             .expect("mismatched const remains in the supported subset");
@@ -78912,13 +78951,13 @@ property "shared"() {}
             None
         );
 
-        for index in [5, 6, 7, 8] {
+        for index in [6, 7, 8] {
             assert_eq!(
                 resolved.owners()[index]
                     .literal_check()
                     .expect("gated shapes remain resolvable"),
                 &ConstLiteralCheck::Unsupported,
-                "nested, non-Bool, path, and tuple-typed forms remain gated at owner index {index}"
+                "non-Bool, path, and tuple-typed forms remain gated at owner index {index}"
             );
             assert_eq!(
                 resolved.owners()[index]
@@ -78948,7 +78987,7 @@ property "shared"() {}
     fn const_bool_direct_logical_literals_produce_bool_values() {
         use sai_resolve::prelude::PrimTy;
 
-        let root = concat!(
+        let mut root = concat!(
             "pub const AND_FALSE_FALSE: Bool = false and false\n",
             "pub const AND_FALSE_TRUE: Bool = false and true\n",
             "pub const AND_TRUE_FALSE: Bool = true and false\n",
@@ -78957,11 +78996,13 @@ property "shared"() {}
             "pub const OR_FALSE_TRUE: Bool = false or true\n",
             "pub const OR_TRUE_FALSE: Bool = true or false\n",
             "pub const OR_TRUE_TRUE: Bool = true or true\n",
-            "pub const BAD_PRIMITIVE: I32 = true and false\n",
-            "pub const BAD_STR: Str = false or true\n",
-            "pub const BAD_UNIT: () = true and true\n",
             "pub const NESTED: Bool = true and (false or true)\n",
             "pub const CHAINED: Bool = true and false and true\n",
+            "pub const NESTED_NOT: Bool = not (false or false)\n",
+            "pub const MIXED_NESTED: Bool = not (true and (false or true))\n",
+            "pub const BAD_PRIMITIVE: I32 = true and false\n",
+            "pub const BAD_STR: Str = not (false or true)\n",
+            "pub const BAD_UNIT: () = true and true\n",
             "pub const PATH: Bool = true and AND_TRUE_TRUE\n",
             "pub const NON_BOOL: Bool = true and 1\n",
             "pub const BITWISE: Bool = true & false\n",
@@ -78971,7 +79012,15 @@ property "shared"() {}
             "pub const SHORT_CIRCUIT_OR_NON_BOOL: Bool = true or 1\n",
             "pub const NONEMPTY_TUPLE: (Bool, Bool) = true and false\n",
             "pub const BITWISE_OR: Bool = true | false\n",
-        );
+            "pub const NESTED_PATH: Bool = false and (true or AND_TRUE_TRUE)\n",
+            "pub const NESTED_NOT_PATH: Bool = not (not AND_TRUE_TRUE)\n",
+        )
+        .to_owned();
+        root.push_str("pub const DEEP_NESTED: Bool = true");
+        for _ in 0..256 {
+            root.push_str(" and true");
+        }
+        root.push('\n');
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let collection = database
@@ -79026,10 +79075,43 @@ property "shared"() {}
             );
         }
 
+        for (index, expected) in [
+            ConstValue::Bool(true),
+            ConstValue::Bool(false),
+            ConstValue::Bool(true),
+            ConstValue::Bool(false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let owner_index = index + 8;
+            assert!(
+                resolved.owners()[owner_index]
+                    .literal_check()
+                    .expect("nested Bool literal check succeeds")
+                    .is_valid_bool(),
+                "nested Bool const at owner index {owner_index}"
+            );
+            assert!(
+                resolved.owners()[owner_index]
+                    .literal_check()
+                    .expect("nested Bool literal check succeeds")
+                    .requires_const_value(),
+                "nested Bool const at owner index {owner_index} requires an evaluator value"
+            );
+            assert_eq!(
+                resolved.owners()[owner_index]
+                    .const_value()
+                    .expect("nested Bool evaluation succeeds"),
+                Some(expected),
+                "evaluated nested Bool const at owner index {owner_index}"
+            );
+        }
+
         for (index, declaration, initializer) in [
-            (8, "pub const BAD_PRIMITIVE: I32 = ", "true and false"),
-            (9, "pub const BAD_STR: Str = ", "false or true"),
-            (10, "pub const BAD_UNIT: () = ", "true and true"),
+            (12, "pub const BAD_PRIMITIVE: I32 = ", "true and false"),
+            (13, "pub const BAD_STR: Str = ", "not (false or true)"),
+            (14, "pub const BAD_UNIT: () = ", "true and true"),
         ] {
             let check = resolved.owners()[index]
                 .literal_check()
@@ -79038,9 +79120,9 @@ property "shared"() {}
                 ConstLiteralCheck::Supported {
                     primitive: PrimTy::I32,
                     diagnostics,
-                } if index == 8 => diagnostics,
-                ConstLiteralCheck::SupportedStr { diagnostics } if index == 9 => diagnostics,
-                ConstLiteralCheck::SupportedUnit { diagnostics } if index == 10 => diagnostics,
+                } if index == 12 => diagnostics,
+                ConstLiteralCheck::SupportedStr { diagnostics } if index == 13 => diagnostics,
+                ConstLiteralCheck::SupportedUnit { diagnostics } if index == 14 => diagnostics,
                 other => panic!("wrong-result-type logical expression was not checked: {other:?}"),
             };
             assert_eq!(diagnostics.len(), 1);
@@ -79063,13 +79145,13 @@ property "shared"() {}
             );
         }
 
-        for index in 11..22 {
+        for index in 15..26 {
             assert_eq!(
                 resolved.owners()[index]
                     .literal_check()
                     .expect("gated shape remains resolvable"),
                 &ConstLiteralCheck::Unsupported,
-                "nested, chained, path, non-Bool, short-circuit-shaped, nonempty-tuple, and bitwise forms remain gated at owner index {index}"
+                "path, non-Bool, short-circuit-shaped, nested path, nonempty-tuple, and bitwise forms remain gated at owner index {index}"
             );
             assert_eq!(
                 resolved.owners()[index]
@@ -79078,6 +79160,20 @@ property "shared"() {}
                 None
             );
         }
+        assert!(
+            resolved.owners()[26]
+                .literal_check()
+                .expect("deep Bool literal check succeeds")
+                .requires_const_value(),
+            "deep Bool const requires an evaluator value"
+        );
+        assert_eq!(
+            resolved.owners()[26]
+                .const_value()
+                .expect("deep Bool evaluation succeeds"),
+            Some(ConstValue::Bool(true)),
+            "deep left-associated Bool chains evaluate without recursive traversal"
+        );
     }
 
     #[test]

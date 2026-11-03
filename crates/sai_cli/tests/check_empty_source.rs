@@ -16837,6 +16837,10 @@ fn public_bool_logical_literal_consts_emit_check_results() {
         "pub const AND_TRUE: Bool = true and true\n",
         "pub const OR_FALSE: Bool = false or false\n",
         "pub const OR_TRUE: Bool = false or true\n",
+        "pub const NESTED: Bool = true and (false or true)\n",
+        "pub const CHAINED: Bool = true and false and true\n",
+        "pub const NESTED_NOT: Bool = not (false or false)\n",
+        "pub const MIXED_NESTED: Bool = not (true and (false or true))\n",
     );
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
@@ -17328,9 +17332,9 @@ fn const_forms_outside_literal_slice_remain_gated() {
     for source in [
         "const PRIVATE: I8 = 1\n",
         "pub const EXPRESSION: I8 = 1 + 2\n",
-        "pub const NESTED_LOGICAL: Bool = true and (false or true)\n",
-        "pub const CHAINED_LOGICAL: Bool = true and false and true\n",
         "pub const LOGICAL_PATH: Bool = true and READY\n",
+        "pub const NESTED_LOGICAL_PATH: Bool = false and (true or READY)\n",
+        "pub const NESTED_NOT_PATH: Bool = not (not READY)\n",
         "pub const LOGICAL_NON_BOOL: Bool = true and 1\n",
         "pub const READY: Bool = true\npub const SHORT_CIRCUIT_AND_PATH: Bool = false and READY\n",
         "pub const READY: Bool = false\npub const SHORT_CIRCUIT_OR_PATH: Bool = true or READY\n",
@@ -17339,7 +17343,6 @@ fn const_forms_outside_literal_slice_remain_gated() {
         "pub const NONEMPTY_TUPLE: (Bool, Bool) = true and false\n",
         "pub const BITWISE_BOOL: Bool = true & false\n",
         "pub const BITWISE_BOOL_OR: Bool = true | false\n",
-        "pub const NESTED_NOT: Bool = not (not true)\n",
         "pub const NOT_INTEGER: Bool = not 1\n",
         "pub const NOT_PATH: Bool = not READY\n",
         "pub const NOT_TUPLE: (Bool, Bool) = not true\n",
