@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1112 (2026-11-03): evaluate direct floating-point literal constants
+
+- **Decision — review required:** Extend the bounded evaluator with `ConstValue::Float { bits: u64, ty: FloatTy }` for valid direct F32 and F64 HIR literals.
+- **Reason:** §3.7.15 represents floating-point values as IEEE 754 bits with a `FloatTy`, and the existing shared checker already parses each decimal directly at its declared width, applies the sign, and rejects a non-finite result. Reusing that parser preserves its roundTiesToEven behavior without an intermediate F64 conversion.
+- **Boundary and judgment:** Require a value for each valid direct F32/F64 constant in the existing CLI success slice. Store F32 bits in the low 32 bits of `u64`, with `FloatTy` distinguishing the width; retain negative zero from an explicit negative zero or a negative nonzero value that underflows to zero. The existing literal check remains authoritative for parse and range errors, while float arithmetic and other computed expressions stay gated. This is an inferred Stage 0 order because the plan has no numbered post-IR-1107 evaluator items.
+- **Review required:** Verify F32/F64 exact-width conversion, tie-to-even boundaries, positive and negative values, signed zero, nonzero underflow, maximum finite values, overflow diagnostics, invalid kinds, and computed expressions remaining unvalued. Check that valid float values now participate in the CLI success gate.
+- **Verification:** `cargo test --workspace --locked --offline float -- --nocapture` passed the focused float tests across the workspace. `cargo test --workspace --locked --offline --quiet` passed all tests, including 823 driver tests and 482 CLI integration tests; two existing tests remain ignored. `cargo fmt --all -- --check` and `git diff --check` passed.
+- **Hostile review:** A read-only adversarial review found no actionable code or test findings.
+
 ### IR-1111 (2026-11-03): evaluate direct integer literal constants
 
 - **Decision — review required:** Extend the bounded evaluator with typed `ConstValue::Int { value: i128, ty: IntTy }` and `ConstValue::Uint { value: u128, ty: UintTy }` values for valid direct HIR integer literals.
