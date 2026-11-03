@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1110 (2026-11-03): evaluate direct Char, Byte, and canonical Str constants
+
+- **Decision — review required:** Extend the bounded evaluator with `ConstValue::Char`, `ConstValue::Byte`, and `ConstValue::Str` for matching direct HIR literals in the existing public, attribute-free, canonically named constant slice.
+- **Reason:** §3.7.15 defines these value variants, and the current checker already validates decoded character and byte literals plus direct strings against the canonical prelude `Str` type. Producing values for those validated forms advances the evaluator without adding new parsing, type resolution, or expression checking.
+- **Boundary and judgment:** Require values for valid Bool, Char, Byte, and canonical `Str` constants at the CLI success gate. Preserve the existing checked-only treatment for integer and float literals, unit, and tuple constants until their value representations are implemented. Use the existing session `Symbol` for `Str`; the literal check's canonical-type decision remains authoritative. Byte strings, other string types, aliases, computed expressions, references, and aggregates stay outside this increment. This is an inferred Stage 0 order because the plan has no numbered post-IR-1107 evaluator items.
+- **Review required:** Verify decoded Char/Byte values, empty/escaped/raw/multiline/Unicode `Str` values, the canonical `Str` gate, and no-value results on invalid or unsupported forms. Confirm valid Bool and the new value types require an evaluator result before CLI success, while numeric/float, unit, and tuple paths keep their existing coverage behavior. Challenge whether retaining `Symbol` is correct for the session value representation and whether byte strings or aliases were accidentally admitted.
+- **Verification:** The focused Char/Byte decoded-value test, focused canonical-`Str` value test, all 481 `check_empty_source` CLI integration tests, and `rtk proxy mise exec rust@1.99.1 -- cargo test --workspace --locked --offline --quiet` passed (including 819 driver tests; two existing tests remain ignored). `rtk proxy mise exec rust@1.99.1 -- cargo fmt --all -- --check` and `rtk git diff --check` passed.
+- **Hostile review:** A read-only adversarial review confirmed the canonical `Str` gate, the exact Bool/Char/Byte/Str value-required set, no values for mismatched or unsupported forms, and preservation of checked-only numeric/float/unit/tuple behavior. It found no remaining actionable issue.
+
 ### IR-1109 (2026-11-03): evaluate direct Bool logical const expressions
 
 - **Decision — review required:** Extend the IR-1108 bounded constant evaluator to produce `ConstValue::Bool` for exactly one `and` or `or` whose two immediate HIR operands are direct Bool literals.
