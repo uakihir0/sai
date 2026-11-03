@@ -22,6 +22,7 @@ from pathlib import Path
 
 import expectation_extractor
 import fixture_discovery
+import ndjson_stream
 
 
 CODE_TEXT = r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+"
@@ -46,6 +47,7 @@ CODE_EXEMPTION_TEST_SECTIONS = {
     "IMPLEMENTATION_LIMIT_EXCEEDED": "15.12.2",
     "SOURCE_READ_FAILED": "15.12.5",
 }
+LINT_TABLE_HEADING = "15.17.2"
 
 FULL_DOCUMENTS = tuple(
     [f"spec/{number:02d}" for number in range(2, 17)]
@@ -327,6 +329,137 @@ def _load_registry(path: Path) -> list[str]:
     return codes
 
 
+def _parse_lint_codes(
+    doc_path: Path,
+    headings: list[dict[str, object]],
+    registry: set[str],
+) -> set[str]:
+    heading = next(
+        (entry for entry in headings if entry["section"] == LINT_TABLE_HEADING),
+        None,
+    )
+    if heading is None:
+        raise CoverageError("spec/15 §15.17.2 does not resolve")
+    lines = _read_regular_utf8(doc_path, "lint registry specification").splitlines()
+    start = int(heading["line"])
+    end = len(lines)
+    for candidate in headings:
+        if int(candidate["line"]) > start and int(candidate["level"]) <= int(heading["level"]):
+            end = int(candidate["line"]) - 1
+            break
+
+    table_lines = []
+    in_table = False
+    for line in lines[start:end]:
+        if line.lstrip().startswith("|"):
+            in_table = True
+            table_lines.append(line)
+        elif in_table:
+            break
+    if len(table_lines) < 3:
+        raise CoverageError("could not extract lint table from spec/15 §15.17.2")
+
+    header = [cell.strip() for cell in table_lines[0].strip().strip("|").split("|")]
+    separator = [cell.strip() for cell in table_lines[1].strip().strip("|").split("|")]
+    if not header or header[0] != "Code" or not separator or not re.fullmatch(r":?-{3,}:?", separator[0]):
+        raise CoverageError("spec/15 §15.17.2 has an invalid lint table header")
+
+    codes: list[str] = []
+    for line in table_lines[2:]:
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if not cells:
+            continue
+        match = re.fullmatch(r"`([^`]+)`", cells[0])
+        if match is None or CODE.fullmatch(match[1]) is None:
+            raise CoverageError("spec/15 §15.17.2 has an invalid lint code")
+        codes.append(match[1])
+    if not codes or len(codes) != len(set(codes)):
+        raise CoverageError("spec/15 §15.17.2 must list unique lint codes")
+    unknown = sorted(set(codes) - registry)
+    if unknown:
+        raise CoverageError(
+            "spec/15 §15.17.2 names unregistered diagnostic(s): " + ", ".join(unknown)
+        )
+    return set(codes)
+
+
+def _diagnostic_json_golden_paths(
+    root: Path,
+    fixture: dict[str, str],
+    directives: dict[str, object],
+) -> list[Path]:
+    fixture_path = root / EXPECTED_CONFORMANCE / fixture["path"].removeprefix("conformance/")
+    if fixture["kind"] == "single-file":
+        root_file = root / EXPECTED_CONFORMANCE / fixture["root_file"].removeprefix("conformance/")
+        base = root_file.with_suffix("")
+    else:
+        base = fixture_path / "expected" / "diagnostics"
+
+    # Formatting commands do not select a target or profile. Stage 0 check
+    # tests are also targetless when their directives leave both unrestricted;
+    # higher-stage claims may additionally select their permitted matrix.
+    configurations = []
+    if directives["kind"] in ("fmt", "fmt-refuse"):
+        configurations.append((None, None))
+    elif (
+        directives["stage"] == 0
+        and directives["kind"] in ("check-pass", "check-fail")
+        and not {"targets", "profiles"} & set(directives["specified"])
+    ):
+        configurations.append((None, None))
+        configurations.extend(
+            (target, profile)
+            for target in sorted(directives["targets"])
+            for profile in sorted(directives["profiles"])
+        )
+    else:
+        configurations.extend(
+            (target, profile)
+            for target in sorted(directives["targets"])
+            for profile in sorted(directives["profiles"])
+        )
+
+    selected = set()
+    ordinary = base.with_name(f"{base.name}.json")
+    for target, profile in configurations:
+        candidates = []
+        if target is not None and profile is not None:
+            candidates.append(base.with_name(f"{base.name}.{target}.{profile}.json"))
+        if profile is not None:
+            candidates.append(base.with_name(f"{base.name}.{profile}.json"))
+        if target is not None:
+            candidates.append(base.with_name(f"{base.name}.{target}.json"))
+        candidates.append(ordinary)
+        for candidate in candidates:
+            if candidate.exists():
+                selected.add(candidate)
+                break
+    return sorted(selected, key=lambda path: path.relative_to(root).as_posix())
+
+
+def _codes_in_diagnostic_json_golden(path: Path, registry: set[str]) -> set[str]:
+    try:
+        info = path.lstat()
+    except OSError:
+        raise CoverageError(f"missing diagnostic JSON golden: {path.as_posix()}") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise CoverageError(f"diagnostic JSON golden is not a regular file: {path.as_posix()}")
+    try:
+        data = path.read_bytes()
+        records = ndjson_stream.validate_stream(data.splitlines(keepends=True))
+    except (OSError, ndjson_stream.StreamError) as error:
+        raise CoverageError(
+            f"invalid diagnostic JSON golden {path.as_posix()}: {error}"
+        ) from None
+    codes = {record["code"] for record in records if record["type"] == "diagnostic"}
+    unknown = sorted(codes - registry)
+    if unknown:
+        raise CoverageError(
+            f"{path.as_posix()} names unregistered diagnostic(s): {', '.join(unknown)}"
+        )
+    return codes
+
+
 def _fixture_source_files(fixture_root: Path) -> list[Path]:
     """List package sources, excluding expected outputs and WIT/MIR sidecars."""
     result = []
@@ -429,6 +562,13 @@ def build_report(root: Path) -> dict[str, object]:
     # lint level lets the shared extractor validate syntax while the conformance
     # runner remains responsible for checking actual lint levels and outcomes.
     neutral_lint_levels = {code: "info" for code in registry_codes}
+    lint_doc = aliases.get("spec/15")
+    if lint_doc is None:
+        raise CoverageError("covered lint document spec/15 does not resolve")
+    lint_codes = _parse_lint_codes(
+        lint_doc, headings_by_path[lint_doc.resolve()], set(registry_codes)
+    )
+    hard_codes = set(registry_codes) - lint_codes
     all_sections = {
         entry["id"]: entry
         for entries in inventory.values()
@@ -436,6 +576,7 @@ def build_report(root: Path) -> dict[str, object]:
     }
     section_tests: dict[str, set[str]] = {identifier: set() for identifier in all_sections}
     code_tests: dict[str, set[str]] = {code: set() for code in registry_codes}
+    hard_code_json_goldens: dict[str, set[str]] = {code: set() for code in hard_codes}
     test_records = []
 
     for fixture in fixtures:
@@ -463,6 +604,18 @@ def build_report(root: Path) -> dict[str, object]:
         codes = _codes_for_fixture(
             root, fixture, directives, extracted["expected"], set(registry_codes)
         )
+        golden_records = []
+        for golden_path in _diagnostic_json_golden_paths(root, fixture, directives):
+            golden_codes = _codes_in_diagnostic_json_golden(
+                golden_path, set(registry_codes)
+            )
+            relative_golden_path = golden_path.relative_to(root).as_posix()
+            golden_records.append({
+                "path": relative_golden_path,
+                "diagnostic_codes": sorted(golden_codes),
+            })
+            for code in golden_codes & hard_codes:
+                hard_code_json_goldens[code].add(relative_golden_path)
         portable = directives["reference_only"] is None
         if portable:
             for identifier in resolved_specs:
@@ -479,6 +632,7 @@ def build_report(root: Path) -> dict[str, object]:
             "reference_only_reason": directives["reference_only"],
             "spec": resolved_specs,
             "diagnostic_codes": codes,
+            "diagnostic_json_goldens": golden_records,
         })
 
     for identifier, entry in all_sections.items():
@@ -500,6 +654,10 @@ def build_report(root: Path) -> dict[str, object]:
         raise CoverageError("covered panic-kind document spec/10 does not resolve")
     panic_kinds = _parse_panic_kinds(panic_doc, headings_by_path[panic_doc.resolve()])
     panic_records = [{"kind": kind, "tests": []} for kind in panic_kinds]
+    hard_code_json_records = [
+        {"code": code, "goldens": sorted(hard_code_json_goldens[code])}
+        for code in sorted(hard_codes)
+    ]
 
     uncovered = {
         "sections": [
@@ -511,6 +669,9 @@ def build_report(root: Path) -> dict[str, object]:
             if not entry["tests"] and entry["exemption"] is None
         ],
         "panic_kinds": [entry["kind"] for entry in panic_records if not entry["tests"]],
+        "hard_code_json_goldens": [
+            entry["code"] for entry in hard_code_json_records if not entry["goldens"]
+        ],
     }
     return {
         "schema_version": 1,
@@ -532,6 +693,7 @@ def build_report(root: Path) -> dict[str, object]:
         "fixtures": test_records,
         "sections": section_records,
         "diagnostic_codes": code_records,
+        "hard_code_json_goldens": hard_code_json_records,
         "panic_kinds": panic_records,
         "uncovered": uncovered,
     }
