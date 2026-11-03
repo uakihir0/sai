@@ -1,0 +1,2 @@
+# Reviewed section exemptions are recorded as "<document> §<section> | <reason>".
+# See docs/impl/15-conformance-and-testing.md §15.9.2.

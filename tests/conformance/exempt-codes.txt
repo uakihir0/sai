@@ -1,0 +1,2 @@
+# Reviewed code exemptions are recorded as "<CODE> | <reason> | §15.12.<section>".
+# See docs/impl/15-conformance-and-testing.md §15.9.2.

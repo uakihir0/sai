@@ -1,0 +1,354 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from coverage import (
+    CoverageError,
+    _build_inventory,
+    _document_index,
+    _leaf_sections,
+    _parse_code_exemptions,
+    _parse_panic_kinds,
+    _parse_section_exemptions,
+    _scan_headings,
+    _section_ids,
+    _canonical_json,
+    build_report,
+    write_report,
+)
+
+
+class CoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self._write_repository()
+
+    def write(self, relative, content):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def _write_repository(self):
+        for area, maximum in (("spec", 16), ("package", 4), ("impl", 15)):
+            for number in range(1, maximum + 1):
+                if area == "spec" and number == 1:
+                    body = """# 1. Introduction
+## 1.4 Designations
+### 1.4.5 Implemented stages
+#### 1.4.5.1 Feature stage
+### 1.4.6 Other section
+## 1.5 Limits
+### 1.5.4 Resource limits
+## 1.6 Determinism
+### 1.6.1 Stable output
+"""
+                elif area == "spec" and number == 10:
+                    body = """# 10. Errors
+## 10.4 Panics
+### 10.4.4 Panic messages
+| Kind | Message |
+|---|---|
+| `Overflow(Add)` | text |
+| `Contract(id), Invariant(id), Refinement(id)` | text |
+| `StackOverflow`, `OutOfMemory` | text |
+### 10.4.5 Panic locations
+### 10.5 Reporting
+"""
+                elif area == "impl" and number == 12:
+                    body = """# 12. Tooling
+## 12.4 Graphs
+### 12.4.1 Queries
+## 12.5 Semantic protocol
+### 12.5.1 Transport
+### 12.5.2 Errors
+"""
+                elif area == "impl" and number == 13:
+                    body = """# 13. CLI
+## 13.3 Command output
+### 13.3.1 Syntax
+## 13.6 Commands
+### 13.6.1 Check
+## 13.7 Environment
+### 13.7.1 Variables
+## 13.8 Result records
+### 13.8.1 Summary
+"""
+                elif area == "impl" and number == 15:
+                    body = """# 15. Conformance
+## 15.8 Generated tests
+### 15.8.4 Diagnostic records
+## 15.12 Compiler tests
+### 15.12.2 Compiler-level tests
+### 15.12.3 ICE injection
+### 15.12.5 CLI
+"""
+                else:
+                    body = (
+                        f"# {number}. Document\n"
+                        f"## {number}.1 Parent\n"
+                        f"### {number}.1.1 Leaf\n"
+                        f"### {number}.1.2 Leaf\n"
+                    )
+                self.write(f"docs/{area}/{number:02d}-document.md", body)
+
+        self.write(
+            "crates/sai_diagnostics/src/diagnostic_code_names.txt",
+            "EXPECTED_TOKEN FEATURE_NOT_IMPLEMENTED IMPLEMENTATION_LIMIT_EXCEEDED "
+            "INTERNAL_COMPILER_ERROR INVALID_ESCAPE REF_ONLY_CODE SIDECAR_ONLY "
+            "SIDECAR_SOURCE_EXPECTED SIDECAR_SOURCE_FIXED SOURCE_READ_FAILED\n",
+        )
+        self.write("tests/conformance/exempt-sections.txt", "")
+        self.write("tests/conformance/exempt-codes.txt", "")
+        self.write(
+            "tests/conformance/cli/pass.sai",
+            """//@ kind: check-fail
+//@ stage: 0
+//@ spec: spec/02 §2.1.1, 11 §11.1.1
+//@ diag: error FEATURE_NOT_IMPLEMENTED
+//@ diag: error FEATURE_NOT_IMPLEMENTED
+const A: I32 = 1 //~ error EXPECTED_TOKEN
+""",
+        )
+        self.write(
+            "tests/conformance/cli/ref-only.sai",
+            """//@ kind: check-fail
+//@ stage: 0
+//@ spec: spec/02 §2.1.1
+//@ reference-only: depends on an implementation limit above the portable minimum
+const B: I32 = 2 //~ error INVALID_ESCAPE
+const C: I32 = 3 //~ error REF_ONLY_CODE
+""",
+        )
+        self.write(
+            "tests/conformance/cli/package.t/sai.package",
+            """//@ kind: check-fail
+//@ stage: 0
+//@ spec: impl/13 §13.6.1
+""",
+        )
+        self.write(
+            "tests/conformance/cli/package.t/src/lib.sai",
+            "const C: I32 = 3 //~ error EXPECTED_TOKEN\n",
+        )
+        self.write(
+            "tests/conformance/cli/package.t/src/edge.expected.sai",
+            "const D: I32 = 4 //~ error SIDECAR_SOURCE_EXPECTED\n",
+        )
+        self.write(
+            "tests/conformance/cli/package.t/src/edge.fixed.sai",
+            "const E: I32 = 5 //~ error SIDECAR_SOURCE_FIXED\n",
+        )
+        self.write(
+            "tests/conformance/cli/package.t/expected/fixed.sai",
+            "const Ignored: I32 = 4 //~ error SIDECAR_ONLY\n",
+        )
+        self.write(
+            "tests/conformance/cli/package.t/module.wit/world.sai",
+            "const AlsoIgnored: I32 = 4 //~ error INVALID_ESCAPE\n",
+        )
+
+    def test_heading_scan_ignores_fences_and_only_uses_numbered_leaves(self):
+        headings = _scan_headings(
+            """## 2.1 Parent
+```sai
+### 2.1.1 Not a section
+```
+### 2.1.1 Actual leaf
+~~~text
+## 2.1.2 Also not a section
+~~~
+### 2.1.2 Second leaf
+""",
+            "spec/02",
+        )
+        self.assertEqual(_section_ids(headings), {"2.1", "2.1.1", "2.1.2"})
+        self.assertEqual(_leaf_sections(headings, None), ["2.1.1", "2.1.2"])
+        self.assertEqual(_leaf_sections(headings, ("2.1.1",)), ["2.1.1"])
+
+    def test_heading_scan_rejects_unterminated_fences_and_duplicate_numbers(self):
+        with self.assertRaisesRegex(CoverageError, "unterminated fenced"):
+            _scan_headings("```text\n## 2.1 Hidden\n", "spec/02")
+        with self.assertRaisesRegex(CoverageError, "duplicate numbered"):
+            _scan_headings("## 2.1 First\n## 2.1 Duplicate\n", "spec/02")
+
+    def test_document_index_rejects_duplicate_chapter_numbers(self):
+        self.write("docs/spec/02-other-name.md", "# 2. Other document\n")
+        with self.assertRaisesRegex(CoverageError, "duplicate numbered document: spec/02"):
+            _document_index(self.root / "docs")
+
+    def test_covered_scopes_include_only_required_leaves(self):
+        aliases, canonical = _document_index(self.root / "docs")
+        inventory, _ = _build_inventory(self.root / "docs", aliases, canonical)
+        self.assertEqual(
+            [entry["id"] for entry in inventory["spec/01"]],
+            ["spec/01 §1.4.5.1", "spec/01 §1.5.4", "spec/01 §1.6.1"],
+        )
+        self.assertEqual(
+            [entry["id"] for entry in inventory["impl/12"]],
+            ["impl/12 §12.5.1", "impl/12 §12.5.2"],
+        )
+        self.assertEqual(
+            [entry["id"] for entry in inventory["impl/13"]],
+            ["impl/13 §13.3.1", "impl/13 §13.6.1", "impl/13 §13.8.1"],
+        )
+
+    def test_report_resolves_aliases_counts_portable_codes_and_ignores_sidecars(self):
+        report = build_report(self.root)
+        records = {test["path"]: test for test in report["fixtures"]}
+        portable = records["tests/conformance/cli/pass.sai"]
+        self.assertEqual(
+            portable["spec"],
+            ["spec/02 §2.1.1", "impl/11 §11.1.1"],
+        )
+        self.assertEqual(portable["diagnostic_codes"],
+                         ["EXPECTED_TOKEN", "FEATURE_NOT_IMPLEMENTED"])
+        directory = records["tests/conformance/cli/package.t"]
+        self.assertEqual(directory["diagnostic_codes"], ["EXPECTED_TOKEN"])
+        self.assertNotIn("SIDECAR_ONLY", directory["diagnostic_codes"])
+        self.assertNotIn("SIDECAR_SOURCE_EXPECTED", directory["diagnostic_codes"])
+        self.assertNotIn("SIDECAR_SOURCE_FIXED", directory["diagnostic_codes"])
+        self.assertFalse(records["tests/conformance/cli/ref-only.sai"]["portable"])
+        self.assertEqual(
+            next(item for item in report["diagnostic_codes"]
+                 if item["code"] == "INVALID_ESCAPE")["tests"],
+            [],
+        )
+        self.assertEqual(
+            next(item for item in report["diagnostic_codes"]
+                 if item["code"] == "REF_ONLY_CODE")["tests"],
+            [],
+        )
+        for code in ("SIDECAR_SOURCE_EXPECTED", "SIDECAR_SOURCE_FIXED"):
+            self.assertEqual(
+                next(item for item in report["diagnostic_codes"]
+                     if item["code"] == code)["tests"],
+                [],
+            )
+        self.assertFalse(report["claim"])
+        self.assertFalse(report["stage_gate_enabled"])
+
+    def test_panic_table_is_read_from_the_normative_section(self):
+        aliases, canonical = _document_index(self.root / "docs")
+        path = aliases["spec/10"]
+        headings = _scan_headings(path.read_text(encoding="utf-8"), "spec/10")
+        self.assertEqual(
+            _parse_panic_kinds(path, headings),
+            ["Overflow(Add)", "Contract(id)", "Invariant(id)", "Refinement(id)",
+             "StackOverflow", "OutOfMemory"],
+        )
+
+    def test_section_exemptions_are_validated_and_bound_to_inventory(self):
+        aliases, canonical = _document_index(self.root / "docs")
+        inventory, headings = _build_inventory(self.root / "docs", aliases, canonical)
+        path = self.write(
+            "tests/conformance/exempt-sections.txt",
+            "spec/02 §2.1.1 | generated §15.8.4\n",
+        )
+        self.assertEqual(
+            _parse_section_exemptions(path, inventory, aliases, canonical, headings),
+            {"spec/02 §2.1.1": "generated §15.8.4"},
+        )
+        path.write_text("spec/02 §2.1.1 | typo\n", encoding="utf-8")
+        with self.assertRaisesRegex(CoverageError, "invalid section exemption"):
+            _parse_section_exemptions(path, inventory, aliases, canonical, headings)
+        path.write_text("spec/02 §2.1.99 | informative\n", encoding="utf-8")
+        with self.assertRaisesRegex(CoverageError, "does not resolve"):
+            _parse_section_exemptions(path, inventory, aliases, canonical, headings)
+        path.write_text(
+            "spec/02 §2.1.1 | generated §15.8.99\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(CoverageError, "does not resolve"):
+            _parse_section_exemptions(path, inventory, aliases, canonical, headings)
+
+    def test_code_exemptions_are_allowlisted_and_bind_to_their_required_tests(self):
+        aliases, canonical = _document_index(self.root / "docs")
+        _, headings = _build_inventory(self.root / "docs", aliases, canonical)
+        path = self.write(
+            "tests/conformance/exempt-codes.txt",
+            "INTERNAL_COMPILER_ERROR | produced only by an injected compiler failure | §15.12.3\n"
+            "IMPLEMENTATION_LIMIT_EXCEEDED | limits differ between implementations | §15.12.2\n"
+            "SOURCE_READ_FAILED | host permissions cannot be made portable | §15.12.5\n",
+        )
+        self.assertEqual(
+            _parse_code_exemptions(
+                path,
+                {
+                    "EXPECTED_TOKEN", "INTERNAL_COMPILER_ERROR",
+                    "IMPLEMENTATION_LIMIT_EXCEEDED", "SOURCE_READ_FAILED",
+                },
+                aliases, canonical, headings,
+            ),
+            {
+                "INTERNAL_COMPILER_ERROR": {
+                    "reason": "produced only by an injected compiler failure",
+                    "test_section": "impl/15 §15.12.3",
+                },
+                "IMPLEMENTATION_LIMIT_EXCEEDED": {
+                    "reason": "limits differ between implementations",
+                    "test_section": "impl/15 §15.12.2",
+                },
+                "SOURCE_READ_FAILED": {
+                    "reason": "host permissions cannot be made portable",
+                    "test_section": "impl/15 §15.12.5",
+                },
+            },
+        )
+        path.write_text("NOT_REGISTERED | impossible | §15.12.3\n", encoding="utf-8")
+        with self.assertRaisesRegex(CoverageError, "unregistered diagnostic"):
+            _parse_code_exemptions(
+                path, {"EXPECTED_TOKEN"}, aliases, canonical, headings
+            )
+        path.write_text("EXPECTED_TOKEN | impossible | §15.12.3\n", encoding="utf-8")
+        with self.assertRaisesRegex(CoverageError, "not exemptible"):
+            _parse_code_exemptions(
+                path, {"EXPECTED_TOKEN"}, aliases, canonical, headings
+            )
+        path.write_text(
+            "INTERNAL_COMPILER_ERROR | wrong test | §15.12.5\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(CoverageError, "must cite impl/15 §15.12.3"):
+            _parse_code_exemptions(
+                path,
+                {"INTERNAL_COMPILER_ERROR", "SOURCE_READ_FAILED"},
+                aliases, canonical, headings,
+            )
+
+    def test_missing_exemption_lists_are_fatal(self):
+        (self.root / "tests/conformance/exempt-sections.txt").unlink()
+        with self.assertRaisesRegex(CoverageError, "missing section exemption"):
+            build_report(self.root)
+
+    def test_report_bytes_are_stable_and_sorted(self):
+        first = self.root / "target/conformance/coverage.json"
+        second = self.root / "target/another/coverage.json"
+        write_report(self.root, first)
+        initial = first.read_bytes()
+        write_report(self.root, second)
+        write_report(self.root, first)
+        self.assertEqual(initial, first.read_bytes())
+        self.assertEqual(initial, second.read_bytes())
+        report = build_report(self.root)
+        self.assertEqual(initial, _canonical_json(report))
+        self.assertEqual(
+            [entry["path"] for entry in report["fixtures"]],
+            sorted(entry["path"] for entry in report["fixtures"]),
+        )
+
+    def test_malformed_spec_reference_fails_closed(self):
+        self.write(
+            "tests/conformance/cli/bad.sai",
+            """//@ kind: check-pass
+//@ stage: 0
+//@ spec: spec/02 §2.999
+const A: I32 = 0
+""",
+        )
+        with self.assertRaisesRegex(CoverageError, "spec section does not resolve"):
+            build_report(self.root)
+
+
+if __name__ == "__main__":
+    unittest.main()
