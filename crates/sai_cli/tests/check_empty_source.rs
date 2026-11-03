@@ -17660,6 +17660,201 @@ fn pointer_sized_integer_subtraction_uses_the_selected_target_width() {
 }
 
 #[test]
+fn public_integer_multiplication_const_values_cover_scalar_and_flat_aggregates() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub const I8_VALUE: I8 = -8 * 16\n",
+        "pub const I16_VALUE: I16 = -32768 * 1\n",
+        "pub const I32_VALUE: I32 = 46340 * 46340\n",
+        "pub const I64_VALUE: I64 = 3037000499 * 3037000499\n",
+        "pub const ISIZE_VALUE: ISize = -32768 * 1\n",
+        "pub const U8_VALUE: U8 = 17 * 15\n",
+        "pub const U16_VALUE: U16 = 256 * 255\n",
+        "pub const U32_VALUE: U32 = 65536 * 65535\n",
+        "pub const U64_VALUE: U64 = 4294967296 * 4294967295\n",
+        "pub const USIZE_VALUE: USize = 65536 * 1\n",
+        "pub const TUPLE_VALUE: (I8, U8, I32) = (-8 * 16, 17 * 15, 21 * 2)\n",
+        "pub const ARRAY_VALUE: Array<U16, 2> = [256 * 255, 3 * 2]\n",
+        "pub const BASE: I32 = 40\n",
+        "pub const MIXED_REFERENCE: (I32, I32) = (3 * 5, BASE)\n",
+        "pub const MIXED_REFERENCE_ARRAY: Array<I32, 2> = [3 * 5, BASE]\n",
+    );
+
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", target]),
+            target,
+            "dev",
+        );
+    }
+}
+
+#[test]
+fn integer_multiplication_diagnostics_and_unsupported_forms_are_preserved() {
+    let overflow_source = "pub const OVERFLOW: I8 = -16 /* comment * is not the operator */ * -8\n";
+    let overflow_output = run_check(overflow_source, "", &[], &[]);
+    let overflow_stdout = String::from_utf8(overflow_output.stdout).expect("CLI stdout is UTF-8");
+    let operator_start = overflow_source
+        .find("*/ * -8")
+        .expect("multiplication operator after comment exists")
+        + "*/ ".len();
+    assert_eq!(
+        overflow_output.status.code(),
+        Some(1),
+        "overflowing multiplication should fail the check:\n{overflow_stdout}"
+    );
+    assert!(
+        overflow_stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+            && overflow_stdout.contains("Overflow(Mul)")
+            && overflow_stdout.contains("integer overflow in multiplication")
+            && !overflow_stdout.contains("\"type\":\"result\"")
+            && !overflow_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "overflow is a checked const-evaluation panic, not a feature gate:\n{overflow_stdout}"
+    );
+    assert_json_diagnostic_primary_byte_span(
+        &overflow_stdout,
+        "CONST_EVAL_PANIC",
+        operator_start,
+        operator_start + 1,
+    );
+
+    for (source, expected_code, forbidden_code, diagnostic_expression) in [
+        (
+            "pub const SIGNED_NEGATIVE_OVERFLOW: I8 = -128 * 2\n",
+            "CONST_EVAL_PANIC",
+            "FEATURE_NOT_IMPLEMENTED",
+            None,
+        ),
+        (
+            "pub const UNSIGNED_OVERFLOW: U8 = 16 * 16\n",
+            "CONST_EVAL_PANIC",
+            "FEATURE_NOT_IMPLEMENTED",
+            None,
+        ),
+        (
+            "pub const OUT_OF_RANGE_LEFT: I8 = 128 * 1\n",
+            "LITERAL_OUT_OF_RANGE",
+            "CONST_EVAL_PANIC",
+            None,
+        ),
+        (
+            "pub const OUT_OF_RANGE_RIGHT: I8 = 1 * 128\n",
+            "LITERAL_OUT_OF_RANGE",
+            "CONST_EVAL_PANIC",
+            None,
+        ),
+        (
+            "pub const BOTH_OUT_OF_RANGE: I8 = 128 * 129\n",
+            "LITERAL_OUT_OF_RANGE",
+            "CONST_EVAL_PANIC",
+            None,
+        ),
+        (
+            "pub const BAD_TYPE: Bool = 7 * 1\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("7 * 1"),
+        ),
+        (
+            "pub const BAD_BYTE_STR: Slice<Byte> = 1 * 2\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("1 * 2"),
+        ),
+        (
+            "pub const BAD_TUPLE_LEAF: (Bool,) = (1 * 2,)\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("1 * 2"),
+        ),
+        (
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [1 * 2]\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("1 * 2"),
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && !stdout.contains(&format!("\"code\":\"{forbidden_code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a checked multiplication diagnostic without a feature gate:\n{stdout}"
+        );
+        if let Some(expression) = diagnostic_expression {
+            let start = source
+                .find(expression)
+                .expect("diagnosed multiplication expression exists");
+            assert_json_diagnostic_primary_byte_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                start,
+                start + expression.len(),
+            );
+        }
+    }
+
+    for source in [
+        "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 2 * BASE\n",
+        "pub const CHAINED: I8 = 1 * 2 * 3\n",
+        "pub const NESTED: I8 = (1 * 2) * 3\n",
+        "pub const WRAPPING: I8 = 64 *% 2\n",
+        "pub const MIXED: I8 = 1 * true\n",
+        "pub const BYTE_OPERAND: I8 = 1 * b'\\0'\n",
+        "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(1 * 2)\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn pointer_sized_integer_multiplication_uses_the_selected_target_width() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+
+    for (name, source) in [
+        (
+            "signed",
+            "pub const POINTER_MULTIPLICATION: ISize = 65536 * 65536\n",
+        ),
+        (
+            "unsigned",
+            "pub const POINTER_MULTIPLICATION: USize = 65536 * 65536\n",
+        ),
+    ] {
+        let wasm32 = run_check(source, manifest, &[], &["--target", "wasm32-core"]);
+        let wasm32_stdout = String::from_utf8(wasm32.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            wasm32.status.code(),
+            Some(1),
+            "{name} 32-bit pointer-sized multiplication should overflow:\n{wasm32_stdout}"
+        );
+        assert!(
+            wasm32_stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+                && wasm32_stdout.contains("Overflow(Mul)")
+                && !wasm32_stdout.contains("\"type\":\"result\"")
+                && !wasm32_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{name} pointer overflow is a checked panic, not a feature gate:\n{wasm32_stdout}"
+        );
+        let operator_start = source.find('*').expect("multiplication operator exists");
+        assert_json_diagnostic_primary_byte_span(
+            &wasm32_stdout,
+            "CONST_EVAL_PANIC",
+            operator_start,
+            operator_start + 1,
+        );
+
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", "wasm64-core"]),
+            "wasm64-core",
+            "dev",
+        );
+    }
+}
+
+#[test]
 fn public_bool_logical_literal_consts_emit_check_results() {
     let source = concat!(
         "pub const AND_FALSE: Bool = true and false\n",
