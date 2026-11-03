@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -372,7 +372,7 @@ fn run_check(
                 ),
                 primary: None,
                 primary_label: String::new(),
-                argument_index: None,
+                argument_index: Some(0),
                 argument: String::new(),
                 help: Some("run `sai new` to create a package".to_owned()),
                 data: None,
@@ -10166,7 +10166,7 @@ fn report_fmt_no_package_found(
         ),
         primary: None,
         primary_label: String::new(),
-        argument_index: None,
+        argument_index: Some(0),
         argument: String::new(),
         help: Some("run `sai new` to create a package".to_owned()),
         data: None,
@@ -13405,6 +13405,11 @@ fn validate_known_command_options(command: &crate::args::ParsedCommand) -> Vec<U
     let mut seen_values = BTreeSet::new();
     let mut seen_options = BTreeSet::new();
     let mut index = 0;
+    let missing_argument = |option: &str| UsageError {
+        kind: UsageErrorKind::MissingArgument,
+        argument_index: 0,
+        argument: OsString::from(option),
+    };
 
     while index < command.arguments.len() {
         if global_indices.contains(&index) {
@@ -13499,12 +13504,7 @@ fn validate_known_command_options(command: &crate::args::ParsedCommand) -> Vec<U
                 }
                 index += consumed;
             } else {
-                errors.push(command_option_error(
-                    command,
-                    index,
-                    UsageErrorKind::MissingArgument,
-                    argument.clone(),
-                ));
+                errors.push(missing_argument(&option));
                 index += 1;
             }
         } else {
@@ -13648,11 +13648,10 @@ fn validate_command_shape(
         "bindgen" => {
             errors.extend(positionals.iter().map(unexpected));
             if seen_options.contains("--show") && seen_options.contains("-o") {
-                errors.push(UsageError {
-                    kind: UsageErrorKind::ConflictingOptions,
-                    argument_index: 0,
-                    argument: OsString::new(),
-                });
+                errors.push(
+                    conflicting_options_error(command, &["--show", "-o"])
+                        .expect("conflicting options are present in the command"),
+                );
             }
         }
         "run" => errors.extend(positionals.iter().map(unexpected)),
@@ -13716,14 +13715,10 @@ fn validate_command_shape(
             let has_dir = seen_options.contains("--dir");
             let has_version = seen_options.contains("--version");
             if has_path && (has_version || has_dir) {
-                if let Some(index) = command_option_argument_index(command, "--path") {
-                    errors.push(command_option_error(
-                        command,
-                        index,
-                        UsageErrorKind::ConflictingOptions,
-                        command.arguments[index].clone(),
-                    ));
-                }
+                errors.push(
+                    conflicting_options_error(command, &["--path", "--version", "--dir"])
+                        .expect("conflicting options are present in the command"),
+                );
             }
             if positionals.is_empty() && !has_path {
                 errors.push(missing());
@@ -13844,11 +13839,10 @@ fn validate_command_shape(
                 errors.push(invalid(&positionals[0]));
             }
             if seen_options.contains("--in") && seen_options.contains("--both") {
-                errors.push(UsageError {
-                    kind: UsageErrorKind::ConflictingOptions,
-                    argument_index: 0,
-                    argument: OsString::new(),
-                });
+                errors.push(
+                    conflicting_options_error(command, &["--in", "--both"])
+                        .expect("conflicting options are present in the command"),
+                );
             }
         }
         "diff" => {
@@ -13880,11 +13874,10 @@ fn validate_command_shape(
         && seen_options.contains("--workspace")
         && seen_options.contains("--package")
     {
-        errors.push(UsageError {
-            kind: UsageErrorKind::ConflictingOptions,
-            argument_index: 0,
-            argument: OsString::new(),
-        });
+        errors.push(
+            conflicting_options_error(command, &["--workspace", "--package"])
+                .expect("conflicting options are present in the command"),
+        );
     }
     errors
 }
@@ -13950,8 +13943,29 @@ fn command_option_argument_index(
     option: &str,
 ) -> Option<usize> {
     command.arguments.iter().position(|argument| {
-        crate::args::split_os_option(argument).is_some_and(|(name, _)| name == option)
+        argument == OsStr::new(option)
+            || crate::args::split_os_option(argument).is_some_and(|(name, _)| name == option)
     })
+}
+
+fn conflicting_options_error(
+    command: &crate::args::ParsedCommand,
+    options: &[&str],
+) -> Option<UsageError> {
+    let (index, _) = options
+        .iter()
+        .filter_map(|option| {
+            let index = command_option_argument_index(command, option)?;
+            let argv_index = command.argument_indices.get(index)?;
+            Some((index, argv_index))
+        })
+        .max_by_key(|(_, argv_index)| *argv_index)?;
+    Some(command_option_error(
+        command,
+        index,
+        UsageErrorKind::ConflictingOptions,
+        command.arguments[index].clone(),
+    ))
 }
 
 fn is_git_url_or_path(value: &str) -> bool {
@@ -14295,20 +14309,16 @@ fn report_new_error(
 fn report_usage_errors(
     parsed: &ParsedArgs,
     command_name: &str,
-    mut errors: Vec<UsageError>,
+    errors: Vec<UsageError>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
-    errors.sort_by_key(|error| error.argument_index);
     let total_errors = errors.len();
-    let max_errors = parsed.globals.max_errors;
-    if max_errors != 0 {
-        errors.truncate(max_errors);
-    }
-    let diagnostics = errors
+    let mut diagnostics = errors
         .iter()
         .map(|error| usage_diagnostic(error, command_name, parsed.command.as_ref()))
         .collect::<Vec<_>>();
+    diagnostics.sort_by(compare_usage_diagnostics);
     match parsed.globals.format {
         OutputFormat::Human => {
             let color = color_enabled(parsed.globals.color, io::stderr().is_terminal());
@@ -14319,7 +14329,7 @@ fn report_usage_errors(
                 !parsed.globals.quiet,
                 color,
                 total_errors,
-                max_errors,
+                0,
             ) {
                 report_stderr_failure(error)
             } else {
@@ -14337,6 +14347,21 @@ fn report_usage_errors(
             }
         }
     }
+}
+
+fn compare_usage_diagnostics(left: &CliDiagnostic, right: &CliDiagnostic) -> Ordering {
+    left.code
+        .as_bytes()
+        .cmp(right.code.as_bytes())
+        .then_with(|| left.message.as_bytes().cmp(right.message.as_bytes()))
+        .then_with(|| cli_diagnostic_record_bytes(left).cmp(&cli_diagnostic_record_bytes(right)))
+}
+
+fn cli_diagnostic_record_bytes(diagnostic: &CliDiagnostic) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    write_json_diagnostic_records(&mut bytes, std::slice::from_ref(diagnostic))
+        .expect("writing a usage diagnostic to a byte vector cannot fail");
+    bytes
 }
 
 fn usage_diagnostic(
@@ -14368,7 +14393,11 @@ fn usage_diagnostic(
         ),
         UsageErrorKind::MissingArgument => (
             "MISSING_ARGUMENT",
-            format!("missing required argument for `{command}`"),
+            if argument.is_empty() {
+                format!("missing required argument for `{command}`")
+            } else {
+                format!("missing value for `{argument}` for `{command}`")
+            },
             None,
         ),
         UsageErrorKind::InvalidOptionValue => {
@@ -14438,7 +14467,11 @@ fn usage_diagnostic(
         primary: None,
         primary_label: String::new(),
         argument_index: Some(error.argument_index),
-        argument,
+        argument: if error.kind == UsageErrorKind::MissingArgument {
+            String::new()
+        } else {
+            argument
+        },
         help,
         data: None,
     }
@@ -19019,7 +19052,52 @@ mod tests {
         assert_eq!(exit_code, 2);
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"code\":\"MISSING_ARGUMENT\""));
-        assert!(stdout.contains("\"argument_index\":3"));
+        assert!(stdout.contains("\"argument_index\":0,\"argument\":\"\""));
+        assert!(stdout.contains("missing value for `--target` for `sai check`"));
+    }
+
+    #[test]
+    fn global_and_new_missing_option_values_name_the_option() {
+        let (exit_code, stdout, stderr) = invoke(&["--directory", "--format=json", "check"]);
+
+        assert_eq!(exit_code, 2);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"MISSING_ARGUMENT\""));
+        assert!(stdout.contains("missing value for `--directory` for `sai check`"));
+        assert!(stdout.contains("\"argument_index\":0,\"argument\":\"\""));
+
+        let temporary = TestDirectory::new();
+        let destination = temporary.child("unused");
+        let destination_arg = destination.to_str().expect("temporary path is UTF-8");
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "new", destination_arg, "--name"]);
+
+        assert_eq!(exit_code, 2);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"MISSING_ARGUMENT\""));
+        assert!(stdout.contains("missing value for `--name` for `sai new`"));
+        assert!(stdout.contains("\"argument_index\":0,\"argument\":\"\""));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn repeated_missing_option_values_are_not_deduplicated() {
+        let (exit_code, stdout, stderr) =
+            invoke(&["check", "--format=json", "--target", "--target"]);
+
+        assert_eq!(exit_code, 2);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout.matches("\"code\":\"MISSING_ARGUMENT\"").count(), 2);
+        assert!(stdout.contains("\"code\":\"CONFLICTING_OPTIONS\""));
+        assert_eq!(
+            stdout
+                .matches("\"argument_index\":0,\"argument\":\"\"")
+                .count(),
+            2
+        );
+        assert!(stdout.contains("\"errors\":3"));
+        assert!(stdout.contains("\"shown_errors\":3"));
+        assert!(stdout.contains("\"duplicate\":0"));
     }
 
     #[test]
@@ -22115,8 +22193,8 @@ mod tests {
         assert_eq!(exit_code, 2);
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"code\":\"CONFLICTING_OPTIONS\""));
-        assert!(stdout.contains("\"argument_index\":3"));
-        assert!(stdout.contains("\"argument\":\"--path=.\""));
+        assert!(stdout.contains("\"argument_index\":4"));
+        assert!(stdout.contains("\"argument\":\"--version\""));
 
         let (exit_code, stdout, stderr) =
             invoke(&["fmt", "--format=json", "--stdin-kind=source", "file.sai"]);
@@ -22126,6 +22204,55 @@ mod tests {
         assert!(stdout.contains("\"code\":\"CONFLICTING_OPTIONS\""));
         assert!(stdout.contains("\"argument_index\":3"));
         assert!(stdout.contains("\"argument\":\"--stdin-kind=source\""));
+    }
+
+    #[test]
+    fn bindgen_conflict_identifies_later_option_in_either_order() {
+        for (arguments, index, option) in [
+            (
+                vec![
+                    "bindgen",
+                    "--format=json",
+                    "wit",
+                    "--show",
+                    "ns:pkg",
+                    "-o",
+                    "out",
+                ],
+                6,
+                "-o",
+            ),
+            (
+                vec![
+                    "bindgen",
+                    "--format=json",
+                    "wit",
+                    "-o",
+                    "out",
+                    "--show",
+                    "ns:pkg",
+                ],
+                6,
+                "--show",
+            ),
+        ] {
+            let (exit_code, stdout, stderr) = invoke(&arguments);
+
+            assert_eq!(exit_code, 2, "{arguments:?}");
+            assert!(stderr.is_empty(), "{arguments:?}");
+            assert!(
+                stdout.contains("\"code\":\"CONFLICTING_OPTIONS\""),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains(&format!("\"argument_index\":{index}")),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains(&format!("\"argument\":\"{option}\"")),
+                "{stdout}"
+            );
+        }
     }
 
     #[test]
@@ -22449,7 +22576,7 @@ mod tests {
     }
 
     #[test]
-    fn max_errors_limits_rendered_usage_diagnostics_but_not_counts() {
+    fn max_errors_does_not_limit_usage_diagnostics() {
         let (exit_code, stdout, stderr) = invoke(&[
             "--format=json",
             "--max-errors=1",
@@ -22465,16 +22592,37 @@ mod tests {
         assert_eq!(exit_code, 2);
         assert!(stderr.is_empty());
         let records = stdout.lines().collect::<Vec<_>>();
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 5);
         assert_eq!(
             records
                 .iter()
                 .filter(|record| record.contains("\"type\":\"diagnostic\""))
                 .count(),
-            1
+            3
         );
-        assert!(records[2].contains("\"errors\":3"));
-        assert!(records[2].contains("\"shown_errors\":1"));
+        assert!(records[4].contains("\"errors\":3"));
+        assert!(records[4].contains("\"shown_errors\":3"));
+    }
+
+    #[test]
+    fn max_errors_does_not_limit_human_usage_diagnostics() {
+        let arguments = [
+            "--max-errors=1",
+            "check",
+            "--target=not-a-target",
+            "--bogus",
+        ]
+        .map(std::ffi::OsString::from);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run(&arguments, &mut stdout, &mut stderr);
+
+        assert_eq!(exit_code, 2);
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).expect("stderr is UTF-8");
+        assert!(stderr.contains("invalid value `not-a-target`"), "{stderr}");
+        assert!(stderr.contains("unknown option `--bogus`"), "{stderr}");
     }
 
     #[test]

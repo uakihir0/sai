@@ -89,6 +89,9 @@ pub struct UsageError {
     pub kind: UsageErrorKind,
     /// One-based argv position; zero denotes a missing argument.
     pub argument_index: usize,
+    /// Text associated with the error. Missing option values retain the option
+    /// spelling internally so the CLI can name it in the message; their
+    /// serialized `argument` remains empty as required by §13.3.5.
     pub argument: OsString,
 }
 
@@ -261,7 +264,7 @@ fn parse_global_option(
                 parsed,
             );
             let Some((value, consumed, value_index)) =
-                read_value(inline_value, index, arguments, parsed)
+                read_value(name, inline_value, index, arguments, parsed)
             else {
                 return Some(1);
             };
@@ -286,7 +289,7 @@ fn parse_global_option(
                 parsed,
             );
             let Some((value, consumed, value_index)) =
-                read_value(inline_value, index, arguments, parsed)
+                read_value(name, inline_value, index, arguments, parsed)
             else {
                 return Some(1);
             };
@@ -311,7 +314,8 @@ fn parse_global_option(
                 seen_values,
                 parsed,
             );
-            let Some((value, consumed, _)) = read_os_value(inline_value, index, arguments, parsed)
+            let Some((value, consumed, _)) =
+                read_os_value(name, inline_value, index, arguments, parsed)
             else {
                 return Some(1);
             };
@@ -329,7 +333,7 @@ fn parse_global_option(
                 parsed,
             );
             let Some((value, consumed, value_index)) =
-                read_value(inline_value, index, arguments, parsed)
+                read_value(name, inline_value, index, arguments, parsed)
             else {
                 return Some(1);
             };
@@ -415,6 +419,7 @@ fn parse_global_option(
 }
 
 fn read_value(
+    option_name: &str,
     inline_value: Option<&OsStr>,
     option_index: usize,
     arguments: &[OsString],
@@ -427,7 +432,7 @@ fn read_value(
         parsed.usage_errors.push(UsageError {
             kind: UsageErrorKind::MissingArgument,
             argument_index: 0,
-            argument: OsString::new(),
+            argument: OsString::from(option_name),
         });
         return None;
     };
@@ -435,7 +440,7 @@ fn read_value(
         parsed.usage_errors.push(UsageError {
             kind: UsageErrorKind::MissingArgument,
             argument_index: 0,
-            argument: OsString::new(),
+            argument: OsString::from(option_name),
         });
         return None;
     }
@@ -443,6 +448,7 @@ fn read_value(
 }
 
 fn read_os_value<'a>(
+    option_name: &str,
     inline_value: Option<&'a OsStr>,
     option_index: usize,
     arguments: &'a [OsString],
@@ -455,7 +461,7 @@ fn read_os_value<'a>(
         parsed.usage_errors.push(UsageError {
             kind: UsageErrorKind::MissingArgument,
             argument_index: 0,
-            argument: OsString::new(),
+            argument: OsString::from(option_name),
         });
         return None;
     };
@@ -463,7 +469,7 @@ fn read_os_value<'a>(
         parsed.usage_errors.push(UsageError {
             kind: UsageErrorKind::MissingArgument,
             argument_index: 0,
-            argument: OsString::new(),
+            argument: OsString::from(option_name),
         });
         return None;
     }
@@ -778,6 +784,7 @@ mod tests {
             UsageErrorKind::MissingArgument
         );
         assert_eq!(missing.usage_errors[0].argument_index, 0);
+        assert_eq!(missing.usage_errors[0].argument, "--format");
 
         let invalid = parse_args(&args(&["check", "--color", "blue"]));
         assert_eq!(

@@ -103,7 +103,7 @@ pub fn parse_new_command(command: &ParsedCommand) -> Result<NewPackageArgs, Vec<
             };
 
             let Some(value) = value else {
-                errors.push(missing_argument());
+                errors.push(missing_argument(Some(&option)));
                 index += consumed;
                 continue;
             };
@@ -184,10 +184,10 @@ pub fn parse_new_command(command: &ParsedCommand) -> Result<NewPackageArgs, Vec<
     }
 
     if destination.is_none() {
-        errors.push(missing_argument());
+        errors.push(missing_argument(None));
     }
     if !name_option_seen {
-        errors.push(missing_argument());
+        errors.push(missing_argument(Some("--name")));
     }
 
     if let (Some(identity), Some(argument_index), Some(argument)) = (
@@ -242,11 +242,11 @@ fn command_error(
     }
 }
 
-fn missing_argument() -> UsageError {
+fn missing_argument(option: Option<&str>) -> UsageError {
     UsageError {
         kind: UsageErrorKind::MissingArgument,
         argument_index: 0,
-        argument: OsString::new(),
+        argument: option.map_or_else(OsString::new, OsString::from),
     }
 }
 
@@ -361,5 +361,6 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, UsageErrorKind::MissingArgument);
         assert_eq!(errors[0].argument_index, 0);
+        assert_eq!(errors[0].argument, "--name");
     }
 }
