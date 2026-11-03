@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1105 (2026-11-03): allow bitwise path-pair tails in top-level functions
+
+- **Decision — review required:** Extend supported public top-level function tails to accept one direct `&`, `|`, or `^` whose two immediate operands are plain one-segment local paths resolving by `BindingId` to parameters or preceding accepted locals.
+- **Reason:** Spec/06 §6.8.5 defines bitwise operations, and the existing primitive body checker already handles all integer types, `Byte`, operator diagnostics for `Bool` and floats, Char trait diagnostics, right-operand mismatches, recovery, and expression facts. A dedicated tail gate reuses those checks without broadening the accepted expression grammar.
+- **Boundary and judgment:** Enable the path-pair gate only for top-level functions and require both paths to refer to preceding bindings. Matching pairs of all ten integer types and `Byte` are accepted; `Bool`, `F32`, `F64`, and `Char` retain their existing unsupported-operator diagnostics. Literals, unresolved literal-derived paths, nonlocal paths, nested/computed operands, fields, qualified paths, shifts, logical operators, and unsupported owners remain gated. The existing inherent-method binary-tail and local-initializer behavior is unchanged. This is type checking only and adds no bitwise semantics, lowering, or runtime execution.
+- **Review required:** Challenge that only the three direct path-pair operators are enabled for top-level functions; cover all eleven supported operand types, preceding and shadowed bindings, exact mismatch and independent return spans, all existing noninteger diagnostics, primitive/canonical facts, and representative rejected shapes. Confirm shifts and method tails are unchanged.
+- **Verification:** The positive acceptance test first failed with `FEATURE_NOT_IMPLEMENTED` before the gate was added. The focused CLI acceptance, diagnostics, and rejected-shape tests passed, including direct `<<`/`>>` tails remaining gated and mismatched `Bool`/`F32`/`F64` pairs retaining both operand and unsupported-operator diagnostics with exact spans. The driver primitive/canonical fact test, existing inherent-method binary-tail regression, all 473 `check_empty_source` integration tests, `cargo test --workspace --locked --quiet`, formatting checks, and diff checks passed.
+- **Hostile review:** The first read-only pass found no actionable findings. A second pass identified missing shift-tail rejection and non-integer right-operand mismatch cases; both were added. The final review confirmed those regressions and found no remaining actionable issue.
+
 ### IR-1104 (2026-11-03): allow wrapping integer path-pair tails in top-level functions
 
 - **Decision — review required:** Extend supported public top-level function tails to accept one direct `+%`, `-%`, or `*%` whose two immediate operands are plain one-segment local paths resolving by `BindingId` to parameters or preceding accepted locals.
