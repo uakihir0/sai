@@ -8783,6 +8783,100 @@ fn top_level_function_subtract_multiply_divide_tails_report_operand_and_return_m
 }
 
 #[test]
+fn top_level_function_remainder_tails_accept_integer_paths() {
+    let mut functions = Vec::new();
+    for (name, ty) in [
+        ("i8", "I8"),
+        ("i16", "I16"),
+        ("i32", "I32"),
+        ("i64", "I64"),
+        ("isize", "ISize"),
+        ("u8", "U8"),
+        ("u16", "U16"),
+        ("u32", "U32"),
+        ("u64", "U64"),
+        ("usize", "USize"),
+    ] {
+        functions.push(format!(
+            "pub fn remainder_{name}(left: {ty}, right: {ty}) -> {ty} {{ left % right }}"
+        ));
+    }
+    functions.push(
+        concat!(
+            "pub fn remainder_preceding_local(left: I32, right: I32) -> I32 {\n",
+            "    let copy: I32 = left\n",
+            "    copy % right\n",
+            "}\n",
+        )
+        .to_owned(),
+    );
+    let source = functions.join("\n");
+
+    assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn top_level_function_remainder_tails_report_operand_and_return_mismatches() {
+    let source = "pub fn mismatch(left: I32, right: U32) -> Bool { left % right }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let right_start = source.find("right }").expect("right operand exists");
+    let expression_start = source.find("left % right").expect("remainder tail exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the operand and independently known result both need diagnostics:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "supported remainder-tail errors remain semantic diagnostics:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `U32`",
+        right_start,
+        right_start + "right".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        expression_start,
+        expression_start + "left % right".len(),
+    );
+}
+
+#[test]
+fn top_level_function_float_remainder_tail_reports_operator_error() {
+    for ty in ["F32", "F64"] {
+        let source =
+            format!("pub fn float_remainder(left: {ty}, right: {ty}) -> {ty} {{ left % right }}\n");
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression_start = source.find("left % right").expect("remainder tail exists");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "float remainder tails reach the existing operator diagnostic:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `%` is not defined for `{ty}`"),
+            expression_start,
+            expression_start + "left % right".len(),
+        );
+    }
+}
+
+#[test]
 fn top_level_function_addition_tails_accept_one_direct_numeric_literal() {
     let mut functions = Vec::new();
     for (name, ty) in [
@@ -8927,7 +9021,6 @@ fn top_level_function_addition_literal_reports_family_and_range_errors() {
 #[test]
 fn unsupported_top_level_arithmetic_and_bitwise_tail_shapes_remain_gated() {
     for source in [
-        "pub fn remainder(left: I32, right: I32) -> I32 { left % right }\n",
         "pub fn subtract_literal(left: I32) -> I32 { left - 1 }\n",
         "pub fn bitand(left: U8, right: U8) -> U8 { left & right }\n",
         "pub fn bool_literal_right(left: I32) -> I32 { left + true }\n",
@@ -8948,6 +9041,31 @@ fn unsupported_top_level_arithmetic_and_bitwise_tail_shapes_remain_gated() {
             "unsupported top-level arithmetic or bitwise binary tail",
         );
     }
+    for source in [
+        "pub fn remainder_right_literal(left: I32) -> I32 { left % 1 }\n",
+        "pub fn remainder_left_literal(right: I32) -> I32 { 1 % right }\n",
+        "pub fn remainder_literal_pair() -> I32 { 1 % 2 }\n",
+        "pub fn remainder_bool(left: Bool, right: Bool) -> Bool { left % right }\n",
+        "pub fn remainder_byte(left: Byte, right: Byte) -> Byte { left % right }\n",
+        "pub fn remainder_char(left: Char, right: Char) -> Char { left % right }\n",
+        "pub fn remainder_computed_left(left: I32, right: I32) -> I32 { (left + 1) % right }\n",
+        "pub fn remainder_computed_right(left: I32, right: I32) -> I32 { left % (right + 1) }\n",
+        "pub fn remainder_unresolved_numeric(left: I32) -> I32 { let one = 1\nleft % one }\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(
+            &run_check(source, "", &[], &[]),
+            "unsupported top-level remainder tail shape",
+        );
+    }
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(
+            "const One: I32 = 1\npub fn remainder_module_constant(left: I32) -> I32 { left % One }\n",
+            "",
+            &[],
+            &[],
+        ),
+        "nonlocal remainder operand",
+    );
     for operator in ["-", "*", "/"] {
         for source in [
             format!("pub fn literal_right(left: I32, right: I32) -> I32 {{ left {operator} 1 }}\n"),
