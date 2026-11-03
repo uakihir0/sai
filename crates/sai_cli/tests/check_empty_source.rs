@@ -9193,7 +9193,6 @@ fn top_level_function_addition_literal_reports_family_and_range_errors() {
 fn unsupported_top_level_arithmetic_and_bitwise_tail_shapes_remain_gated() {
     for source in [
         "pub fn subtract_literal(left: I32) -> I32 { left - 1 }\n",
-        "pub fn bitand(left: U8, right: U8) -> U8 { left & right }\n",
         "pub fn bool_literal_right(left: I32) -> I32 { left + true }\n",
         "pub fn bool_literal_left(right: I32) -> I32 { true + right }\n",
         "pub fn two_literals() -> I32 { 1 + 2 }\n",
@@ -9254,6 +9253,49 @@ fn unsupported_top_level_arithmetic_and_bitwise_tail_shapes_remain_gated() {
                 "unsupported subtraction, multiplication, or division tail shape",
             );
         }
+    }
+    for source in [
+        "pub fn bitwise_literal_right(left: I32) -> I32 { left & 1 }\n",
+        "pub fn bitwise_literal_left(right: I32) -> I32 { 1 | right }\n",
+        "pub fn bitwise_literal_pair() -> I32 { 1 ^ 2 }\n",
+        "pub fn bitwise_computed_left(left: I32, right: I32) -> I32 { (left + 1) & right }\n",
+        "pub fn bitwise_computed_right(left: I32, right: I32) -> I32 { left | (right + 1) }\n",
+        concat!(
+            "pub fn bitwise_unresolved_numeric_path(left: I32) -> I32 {\n",
+            "    let mask = 1\n",
+            "    left ^ mask\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn bitwise_forward_path(left: I32) -> I32 {\n",
+            "    let value = left & later\n",
+            "    let later = left\n",
+            "    value\n",
+            "}\n",
+        ),
+    ] {
+        assert_check_stays_gated_without_syntax_errors(
+            &run_check(source, "", &[], &[]),
+            "unsupported top-level bitwise path-pair tail shape",
+        );
+    }
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(
+            "const Mask: I32 = 1\npub fn bitwise_module_constant(left: I32) -> I32 { left & Mask }\n",
+            "",
+            &[],
+            &[],
+        ),
+        "nonlocal bitwise operand",
+    );
+    for source in [
+        "pub fn left_shift_tail(left: I32, amount: U32) -> I32 { left << amount }\n",
+        "pub fn right_shift_tail(left: I32, amount: U32) -> I32 { left >> amount }\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(
+            &run_check(source, "", &[], &[]),
+            "unsupported top-level shift tail shape",
+        );
     }
 }
 
@@ -17259,6 +17301,239 @@ fn primitive_bitwise_path_pairs_accept_matching_integer_and_byte_types() {
         ),
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn top_level_function_bitwise_path_tails_accept_integer_and_byte_types() {
+    let integer_types = [
+        "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
+    ];
+    for primitive in integer_types.into_iter().chain(["Byte"]) {
+        let mut source = String::new();
+        for (operator, name) in [("&", "and"), ("|", "or"), ("^", "xor")] {
+            source.push_str(&format!(
+                "pub fn bitwise_{}_{name}(left: {primitive}, right: {primitive}) -> {primitive} {{ left {operator} right }}\n",
+                primitive.to_ascii_lowercase(),
+            ));
+        }
+        assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+    }
+
+    for source in [
+        concat!(
+            "pub fn bitwise_preceding_locals(left: I32, right: I32) -> I32 {\n",
+            "    let first = left\n",
+            "    let second = right\n",
+            "    first ^ second\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn bitwise_shadow(left: U32, right: I32) -> I32 {\n",
+            "    let left: I32 = right\n",
+            "    left | right\n",
+            "}\n",
+        ),
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn top_level_function_bitwise_path_tails_reuse_operator_diagnostics() {
+    let mut source = String::new();
+    let mut operator_diagnostics = Vec::new();
+    for (primitive, left, right) in [
+        ("Bool", "flag", "other_flag"),
+        ("F32", "left32", "right32"),
+        ("F64", "left64", "right64"),
+        ("Char", "letter", "other_letter"),
+    ] {
+        for (operator, name, trait_name) in [
+            ("&", "and", "BitAnd"),
+            ("|", "or", "BitOr"),
+            ("^", "xor", "BitXor"),
+        ] {
+            let function = format!(
+                "pub fn unsupported_{name}_{}({left}: {primitive}, {right}: {primitive}) -> {primitive} {{ {left} {operator} {right} }}\n",
+                primitive.to_ascii_lowercase(),
+            );
+            let expression = format!("{left} {operator} {right}");
+            let start = source.len()
+                + function
+                    .find(&expression)
+                    .expect("direct bitwise tail exists");
+            let end = start + expression.len();
+            let message = if primitive == "Char" {
+                format!(
+                    "operator `{operator}` has no `{trait_name}<Char>` implementation for `Char`"
+                )
+            } else {
+                format!("operator `{operator}` is not defined for `{primitive}`")
+            };
+            operator_diagnostics.push((message, start, end));
+            source.push_str(&function);
+        }
+    }
+
+    let output = run_check(&source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        operator_diagnostics.len(),
+        "each non-integer primitive bitwise path pair should keep its operator diagnostic:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "matching Bool, float, and Char path pairs should recover through ordinary operator diagnostics:\n{stdout}"
+    );
+    for (message, start, end) in operator_diagnostics {
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &message,
+            start,
+            end,
+        );
+    }
+
+    let mismatch_cases = [
+        ("integer", "I32", "U8", "&"),
+        ("byte", "Byte", "I32", "|"),
+        ("unsigned", "U32", "I32", "^"),
+    ];
+    let mut mismatch_source = String::new();
+    let mut mismatch_spans = Vec::new();
+    for (name, left_type, right_type, operator) in mismatch_cases {
+        let function = format!(
+            "pub fn {name}_path_mismatch(left: {left_type}, right: {right_type}) -> {left_type} {{ left {operator} right }}\n"
+        );
+        let expression = format!("left {operator} right");
+        let start = mismatch_source.len()
+            + function
+                .find(&expression)
+                .expect("mismatch bitwise tail exists");
+        let right = start + format!("left {operator} ").len();
+        mismatch_spans.push((
+            format!("expected `{left_type}`, found `{right_type}`"),
+            right,
+            right + "right".len(),
+        ));
+        mismatch_source.push_str(&function);
+    }
+    let return_mismatch =
+        "pub fn independent_return_mismatch(left: I32, right: U8) -> Bool { left ^ right }\n";
+    let return_expression = "left ^ right";
+    let return_start = mismatch_source.len()
+        + return_mismatch
+            .find(return_expression)
+            .expect("return mismatch bitwise tail exists");
+    let return_right = return_start + "left ^ ".len();
+    mismatch_spans.push((
+        "expected `I32`, found `U8`".to_owned(),
+        return_right,
+        return_right + "right".len(),
+    ));
+    mismatch_spans.push((
+        "expected `Bool`, found `I32`".to_owned(),
+        return_start,
+        return_start + return_expression.len(),
+    ));
+    mismatch_source.push_str(return_mismatch);
+
+    let mismatch_output = run_check(&mismatch_source, "", &[], &[]);
+    let mismatch_stdout = String::from_utf8(mismatch_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(mismatch_output.status.code(), Some(1), "{mismatch_stdout}");
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        mismatch_spans.len(),
+        "path mismatches should recover to the left type and retain an independent return error:\n{mismatch_stdout}"
+    );
+    assert!(
+        !mismatch_stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !mismatch_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !mismatch_stdout.contains("\"type\":\"result\""),
+        "integer and Byte mismatches should use the existing recovery contract:\n{mismatch_stdout}"
+    );
+    for (message, start, end) in mismatch_spans {
+        assert_json_diagnostic_primary_span(
+            &mismatch_stdout,
+            "TYPE_MISMATCH",
+            &message,
+            start,
+            end,
+        );
+    }
+
+    let incompatible_cases = [
+        ("bool", "Bool", "I32", "&"),
+        ("f32", "F32", "F64", "|"),
+        ("f64", "F64", "I32", "^"),
+    ];
+    let incompatible_count = incompatible_cases.len();
+    let mut incompatible_source = String::new();
+    let mut incompatible_spans = Vec::new();
+    for (name, left_type, right_type, operator) in incompatible_cases {
+        let function = format!(
+            "pub fn {name}_path_mismatch(left: {left_type}, right: {right_type}) -> {left_type} {{ left {operator} right }}\n"
+        );
+        let expression = format!("left {operator} right");
+        let start = incompatible_source.len()
+            + function
+                .find(&expression)
+                .expect("incompatible bitwise tail exists");
+        let right = start + format!("left {operator} ").len();
+        incompatible_spans.push((
+            "TYPE_MISMATCH",
+            format!("expected `{left_type}`, found `{right_type}`"),
+            right,
+            right + "right".len(),
+        ));
+        incompatible_spans.push((
+            "OPERATOR_NOT_SUPPORTED",
+            format!("operator `{operator}` is not defined for `{left_type}`"),
+            start,
+            start + expression.len(),
+        ));
+        incompatible_source.push_str(&function);
+    }
+
+    let incompatible_output = run_check(&incompatible_source, "", &[], &[]);
+    let incompatible_stdout =
+        String::from_utf8(incompatible_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        incompatible_output.status.code(),
+        Some(1),
+        "{incompatible_stdout}"
+    );
+    assert_eq!(
+        incompatible_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        incompatible_count,
+        "mismatched non-integer right paths should keep their operand diagnostics:\n{incompatible_stdout}"
+    );
+    assert_eq!(
+        incompatible_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        incompatible_count,
+        "unsupported Bool and floating-point left paths should keep their operator diagnostics:\n{incompatible_stdout}"
+    );
+    assert!(
+        !incompatible_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !incompatible_stdout.contains("\"type\":\"result\""),
+        "mismatched non-integer operands should recover through the existing bitwise diagnostics:\n{incompatible_stdout}"
+    );
+    for (code, message, start, end) in incompatible_spans {
+        assert_json_diagnostic_primary_span(&incompatible_stdout, code, &message, start, end);
     }
 }
 
