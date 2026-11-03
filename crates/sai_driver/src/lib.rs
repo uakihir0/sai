@@ -7418,7 +7418,7 @@ pub enum ConstValue {
     /// A direct floating-point literal rounded to its resolved primitive width.
     Float { bits: u64, ty: sai_ty::ty::FloatTy },
     /// A Bool direct literal or a literal-only expression tree composed of
-    /// `not`, `and`, and `or`.
+    /// `not`, `and`, `or`, and comparisons between direct Bool literals.
     Bool(bool),
     /// A direct character literal.
     Char(char),
@@ -7439,9 +7439,9 @@ pub enum ConstValue {
 /// This deliberately covers only direct literals of supported primitive
 /// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
 /// fields are supported direct scalar or unit literals or Bool literal-only
-/// `not`/`and`/`or` expressions, and top-level Bool expressions with those same
-/// literal-only operators. It does not imply that other constant expressions
-/// are evaluated.
+/// `not`/`and`/`or` expressions and comparisons between direct Bool literals.
+/// Top-level Bool expressions use those same forms. It does not imply that
+/// other constant expressions are evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -7664,7 +7664,19 @@ fn check_const_bool_expression_initializer(
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let is_supported_bool_expression = matches!(
         value.kind,
-        ExprKind::Unary(UnOp::Not, _) | ExprKind::Binary(BinOp::And | BinOp::Or, _, _)
+        ExprKind::Unary(UnOp::Not, _)
+            | ExprKind::Binary(
+                BinOp::And
+                    | BinOp::Or
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge,
+                _,
+                _
+            )
     ) && is_const_bool_literal_expression(value);
     if !is_supported_bool_expression {
         return Ok(None);
@@ -7700,6 +7712,16 @@ fn is_const_bool_literal_expression(value: &HirExpr<'_>) -> bool {
             ExprKind::Lit(Lit::Bool(_)) => {}
             ExprKind::Unary(UnOp::Not, operand) => pending.push(operand),
             ExprKind::Binary(BinOp::And | BinOp::Or, left, right) => {
+                pending.push(right);
+                pending.push(left);
+            }
+            ExprKind::Binary(
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+                left,
+                right,
+            ) if matches!(left.kind, ExprKind::Lit(Lit::Bool(_)))
+                && matches!(right.kind, ExprKind::Lit(Lit::Bool(_))) =>
+            {
                 pending.push(right);
                 pending.push(left);
             }
@@ -7829,6 +7851,15 @@ fn evaluate_const_bool_literal_expression(value: &HirExpr<'_>) -> Option<bool> {
                     pending.push((right, false));
                     pending.push((left, false));
                 }
+                ExprKind::Binary(
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+                    left,
+                    right,
+                ) => {
+                    pending.push((value, true));
+                    pending.push((right, false));
+                    pending.push((left, false));
+                }
                 _ => return None,
             }
             continue;
@@ -7845,6 +7876,23 @@ fn evaluate_const_bool_literal_expression(value: &HirExpr<'_>) -> Option<bool> {
                 values.push(match operator {
                     BinOp::And => left && right,
                     BinOp::Or => left || right,
+                    _ => return None,
+                });
+            }
+            ExprKind::Binary(
+                operator @ (BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge),
+                _,
+                _,
+            ) => {
+                let right = values.pop()?;
+                let left = values.pop()?;
+                values.push(match operator {
+                    BinOp::Eq => left == right,
+                    BinOp::Ne => left != right,
+                    BinOp::Lt => left < right,
+                    BinOp::Le => left <= right,
+                    BinOp::Gt => left > right,
+                    BinOp::Ge => left >= right,
                     _ => return None,
                 });
             }
@@ -79027,7 +79075,6 @@ property "shared"() {}
             "pub const BITWISE_OR: Bool = true | false\n",
             "pub const NESTED_PATH: Bool = false and (true or AND_TRUE_TRUE)\n",
             "pub const NESTED_NOT_PATH: Bool = not (not AND_TRUE_TRUE)\n",
-            "pub const COMPARISON: Bool = true == false\n",
         )
         .to_owned();
         root.push_str("pub const DEEP_NESTED: Bool = true");
@@ -79159,7 +79206,7 @@ property "shared"() {}
             );
         }
 
-        for index in 15..27 {
+        for index in 15..26 {
             assert_eq!(
                 resolved.owners()[index]
                     .literal_check()
@@ -79175,19 +79222,153 @@ property "shared"() {}
             );
         }
         assert!(
-            resolved.owners()[27]
+            resolved.owners()[26]
                 .literal_check()
                 .expect("deep Bool literal check succeeds")
                 .requires_const_value(),
             "deep Bool const requires an evaluator value"
         );
         assert_eq!(
-            resolved.owners()[27]
+            resolved.owners()[26]
                 .const_value()
                 .expect("deep Bool evaluation succeeds"),
             Some(ConstValue::Bool(true)),
             "deep left-associated Bool chains evaluate without recursive traversal"
         );
+    }
+
+    #[test]
+    fn const_bool_direct_literal_comparisons_produce_bool_values() {
+        let comparisons = [
+            (BinOp::Eq, "==", [true, false, false, true]),
+            (BinOp::Ne, "!=", [false, true, true, false]),
+            (BinOp::Lt, "<", [false, true, false, false]),
+            (BinOp::Le, "<=", [true, true, false, true]),
+            (BinOp::Gt, ">", [false, false, true, false]),
+            (BinOp::Ge, ">=", [true, false, true, true]),
+        ];
+        let operands = [(false, false), (false, true), (true, false), (true, true)];
+        let mut root = String::new();
+        let mut expected_values = Vec::new();
+        for (operator, spelling, results) in comparisons {
+            for ((left, right), expected) in operands.into_iter().zip(results) {
+                let case = expected_values.len();
+                root.push_str(&format!(
+                    "pub const CASE_{case}: Bool = {left} {spelling} {right}\n"
+                ));
+                expected_values.push((operator, left, right, expected));
+            }
+        }
+        root.push_str(concat!(
+            "pub const NESTED: Bool = not (true == false) and (false <= true)\n",
+            "pub const MISMATCH: I32 = true == false\n",
+            "pub const READY: Bool = true\n",
+            "pub const PATH_OPERAND: Bool = READY == false\n",
+            "pub const NON_BOOL_OPERAND: Bool = true == 0\n",
+            "pub const COMPUTED_LEFT_OPERAND: Bool = (true and true) == true\n",
+            "pub const COMPUTED_RIGHT_OPERAND: Bool = true == (false and true)\n",
+            "pub const NESTED_COMPARISON_OPERAND: Bool = true == (false == false)\n",
+            "pub const SHORT_CIRCUIT_PATH: Bool = false and (READY == false)\n",
+        ));
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        for (index, (operator, left, right, expected)) in expected_values.into_iter().enumerate() {
+            assert_eq!(
+                expected,
+                match operator {
+                    BinOp::Eq => left == right,
+                    BinOp::Ne => left != right,
+                    BinOp::Lt => left < right,
+                    BinOp::Le => left <= right,
+                    BinOp::Gt => left > right,
+                    BinOp::Ge => left >= right,
+                    _ => unreachable!("the table contains only Bool comparison operators"),
+                },
+                "Bool comparison truth table is correct at owner {index}"
+            );
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("Bool comparison literal check succeeds");
+            assert!(
+                check.is_valid_bool(),
+                "comparison owner {index} is a valid Bool"
+            );
+            assert!(
+                check.requires_const_value(),
+                "comparison owner {index} requires an evaluator value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("comparison evaluation succeeds"),
+                Some(ConstValue::Bool(expected)),
+                "comparison owner {index} evaluates with Bool ordering"
+            );
+        }
+
+        let nested = resolved.owners()[24]
+            .const_value()
+            .expect("nested comparison evaluation succeeds");
+        assert_eq!(nested, Some(ConstValue::Bool(true)));
+
+        let mismatch = resolved.owners()[25]
+            .literal_check()
+            .expect("Bool comparison against I32 remains a checked mismatch");
+        let ConstLiteralCheck::Supported {
+            primitive: sai_resolve::prelude::PrimTy::I32,
+            diagnostics,
+        } = mismatch
+        else {
+            panic!("Bool comparison against I32 should remain in the checked subset");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        let primary = diagnostics[0]
+            .primary()
+            .expect("comparison mismatch points at the complete initializer");
+        let declaration = "pub const MISMATCH: I32 = ";
+        let initializer = "true == false";
+        let initializer_start =
+            root.find(declaration).expect("mismatch declaration exists") + declaration.len();
+        assert_eq!(primary.span.range.start().to_usize(), initializer_start);
+        assert_eq!(
+            primary.span.range.end().to_usize(),
+            initializer_start + initializer.len()
+        );
+        assert_eq!(
+            resolved.owners()[25]
+                .const_value()
+                .expect("mismatched comparison does not evaluate"),
+            None
+        );
+
+        for index in 27..33 {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("unsupported comparison remains resolvable"),
+                &ConstLiteralCheck::Unsupported,
+                "paths, non-Bool operands, computed operands, nested comparisons, and short-circuit paths remain gated at owner {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported comparison does not evaluate"),
+                None
+            );
+        }
     }
 
     #[test]
@@ -80147,6 +80328,7 @@ property "shared"() {}
             "pub const READY: Bool = true\n",
             "pub const LOGICAL_PATH_FIELD: (Bool,) = (false and READY,)\n",
             "pub const LOGICAL_COMPARISON_FIELD: (Bool,) = (true == false,)\n",
+            "pub const LOGICAL_COMPARISON_FIELD_MISMATCH: (I32,) = (true == false,)\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -80171,7 +80353,7 @@ property "shared"() {}
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(checks.len(), 21);
+        assert_eq!(checks.len(), 22);
         let assert_primary_literal_span =
             |diagnostic: &Diagnostic, declaration: &str, literal: &str| {
                 let declaration_start = root
@@ -80343,13 +80525,33 @@ property "shared"() {}
         assert_eq!(
             resolved.owners()[20]
                 .literal_check()
-                .expect("comparison in a Bool field remains outside the supported grammar"),
-            &ConstLiteralCheck::Unsupported
+                .expect("comparison of Bool literals is a supported Bool field")
+                .requires_const_value(),
+            true
         );
         assert_eq!(
             resolved.owners()[20]
                 .const_value()
-                .expect("unsupported comparison field does not evaluate"),
+                .expect("Bool comparison field evaluates"),
+            Some(ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([ConstValue::Bool(false)]),
+            })
+        );
+        let ConstLiteralCheck::SupportedTuple { diagnostics } = &checks[21] else {
+            panic!("Bool comparison in an I32 field remains a checked mismatch");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_primary_literal_span(
+            &diagnostics[0],
+            "pub const LOGICAL_COMPARISON_FIELD_MISMATCH:",
+            "true == false",
+        );
+        assert_eq!(
+            resolved.owners()[21]
+                .const_value()
+                .expect("Bool comparison in a mismatched tuple field has no value"),
             None
         );
         for index in [3, 4, 5, 6, 7, 15] {

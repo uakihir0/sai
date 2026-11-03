@@ -16841,6 +16841,13 @@ fn public_bool_logical_literal_consts_emit_check_results() {
         "pub const CHAINED: Bool = true and false and true\n",
         "pub const NESTED_NOT: Bool = not (false or false)\n",
         "pub const MIXED_NESTED: Bool = not (true and (false or true))\n",
+        "pub const EQ_TRUE: Bool = true == true\n",
+        "pub const NE_TRUE: Bool = true != false\n",
+        "pub const LT_TRUE: Bool = false < true\n",
+        "pub const LE_FALSE: Bool = true <= false\n",
+        "pub const GT_TRUE: Bool = true > false\n",
+        "pub const GE_FALSE: Bool = false >= true\n",
+        "pub const NESTED_COMPARISON: Bool = not (true == false) and (false <= true)\n",
     );
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
@@ -17101,6 +17108,7 @@ fn public_flat_tuple_const_literals_emit_check_results() {
         "pub const SINGLE: (U8,) = (255,)\n",
         "pub const MIXED: (F32, Str, ()) = (1.25, \"text\", ())\n",
         "pub const LOGICAL_FIELDS: (Bool, Bool, Bool) = (true and false, not (false or false), true and (false or true))\n",
+        "pub const COMPARISON_FIELDS: (Bool, Bool, Bool) = (true == false, false < true, not (true > false))\n",
     );
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
@@ -17114,6 +17122,10 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
         ),
         (
             "pub const LOGICAL_FIELD_MISMATCH: (I32,) = (true and false,)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const LOGICAL_COMPARISON_FIELD_MISMATCH: (I32,) = (true == false,)\n",
             "TYPE_MISMATCH",
         ),
         (
@@ -17167,7 +17179,9 @@ fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
         "pub const EXPRESSION_FIELD: (I32,) = (1 + 2,)\n",
         "pub const READY: Bool = true\npub const LOGICAL_PATH_FIELD: (Bool,) = (false and READY,)\n",
-        "pub const LOGICAL_COMPARISON_FIELD: (Bool,) = (true == false,)\n",
+        "pub const LOGICAL_PATH_COMPARISON_FIELD: (Bool,) = (READY == false,)\n",
+        "pub const LOGICAL_NON_BOOL_COMPARISON_FIELD: (Bool,) = (true == 1,)\n",
+        "pub const LOGICAL_COMPUTED_COMPARISON_FIELD: (Bool,) = ((true and true) == true,)\n",
         "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
         "pub const SCALAR_TUPLE_MISMATCH: I32 = (1,)\n",
         "pub type Number = I32\npub const ALIAS_FIELD: (Number,) = (1,)\n",
@@ -17343,7 +17357,9 @@ fn const_forms_outside_literal_slice_remain_gated() {
         "pub const NESTED_LOGICAL_PATH: Bool = false and (true or READY)\n",
         "pub const NESTED_NOT_PATH: Bool = not (not READY)\n",
         "pub const LOGICAL_NON_BOOL: Bool = true and 1\n",
-        "pub const BOOL_COMPARISON: Bool = true == false\n",
+        "pub const BOOL_PATH_COMPARISON: Bool = READY == false\n",
+        "pub const BOOL_NON_BOOL_COMPARISON: Bool = true == 0\n",
+        "pub const BOOL_COMPUTED_COMPARISON: Bool = (true and true) == true\n",
         "pub const READY: Bool = true\npub const SHORT_CIRCUIT_AND_PATH: Bool = false and READY\n",
         "pub const READY: Bool = false\npub const SHORT_CIRCUIT_OR_PATH: Bool = true or READY\n",
         "pub const SHORT_CIRCUIT_AND_NON_BOOL: Bool = false and 1\n",
