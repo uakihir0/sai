@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1121 (2026-11-03): byte strings in flat array constants
+
+- **Decision — review required:** Extend flat array constant evaluation to allow direct byte-string literal elements when `Array`'s element type is the exact canonical prelude `Slice<Byte>` type. Store the array as `ConstValue::Array { element_type: ConstValueType::ByteStr, elements }` in source order.
+- **Reason:** IR-1119 and IR-1120 already produce and validate `ConstValue::ByteStr`. The flat array checker already carries its resolved element type into evaluation and preserves element diagnostics, so adding one element-type case supports both populated and empty arrays without changing the evaluator shape.
+- **Boundary and judgment:** Restrict this increment to top-level flat arrays with the exact canonical `Slice<Byte>` element type. This additive public `ConstValueType` case keeps empty byte-string arrays self-describing. User aliases, other slice element types, nested arrays, arrays in tuple fields, and nonliteral elements remain gated. Preserve decoded bytes and source order; keep array-length and element diagnostics, and produce no value when either is present.
+- **Review required:** Verify exact canonical type recognition, empty-array type metadata, byte preservation and source order, mismatch/length diagnostic ordering and value suppression, and all listed shape gates. Review the additive public element-type variant.
+- **Verification:** The focused driver test `const_byte_strings_are_supported_only_as_flat_array_elements` passes. The complete driver suite passes (828 tests), the complete CLI integration suite passes (494 tests), and `cargo test --workspace --locked --offline` passes. `cargo fmt --all -- --check` and `git diff --check` pass.
+- **Hostile review:** A read-only adversarial review checked canonical `Slice<Byte>` recognition, empty-array type metadata, exact decoded-byte preservation and order, mismatch/length diagnostics and value suppression, and all listed unsupported forms. It found no actionable issues.
+
 ### IR-1120 (2026-11-03): byte strings in flat tuple constants
 
 - **Decision — review required:** Allow direct byte-string literals as fields in flat tuple constants when the field type is the exact canonical prelude `Slice<Byte>` path. Store each value as `ConstValue::ByteStr(Arc<[u8]>)` in its source-order aggregate position.
