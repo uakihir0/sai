@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1117 (2026-11-03): evaluate direct Bool-literal comparisons
+
+- **Decision — review required:** Extend top-level Bool constants and Bool fields in flat tuple constants to evaluate `==`, `!=`, `<`, `<=`, `>`, and `>=` when both immediate operands are direct Bool literals. Bool ordering follows the built-in order `false < true`.
+- **Reason:** Spec/06 §§6.8.7 and 6.27 permit these pure Bool comparisons in constant expressions. Restricting each comparison to two direct Bool literals composes the existing literal-only checker and evaluator without introducing type inference, const references, or general expression evaluation.
+- **Boundary and judgment:** Validate the complete expression tree before evaluation, including operands beneath logical short-circuit forms. Keep paths, non-Bool operands, computed comparison operands, and nested comparisons in comparison operands gated. A valid Bool comparison assigned to another supported constant type reports `TYPE_MISMATCH` over the complete initializer and produces no value; unsupported comparison operand shapes remain gated rather than receiving general type diagnostics. Flat tuple Bool fields share this same grammar and evaluator. This is an inferred Stage 0 order because §3.7.15 has no numbered post-IR-1107 evaluator items.
+- **Review required:** Check all six operators over every Bool input pair, `false < true`, nested logical/comparison evaluation and operand pairing, full-tree gates under short-circuit forms, mismatch spans and valueless results, tuple-field reuse, and current-state documentation against the deliberately narrower historical IR-1115/IR-1116 boundaries.
+- **Verification:** The focused driver tests cover the 24 comparison truth-table cases, nested expressions, mismatch diagnostics, and unsupported operand shapes. Focused CLI cases cover top-level and tuple success, mismatch, and gates; the complete CLI integration suite passes (482 tests). The full workspace suite passes, including 824 driver tests (two existing ignored tests). `cargo fmt --all -- --check` and `git diff --check` pass.
+- **Hostile review:** A read-only review found no actionable issues. It confirmed the direct-literal boundary, `false < true` evaluation, mismatch/no-value behavior, and that paths, non-Bool operands, computed operands, and nested comparison operands remain gated.
+
 ### IR-1115 (2026-11-03): evaluate nested Bool literal expressions
 
 - **Decision — review required:** Extend the existing Bool constant slice to evaluate any expression tree made only of direct Bool literals, unary `not`, and binary `and`/`or`; require a value for each valid Bool constant accepted by this grammar.
