@@ -7417,8 +7417,8 @@ pub enum ConstValue {
     Uint { value: u128, ty: sai_ty::ty::UintTy },
     /// A direct floating-point literal rounded to its resolved primitive width.
     Float { bits: u64, ty: sai_ty::ty::FloatTy },
-    /// A Bool direct literal, exact `not` of one, or one logical `and`/`or`
-    /// with two direct Bool literal operands.
+    /// A Bool direct literal or a literal-only expression tree composed of
+    /// `not`, `and`, and `or`.
     Bool(bool),
     /// A direct character literal.
     Char(char),
@@ -7438,9 +7438,10 @@ pub enum ConstValue {
 ///
 /// This deliberately covers only direct literals of supported primitive
 /// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
-/// fields are supported direct scalar or unit literals, exact `not` of a Bool
-/// literal, and one logical `and`/`or` whose immediate operands are direct Bool
-/// literals. It does not imply that other constant expressions are evaluated.
+/// fields are supported direct scalar or unit literals or Bool literal-only
+/// `not`/`and`/`or` expressions, and top-level Bool expressions with those same
+/// literal-only operators. It does not imply that other constant expressions
+/// are evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -7459,7 +7460,7 @@ pub enum ConstLiteralCheck {
     /// The empty tuple type and direct unit literal, checked without general
     /// type resolution.
     SupportedUnit { diagnostics: Vec<Diagnostic> },
-    /// A flat tuple whose fields each have a supported direct scalar or unit literal.
+    /// A flat tuple whose fields each have a supported literal or unit expression.
     SupportedTuple { diagnostics: Vec<Diagnostic> },
 }
 
@@ -7733,10 +7734,9 @@ fn evaluate_const_value(
             let ExprKind::Tuple(values) = value.kind else {
                 return None;
             };
-            if values
-                .iter()
-                .any(|value| !is_direct_const_literal_or_unit(value))
-                || values.len() != tuple_element_types?.len()
+            if values.iter().any(|value| {
+                !is_direct_const_literal_or_unit(value) && !is_const_bool_literal_expression(value)
+            }) || values.len() != tuple_element_types?.len()
             {
                 return None;
             }
@@ -11248,10 +11248,9 @@ fn check_const_tuple_literal(
         return Ok(Some((diagnostics, expected_types)));
     };
 
-    if values
-        .iter()
-        .any(|value| !is_direct_const_literal_or_unit(value))
-    {
+    if values.iter().any(|value| {
+        !is_direct_const_literal_or_unit(value) && !is_const_bool_literal_expression(value)
+    }) {
         return Ok(None);
     }
     if values.len() != expected_elements.len() {
@@ -11272,19 +11271,33 @@ fn check_const_tuple_literal(
     }
 
     let mut diagnostics = Vec::new();
-    for (expected_ty, value) in expected_elements.iter().zip(values) {
-        let Some(mut field_diagnostics) = check_const_literal_leaf(
-            owner,
-            *expected_ty,
+    for ((expected_ty, literal_type), value) in
+        expected_elements.iter().zip(&expected_types).zip(values)
+    {
+        let mut field_diagnostics = match check_const_bool_expression_initializer(
+            owner.id,
+            *literal_type,
             value,
-            type_paths,
-            symbols,
             inputs,
             snapshot,
-            target_cfg,
-        )?
-        else {
-            return Ok(None);
+        )? {
+            Some(diagnostics) => diagnostics,
+            None => {
+                let Some(diagnostics) = check_const_literal_leaf(
+                    owner,
+                    *expected_ty,
+                    value,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics
+            }
         };
         diagnostics.append(&mut field_diagnostics);
     }
@@ -79014,6 +79027,7 @@ property "shared"() {}
             "pub const BITWISE_OR: Bool = true | false\n",
             "pub const NESTED_PATH: Bool = false and (true or AND_TRUE_TRUE)\n",
             "pub const NESTED_NOT_PATH: Bool = not (not AND_TRUE_TRUE)\n",
+            "pub const COMPARISON: Bool = true == false\n",
         )
         .to_owned();
         root.push_str("pub const DEEP_NESTED: Bool = true");
@@ -79145,7 +79159,7 @@ property "shared"() {}
             );
         }
 
-        for index in 15..26 {
+        for index in 15..27 {
             assert_eq!(
                 resolved.owners()[index]
                     .literal_check()
@@ -79161,14 +79175,14 @@ property "shared"() {}
             );
         }
         assert!(
-            resolved.owners()[26]
+            resolved.owners()[27]
                 .literal_check()
                 .expect("deep Bool literal check succeeds")
                 .requires_const_value(),
             "deep Bool const requires an evaluator value"
         );
         assert_eq!(
-            resolved.owners()[26]
+            resolved.owners()[27]
                 .const_value()
                 .expect("deep Bool evaluation succeeds"),
             Some(ConstValue::Bool(true)),
@@ -80109,7 +80123,7 @@ property "shared"() {}
     }
 
     #[test]
-    fn const_flat_tuple_literal_check_accepts_only_supported_direct_fields() {
+    fn const_flat_tuple_literal_check_accepts_only_supported_fields() {
         let root = concat!(
             "pub const PAIR: (I32, Bool) = (1, true)\n",
             "pub const SINGLE: (U8,) = (255,)\n",
@@ -80128,6 +80142,11 @@ property "shared"() {}
             "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
             "pub const SCALAR_TUPLE_MISMATCH: I32 = (1,)\n",
             "pub const MULTIPLE_FIELD_ERRORS: (I8, Bool) = (128, 1)\n",
+            "pub const LOGICAL_FIELDS: (Bool, Bool, Bool, Bool) = (true and false, false or true, not (true and false), true and (false or false))\n",
+            "pub const LOGICAL_FIELD_MISMATCH: (I32,) = (true and false,)\n",
+            "pub const READY: Bool = true\n",
+            "pub const LOGICAL_PATH_FIELD: (Bool,) = (false and READY,)\n",
+            "pub const LOGICAL_COMPARISON_FIELD: (Bool,) = (true == false,)\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -80152,7 +80171,7 @@ property "shared"() {}
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(checks.len(), 16);
+        assert_eq!(checks.len(), 21);
         let assert_primary_literal_span =
             |diagnostic: &Diagnostic, declaration: &str, literal: &str| {
                 let declaration_start = root
@@ -80270,6 +80289,69 @@ property "shared"() {}
                 _ => unreachable!("the loop covers only supported direct tuples"),
             }
         }
+        assert_eq!(
+            checks[16],
+            &ConstLiteralCheck::SupportedTuple {
+                diagnostics: Vec::new(),
+            },
+            "flat tuples accept literal-only Bool expression fields"
+        );
+        assert!(checks[16].requires_const_value());
+        assert_eq!(
+            resolved.owners()[16]
+                .const_value()
+                .expect("Bool tuple fields evaluate"),
+            Some(ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([
+                    ConstValue::Bool(false),
+                    ConstValue::Bool(true),
+                    ConstValue::Bool(true),
+                    ConstValue::Bool(false),
+                ]),
+            }),
+            "Bool field values retain source order"
+        );
+        let ConstLiteralCheck::SupportedTuple { diagnostics } = &checks[17] else {
+            panic!("logical Bool expression against I32 remains a checked mismatch");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_primary_literal_span(
+            &diagnostics[0],
+            "pub const LOGICAL_FIELD_MISMATCH:",
+            "true and false",
+        );
+        assert_eq!(
+            resolved.owners()[17]
+                .const_value()
+                .expect("Bool field type mismatch has no evaluator value"),
+            None
+        );
+        assert_eq!(
+            resolved.owners()[19]
+                .literal_check()
+                .expect("path in a Bool field remains outside the supported grammar"),
+            &ConstLiteralCheck::Unsupported
+        );
+        assert_eq!(
+            resolved.owners()[19]
+                .const_value()
+                .expect("unsupported Bool field does not evaluate"),
+            None
+        );
+        assert_eq!(
+            resolved.owners()[20]
+                .literal_check()
+                .expect("comparison in a Bool field remains outside the supported grammar"),
+            &ConstLiteralCheck::Unsupported
+        );
+        assert_eq!(
+            resolved.owners()[20]
+                .const_value()
+                .expect("unsupported comparison field does not evaluate"),
+            None
+        );
         for index in [3, 4, 5, 6, 7, 15] {
             assert!(
                 !checks[index].requires_const_value(),

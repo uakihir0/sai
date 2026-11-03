@@ -17100,6 +17100,7 @@ fn public_flat_tuple_const_literals_emit_check_results() {
         "pub const PAIR: (I32, Bool) = (1, true)\n",
         "pub const SINGLE: (U8,) = (255,)\n",
         "pub const MIXED: (F32, Str, ()) = (1.25, \"text\", ())\n",
+        "pub const LOGICAL_FIELDS: (Bool, Bool, Bool) = (true and false, not (false or false), true and (false or true))\n",
     );
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
@@ -17109,6 +17110,10 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
     for (source, expected_code) in [
         (
             "pub const FIELD_MISMATCH: (I32, Bool) = (1, 2)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const LOGICAL_FIELD_MISMATCH: (I32,) = (true and false,)\n",
             "TYPE_MISMATCH",
         ),
         (
@@ -17161,6 +17166,8 @@ fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
         "pub const ARRAY: Array<I32, 1> = [1]\n",
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
         "pub const EXPRESSION_FIELD: (I32,) = (1 + 2,)\n",
+        "pub const READY: Bool = true\npub const LOGICAL_PATH_FIELD: (Bool,) = (false and READY,)\n",
+        "pub const LOGICAL_COMPARISON_FIELD: (Bool,) = (true == false,)\n",
         "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
         "pub const SCALAR_TUPLE_MISMATCH: I32 = (1,)\n",
         "pub type Number = I32\npub const ALIAS_FIELD: (Number,) = (1,)\n",
@@ -17336,6 +17343,7 @@ fn const_forms_outside_literal_slice_remain_gated() {
         "pub const NESTED_LOGICAL_PATH: Bool = false and (true or READY)\n",
         "pub const NESTED_NOT_PATH: Bool = not (not READY)\n",
         "pub const LOGICAL_NON_BOOL: Bool = true and 1\n",
+        "pub const BOOL_COMPARISON: Bool = true == false\n",
         "pub const READY: Bool = true\npub const SHORT_CIRCUIT_AND_PATH: Bool = false and READY\n",
         "pub const READY: Bool = false\npub const SHORT_CIRCUIT_OR_PATH: Bool = true or READY\n",
         "pub const SHORT_CIRCUIT_AND_NON_BOOL: Bool = false and 1\n",
