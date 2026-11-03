@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from coverage import (
     _document_index,
     _leaf_sections,
     _parse_code_exemptions,
+    _parse_lint_codes,
     _parse_panic_kinds,
     _parse_section_exemptions,
     _scan_headings,
@@ -85,6 +87,14 @@ class CoverageTests(unittest.TestCase):
 ### 15.12.3 ICE injection
 ### 15.12.5 CLI
 """
+                elif area == "spec" and number == 15:
+                    body = """# 15. Attributes and lints
+## 15.17 Diagnostic registry
+### 15.17.2 The lints of v0.1
+| Code | Default | Owner | Stage | Summary |
+|---|---|---|---|---|
+| `UNUSED_VARIABLE` | `warn` | this chapter | 0 | unused binding |
+"""
                 else:
                     body = (
                         f"# {number}. Document\n"
@@ -99,6 +109,11 @@ class CoverageTests(unittest.TestCase):
             "EXPECTED_TOKEN FEATURE_NOT_IMPLEMENTED IMPLEMENTATION_LIMIT_EXCEEDED "
             "INTERNAL_COMPILER_ERROR INVALID_ESCAPE REF_ONLY_CODE SIDECAR_ONLY "
             "SIDECAR_SOURCE_EXPECTED SIDECAR_SOURCE_FIXED SOURCE_READ_FAILED\n",
+        )
+        registry = self.root / "crates/sai_diagnostics/src/diagnostic_code_names.txt"
+        registry.write_text(
+            registry.read_text(encoding="utf-8") + "UNUSED_VARIABLE\n",
+            encoding="utf-8",
         )
         self.write("tests/conformance/exempt-sections.txt", "")
         self.write("tests/conformance/exempt-codes.txt", "")
@@ -149,6 +164,50 @@ const C: I32 = 3 //~ error REF_ONLY_CODE
             "tests/conformance/cli/package.t/module.wit/world.sai",
             "const AlsoIgnored: I32 = 4 //~ error INVALID_ESCAPE\n",
         )
+
+    def write_golden(self, relative, *codes):
+        records = [
+            {
+                "type": "header",
+                "format": "sai-diagnostics",
+                "version": 1,
+                "tool": {"name": "sai", "version": "0.1.0"},
+                "command": "check",
+                "root": "src",
+            }
+        ]
+        for code in codes:
+            records.append({
+                "type": "diagnostic",
+                "code": code,
+                "severity": "error",
+                "level": None,
+                "message": "expected diagnostic",
+                "primary": None,
+                "primary_label": "",
+                "labels": [],
+                "children": [],
+                "fixes": [],
+                "related": [],
+                "data": {},
+                "node": None,
+                "symbol": None,
+                "package": None,
+            })
+        records.append({
+            "type": "summary",
+            "errors": len(codes),
+            "warnings": 0,
+            "infos": 0,
+            "shown_errors": len(codes),
+            "suppressed": {"cascade": 0, "duplicate": 0, "dependency": 0},
+            "exit_code": 1 if codes else 0,
+        })
+        content = "".join(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for record in records
+        )
+        return self.write(relative, content)
 
     def test_heading_scan_ignores_fences_and_only_uses_numbered_leaves(self):
         headings = _scan_headings(
@@ -207,6 +266,7 @@ const C: I32 = 3 //~ error REF_ONLY_CODE
                          ["EXPECTED_TOKEN", "FEATURE_NOT_IMPLEMENTED"])
         directory = records["tests/conformance/cli/package.t"]
         self.assertEqual(directory["diagnostic_codes"], ["EXPECTED_TOKEN"])
+        self.assertEqual(directory["diagnostic_json_goldens"], [])
         self.assertNotIn("SIDECAR_ONLY", directory["diagnostic_codes"])
         self.assertNotIn("SIDECAR_SOURCE_EXPECTED", directory["diagnostic_codes"])
         self.assertNotIn("SIDECAR_SOURCE_FIXED", directory["diagnostic_codes"])
@@ -229,6 +289,216 @@ const C: I32 = 3 //~ error REF_ONLY_CODE
             )
         self.assertFalse(report["claim"])
         self.assertFalse(report["stage_gate_enabled"])
+        self.assertNotIn("UNUSED_VARIABLE", report["uncovered"]["hard_code_json_goldens"])
+
+    def test_single_file_json_golden_covers_a_hard_code(self):
+        self.write_golden("tests/conformance/cli/pass.json", "EXPECTED_TOKEN")
+        report = build_report(self.root)
+        entry = next(
+            item for item in report["hard_code_json_goldens"]
+            if item["code"] == "EXPECTED_TOKEN"
+        )
+        self.assertEqual(
+            entry["goldens"], ["tests/conformance/cli/pass.json"]
+        )
+        fixture = next(
+            item for item in report["fixtures"]
+            if item["path"] == "tests/conformance/cli/pass.sai"
+        )
+        self.assertEqual(
+            fixture["diagnostic_json_goldens"],
+            [{
+                "path": "tests/conformance/cli/pass.json",
+                "diagnostic_codes": ["EXPECTED_TOKEN"],
+            }],
+        )
+
+    def test_directory_json_golden_covers_a_hard_code(self):
+        self.write_golden(
+            "tests/conformance/cli/package.t/expected/diagnostics.json",
+            "EXPECTED_TOKEN",
+        )
+        report = build_report(self.root)
+        entry = next(
+            item for item in report["hard_code_json_goldens"]
+            if item["code"] == "EXPECTED_TOKEN"
+        )
+        self.assertEqual(
+            entry["goldens"],
+            ["tests/conformance/cli/package.t/expected/diagnostics.json"],
+        )
+
+    def test_lint_code_in_json_golden_is_excluded_from_hard_code_inventory(self):
+        self.write_golden("tests/conformance/cli/pass.json", "UNUSED_VARIABLE")
+        report = build_report(self.root)
+        self.assertNotIn(
+            "UNUSED_VARIABLE",
+            {item["code"] for item in report["hard_code_json_goldens"]},
+        )
+        self.assertNotIn(
+            "tests/conformance/cli/pass.json",
+            next(
+                item for item in report["hard_code_json_goldens"]
+                if item["code"] == "EXPECTED_TOKEN"
+            )["goldens"],
+        )
+
+    def test_missing_json_goldens_leave_sorted_hard_codes_uncovered(self):
+        report = build_report(self.root)
+        uncovered = report["uncovered"]["hard_code_json_goldens"]
+        self.assertEqual(uncovered, sorted(uncovered))
+        self.assertIn("EXPECTED_TOKEN", uncovered)
+        self.assertNotIn("UNUSED_VARIABLE", uncovered)
+
+    def test_malformed_json_golden_fails_closed(self):
+        self.write(
+            "tests/conformance/cli/pass.json",
+            '{"type":"header","format":"sai-diagnostics"}\n',
+        )
+        with self.assertRaisesRegex(CoverageError, "invalid diagnostic JSON golden"):
+            build_report(self.root)
+
+    def test_unregistered_code_in_json_golden_fails_closed(self):
+        self.write_golden("tests/conformance/cli/pass.json", "UNKNOWN_CODE")
+        with self.assertRaisesRegex(CoverageError, "unregistered diagnostic"):
+            build_report(self.root)
+
+    def test_specialized_single_file_json_golden_is_inventoried(self):
+        self.write_golden(
+            "tests/conformance/cli/pass.wasm32-core.dev.json",
+            "EXPECTED_TOKEN",
+        )
+        report = build_report(self.root)
+        entry = next(
+            item for item in report["hard_code_json_goldens"]
+            if item["code"] == "EXPECTED_TOKEN"
+        )
+        self.assertEqual(
+            entry["goldens"],
+            ["tests/conformance/cli/pass.wasm32-core.dev.json"],
+        )
+
+    def test_unselected_single_file_json_fallback_does_not_count_as_coverage(self):
+        self.write(
+            "tests/conformance/cli/pass.sai",
+            """//@ kind: check-fail
+//@ stage: 1
+//@ targets: wasm32-core
+//@ profiles: dev
+//@ spec: spec/02 §2.1.1
+const A: I32 = 1 //~ error EXPECTED_TOKEN
+""",
+        )
+        self.write_golden("tests/conformance/cli/pass.json", "EXPECTED_TOKEN")
+        self.write_golden(
+            "tests/conformance/cli/pass.wasm32-core.dev.json",
+            "FEATURE_NOT_IMPLEMENTED",
+        )
+        report = build_report(self.root)
+        expected_token = next(
+            item for item in report["hard_code_json_goldens"]
+            if item["code"] == "EXPECTED_TOKEN"
+        )
+        self.assertEqual(expected_token["goldens"], [])
+        self.assertIn("EXPECTED_TOKEN", report["uncovered"]["hard_code_json_goldens"])
+        fixture = next(
+            item for item in report["fixtures"]
+            if item["path"] == "tests/conformance/cli/pass.sai"
+        )
+        self.assertEqual(
+            fixture["diagnostic_json_goldens"],
+            [{
+                "path": "tests/conformance/cli/pass.wasm32-core.dev.json",
+                "diagnostic_codes": ["FEATURE_NOT_IMPLEMENTED"],
+            }],
+        )
+
+    def test_profile_specialization_precedes_target_specialization(self):
+        self.write(
+            "tests/conformance/cli/pass.sai",
+            """//@ kind: check-fail
+//@ stage: 1
+//@ targets: wasm32-core
+//@ profiles: dev
+//@ spec: spec/02 §2.1.1
+const A: I32 = 1 //~ error EXPECTED_TOKEN
+""",
+        )
+        self.write_golden(
+            "tests/conformance/cli/pass.dev.json",
+            "FEATURE_NOT_IMPLEMENTED",
+        )
+        self.write_golden(
+            "tests/conformance/cli/pass.wasm32-core.json",
+            "EXPECTED_TOKEN",
+        )
+        report = build_report(self.root)
+        expected_token = next(
+            item for item in report["hard_code_json_goldens"]
+            if item["code"] == "EXPECTED_TOKEN"
+        )
+        self.assertEqual(expected_token["goldens"], [])
+
+    def test_specialized_directory_json_golden_is_inventoried(self):
+        self.write_golden(
+            "tests/conformance/cli/package.t/expected/diagnostics.wasm32-core.dev.json",
+            "EXPECTED_TOKEN",
+        )
+        report = build_report(self.root)
+        entry = next(
+            item for item in report["hard_code_json_goldens"]
+            if item["code"] == "EXPECTED_TOKEN"
+        )
+        self.assertEqual(
+            entry["goldens"],
+            ["tests/conformance/cli/package.t/expected/diagnostics.wasm32-core.dev.json"],
+        )
+
+    def test_reference_only_json_golden_still_covers_hard_code(self):
+        self.write_golden("tests/conformance/cli/ref-only.json", "REF_ONLY_CODE")
+        report = build_report(self.root)
+        entry = next(
+            item for item in report["hard_code_json_goldens"]
+            if item["code"] == "REF_ONLY_CODE"
+        )
+        self.assertEqual(entry["goldens"], ["tests/conformance/cli/ref-only.json"])
+        fixture = next(
+            item for item in report["fixtures"]
+            if item["path"] == "tests/conformance/cli/ref-only.sai"
+        )
+        self.assertFalse(fixture["portable"])
+
+    def test_lint_inventory_rejects_duplicates_and_unregistered_codes(self):
+        aliases, canonical = _document_index(self.root / "docs")
+        path = aliases["spec/15"]
+        headings = _scan_headings(path.read_text(encoding="utf-8"), "spec/15")
+        path.write_text(
+            """# 15. Attributes and lints
+## 15.17 Diagnostic registry
+### 15.17.2 The lints of v0.1
+| Code | Default |
+|---|---|
+| `UNUSED_VARIABLE` | `warn` |
+| `UNUSED_VARIABLE` | `warn` |
+""",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(CoverageError, "unique lint codes"):
+            _parse_lint_codes(path, headings, {"UNUSED_VARIABLE"})
+
+        path.write_text(
+            """# 15. Attributes and lints
+## 15.17 Diagnostic registry
+### 15.17.2 The lints of v0.1
+| Code | Default |
+|---|---|
+| `UNREGISTERED_LINT` | `warn` |
+""",
+            encoding="utf-8",
+        )
+        headings = _scan_headings(path.read_text(encoding="utf-8"), "spec/15")
+        with self.assertRaisesRegex(CoverageError, "unregistered diagnostic"):
+            _parse_lint_codes(path, headings, {"UNUSED_VARIABLE"})
 
     def test_panic_table_is_read_from_the_normative_section(self):
         aliases, canonical = _document_index(self.root / "docs")
@@ -322,6 +592,7 @@ const C: I32 = 3 //~ error REF_ONLY_CODE
             build_report(self.root)
 
     def test_report_bytes_are_stable_and_sorted(self):
+        self.write_golden("tests/conformance/cli/pass.json", "EXPECTED_TOKEN")
         first = self.root / "target/conformance/coverage.json"
         second = self.root / "target/another/coverage.json"
         write_report(self.root, first)
