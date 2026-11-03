@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1106 (2026-11-03): allow shift path-pair tails in top-level functions
+
+- **Decision — review required:** Extend supported public top-level function tails to accept one direct `<<` or `>>` whose two immediate operands are plain one-segment local paths resolving by `BindingId` to parameters or preceding accepted locals.
+- **Reason:** Spec/06 §6.8.5 requires a `U32` shift count, and the existing primitive body checker already handles integer and `Byte` left operands, count mismatches, unsupported left types, recovery, and expression facts. A separate path-pair tail gate lets the existing checker enforce those rules without admitting literal or computed operands.
+- **Boundary and judgment:** Enable this gate for top-level functions only, while preserving the existing inherent-method shift-tail behavior and local-initializer literal-count support. `I8` through `USize` and `Byte` are accepted on the left when paired with a `U32` path; `Bool`, `F32`, `F64`, and `Char` keep `OPERATOR_NOT_SUPPORTED`. A non-`U32` count reports its mismatch on the right path and recovers to the left type, so a wrong declared return type remains independently diagnosable over the full tail. No shift-width check, lowering, or runtime `ShiftOverflow` behavior is added.
+- **Review required:** Challenge the top-level-only owner gate, path resolution and preceding-binding boundary, both operators and all eleven left types, non-`U32` right-path diagnostics and recovery, unsupported-left diagnostics with valid and invalid counts, independent return mismatch spans, primitive/canonical fact parity, rejected literal, forward, nonlocal, computed, and nested shapes, and unchanged inherent-method behavior.
+- **Verification:** The acceptance test first failed with `FEATURE_NOT_IMPLEMENTED`. Focused positive, diagnostic, mismatch-matrix, rejected-shape, and inherent-method parameter-path regression tests pass; the driver test checks shift operand/result fact types, canonical projections, and mismatch recovery. All 476 `check_empty_source` integration tests, `cargo test --workspace --locked --quiet`, `cargo fmt --all -- --check`, and `git diff --check` pass.
+- **Hostile review:** The first follow-up found a stale claim that inherent-method shifts were gated; the record and gated-shape test were corrected to preserve the existing method behavior. A second pass requested direct inherent-method parameter-path regressions for both shift operators and an IR-1106 summary cross-reference; both were added and passed. The final read-only pass found no actionable issues.
+
 ### IR-1105 (2026-11-03): allow bitwise path-pair tails in top-level functions
 
 - **Decision — review required:** Extend supported public top-level function tails to accept one direct `&`, `|`, or `^` whose two immediate operands are plain one-segment local paths resolving by `BindingId` to parameters or preceding accepted locals.
