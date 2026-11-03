@@ -17296,6 +17296,128 @@ fn bitwise_not_const_diagnostics_and_unsupported_forms_are_preserved() {
 }
 
 #[test]
+fn public_integer_bitwise_const_values_cover_scalar_and_flat_aggregates() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub const I8_AND: I8 = -2 & 3\n",
+        "pub const I16_OR: I16 = -2 | 1\n",
+        "pub const I32_XOR: I32 = -1 ^ 5\n",
+        "pub const I64_AND: I64 = -8 & 3\n",
+        "pub const ISIZE_OR: ISize = -2 | 1\n",
+        "pub const U8_XOR: U8 = 15 ^ 5\n",
+        "pub const U16_AND: U16 = 65535 & 255\n",
+        "pub const U32_OR: U32 = 2147483648 | 1\n",
+        "pub const U64_XOR: U64 = 15 ^ 5\n",
+        "pub const USIZE_AND: USize = 4294967295 & 255\n",
+        "pub const BYTE_AND: Byte = b'\\x0f' & b'\\x03'\n",
+        "pub const BYTE_OR: Byte = b'\\x08' | b'\\x01'\n",
+        "pub const BYTE_XOR: Byte = b'\\x0f' ^ b'\\x05'\n",
+        "pub const TUPLE_VALUE: (I8, U8, Byte) = (-2 & 3, 15 | 1, b'\\x0f' ^ b'\\x05')\n",
+        "pub const ARRAY_VALUE: Array<I16, 2> = [-1 ^ 1, 255 & 3]\n",
+        "pub const BASE: I8 = 5\n",
+        "pub const MIXED_REFERENCE: (I8, I8) = (1 ^ 3, BASE)\n",
+    );
+
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", target]),
+            target,
+            "dev",
+        );
+    }
+}
+
+#[test]
+fn integer_bitwise_const_diagnostics_and_unsupported_forms_are_preserved() {
+    for (source, bad_literal) in [
+        ("pub const BAD_LEFT: I8 = 128 & 1\n", "128"),
+        ("pub const BAD_RIGHT: U8 = 1 | 256\n", "256"),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let bad_start = source.find(bad_literal).expect("bad operand exists");
+
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected an operand range diagnostic and no result:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            "LITERAL_OUT_OF_RANGE",
+            bad_start,
+            bad_start + bad_literal.len(),
+        );
+    }
+
+    let both_out_of_range = "pub const BAD_BOTH: I8 = 128 ^ 129\n";
+    let output = run_check(both_out_of_range, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        2,
+        "both independently invalid operands should retain range diagnostics:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "invalid bitwise operands should not be evaluated or gated:\n{stdout}"
+    );
+
+    for (source, expression) in [
+        ("pub const BAD_TYPE: Bool = 1 ^ 2\n", "1 ^ 2"),
+        (
+            "pub const BAD_BYTE_TYPE: Byte = 1 & b'\\x01'\n",
+            "1 & b'\\x01'",
+        ),
+        ("pub const BAD_BYTE_STR: Slice<Byte> = 1 | 2\n", "1 | 2"),
+        ("pub const BAD_TUPLE_LEAF: (Bool,) = (1 & 2,)\n", "1 & 2"),
+        (
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [1 | 2]\n",
+            "1 | 2",
+        ),
+        ("pub const BAD_TUPLE_SHAPE: (I8,) = 1 & 2\n", "1 & 2"),
+        ("pub const BAD_ARRAY_SHAPE: Array<I8, 1> = 1 | 2\n", "1 | 2"),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let start = source
+            .find(expression)
+            .expect("diagnosed expression exists");
+
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a checked mismatch without a result or feature gate:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            start,
+            start + expression.len(),
+        );
+    }
+
+    for source in [
+        "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 1 & BASE\n",
+        "pub const CHAINED: I8 = 1 & 2 & 3\n",
+        "pub const NESTED: I8 = (1 & 2) | 3\n",
+        "pub const BOOL_OPERANDS: Bool = true & false\n",
+        "pub const SHIFT: I8 = 1 << 2\n",
+        "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(1 & 2)\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_integer_addition_const_values_cover_scalar_and_flat_aggregates() {
     let manifest = "targets { wasm32-core, wasm64-core }\n";
     let source = concat!(
