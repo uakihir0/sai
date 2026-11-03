@@ -7411,7 +7411,8 @@ impl FunctionBodyTypeCheck {
 /// evaluation model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConstValue {
-    /// A Bool direct literal or exact `not` of a Bool direct literal.
+    /// A Bool direct literal, exact `not` of one, or one logical `and`/`or`
+    /// with two direct Bool literal operands.
     Bool(bool),
 }
 
@@ -7419,14 +7420,14 @@ pub enum ConstValue {
 ///
 /// This deliberately covers only direct literals of supported primitive
 /// types, canonical `Str`, the unit literal `()`, flat tuple literals whose
-/// fields are supported direct scalar or unit literals, and exact `not` of a
-/// Bool literal. It does not imply that other constant expressions are
-/// evaluated.
+/// fields are supported direct scalar or unit literals, exact `not` of a Bool
+/// literal, and one logical `and`/`or` whose immediate operands are direct Bool
+/// literals. It does not imply that other constant expressions are evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
     Unsupported,
-    /// The primitive type and literal form are in scope for this checker.
+    /// The primitive type and supported initializer form are in scope for this checker.
     ///
     /// A nonempty diagnostic list represents a supported but invalid
     /// initializer. An empty list means the initializer passed this check.
@@ -7525,7 +7526,7 @@ fn check_const_literal_owner(
     };
     if let TyKind::Tuple(elements) = ty.kind {
         if elements.is_empty() {
-            let diagnostics = match check_const_bool_not_initializer(
+            let diagnostics = match check_const_bool_expression_initializer(
                 owner.id,
                 ConstLiteralType::Unit,
                 &body.value,
@@ -7572,7 +7573,7 @@ fn check_const_literal_owner(
     let Some(literal_type) = resolve_const_literal_type(*ty, type_paths, symbols, inputs) else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
-    let diagnostics = match check_const_bool_not_initializer(
+    let diagnostics = match check_const_bool_expression_initializer(
         owner.id,
         literal_type,
         &body.value,
@@ -7608,17 +7609,25 @@ fn check_const_literal_owner(
     })
 }
 
-fn check_const_bool_not_initializer(
+fn check_const_bool_expression_initializer(
     owner: OwnerId,
     literal_type: ConstLiteralType,
     value: &HirExpr<'_>,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    let ExprKind::Unary(UnOp::Not, operand) = value.kind else {
-        return Ok(None);
+    let is_supported_bool_expression = match value.kind {
+        ExprKind::Unary(UnOp::Not, operand) => {
+            matches!(operand.kind, ExprKind::Lit(Lit::Bool(_)))
+        }
+        ExprKind::Binary(BinOp::And | BinOp::Or, left, right) => {
+            let left_is_bool = matches!(left.kind, ExprKind::Lit(Lit::Bool(_)));
+            let right_is_bool = matches!(right.kind, ExprKind::Lit(Lit::Bool(_)));
+            left_is_bool && right_is_bool
+        }
+        _ => false,
     };
-    if !matches!(operand.kind, ExprKind::Lit(Lit::Bool(_))) {
+    if !is_supported_bool_expression {
         return Ok(None);
     }
 
@@ -7668,6 +7677,20 @@ fn evaluate_const_value(
             ExprKind::Lit(Lit::Bool(value)) => Some(ConstValue::Bool(!value)),
             _ => None,
         },
+        ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right) => {
+            let ExprKind::Lit(Lit::Bool(left)) = left.kind else {
+                return None;
+            };
+            let ExprKind::Lit(Lit::Bool(right)) = right.kind else {
+                return None;
+            };
+            let value = match operator {
+                BinOp::And => left && right,
+                BinOp::Or => left || right,
+                _ => return None,
+            };
+            Some(ConstValue::Bool(value))
+        }
         _ => None,
     }
 }
@@ -78729,6 +78752,135 @@ property "shared"() {}
                 .expect("unit mismatch evaluation does not fail resolution"),
             None
         );
+    }
+
+    #[test]
+    fn const_bool_direct_logical_literals_produce_bool_values() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub const AND_FALSE_FALSE: Bool = false and false\n",
+            "pub const AND_FALSE_TRUE: Bool = false and true\n",
+            "pub const AND_TRUE_FALSE: Bool = true and false\n",
+            "pub const AND_TRUE_TRUE: Bool = true and true\n",
+            "pub const OR_FALSE_FALSE: Bool = false or false\n",
+            "pub const OR_FALSE_TRUE: Bool = false or true\n",
+            "pub const OR_TRUE_FALSE: Bool = true or false\n",
+            "pub const OR_TRUE_TRUE: Bool = true or true\n",
+            "pub const BAD_PRIMITIVE: I32 = true and false\n",
+            "pub const BAD_STR: Str = false or true\n",
+            "pub const BAD_UNIT: () = true and true\n",
+            "pub const NESTED: Bool = true and (false or true)\n",
+            "pub const CHAINED: Bool = true and false and true\n",
+            "pub const PATH: Bool = true and AND_TRUE_TRUE\n",
+            "pub const NON_BOOL: Bool = true and 1\n",
+            "pub const BITWISE: Bool = true & false\n",
+            "pub const SHORT_CIRCUIT_AND_PATH: Bool = false and AND_TRUE_TRUE\n",
+            "pub const SHORT_CIRCUIT_OR_PATH: Bool = true or AND_TRUE_TRUE\n",
+            "pub const SHORT_CIRCUIT_AND_NON_BOOL: Bool = false and 1\n",
+            "pub const SHORT_CIRCUIT_OR_NON_BOOL: Bool = true or 1\n",
+            "pub const NONEMPTY_TUPLE: (Bool, Bool) = true and false\n",
+            "pub const BITWISE_OR: Bool = true | false\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        let truth_table = [
+            (BinOp::And, false, false, false),
+            (BinOp::And, false, true, false),
+            (BinOp::And, true, false, false),
+            (BinOp::And, true, true, true),
+            (BinOp::Or, false, false, false),
+            (BinOp::Or, false, true, true),
+            (BinOp::Or, true, false, true),
+            (BinOp::Or, true, true, true),
+        ];
+        for (index, (operator, left, right, expected)) in truth_table.into_iter().enumerate() {
+            let expected_from_operator = match operator {
+                BinOp::And => left && right,
+                BinOp::Or => left || right,
+                _ => unreachable!("the table contains only logical operators"),
+            };
+            assert_eq!(expected, expected_from_operator);
+            assert!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check succeeds")
+                    .is_valid_bool(),
+                "supported Bool logical const at owner index {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("const evaluation succeeds"),
+                Some(ConstValue::Bool(expected)),
+                "evaluated Bool logical const at owner index {index}"
+            );
+        }
+
+        for (index, declaration, initializer) in [
+            (8, "pub const BAD_PRIMITIVE: I32 = ", "true and false"),
+            (9, "pub const BAD_STR: Str = ", "false or true"),
+            (10, "pub const BAD_UNIT: () = ", "true and true"),
+        ] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("mismatched const remains in the supported subset");
+            let diagnostics = match check {
+                ConstLiteralCheck::Supported {
+                    primitive: PrimTy::I32,
+                    diagnostics,
+                } if index == 8 => diagnostics,
+                ConstLiteralCheck::SupportedStr { diagnostics } if index == 9 => diagnostics,
+                ConstLiteralCheck::SupportedUnit { diagnostics } if index == 10 => diagnostics,
+                other => panic!("wrong-result-type logical expression was not checked: {other:?}"),
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            let primary = diagnostics[0]
+                .primary()
+                .expect("type mismatch points at the full initializer");
+            let initializer_start =
+                root.find(declaration).expect("mismatch declaration exists") + declaration.len();
+            assert_eq!(primary.span.range.start().to_usize(), initializer_start);
+            assert_eq!(
+                primary.span.range.end().to_usize(),
+                initializer_start + initializer.len()
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("invalid const evaluation does not fail resolution"),
+                None
+            );
+        }
+
+        for index in 11..22 {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("gated shape remains resolvable"),
+                &ConstLiteralCheck::Unsupported,
+                "nested, chained, path, non-Bool, short-circuit-shaped, nonempty-tuple, and bitwise forms remain gated at owner index {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported evaluation does not fail resolution"),
+                None
+            );
+        }
     }
 
     #[test]

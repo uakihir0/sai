@@ -16803,6 +16803,17 @@ fn public_primitive_const_literals_emit_check_results() {
 }
 
 #[test]
+fn public_bool_logical_literal_consts_emit_check_results() {
+    let source = concat!(
+        "pub const AND_FALSE: Bool = true and false\n",
+        "pub const AND_TRUE: Bool = true and true\n",
+        "pub const OR_FALSE: Bool = false or false\n",
+        "pub const OR_TRUE: Bool = false or true\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
 fn multiple_public_primitive_const_literals_emit_one_check_result() {
     assert_success_result(
         run_check(
@@ -16966,6 +16977,7 @@ fn public_str_const_literals_emit_check_results() {
 fn public_str_const_type_errors_suppress_the_check_result() {
     for source in [
         "pub const BAD_BOOL: Str = true\n",
+        "pub const BAD_LOGICAL: Str = true and false\n",
         "pub const BAD_BYTES: Str = b\"bytes\"\n",
         "pub const FIRST: Str = \"ok\"\npub const SECOND: Str = true\n",
     ] {
@@ -17010,6 +17022,7 @@ fn public_unit_const_literals_emit_check_results() {
 fn public_unit_const_type_errors_suppress_the_check_result() {
     for source in [
         "pub const BAD_BOOL: () = true\n",
+        "pub const BAD_LOGICAL: () = false or true\n",
         "pub const BAD_INTEGER: () = 0\n",
         "pub const BAD_STRING: () = \"text\"\n",
         "pub const FIRST: () = ()\npub const SECOND: () = 0\n",
@@ -17158,6 +17171,8 @@ fn public_primitive_const_type_errors_do_not_emit_results() {
     let cases = [
         ("pub const BAD: Bool = 1\n", "TYPE_MISMATCH"),
         ("pub const BAD: I32 = not true\n", "TYPE_MISMATCH"),
+        ("pub const BAD: I32 = true and false\n", "TYPE_MISMATCH"),
+        ("pub const BAD: I32 = false or true\n", "TYPE_MISMATCH"),
         ("pub const BAD: () = not true\n", "TYPE_MISMATCH"),
         ("pub const BAD: I8 = true\n", "TYPE_MISMATCH"),
         ("pub const BAD: I8 = -129\n", "LITERAL_OUT_OF_RANGE"),
@@ -17279,6 +17294,17 @@ fn const_forms_outside_literal_slice_remain_gated() {
     for source in [
         "const PRIVATE: I8 = 1\n",
         "pub const EXPRESSION: I8 = 1 + 2\n",
+        "pub const NESTED_LOGICAL: Bool = true and (false or true)\n",
+        "pub const CHAINED_LOGICAL: Bool = true and false and true\n",
+        "pub const LOGICAL_PATH: Bool = true and READY\n",
+        "pub const LOGICAL_NON_BOOL: Bool = true and 1\n",
+        "pub const READY: Bool = true\npub const SHORT_CIRCUIT_AND_PATH: Bool = false and READY\n",
+        "pub const READY: Bool = false\npub const SHORT_CIRCUIT_OR_PATH: Bool = true or READY\n",
+        "pub const SHORT_CIRCUIT_AND_NON_BOOL: Bool = false and 1\n",
+        "pub const SHORT_CIRCUIT_OR_NON_BOOL: Bool = true or 1\n",
+        "pub const NONEMPTY_TUPLE: (Bool, Bool) = true and false\n",
+        "pub const BITWISE_BOOL: Bool = true & false\n",
+        "pub const BITWISE_BOOL_OR: Bool = true | false\n",
         "pub const NESTED_NOT: Bool = not (not true)\n",
         "pub const NOT_INTEGER: Bool = not 1\n",
         "pub const NOT_PATH: Bool = not READY\n",
