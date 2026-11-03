@@ -3502,7 +3502,7 @@ fn inherent_method_direct_calls_keep_unsupported_trailing_items_gated() {
                 "        identity(self.count)\n",
                 "    }\n",
                 "}\n",
-                "pub fn identity(value: I32) -> I32 { value + 1 }\n",
+                "pub fn identity(value: I32) -> I32 { value * 1 }\n",
             ),
         ),
         (
@@ -8424,6 +8424,14 @@ fn unsupported_known_method_binary_tail_shapes_remain_gated() {
             "    }\n",
             "}\n",
         ),
+        concat!(
+            "type Counter {}\n",
+            "impl Counter {\n",
+            "    pub fn add(self: borrow Self, value: I32) -> I32 {\n",
+            "        value + 1\n",
+            "    }\n",
+            "}\n",
+        ),
     ] {
         assert_check_stays_gated_without_syntax_errors(
             &run_check(source, "", &[], &[]),
@@ -8674,6 +8682,50 @@ fn top_level_function_addition_tails_accept_concrete_numeric_paths() {
 }
 
 #[test]
+fn top_level_function_addition_tails_accept_one_direct_numeric_literal() {
+    let mut functions = Vec::new();
+    for (name, ty) in [
+        ("i8", "I8"),
+        ("i16", "I16"),
+        ("i32", "I32"),
+        ("i64", "I64"),
+        ("isize", "ISize"),
+        ("u8", "U8"),
+        ("u16", "U16"),
+        ("u32", "U32"),
+        ("u64", "U64"),
+        ("usize", "USize"),
+    ] {
+        functions.push(format!(
+            "pub fn add_right_{name}(value: {ty}) -> {ty} {{ value + 1 }}"
+        ));
+        functions.push(format!(
+            "pub fn add_left_{name}(value: {ty}) -> {ty} {{ 1 + value }}"
+        ));
+    }
+    for (name, ty) in [("f32", "F32"), ("f64", "F64")] {
+        functions.push(format!(
+            "pub fn add_right_{name}(value: {ty}) -> {ty} {{ value + 1.5 }}"
+        ));
+        functions.push(format!(
+            "pub fn add_left_{name}(value: {ty}) -> {ty} {{ 1.5 + value }}"
+        ));
+    }
+    functions.push(
+        concat!(
+            "pub fn add_after_local(value: I32) -> I32 {\n",
+            "    let copy: I32 = value\n",
+            "    1 + copy\n",
+            "}\n",
+        )
+        .to_owned(),
+    );
+    let source = functions.join("\n");
+
+    assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
 fn top_level_function_addition_tail_reports_operand_and_return_mismatches() {
     let source = "pub fn mismatch(left: I32, right: U8) -> Bool { left + right }\n";
     let output = run_check(source, "", &[], &[]);
@@ -8709,20 +8761,85 @@ fn top_level_function_addition_tail_reports_operand_and_return_mismatches() {
 }
 
 #[test]
+fn top_level_function_addition_literal_reports_family_and_range_errors() {
+    for (source, expression) in [
+        (
+            "pub fn mismatch(value: I32) -> I32 { value + 1.0 }\n",
+            "1.0",
+        ),
+        (
+            "pub fn mismatch(value: I32) -> I32 { 1.0 + value }\n",
+            "1.0 + value",
+        ),
+        (
+            "pub fn out_of_range(value: I8) -> I8 { value + 128 }\n",
+            "128",
+        ),
+        (
+            "pub fn out_of_range(value: I8) -> I8 { 128 + value }\n",
+            "128",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression_start = source.find(expression).expect("expression exists");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "supported addition literal errors remain semantic diagnostics:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                || stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""),
+            "the literal's family or range error must be reported:\n{stdout}"
+        );
+        if expression == "1.0 + value" {
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                "expected `F64`, found `I32`",
+                expression_start + "1.0 + ".len(),
+                expression_start + "1.0 + value".len(),
+            );
+        } else {
+            let code = if expression == "128" {
+                "LITERAL_OUT_OF_RANGE"
+            } else {
+                "TYPE_MISMATCH"
+            };
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                code,
+                if code == "TYPE_MISMATCH" {
+                    "expected `I32`, found a floating-point literal"
+                } else {
+                    "integer literal is out of range for `I8`"
+                },
+                expression_start,
+                expression_start + expression.len(),
+            );
+        }
+    }
+}
+
+#[test]
 fn unsupported_top_level_arithmetic_and_bitwise_tail_shapes_remain_gated() {
     for source in [
         "pub fn subtract(left: I32, right: I32) -> I32 { left - right }\n",
         "pub fn bitand(left: U8, right: U8) -> U8 { left & right }\n",
-        "pub fn literal_right(left: I32) -> I32 { left + 1 }\n",
-        "pub fn literal_left(right: I32) -> I32 { 1 + right }\n",
+        "pub fn bool_literal_right(left: I32) -> I32 { left + true }\n",
+        "pub fn bool_literal_left(right: I32) -> I32 { true + right }\n",
+        "pub fn two_literals() -> I32 { 1 + 2 }\n",
         concat!(
             "pub fn unresolved_literal(left: I32) -> I32 {\n",
             "    let one = 1\n",
             "    left + one\n",
             "}\n",
         ),
-        "pub fn computed(left: I32, right: I32) -> I32 { (left + right) + left }\n",
+        "pub fn computed(left: I32, right: I32) -> I32 { (left + 1) + right }\n",
         "pub fn nonnumeric(left: Bool, right: Bool) -> Bool { left + right }\n",
+        "pub fn nonnumeric_literal(value: Bool) -> Bool { value + 1 }\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(
             &run_check(source, "", &[], &[]),
@@ -15978,7 +16095,6 @@ fn target_filtered_public_name_does_not_report_a_name_error() {
 #[test]
 fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     for source in [
-        "pub fn add(value: I32) -> I32 { value + 1 }\n",
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
         "pub fn local() -> I32 {\nvar value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",

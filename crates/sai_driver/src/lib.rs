@@ -7649,6 +7649,7 @@ fn check_function_body_type(
             PrimitiveLocalBlockGates {
                 allow_binary_tail: false,
                 allow_addition_tail: true,
+                allow_addition_literal_tail: true,
                 allow_unary_path_tail: true,
                 allow_bool_literal_not_tail: true,
                 allow_logical_tail: true,
@@ -8394,6 +8395,7 @@ fn check_inherent_method_body_type(
         PrimitiveLocalBlockGates {
             allow_binary_tail: true,
             allow_addition_tail: false,
+            allow_addition_literal_tail: false,
             allow_unary_path_tail: true,
             allow_bool_literal_not_tail: false,
             allow_logical_tail: true,
@@ -8886,6 +8888,7 @@ fn unknown_self_field_diagnostic(
 struct PrimitiveLocalBlockGates {
     allow_binary_tail: bool,
     allow_addition_tail: bool,
+    allow_addition_literal_tail: bool,
     allow_unary_path_tail: bool,
     allow_bool_literal_not_tail: bool,
     allow_logical_tail: bool,
@@ -9396,6 +9399,17 @@ fn check_function_body_primitive_local_block(
                 || (preceding_paths == 1 && scalar_literals == 1)
         } else if is_addition_only_tail {
             operands.iter().all(|operand| is_preceding_path(operand))
+                || (gates.allow_addition_literal_tail
+                    && operands
+                        .iter()
+                        .filter(|operand| is_preceding_path(operand))
+                        .count()
+                        == 1
+                    && operands
+                        .iter()
+                        .filter(|operand| is_direct_function_numeric_literal(operand))
+                        .count()
+                        == 1)
         } else {
             operands.iter().enumerate().all(|(index, operand)| {
                 is_preceding_path_or_field(operand)
@@ -48430,7 +48444,7 @@ property "shared"() {}
             "pub fn mismatch(value: I32) -> Bool { value }\n",
             "pub fn discard(value: I32) { value }\n",
             "pub fn discard_explicit(value: I32) -> () { value }\n",
-            "pub fn computed(value: I32) -> I32 { value + 1 }\n",
+            "pub fn computed(value: I32) -> I32 { value * 1 }\n",
             "pub fn self_param(self: I32) -> I32 { self }\n",
             "pub fn string_parameter_return(value: Str) -> Str { \"text\" }\n",
             "pub fn local_str_return() -> Str {\n    let value = \"text\"\n    value\n}\n",
@@ -75692,6 +75706,9 @@ property "shared"() {}
             "    copy + right\n",
             "}\n",
             "pub fn add_float(left: F64, right: F64) -> F64 { left + right }\n",
+            "pub fn add_integer_literal_right(value: I32) -> I32 { value + 1 }\n",
+            "pub fn add_integer_literal_left(value: I32) -> I32 { 1 + value }\n",
+            "pub fn add_float_literal_left(value: F64) -> F64 { 1.5 + value }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -75706,9 +75723,9 @@ property "shared"() {}
         let resolved = database
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
-        assert_eq!(resolved.owners().len(), 3);
+        assert_eq!(resolved.owners().len(), 6);
 
-        for (index, expected_type_count) in [3, 4, 3].into_iter().enumerate() {
+        for (index, expected_type_count) in [3, 4, 3, 3, 3, 3].into_iter().enumerate() {
             let owner = &resolved.owners()[index];
             assert!(
                 matches!(
@@ -75735,6 +75752,18 @@ property "shared"() {}
                     .len(),
                 expected_type_count,
                 "every trusted primitive fact has a canonical projection"
+            );
+            let expected_type = if index == 2 || index == 5 {
+                sai_resolve::prelude::PrimTy::F64
+            } else {
+                sai_resolve::prelude::PrimTy::I32
+            };
+            assert!(
+                type_results
+                    .expression_types()
+                    .values()
+                    .all(|ty| *ty == expected_type),
+                "all addition operands and results carry the expected {expected_type:?} fact"
             );
         }
     }
