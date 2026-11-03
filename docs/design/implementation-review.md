@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1103 (2026-11-03): allow integer remainder path-pair tails in top-level functions
+
+- **Decision — review required:** Extend supported public top-level function tails to accept one direct `%` whose two immediate operands are plain one-segment local paths resolving by `BindingId` to parameters or preceding accepted locals.
+- **Reason:** Spec/06 §§6.8.2–6.8.3 define integer remainder, and the existing primitive body checker already handles matching integer operands, right-operand mismatch recovery, floating-point rejection, and expression facts. The narrow path-pair tail can reuse those checks without adding another typing implementation.
+- **Boundary and judgment:** Enable a dedicated remainder path-tail gate only for top-level functions and require both immediate operands to be resolved preceding paths. The checker accepts matching pairs of all ten integer types, reports an existing `OPERATOR_NOT_SUPPORTED` diagnostic for `F32`/`F64`, and retains operand-mismatch plus independent full-tail return diagnostics and primitive/canonical facts. Keep remainder literals, literal pairs, unresolved literal-derived paths, nonlocal paths, nonnumeric paths, and nested/computed operands gated; do not add remainder evaluation, zero-divisor checks, lowering, or runtime behavior. The owner/shape boundary and the choice to let float path pairs reach the existing unsupported-operator diagnostic are **Review required**.
+- **Review required:** Cover all ten integer types, a preceding local, exact right-operand and independent return mismatch spans, both float types' operator errors, module/nonlocal, nonnumeric, literal, unresolved, and computed shapes, and primitive/canonical fact parity. Confirm inherent-method tails and local initializers retain their prior behavior.
+- **Verification:** The new positive acceptance test first failed under the prior top-level gate with `FEATURE_NOT_IMPLEMENTED`. All 22 remainder-related tests passed, covering all ten integer types, a preceding local, mismatch recovery, `F32`/`F64` operator diagnostics, and rejected shapes. The driver fact test passed with primitive/canonical parity. The complete `check_empty_source` target passed (467 tests), and `cargo test --workspace --locked --quiet` passed across the workspace and doctests, including all 815 driver tests. `cargo fmt --all -- --check` and `git diff --check` passed.
+- **Hostile review:** The read-only adversarial review found no actionable implementation, scope, test, or documentation issue. It requested recording the focused verification result; the complete CLI and workspace suites also passed.
+
 ### IR-1102 (2026-11-03): allow numeric path-pair subtraction, multiplication, and division tails
 
 - **Decision — review required:** Extend supported public top-level function tails to accept one direct `-`, `*`, or `/` whose two immediate operands are plain one-segment local paths resolving by `BindingId` to parameters or preceding accepted locals.
