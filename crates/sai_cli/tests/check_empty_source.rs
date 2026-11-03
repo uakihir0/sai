@@ -17818,7 +17818,6 @@ fn integer_division_diagnostics_and_unsupported_forms_are_preserved() {
         "pub const CHAINED: I8 = 8 / 2 / 2\n",
         "pub const NESTED: I8 = (8 / 2) / 2\n",
         "pub const WRAPPING: I8 = 1 +% 2\n",
-        "pub const REMAINDER: I8 = 1 % 2\n",
         "pub const MIXED: I8 = 1 / true\n",
         "pub const FLOAT_DIVISION: F64 = 1.0 / 0.0\n",
         "pub const BYTE_OPERAND: I8 = 1 / b'\\0'\n",
@@ -17879,6 +17878,215 @@ fn pointer_sized_integer_division_uses_the_selected_target_width() {
     );
     assert_success_result(
         run_check(unsigned_source, manifest, &[], &["--target", "wasm64-core"]),
+        "wasm64-core",
+        "dev",
+    );
+}
+
+#[test]
+fn public_integer_remainder_const_values_cover_scalar_and_flat_aggregates() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub const I8_VALUE: I8 = -7 % 3\n",
+        "pub const I16_VALUE: I16 = 7 % 3\n",
+        "pub const I32_VALUE: I32 = -7 % -3\n",
+        "pub const I64_VALUE: I64 = 7 % -3\n",
+        "pub const ISIZE_VALUE: ISize = -7 % -3\n",
+        "pub const U8_VALUE: U8 = 255 % 7\n",
+        "pub const U16_VALUE: U16 = 65535 % 256\n",
+        "pub const U32_VALUE: U32 = 4294967295 % 65536\n",
+        "pub const U64_VALUE: U64 = 18446744073709551615 % 10\n",
+        "pub const USIZE_VALUE: USize = 4294967295 % 10\n",
+        "pub const SIGNED_MIN_REMAINDER: I8 = -128 % -1\n",
+        "pub const TUPLE_VALUE: (I8, U8, I32) = (-7 % 3, 255 % 10, 21 % -2)\n",
+        "pub const ARRAY_VALUE: Array<U16, 2> = [65535 % 256, 6 % 4]\n",
+        "pub const BASE: I32 = 40\n",
+        "pub const MIXED_REFERENCE: (I32, I32) = (3 % 5, BASE)\n",
+        "pub const MIXED_REFERENCE_ARRAY: Array<I32, 2> = [3 % 5, BASE]\n",
+    );
+
+    for target in ["wasm32-core", "wasm64-core"] {
+        assert_success_result(
+            run_check(source, manifest, &[], &["--target", target]),
+            target,
+            "dev",
+        );
+    }
+}
+
+#[test]
+fn integer_remainder_diagnostics_and_unsupported_forms_are_preserved() {
+    let zero_source = "pub const REM_BY_ZERO: I8 = 12 /* comment % is not the operator */ % -0\n";
+    let zero_output = run_check(zero_source, "", &[], &[]);
+    let zero_stdout = String::from_utf8(zero_output.stdout).expect("CLI stdout is UTF-8");
+    let zero_operator_start = zero_source
+        .find("*/ % -0")
+        .expect("remainder operator after comment exists")
+        + "*/ ".len();
+    assert_eq!(
+        zero_output.status.code(),
+        Some(1),
+        "remainder by zero should fail the check:\n{zero_stdout}"
+    );
+    assert!(
+        zero_stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+            && zero_stdout.contains("RemByZero")
+            && zero_stdout.contains("remainder by zero")
+            && !zero_stdout.contains("DivByZero")
+            && !zero_stdout.contains("\"type\":\"result\"")
+            && !zero_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "zero remainder is a checked const-evaluation panic with its own kind:\n{zero_stdout}"
+    );
+    assert_json_diagnostic_primary_byte_span(
+        &zero_stdout,
+        "CONST_EVAL_PANIC",
+        zero_operator_start,
+        zero_operator_start + 1,
+    );
+
+    for (source, expected_code, forbidden_code, diagnostic_expression) in [
+        (
+            "pub const OUT_OF_RANGE_LEFT: I8 = 128 % 0\n",
+            "LITERAL_OUT_OF_RANGE",
+            "CONST_EVAL_PANIC",
+            None,
+        ),
+        (
+            "pub const OUT_OF_RANGE_RIGHT: I8 = 1 % 128\n",
+            "LITERAL_OUT_OF_RANGE",
+            "CONST_EVAL_PANIC",
+            None,
+        ),
+        (
+            "pub const BOTH_OUT_OF_RANGE: I8 = 128 % 129\n",
+            "LITERAL_OUT_OF_RANGE",
+            "CONST_EVAL_PANIC",
+            None,
+        ),
+        (
+            "pub const BAD_TYPE: Bool = 7 % 1\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("7 % 1"),
+        ),
+        (
+            "pub const BAD_BYTE_STR: Slice<Byte> = 1 % 2\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("1 % 2"),
+        ),
+        (
+            "pub const BAD_TUPLE_LEAF: (Bool,) = (1 % 2,)\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("1 % 2"),
+        ),
+        (
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [1 % 2]\n",
+            "TYPE_MISMATCH",
+            "CONST_EVAL_PANIC",
+            Some("1 % 2"),
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && !stdout.contains(&format!("\"code\":\"{forbidden_code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a checked remainder diagnostic without a feature gate:\n{stdout}"
+        );
+        if let Some(expression) = diagnostic_expression {
+            let start = source
+                .find(expression)
+                .expect("diagnosed remainder expression exists");
+            assert_json_diagnostic_primary_byte_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                start,
+                start + expression.len(),
+            );
+        }
+    }
+
+    for source in [
+        "pub const BASE: I8 = 1\npub const PATH_OPERAND: I8 = 2 % BASE\n",
+        "pub const CHAINED: I8 = 8 % 3 % 2\n",
+        "pub const NESTED: I8 = (8 % 3) % 2\n",
+        "pub const WRAPPING: I8 = 1 +% 2\n",
+        "pub const MIXED: I8 = 1 % true\n",
+        "pub const FLOAT_REMAINDER: F64 = 1.0 % 2.0\n",
+        "pub const BYTE_OPERAND: I8 = 1 % b'\\0'\n",
+        "enum Bits { One(I8) }\npub const ENUM_PAYLOAD: Bits = Bits.One(1 % 2)\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn integer_remainder_uses_the_selected_pointer_width() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+
+    let signed_64bit_minimum = "pub const SIGNED_MIN: ISize = -9223372036854775808 % -1\n";
+    let wasm32 = run_check(
+        signed_64bit_minimum,
+        manifest,
+        &[],
+        &["--target", "wasm32-core"],
+    );
+    let wasm32_stdout = String::from_utf8(wasm32.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        wasm32.status.code(),
+        Some(1),
+        "64-bit signed pointer-sized operand should be out of range on wasm32:\n{wasm32_stdout}"
+    );
+    assert!(
+        wasm32_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !wasm32_stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+            && !wasm32_stdout.contains("\"type\":\"result\"")
+            && !wasm32_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "operand range checking precedes pointer-sized remainder:\n{wasm32_stdout}"
+    );
+    assert_success_result(
+        run_check(
+            signed_64bit_minimum,
+            manifest,
+            &[],
+            &["--target", "wasm64-core"],
+        ),
+        "wasm64-core",
+        "dev",
+    );
+
+    let unsigned_pointer_value = "pub const POINTER_REMAINDER: USize = 4294967296 % 3\n";
+    let wasm32 = run_check(
+        unsigned_pointer_value,
+        manifest,
+        &[],
+        &["--target", "wasm32-core"],
+    );
+    let wasm32_stdout = String::from_utf8(wasm32.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        wasm32.status.code(),
+        Some(1),
+        "unsigned 32-bit pointer-sized operand should be out of range:\n{wasm32_stdout}"
+    );
+    assert!(
+        wasm32_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !wasm32_stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
+            && !wasm32_stdout.contains("\"type\":\"result\"")
+            && !wasm32_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "unsigned pointer-width range diagnostic is preserved:\n{wasm32_stdout}"
+    );
+    assert_success_result(
+        run_check(
+            unsigned_pointer_value,
+            manifest,
+            &[],
+            &["--target", "wasm64-core"],
+        ),
         "wasm64-core",
         "dev",
     );
