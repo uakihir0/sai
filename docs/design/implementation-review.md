@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1113 (2026-11-03): evaluate direct unit constants
+
+- **Decision — review required:** Represent a valid direct unit literal as `ConstValue::Aggregate { variant: None, fields: [] }` and require a value for each valid unit constant in the CLI success slice.
+- **Reason:** Unit is the zero-field tuple case in the type checker, and §3.7.15 uses structured aggregate values for constructions. The existing checker already validates exact direct `()` initializers and rejects mismatches before evaluation, so reusing its result advances the value gate without admitting new expression forms.
+- **Boundary and judgment:** Only the empty tuple HIR expression checked against the empty tuple type produces a value. Mismatches remain valueless; block forms, aliases, nonempty tuple initializers for unit, nested tuples, and other computed forms remain gated. Valid flat tuple constants remain checked-only for a follow-up increment. Use `DefId` for the optional variant identity in `Aggregate` because no `VariantIdx` type exists in the workspace; this unit-only slice always stores `None`. The new owned field array means `ConstValue` is `Clone` rather than `Copy`; its public API compatibility impact needs review. This is an inferred Stage 0 order because the plan has no numbered post-IR-1107 evaluator items.
+- **Review required:** Confirm the `DefId` representation before enum value support, the public `Copy` to `Clone` change, exact empty aggregate value, no values after unit mismatches, continued gates for block/alias/nonempty tuple shapes, and the CLI unit success gate.
+- **Verification:** With pinned Rust 1.99.1, the focused driver test `const_unit_literal_check_accepts_only_empty_tuple_type_and_literal` and CLI integration test `public_unit_const_literals_emit_check_results` passed. `cargo test --workspace --locked --offline --quiet` passed all tests, including 823 driver tests and 482 CLI integration tests; two existing tests remain ignored. `cargo fmt --all -- --check` and `git diff --check` passed.
+- **Hostile review:** Read-only reviews found no evaluator correctness defect. They confirmed that only valid empty unit HIR produces an aggregate, mismatch and unsupported cases do not produce values, and the existing CLI unit integration test covers the success gate. The `DefId` representation is defensible for this unit-only slice because `VariantIdx` is not defined in the workspace and the field is always `None`; it remains review-required before enum value support. The review also requested current-state documentation and explicit recording of the public `Copy` to `Clone` API impact; both are now documented. Final review found no remaining actionable inconsistency.
+
 ### IR-1112 (2026-11-03): evaluate direct floating-point literal constants
 
 - **Decision — review required:** Extend the bounded evaluator with `ConstValue::Float { bits: u64, ty: FloatTy }` for valid direct F32 and F64 HIR literals.
