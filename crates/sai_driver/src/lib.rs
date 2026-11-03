@@ -8422,6 +8422,7 @@ fn const_unsigned_integer_width(ty: sai_ty::ty::UintTy, pointer_width: u8) -> u3
 enum ConstIntegerArithmeticOp {
     Add,
     Sub,
+    Mul,
 }
 
 impl ConstIntegerArithmeticOp {
@@ -8429,6 +8430,7 @@ impl ConstIntegerArithmeticOp {
         match self {
             Self::Add => sai_syntax::SyntaxKind::PLUS,
             Self::Sub => sai_syntax::SyntaxKind::MINUS,
+            Self::Mul => sai_syntax::SyntaxKind::STAR,
         }
     }
 
@@ -8436,6 +8438,7 @@ impl ConstIntegerArithmeticOp {
         match self {
             Self::Add => "Overflow(Add)",
             Self::Sub => "Overflow(Sub)",
+            Self::Mul => "Overflow(Mul)",
         }
     }
 
@@ -8443,6 +8446,7 @@ impl ConstIntegerArithmeticOp {
         match self {
             Self::Add => "integer overflow in addition",
             Self::Sub => "integer overflow in subtraction",
+            Self::Mul => "integer overflow in multiplication",
         }
     }
 }
@@ -8465,6 +8469,7 @@ fn const_integer_arithmetic_operands<'hir>(
     let operator = match operator {
         BinOp::Add => ConstIntegerArithmeticOp::Add,
         BinOp::Sub => ConstIntegerArithmeticOp::Sub,
+        BinOp::Mul => ConstIntegerArithmeticOp::Mul,
         _ => return None,
     };
     (matches!(left.kind, ExprKind::Lit(Lit::Int { .. }))
@@ -8515,11 +8520,12 @@ fn evaluate_const_integer_arithmetic(
             }
             let minimum = -(1_i128 << (width - 1));
             let maximum = (1_i128 << (width - 1)) - 1;
-            let difference = match operator {
+            let arithmetic_result = match operator {
                 ConstIntegerArithmeticOp::Add => left.checked_add(right),
                 ConstIntegerArithmeticOp::Sub => left.checked_sub(right),
+                ConstIntegerArithmeticOp::Mul => left.checked_mul(right),
             };
-            let Some(result) = difference else {
+            let Some(result) = arithmetic_result else {
                 return Some(ConstIntegerArithmeticResult::Overflow);
             };
             if !(minimum..=maximum).contains(&result) {
@@ -8546,11 +8552,12 @@ fn evaluate_const_integer_arithmetic(
                 return None;
             }
             let maximum = (1_u128 << width) - 1;
-            let difference = match operator {
+            let arithmetic_result = match operator {
                 ConstIntegerArithmeticOp::Add => left.checked_add(right),
                 ConstIntegerArithmeticOp::Sub => left.checked_sub(right),
+                ConstIntegerArithmeticOp::Mul => left.checked_mul(right),
             };
-            let Some(result) = difference else {
+            let Some(result) = arithmetic_result else {
                 return Some(ConstIntegerArithmeticResult::Overflow);
             };
             if result > maximum {
@@ -82356,6 +82363,389 @@ property "shared"() {}
             }
 
             for index in [13, 14, 15, 16, 17, 18, 19] {
+                assert_eq!(
+                    resolved.owners()[index]
+                        .literal_check()
+                        .expect("unsupported expression remains resolvable"),
+                    &ConstLiteralCheck::Unsupported,
+                    "paths, composed/wrapping/mixed operators, and enum payloads remain gated at owner index {index}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("unsupported evaluation does not fail resolution"),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn const_direct_integer_multiplication_checks_type_width_and_materializes_aggregates() {
+        use sai_resolve::prelude::PrimTy;
+        use sai_ty::ty::{IntTy, UintTy};
+
+        let root = concat!(
+            "pub const I8_VALUE: I8 = -16 * 8\n",
+            "pub const I16_VALUE: I16 = 256 * 127\n",
+            "pub const I32_VALUE: I32 = 65536 * 32767\n",
+            "pub const I64_VALUE: I64 = 1000000000 * 1000000000\n",
+            "pub const ISIZE_VALUE: ISize = 1000 * 1000\n",
+            "pub const U8_VALUE: U8 = 17 * 15\n",
+            "pub const U16_VALUE: U16 = 256 * 255\n",
+            "pub const U32_VALUE: U32 = 65536 * 65535\n",
+            "pub const U64_VALUE: U64 = 4294967296 * 4294967295\n",
+            "pub const USIZE_VALUE: USize = 65536 * 65535\n",
+            "pub const TUPLE_VALUE: (I8, U8, I32) = (-16 * 8, 17 * 15, 6 * 7)\n",
+            "pub const ARRAY_VALUE: Array<U16, 2> = [256 * 255, 3 * 2]\n",
+            "pub const BASE: I32 = 40\n",
+            "pub const MIXED_REFERENCE: (I32, I32) = (3 * 5, BASE)\n",
+            "pub const MIXED_REFERENCE_ARRAY: Array<I32, 2> = [3 * 5, BASE]\n",
+        );
+
+        for target in ["wasm32-core", "wasm64-core"] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+
+            let expected_scalars = [
+                ConstValue::Int {
+                    value: -128,
+                    ty: IntTy::I8,
+                },
+                ConstValue::Int {
+                    value: 32_512,
+                    ty: IntTy::I16,
+                },
+                ConstValue::Int {
+                    value: 2_147_418_112,
+                    ty: IntTy::I32,
+                },
+                ConstValue::Int {
+                    value: 1_000_000_000_000_000_000,
+                    ty: IntTy::I64,
+                },
+                ConstValue::Int {
+                    value: 1_000_000,
+                    ty: IntTy::ISize,
+                },
+                ConstValue::Uint {
+                    value: 255,
+                    ty: UintTy::U8,
+                },
+                ConstValue::Uint {
+                    value: 65_280,
+                    ty: UintTy::U16,
+                },
+                ConstValue::Uint {
+                    value: 4_294_901_760,
+                    ty: UintTy::U32,
+                },
+                ConstValue::Uint {
+                    value: 18_446_744_069_414_584_320,
+                    ty: UintTy::U64,
+                },
+                ConstValue::Uint {
+                    value: 4_294_901_760,
+                    ty: UintTy::USize,
+                },
+            ];
+            assert_eq!(resolved.owners().len(), 15);
+            for (index, expected) in expected_scalars.into_iter().enumerate() {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check uses the current owner snapshot");
+                assert!(
+                    check.is_supported() && check.is_valid() && check.requires_const_value(),
+                    "supported integer multiplication at owner index {index}: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("const evaluation succeeds"),
+                    Some(expected),
+                    "integer multiplication result at owner index {index} for {target}"
+                );
+            }
+            assert_eq!(
+                resolved.owners()[10]
+                    .const_value()
+                    .expect("flat tuple evaluation succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![
+                        ConstValue::Int {
+                            value: -128,
+                            ty: IntTy::I8,
+                        },
+                        ConstValue::Uint {
+                            value: 255,
+                            ty: UintTy::U8,
+                        },
+                        ConstValue::Int {
+                            value: 42,
+                            ty: IntTy::I32,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[11]
+                    .const_value()
+                    .expect("flat array evaluation succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::U16),
+                    elements: vec![
+                        ConstValue::Uint {
+                            value: 65_280,
+                            ty: UintTy::U16,
+                        },
+                        ConstValue::Uint {
+                            value: 6,
+                            ty: UintTy::U16,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[13]
+                    .const_value()
+                    .expect("mixed tuple template materialization succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![
+                        ConstValue::Int {
+                            value: 15,
+                            ty: IntTy::I32,
+                        },
+                        ConstValue::Int {
+                            value: 40,
+                            ty: IntTy::I32,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[14]
+                    .const_value()
+                    .expect("mixed array template materialization succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::I32),
+                    elements: vec![
+                        ConstValue::Int {
+                            value: 15,
+                            ty: IntTy::I32,
+                        },
+                        ConstValue::Int {
+                            value: 40,
+                            ty: IntTy::I32,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn const_direct_integer_multiplication_reports_ranges_overflow_and_exact_operator() {
+        let root = concat!(
+            "pub const SIGNED_POSITIVE_OVERFLOW: I8 = -16 /* comment * is not operator */ * -8\n",
+            "pub const SIGNED_NEGATIVE_OVERFLOW: I8 = -128 * 2\n",
+            "pub const SIGNED_UPPER_OVERFLOW: I8 = 64 * 2\n",
+            "pub const UNSIGNED_OVERFLOW: U8 = 16 * 16\n",
+            "pub const BAD_LEFT: I8 = 128 * 1\n",
+            "pub const BAD_RIGHT: I8 = 1 * 128\n",
+            "pub const BAD_BOTH: I8 = 128 * 129\n",
+            "pub const BAD_BOOL: Bool = 7 * 1\n",
+            "pub const BAD_BYTE_STR: Slice<Byte> = 1 * 2\n",
+            "pub const BAD_TUPLE: (Bool,) = (1 * 2,)\n",
+            "pub const BAD_ARRAY: Array<Bool, 1> = [1 * 2]\n",
+            "pub const ISIZE_ABOVE_W32: ISize = 65536 * 65536\n",
+            "pub const USIZE_ABOVE_W32: USize = 65536 * 65536\n",
+            "pub const BASE: I8 = 1\n",
+            "pub const PATH_OPERAND: I8 = 2 * BASE\n",
+            "pub const CHAINED: I8 = 1 * 2 * 3\n",
+            "pub const NESTED: I8 = (1 * 2) * 3\n",
+            "pub const WRAPPING: I8 = 64 *% 2\n",
+            "pub const MIXED: I8 = 1 * true\n",
+            "pub const BYTE_OPERAND: I8 = 1 * b'\\0'\n",
+            "enum Bits { One(I8) }\n",
+            "pub const ENUM_PAYLOAD: Bits = Bits.One(1 * 2)\n",
+        );
+
+        for target in ["wasm32-core", "wasm64-core"] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+
+            assert_eq!(resolved.owners().len(), 21);
+            for index in [0, 1, 2, 3] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("overflow remains a supported checked expression");
+                assert!(check.is_supported());
+                assert!(!check.is_valid());
+                assert_eq!(check.diagnostics().len(), 1);
+                assert_eq!(
+                    check.diagnostics()[0].code,
+                    sai_diagnostics::Code::ConstEvalPanic
+                );
+                assert!(
+                    check.diagnostics()[0].message.contains("Overflow(Mul)")
+                        && check.diagnostics()[0]
+                            .message
+                            .contains("integer overflow in multiplication"),
+                    "multiplication overflow identifies the panic kind: {:?}",
+                    check.diagnostics()[0]
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("invalid multiplication does not fail resolution"),
+                    None
+                );
+            }
+            let operator_range = resolved.owners()[0]
+                .literal_check()
+                .expect("operator-span check succeeds")
+                .diagnostics()[0]
+                .primary()
+                .expect("overflow primary span points at the binary operator")
+                .span
+                .range;
+            let operator_start = root
+                .find("*/ * -8")
+                .expect("binary multiplication after comment exists")
+                + "*/ ".len();
+            assert_eq!(operator_range.start().to_usize(), operator_start);
+            assert_eq!(operator_range.end().to_usize(), operator_start + 1);
+
+            for (index, expected_diagnostics) in [(4, 1), (5, 1), (6, 2)] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("invalid operand ranges remain checked");
+                assert!(check.is_supported());
+                assert!(!check.is_valid());
+                assert_eq!(check.diagnostics().len(), expected_diagnostics);
+                assert!(
+                    check
+                        .diagnostics()
+                        .iter()
+                        .all(|diagnostic| diagnostic.code
+                            == sai_diagnostics::Code::LiteralOutOfRange),
+                    "operand range errors suppress multiplication overflow: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("invalid operand evaluation does not fail resolution"),
+                    None
+                );
+            }
+            let both_out_of_range = resolved.owners()[6]
+                .literal_check()
+                .expect("both operand range diagnostics are retained")
+                .diagnostics();
+            let first_bad_literal = root
+                .find("128 * 129")
+                .expect("both-invalid multiplication exists");
+            for (diagnostic, expected_start, expected_length) in [
+                (&both_out_of_range[0], first_bad_literal, "128".len()),
+                (
+                    &both_out_of_range[1],
+                    first_bad_literal + "128 * ".len(),
+                    "129".len(),
+                ),
+            ] {
+                let range = diagnostic
+                    .primary()
+                    .expect("range diagnostic points at its operand")
+                    .span
+                    .range;
+                assert_eq!(range.start().to_usize(), expected_start);
+                assert_eq!(range.end().to_usize(), expected_start + expected_length);
+            }
+            for index in [7, 8, 9, 10] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("wrong result type remains checked");
+                assert!(check.is_supported());
+                assert!(!check.is_valid());
+                assert_eq!(check.diagnostics().len(), 1);
+                assert_eq!(
+                    check.diagnostics()[0].code,
+                    sai_diagnostics::Code::TypeMismatch
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("type mismatch evaluation does not fail resolution"),
+                    None
+                );
+            }
+
+            let pointer_width = target_cfg.pointer_width();
+            for (index, expected) in [
+                (
+                    11,
+                    (pointer_width == 64).then_some(ConstValue::Int {
+                        value: 4_294_967_296,
+                        ty: sai_ty::ty::IntTy::ISize,
+                    }),
+                ),
+                (
+                    12,
+                    (pointer_width == 64).then_some(ConstValue::Uint {
+                        value: 4_294_967_296,
+                        ty: sai_ty::ty::UintTy::USize,
+                    }),
+                ),
+            ] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("pointer-width multiplication remains supported");
+                assert!(check.is_supported());
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("pointer-width evaluation succeeds"),
+                    expected,
+                    "pointer-width product at owner index {index} for {target}"
+                );
+                assert_eq!(check.diagnostics().len(), usize::from(pointer_width == 32));
+                if pointer_width == 32 {
+                    assert_eq!(
+                        check.diagnostics()[0].code,
+                        sai_diagnostics::Code::ConstEvalPanic
+                    );
+                }
+            }
+
+            for index in 14..=20 {
                 assert_eq!(
                     resolved.owners()[index]
                         .literal_check()
