@@ -7495,14 +7495,15 @@ pub enum ConstValueType {
 /// fields are supported direct scalar, byte-string, or unit literals or Bool
 /// literal-only `not`/`and`/`or` expressions and comparisons between direct
 /// Bool literals. A direct unary bitwise-NOT over an integer or `Byte` literal
-/// is also supported in scalar constants and flat tuple/array leaves. Flat
-/// tuple and array scalar leaves may also use direct references to other
-/// supported constants. Flat arrays allow the existing scalar, canonical
-/// `Str`, canonical `Slice<Byte>`, or unit element literals and Bool
-/// literal-only `not`/`and`/`or` expressions and comparisons between direct
-/// Bool literals. They require an explicit built-in `Array<T, N>` type with a
-/// literal length. Top-level Bool expressions use those same Bool forms. It
-/// does not imply that other constant expressions are evaluated.
+/// and a direct addition of two integer literals are also supported in scalar
+/// constants and flat tuple/array leaves. Flat tuple and array scalar leaves
+/// may also use direct references to other supported constants. Flat arrays
+/// allow the existing scalar, canonical `Str`, canonical `Slice<Byte>`, or
+/// unit element literals and Bool literal-only `not`/`and`/`or` expressions
+/// and comparisons between direct Bool literals. They require an explicit
+/// built-in `Array<T, N>` type with a literal length. Top-level Bool
+/// expressions use those same Bool forms. It does not imply that other
+/// constant expressions are evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -8143,6 +8144,7 @@ fn evaluate_const_value(
                 !is_direct_const_literal_or_unit(value)
                     && !is_const_bool_literal_expression(value)
                     && !is_supported_const_bitnot_literal_expression(value)
+                    && !is_supported_const_integer_addition_expression(value)
             }) || values.len() != tuple_element_types.len()
             {
                 return None;
@@ -8178,6 +8180,7 @@ fn evaluate_const_value(
                 !is_direct_const_literal_or_unit(value)
                     && !is_const_bool_literal_expression(value)
                     && !is_supported_const_bitnot_literal_expression(value)
+                    && !is_supported_const_integer_addition_expression(value)
             }) {
                 return None;
             }
@@ -8283,6 +8286,15 @@ fn evaluate_const_literal_value(
 ) -> Option<ConstValue> {
     if let ExprKind::Unary(UnOp::BitNot, operand) = value.kind {
         return evaluate_const_bitwise_not_literal(literal_type, operand, symbols, target_cfg);
+    }
+    if is_supported_const_integer_addition_expression(value) {
+        let ConstLiteralType::Primitive(primitive) = literal_type else {
+            return None;
+        };
+        return match evaluate_const_integer_addition(primitive, value, target_cfg)? {
+            ConstIntegerAdditionResult::Value(value) => Some(value),
+            ConstIntegerAdditionResult::Overflow => None,
+        };
     }
 
     match literal_type {
@@ -8404,6 +8416,142 @@ fn const_unsigned_integer_width(ty: sai_ty::ty::UintTy, pointer_width: u8) -> u3
         sai_ty::ty::UintTy::U64 => 64,
         sai_ty::ty::UintTy::USize => u32::from(pointer_width),
     }
+}
+
+enum ConstIntegerAdditionResult {
+    Value(ConstValue),
+    Overflow,
+}
+
+fn const_integer_addition_operands<'hir>(
+    value: &HirExpr<'hir>,
+) -> Option<(&'hir HirExpr<'hir>, &'hir HirExpr<'hir>)> {
+    let ExprKind::Binary(BinOp::Add, left, right) = value.kind else {
+        return None;
+    };
+    (matches!(left.kind, ExprKind::Lit(Lit::Int { .. }))
+        && matches!(right.kind, ExprKind::Lit(Lit::Int { .. })))
+    .then_some((left, right))
+}
+
+fn is_supported_const_integer_addition_expression(value: &HirExpr<'_>) -> bool {
+    const_integer_addition_operands(value).is_some()
+}
+
+fn evaluate_const_integer_addition(
+    primitive: sai_resolve::prelude::PrimTy,
+    value: &HirExpr<'_>,
+    target_cfg: &TargetCfg,
+) -> Option<ConstIntegerAdditionResult> {
+    let (left, right) = const_integer_addition_operands(value)?;
+    let (
+        ExprKind::Lit(Lit::Int {
+            value: left_magnitude,
+            negated: left_negated,
+        }),
+        ExprKind::Lit(Lit::Int {
+            value: right_magnitude,
+            negated: right_negated,
+        }),
+    ) = (left.kind, right.kind)
+    else {
+        return None;
+    };
+    let left = evaluate_const_integer_literal(primitive, left_magnitude, left_negated)?;
+    let right = evaluate_const_integer_literal(primitive, right_magnitude, right_negated)?;
+
+    match (left, right) {
+        (
+            ConstValue::Int {
+                value: left,
+                ty: left_ty,
+            },
+            ConstValue::Int {
+                value: right,
+                ty: right_ty,
+            },
+        ) if left_ty == right_ty => {
+            let width = const_signed_integer_width(left_ty, target_cfg.pointer_width());
+            if width == 0 || width >= 128 {
+                return None;
+            }
+            let minimum = -(1_i128 << (width - 1));
+            let maximum = (1_i128 << (width - 1)) - 1;
+            let Some(sum) = left.checked_add(right) else {
+                return Some(ConstIntegerAdditionResult::Overflow);
+            };
+            if !(minimum..=maximum).contains(&sum) {
+                Some(ConstIntegerAdditionResult::Overflow)
+            } else {
+                Some(ConstIntegerAdditionResult::Value(ConstValue::Int {
+                    value: sum,
+                    ty: left_ty,
+                }))
+            }
+        }
+        (
+            ConstValue::Uint {
+                value: left,
+                ty: left_ty,
+            },
+            ConstValue::Uint {
+                value: right,
+                ty: right_ty,
+            },
+        ) if left_ty == right_ty => {
+            let width = const_unsigned_integer_width(left_ty, target_cfg.pointer_width());
+            if width == 0 || width >= 128 {
+                return None;
+            }
+            let maximum = (1_u128 << width) - 1;
+            let Some(sum) = left.checked_add(right) else {
+                return Some(ConstIntegerAdditionResult::Overflow);
+            };
+            if sum > maximum {
+                Some(ConstIntegerAdditionResult::Overflow)
+            } else {
+                Some(ConstIntegerAdditionResult::Value(ConstValue::Uint {
+                    value: sum,
+                    ty: left_ty,
+                }))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn const_integer_addition_operator_span(
+    value: &HirExpr<'_>,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<sai_hir::Span, OwnerControlFlowResolutionError> {
+    let (left, right) = const_integer_addition_operands(value)
+        .ok_or(OwnerControlFlowResolutionError::SnapshotMismatch)?;
+    if left.span.file != value.span.file
+        || right.span.file != value.span.file
+        || left.span.ctxt != value.span.ctxt
+        || right.span.ctxt != value.span.ctxt
+        || left.span.range.end() > right.span.range.start()
+    {
+        return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+    }
+    let lexed = sai_syntax::lex(snapshot, value.span.file)
+        .map_err(|_| OwnerControlFlowResolutionError::SnapshotMismatch)?;
+    let mut operators = lexed.tokens.iter().filter(|token| {
+        token.kind == sai_syntax::SyntaxKind::PLUS
+            && token.range.start() >= left.span.range.end()
+            && token.range.end() <= right.span.range.start()
+    });
+    let operator = operators
+        .next()
+        .ok_or(OwnerControlFlowResolutionError::SnapshotMismatch)?;
+    if operators.next().is_some() {
+        return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+    }
+    Ok(sai_hir::Span {
+        file: value.span.file,
+        range: operator.range,
+        ctxt: value.span.ctxt,
+    })
 }
 
 fn is_supported_const_bitnot_literal_expression(value: &HirExpr<'_>) -> bool {
@@ -9343,7 +9491,9 @@ fn check_const_byte_str_literal(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    if is_supported_const_bitnot_literal_expression(value) {
+    if is_supported_const_bitnot_literal_expression(value)
+        || is_supported_const_integer_addition_expression(value)
+    {
         return check_const_literal_against_type(
             owner,
             ConstLiteralType::ByteStr,
@@ -9407,6 +9557,7 @@ fn check_const_array_literal(
         let found_type = match value.kind {
             ExprKind::Lit(literal) => const_literal_found_type(literal),
             ExprKind::Tuple(elements) if elements.is_empty() => "unit",
+            _ if is_supported_const_integer_addition_expression(value) => "an integer expression",
             _ if is_const_bool_literal_expression(value) => "Bool",
             _ => return Ok(None),
         };
@@ -9425,6 +9576,7 @@ fn check_const_array_literal(
         !is_direct_const_literal_or_unit(value)
             && !is_const_bool_literal_expression(value)
             && !is_supported_const_bitnot_literal_expression(value)
+            && !is_supported_const_integer_addition_expression(value)
             && !is_direct_const_reference_candidate(value)
     }) {
         return Ok(None);
@@ -12817,8 +12969,10 @@ fn check_const_tuple_literal(
     };
 
     let ExprKind::Tuple(values) = value.kind else {
-        let ExprKind::Lit(literal) = value.kind else {
-            return Ok(None);
+        let found_type = match value.kind {
+            ExprKind::Lit(literal) => const_literal_found_type(literal),
+            _ if is_supported_const_integer_addition_expression(value) => "an integer expression",
+            _ => return Ok(None),
         };
         let diagnostics = vec![const_literal_diagnostic(
             owner.id,
@@ -12826,10 +12980,7 @@ fn check_const_tuple_literal(
             snapshot,
             value.span,
             sai_diagnostics::Code::TypeMismatch,
-            format!(
-                "expected a tuple, found {}",
-                const_literal_found_type(literal)
-            ),
+            format!("expected a tuple, found {found_type}"),
             "type mismatch",
         )?];
         return Ok(Some((diagnostics, expected_types)));
@@ -12839,6 +12990,7 @@ fn check_const_tuple_literal(
         !is_direct_const_literal_or_unit(value)
             && !is_const_bool_literal_expression(value)
             && !is_supported_const_bitnot_literal_expression(value)
+            && !is_supported_const_integer_addition_expression(value)
             && !is_direct_const_reference_candidate(value)
     }) {
         return Ok(None);
@@ -14243,6 +14395,90 @@ fn check_const_literal_against_type(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let mismatch = |expected: &str, found: &str| {
+        const_literal_diagnostic(
+            owner,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `{expected}`, found {found}"),
+            "type mismatch",
+        )
+    };
+
+    if let Some((left, right)) = const_integer_addition_operands(value) {
+        let ConstLiteralType::Primitive(primitive) = literal_type else {
+            return Ok(Some(vec![mismatch(
+                local_enum_variant_type_name(literal_type),
+                "an integer expression",
+            )?]));
+        };
+        if !is_integer_primitive(primitive) {
+            return Ok(Some(vec![mismatch(
+                const_primitive_name(primitive),
+                "an integer expression",
+            )?]));
+        }
+
+        let mut diagnostics = Vec::new();
+        for operand in [left, right] {
+            let ExprKind::Lit(literal @ Lit::Int { .. }) = operand.kind else {
+                return Ok(None);
+            };
+            match sai_ty::typeck::literal::check_primitive_literal(
+                primitive,
+                literal,
+                symbols,
+                target_cfg.pointer_width(),
+            ) {
+                sai_ty::typeck::literal::PrimitiveLiteralResult::Match => {}
+                sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => {
+                    diagnostics.push(mismatch(
+                        const_primitive_name(primitive),
+                        const_literal_found_type(literal),
+                    )?);
+                }
+                sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
+                    diagnostics.push(const_literal_diagnostic(
+                        owner,
+                        inputs,
+                        snapshot,
+                        operand.span,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        format!(
+                            "integer literal is out of range for `{}`",
+                            const_primitive_name(primitive)
+                        ),
+                        "literal out of range",
+                    )?);
+                }
+            }
+        }
+        if !diagnostics.is_empty() {
+            return Ok(Some(diagnostics));
+        }
+
+        match evaluate_const_integer_addition(primitive, value, target_cfg) {
+            Some(ConstIntegerAdditionResult::Value(_)) => {}
+            Some(ConstIntegerAdditionResult::Overflow) => {
+                let operator_span = const_integer_addition_operator_span(value, snapshot)?;
+                diagnostics.push(const_literal_diagnostic(
+                    owner,
+                    inputs,
+                    snapshot,
+                    operator_span,
+                    sai_diagnostics::Code::ConstEvalPanic,
+                    "constant evaluation would panic with Overflow(Add): integer overflow in addition"
+                        .to_owned(),
+                    "constant evaluation panic",
+                )?);
+            }
+            None => return Err(OwnerControlFlowResolutionError::SnapshotMismatch),
+        }
+        return Ok(Some(diagnostics));
+    }
+
     let (literal, literal_span) = match value.kind {
         ExprKind::Lit(literal) => (Some(literal), value.span),
         ExprKind::Unary(UnOp::BitNot, operand)
@@ -14257,18 +14493,6 @@ fn check_const_literal_against_type(
         }
         ExprKind::Tuple(elements) if elements.is_empty() => (None, value.span),
         _ => return Ok(None),
-    };
-
-    let mismatch = |expected: &str, found: &str| {
-        const_literal_diagnostic(
-            owner,
-            inputs,
-            snapshot,
-            value.span,
-            sai_diagnostics::Code::TypeMismatch,
-            format!("expected `{expected}`, found {found}"),
-            "type mismatch",
-        )
     };
 
     let Some(literal) = literal else {
@@ -81335,6 +81559,435 @@ property "shared"() {}
     }
 
     #[test]
+    fn const_direct_integer_addition_checks_type_width_and_gates_other_forms() {
+        use sai_resolve::prelude::PrimTy;
+        use sai_ty::ty::{IntTy, UintTy};
+
+        let root = concat!(
+            "pub const I8_VALUE: I8 = -127 + 1\n",
+            "pub const I16_VALUE: I16 = -32768 + 32767\n",
+            "pub const I32_VALUE: I32 = 2147483646 + 1\n",
+            "pub const I64_VALUE: I64 = 9223372036854775806 + 1\n",
+            "pub const ISIZE_VALUE: ISize = -2147483648 + 2147483647\n",
+            "pub const U8_VALUE: U8 = 254 + 1\n",
+            "pub const U16_VALUE: U16 = 65534 + 1\n",
+            "pub const U32_VALUE: U32 = 4294967294 + 1\n",
+            "pub const U64_VALUE: U64 = 18446744073709551614 + 1\n",
+            "pub const USIZE_VALUE: USize = 1 + 1\n",
+            "pub const TUPLE_VALUE: (I8, U8, I32) = (-100 + 99, 254 + 1, 40 + 2)\n",
+            "pub const ARRAY_VALUE: Array<U16, 2> = [65534 + 1, 3 + 2]\n",
+            "pub const BASE: I32 = 40\n",
+            "pub const MIXED_REFERENCE: (I32, I32) = (1 + 2, BASE)\n",
+            "pub const ISIZE_ABOVE_W32: ISize = 2147483647 + 1\n",
+            "pub const USIZE_ABOVE_W32: USize = 4294967295 + 1\n",
+            "pub const I8_POSITIVE_OVERFLOW: I8 = 127 + 1\n",
+            "pub const I8_NEGATIVE_OVERFLOW: I8 = -128 + -1\n",
+            "pub const U8_OVERFLOW: U8 = 255 + 1\n",
+            "pub const BAD_LEFT: I8 = 128 + 1\n",
+            "pub const BAD_RIGHT: I8 = 1 + 128\n",
+            "pub const BAD_BOTH: I8 = 128 + 129\n",
+            "pub const BAD_BOOL: Bool = 127 + 1\n",
+            "pub const BAD_BYTE_STR: Slice<Byte> = 1 + 2\n",
+            "pub const BAD_TUPLE: (I8,) = 1 + 2\n",
+            "pub const BAD_ARRAY: Array<I8, 1> = 1 + 2\n",
+            "pub const COMMENT_OVERFLOW: I8 = 127 /* comment + plus */ + 1\n",
+            "pub const PATH_OPERAND: I8 = 1 + BASE\n",
+            "pub const CHAINED: I8 = 1 + 2 + 3\n",
+            "pub const NESTED: I8 = (1 + 2) + 3\n",
+            "pub const WRAPPING: I8 = 127 +% 1\n",
+            "enum Bits { One(I8) }\n",
+            "pub const ENUM_PAYLOAD: Bits = Bits.One(1 + 2)\n",
+            "pub const MIXED_ARRAY: Array<I32, 2> = [1 + 2, BASE]\n",
+        );
+
+        for target in ["wasm32-core", "wasm64-core"] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+
+            let expected_scalars = [
+                ConstValue::Int {
+                    value: -126,
+                    ty: IntTy::I8,
+                },
+                ConstValue::Int {
+                    value: -1,
+                    ty: IntTy::I16,
+                },
+                ConstValue::Int {
+                    value: i32::MAX.into(),
+                    ty: IntTy::I32,
+                },
+                ConstValue::Int {
+                    value: i64::MAX.into(),
+                    ty: IntTy::I64,
+                },
+                ConstValue::Int {
+                    value: -1,
+                    ty: IntTy::ISize,
+                },
+                ConstValue::Uint {
+                    value: u8::MAX.into(),
+                    ty: UintTy::U8,
+                },
+                ConstValue::Uint {
+                    value: u16::MAX.into(),
+                    ty: UintTy::U16,
+                },
+                ConstValue::Uint {
+                    value: u32::MAX.into(),
+                    ty: UintTy::U32,
+                },
+                ConstValue::Uint {
+                    value: u64::MAX.into(),
+                    ty: UintTy::U64,
+                },
+                ConstValue::Uint {
+                    value: 2,
+                    ty: UintTy::USize,
+                },
+            ];
+            assert_eq!(resolved.owners().len(), 33);
+            for (index, expected) in expected_scalars.into_iter().enumerate() {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("literal check uses the current owner snapshot");
+                assert!(
+                    check.is_supported() && check.is_valid() && check.requires_const_value(),
+                    "supported integer addition at owner index {index}: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("const evaluation succeeds"),
+                    Some(expected),
+                    "integer addition result at owner index {index} for {target}"
+                );
+            }
+
+            assert_eq!(
+                resolved.owners()[10]
+                    .const_value()
+                    .expect("flat tuple evaluation succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![
+                        ConstValue::Int {
+                            value: -1,
+                            ty: IntTy::I8,
+                        },
+                        ConstValue::Uint {
+                            value: u8::MAX.into(),
+                            ty: UintTy::U8,
+                        },
+                        ConstValue::Int {
+                            value: 42,
+                            ty: IntTy::I32,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[11]
+                    .const_value()
+                    .expect("flat array evaluation succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::U16),
+                    elements: vec![
+                        ConstValue::Uint {
+                            value: u16::MAX.into(),
+                            ty: UintTy::U16,
+                        },
+                        ConstValue::Uint {
+                            value: 5,
+                            ty: UintTy::U16,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[13]
+                    .const_value()
+                    .expect("mixed aggregate template materialization succeeds"),
+                Some(ConstValue::Aggregate {
+                    variant: None,
+                    fields: vec![
+                        ConstValue::Int {
+                            value: 3,
+                            ty: IntTy::I32,
+                        },
+                        ConstValue::Int {
+                            value: 40,
+                            ty: IntTy::I32,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+            assert_eq!(
+                resolved.owners()[32]
+                    .const_value()
+                    .expect("mixed array template materialization succeeds"),
+                Some(ConstValue::Array {
+                    element_type: ConstValueType::Primitive(PrimTy::I32),
+                    elements: vec![
+                        ConstValue::Int {
+                            value: 3,
+                            ty: IntTy::I32,
+                        },
+                        ConstValue::Int {
+                            value: 40,
+                            ty: IntTy::I32,
+                        },
+                    ]
+                    .into(),
+                })
+            );
+
+            let pointer_width = target_cfg.pointer_width();
+            for (index, expected) in [
+                (
+                    14,
+                    (pointer_width == 64).then_some(ConstValue::Int {
+                        value: 2_147_483_648,
+                        ty: IntTy::ISize,
+                    }),
+                ),
+                (
+                    15,
+                    (pointer_width == 64).then_some(ConstValue::Uint {
+                        value: 4_294_967_296,
+                        ty: UintTy::USize,
+                    }),
+                ),
+            ] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("pointer-width addition remains supported");
+                assert!(check.is_supported(), "pointer-width check: {check:?}");
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("pointer-width evaluation succeeds"),
+                    expected,
+                    "pointer-width result at owner index {index} for {target}"
+                );
+                if pointer_width == 32 {
+                    assert_eq!(check.diagnostics().len(), 1);
+                    assert_eq!(
+                        check.diagnostics()[0].code,
+                        sai_diagnostics::Code::ConstEvalPanic
+                    );
+                } else {
+                    assert!(check.is_valid());
+                }
+            }
+
+            for index in [16, 17, 18, 26] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("overflow remains a supported checked expression");
+                assert!(check.is_supported());
+                assert!(!check.is_valid());
+                assert_eq!(check.diagnostics().len(), 1);
+                assert_eq!(
+                    check.diagnostics()[0].code,
+                    sai_diagnostics::Code::ConstEvalPanic
+                );
+                assert!(
+                    check.diagnostics()[0].message.contains("Overflow(Add)"),
+                    "overflow diagnostic identifies the panic kind: {:?}",
+                    check.diagnostics()[0]
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("invalid addition does not fail resolution"),
+                    None
+                );
+            }
+            let comment_operator_span = resolved.owners()[26]
+                .literal_check()
+                .expect("comment overflow check succeeds")
+                .diagnostics()[0]
+                .primary()
+                .expect("overflow primary span points at the operator")
+                .span
+                .range;
+            let comment_operator_start =
+                root.find("*/ + 1").expect("operator after comment exists") + "*/ ".len();
+            assert_eq!(
+                comment_operator_span.start().to_usize(),
+                comment_operator_start
+            );
+            assert_eq!(
+                comment_operator_span.end().to_usize(),
+                comment_operator_start + 1
+            );
+
+            for (index, expected_diagnostics) in [(19, 1), (20, 1), (21, 2)] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("invalid operand ranges remain checked");
+                assert!(check.is_supported());
+                assert!(!check.is_valid());
+                assert_eq!(check.diagnostics().len(), expected_diagnostics);
+                assert!(
+                    check
+                        .diagnostics()
+                        .iter()
+                        .all(|diagnostic| diagnostic.code
+                            == sai_diagnostics::Code::LiteralOutOfRange),
+                    "operand range errors suppress arithmetic overflow: {check:?}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("invalid operand evaluation does not fail resolution"),
+                    None
+                );
+            }
+            let expected_range_spans = [
+                (
+                    19,
+                    vec![root.find("128 + 1").expect("bad left operand exists")],
+                ),
+                (
+                    20,
+                    vec![root.find("1 + 128").expect("bad right operand exists") + "1 + ".len()],
+                ),
+                (
+                    21,
+                    vec![
+                        root.find("128 + 129").expect("first bad operand exists"),
+                        root.find("128 + 129").expect("second bad operand exists") + "128 + ".len(),
+                    ],
+                ),
+            ];
+            for (index, starts) in expected_range_spans {
+                let diagnostics = resolved.owners()[index]
+                    .literal_check()
+                    .expect("operand range diagnostics remain checked")
+                    .diagnostics();
+                for (diagnostic, expected_start) in diagnostics.iter().zip(starts) {
+                    let range = diagnostic
+                        .primary()
+                        .expect("range diagnostic points at its operand")
+                        .span
+                        .range;
+                    assert_eq!(range.start().to_usize(), expected_start);
+                    assert_eq!(range.end().to_usize(), expected_start + "128".len());
+                }
+            }
+
+            for index in [22, 23, 24, 25] {
+                let check = resolved.owners()[index]
+                    .literal_check()
+                    .expect("wrong result type remains checked");
+                assert!(check.is_supported());
+                assert!(!check.is_valid());
+                assert_eq!(check.diagnostics().len(), 1);
+                assert_eq!(
+                    check.diagnostics()[0].code,
+                    sai_diagnostics::Code::TypeMismatch
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("type mismatch evaluation does not fail resolution"),
+                    None
+                );
+            }
+
+            for index in [27, 28, 29, 30, 31] {
+                assert_eq!(
+                    resolved.owners()[index]
+                        .literal_check()
+                        .expect("unsupported expression remains resolvable"),
+                    &ConstLiteralCheck::Unsupported,
+                    "paths, chained/nested/wrapping operators, and enum payloads remain gated at owner index {index}"
+                );
+                assert_eq!(
+                    resolved.owners()[index]
+                        .const_value()
+                        .expect("unsupported evaluation does not fail resolution"),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn const_addition_aggregate_leaf_type_mismatches_point_at_each_expression() {
+        let root = concat!(
+            "pub const BAD_TUPLE_LEAF: (Bool,) = (1 + 2,)\n",
+            "pub const BAD_ARRAY_LEAF: Array<Bool, 1> = [1 + 2]\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        assert_eq!(resolved.owners().len(), 2);
+        for (index, declaration) in [
+            (0, "pub const BAD_TUPLE_LEAF"),
+            (1, "pub const BAD_ARRAY_LEAF"),
+        ] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("aggregate leaf mismatch remains checked");
+            assert!(check.is_supported());
+            assert!(!check.is_valid());
+            assert_eq!(check.diagnostics().len(), 1);
+            assert_eq!(
+                check.diagnostics()[0].code,
+                sai_diagnostics::Code::TypeMismatch
+            );
+            let range = check.diagnostics()[0]
+                .primary()
+                .expect("mismatch points at the complete aggregate leaf expression")
+                .span
+                .range;
+            let declaration_start = root
+                .find(declaration)
+                .expect("aggregate declaration exists");
+            let start = root[declaration_start..]
+                .find("1 + 2")
+                .expect("leaf addition expression exists")
+                + declaration_start;
+            assert_eq!(range.start().to_usize(), start);
+            assert_eq!(range.end().to_usize(), start + "1 + 2".len());
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("mismatched aggregate remains resolvable"),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn const_bool_direct_logical_literals_produce_bool_values() {
         use sai_resolve::prelude::PrimTy;
 
@@ -81957,7 +82610,7 @@ property "shared"() {}
             "pub const UNSIGNED_HIGH: U8 = 256\n",
             "pub const UNSIGNED_NEGATIVE: U8 = -1\n",
             "pub const TOO_WIDE: I64 = 340282366920938463463374607431768211456\n",
-            "pub const COMPUTED: I32 = 1 + 2\n",
+            "pub const COMPUTED: I32 = 1 + 2 + 3\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -84751,8 +85404,8 @@ property "shared"() {}
             "pub const SCALAR_MISMATCH: Array<I32, 1> = false\n",
             "pub const READY: I32 = 1\n",
             "pub const PATH_ELEMENT: Array<I32, 1> = [READY]\n",
-            "pub const COMPUTED_ELEMENT: Array<I32, 1> = [1 + 2]\n",
-            "pub const NESTED: Array<Array<I32, 1>, 1> = [[1]]\n",
+            "pub const COMPUTED_ELEMENT: Array<I32, 1> = [1 + 2 + 3]\n",
+            "pub const NESTED: Array<Array<I32, 1>, 1> = [[1 + 2]]\n",
             "pub type Number = I32\n",
             "pub const ALIAS_ELEMENT: Array<Number, 1> = [1]\n",
             "pub const EMPTY_I32: Array<I32, 0> = []\n",
