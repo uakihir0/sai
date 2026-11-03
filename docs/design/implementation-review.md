@@ -4,6 +4,13 @@
 
 ## Open for review
 
+### IR-1125 (2026-11-03): direct constant references in flat aggregates
+
+- **Decision — review required:** Extend the bounded constant evaluator so a supported flat tuple or array initializer may contain direct const references in scalar fields or elements alongside the existing literal forms. Resolve every leaf to an exact same-package const `DefId`, require its declared value shape to equal that leaf's resolved literal type, and retain source order and array element metadata when materializing the aggregate.
+- **Reason:** Spec/06 §6.27 permits paths as constant expressions and tuple/array construction. Reusing the bounded direct-reference resolver and the existing flat tuple/array checks supports this composition without admitting nested aggregate evaluation or general expressions.
+- **Boundary and judgment:** Only direct, plain, unqualified, one-segment paths in top-level flat tuple fields or array elements are candidates. The target must be a supported const in the current owner collection, its written spelling must match its canonical declaration name, and it must have the exact field or element type. Qualified, aliased, cross-package, unresolved, non-const, nested, computed, enum-payload, and otherwise unsupported forms remain gated. Supported but invalid or cyclic dependencies suppress values without an additional feature gate; type mismatches point at the individual path. Multiple leaves create multiple outgoing dependency edges. For a cyclic strongly connected component, emit one `CONST_CYCLE` diagnostic anchored at its lowest `DefId`, using a deterministic witness path, then block every member and dependent value. This avoids emitting an unbounded set of diagnostics for branching cycles and replaces IR-1122's one-edge-per-owner limitation.
+- **Review required:** Verify exact path/target identity and same-package gates, exact field/element type checks and spans, mixed literal/reference value order and metadata, invalid-target propagation, multiple dependencies, one deterministic diagnostic per cyclic component, unsupported expression gates, and unchanged top-level reference behavior. Review the SCC diagnostic policy and the private post-HIR value template.
+
 ### IR-1122 (2026-11-03): direct constant references and cycle detection
 
 - **Decision — review required:** Extend the existing bounded constant evaluator to accept a public, attribute-free, canonically named constant whose initializer is one plain, unqualified, one-segment reference to another supported constant in the same package. Copy the target's validated `ConstValue`, preserving its exact primitive type, bytes, tuple fields, or array element metadata.
