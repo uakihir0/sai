@@ -19424,6 +19424,71 @@ fn str_comparison_const_mismatches_and_gates_are_preserved() {
 }
 
 #[test]
+fn public_unit_literal_comparison_consts_emit_check_results() {
+    let source = concat!(
+        "pub const EQ: Bool = () == ()\n",
+        "pub const NE: Bool = () != ()\n",
+        "pub const LT: Bool = () < ()\n",
+        "pub const LE: Bool = () <= ()\n",
+        "pub const GT: Bool = () > ()\n",
+        "pub const GE: Bool = () >= ()\n",
+        "pub const NESTED: Bool = not (() > ()) and (() <= ())\n",
+        "pub const TUPLE: (Bool, Bool) = (() < (), () == ())\n",
+        "pub const ARRAY: Array<Bool, 2> = [() != (), () >= ()]\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn unit_comparison_const_mismatches_and_gates_are_preserved() {
+    for (source, initializer) in [
+        ("pub const MISMATCH: I32 = () < ()\n", "() < ()"),
+        ("pub const TUPLE_MISMATCH: (I32,) = (() < (),)\n", "() < ()"),
+        (
+            "pub const ARRAY_MISMATCH: Array<I32, 1> = [() == ()]\n",
+            "() == ()",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "comparison assigned to another type should fail:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "a supported unit comparison with the wrong declared type is a checked mismatch:\n{stdout}"
+        );
+        let start = source
+            .find(initializer)
+            .expect("mismatched comparison initializer exists");
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            start,
+            start + initializer.len(),
+        );
+    }
+
+    for source in [
+        "pub const BASE: () = ()\npub const PATH: Bool = BASE == ()\n",
+        "pub const MIXED_BOOL: Bool = () == true\n",
+        "pub const MIXED_CHAR: Bool = () == 'a'\n",
+        "pub const MIXED_BYTE: Bool = () == b'a'\n",
+        "pub const MIXED_FLOAT: Bool = () == 1.0\n",
+        "pub const MIXED_STR: Bool = () == \"\"\n",
+        "pub const MIXED_INT: Bool = () == 1\n",
+        "pub const NESTED_COMPARISON: Bool = (() == ()) == true\n",
+        "pub const BASE: () = ()\npub const SHORT_CIRCUIT_PATH: Bool = false and (BASE == ())\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_f64_literal_comparison_consts_emit_check_results() {
     let source = concat!(
         "pub const EQ: Bool = 1.0 == 1.0\n",
