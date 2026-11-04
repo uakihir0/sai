@@ -279,31 +279,45 @@ fn assert_json_diagnostic_primary_span(
 }
 
 fn assert_json_diagnostic_primary_byte_span(stdout: &str, code: &str, start: usize, end: usize) {
+    assert_json_diagnostic_primary_byte_spans(stdout, code, &[(start, end)]);
+}
+
+fn assert_json_diagnostic_primary_byte_spans(
+    stdout: &str,
+    code: &str,
+    expected_spans: &[(usize, usize)],
+) {
     let matching_records = stdout
         .lines()
         .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
         .collect::<Vec<_>>();
     assert_eq!(
         matching_records.len(),
-        1,
-        "expected exactly one {code} diagnostic:\n{stdout}"
+        expected_spans.len(),
+        "expected {} {code} diagnostics:\n{stdout}",
+        expected_spans.len(),
     );
-    let diagnostic = matching_records[0];
-    let primary = diagnostic
-        .split_once("\"primary\":")
-        .expect("diagnostic has a primary field")
-        .1
-        .split_once(",\"primary_label\":")
-        .expect("primary span ends before the primary label")
-        .0;
-    assert!(
-        primary.contains(&format!("\"start\":{{\"byte\":{start},")),
-        "{code} diagnostic has the wrong primary start span:\n{diagnostic}"
-    );
-    assert!(
-        primary.contains(&format!("\"end\":{{\"byte\":{end},")),
-        "{code} diagnostic has the wrong primary end span:\n{diagnostic}"
-    );
+    for (start, end) in expected_spans {
+        let matching_primary_records = matching_records
+            .iter()
+            .filter(|diagnostic| {
+                let primary = diagnostic
+                    .split_once("\"primary\":")
+                    .expect("diagnostic has a primary field")
+                    .1
+                    .split_once(",\"primary_label\":")
+                    .expect("primary span ends before the primary label")
+                    .0;
+                primary.contains(&format!("\"start\":{{\"byte\":{start},"))
+                    && primary.contains(&format!("\"end\":{{\"byte\":{end},"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching_primary_records.len(),
+            1,
+            "{code} should have exactly one primary span {start}..{end}:\n{stdout}"
+        );
+    }
 }
 
 fn assert_success_result(output: Output, target: &str, profile: &str) {
@@ -19338,6 +19352,178 @@ fn char_and_byte_comparison_const_mismatches_and_gates_are_preserved() {
         "pub const COMPUTED: Bool = ('a' < 'b') == true\n",
         "pub const NESTED: Bool = 'a' == ('b' < 'c')\n",
         "pub const CHAR_BASE: Char = 'a'\npub const SHORT_CIRCUIT: Bool = false and (CHAR_BASE < 'b')\n",
+        "pub const UNRELATED: Bool = 1 < 2\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn public_f64_literal_comparison_consts_emit_check_results() {
+    let source = concat!(
+        "pub const EQ: Bool = 1.0 == 1.0\n",
+        "pub const NE: Bool = 1.0 != 2.0\n",
+        "pub const LT: Bool = 1.0 < 2.0\n",
+        "pub const LE: Bool = 2.0 <= 2.0\n",
+        "pub const GT: Bool = 2.0 > 1.0\n",
+        "pub const GE: Bool = 2.0 >= 2.0\n",
+        "pub const SIGNED_ZERO: Bool = -0.0 == 0.0\n",
+        "pub const SUBNORMAL: Bool = 5e-324 > 0.0\n",
+        "pub const UNDERFLOW: Bool = 1e-324 == 0.0\n",
+        "pub const F64_ROUNDING: Bool = 9007199254740992.0 == 9007199254740993.0\n",
+        "pub const NESTED: Bool = not (1.0 >= 2.0) and (-0.0 == 0.0)\n",
+        "pub const TUPLE: (Bool, Bool) = (1.0 < 2.0, 2.0 <= 2.0)\n",
+        "pub const ARRAY: Array<Bool, 2> = [2.0 > 1.0, 0.0 != -0.0]\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn f64_comparison_ranges_mismatches_and_gates_are_preserved() {
+    for (source, operands) in [
+        ("pub const LEFT: Bool = 1e309 < 2.0\n", vec!["1e309"]),
+        ("pub const RIGHT: Bool = 2.0 < 1e309\n", vec!["1e309"]),
+        (
+            "pub const BOTH: Bool = -1e309 == 1e309\n",
+            vec!["-1e309", "1e309"],
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: an out-of-range F64 operand should fail:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: an out-of-range literal is diagnosed without a result or feature gate:\n{stdout}"
+        );
+        let records = stdout
+            .lines()
+            .filter(|record| record.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records.len(),
+            operands.len(),
+            "{source:?}: each invalid operand gets one diagnostic:\n{stdout}"
+        );
+        let mut search_from = 0;
+        let mut expected_range_spans = Vec::new();
+        for operand in operands {
+            let relative_start = source[search_from..]
+                .find(operand)
+                .expect("out-of-range operand exists");
+            let start = search_from + relative_start;
+            let end = start + operand.len();
+            search_from = end;
+            expected_range_spans.push((start, end));
+        }
+        assert_json_diagnostic_primary_byte_spans(
+            &stdout,
+            "LITERAL_OUT_OF_RANGE",
+            &expected_range_spans,
+        );
+    }
+
+    let mismatch_source = "pub const RANGE_AND_MISMATCH: I32 = 1e309 < 2.0\n";
+    let mismatch_output = run_check(mismatch_source, "", &[], &[]);
+    let mismatch_stdout = String::from_utf8(mismatch_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        mismatch_output.status.code(),
+        Some(1),
+        "a wrong result type with an invalid float literal should fail:\n{mismatch_stdout}"
+    );
+    assert!(
+        mismatch_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && mismatch_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !mismatch_stdout.contains("\"type\":\"result\"")
+            && !mismatch_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "independent operand range and result-type diagnostics should both be retained:\n{mismatch_stdout}"
+    );
+    let mismatch_expression = "1e309 < 2.0";
+    let mismatch_start = mismatch_source
+        .find(mismatch_expression)
+        .expect("mismatched comparison initializer exists");
+    assert_json_diagnostic_primary_byte_span(
+        &mismatch_stdout,
+        "TYPE_MISMATCH",
+        mismatch_start,
+        mismatch_start + mismatch_expression.len(),
+    );
+    let mismatch_range_start = mismatch_source
+        .find("1e309")
+        .expect("out-of-range Float operand exists");
+    assert_json_diagnostic_primary_byte_span(
+        &mismatch_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        mismatch_range_start,
+        mismatch_range_start + "1e309".len(),
+    );
+
+    for (source, expected_mismatch) in [
+        (
+            "pub const ARRAY_ROOT: Array<Bool, 1> = 1e309 < 2.0\n",
+            "1e309 < 2.0",
+        ),
+        ("pub const TUPLE_ROOT: (Bool,) = 1.0 < 2.0\n", "1.0 < 2.0"),
+        (
+            "pub const TUPLE_ROOT_RANGE: (Bool,) = 1e309 < 2.0\n",
+            "1e309 < 2.0",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: Bool-to-aggregate shape mismatch should fail:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: supported Bool result shape mismatch should be diagnosed:\n{stdout}"
+        );
+        if source.contains("RANGE") || source.contains("ARRAY_ROOT") {
+            assert!(
+                stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""),
+                "{source:?}: invalid Float operands retain their range diagnostic:\n{stdout}"
+            );
+            let range_operand = "1e309";
+            let range_start = source
+                .find(range_operand)
+                .expect("out-of-range Float operand exists");
+            assert_json_diagnostic_primary_byte_span(
+                &stdout,
+                "LITERAL_OUT_OF_RANGE",
+                range_start,
+                range_start + range_operand.len(),
+            );
+        }
+        let mismatch_start = source
+            .find(expected_mismatch)
+            .expect("mismatched comparison exists");
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            mismatch_start,
+            mismatch_start + expected_mismatch.len(),
+        );
+    }
+
+    for source in [
+        "pub const BASE: F64 = 1.0\npub const PATH: Bool = BASE < 2.0\n",
+        "pub const MIXED: Bool = 1.0 == 1\n",
+        "pub const MIXED_BOOL: Bool = 1.0 == true\n",
+        "pub const MIXED_CHAR: Bool = 1.0 == 'a'\n",
+        "pub const MIXED_BYTE: Bool = 1.0 == b'a'\n",
+        "pub const COMPUTED: Bool = (1.0 + 0.0) < 2.0\n",
+        "pub const COMPUTED_DIVISION: Bool = (1.0 / 2.0) < 1.0\n",
+        "pub const COMPUTED_REMAINDER: Bool = (1.0 % 2.0) < 1.0\n",
+        "pub const NESTED: Bool = 1.0 == (2.0 < 3.0)\n",
+        "pub const BASE: F64 = 1.0\npub const SHORT_CIRCUIT: Bool = false and (BASE < 2.0)\n",
         "pub const UNRELATED: Bool = 1 < 2\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
