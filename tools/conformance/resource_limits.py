@@ -153,3 +153,13 @@ def byte_minimum_for(limits: tuple[ResourceLimit, ...], name: str) -> int:
             f"§1.5.4 must define one byte-valued minimum for {name}"
         )
     return matches[0].minimum
+
+
+def count_minimum_for(limits: tuple[ResourceLimit, ...], name: str) -> int:
+    """Return one uniquely named unitless count minimum."""
+    matches = [limit for limit in limits if limit.name == name]
+    if len(matches) != 1 or matches[0].unit is not None:
+        raise LimitTableError(
+            f"§1.5.4 must define one unitless count minimum for {name}"
+        )
+    return matches[0].minimum

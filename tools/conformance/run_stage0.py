@@ -1509,6 +1509,34 @@ def _identifier_at_minimum_size(minimum_bytes: int) -> tuple[bytes, bytes]:
     return identifier, source
 
 
+def _tuple_at_minimum(minimum_elements: int) -> bytes:
+    if (
+        isinstance(minimum_elements, bool)
+        or not isinstance(minimum_elements, int)
+        or minimum_elements < 1
+    ):
+        raise SmokeError("tuple element minimum must be a positive integer")
+    type_items = b"\n".join(
+        b"    Bool," for _ in range(minimum_elements)
+    )
+    value_items = b"\n".join(
+        b"    true," for _ in range(minimum_elements)
+    )
+    source = (
+        b"pub const TUPLE_LIMIT: (\n"
+        + type_items
+        + b"\n) = (\n"
+        + value_items
+        + b"\n)\n"
+    )
+    if (
+        source.count(b"Bool") != minimum_elements
+        or source.count(b"true") != minimum_elements
+    ):
+        raise SmokeError("generated tuple does not match its element minimum")
+    return source
+
+
 def _run_check_identifier_minimum(
     iut: Path,
     registered_codes: set[str],
@@ -1570,6 +1598,104 @@ def _run_check_identifier_minimum(
         output["failures"] = [str(error)]
     except Exception:
         output["failures"] = ["unexpected identifier-length smoke-runner failure"]
+    return output
+
+
+def _run_check_tuple_minimum(
+    iut: Path,
+    registered_codes: set[str],
+    *,
+    minimum_elements: int,
+    timeout: float,
+) -> dict:
+    test = "generated/spec-01-introduction/tuple-type-minimum-check"
+    output = {
+        "type": "test",
+        "test": test,
+        "mode": "partial-smoke",
+        "claim": False,
+        "configuration": {"target": None, "profile": None},
+        "compatibility_execution": {
+            "manifest_target": "wasm32-core",
+            "cli_target": "wasm32-core",
+            "cli_profile_default": "dev",
+        },
+        "outcome": "fail",
+        "deviations": [],
+        "failures": [],
+        "limit": "elements of one tuple type",
+        "minimum_elements": minimum_elements,
+        "canonical_source_verified": False,
+    }
+    try:
+        source = _tuple_at_minimum(minimum_elements)
+        with tempfile.TemporaryDirectory(prefix="sai-stage0-tuple-limit-") as temporary:
+            sandbox_root = Path(temporary)
+            package_root = sandbox_root / "package"
+            source_dir = package_root / "src"
+            source_dir.mkdir(parents=True)
+            (package_root / "sai.package").write_text(
+                PACKAGE_MANIFEST,
+                encoding="utf-8",
+                newline="\n",
+            )
+            (source_dir / "lib.sai").write_bytes(source)
+            formatter = _run_iut(
+                iut,
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "fmt",
+                    "--check",
+                    "--stdin-kind",
+                    "source",
+                    "-",
+                ],
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+                stdin_data=source,
+            )
+            _validate_fmt_check(
+                formatter,
+                input_bytes=source,
+                expected_output=source,
+                registered_codes=registered_codes,
+            )
+            try:
+                checked_source = (source_dir / "lib.sai").read_bytes()
+            except OSError as error:
+                raise SmokeError(
+                    "tuple source disappeared after formatter preflight"
+                ) from error
+            if checked_source != source:
+                raise SmokeError(
+                    "formatter preflight modified the generated tuple source"
+                )
+            output["canonical_source_verified"] = True
+            completed = _run_iut(
+                iut,
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "check",
+                    "--target=wasm32-core",
+                    "--jobs=1",
+                ],
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+            )
+        _validate_check_source_size_minimum(
+            completed,
+            registered_codes=registered_codes,
+            subject="tuple type at its minimum element count",
+        )
+        output["outcome"] = "pass"
+    except (SmokeError, ValueError, ndjson_stream.StreamError) as error:
+        output["failures"] = [str(error)]
+    except Exception:
+        output["failures"] = ["unexpected tuple-element smoke-runner failure"]
     return output
 
 
@@ -2538,6 +2664,9 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
         identifier_minimum = resource_limits.byte_minimum_for(
             limits, "length of an identifier"
         )
+        tuple_element_minimum = resource_limits.count_minimum_for(
+            limits, "elements of one tuple type"
+        )
         results = [
             _run_fixture(fixture, conformance_root, iut_path, codes,
                          timeout=timeout, docs_root=docs_root)
@@ -2551,6 +2680,14 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
         results.append(
             _run_check_identifier_minimum(
                 iut_path, codes, minimum_bytes=identifier_minimum, timeout=timeout
+            )
+        )
+        results.append(
+            _run_check_tuple_minimum(
+                iut_path,
+                codes,
+                minimum_elements=tuple_element_minimum,
+                timeout=timeout,
             )
         )
         results.append(

@@ -246,12 +246,14 @@ fixtures; it does not cover formatter goldens, target/profile specializations,
 or directory fixtures.
 The generated minimum-limit probes read their values from the numeric table in
 `docs/spec/01-introduction.md` §1.5.4. They check source-file minimum acceptance
-through formatting and package-file checking, and check identifier-length
-minimum acceptance through package-file checking with an identifier token of
-exactly the table's UTF-8 byte length. The formatter's one-byte-over-source-size
-refusal is specific to the current reference implementation. The probes do not
-generate the remaining 10 limit cases or the full required portable test
-matrix. Formatter coverage is limited to single-file source and one package-manifest
+through formatting and package-file checking, identifier-length minimum
+acceptance through a package check with a token of exactly the table's UTF-8
+byte length, and tuple-type minimum acceptance through a package check with a
+canonical flat tuple containing exactly the table's number of elements. The
+formatter's one-byte-over-source-size refusal is specific to the current
+reference implementation. The probes do not generate the remaining 9 limit
+cases or the full required portable test matrix. Formatter coverage is limited
+to single-file source and one package-manifest
 `fmt` fixture's byte comparisons, fixed-point checks, 16 deterministic layout
 variants, source-stdin, generated
 package-wide `fmt --check` and `fmt --check` with one explicit path,
@@ -324,9 +326,9 @@ stage, and owner), determine code owners, or apply claim-stage filtering.
 The inventory is intentionally report-only. It does not run the IUT, check the
 required-content matrix of §15.9.1, compare goldens with IUT output, verify
 code-specific diagnostic data shapes, or generate or check the complete
-§1.5.4 limit-test matrix. The smoke runner's source-formatting and package-file
-minimum-acceptance probes plus its formatter refusal probe do not cover the
-other limits or compiler acceptance at those limits.
+§1.5.4 limit-test matrix. The smoke runner's source-size, identifier-length,
+and tuple-arity minimum-acceptance probes plus its formatter refusal probe do
+not cover the other limits or compiler acceptance at those limits.
 The repository does not yet record its implemented stages, so coverage is not a
 CI merge gate.
 `run-panic` annotations identify a location but not a panic kind, and panic

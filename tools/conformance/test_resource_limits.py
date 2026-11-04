@@ -5,6 +5,7 @@ from pathlib import Path
 from resource_limits import (
     LimitTableError,
     byte_minimum_for,
+    count_minimum_for,
     parse_implementation_limits,
     read_implementation_limits,
     source_file_minimum_bytes,
@@ -51,6 +52,10 @@ class ResourceLimitTests(unittest.TestCase):
             ],
         )
         self.assertEqual(source_file_minimum_bytes(limits), 16 * 1024 * 1024)
+        self.assertEqual(
+            count_minimum_for(limits, "elements of one tuple type"),
+            64,
+        )
 
     def test_parser_rejects_duplicate_names_and_malformed_rows(self):
         prefix = "### 1.5.4 Implementation limits\n\n| Limit | Minimum |\n|---|---|\n"
@@ -99,6 +104,29 @@ class ResourceLimitTests(unittest.TestCase):
                     "| length of an identifier | 1,024 |\n"
                 ),
                 "length of an identifier",
+            )
+
+    def test_count_minimum_lookup_requires_one_unitless_matching_row(self):
+        limits = parse_implementation_limits(
+            "### 1.5.4 Implementation limits\n"
+            "| Limit | Minimum |\n|---|---|\n"
+            "| elements of one tuple type | 64 |\n"
+        )
+
+        self.assertEqual(
+            count_minimum_for(limits, "elements of one tuple type"),
+            64,
+        )
+        with self.assertRaisesRegex(LimitTableError, "unitless count minimum"):
+            count_minimum_for(limits, "not a limit")
+        with self.assertRaisesRegex(LimitTableError, "unitless count minimum"):
+            count_minimum_for(
+                parse_implementation_limits(
+                    "### 1.5.4 Implementation limits\n"
+                    "| Limit | Minimum |\n|---|---|\n"
+                    "| elements of one tuple type | 64 bytes |\n"
+                ),
+                "elements of one tuple type",
             )
 
     def test_file_reader_rejects_a_truncated_implementation_limit_table(self):
