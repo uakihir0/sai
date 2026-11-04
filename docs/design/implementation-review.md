@@ -4,6 +4,14 @@
 
 ## Open for review
 
+### IR-1150 (2026-11-04): preserve nested unsafe keyword comments
+
+- **Decision — review required:** Preserve single-line block comments attached to an `unsafe` keyword when the unsafe expression is rendered by the existing compound-expression formatter, including as a call argument.
+- **Reason:** The formatter already renders both unsafe block expressions and call arguments, but it refused a valid call argument solely because it did not collect and emit the comment attached to `unsafe`.
+- **Boundary and judgment:** The generic expression path collects only comments trailing the `unsafe` token and routes them through the existing single-line-block-comment helper. That helper continues to refuse line comments and multiline block comments. This does not add support for new enclosing expression shapes; unsupported surrounding syntax remains refused. The supported attachment position and reliance on the existing outer-expression formatter are **Review required**.
+- **Review required:** Verify the existing nested call-argument refusal is now formatted with exact spacing and line breaks; commentless call-argument output remains unchanged; formatting reaches a fixed point; nested line and multiline comments remain refused; and unsupported surrounding expression shapes do not become accepted just because an unsafe keyword comment is allowlisted for comment collection.
+- **Verification:** `rtk mise exec rust@1.99.1 -- cargo test -p sai_fmt unsafe_keyword --locked` passed all four unsafe-keyword formatter regressions, including exact nested call-argument output, commentless compatibility, fixed point, and continued refusal of line and multiline comments. `rtk mise exec rust@1.99.1 -- cargo test -p sai_fmt --locked` passed all 405 tests. `rtk mise exec rust@1.99.1 -- cargo fmt --all -- --check` and `rtk git diff --check` passed. No extra unsupported-outer-shape fixture was added: the comment-owner set only permits collection to proceed; the existing expression document builder still returns `UnsupportedShape` for unhandled expression kinds, and that error propagates.
+
 ### Stage 0 source-size minimum boundary (2026-11-04)
 
 - **Decision — review required:** Add a generated Stage 0 formatter smoke case whose valid, canonical source is exactly the 16 MiB minimum source-file limit, while retaining the existing 16 MiB + 1 byte refusal case.
