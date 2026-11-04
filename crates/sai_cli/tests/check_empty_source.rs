@@ -19284,6 +19284,67 @@ fn public_bool_logical_literal_consts_emit_check_results() {
 }
 
 #[test]
+fn public_char_and_byte_literal_comparison_consts_emit_check_results() {
+    let source = concat!(
+        "pub const CHAR_EQ: Bool = 'a' == 'a'\n",
+        "pub const CHAR_NE: Bool = 'a' != 'b'\n",
+        "pub const CHAR_LT: Bool = 'é' < '😀'\n",
+        "pub const CHAR_LE: Bool = 'a' <= 'a'\n",
+        "pub const CHAR_GT: Bool = '😀' > 'é'\n",
+        "pub const CHAR_GE: Bool = 'b' >= 'a'\n",
+        "pub const BYTE_EQ: Bool = b'\\x00' == b'\\x00'\n",
+        "pub const BYTE_NE: Bool = b'\\x00' != b'\\xff'\n",
+        "pub const BYTE_LT: Bool = b'\\x7f' < b'\\x80'\n",
+        "pub const BYTE_LE: Bool = b'\\x00' <= b'\\xff'\n",
+        "pub const BYTE_GT: Bool = b'\\xff' > b'\\x7f'\n",
+        "pub const BYTE_GE: Bool = b'\\xff' >= b'\\xff'\n",
+        "pub const NESTED: Bool = not ('a' >= 'é') and (b'\\x00' < b'\\xff')\n",
+        "pub const TUPLE: (Bool, Bool) = ('a' < 'b', b'\\x00' <= b'\\xff')\n",
+        "pub const ARRAY: Array<Bool, 2> = ['é' < '😀', b'\\xff' > b'\\x7f']\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn char_and_byte_comparison_const_mismatches_and_gates_are_preserved() {
+    let source = "pub const MISMATCH: I32 = 'a' < 'b'\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "comparison assigned to I32 should fail:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a supported Char comparison with the wrong declared type is a checked mismatch:\n{stdout}"
+    );
+    let initializer = "'a' < 'b'";
+    let start = source
+        .find(initializer)
+        .expect("mismatched comparison initializer exists");
+    assert_json_diagnostic_primary_byte_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        start,
+        start + initializer.len(),
+    );
+
+    for source in [
+        "pub const CHAR_BASE: Char = 'a'\npub const PATH: Bool = CHAR_BASE < 'b'\n",
+        "pub const MIXED: Bool = 'a' == b'a'\n",
+        "pub const COMPUTED: Bool = ('a' < 'b') == true\n",
+        "pub const NESTED: Bool = 'a' == ('b' < 'c')\n",
+        "pub const CHAR_BASE: Char = 'a'\npub const SHORT_CIRCUIT: Bool = false and (CHAR_BASE < 'b')\n",
+        "pub const UNRELATED: Bool = 1 < 2\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn multiple_public_primitive_const_literals_emit_one_check_result() {
     assert_success_result(
         run_check(
