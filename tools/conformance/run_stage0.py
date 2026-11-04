@@ -1397,6 +1397,105 @@ def _validate_fmt_source_size_refusal(
         raise SmokeError("oversized source did not report the exact size-limit diagnostic")
 
 
+def _validate_fmt_source_size_minimum(
+    completed: subprocess.CompletedProcess,
+    *,
+    expected_source: bytes,
+    registered_codes: set[str],
+) -> None:
+    actual, data, summary, diagnostics = _formatter_envelope(
+        completed,
+        registered_codes=registered_codes,
+    )
+    if not isinstance(data["output"], str):
+        raise SmokeError("source at the minimum size limit was not accepted unchanged")
+    try:
+        output_bytes = data["output"].encode("utf-8", "strict")
+    except (AttributeError, UnicodeEncodeError):
+        raise SmokeError("source at the minimum size limit was not accepted unchanged") from None
+    if (
+        completed.returncode != 0
+        or summary["exit_code"] != 0
+        or summary["errors"] != 0
+        or summary["warnings"] != 0
+        or summary["infos"] != 0
+        or summary["shown_errors"] != 0
+        or summary["suppressed"] != {
+            "cascade": 0,
+            "duplicate": 0,
+            "dependency": 0,
+        }
+        or diagnostics
+        or actual
+        or type(data["check"]) is not bool
+        or data["check"] is not False
+        or type(data["files"]) is not int
+        or data["files"] != 1
+        or not isinstance(data["changed"], list)
+        or data["changed"] != []
+        or not isinstance(data["refused"], list)
+        or data["refused"] != []
+        or output_bytes != expected_source
+    ):
+        raise SmokeError("source at the minimum size limit was not accepted unchanged")
+
+
+def _run_fmt_source_size_minimum(
+    iut: Path,
+    registered_codes: set[str],
+    *,
+    timeout: float,
+) -> dict:
+    test = "generated/impl-14-formatter/source-size-minimum"
+    output = {
+        "type": "test",
+        "test": test,
+        "mode": "partial-smoke",
+        "claim": False,
+        "configuration": {"target": None, "profile": None},
+        "compatibility_execution": None,
+        "outcome": "fail",
+        "deviations": [],
+        "failures": [],
+    }
+    try:
+        # A canonical block comment reaches the source-file byte limit without
+        # creating a checked-in 16 MiB fixture.
+        source = b"/*" + b" " * (FMT_SOURCE_MAX_BYTES - 5) + b"*/\n"
+        if len(source) != FMT_SOURCE_MAX_BYTES:
+            raise SmokeError("generated source-size minimum has the wrong byte length")
+        with tempfile.TemporaryDirectory(prefix="sai-stage0-fmt-size-") as temporary:
+            sandbox_root = Path(temporary)
+            package_root = sandbox_root / "package"
+            package_root.mkdir()
+            completed = _run_iut(
+                iut,
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "fmt",
+                    "--stdin-kind",
+                    "source",
+                    "-",
+                ],
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+                stdin_data=source,
+            )
+        _validate_fmt_source_size_minimum(
+            completed,
+            expected_source=source,
+            registered_codes=registered_codes,
+        )
+        output["outcome"] = "pass"
+    except (SmokeError, ValueError, ndjson_stream.StreamError) as error:
+        output["failures"] = [str(error)]
+    except Exception:
+        output["failures"] = ["unexpected source-size minimum smoke-runner failure"]
+    return output
+
+
 def _run_fmt_source_size_refusal(
     iut: Path,
     registered_codes: set[str],
@@ -2193,7 +2292,8 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "Stage 3 package fmt directory goldens, their "
             "fixed-point, 16 reference-lexer-derived deterministic layout variants, "
             "source-stdin, generated package-wide, and fmt --check with one explicit "
-            "path, refusal fixtures, and a generated 16 MiB + 1 byte size-limit case. "
+            "path, refusal fixtures, and generated 16 MiB acceptance and 16 MiB + 1 "
+            "byte source-size boundary cases. "
             "workspaces, multi-source package checks, multiple explicit path arguments, "
             "and complete "
             "formatter-rule coverage are not covered.",
@@ -2224,6 +2324,9 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
                          timeout=timeout, docs_root=docs_root)
             for fixture in fixtures
         ]
+        results.append(
+            _run_fmt_source_size_minimum(iut_path, codes, timeout=timeout)
+        )
         results.append(
             _run_fmt_source_size_refusal(iut_path, codes, timeout=timeout)
         )

@@ -217,6 +217,7 @@ REFUSAL_LINE = {self.refusal_line!r}
 EXPECTED_FORMATTED = {self.expected_format!r}
 EXPECTED_SIZE_PROBE_LENGTH = {self.probe_limit + 1}
 EXPECTED_SIZE_PROBE = b"/*" + b" " * (EXPECTED_SIZE_PROBE_LENGTH - 2)
+EXPECTED_SIZE_MINIMUM = b"/*" + b" " * ({self.probe_limit} - 5) + b"*/\\n"
 USAGE_RESPONSES = {FAKE_USAGE_RESPONSES!r}
 USAGE_MESSAGES = {FAKE_USAGE_MESSAGES!r}
 
@@ -662,6 +663,51 @@ package_fmt_args = [
 ]
 if args in (source_fmt_args, package_fmt_args):
     formatter_input = sys.stdin.buffer.read()
+    if args == source_fmt_args and formatter_input == EXPECTED_SIZE_MINIMUM:
+        try:
+            receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            receipt = {{}}
+        receipt["size_minimum_probe"] = {{
+            "argv":args,
+            "input_length":len(formatter_input),
+            "suffix":formatter_input[-3:].decode("ascii"),
+        }}
+        receipt.setdefault("calls", []).append("fmt-size-minimum")
+        Path(RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
+        if MODE == "fmt_size_minimum_refuses":
+            diagnostic = {{
+                "type":"diagnostic","code":"IMPLEMENTATION_LIMIT_EXCEEDED",
+                "severity":"error","level":None,
+                "message":"source at the minimum size was refused",
+                "primary":{{
+                    "file":{{"path":"<stdin>","package":None,"snapshot":None}},
+                    "start":{{"byte":0,"line":1,"col":1,"utf16_col":1}},
+                    "end":{{"byte":0,"line":1,"col":1,"utf16_col":1}}
+                }},"primary_label":"","labels":[],"children":[],"fixes":[],
+                "related":[],"data":{{
+                    "limit":"size of a source file","value":len(formatter_input)
+                }},"node":None,"symbol":None,"package":None
+            }}
+            result_data = {{
+                "check":False,"files":1,"changed":[],
+                "refused":["<stdin>"],"output":None
+            }}
+            diagnostics = [diagnostic]
+            status = 1
+        else:
+            result_data = {{
+                "check":False,"files":1,"changed":[],
+                "refused":[],"output":formatter_input.decode("utf-8")
+            }}
+            diagnostics = []
+            status = 0
+        print(line(header("fmt", None)).rstrip("\\n"))
+        for item in diagnostics:
+            print(line(item).rstrip("\\n"))
+        print(line({{"type":"result","kind":"fmt","data":result_data}}).rstrip("\\n"))
+        print(line(summary(errors=len(diagnostics), exit_code=status)).rstrip("\\n"))
+        raise SystemExit(status)
     if args == source_fmt_args and formatter_input == EXPECTED_SIZE_PROBE:
         if MODE.startswith("fmt_size_refusal"):
             try:
@@ -1161,7 +1207,7 @@ raise SystemExit(exit_code)
             "--format=json", "--max-errors=0", "fmt", "--check",
             "--stdin-kind", "source", "-",
         ])
-        self.assertEqual(receipt["calls"], ["fmt", "check"])
+        self.assertEqual(receipt["calls"], ["fmt", "check", "fmt-size-minimum"])
         self.assertEqual(receipt["manifest"],
                          "package conformance:test @ 0.1.0\n"
                          "compiler ^0.1\nsource \"src\"\n"
@@ -1237,7 +1283,7 @@ raise SystemExit(exit_code)
             " ".join(report["results"][0]["failures"]),
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt-size-minimum"])
 
     def test_unexpected_formatter_refusal_fails_before_check(self):
         self._fixture()
@@ -1250,7 +1296,7 @@ raise SystemExit(exit_code)
             " ".join(report["results"][0]["failures"]),
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt-size-minimum"])
 
     def test_expected_type_dependent_literal_error_is_not_a_parse_refusal(self):
         self._fixture(
@@ -1267,7 +1313,7 @@ raise SystemExit(exit_code)
             " ".join(report["results"][0]["failures"]),
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt-size-minimum"])
 
     def test_expected_name_resolution_error_is_not_a_parse_refusal(self):
         self._fixture(
@@ -1287,7 +1333,7 @@ raise SystemExit(exit_code)
             " ".join(report["results"][0]["failures"]),
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt-size-minimum"])
 
     def test_formatter_refusal_taxonomy_uses_exact_parser_phase_rows(self):
         codes = _formatter_refusal_codes(Path(__file__).resolve().parents[2] / "docs")
@@ -1381,7 +1427,7 @@ raise SystemExit(exit_code)
         self.assertEqual(report["outcome"], "pass")
         self.assertEqual(report["results"][0]["failures"], [])
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["calls"], ["fmt", "check"])
+        self.assertEqual(receipt["calls"], ["fmt", "check", "fmt-size-minimum"])
 
     def test_fake_validation_only_formatter_refusal_is_rejected_before_check(self):
         self._fixture()
@@ -1392,7 +1438,7 @@ raise SystemExit(exit_code)
         self.assertIn("non-parser or unsupported",
                       " ".join(report["results"][0]["failures"]))
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt-size-minimum"])
 
     def test_formatter_refusal_with_unexpected_parse_error_fails(self):
         self._fixture("check-fail", body="@ //~ error EXPECTED_TOKEN\n")
@@ -1405,7 +1451,7 @@ raise SystemExit(exit_code)
             " ".join(report["results"][0]["failures"]),
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt-size-minimum"])
 
     def _fmt_fixture(self, *, body="pub fn value()->Bool{true}\n"):
         self._fixture("fmt", body=body)
@@ -1518,7 +1564,7 @@ raise SystemExit(exit_code)
         self.assertEqual(report["results"][0]["outcome"], "pass")
         self.assertIs(report["claim"], False)
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt-size-minimum"])
         self.assertEqual(receipt["formatter_inputs"], [original.decode("utf-8")])
         self.assertEqual(self.source.read_bytes(), original)
 
@@ -1531,7 +1577,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["tests"], 2 + len(USAGE_ERROR_CASES))
+        self.assertEqual(report["tests"], 3 + len(USAGE_ERROR_CASES))
         self.assertEqual(report["results"][-1]["test"],
                          "generated/impl-14-formatter/source-size-refusal")
         self.assertEqual(report["results"][-1]["outcome"], "pass")
@@ -1543,6 +1589,46 @@ raise SystemExit(exit_code)
         self.assertEqual(receipt["size_refusal_probe"]["input_length"],
                          self.probe_limit + 1)
         self.assertEqual(receipt["size_refusal_probe"]["prefix"], "/*")
+
+    def test_source_size_minimum_probe_accepts_exact_limit_unchanged(self):
+        self.assertEqual(FMT_SOURCE_MAX_BYTES, 16 * 1024 * 1024)
+        self._fixture()
+        self.mode = "fmt_size_minimum"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "pass", report)
+        self.assertEqual(report["tests"], 3 + len(USAGE_ERROR_CASES))
+        self.assertEqual(
+            report["results"][-2]["test"],
+            "generated/impl-14-formatter/source-size-minimum",
+        )
+        self.assertEqual(report["results"][-2]["outcome"], "pass")
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"].count("fmt-size-minimum"), 1)
+        self.assertIn("fmt-size-minimum", receipt["calls"])
+        self.assertEqual(receipt["size_minimum_probe"]["argv"], [
+            "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
+        ])
+        self.assertEqual(
+            receipt["size_minimum_probe"]["input_length"],
+            self.probe_limit,
+        )
+        self.assertEqual(receipt["size_minimum_probe"]["suffix"], "*/\n")
+
+    def test_source_size_minimum_probe_rejects_refusal(self):
+        self._fixture()
+        self.mode = "fmt_size_minimum_refuses"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(
+            report["results"][-2]["failures"],
+            ["source at the minimum size limit was not accepted unchanged"],
+        )
 
     def test_usage_error_matrix_checks_required_cli_boundaries(self):
         self._fixture()
@@ -1932,7 +2018,7 @@ raise SystemExit(exit_code)
         self.assertEqual(receipt["fmt_argv"], [
             "--format=json", "--max-errors=0", "fmt", "--stdin-kind", "source", "-",
         ])
-        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt-size-minimum"])
         self.assertEqual(receipt["formatter_inputs"], [original.decode("utf-8")])
         self.assertEqual(self.source.read_bytes(), original)
 
@@ -1996,7 +2082,9 @@ raise SystemExit(exit_code)
         self.assertEqual(report["outcome"], "fail")
         self.assertIn("sidecars are unsupported",
                       " ".join(report["results"][0]["failures"]))
-        self.assertFalse(self.receipt.exists())
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["calls"], ["fmt-size-minimum"])
+        self.assertNotIn("formatter_inputs", receipt)
 
     def test_fmt_compares_original_bytes_and_expected_fixed_point(self):
         self._fmt_fixture()
@@ -2029,7 +2117,9 @@ raise SystemExit(exit_code)
         ])
         self.assertEqual(
             receipt["calls"],
-            ["fmt"] * (FMT_LAYOUT_VARIANT_COUNT + 2) + ["fmt-check"] * 6,
+            ["fmt"] * (FMT_LAYOUT_VARIANT_COUNT + 2)
+            + ["fmt-check"] * 6
+            + ["fmt-size-minimum"],
         )
         self.assertEqual(receipt["formatter_inputs"], [
             original.decode("utf-8"),
@@ -2344,7 +2434,7 @@ raise SystemExit(exit_code)
         )
         self.assertEqual(self.source.read_bytes(), original)
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt-size-minimum"])
         self.assertEqual(receipt["formatter_input"].encode("utf-8"), original)
 
     def test_malformed_formatter_stream_fails_closed(self):
@@ -2358,7 +2448,7 @@ raise SystemExit(exit_code)
             " ".join(report["results"][0]["failures"]),
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(receipt["calls"], ["fmt"])
+        self.assertEqual(receipt["calls"], ["fmt", "fmt-size-minimum"])
 
     def test_explicit_target_or_profile_and_unused_directives_fail_closed(self):
         for directive in (
