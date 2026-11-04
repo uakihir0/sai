@@ -19359,6 +19359,71 @@ fn char_and_byte_comparison_const_mismatches_and_gates_are_preserved() {
 }
 
 #[test]
+fn public_str_literal_comparison_consts_emit_check_results() {
+    let source = concat!(
+        "pub const EQ: Bool = \"same\" == \"same\"\n",
+        "pub const NE: Bool = \"a\" != \"b\"\n",
+        "pub const LT: Bool = \"a\" < \"b\"\n",
+        "pub const LE: Bool = \"a\" <= \"a\"\n",
+        "pub const GT: Bool = \"z\" > \"a\"\n",
+        "pub const GE: Bool = \"z\" >= \"z\"\n",
+        "pub const EMPTY_PREFIX: Bool = \"\" < \"a\"\n",
+        "pub const PREFIX: Bool = \"a\" < \"aa\"\n",
+        "pub const ESCAPED: Bool = \"a\\n\" < \"a\\\\n\"\n",
+        "pub const UNICODE: Bool = \"é\" < \"😀\"\n",
+        "pub const NESTED: Bool = not (\"a\" > \"b\") and (\"a\" <= \"b\")\n",
+        "pub const TUPLE: (Bool, Bool) = (\"a\" < \"b\", \"z\" < \"a\")\n",
+        "pub const ARRAY: Array<Bool, 2> = [\"a\" < \"aa\", \"é\" < \"😀\"]\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn str_comparison_const_mismatches_and_gates_are_preserved() {
+    let source = "pub const MISMATCH: I32 = \"a\" < \"b\"\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "comparison assigned to I32 should fail:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a supported Str comparison with the wrong declared type is a checked mismatch:\n{stdout}"
+    );
+    let initializer = "\"a\" < \"b\"";
+    let start = source
+        .find(initializer)
+        .expect("mismatched comparison initializer exists");
+    assert_json_diagnostic_primary_byte_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        start,
+        start + initializer.len(),
+    );
+
+    for source in [
+        "pub const BASE: Str = \"a\"\npub const PATH: Bool = BASE < \"b\"\n",
+        "pub const MIXED_BYTE_STRING: Bool = \"a\" == b\"a\"\n",
+        "pub const MIXED_CHAR: Bool = \"a\" == 'a'\n",
+        "pub const MIXED_BOOL: Bool = \"a\" == true\n",
+        "pub const MIXED_FLOAT: Bool = \"a\" == 1.0\n",
+        "pub const MIXED_NUMBER: Bool = \"a\" < 1\n",
+        "pub const COMPUTED: Bool = (\"a\" + \"b\") < \"ab\"\n",
+        "pub const NESTED: Bool = (\"a\" < \"b\") == true\n",
+        "pub const BASE: Str = \"a\"\npub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < \"b\")\n",
+        "pub const SHORT_CIRCUIT_COMPUTED: Bool = true or ((\"a\" + \"b\") == \"ab\")\n",
+        "pub const BYTE_STRING: Bool = b\"a\" < b\"b\"\n",
+        "pub const UNRELATED: Bool = 1 < 2\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_f64_literal_comparison_consts_emit_check_results() {
     let source = concat!(
         "pub const EQ: Bool = 1.0 == 1.0\n",
