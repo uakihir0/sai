@@ -671,6 +671,50 @@ def _scan_diagnostic_tables(
     )
 
 
+def _audit_diagnostic_tables(
+    registry_codes: set[str],
+    diagnostic_tables: list[dict[str, object]],
+) -> dict[str, object]:
+    table_codes: set[str] = set()
+    rows_by_code: dict[str, list[dict[str, object]]] = {}
+    for row in diagnostic_tables:
+        code = str(row["code"])
+        table_codes.add(code)
+        rows_by_code.setdefault(code, []).append({
+            "document": str(row["document"]),
+            "section": str(row["section"]),
+            "line": int(row["line"]),
+            "severity": str(row["severity"]),
+        })
+
+    severity_disagreements = []
+    for code in sorted(rows_by_code):
+        rows = rows_by_code[code]
+        if len({str(row["severity"]) for row in rows}) < 2:
+            continue
+        severity_disagreements.append({
+            "code": code,
+            "rows": sorted(
+                rows,
+                key=lambda row: (
+                    str(row["document"]),
+                    tuple(int(part) for part in str(row["section"]).split(".")),
+                    int(row["line"]),
+                    str(row["severity"]),
+                ),
+            ),
+        })
+
+    return {
+        "registry_codes_without_table": sorted(registry_codes - table_codes),
+        "severity_disagreements": severity_disagreements,
+        "severity_comparison_note": (
+            "Severity cells are compared literally across diagnostic-table rows; "
+            "this audit does not compare them with IUT explain metadata."
+        ),
+    }
+
+
 def _parse_lint_codes(
     doc_path: Path,
     headings: list[dict[str, object]],
@@ -885,6 +929,9 @@ def build_report(root: Path) -> dict[str, object]:
     diagnostic_tables = _scan_diagnostic_tables(
         canonical, headings_by_path, set(registry_codes)
     )
+    diagnostic_table_audit = _audit_diagnostic_tables(
+        set(registry_codes), diagnostic_tables
+    )
     section_exemptions = _parse_section_exemptions(
         root / EXPECTED_EXEMPT_SECTIONS, inventory, aliases, canonical, headings_by_path
     )
@@ -1019,7 +1066,7 @@ def build_report(root: Path) -> dict[str, object]:
         ],
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "report-only",
         "claim": False,
         "stage_gate_enabled": False,
@@ -1038,6 +1085,7 @@ def build_report(root: Path) -> dict[str, object]:
         "fixtures": test_records,
         "sections": section_records,
         "diagnostic_tables": diagnostic_tables,
+        "diagnostic_table_audit": diagnostic_table_audit,
         "diagnostic_codes": code_records,
         "hard_code_json_goldens": hard_code_json_records,
         "panic_kinds": panic_records,

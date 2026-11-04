@@ -302,11 +302,21 @@ their root `sai.package` and scan their source `.sai` files for diagnostic
 annotations; reserved `.expected.sai` and `.fixed.sai` outputs, `expected/`
 directories, and `.wit` and `.mir` trees do not count as tests.
 
+The `diagnostic_table_audit` reports registry names from
+`crates/sai_diagnostics/src/diagnostic_code_names.txt` with no diagnostic-table
+occurrence and codes whose table rows use different literal severity cells.
+Each disagreement includes the document, section, line, and severity for every
+row; contradictions inside one table are reported too. This inventory does not
+invoke `sai explain --list` or fetch and compare per-code JSON explanation
+records from `sai explain <CODE> --format json` (class, severity, default level,
+stage, and owner), determine code owners, or apply claim-stage filtering.
+
 The inventory is intentionally report-only. It does not run the IUT, check the
 required-content matrix of §15.9.1, compare goldens with IUT output, verify
 code-specific diagnostic data shapes, or generate or check the complete
-§1.5.4 limit-test matrix. The smoke runner's two source-formatter boundary
-probes do not cover the other limits or compiler acceptance at those limits.
+§1.5.4 limit-test matrix. The smoke runner's source-formatting and package-file
+minimum-acceptance probes plus its formatter refusal probe do not cover the
+other limits or compiler acceptance at those limits.
 The repository does not yet record its implemented stages, so coverage is not a
 CI merge gate.
 `run-panic` annotations identify a location but not a panic kind, and panic

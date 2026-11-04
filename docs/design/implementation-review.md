@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1153 (2026-11-04): audit registry coverage and diagnostic-table severity
+
+- **Decision — review required:** Extend the report-only coverage inventory with sorted registry names that do not occur in a diagnostic table and a deterministic list of every source-located table row for codes whose rows have different severity text.
+- **Reason:** `docs/impl/15-conformance-and-testing.md` §15.8.5 requires registry/table coverage and reports inconsistencies with both locations. The current scanner validates individual table rows but does not expose codes absent from tables or disagreements between rows.
+- **Boundary and judgment:** Reverse coverage uses the static `diagnostic_code_names.txt` list. This inventory invokes neither `sai explain --list` nor `sai explain <CODE> --format json`, and it does not fetch or compare the per-code JSON records for class, severity, default level, stage, and owner. Severity cells are compared as exact strings; semantic aliases are not inferred. Any different severity rows for one code are reported, including conflicts within one table. These findings remain report-only, do not fail the command, do not enable stage gating, and do not substantiate conformance.
+- **Review required:** Challenge literal severity comparison and inclusion of same-table contradictions; verify every conflict contains deterministic document/section/line/severity locations, absent registry names are sorted, identical severity rows are not flagged, and the audit stays independent of `claim` and `stage_gate_enabled`. Confirm the schema version changes with the new report field and docs do not imply comparison with live IUT metadata.
+- **Verification:** The focused diagnostic-table audit regressions pass 2/2, and the full conformance Python suite passes 236 tests (3 skipped). A report built from the repository's actual documents contains 1,369 diagnostic-table rows; `NATIVE_ENTRY_POINT_REQUIRED` and `NATIVE_LIBRARY_NOT_FOUND` have no table occurrence, and there are no literal severity disagreements. The report keeps `claim: false` and `stage_gate_enabled: false`. `rtk git diff --check` passes.
+- **Hostile review:** The source review found no implementation issues. The documentation review found that `sai explain --list` does not return the per-code metadata attributed to it; wording now distinguishes that listing command from `sai explain <CODE> --format json`, which provides per-code records. The review otherwise confirmed this slice's report-only boundary and the source-size status statement.
+
 ### IR-1152 (2026-11-04): check a source file at the 16 MiB minimum
 
 - **Decision — review required:** Add a generated Stage 0 smoke case that writes a source exactly 16 MiB long as `src/lib.sai` in a temporary package, runs `sai check --target=wasm32-core --jobs=1`, and requires a successful check result without diagnostics.

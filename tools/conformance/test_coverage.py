@@ -647,6 +647,134 @@ const C: I32 = 3 //~ error REF_ONLY_CODE
         self.assertFalse(report["stage_gate_enabled"])
         self.assertNotIn("UNUSED_VARIABLE", report["uncovered"]["hard_code_json_goldens"])
 
+    def test_diagnostic_table_audit_reports_sorted_registry_codes_without_tables(self):
+        self.write(
+            "docs/spec/02-document.md",
+            """# 2. Document
+## 2.1 Parent
+### 2.1.1 Leaf
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | Expected a token. |
+""",
+        )
+
+        report = build_report(self.root)
+
+        audit = report["diagnostic_table_audit"]
+        registry_codes = set(
+            (self.root / "crates/sai_diagnostics/src/diagnostic_code_names.txt")
+            .read_text(encoding="utf-8")
+            .split()
+        )
+        table_codes = {row["code"] for row in report["diagnostic_tables"]}
+        self.assertEqual(
+            audit["registry_codes_without_table"],
+            sorted(registry_codes - table_codes),
+        )
+        self.assertNotIn("EXPECTED_TOKEN", audit["registry_codes_without_table"])
+        self.assertIn("UNUSED_VARIABLE", audit["registry_codes_without_table"])
+        self.assertEqual(audit["severity_disagreements"], [])
+        self.assertEqual(report["schema_version"], 2)
+        self.assertFalse(report["claim"])
+        self.assertFalse(report["stage_gate_enabled"])
+
+    def test_diagnostic_table_audit_reports_literal_severity_disagreements(self):
+        self.write(
+            "docs/spec/02-document.md",
+            """# 2. Document
+## 2.1 Parent
+### 2.1.1 Leaf
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | Expected a token. |
+| `SOURCE_READ_FAILED` | error | Could not read a source file. |
+| `SOURCE_READ_FAILED` | warning | Alternate severity in the same table. |
+| `FEATURE_NOT_IMPLEMENTED` | error | Feature is unavailable. |
+| `UNUSED_VARIABLE` | warning (lint), default `allow` | Unused binding. |
+""",
+        )
+        self.write(
+            "docs/package/01-document.md",
+            """# 1. Package
+## 1.1 Parent
+### 1.1.1 Leaf
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | warning | Expected a token. |
+| `FEATURE_NOT_IMPLEMENTED` | error | Feature is unavailable. |
+| `UNUSED_VARIABLE` | warning (lint) | Unused binding. |
+""",
+        )
+
+        report = build_report(self.root)
+
+        audit = report["diagnostic_table_audit"]
+        self.assertEqual(
+            audit["severity_disagreements"],
+            [
+                {
+                    "code": "EXPECTED_TOKEN",
+                    "rows": [
+                        {
+                            "document": "package/01",
+                            "section": "1.1.1",
+                            "line": 6,
+                            "severity": "warning",
+                        },
+                        {
+                            "document": "spec/02",
+                            "section": "2.1.1",
+                            "line": 6,
+                            "severity": "error",
+                        },
+                    ],
+                },
+                {
+                    "code": "SOURCE_READ_FAILED",
+                    "rows": [
+                        {
+                            "document": "spec/02",
+                            "section": "2.1.1",
+                            "line": 7,
+                            "severity": "error",
+                        },
+                        {
+                            "document": "spec/02",
+                            "section": "2.1.1",
+                            "line": 8,
+                            "severity": "warning",
+                        },
+                    ],
+                },
+                {
+                    "code": "UNUSED_VARIABLE",
+                    "rows": [
+                        {
+                            "document": "package/01",
+                            "section": "1.1.1",
+                            "line": 8,
+                            "severity": "warning (lint)",
+                        },
+                        {
+                            "document": "spec/02",
+                            "section": "2.1.1",
+                            "line": 10,
+                            "severity": "warning (lint), default `allow`",
+                        },
+                    ],
+                },
+            ],
+        )
+        self.assertNotIn(
+            "FEATURE_NOT_IMPLEMENTED",
+            {entry["code"] for entry in audit["severity_disagreements"]},
+        )
+        self.assertIn("compared literally", audit["severity_comparison_note"])
+        self.assertEqual(audit, build_report(self.root)["diagnostic_table_audit"])
+        self.assertFalse(report["claim"])
+        self.assertFalse(report["stage_gate_enabled"])
+
     def test_single_file_json_golden_covers_a_hard_code(self):
         self.write_golden("tests/conformance/cli/pass.json", "EXPECTED_TOKEN")
         report = build_report(self.root)
