@@ -8035,7 +8035,7 @@ fn check_const_bool_expression_initializer(
         ConstLiteralType::ByteStr => ("Slice<Byte>", false),
         ConstLiteralType::Unit => ("()", false),
     };
-    let mut diagnostics = check_const_bool_float_comparison_literals(
+    let mut diagnostics = check_const_bool_comparison_literal_ranges(
         owner, value, symbols, inputs, snapshot, target_cfg,
     )?;
     if !is_bool {
@@ -8053,7 +8053,7 @@ fn check_const_bool_expression_initializer(
     Ok(Some(diagnostics))
 }
 
-fn is_const_bool_literal_expression(value: &HirExpr<'_>, symbols: &Interner) -> bool {
+fn is_const_bool_literal_expression(value: &HirExpr<'_>, _symbols: &Interner) -> bool {
     let mut pending = vec![value];
     while let Some(value) = pending.pop() {
         match value.kind {
@@ -8064,18 +8064,17 @@ fn is_const_bool_literal_expression(value: &HirExpr<'_>, symbols: &Interner) -> 
                 pending.push(left);
             }
             ExprKind::Binary(
-                operator @ (BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge),
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
                 left,
                 right,
-            ) if evaluate_const_bool_literal_comparison(operator, left, right, symbols)
-                .is_some() => {}
+            ) if is_const_bool_comparison_literal_pair(left, right) => {}
             _ => return false,
         }
     }
     true
 }
 
-fn is_const_bool_comparison_literal_expression(value: &HirExpr<'_>, symbols: &Interner) -> bool {
+fn is_const_bool_comparison_literal_expression(value: &HirExpr<'_>, _symbols: &Interner) -> bool {
     let mut pending = vec![value];
     let mut has_comparison = false;
     while let Some(value) = pending.pop() {
@@ -8087,12 +8086,10 @@ fn is_const_bool_comparison_literal_expression(value: &HirExpr<'_>, symbols: &In
                 pending.push(left);
             }
             ExprKind::Binary(
-                operator @ (BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge),
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
                 left,
                 right,
-            ) if evaluate_const_bool_literal_comparison(operator, left, right, symbols)
-                .is_some() =>
-            {
+            ) if is_const_bool_comparison_literal_pair(left, right) => {
                 has_comparison = true;
             }
             _ => return false,
@@ -8101,7 +8098,26 @@ fn is_const_bool_comparison_literal_expression(value: &HirExpr<'_>, symbols: &In
     has_comparison
 }
 
-fn check_const_bool_float_comparison_literals(
+fn is_const_bool_comparison_literal_pair(left: &HirExpr<'_>, right: &HirExpr<'_>) -> bool {
+    matches!(
+        (left.kind, right.kind),
+        (ExprKind::Lit(Lit::Bool(_)), ExprKind::Lit(Lit::Bool(_)))
+            | (ExprKind::Lit(Lit::Char(_)), ExprKind::Lit(Lit::Char(_)))
+            | (ExprKind::Lit(Lit::Byte(_)), ExprKind::Lit(Lit::Byte(_)))
+            | (
+                ExprKind::Lit(Lit::Int { .. }),
+                ExprKind::Lit(Lit::Int { .. })
+            )
+            | (
+                ExprKind::Lit(Lit::Float { .. }),
+                ExprKind::Lit(Lit::Float { .. })
+            )
+            | (ExprKind::Lit(Lit::Str(_)), ExprKind::Lit(Lit::Str(_)))
+            | (ExprKind::Tuple([]), ExprKind::Tuple([]))
+    )
+}
+
+fn check_const_bool_comparison_literal_ranges(
     owner: OwnerId,
     value: &HirExpr<'_>,
     symbols: &Interner,
@@ -8127,6 +8143,31 @@ fn check_const_bool_float_comparison_literals(
                 left,
                 right,
             ) => {
+                if let Some((left, right)) = const_int_comparison_operands(left, right) {
+                    for operand in [left, right] {
+                        let ExprKind::Lit(literal @ Lit::Int { .. }) = operand.kind else {
+                            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+                        };
+                        if sai_ty::typeck::literal::check_primitive_literal(
+                            PrimTy::I64,
+                            literal,
+                            symbols,
+                            target_cfg.pointer_width(),
+                        ) == PrimitiveLiteralResult::OutOfRange
+                        {
+                            diagnostics.push(const_literal_diagnostic(
+                                owner,
+                                inputs,
+                                snapshot,
+                                operand.span,
+                                sai_diagnostics::Code::LiteralOutOfRange,
+                                "integer literal is out of range for `I64`".to_owned(),
+                                "literal out of range",
+                            )?);
+                        }
+                    }
+                    continue;
+                }
                 let Some((left, right)) = const_float_comparison_operands(left, right) else {
                     continue;
                 };
@@ -8159,6 +8200,15 @@ fn check_const_bool_float_comparison_literals(
     Ok(diagnostics)
 }
 
+fn const_int_comparison_operands<'hir>(
+    left: &'hir HirExpr<'hir>,
+    right: &'hir HirExpr<'hir>,
+) -> Option<(&'hir HirExpr<'hir>, &'hir HirExpr<'hir>)> {
+    (matches!(left.kind, ExprKind::Lit(Lit::Int { .. }))
+        && matches!(right.kind, ExprKind::Lit(Lit::Int { .. })))
+    .then_some((left, right))
+}
+
 fn const_literal_comparison_ordering(
     left: &HirExpr<'_>,
     right: &HirExpr<'_>,
@@ -8189,6 +8239,40 @@ fn const_float_comparison_operands<'hir>(
     .then_some((left, right))
 }
 
+fn const_int_literal_comparison_ordering(
+    left: &HirExpr<'_>,
+    right: &HirExpr<'_>,
+) -> Option<std::cmp::Ordering> {
+    use sai_resolve::prelude::PrimTy;
+
+    let (left, right) = const_int_comparison_operands(left, right)?;
+    let ExprKind::Lit(Lit::Int {
+        value: left_magnitude,
+        negated: left_negated,
+    }) = left.kind
+    else {
+        return None;
+    };
+    let ExprKind::Lit(Lit::Int {
+        value: right_magnitude,
+        negated: right_negated,
+    }) = right.kind
+    else {
+        return None;
+    };
+    let ConstValue::Int { value: left, .. } =
+        evaluate_const_integer_literal(PrimTy::I64, left_magnitude, left_negated)?
+    else {
+        return None;
+    };
+    let ConstValue::Int { value: right, .. } =
+        evaluate_const_integer_literal(PrimTy::I64, right_magnitude, right_negated)?
+    else {
+        return None;
+    };
+    Some(left.cmp(&right))
+}
+
 fn evaluate_const_bool_literal_comparison(
     operator: BinOp,
     left: &HirExpr<'_>,
@@ -8217,7 +8301,8 @@ fn evaluate_const_bool_literal_comparison(
         });
     }
 
-    let ordering = const_literal_comparison_ordering(left, right, symbols)?;
+    let ordering = const_int_literal_comparison_ordering(left, right)
+        .or_else(|| const_literal_comparison_ordering(left, right, symbols))?;
     Some(match operator {
         BinOp::Eq => ordering.is_eq(),
         BinOp::Ne => !ordering.is_eq(),
@@ -10253,7 +10338,7 @@ fn check_const_byte_str_literal(
             )?]))
         }
         _ if is_const_bool_literal_expression(value, symbols) => {
-            let mut diagnostics = check_const_bool_float_comparison_literals(
+            let mut diagnostics = check_const_bool_comparison_literal_ranges(
                 owner, value, symbols, inputs, snapshot, target_cfg,
             )?;
             diagnostics.push(const_literal_diagnostic(
@@ -10284,7 +10369,7 @@ fn check_const_array_literal(
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let ExprKind::Array(values) = value.kind else {
         if is_const_bool_literal_expression(value, symbols) {
-            let mut diagnostics = check_const_bool_float_comparison_literals(
+            let mut diagnostics = check_const_bool_comparison_literal_ranges(
                 owner.id, value, symbols, inputs, snapshot, target_cfg,
             )?;
             diagnostics.push(const_literal_diagnostic(
@@ -13724,7 +13809,7 @@ fn check_const_tuple_literal(
 
     let ExprKind::Tuple(values) = value.kind else {
         if is_const_bool_comparison_literal_expression(value, symbols) {
-            let mut diagnostics = check_const_bool_float_comparison_literals(
+            let mut diagnostics = check_const_bool_comparison_literal_ranges(
                 owner.id, value, symbols, inputs, snapshot, target_cfg,
             )?;
             diagnostics.push(const_literal_diagnostic(
@@ -86643,6 +86728,273 @@ property "shared"() {}
     }
 
     #[test]
+    fn const_bool_direct_integer_literal_comparisons_default_to_i64() {
+        use sai_resolve::prelude::PrimTy;
+
+        let comparisons = [
+            (BinOp::Eq, "=="),
+            (BinOp::Ne, "!="),
+            (BinOp::Lt, "<"),
+            (BinOp::Le, "<="),
+            (BinOp::Gt, ">"),
+            (BinOp::Ge, ">="),
+        ];
+        let operands = [
+            ("0", "0", 0_i64, 0_i64),
+            ("-1", "0", -1, 0),
+            ("0", "-1", 0, -1),
+            ("-0", "0", 0, 0),
+            (
+                "9223372036854775807",
+                "9223372036854775807",
+                i64::MAX,
+                i64::MAX,
+            ),
+            (
+                "-9223372036854775808",
+                "-9223372036854775808",
+                i64::MIN,
+                i64::MIN,
+            ),
+            (
+                "-9223372036854775808",
+                "9223372036854775807",
+                i64::MIN,
+                i64::MAX,
+            ),
+        ];
+        let mut root = String::from("enum Payload { Flag(Bool) }\n");
+        let mut expected_values = Vec::new();
+        for (operator, spelling) in comparisons {
+            for (left, right, left_value, right_value) in operands {
+                let case = expected_values.len();
+                root.push_str(&format!(
+                    "pub const CASE_{case}: Bool = {left} {spelling} {right}\n"
+                ));
+                expected_values.push(match operator {
+                    BinOp::Eq => left_value == right_value,
+                    BinOp::Ne => left_value != right_value,
+                    BinOp::Lt => left_value < right_value,
+                    BinOp::Le => left_value <= right_value,
+                    BinOp::Gt => left_value > right_value,
+                    BinOp::Ge => left_value >= right_value,
+                    _ => unreachable!("the table contains only comparison operators"),
+                });
+            }
+        }
+        root.push_str(concat!(
+            "pub const NESTED: Bool = not (-3 >= -2) and (5 >= 5)\n",
+            "pub const TUPLE: (Bool, Bool) = (-1 < 0, -2 == -1)\n",
+            "pub const ARRAY: Array<Bool, 2> = [0 < 1, 2 <= 1]\n",
+            "pub const ENUM: Payload = Payload.Flag(-1 < 0)\n",
+            "pub const MISMATCH: I32 = 1 < 2\n",
+            "pub const TUPLE_MISMATCH: (I32,) = (1 < 2,)\n",
+            "pub const ARRAY_MISMATCH: Array<I32, 1> = [1 < 2]\n",
+            "pub const RANGE_LEFT: Bool = 9223372036854775808 == 0\n",
+            "pub const RANGE_RIGHT: Bool = 0 == 9223372036854775808\n",
+            "pub const RANGE_BOTH: Bool = 9223372036854775808 == -9223372036854775809\n",
+            "pub const RANGE_AND_MISMATCH: I32 = 9223372036854775808 < 0\n",
+            "pub const SHORT_CIRCUIT_RANGE: Bool = false and (9223372036854775808 == 0)\n",
+            "pub const TUPLE_ROOT_RANGE: (Bool,) = 9223372036854775808 == 0\n",
+            "pub const ARRAY_ROOT_RANGE: Array<Bool, 1> = 9223372036854775808 == 0\n",
+            "pub const BASE: I64 = 1\n",
+            "pub const PATH: Bool = BASE < 2\n",
+            "pub const MIXED_BOOL: Bool = 1 == true\n",
+            "pub const MIXED_FLOAT: Bool = 1 == 1.0\n",
+            "pub const MIXED_CHAR: Bool = 1 == 'a'\n",
+            "pub const MIXED_BYTE: Bool = 1 == b'a'\n",
+            "pub const MIXED_STR: Bool = 1 == \"1\"\n",
+            "pub const COMPUTED: Bool = (1 + 2) < 4\n",
+            "pub const NESTED_COMPARISON: Bool = (1 < 2) == true\n",
+            "pub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < 2)\n",
+            "pub const SHORT_CIRCUIT_COMPUTED: Bool = false and ((1 + 2) < 4)\n",
+        ));
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        assert_eq!(expected_values.len(), 42);
+        for (index, expected) in expected_values.into_iter().enumerate() {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("I64 comparison literal check succeeds");
+            assert!(
+                check.is_valid_bool(),
+                "I64 comparison owner {index} is a valid Bool"
+            );
+            assert!(
+                check.requires_const_value(),
+                "I64 comparison owner {index} requires an evaluator value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("I64 comparison evaluation succeeds"),
+                Some(ConstValue::Bool(expected)),
+                "comparison owner {index} compares defaulted I64 values"
+            );
+        }
+
+        assert_eq!(
+            resolved.owners()[42]
+                .const_value()
+                .expect("nested integer comparisons evaluate"),
+            Some(ConstValue::Bool(true))
+        );
+        assert_eq!(
+            resolved.owners()[43]
+                .const_value()
+                .expect("tuple Bool leaves evaluate"),
+            Some(ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([ConstValue::Bool(true), ConstValue::Bool(false)]),
+            })
+        );
+        assert_eq!(
+            resolved.owners()[44]
+                .const_value()
+                .expect("array Bool leaves evaluate"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(PrimTy::Bool),
+                elements: Arc::from([ConstValue::Bool(true), ConstValue::Bool(false)]),
+            })
+        );
+        let Some(ConstValue::Aggregate {
+            variant: Some(_),
+            fields,
+        }) = resolved.owners()[45]
+            .const_value()
+            .expect("tuple enum Bool payload evaluates")
+        else {
+            panic!("tuple enum constant retains its variant and Bool payload");
+        };
+        assert_eq!(fields.as_ref(), &[ConstValue::Bool(true)]);
+
+        for index in [46, 47, 48] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("supported integer comparison mismatch is checked");
+            assert_eq!(check.diagnostics().len(), 1, "owner {index}");
+            assert_eq!(
+                check.diagnostics()[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("type mismatch suppresses comparison values"),
+                None,
+                "owner {index}"
+            );
+        }
+
+        let invalid_operands = [
+            (49, "RANGE_LEFT", &["9223372036854775808"][..]),
+            (50, "RANGE_RIGHT", &["9223372036854775808"][..]),
+            (
+                51,
+                "RANGE_BOTH",
+                &["9223372036854775808", "-9223372036854775809"][..],
+            ),
+            (52, "RANGE_AND_MISMATCH", &["9223372036854775808"][..]),
+            (53, "SHORT_CIRCUIT_RANGE", &["9223372036854775808"][..]),
+            (54, "TUPLE_ROOT_RANGE", &["9223372036854775808"][..]),
+            (55, "ARRAY_ROOT_RANGE", &["9223372036854775808"][..]),
+        ];
+        for (index, declaration, expected_operands) in invalid_operands {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("out-of-range integer comparison is recognized");
+            assert!(
+                !check.diagnostics().is_empty(),
+                "{declaration} has literal diagnostics"
+            );
+            assert_eq!(
+                check
+                    .diagnostics()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::LiteralOutOfRange)
+                    .count(),
+                expected_operands.len(),
+                "{declaration} retains one range diagnostic per bad operand"
+            );
+            if declaration == "RANGE_AND_MISMATCH"
+                || declaration == "TUPLE_ROOT_RANGE"
+                || declaration == "ARRAY_ROOT_RANGE"
+            {
+                assert!(
+                    check
+                        .diagnostics()
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch),
+                    "{declaration} retains its independent shape mismatch"
+                );
+            }
+            let declaration_start = root
+                .find(&format!("pub const {declaration}:"))
+                .expect("range declaration exists");
+            let mut search_from = declaration_start;
+            let range_diagnostics = check
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::LiteralOutOfRange)
+                .collect::<Vec<_>>();
+            for (diagnostic, operand) in range_diagnostics.into_iter().zip(expected_operands) {
+                let relative_start = root[search_from..]
+                    .find(operand)
+                    .expect("out-of-range literal occurs in declaration");
+                let start = search_from + relative_start;
+                let expected_range = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + operand.len()) as u32),
+                )
+                .expect("range literal span is ordered");
+                assert_eq!(
+                    diagnostic.primary().map(|location| location.span.range),
+                    Some(expected_range),
+                    "{declaration} range diagnostic covers {operand:?}"
+                );
+                search_from = start + operand.len();
+            }
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("out-of-range integer comparison does not evaluate"),
+                None,
+                "{declaration} has no const value"
+            );
+        }
+
+        for index in 57..67 {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("unsupported comparison shape remains resolvable"),
+                &ConstLiteralCheck::Unsupported,
+                "paths, mixed families, computed/nested operands, and hidden unsupported nodes remain gated at owner {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported comparison does not evaluate"),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn const_bool_char_and_byte_literal_comparisons_produce_bool_values() {
         let comparisons = [
             (BinOp::Eq, "=="),
@@ -86701,7 +87053,6 @@ property "shared"() {}
             "pub const MIXED_OPERANDS: Bool = 'a' == b'a'\n",
             "pub const NESTED_COMPARISON: Bool = 'a' == ('b' < 'c')\n",
             "pub const SHORT_CIRCUIT_PATH: Bool = false and (CHAR_BASE < 'b')\n",
-            "pub const UNRELATED_PRIMITIVE: Bool = 1 < 2\n",
         ));
 
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -86847,7 +87198,7 @@ property "shared"() {}
             Some(ConstValue::Char('a'))
         );
 
-        for index in 44..49 {
+        for index in 44..48 {
             assert_eq!(
                 resolved.owners()[index]
                     .literal_check()
@@ -87091,7 +87442,6 @@ property "shared"() {}
             "pub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < \"b\")\n",
             "pub const SHORT_CIRCUIT_COMPUTED: Bool = true or ((\"a\" + \"b\") == \"ab\")\n",
             "pub const BYTE_STRING_COMPARISON: Bool = b\"a\" < b\"b\"\n",
-            "pub const UNRELATED_PRIMITIVE: Bool = 1 < 2\n",
         ));
 
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -87207,7 +87557,7 @@ property "shared"() {}
             Some(ConstValue::Str(_))
         ));
 
-        for index in 37..49 {
+        for index in 37..48 {
             assert_eq!(
                 resolved.owners()[index]
                     .literal_check()
@@ -87294,7 +87644,6 @@ property "shared"() {}
             "pub const COMPUTED_REMAINDER_OPERAND: Bool = (1.0 % 2.0) < 1.0\n",
             "pub const NESTED_COMPARISON: Bool = 1.0 == (2.0 < 3.0)\n",
             "pub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < 2.0)\n",
-            "pub const UNRELATED_PRIMITIVE: Bool = 1 < 2\n",
         ));
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -87501,7 +87850,7 @@ property "shared"() {}
             None
         );
 
-        for index in 48..56 {
+        for index in 48..55 {
             assert_eq!(
                 resolved.owners()[index]
                     .literal_check()
