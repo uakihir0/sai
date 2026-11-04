@@ -8,11 +8,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from resource_limits import LimitTableError
 from run_stage0 import (
     FMT_LAYOUT_VARIANT_COUNT,
     PACKAGE_MANIFEST,
     ROOT_ID,
-    SOURCE_FILE_MAX_BYTES,
     SmokeError,
     USAGE_ERROR_CASES,
     _canonical_json,
@@ -21,6 +21,7 @@ from run_stage0 import (
     _first_differing_lf_line,
     _normalize_diagnostic_json,
     _formatter_refusal_codes,
+    _format_source_limit,
     _resolve_spec_reference,
     _source_position,
     _run_iut,
@@ -187,12 +188,12 @@ class Stage0SmokeRunnerTests(unittest.TestCase):
         self.refusal_line = None
         self.expected_format = None
         self.probe_limit = 64
-        self.source_file_max_bytes_patch = patch(
-            "run_stage0.SOURCE_FILE_MAX_BYTES",
-            self.probe_limit,
+        self.source_file_minimum_patch = patch(
+            "run_stage0.resource_limits.source_file_minimum_bytes",
+            return_value=self.probe_limit,
         )
-        self.source_file_max_bytes_patch.start()
-        self.addCleanup(self.source_file_max_bytes_patch.stop)
+        self.source_file_minimum_patch.start()
+        self.addCleanup(self.source_file_minimum_patch.stop)
         self.layout_variants = [f"mock layout {index}\n".encode("utf-8") for index in range(16)]
         self.layout_variants_patch = patch(
             "run_stage0._generate_fmt_layout_variants",
@@ -218,6 +219,7 @@ REFUSAL_LINE = {self.refusal_line!r}
 EXPECTED_FORMATTED = {self.expected_format!r}
 EXPECTED_SIZE_PROBE_LENGTH = {self.probe_limit + 1}
 EXPECTED_SIZE_PROBE = b"/*" + b" " * (EXPECTED_SIZE_PROBE_LENGTH - 2)
+EXPECTED_SIZE_LIMIT_LABEL = {_format_source_limit(self.probe_limit)!r}
 EXPECTED_SIZE_MINIMUM = b"/*" + b" " * ({self.probe_limit} - 5) + b"*/\\n"
 EXPECTED_SIZE_CHECK_PREFIX = b"pub const FLAG: Bool = true\\n"
 EXPECTED_SIZE_CHECK = (
@@ -734,7 +736,7 @@ if args in (source_fmt_args, package_fmt_args):
         diagnostic = {{
             "type":"diagnostic","code":"IMPLEMENTATION_LIMIT_EXCEEDED",
             "severity":"error","level":None,
-            "message":f"source file is {{len(formatter_input)}} bytes, exceeding the 16 MiB limit",
+            "message":f"source file is {{len(formatter_input)}} bytes, exceeding the {{EXPECTED_SIZE_LIMIT_LABEL}} limit",
             "primary":{{
                 "file":{{"path":"<stdin>","package":None,"snapshot":None}},
                 "start":{{"byte":0,"line":1,"col":1,"utf16_col":1}},
@@ -1654,7 +1656,6 @@ raise SystemExit(exit_code)
         self.assertEqual(self.source.read_bytes(), original)
 
     def test_source_size_refusal_probe_uses_documented_limit(self):
-        self.assertEqual(SOURCE_FILE_MAX_BYTES, 16 * 1024 * 1024)
         self._fixture()
         self.mode = "fmt_size_refusal"
         self._write_fake()
@@ -1664,8 +1665,17 @@ raise SystemExit(exit_code)
         self.assertEqual(report["outcome"], "pass", report)
         self.assertEqual(report["tests"], 4 + len(USAGE_ERROR_CASES))
         self.assertEqual(report["results"][-1]["test"],
-                         "generated/impl-14-formatter/source-size-refusal")
+                         "generated/impl-14-formatter/reference-source-size-refusal")
         self.assertEqual(report["results"][-1]["outcome"], "pass")
+        self.assertEqual(report["results"][-1]["minimum_bytes"], self.probe_limit)
+        self.assertEqual(
+            report["results"][-1]["refusal_size_bytes"],
+            self.probe_limit + 1,
+        )
+        self.assertIs(
+            report["results"][-1]["reference_implementation_specific"],
+            True,
+        )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual(receipt["calls"][-1], "fmt-size-refusal")
         self.assertEqual(receipt["size_refusal_probe"]["argv"], [
@@ -1675,8 +1685,20 @@ raise SystemExit(exit_code)
                          self.probe_limit + 1)
         self.assertEqual(receipt["size_refusal_probe"]["prefix"], "/*")
 
+    def test_suite_fails_closed_when_spec_limit_table_is_incomplete(self):
+        self._fixture()
+        message = "§1.5.4 implementation-limit table row set changed"
+        with patch(
+            "run_stage0.resource_limits.read_implementation_limits",
+            side_effect=LimitTableError(message),
+        ):
+            report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(report["failures"], [message])
+        self.assertEqual(report["results"], [])
+
     def test_source_size_minimum_probe_accepts_exact_limit_unchanged(self):
-        self.assertEqual(SOURCE_FILE_MAX_BYTES, 16 * 1024 * 1024)
         self._fixture()
         self.mode = "fmt_size_minimum"
         self._write_fake()
@@ -1690,6 +1712,7 @@ raise SystemExit(exit_code)
             "generated/impl-14-formatter/source-size-minimum",
         )
         self.assertEqual(report["results"][-2]["outcome"], "pass")
+        self.assertEqual(report["results"][-2]["minimum_bytes"], self.probe_limit)
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual(receipt["calls"].count("fmt-size-minimum"), 1)
         self.assertIn("fmt-size-minimum", receipt["calls"])
@@ -1716,7 +1739,6 @@ raise SystemExit(exit_code)
         )
 
     def test_check_source_size_minimum_reads_an_exact_limit_file(self):
-        self.assertEqual(SOURCE_FILE_MAX_BYTES, 16 * 1024 * 1024)
         self._fixture()
         self._write_fake()
 
@@ -1728,6 +1750,7 @@ raise SystemExit(exit_code)
             report["results"][-3]["test"],
             "generated/spec-01-introduction/source-size-minimum-check",
         )
+        self.assertEqual(report["results"][-3]["minimum_bytes"], self.probe_limit)
         self.assertEqual(report["results"][-3]["outcome"], "pass")
         self.assertEqual(
             report["results"][-3]["compatibility_execution"],

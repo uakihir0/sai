@@ -195,19 +195,25 @@ refusal codes from the lexical error table and parser-only rows in the
 syntactic-validation table; parser severities come from the implementation
 diagnostics table, and unknown severities fail closed. Validation and mixed
 parser/validation codes are excluded. This kind also bypasses canonical-input
-preflight and `sai check`. The runner generates an exactly 16 MiB valid source
-with a canonical block comment and final newline, and requires formatter
-acceptance with byte-identical output. It also writes a generated 16 MiB
-`src/lib.sai` into a temporary package and requires
+preflight and `sai check`. The runner parses §1.5.4's implementation-limit
+table and generates a valid source at the `size of a source file` minimum,
+with a canonical block comment and final newline, then requires formatter
+acceptance with byte-identical output. It also writes `src/lib.sai` at that
+parsed minimum in a temporary package and requires
 `sai check --target=wasm32-core --jobs=1` to return a successful result with
 no diagnostics. The source begins with a supported public Bool constant and uses
 a trailing block comment for padding, exercising source-file loading through
-the compiler check path. A valid-UTF-8 source input of 16 MiB + 1 byte
-beginning with an unterminated block comment must produce the exact
+the compiler check path. A valid-UTF-8 source input one byte above the parsed
+minimum, beginning with an unterminated block comment, is expected to produce
+the exact
 `IMPLEMENTATION_LIMIT_EXCEEDED` diagnostic, actual byte length, one refused
 `<stdin>` input, no changed files, no output, and no other diagnostic. The
 malformed prefix makes the probe verify that the formatter's size check
-precedes lexing. Generated files are temporary and are not checked in.
+precedes lexing. This refusal expectation is specific to the current reference
+implementation; the specification permits other implementations to accept
+larger files. This refusal is not portable conformance evidence. The report sets
+`reference_implementation_specific: true` for this result. Generated files are
+temporary and are not checked in.
 A timeout is a failure, never a pass.
 
 For the package `fmt` directory fixture, the runner pipes the `sai.package`
@@ -238,10 +244,11 @@ protocol, and cannot substantiate a conformance claim. Its JSON golden
 comparison is limited to ordinary sidecars on single-file Stage 0 check
 fixtures; it does not cover formatter goldens, target/profile specializations,
 or directory fixtures.
-Source-size coverage checks the generated 16 MiB minimum through source
-formatting and package-file checking, plus the formatter's 16 MiB + 1 byte
-refusal; it does not cover the remaining §1.5.4 limits or the required portable
-generated tests. Formatter coverage is limited to single-file source and one package-manifest
+The source-size probes read the source-file minimum from the numeric table in
+`docs/spec/01-introduction.md` §1.5.4. They check generated minimum-size source
+through formatting and package-file checking, plus the formatter's one-byte
+over-limit refusal; they do not generate the remaining 11 limit cases or the
+full required portable test matrix. Formatter coverage is limited to single-file source and one package-manifest
 `fmt` fixture's byte comparisons, fixed-point checks, 16 deterministic layout
 variants, source-stdin, generated
 package-wide `fmt --check` and `fmt --check` with one explicit path,

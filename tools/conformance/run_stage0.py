@@ -25,6 +25,7 @@ import diagnostic_matcher
 import expectation_extractor
 import fixture_discovery
 import ndjson_stream
+import resource_limits
 
 
 ROOT_ID = "conformance:test@0.1.0"
@@ -36,7 +37,6 @@ PACKAGE_MANIFEST = (
 )
 TIMEOUT_SECONDS = 600
 FMT_LAYOUT_VARIANT_COUNT = 16
-SOURCE_FILE_MAX_BYTES = 16 * 1024 * 1024
 ALLOWED_DIRECTIVES = {"kind", "stage", "spec", "diag"}
 SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+\Z")
@@ -1340,6 +1340,7 @@ def _validate_fmt_source_size_refusal(
     completed: subprocess.CompletedProcess,
     *,
     input_length: int,
+    minimum_bytes: int,
     registered_codes: set[str],
 ) -> None:
     actual, data, summary, diagnostics = _formatter_envelope(
@@ -1383,7 +1384,10 @@ def _validate_fmt_source_size_refusal(
         diagnostic["code"] != "IMPLEMENTATION_LIMIT_EXCEEDED"
         or diagnostic["severity"] != "error"
         or diagnostic["message"]
-        != f"source file is {input_length} bytes, exceeding the 16 MiB limit"
+        != (
+            f"source file is {input_length} bytes, exceeding the "
+            f"{_format_source_limit(minimum_bytes)} limit"
+        )
         or diagnostic["data"] != {
             "limit": "size of a source file",
             "value": input_length,
@@ -1471,17 +1475,24 @@ def _validate_check_source_size_minimum(
     )
 
 
-def _source_at_minimum_size() -> bytes:
-    source = b"/*" + b" " * (SOURCE_FILE_MAX_BYTES - 5) + b"*/\n"
-    if len(source) != SOURCE_FILE_MAX_BYTES:
+def _source_at_minimum_size(minimum_bytes: int) -> bytes:
+    source = b"/*" + b" " * (minimum_bytes - 5) + b"*/\n"
+    if len(source) != minimum_bytes:
         raise SmokeError("generated source-size minimum has the wrong byte length")
     return source
 
 
-def _check_source_at_minimum_size() -> bytes:
+def _format_source_limit(minimum_bytes: int) -> str:
+    for unit, multiplier in (("MiB", 1024 * 1024), ("KiB", 1024)):
+        if minimum_bytes % multiplier == 0:
+            return f"{minimum_bytes // multiplier} {unit}"
+    return f"{minimum_bytes:,} bytes"
+
+
+def _check_source_at_minimum_size(minimum_bytes: int) -> bytes:
     prefix = b"pub const FLAG: Bool = true\n"
-    source = prefix + b"/*" + b" " * (SOURCE_FILE_MAX_BYTES - len(prefix) - 5) + b"*/\n"
-    if len(source) != SOURCE_FILE_MAX_BYTES:
+    source = prefix + b"/*" + b" " * (minimum_bytes - len(prefix) - 5) + b"*/\n"
+    if len(source) != minimum_bytes:
         raise SmokeError("generated source-size minimum has the wrong byte length")
     return source
 
@@ -1490,6 +1501,7 @@ def _run_check_source_size_minimum(
     iut: Path,
     registered_codes: set[str],
     *,
+    minimum_bytes: int,
     timeout: float,
 ) -> dict:
     test = "generated/spec-01-introduction/source-size-minimum-check"
@@ -1507,9 +1519,10 @@ def _run_check_source_size_minimum(
         "outcome": "fail",
         "deviations": [],
         "failures": [],
+        "minimum_bytes": minimum_bytes,
     }
     try:
-        source = _check_source_at_minimum_size()
+        source = _check_source_at_minimum_size(minimum_bytes)
         with tempfile.TemporaryDirectory(prefix="sai-stage0-check-size-") as temporary:
             sandbox_root = Path(temporary)
             package_root = sandbox_root / "package"
@@ -1550,6 +1563,7 @@ def _run_fmt_source_size_minimum(
     iut: Path,
     registered_codes: set[str],
     *,
+    minimum_bytes: int,
     timeout: float,
 ) -> dict:
     test = "generated/impl-14-formatter/source-size-minimum"
@@ -1563,11 +1577,12 @@ def _run_fmt_source_size_minimum(
         "outcome": "fail",
         "deviations": [],
         "failures": [],
+        "minimum_bytes": minimum_bytes,
     }
     try:
         # A canonical block comment reaches the source-file byte limit without
         # creating a checked-in 16 MiB fixture.
-        source = _source_at_minimum_size()
+        source = _source_at_minimum_size(minimum_bytes)
         with tempfile.TemporaryDirectory(prefix="sai-stage0-fmt-size-") as temporary:
             sandbox_root = Path(temporary)
             package_root = sandbox_root / "package"
@@ -1604,9 +1619,10 @@ def _run_fmt_source_size_refusal(
     iut: Path,
     registered_codes: set[str],
     *,
+    minimum_bytes: int,
     timeout: float,
 ) -> dict:
-    test = "generated/impl-14-formatter/source-size-refusal"
+    test = "generated/impl-14-formatter/reference-source-size-refusal"
     output = {
         "type": "test",
         "test": test,
@@ -1617,13 +1633,16 @@ def _run_fmt_source_size_refusal(
         "outcome": "fail",
         "deviations": [],
         "failures": [],
+        "minimum_bytes": minimum_bytes,
+        "refusal_size_bytes": minimum_bytes + 1,
+        "reference_implementation_specific": True,
     }
     try:
-        # An unterminated comment would produce a lexical refusal if the size
-        # check did not run first. The payload stays valid UTF-8 and is generated
-        # in memory so the repository does not need a 16 MiB fixture.
-        source = b"/*" + b" " * (SOURCE_FILE_MAX_BYTES - 1)
-        if len(source) != SOURCE_FILE_MAX_BYTES + 1:
+        # The current reference implementation refuses this boundary. The spec
+        # requires support through the minimum but permits larger inputs.
+        # The unterminated comment also verifies that size checking precedes lexing.
+        source = b"/*" + b" " * (minimum_bytes - 1)
+        if len(source) != minimum_bytes + 1:
             raise SmokeError("generated source-size probe has the wrong byte length")
         with tempfile.TemporaryDirectory(prefix="sai-stage0-fmt-size-") as temporary:
             sandbox_root = Path(temporary)
@@ -1647,6 +1666,7 @@ def _run_fmt_source_size_refusal(
         _validate_fmt_source_size_refusal(
             completed,
             input_length=len(source),
+            minimum_bytes=minimum_bytes,
             registered_codes=registered_codes,
         )
         output["outcome"] = "pass"
@@ -2399,15 +2419,17 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "uses the generated package's wasm32-core/dev defaults for execution.",
             "The caller must supply this repository's reference sai binary; the runner "
             "cannot verify the identity of the executable passed with --iut.",
-            "A generated public-constant source file of exactly 16 MiB is also "
-            "checked through the package file-read path with an explicit wasm32-core "
+            "A generated public-constant source file at the parsed §1.5.4 minimum "
+            "is also checked through the package file-read path with an explicit wasm32-core "
             "target; the other §1.5.4 minimums are not "
             "covered. Formatter coverage is limited to single-file source fmt goldens and "
             "Stage 3 package fmt directory goldens, their "
             "fixed-point, 16 reference-lexer-derived deterministic layout variants, "
             "source-stdin, generated package-wide, and fmt --check with one explicit "
-            "path, refusal fixtures, and generated 16 MiB acceptance and 16 MiB + 1 "
-            "byte source-size boundary cases. "
+            "path, refusal fixtures, and generated exact-minimum acceptance plus a "
+            "one-byte-above refusal smoke specific to the current reference "
+            "implementation. The specification permits implementations to accept "
+            "files above the minimum. "
             "workspaces, multi-source package checks, multiple explicit path arguments, "
             "and complete "
             "formatter-rule coverage are not covered.",
@@ -2433,19 +2455,30 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             raise SmokeError("no supported smoke fixtures were discovered")
         codes = _read_registry(iut_path, timeout=timeout)
         docs_root = Path(__file__).resolve().parents[2] / "docs"
+        source_file_minimum = resource_limits.source_file_minimum_bytes(
+            resource_limits.read_implementation_limits(
+                docs_root / "spec/01-introduction.md"
+            )
+        )
         results = [
             _run_fixture(fixture, conformance_root, iut_path, codes,
                          timeout=timeout, docs_root=docs_root)
             for fixture in fixtures
         ]
         results.append(
-            _run_check_source_size_minimum(iut_path, codes, timeout=timeout)
+            _run_check_source_size_minimum(
+                iut_path, codes, minimum_bytes=source_file_minimum, timeout=timeout
+            )
         )
         results.append(
-            _run_fmt_source_size_minimum(iut_path, codes, timeout=timeout)
+            _run_fmt_source_size_minimum(
+                iut_path, codes, minimum_bytes=source_file_minimum, timeout=timeout
+            )
         )
         results.append(
-            _run_fmt_source_size_refusal(iut_path, codes, timeout=timeout)
+            _run_fmt_source_size_refusal(
+                iut_path, codes, minimum_bytes=source_file_minimum, timeout=timeout
+            )
         )
         usage_results = [
             _run_usage_error_case(iut_path, case, codes, timeout=timeout)

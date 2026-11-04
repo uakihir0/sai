@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1154 (2026-11-04): drive the source-size probe from the limit table
+
+- **Decision — review required:** Parse and validate the complete §1.5.4 two-column implementation-limit table and use its source-file minimum to size the generated formatter and package-check acceptance probes. Retain the one-byte-above refusal probe only as a smoke check for the current reference implementation.
+- **Reason:** §15.9.2 item 5 requires generated minimum-limit tests sourced from §1.5.4. Parsing the table removes the hard-coded source-size value from the acceptance probes and exposes the actual table-derived byte count in results.
+- **Boundary and judgment:** The file reader requires the current set of all 12 row names so a truncated table fails closed and a future table change requires an intentional update. It currently drives only the `size of a source file` row. Numeric units are normalized to bytes for `bytes`, `KiB`, and `MiB`; unitless minima remain counts. The specification requires support through the minimum but permits larger inputs, so rejecting minimum + 1 is not portable; the result marks this expected refusal `reference_implementation_specific`. These generated probes remain partial smoke evidence: they do not create checked-in fixtures, exercise the other 11 limits or the full §15.9.2 matrix, or substantiate a conformance claim.
+- **Review required:** Challenge section/table parsing and numeric grouping; verify the entire expected row set is required and truncation fails; confirm each acceptance input is exactly the parsed source minimum and the refusal input is one byte larger; verify diagnostic labels derive from the parsed minimum; and confirm the refusal result and docs describe only current-reference behavior, not a portable requirement.
+- **Verification:** All 4 resource-limit parser tests passed; all 11 focused source-size tests and the fail-closed runner regression passed. The complete `tools/conformance` Python suite passed 241 tests (3 skipped). The actual `target/debug/sai` Stage 0 smoke passed 35/35 cases with `claim: false`; `iut_identity_verified` remains false. Final diff checks are recorded with the commit.
+- **Hostile review:** Code review found no remaining actionable issues after the fixes: the one-byte-above case is explicitly reference-specific, the runtime reader requires the complete current row-name set, and the result threshold is table-derived. Documentation review confirmed the portable minimum versus reference-only refusal distinction; it requested a precise README reference to `reference_implementation_specific: true` and a clarified line wrap, both addressed and confirmed. The runner still cannot verify the supplied binary's identity, which is stated in the report and README.
+
 ### IR-1153 (2026-11-04): audit registry coverage and diagnostic-table severity
 
 - **Decision — review required:** Extend the report-only coverage inventory with sorted registry names that do not occur in a diagnostic table and a deterministic list of every source-located table row for codes whose rows have different severity text.
