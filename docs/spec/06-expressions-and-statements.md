@@ -1786,12 +1786,14 @@ The initializer of a `const` and the arguments of an explicit discriminant are e
 - literals, including `Str` and `b"…"` literals
 - paths to other consts and to unit variants
 - built-in operators on primitives: arithmetic, wrapping, bitwise, shifts, comparisons, `and`, `or`, `not`, unary `-` and `~`
+- direct `==`, `!=`, `<`, `<=`, `>`, and `>=` comparisons between two byte-string literals, evaluated with the `Slice<Byte>` semantics of [16](16-core-library.md) §16.5.5 (N-C-86)
 - record, variant, distinct, tuple and array construction
 - parentheses
 
 Rules:
 
 - Every other form is `NOT_CONST_EXPRESSION`. That includes calls, method calls, operator trait calls, `if`, `match`, blocks, closures, borrows, indexing, f-strings, `Array.filled` and `assert`. There is no const fn (D-EXPR-07).
+- A direct comparison between two byte-string literals is evaluated over their decoded bytes using the equality or lexicographic ordering specified for `Slice<Byte>` in [16](16-core-library.md) §16.5.5. This operation is evaluated directly by the const interpreter and does not invoke an operator trait method; every other operator trait call remains disallowed (N-C-86).
 - Evaluation follows §6.8 exactly, including all checks. An operation that would panic at run time is the compile-time error `CONST_EVAL_PANIC`, naming the panic kind. Float operations are evaluated with IEEE 754 semantics. A NaN result is allowed, and its bit pattern is unspecified (D-TYPE-06).
 - A const that refers to itself, directly or through other consts, is `CONST_CYCLE`.
 - A B→R conversion or a construction of a type with an invariant inside a const initializer MUST be proven by the SFC, because no runtime check can exist. Otherwise the error is `REFINEMENT_NOT_PROVEN` or `CONST_INVARIANT_NOT_PROVEN` ([09](09-contracts-and-refinements.md)).
@@ -1839,6 +1841,7 @@ These decisions fill gaps that [decisions.md](../design/decisions.md) leaves ope
 | N-C-34 | Fields reached through a refined type, or `.value` of a refined distinct type, are immutable places (§6.6.1). | P2: a refinement predicate cannot be broken by a field write. |
 | N-C-35 | A refined scrutinee: a top-level binding or `_` matches at the refined type; all other patterns and exhaustiveness use the base (§6.21.2). | D-EXPR-04 (refinements ignored for exhaustiveness); P8. |
 | N-C-36 | Slice patterns apply only to `Array`, `Slice` and `SliceMut`, and have the rest-binding types of §6.21.3. | P1: `Vec` is matched through `as_slice()`. |
+| N-C-86 | The six direct comparison operators between two byte-string literals are const operations evaluated over decoded bytes with `Slice<Byte>` comparison semantics; the interpreter does not call the comparison trait method (§6.27). | Preserve the specified `Slice<Byte>` ordering for this direct literal form while keeping general operator trait calls outside const expressions. |
 
 ## 6.29 Diagnostics
 

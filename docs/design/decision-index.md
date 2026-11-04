@@ -223,6 +223,7 @@ Defined in spec/06, spec/09, spec/10.
 | N-C-83 | [spec/10](../spec/10-errors-and-panics.md) §10.10 | A host MUST NOT call a core module instance again after it has trapped. |
 | N-C-84 | [spec/10](../spec/10-errors-and-panics.md) §10.10 | The operands of a panic, including the message arguments of `panic`, `expect` and `expect_err`, are evaluated as written in every profile and panic mode. |
 | N-C-85 | [spec/09](../spec/09-contracts-and-refinements.md) §9.10 | Borrowed places. |
+| N-C-86 | [spec/06](../spec/06-expressions-and-statements.md) §6.28 | The six direct comparison operators between two byte-string literals are const operations evaluated over decoded bytes with `Slice<Byte>` comparison semantics. |
 
 ## N-D
 
