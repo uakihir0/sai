@@ -1,0 +1,3 @@
+{"type":"header","format":"sai-diagnostics","version":1,"tool":{"name":"sai","version":"0.1.0"},"command":"check","root":"conformance:test@0.1.0"}
+{"type":"result","kind":"check","data":{"target":"wasm32-core","profile":"dev","tests":false,"packages":1,"fixes_applied":0,"changed_files":[]}}
+{"type":"summary","errors":0,"warnings":0,"infos":0,"shown_errors":0,"suppressed":{"cascade":0,"duplicate":0,"dependency":0},"exit_code":0}
