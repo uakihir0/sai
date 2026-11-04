@@ -8162,11 +8162,17 @@ fn check_const_bool_float_comparison_literals(
 fn const_literal_comparison_ordering(
     left: &HirExpr<'_>,
     right: &HirExpr<'_>,
+    symbols: &Interner,
 ) -> Option<std::cmp::Ordering> {
     match (left.kind, right.kind) {
         (ExprKind::Lit(Lit::Bool(left)), ExprKind::Lit(Lit::Bool(right))) => Some(left.cmp(&right)),
         (ExprKind::Lit(Lit::Char(left)), ExprKind::Lit(Lit::Char(right))) => Some(left.cmp(&right)),
         (ExprKind::Lit(Lit::Byte(left)), ExprKind::Lit(Lit::Byte(right))) => Some(left.cmp(&right)),
+        (ExprKind::Lit(Lit::Str(left)), ExprKind::Lit(Lit::Str(right))) => {
+            let left = symbols.resolve(left).ok()?;
+            let right = symbols.resolve(right).ok()?;
+            Some(left.as_bytes().cmp(right.as_bytes()))
+        }
         _ => None,
     }
 }
@@ -8208,7 +8214,7 @@ fn evaluate_const_bool_literal_comparison(
         });
     }
 
-    let ordering = const_literal_comparison_ordering(left, right)?;
+    let ordering = const_literal_comparison_ordering(left, right, symbols)?;
     Some(match operator {
         BinOp::Eq => ordering.is_eq(),
         BinOp::Ne => !ordering.is_eq(),
@@ -86850,6 +86856,195 @@ property "shared"() {}
                 resolved.owners()[index]
                     .const_value()
                     .expect("unsupported comparison does not evaluate"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn const_bool_direct_str_literal_comparisons_produce_byte_ordered_values() {
+        let comparisons = [
+            (BinOp::Eq, "=="),
+            (BinOp::Ne, "!="),
+            (BinOp::Lt, "<"),
+            (BinOp::Le, "<="),
+            (BinOp::Gt, ">"),
+            (BinOp::Ge, ">="),
+        ];
+        let operand_pairs = [
+            (r#""z""#, "z", r#""a""#, "a"),
+            (r#""""#, "", r#""a""#, "a"),
+            (r#""a""#, "a", r#""a""#, "a"),
+            (r#""a\n""#, "a\n", r#""a\\n""#, "a\\n"),
+            (r#""é""#, "é", r#""😀""#, "😀"),
+        ];
+        let mut root = String::from("enum Payload { Flag(Bool) }\n");
+        let mut expected_values = Vec::new();
+        for (left_source, left, right_source, right) in operand_pairs {
+            for (operator, spelling) in comparisons {
+                let case = expected_values.len();
+                root.push_str(&format!(
+                    "pub const CASE_{case}: Bool = {left_source} {spelling} {right_source}\n"
+                ));
+                let ordering = left.cmp(&right);
+                expected_values.push(match operator {
+                    BinOp::Eq => ordering.is_eq(),
+                    BinOp::Ne => !ordering.is_eq(),
+                    BinOp::Lt => ordering.is_lt(),
+                    BinOp::Le => !ordering.is_gt(),
+                    BinOp::Gt => ordering.is_gt(),
+                    BinOp::Ge => !ordering.is_lt(),
+                    _ => unreachable!("the table contains only comparison operators"),
+                });
+            }
+        }
+        root.push_str(concat!(
+            "pub const NESTED: Bool = not (\"z\" < \"a\") and (\"\" <= \"a\")\n",
+            "pub const TUPLE: (Bool, Bool) = (\"a\" < \"aa\", \"z\" < \"a\")\n",
+            "pub const ARRAY: Array<Bool, 2> = [\"a\\né\" < \"a😀\", \"a\" == \"a\"]\n",
+            "pub const ENUM: Payload = Payload.Flag(\"a\" < \"b\")\n",
+            "pub const MISMATCH: I32 = \"a\" < \"b\"\n",
+            "pub const TUPLE_MISMATCH: (Bool,) = \"a\" < \"b\"\n",
+            "pub const BASE: Str = \"a\"\n",
+            "pub const PATH_OPERAND: Bool = BASE < \"b\"\n",
+            "pub const MIXED_BYTE_STRING: Bool = \"a\" == b\"a\"\n",
+            "pub const MIXED_CHAR: Bool = \"a\" == 'a'\n",
+            "pub const MIXED_BOOL: Bool = \"a\" == true\n",
+            "pub const MIXED_FLOAT: Bool = \"a\" == 1.0\n",
+            "pub const MIXED_NUMBER: Bool = \"a\" < 1\n",
+            "pub const COMPUTED_OPERAND: Bool = (\"a\" + \"b\") < \"ab\"\n",
+            "pub const NESTED_COMPARISON: Bool = (\"a\" < \"b\") == true\n",
+            "pub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < \"b\")\n",
+            "pub const SHORT_CIRCUIT_COMPUTED: Bool = true or ((\"a\" + \"b\") == \"ab\")\n",
+            "pub const BYTE_STRING_COMPARISON: Bool = b\"a\" < b\"b\"\n",
+            "pub const UNRELATED_PRIMITIVE: Bool = 1 < 2\n",
+        ));
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        assert_eq!(expected_values.len(), 30);
+        for (index, expected) in expected_values.into_iter().enumerate() {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("Str comparison literal check succeeds");
+            assert!(
+                check.is_valid_bool(),
+                "Str comparison owner {index} is a valid Bool"
+            );
+            assert!(
+                check.requires_const_value(),
+                "Str comparison owner {index} requires an evaluator value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("Str comparison evaluation succeeds"),
+                Some(ConstValue::Bool(expected)),
+                "comparison owner {index} follows decoded UTF-8 byte ordering"
+            );
+        }
+        assert_eq!(
+            resolved.owners()[30]
+                .const_value()
+                .expect("nested Str comparisons evaluate"),
+            Some(ConstValue::Bool(true))
+        );
+        assert_eq!(
+            resolved.owners()[31]
+                .const_value()
+                .expect("tuple Bool leaves evaluate"),
+            Some(ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([ConstValue::Bool(true), ConstValue::Bool(false)]),
+            })
+        );
+        assert_eq!(
+            resolved.owners()[32]
+                .const_value()
+                .expect("array Bool leaves evaluate"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::Bool),
+                elements: Arc::from([ConstValue::Bool(true), ConstValue::Bool(true)]),
+            })
+        );
+        let Some(ConstValue::Aggregate {
+            variant: Some(_),
+            fields,
+        }) = resolved.owners()[33]
+            .const_value()
+            .expect("tuple enum Bool payload evaluates")
+        else {
+            panic!("tuple enum constant retains its variant and Bool payload");
+        };
+        assert_eq!(fields.as_ref(), &[ConstValue::Bool(true)]);
+
+        for (index, expected_shape, expression) in [
+            (34, "scalar", "\"a\" < \"b\""),
+            (35, "tuple", "\"a\" < \"b\""),
+        ] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("Str comparison against a different type remains checked");
+            let diagnostics = match (expected_shape, check) {
+                ("scalar", ConstLiteralCheck::Supported { diagnostics, .. })
+                | ("tuple", ConstLiteralCheck::SupportedTuple { diagnostics }) => diagnostics,
+                _ => panic!("{expected_shape} Str comparison mismatch remains checked"),
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("mismatched Str comparison does not evaluate"),
+                None
+            );
+            let primary = diagnostics[0]
+                .primary()
+                .expect("comparison mismatch points at the complete expression");
+            let declaration = if expected_shape == "scalar" {
+                "pub const MISMATCH: I32 = "
+            } else {
+                "pub const TUPLE_MISMATCH: (Bool,) = "
+            };
+            let initializer_start =
+                root.find(declaration).expect("mismatch declaration exists") + declaration.len();
+            assert_eq!(primary.span.range.start().to_usize(), initializer_start);
+            assert_eq!(
+                primary.span.range.end().to_usize(),
+                initializer_start + expression.len()
+            );
+        }
+        assert!(matches!(
+            resolved.owners()[36]
+                .const_value()
+                .expect("direct Str const remains supported"),
+            Some(ConstValue::Str(_))
+        ));
+
+        for index in 37..49 {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("unsupported Str comparison remains resolvable"),
+                &ConstLiteralCheck::Unsupported,
+                "paths, mixed families, computed or nested operands, and short-circuit operands remain gated at owner {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported Str comparison does not evaluate"),
                 None
             );
         }
