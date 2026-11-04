@@ -8173,6 +8173,9 @@ fn const_literal_comparison_ordering(
             let right = symbols.resolve(right).ok()?;
             Some(left.as_bytes().cmp(right.as_bytes()))
         }
+        (ExprKind::Tuple(left), ExprKind::Tuple(right)) if left.is_empty() && right.is_empty() => {
+            Some(std::cmp::Ordering::Equal)
+        }
         _ => None,
     }
 }
@@ -86856,6 +86859,177 @@ property "shared"() {}
                 resolved.owners()[index]
                     .const_value()
                     .expect("unsupported comparison does not evaluate"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn const_bool_unit_literal_comparisons_produce_bool_values() {
+        let comparisons = [
+            ("EQ", BinOp::Eq, "==", true),
+            ("NE", BinOp::Ne, "!=", false),
+            ("LT", BinOp::Lt, "<", false),
+            ("LE", BinOp::Le, "<=", true),
+            ("GT", BinOp::Gt, ">", false),
+            ("GE", BinOp::Ge, ">=", true),
+        ];
+        let mut root = String::from("enum Payload { Flag(Bool) }\n");
+        for (name, _, spelling, _) in comparisons {
+            root.push_str(&format!("pub const {name}: Bool = () {spelling} ()\n"));
+        }
+        root.push_str(concat!(
+            "pub const NESTED: Bool = not (() > ()) and (() <= ())\n",
+            "pub const TUPLE: (Bool, Bool) = (() < (), () == ())\n",
+            "pub const ARRAY: Array<Bool, 2> = [() != (), () >= ()]\n",
+            "pub const ENUM: Payload = Payload.Flag(() == ())\n",
+            "pub const MISMATCH: I32 = () < ()\n",
+            "pub const TUPLE_MISMATCH: (I32,) = (() < (),)\n",
+            "pub const ARRAY_MISMATCH: Array<I32, 1> = [() == ()]\n",
+            "pub const BASE: () = ()\n",
+            "pub const PATH: Bool = BASE == ()\n",
+            "pub const MIXED_BOOL: Bool = () == true\n",
+            "pub const MIXED_CHAR: Bool = () == 'a'\n",
+            "pub const MIXED_BYTE: Bool = () == b'a'\n",
+            "pub const MIXED_FLOAT: Bool = () == 1.0\n",
+            "pub const MIXED_STR: Bool = () == \"\"\n",
+            "pub const MIXED_INT: Bool = () == 1\n",
+            "pub const NESTED_COMPARISON: Bool = (() == ()) == true\n",
+            "pub const SHORT_CIRCUIT_PATH: Bool = false and (BASE == ())\n",
+        ));
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        for (index, (_, _, _, expected)) in comparisons.into_iter().enumerate() {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("unit comparison literal check succeeds");
+            assert!(check.is_valid_bool(), "comparison owner {index} is Bool");
+            assert!(
+                check.requires_const_value(),
+                "comparison owner {index} needs a value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unit comparison evaluation succeeds"),
+                Some(ConstValue::Bool(expected)),
+                "all unit values compare equal"
+            );
+        }
+        assert_eq!(
+            resolved.owners()[6]
+                .const_value()
+                .expect("nested unit comparisons evaluate"),
+            Some(ConstValue::Bool(true))
+        );
+        assert_eq!(
+            resolved.owners()[7]
+                .const_value()
+                .expect("tuple Bool leaves evaluate"),
+            Some(ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([ConstValue::Bool(false), ConstValue::Bool(true)]),
+            })
+        );
+        assert_eq!(
+            resolved.owners()[8]
+                .const_value()
+                .expect("array Bool leaves evaluate"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::Bool),
+                elements: Arc::from([ConstValue::Bool(false), ConstValue::Bool(true)]),
+            })
+        );
+        let Some(ConstValue::Aggregate {
+            variant: Some(_),
+            fields,
+        }) = resolved.owners()[9]
+            .const_value()
+            .expect("tuple enum Bool payload evaluates")
+        else {
+            panic!("tuple enum constant retains its variant and Bool payload");
+        };
+        assert_eq!(fields.as_ref(), &[ConstValue::Bool(true)]);
+
+        for (index, declared_type, expression) in [
+            (10, "I32", "() < ()"),
+            (11, "(I32,)", "() < ()"),
+            (12, "Array<I32, 1>", "() == ()"),
+        ] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("unit comparison against a different type remains checked");
+            let diagnostics = match (index, check) {
+                (10, ConstLiteralCheck::Supported { diagnostics, .. })
+                | (11, ConstLiteralCheck::SupportedTuple { diagnostics })
+                | (12, ConstLiteralCheck::SupportedArray { diagnostics }) => diagnostics,
+                _ => panic!("wrong-result-type comparison remains in the checked subset"),
+            };
+            assert_eq!(diagnostics.len(), 1, "{declared_type} mismatch diagnostic");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "{declared_type} mismatch diagnostic"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("mismatched unit comparison does not evaluate"),
+                None
+            );
+            let primary = diagnostics[0]
+                .primary()
+                .expect("comparison mismatch points at its expression");
+            let declaration = match index {
+                10 => "pub const MISMATCH: I32 = ",
+                11 => "pub const TUPLE_MISMATCH: (I32,) = (",
+                12 => "pub const ARRAY_MISMATCH: Array<I32, 1> = [",
+                _ => unreachable!(),
+            };
+            let initializer_start =
+                root.find(declaration).expect("mismatch declaration exists") + declaration.len();
+            assert_eq!(primary.span.range.start().to_usize(), initializer_start);
+            assert_eq!(
+                primary.span.range.end().to_usize(),
+                initializer_start + expression.len()
+            );
+        }
+        assert_eq!(
+            resolved.owners()[13]
+                .const_value()
+                .expect("direct unit const remains supported"),
+            Some(ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([]),
+            })
+        );
+
+        assert_eq!(resolved.owners().len(), 23);
+        for index in 14..23 {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("unsupported unit comparison remains resolvable"),
+                &ConstLiteralCheck::Unsupported,
+                "paths, mixed families, nested comparisons, and short-circuit paths remain gated at owner {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported unit comparison does not evaluate"),
                 None
             );
         }
