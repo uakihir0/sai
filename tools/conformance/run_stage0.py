@@ -271,6 +271,88 @@ def _records(stdout: bytes, *, exit_code: int, stderr: bytes,
     )
 
 
+def _normalize_diagnostic_json(
+    data: bytes,
+    *,
+    exit_code: int,
+    stderr: bytes,
+    max_errors: int | None = None,
+) -> bytes:
+    records = _records(
+        data,
+        exit_code=exit_code,
+        stderr=stderr,
+        max_errors=max_errors,
+    )
+    records[0]["tool"] = {"name": "sai", "version": "<version>"}
+    for record in records:
+        if record.get("type") == "result" and record.get("kind") == "test":
+            result_data = record.get("data")
+            if isinstance(result_data, dict) and "duration_us" in result_data:
+                result_data["duration_us"] = 0
+    return b"".join(_canonical_json(record) + b"\n" for record in records)
+
+
+def _compare_diagnostic_json_golden(
+    stdout: bytes,
+    *,
+    exit_code: int,
+    stderr: bytes,
+    golden_path: Path,
+    golden_label: str,
+    temporary_root: Path,
+) -> None:
+    try:
+        info = golden_path.lstat()
+    except OSError:
+        raise SmokeError(f"missing diagnostic JSON golden: {golden_label}") from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise SmokeError(f"diagnostic JSON golden is not a regular file: {golden_label}")
+    try:
+        expected_bytes = golden_path.read_bytes()
+    except OSError:
+        raise SmokeError(f"could not read diagnostic JSON golden: {golden_label}") from None
+
+    actual = _normalize_diagnostic_json(
+        stdout,
+        exit_code=exit_code,
+        stderr=stderr,
+        max_errors=0,
+    )
+    expected = _normalize_diagnostic_json(
+        expected_bytes,
+        exit_code=exit_code,
+        stderr=b"",
+        max_errors=0,
+    )
+    temporary_text = str(temporary_root)
+    if any(
+        temporary_text in value
+        for record in _records(
+            stdout,
+            exit_code=exit_code,
+            stderr=stderr,
+            max_errors=0,
+        )
+        for value in _strings_in_json(record)
+    ):
+        raise SmokeError("temporary test directory appears in diagnostic JSON output")
+    if actual != expected:
+        raise SmokeError(f"diagnostic JSON golden mismatch: {golden_label}")
+
+
+def _strings_in_json(value: object):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, child in value.items():
+            yield key
+            yield from _strings_in_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _strings_in_json(child)
+
+
 def _run_iut(iut: Path, argv: list[str], cwd: Path, timeout: float, *,
              state_root: Path | None = None,
              stdin_data: bytes | None = None) -> subprocess.CompletedProcess:
@@ -486,7 +568,13 @@ def _validate_directives(
     return directives, expected, selected
 
 
-def _reject_sidecars(source: Path, fixture_path: str, *, allow_expected: bool = False) -> None:
+def _reject_sidecars(
+    source: Path,
+    fixture_path: str,
+    *,
+    allow_expected: bool = False,
+    allow_json: bool = False,
+) -> None:
     stem = source.name[:-4]
     try:
         entries = list(source.parent.iterdir())
@@ -509,6 +597,8 @@ def _reject_sidecars(source: Path, fixture_path: str, *, allow_expected: bool = 
                     if allow_expected and suffix == ".expected.sai" and entry.name == (
                         stem + ".expected.sai"
                     ):
+                        continue
+                    if allow_json and suffix == ".json" and entry.name == stem + ".json":
                         continue
                     raise SmokeError("sidecars are unsupported by the Stage 0 smoke runner")
 
@@ -1867,6 +1957,7 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
         "outcome": "fail",
         "deviations": [],
         "failures": [],
+        "diagnostic_json_golden": None,
     }
     try:
         if fixture["kind"] not in ("single-file", "directory"):
@@ -1971,7 +2062,8 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
             "manifest_target": "wasm32-core",
             "cli_profile_default": "dev",
         }
-        _reject_sidecars(source_path, path)
+        check_kind = directives["kind"] in ("check-pass", "check-fail")
+        _reject_sidecars(source_path, path, allow_json=check_kind)
         if any(item["file"] == "sai.package" for item in expected):
             raise SmokeError("manifest diagnostics are unsupported for generated packages")
 
@@ -2033,6 +2125,40 @@ def _run_fixture(fixture: dict, conformance_root: Path, iut: Path, codes: set[st
             "expected": expected,
             "actual": actual,
         })
+        if check_kind:
+            golden_path = source_path.with_name(source_path.stem + ".json")
+            golden_label = str(
+                PurePosixPath("tests")
+                / PurePosixPath(path).with_suffix(".json")
+            )
+            try:
+                golden_path.lstat()
+            except FileNotFoundError:
+                golden_present = False
+            except OSError:
+                output["diagnostic_json_golden"] = {
+                    "path": golden_label,
+                    "outcome": "fail",
+                }
+                raise SmokeError(
+                    f"could not inspect diagnostic JSON golden: {golden_label}"
+                ) from None
+            else:
+                golden_present = True
+            if golden_present:
+                output["diagnostic_json_golden"] = {
+                    "path": golden_label,
+                    "outcome": "fail",
+                }
+                _compare_diagnostic_json_golden(
+                    completed.stdout,
+                    exit_code=completed.returncode,
+                    stderr=completed.stderr,
+                    golden_path=golden_path,
+                    golden_label=golden_label,
+                    temporary_root=sandbox_root,
+                )
+                output["diagnostic_json_golden"]["outcome"] = "pass"
         output["outcome"] = comparison["outcome"]
         output["deviations"] = comparison["deviations"]
         output["failures"] = comparison["failures"]

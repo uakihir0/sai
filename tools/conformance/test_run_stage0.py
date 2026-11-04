@@ -14,8 +14,11 @@ from run_stage0 import (
     ROOT_ID,
     SmokeError,
     USAGE_ERROR_CASES,
+    _canonical_json,
+    _compare_diagnostic_json_golden,
     _generate_fmt_layout_variants,
     _first_differing_lf_line,
+    _normalize_diagnostic_json,
     _formatter_refusal_codes,
     _resolve_spec_reference,
     _source_position,
@@ -124,6 +127,44 @@ FAKE_USAGE_MESSAGES = {
     ("check", "--format=json", "--target", "--target"): "missing value for `--target`",
     ("check", "--format=json", "--bogus", "--target"): "missing value for `--target`",
 }
+
+
+def _json_stream(*records):
+    return b"".join(_canonical_json(record) + b"\n" for record in records)
+
+
+def _check_pass_stream(*, version="0.1.0", target="wasm32-core"):
+    return _json_stream(
+        {
+            "type": "header",
+            "format": "sai-diagnostics",
+            "version": 1,
+            "tool": {"name": "sai", "version": version},
+            "command": "check",
+            "root": ROOT_ID,
+        },
+        {
+            "type": "result",
+            "kind": "check",
+            "data": {
+                "target": target,
+                "profile": "dev",
+                "tests": False,
+                "packages": 1,
+                "fixes_applied": 0,
+                "changed_files": [],
+            },
+        },
+        {
+            "type": "summary",
+            "errors": 0,
+            "warnings": 0,
+            "infos": 0,
+            "shown_errors": 0,
+            "suppressed": {"cascade": 0, "duplicate": 0, "dependency": 0},
+            "exit_code": 0,
+        },
+    )
 
 
 class Stage0SmokeRunnerTests(unittest.TestCase):
@@ -908,6 +949,196 @@ raise SystemExit(exit_code)
 
     def _run(self, timeout=1):
         return run_suite(self.launcher, self.conformance, timeout=timeout)
+
+    def test_json_golden_normalizes_only_tool_version_and_test_duration(self):
+        def test_stream(version, duration):
+            records = [
+                {
+                    "type": "header",
+                    "format": "sai-diagnostics",
+                    "version": 1,
+                    "tool": {"name": "sai", "version": version},
+                    "command": "test",
+                    "root": ROOT_ID,
+                },
+                {
+                    "type": "result",
+                    "kind": "test",
+                    "data": {"duration_us": duration, "outcome": "passed"},
+                },
+                {
+                    "type": "summary",
+                    "errors": 0,
+                    "warnings": 0,
+                    "infos": 0,
+                    "shown_errors": 0,
+                    "suppressed": {"cascade": 0, "duplicate": 0, "dependency": 0},
+                    "exit_code": 0,
+                },
+            ]
+            return _json_stream(*records)
+
+        normalized = _normalize_diagnostic_json(
+            test_stream("0.1.0", 1),
+            exit_code=0,
+            stderr=b"",
+        )
+        self.assertEqual(
+            normalized,
+            _normalize_diagnostic_json(
+                test_stream("0.2.0", 9001),
+                exit_code=0,
+                stderr=b"",
+            ),
+        )
+        records = [json.loads(line) for line in normalized.splitlines()]
+        self.assertEqual(records[0]["tool"], {"name": "sai", "version": "<version>"})
+        self.assertEqual(records[1]["data"]["duration_us"], 0)
+
+    def test_json_golden_comparison_checks_full_record_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            golden = root / "case.json"
+            golden.write_bytes(_check_pass_stream())
+            _compare_diagnostic_json_golden(
+                _check_pass_stream(version="0.2.0"),
+                exit_code=0,
+                stderr=b"",
+                golden_path=golden,
+                golden_label="tests/conformance/case.json",
+                temporary_root=root / "test-root",
+            )
+            golden.write_bytes(_check_pass_stream(target="wasm64-core"))
+            with self.assertRaisesRegex(SmokeError, "diagnostic JSON golden mismatch"):
+                _compare_diagnostic_json_golden(
+                    _check_pass_stream(),
+                    exit_code=0,
+                    stderr=b"",
+                    golden_path=golden,
+                    golden_label="tests/conformance/case.json",
+                    temporary_root=root / "test-root",
+                )
+
+    def test_json_golden_comparison_preserves_record_and_data_member_order(self):
+        def diagnostic(code, data):
+            return {
+                "type": "diagnostic",
+                "code": code,
+                "severity": "error",
+                "level": None,
+                "message": code,
+                "primary": None,
+                "primary_label": "",
+                "labels": [],
+                "children": [],
+                "fixes": [],
+                "related": [],
+                "data": data,
+                "node": None,
+                "symbol": None,
+                "package": None,
+            }
+
+        def check_fail_stream(*diagnostics):
+            return _json_stream(
+                {
+                    "type": "header",
+                    "format": "sai-diagnostics",
+                    "version": 1,
+                    "tool": {"name": "sai", "version": "0.1.0"},
+                    "command": "check",
+                    "root": ROOT_ID,
+                },
+                *diagnostics,
+                {
+                    "type": "summary",
+                    "errors": len(diagnostics),
+                    "warnings": 0,
+                    "infos": 0,
+                    "shown_errors": len(diagnostics),
+                    "suppressed": {
+                        "cascade": 0,
+                        "duplicate": 0,
+                        "dependency": 0,
+                    },
+                    "exit_code": 1,
+                },
+            )
+
+        first = diagnostic(
+            "EXPECTED_TOKEN",
+            {"first": 1, "second": 2},
+        )
+        second = diagnostic("UNEXPECTED_TOKEN", {})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            golden = root / "case.json"
+            golden.write_bytes(check_fail_stream(first, second))
+            for actual in (
+                check_fail_stream(second, first),
+                check_fail_stream(
+                    diagnostic("EXPECTED_TOKEN", {"second": 2, "first": 1}),
+                    second,
+                ),
+            ):
+                with self.subTest(actual=actual):
+                    with self.assertRaisesRegex(
+                        SmokeError,
+                        "diagnostic JSON golden mismatch",
+                    ):
+                        _compare_diagnostic_json_golden(
+                            actual,
+                            exit_code=1,
+                            stderr=b"",
+                            golden_path=golden,
+                            golden_label="tests/conformance/case.json",
+                            temporary_root=root / "test-root",
+                        )
+
+    def test_json_golden_comparison_rejects_temporary_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            golden = root / "case.json"
+            golden.write_bytes(_check_pass_stream())
+            actual = _check_pass_stream().replace(
+                ROOT_ID.encode("utf-8"),
+                str(root / "package").encode("utf-8"),
+            )
+            with self.assertRaisesRegex(SmokeError, "temporary test directory"):
+                _compare_diagnostic_json_golden(
+                    actual,
+                    exit_code=0,
+                    stderr=b"",
+                    golden_path=golden,
+                    golden_label="tests/conformance/case.json",
+                    temporary_root=root,
+                )
+
+    def test_check_fixture_uses_and_reports_its_json_golden(self):
+        self._fixture()
+        golden = self.source.with_name(self.source.stem + ".json")
+        golden.write_bytes(_check_pass_stream())
+        report = self._run()
+        self.assertEqual(report["outcome"], "pass")
+        self.assertEqual(report["results"][0]["diagnostic_json_golden"], {
+            "path": "tests/conformance/spec-02-lexical-structure/case.json",
+            "outcome": "pass",
+        })
+
+        golden.write_bytes(_check_pass_stream(target="wasm64-core"))
+        report = self._run()
+        self.assertEqual(report["outcome"], "fail")
+        self.assertIn(
+            "diagnostic JSON golden mismatch",
+            " ".join(report["results"][0]["failures"]),
+        )
+        self.assertEqual(
+            report["results"][0]["diagnostic_json_golden"],
+            {
+                "path": "tests/conformance/spec-02-lexical-structure/case.json",
+                "outcome": "fail",
+            },
+        )
 
     def test_pass_uses_exact_cli_environment_and_temp_package(self):
         self._fixture()
