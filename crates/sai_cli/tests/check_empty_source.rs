@@ -19415,7 +19415,69 @@ fn str_comparison_const_mismatches_and_gates_are_preserved() {
         "pub const NESTED: Bool = (\"a\" < \"b\") == true\n",
         "pub const BASE: Str = \"a\"\npub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < \"b\")\n",
         "pub const SHORT_CIRCUIT_COMPUTED: Bool = true or ((\"a\" + \"b\") == \"ab\")\n",
-        "pub const BYTE_STRING: Bool = b\"a\" < b\"b\"\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn public_byte_string_literal_comparison_consts_emit_check_results() {
+    let source = concat!(
+        "pub const EQ: Bool = b\"same\" == b\"same\"\n",
+        "pub const NE: Bool = b\"a\" != b\"b\"\n",
+        "pub const LT: Bool = b\"a\" < b\"b\"\n",
+        "pub const LE: Bool = b\"a\" <= b\"a\"\n",
+        "pub const GT: Bool = b\"z\" > b\"a\"\n",
+        "pub const GE: Bool = b\"z\" >= b\"z\"\n",
+        "pub const EMPTY_PREFIX: Bool = b\"\" < b\"a\"\n",
+        "pub const PREFIX: Bool = b\"a\" < b\"aa\"\n",
+        "pub const ESCAPED: Bool = b\"a\\n\" < b\"a\\\\n\"\n",
+        "pub const NUL_HIGH: Bool = b\"\\x00\" < b\"\\xff\"\n",
+        "pub const HIGH_BYTES: Bool = b\"\\x80\" < b\"\\xff\"\n",
+        "pub const NESTED: Bool = not (b\"z\" < b\"a\") and (b\"\" <= b\"a\")\n",
+        "pub const TUPLE: (Bool, Bool) = (b\"a\" < b\"aa\", b\"\\xff\" < b\"\\x80\")\n",
+        "pub const ARRAY: Array<Bool, 2> = [b\"\\x00\" < b\"\\xff\", b\"\\xff\" > b\"\\x80\"]\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn byte_string_comparison_const_mismatches_and_gates_are_preserved() {
+    let source = "pub const MISMATCH: I32 = b\"a\" < b\"b\"\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "comparison assigned to I32 should fail:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a supported byte-string comparison with the wrong declared type is a checked mismatch:\n{stdout}"
+    );
+    let initializer = "b\"a\" < b\"b\"";
+    let start = source
+        .find(initializer)
+        .expect("mismatched comparison initializer exists");
+    assert_json_diagnostic_primary_byte_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        start,
+        start + initializer.len(),
+    );
+
+    for source in [
+        "pub const BASE: Slice<Byte> = b\"a\"\npub const PATH: Bool = BASE < b\"b\"\n",
+        "pub const MIXED_STR: Bool = b\"a\" == \"a\"\n",
+        "pub const MIXED_CHAR: Bool = b\"a\" == b'a'\n",
+        "pub const MIXED_BOOL: Bool = b\"a\" == true\n",
+        "pub const MIXED_FLOAT: Bool = b\"a\" == 1.0\n",
+        "pub const MIXED_INTEGER: Bool = b\"a\" == 1\n",
+        "pub const NESTED_COMPARISON: Bool = (b\"a\" < b\"b\") == true\n",
+        "pub const BASE: Slice<Byte> = b\"a\"\npub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < b\"b\")\n",
+        "pub const SHORT_CIRCUIT_NESTED: Bool = true or ((b\"a\" < b\"b\") == true)\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
     }
