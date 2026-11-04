@@ -8113,6 +8113,10 @@ fn is_const_bool_comparison_literal_pair(left: &HirExpr<'_>, right: &HirExpr<'_>
                 ExprKind::Lit(Lit::Float { .. })
             )
             | (ExprKind::Lit(Lit::Str(_)), ExprKind::Lit(Lit::Str(_)))
+            | (
+                ExprKind::Lit(Lit::ByteStr(_)),
+                ExprKind::Lit(Lit::ByteStr(_))
+            )
             | (ExprKind::Tuple([]), ExprKind::Tuple([]))
     )
 }
@@ -8222,6 +8226,9 @@ fn const_literal_comparison_ordering(
             let left = symbols.resolve(left).ok()?;
             let right = symbols.resolve(right).ok()?;
             Some(left.as_bytes().cmp(right.as_bytes()))
+        }
+        (ExprKind::Lit(Lit::ByteStr(left)), ExprKind::Lit(Lit::ByteStr(right))) => {
+            Some(left.cmp(right))
         }
         (ExprKind::Tuple(left), ExprKind::Tuple(right)) if left.is_empty() && right.is_empty() => {
             Some(std::cmp::Ordering::Equal)
@@ -87441,7 +87448,6 @@ property "shared"() {}
             "pub const NESTED_COMPARISON: Bool = (\"a\" < \"b\") == true\n",
             "pub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < \"b\")\n",
             "pub const SHORT_CIRCUIT_COMPUTED: Bool = true or ((\"a\" + \"b\") == \"ab\")\n",
-            "pub const BYTE_STRING_COMPARISON: Bool = b\"a\" < b\"b\"\n",
         ));
 
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -87557,7 +87563,8 @@ property "shared"() {}
             Some(ConstValue::Str(_))
         ));
 
-        for index in 37..48 {
+        assert_eq!(resolved.owners().len(), 47);
+        for index in 37..47 {
             assert_eq!(
                 resolved.owners()[index]
                     .literal_check()
@@ -87569,6 +87576,197 @@ property "shared"() {}
                 resolved.owners()[index]
                     .const_value()
                     .expect("unsupported Str comparison does not evaluate"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn const_bool_direct_byte_string_literal_comparisons_use_unsigned_byte_order() {
+        let comparisons = [
+            (BinOp::Eq, "=="),
+            (BinOp::Ne, "!="),
+            (BinOp::Lt, "<"),
+            (BinOp::Le, "<="),
+            (BinOp::Gt, ">"),
+            (BinOp::Ge, ">="),
+        ];
+        let operand_pairs = [
+            (r#"b"z""#, &b"z"[..], r#"b"a""#, &b"a"[..]),
+            (r#"b"""#, &b""[..], r#"b"a""#, &b"a"[..]),
+            (r#"b"a""#, &b"a"[..], r#"b"a""#, &b"a"[..]),
+            (r#"b"a\n""#, &b"a\n"[..], r#"b"a\\n""#, &b"a\\n"[..]),
+            (r#"b"\xFF""#, &b"\xFF"[..], r#"b"\x80""#, &b"\x80"[..]),
+            (r#"b"\x00""#, &b"\x00"[..], r#"b"\xFF""#, &b"\xFF"[..]),
+        ];
+        let mut root = String::from("enum Payload { Flag(Bool) }\n");
+        let mut expected_values = Vec::new();
+        for (left_source, left, right_source, right) in operand_pairs {
+            for (operator, spelling) in comparisons {
+                let case = expected_values.len();
+                root.push_str(&format!(
+                    "pub const CASE_{case}: Bool = {left_source} {spelling} {right_source}\n"
+                ));
+                let ordering = left.cmp(right);
+                expected_values.push(match operator {
+                    BinOp::Eq => ordering.is_eq(),
+                    BinOp::Ne => !ordering.is_eq(),
+                    BinOp::Lt => ordering.is_lt(),
+                    BinOp::Le => !ordering.is_gt(),
+                    BinOp::Gt => ordering.is_gt(),
+                    BinOp::Ge => !ordering.is_lt(),
+                    _ => unreachable!("the table contains only comparison operators"),
+                });
+            }
+        }
+        root.push_str(concat!(
+            "pub const NESTED: Bool = not (b\"z\" < b\"a\") and (b\"\" <= b\"a\")\n",
+            "pub const TUPLE: (Bool, Bool) = (b\"a\" < b\"aa\", b\"\\xFF\" < b\"\\x80\")\n",
+            "pub const ARRAY: Array<Bool, 2> = [b\"\\x00\" < b\"\\xFF\", b\"\\xFF\" > b\"\\x80\"]\n",
+            "pub const ENUM: Payload = Payload.Flag(b\"a\" < b\"b\")\n",
+            "pub const MISMATCH: I32 = b\"a\" < b\"b\"\n",
+            "pub const TUPLE_MISMATCH: (Bool,) = b\"a\" < b\"b\"\n",
+            "pub const ARRAY_MISMATCH: Array<Bool, 1> = b\"a\" < b\"b\"\n",
+            "pub const BASE: Slice<Byte> = b\"a\"\n",
+            "pub const PATH_OPERAND: Bool = BASE < b\"b\"\n",
+            "pub const MIXED_STR: Bool = b\"a\" == \"a\"\n",
+            "pub const MIXED_CHAR: Bool = b\"a\" == b'a'\n",
+            "pub const MIXED_BOOL: Bool = b\"a\" == true\n",
+            "pub const MIXED_FLOAT: Bool = b\"a\" == 1.0\n",
+            "pub const MIXED_INT: Bool = b\"a\" == 1\n",
+            "pub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < b\"b\")\n",
+            "pub const SHORT_CIRCUIT_COMPUTED: Bool = true or ((b\"a\" < b\"b\") == true)\n",
+        ));
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+
+        assert_eq!(expected_values.len(), 36);
+        for (index, expected) in expected_values.into_iter().enumerate() {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("byte-string comparison literal check succeeds");
+            assert!(
+                check.is_valid_bool(),
+                "byte-string comparison owner {index} is a valid Bool"
+            );
+            assert!(
+                check.requires_const_value(),
+                "byte-string comparison owner {index} requires an evaluator value"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("byte-string comparison evaluation succeeds"),
+                Some(ConstValue::Bool(expected)),
+                "comparison owner {index} follows decoded unsigned byte ordering"
+            );
+        }
+        assert_eq!(
+            resolved.owners()[36]
+                .const_value()
+                .expect("nested byte-string comparisons evaluate"),
+            Some(ConstValue::Bool(true))
+        );
+        assert_eq!(
+            resolved.owners()[37]
+                .const_value()
+                .expect("tuple Bool leaves evaluate"),
+            Some(ConstValue::Aggregate {
+                variant: None,
+                fields: Arc::from([ConstValue::Bool(true), ConstValue::Bool(false)]),
+            })
+        );
+        assert_eq!(
+            resolved.owners()[38]
+                .const_value()
+                .expect("array Bool leaves evaluate"),
+            Some(ConstValue::Array {
+                element_type: ConstValueType::Primitive(sai_resolve::prelude::PrimTy::Bool),
+                elements: Arc::from([ConstValue::Bool(true), ConstValue::Bool(true)]),
+            })
+        );
+        let Some(ConstValue::Aggregate {
+            variant: Some(_),
+            fields,
+        }) = resolved.owners()[39]
+            .const_value()
+            .expect("tuple enum Bool payload evaluates")
+        else {
+            panic!("tuple enum constant retains its variant and Bool payload");
+        };
+        assert_eq!(fields.as_ref(), &[ConstValue::Bool(true)]);
+
+        for (index, expected_shape, expression) in [
+            (40, "scalar", "b\"a\" < b\"b\""),
+            (41, "tuple", "b\"a\" < b\"b\""),
+            (42, "array", "b\"a\" < b\"b\""),
+        ] {
+            let check = resolved.owners()[index]
+                .literal_check()
+                .expect("byte-string comparison against a different type remains checked");
+            let diagnostics = match (expected_shape, check) {
+                ("scalar", ConstLiteralCheck::Supported { diagnostics, .. })
+                | ("tuple", ConstLiteralCheck::SupportedTuple { diagnostics })
+                | ("array", ConstLiteralCheck::SupportedArray { diagnostics }) => diagnostics,
+                _ => panic!("{expected_shape} byte-string comparison mismatch remains checked"),
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("mismatched byte-string comparison does not evaluate"),
+                None
+            );
+            let primary = diagnostics[0]
+                .primary()
+                .expect("comparison mismatch points at its expression");
+            let declaration = match expected_shape {
+                "scalar" => "pub const MISMATCH: I32 = ",
+                "tuple" => "pub const TUPLE_MISMATCH: (Bool,) = ",
+                "array" => "pub const ARRAY_MISMATCH: Array<Bool, 1> = ",
+                _ => unreachable!(),
+            };
+            let initializer_start =
+                root.find(declaration).expect("mismatch declaration exists") + declaration.len();
+            assert_eq!(primary.span.range.start().to_usize(), initializer_start);
+            assert_eq!(
+                primary.span.range.end().to_usize(),
+                initializer_start + expression.len()
+            );
+        }
+
+        assert!(matches!(
+            resolved.owners()[43]
+                .const_value()
+                .expect("direct byte-string const remains supported"),
+            Some(ConstValue::ByteStr(_))
+        ));
+        assert_eq!(resolved.owners().len(), 52);
+        for index in 44..52 {
+            assert_eq!(
+                resolved.owners()[index]
+                    .literal_check()
+                    .expect("unsupported byte-string comparison remains resolvable"),
+                &ConstLiteralCheck::Unsupported,
+                "paths, mixed families, computed or nested operands, and short-circuit operands remain gated at owner {index}"
+            );
+            assert_eq!(
+                resolved.owners()[index]
+                    .const_value()
+                    .expect("unsupported byte-string comparison does not evaluate"),
                 None
             );
         }
