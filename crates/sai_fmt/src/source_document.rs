@@ -541,6 +541,23 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
             owners.extend(targets.targets.into_keys());
         }
     }
+    for unsafe_block in root.descendants().filter_map(ast::UnsafeBlockExpr::cast) {
+        if let Some(token) = unsafe_block
+            .syntax()
+            .children_with_tokens()
+            .find_map(|element| match element {
+                SyntaxElement::Token(token) if token.kind() == SyntaxKind::UNSAFE_KW => Some(token),
+                _ => None,
+            })
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
+    }
     for node in root.descendants().filter(|node| {
         node.kind() == SyntaxKind::IF_EXPR
             && node
@@ -6303,19 +6320,6 @@ fn first_choice_layout(document: &Doc) -> Doc {
     }
 }
 
-fn unsafe_block_expression_document(
-    source: &ParsedSource,
-    unsafe_block: &ast::UnsafeBlockExpr,
-    expression_group_ids: &mut ExpressionGroupIds,
-) -> Result<Doc, SourceDocumentError> {
-    unsafe_block_expression_document_with_keyword_comments(
-        source,
-        unsafe_block,
-        expression_group_ids,
-        &[],
-    )
-}
-
 fn unsafe_block_expression_document_with_keyword_comments(
     source: &ParsedSource,
     unsafe_block: &ast::UnsafeBlockExpr,
@@ -7319,7 +7323,14 @@ fn expression_document(
         Expr::Array(array) => array_expression_document(source, array, expression_group_ids),
         Expr::Block(block) => block_expression_document(source, block, expression_group_ids),
         Expr::UnsafeBlock(unsafe_block) => {
-            unsafe_block_expression_document(source, unsafe_block, expression_group_ids)
+            let keyword_comments =
+                trailing_comments_after_direct_token(unsafe_block.syntax(), SyntaxKind::UNSAFE_KW)?;
+            unsafe_block_expression_document_with_keyword_comments(
+                source,
+                unsafe_block,
+                expression_group_ids,
+                &keyword_comments,
+            )
         }
         Expr::AsyncBlock(async_block) => {
             async_block_expression_document(source, async_block, expression_group_ids)

@@ -3300,9 +3300,38 @@ mod tests {
     }
 
     #[test]
-    fn refuses_unsafe_keyword_comments_nested_in_composite_expressions() {
-        let source = "fn f() {\n    let value=consume(unsafe/* nested */{operate()})\n}\n";
-        assert!(format_source(source.as_bytes()).is_err(), "{source}");
+    fn formats_unsafe_keyword_comments_nested_in_composite_expressions() {
+        for (source, expected) in [
+            (
+                "fn f() {\n    let value=consume(unsafe/* nested */{operate()})\n}\n",
+                "fn f() {\n    let value = consume(unsafe /* nested */ { operate() })\n}\n",
+            ),
+            (
+                "fn f() {\n    let value=consume(unsafe{operate()})\n}\n",
+                "fn f() {\n    let value = consume(unsafe { operate() })\n}\n",
+            ),
+        ] {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted = format_source(source.as_bytes())
+                .unwrap_or_else(|error| panic!("supported unsafe expression {source}: {error:?}"));
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_unsafe_keyword_comments_nested_in_composite_expressions() {
+        for source in [
+            "fn f() {\n    let value=consume(unsafe // nested\n        {operate()})\n}\n",
+            "fn f() {\n    let value=consume(unsafe /* nested\n        continued */ {operate()})\n}\n",
+        ] {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
     }
 
     #[test]
