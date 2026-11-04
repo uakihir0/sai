@@ -197,13 +197,17 @@ diagnostics table, and unknown severities fail closed. Validation and mixed
 parser/validation codes are excluded. This kind also bypasses canonical-input
 preflight and `sai check`. The runner generates an exactly 16 MiB valid source
 with a canonical block comment and final newline, and requires formatter
-acceptance with byte-identical output. It also generates a valid-UTF-8 source
-input of 16 MiB + 1 byte beginning with an unterminated block comment and
-requires the exact `IMPLEMENTATION_LIMIT_EXCEEDED` diagnostic, actual byte
-length, one refused `<stdin>` input, no changed files, no output, and no other
-diagnostic. The malformed prefix makes the probe verify that the size check
-precedes lexing. Both inputs are created in memory and are not stored as
-fixtures.
+acceptance with byte-identical output. It also writes a generated 16 MiB
+`src/lib.sai` into a temporary package and requires
+`sai check --target=wasm32-core --jobs=1` to return a successful result with
+no diagnostics. The source begins with a supported public Bool constant and uses
+a trailing block comment for padding, exercising source-file loading through
+the compiler check path. A valid-UTF-8 source input of 16 MiB + 1 byte
+beginning with an unterminated block comment must produce the exact
+`IMPLEMENTATION_LIMIT_EXCEEDED` diagnostic, actual byte length, one refused
+`<stdin>` input, no changed files, no output, and no other diagnostic. The
+malformed prefix makes the probe verify that the formatter's size check
+precedes lexing. Generated files are temporary and are not checked in.
 A timeout is a failure, never a pass.
 
 For the package `fmt` directory fixture, the runner pipes the `sai.package`
@@ -234,7 +238,10 @@ protocol, and cannot substantiate a conformance claim. Its JSON golden
 comparison is limited to ordinary sidecars on single-file Stage 0 check
 fixtures; it does not cover formatter goldens, target/profile specializations,
 or directory fixtures.
-Formatter coverage is limited to single-file source and one package-manifest
+Source-size coverage checks the generated 16 MiB minimum through source
+formatting and package-file checking, plus the formatter's 16 MiB + 1 byte
+refusal; it does not cover the remaining §1.5.4 limits or the required portable
+generated tests. Formatter coverage is limited to single-file source and one package-manifest
 `fmt` fixture's byte comparisons, fixed-point checks, 16 deterministic layout
 variants, source-stdin, generated
 package-wide `fmt --check` and `fmt --check` with one explicit path,

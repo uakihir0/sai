@@ -10,8 +10,9 @@ from unittest.mock import patch
 
 from run_stage0 import (
     FMT_LAYOUT_VARIANT_COUNT,
-    FMT_SOURCE_MAX_BYTES,
+    PACKAGE_MANIFEST,
     ROOT_ID,
+    SOURCE_FILE_MAX_BYTES,
     SmokeError,
     USAGE_ERROR_CASES,
     _canonical_json,
@@ -185,13 +186,13 @@ class Stage0SmokeRunnerTests(unittest.TestCase):
         self.refusal_code = "EXPECTED_TOKEN"
         self.refusal_line = None
         self.expected_format = None
-        self.probe_limit = 31
-        self.fmt_source_max_bytes_patch = patch(
-            "run_stage0.FMT_SOURCE_MAX_BYTES",
+        self.probe_limit = 64
+        self.source_file_max_bytes_patch = patch(
+            "run_stage0.SOURCE_FILE_MAX_BYTES",
             self.probe_limit,
         )
-        self.fmt_source_max_bytes_patch.start()
-        self.addCleanup(self.fmt_source_max_bytes_patch.stop)
+        self.source_file_max_bytes_patch.start()
+        self.addCleanup(self.source_file_max_bytes_patch.stop)
         self.layout_variants = [f"mock layout {index}\n".encode("utf-8") for index in range(16)]
         self.layout_variants_patch = patch(
             "run_stage0._generate_fmt_layout_variants",
@@ -218,6 +219,15 @@ EXPECTED_FORMATTED = {self.expected_format!r}
 EXPECTED_SIZE_PROBE_LENGTH = {self.probe_limit + 1}
 EXPECTED_SIZE_PROBE = b"/*" + b" " * (EXPECTED_SIZE_PROBE_LENGTH - 2)
 EXPECTED_SIZE_MINIMUM = b"/*" + b" " * ({self.probe_limit} - 5) + b"*/\\n"
+EXPECTED_SIZE_CHECK_PREFIX = b"pub const FLAG: Bool = true\\n"
+EXPECTED_SIZE_CHECK = (
+    EXPECTED_SIZE_CHECK_PREFIX
+    + b"/*"
+    + b" " * ({self.probe_limit} - len(EXPECTED_SIZE_CHECK_PREFIX) - 5)
+    + b"*/\\n"
+)
+EXPECTED_MANIFEST = {PACKAGE_MANIFEST!r}
+SIZE_CHECK_ARGS = ["--format=json", "--max-errors=0", "check", "--target=wasm32-core", "--jobs=1"]
 USAGE_RESPONSES = {FAKE_USAGE_RESPONSES!r}
 USAGE_MESSAGES = {FAKE_USAGE_MESSAGES!r}
 
@@ -911,6 +921,81 @@ if args in (source_fmt_args, package_fmt_args):
     print(line(summary_record).rstrip("\\n"))
     raise SystemExit(status)
 
+if args == SIZE_CHECK_ARGS:
+    root = Path.cwd()
+    source_path = root / "src" / "lib.sai"
+    source = source_path.read_bytes()
+    if source.startswith(EXPECTED_SIZE_CHECK_PREFIX):
+        try:
+            receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            receipt = {{}}
+        receipt["source_size_check_probe"] = {{
+            "argv":args,
+            "input_length":len(source),
+            "prefix":source[:len(EXPECTED_SIZE_CHECK_PREFIX)].decode("ascii"),
+            "suffix":source[-3:].decode("ascii"),
+            "source_matches_generated":source == EXPECTED_SIZE_CHECK,
+            "manifest":(root / "sai.package").read_text(encoding="utf-8"),
+            "package_entries":sorted(path.name for path in root.iterdir()),
+            "source_entries":sorted(path.name for path in (root / "src").iterdir()),
+        }}
+        Path(RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
+        if (
+            source != EXPECTED_SIZE_CHECK
+            or (root / "sai.package").read_text(encoding="utf-8") != EXPECTED_MANIFEST
+        ):
+            raise SystemExit("invalid generated source-size package")
+        if MODE == "source_size_minimum_refuses":
+            diagnostic = {{
+                "type":"diagnostic","code":"IMPLEMENTATION_LIMIT_EXCEEDED",
+                "severity":"error","level":None,
+                "message":"source at the minimum size was refused","primary":None,
+                "primary_label":"","labels":[],"children":[],"fixes":[],
+                "related":[],"data":{{
+                    "limit":"size of a source file","value":len(source)
+                }},"node":None,"symbol":None,"package":None
+            }}
+            print(line(header("check", ROOT)).rstrip("\\n"))
+            print(line(diagnostic).rstrip("\\n"))
+            print(line(summary(errors=1, exit_code=1)).rstrip("\\n"))
+            raise SystemExit(1)
+        records = [
+            header("check", ROOT),
+            {{"type":"result","kind":"check","data":{{
+                "target":"wasm32-core","profile":"dev","tests":False,
+                "packages":1,"fixes_applied":0,"changed_files":[]
+            }}}},
+            summary(),
+        ]
+        if MODE == "source_size_minimum_missing_result":
+            records.pop(1)
+        if MODE == "source_size_minimum_unknown_header_members":
+            records[0]["future_optional"] = "supported"
+            records[0]["tool"]["channel"] = "preview"
+            records[1]["future_optional"] = "supported"
+            records[1]["data"]["future_field"] = "accepted"
+        if MODE == "source_size_minimum_wrong_result_member_order":
+            data = records[1]["data"]
+            records[1]["data"] = {{
+                "profile": data["profile"],
+                "target": data["target"],
+                **{{key: value for key, value in data.items()
+                   if key not in {{"target", "profile"}}}},
+            }}
+        if MODE == "source_size_minimum_wrong_result_envelope_order":
+            result = records[1]
+            records[1] = dict(
+                data=result["data"],
+                type=result["type"],
+                kind=result["kind"],
+            )
+        if MODE == "source_size_minimum_wrong_tool_name":
+            records[0]["tool"]["name"] = "not-sai"
+        for record in records:
+            sys.stdout.write(line(record))
+        raise SystemExit(0)
+
 root = Path.cwd()
 source = (root / "src" / "lib.sai").read_bytes()
 try:
@@ -1569,7 +1654,7 @@ raise SystemExit(exit_code)
         self.assertEqual(self.source.read_bytes(), original)
 
     def test_source_size_refusal_probe_uses_documented_limit(self):
-        self.assertEqual(FMT_SOURCE_MAX_BYTES, 16 * 1024 * 1024)
+        self.assertEqual(SOURCE_FILE_MAX_BYTES, 16 * 1024 * 1024)
         self._fixture()
         self.mode = "fmt_size_refusal"
         self._write_fake()
@@ -1577,7 +1662,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["tests"], 3 + len(USAGE_ERROR_CASES))
+        self.assertEqual(report["tests"], 4 + len(USAGE_ERROR_CASES))
         self.assertEqual(report["results"][-1]["test"],
                          "generated/impl-14-formatter/source-size-refusal")
         self.assertEqual(report["results"][-1]["outcome"], "pass")
@@ -1591,7 +1676,7 @@ raise SystemExit(exit_code)
         self.assertEqual(receipt["size_refusal_probe"]["prefix"], "/*")
 
     def test_source_size_minimum_probe_accepts_exact_limit_unchanged(self):
-        self.assertEqual(FMT_SOURCE_MAX_BYTES, 16 * 1024 * 1024)
+        self.assertEqual(SOURCE_FILE_MAX_BYTES, 16 * 1024 * 1024)
         self._fixture()
         self.mode = "fmt_size_minimum"
         self._write_fake()
@@ -1599,7 +1684,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["tests"], 3 + len(USAGE_ERROR_CASES))
+        self.assertEqual(report["tests"], 4 + len(USAGE_ERROR_CASES))
         self.assertEqual(
             report["results"][-2]["test"],
             "generated/impl-14-formatter/source-size-minimum",
@@ -1629,6 +1714,113 @@ raise SystemExit(exit_code)
             report["results"][-2]["failures"],
             ["source at the minimum size limit was not accepted unchanged"],
         )
+
+    def test_check_source_size_minimum_reads_an_exact_limit_file(self):
+        self.assertEqual(SOURCE_FILE_MAX_BYTES, 16 * 1024 * 1024)
+        self._fixture()
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "pass", report)
+        self.assertEqual(report["tests"], 4 + len(USAGE_ERROR_CASES))
+        self.assertEqual(
+            report["results"][-3]["test"],
+            "generated/spec-01-introduction/source-size-minimum-check",
+        )
+        self.assertEqual(report["results"][-3]["outcome"], "pass")
+        self.assertEqual(
+            report["results"][-3]["compatibility_execution"],
+            {
+                "manifest_target": "wasm32-core",
+                "cli_target": "wasm32-core",
+                "cli_profile_default": "dev",
+            },
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        probe = receipt["source_size_check_probe"]
+        self.assertEqual(probe["argv"], [
+            "--format=json", "--max-errors=0", "check",
+            "--target=wasm32-core", "--jobs=1",
+        ])
+        self.assertEqual(probe["input_length"], self.probe_limit)
+        self.assertEqual(probe["prefix"], "pub const FLAG: Bool = true\n")
+        self.assertEqual(probe["suffix"], "*/\n")
+        self.assertIs(probe["source_matches_generated"], True)
+        self.assertEqual(probe["manifest"], PACKAGE_MANIFEST)
+        self.assertEqual(probe["source_entries"], ["lib.sai"])
+
+    def test_check_source_size_minimum_rejects_compiler_refusal(self):
+        self._fixture()
+        self.mode = "source_size_minimum_refuses"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(
+            report["results"][-3]["failures"],
+            ["source at the minimum size limit produced diagnostics"],
+        )
+
+    def test_check_source_size_minimum_requires_a_check_result(self):
+        self._fixture()
+        self.mode = "source_size_minimum_missing_result"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(
+            report["results"][-3]["failures"],
+            ["successful check must have one result and match check-pass"],
+        )
+
+    def test_check_source_size_minimum_ignores_unknown_header_members(self):
+        self._fixture()
+        self.mode = "source_size_minimum_unknown_header_members"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "pass", report)
+        self.assertEqual(report["results"][-3]["outcome"], "pass")
+
+    def test_check_source_size_minimum_rejects_reordered_known_result_members(self):
+        self._fixture()
+        self.mode = "source_size_minimum_wrong_result_member_order"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(
+            report["results"][-3]["failures"],
+            ["sai check returned an invalid result schema"],
+        )
+
+    def test_check_source_size_minimum_rejects_reordered_result_envelope(self):
+        self._fixture()
+        self.mode = "source_size_minimum_wrong_result_envelope_order"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(
+            report["results"][-3]["failures"],
+            ["sai check returned an invalid result schema"],
+        )
+
+    def test_check_source_size_minimum_rejects_wrong_tool_name(self):
+        self._fixture()
+        self.mode = "source_size_minimum_wrong_tool_name"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertTrue(report["results"][-3]["failures"])
 
     def test_usage_error_matrix_checks_required_cli_boundaries(self):
         self._fixture()

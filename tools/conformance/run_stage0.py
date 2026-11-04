@@ -36,7 +36,7 @@ PACKAGE_MANIFEST = (
 )
 TIMEOUT_SECONDS = 600
 FMT_LAYOUT_VARIANT_COUNT = 16
-FMT_SOURCE_MAX_BYTES = 16 * 1024 * 1024
+SOURCE_FILE_MAX_BYTES = 16 * 1024 * 1024
 ALLOWED_DIRECTIVES = {"kind", "stage", "spec", "diag"}
 SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+\Z")
@@ -1440,6 +1440,112 @@ def _validate_fmt_source_size_minimum(
         raise SmokeError("source at the minimum size limit was not accepted unchanged")
 
 
+def _validate_check_source_size_minimum(
+    completed: subprocess.CompletedProcess,
+    *,
+    registered_codes: set[str],
+) -> None:
+    records = _records(
+        completed.stdout,
+        exit_code=completed.returncode,
+        stderr=completed.stderr,
+        max_errors=0,
+    )
+    header = records[0]
+    tool = header.get("tool")
+    if (
+        header.get("command") != "check"
+        or header.get("root") != ROOT_ID
+        or not isinstance(tool, dict)
+        or tool.get("name") != "sai"
+    ):
+        raise SmokeError("sai check returned the wrong header or root")
+    actual = _actual_diagnostics(records, registered_codes)
+    if actual:
+        raise SmokeError("source at the minimum size limit produced diagnostics")
+    _validate_check_result(
+        records,
+        kind="check-pass",
+        exit_code=completed.returncode,
+        diagnostics=actual,
+    )
+
+
+def _source_at_minimum_size() -> bytes:
+    source = b"/*" + b" " * (SOURCE_FILE_MAX_BYTES - 5) + b"*/\n"
+    if len(source) != SOURCE_FILE_MAX_BYTES:
+        raise SmokeError("generated source-size minimum has the wrong byte length")
+    return source
+
+
+def _check_source_at_minimum_size() -> bytes:
+    prefix = b"pub const FLAG: Bool = true\n"
+    source = prefix + b"/*" + b" " * (SOURCE_FILE_MAX_BYTES - len(prefix) - 5) + b"*/\n"
+    if len(source) != SOURCE_FILE_MAX_BYTES:
+        raise SmokeError("generated source-size minimum has the wrong byte length")
+    return source
+
+
+def _run_check_source_size_minimum(
+    iut: Path,
+    registered_codes: set[str],
+    *,
+    timeout: float,
+) -> dict:
+    test = "generated/spec-01-introduction/source-size-minimum-check"
+    output = {
+        "type": "test",
+        "test": test,
+        "mode": "partial-smoke",
+        "claim": False,
+        "configuration": {"target": None, "profile": None},
+        "compatibility_execution": {
+            "manifest_target": "wasm32-core",
+            "cli_target": "wasm32-core",
+            "cli_profile_default": "dev",
+        },
+        "outcome": "fail",
+        "deviations": [],
+        "failures": [],
+    }
+    try:
+        source = _check_source_at_minimum_size()
+        with tempfile.TemporaryDirectory(prefix="sai-stage0-check-size-") as temporary:
+            sandbox_root = Path(temporary)
+            package_root = sandbox_root / "package"
+            source_dir = package_root / "src"
+            source_dir.mkdir(parents=True)
+            (package_root / "sai.package").write_text(
+                PACKAGE_MANIFEST,
+                encoding="utf-8",
+                newline="\n",
+            )
+            (source_dir / "lib.sai").write_bytes(source)
+            completed = _run_iut(
+                iut,
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "check",
+                    "--target=wasm32-core",
+                    "--jobs=1",
+                ],
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+            )
+        _validate_check_source_size_minimum(
+            completed,
+            registered_codes=registered_codes,
+        )
+        output["outcome"] = "pass"
+    except (SmokeError, ValueError, ndjson_stream.StreamError) as error:
+        output["failures"] = [str(error)]
+    except Exception:
+        output["failures"] = ["unexpected source-size check smoke-runner failure"]
+    return output
+
+
 def _run_fmt_source_size_minimum(
     iut: Path,
     registered_codes: set[str],
@@ -1461,9 +1567,7 @@ def _run_fmt_source_size_minimum(
     try:
         # A canonical block comment reaches the source-file byte limit without
         # creating a checked-in 16 MiB fixture.
-        source = b"/*" + b" " * (FMT_SOURCE_MAX_BYTES - 5) + b"*/\n"
-        if len(source) != FMT_SOURCE_MAX_BYTES:
-            raise SmokeError("generated source-size minimum has the wrong byte length")
+        source = _source_at_minimum_size()
         with tempfile.TemporaryDirectory(prefix="sai-stage0-fmt-size-") as temporary:
             sandbox_root = Path(temporary)
             package_root = sandbox_root / "package"
@@ -1518,8 +1622,8 @@ def _run_fmt_source_size_refusal(
         # An unterminated comment would produce a lexical refusal if the size
         # check did not run first. The payload stays valid UTF-8 and is generated
         # in memory so the repository does not need a 16 MiB fixture.
-        source = b"/*" + b" " * (FMT_SOURCE_MAX_BYTES - 1)
-        if len(source) != FMT_SOURCE_MAX_BYTES + 1:
+        source = b"/*" + b" " * (SOURCE_FILE_MAX_BYTES - 1)
+        if len(source) != SOURCE_FILE_MAX_BYTES + 1:
             raise SmokeError("generated source-size probe has the wrong byte length")
         with tempfile.TemporaryDirectory(prefix="sai-stage0-fmt-size-") as temporary:
             sandbox_root = Path(temporary)
@@ -1721,13 +1825,20 @@ def _validate_check_result(records: list[dict], *, kind: str, exit_code: int,
     if not results:
         return
     result = results[0]
-    if result.get("kind") != "check" or set(result) != {"type", "kind", "data"}:
+    result_fields = ("type", "kind", "data")
+    known_result_order = [field for field in result if field in result_fields]
+    if known_result_order != list(result_fields):
+        raise SmokeError("sai check returned an invalid result schema")
+    if result.get("kind") != "check":
         raise SmokeError("sai check returned an invalid result kind")
     data = result.get("data")
-    expected_fields = {
+    expected_fields = (
         "target", "profile", "tests", "packages", "fixes_applied", "changed_files",
-    }
-    if not isinstance(data, dict) or set(data) != expected_fields:
+    )
+    if not isinstance(data, dict) or not set(expected_fields).issubset(data):
+        raise SmokeError("sai check returned an invalid result schema")
+    known_field_order = [field for field in data if field in expected_fields]
+    if known_field_order != list(expected_fields):
         raise SmokeError("sai check returned an invalid result schema")
     if (data["target"] != "wasm32-core" or data["profile"] != "dev"
             or type(data["tests"]) is not bool or data["tests"] is not False
@@ -2288,7 +2399,10 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "uses the generated package's wasm32-core/dev defaults for execution.",
             "The caller must supply this repository's reference sai binary; the runner "
             "cannot verify the identity of the executable passed with --iut.",
-            "Formatter coverage is limited to single-file source fmt goldens and "
+            "A generated public-constant source file of exactly 16 MiB is also "
+            "checked through the package file-read path with an explicit wasm32-core "
+            "target; the other §1.5.4 minimums are not "
+            "covered. Formatter coverage is limited to single-file source fmt goldens and "
             "Stage 3 package fmt directory goldens, their "
             "fixed-point, 16 reference-lexer-derived deterministic layout variants, "
             "source-stdin, generated package-wide, and fmt --check with one explicit "
@@ -2324,6 +2438,9 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
                          timeout=timeout, docs_root=docs_root)
             for fixture in fixtures
         ]
+        results.append(
+            _run_check_source_size_minimum(iut_path, codes, timeout=timeout)
+        )
         results.append(
             _run_fmt_source_size_minimum(iut_path, codes, timeout=timeout)
         )
