@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1151 (2026-11-04): inventory diagnostic-code tables in conformance coverage
+
+- **Decision — review required:** Add a deterministic `diagnostic_tables` inventory to `tools/conformance/coverage.py`, with one source-located record per diagnostic code in each exact `Code | Severity | Description` table in the numbered documents. Require three columns, a supported severity, a nonempty description, a registered code, and no duplicate code/severity/description row. Ignore fenced and indented code and recognize conventional list-item indentation, including list-relative fences.
+- **Reason:** The existing coverage report inventories codes used by fixtures and goldens but did not show which codes appear in specification tables. A separate table inventory exposes documentation coverage gaps and rejects malformed or unregistered table entries without claiming that the tables define every code or gate CI on uncovered codes.
+- **Boundary and judgment:** The scanner handles conventional space-separated list markers and does not implement the full CommonMark container grammar or lazy continuations. It splits inline code spans and escaped pipes so example text inside cells does not alter table columns. The bounded parser and its document scope are **Review required**.
+- **Review required:** Challenge the table-boundary and Markdown-container rules; verify fenced, indented, and nested-list examples are ignored; verify real tables remain inventoried across blank lines; and check malformed rows, duplicate rows, unsupported severities, and unregistered codes fail closed. Confirm deterministic source locations and that the report remains inventory-only.
+- **Verification:** The focused coverage suite passes 38 tests. The complete Python conformance suite passes 227 tests (3 skipped). The real document sweep reports 1,369 table records across 36 documents and 493 distinct codes; all table codes are registered in the 495-code registry. The report command, Rust formatter check, and diff check pass.
+- **Hostile review:** Review found skipped tables nested in list items, list-relative fences mistaken for tables, lost list context across blank lines, skipped first-block list content, and final escaped pipes misread as trailing delimiters. Each parser finding now has a regression and fix. A final P3 review also identified that an indented fake heading did not actually guard numbered-heading suppression; the test now places a column-zero heading inside the marker-line fence. Follow-up hostile review found no remaining actionable issues.
+
 ### IR-1150 (2026-11-04): preserve nested unsafe keyword comments
 
 - **Decision — review required:** Preserve single-line block comments attached to an `unsafe` keyword when the unsafe expression is rendered by the existing compound-expression formatter, including as a call argument.
@@ -3995,18 +4004,18 @@
 - **Human review:** **Review required:** Confirm that the adapter is an acceptable interim boundary, and that producers will move to `Diagnostic` later.
 - **Remaining scope:** Build `Diagnostic` values in producers, serialize labels, children, related entries, and fixes in JSON (§11.9.4 and §11.9.5), and drop the placeholder `FileId`.
 
-### IR-508: Render WORKSPACE_LOCK_FAILED through a registered placeholder code
+### IR-508: Register WORKSPACE_LOCK_FAILED and retain the unknown-code rendering fallback
 
-- **Decision:** `WORKSPACE_LOCK_FAILED` (impl/13 §13.6.7) is absent from Appendix A, so `Code` cannot name it. The CLI renders such a diagnostic with the registered placeholder `INTERNAL_COMPILER_ERROR` and then replaces the first occurrence, which is the heading code, with the real code text.
-- **Reason:** Appendix A must list every code (§A.1 rules 3 and 4), and that file is in `docs/spec`, outside this stream. Without the fallback, `expect` would panic on a lock failure. Dropping the path would change the heading.
-- **Review:** The placeholder text does not appear in the message of such a diagnostic. The CLI test `human_diagnostics_keep_codes_missing_from_the_registry_in_the_heading` pins the heading.
-- **Human review:** **Review required:** Ask the spec owner to add `WORKSPACE_LOCK_FAILED` to Appendix A and regenerate the summary snapshot. Then remove the fallback.
-- **Remaining scope:** `sai explain WORKSPACE_LOCK_FAILED` reports an unknown code until Appendix A lists it.
+- **Decision — review required:** Register `WORKSPACE_LOCK_FAILED` in Appendix A as an implementation-owned error with a summary covering formatter lock discovery or acquisition (shared for `--check`, exclusive for writes) and exclusive-lock failure during symbol-index reconciliation. Regenerate the code-name and summary snapshots. The CLI now renders this known code through the shared diagnostic model and keeps its registered code in human and JSON output. Retain the generic placeholder path for future producer codes that are not yet registered.
+- **Reason:** The CLI specification already defines `WORKSPACE_LOCK_FAILED` in §13.6.7, and `sai check` uses it when symbol-index reconciliation lacks the exclusive lock required by §12.9.3. Omitting the code from Appendix A made the documented registry incomplete and caused `sai explain` to misclassify a known code as unknown. The error severity reflects that the command cannot safely continue without the lock. The shared renderer requires a `Code`; the placeholder remains a defensive way to preserve a future unknown producer string without panicking.
+- **Review:** Focused tests assert that `Code::from_name` resolves `WORKSPACE_LOCK_FAILED`, the registered diagnostic renders with its own heading, and a genuinely unknown producer code retains its heading through the fallback.
+- **Human review:** **Review required:** Confirm the implementation ownership, error severity, and shared/exclusive lock summary for formatting and symbol-index reconciliation, and decide whether it needs a complete single-code `sai explain` record. Its explanation remains gated under IR-509.
+- **Remaining scope:** Author and verify the complete `sai explain WORKSPACE_LOCK_FAILED` record if the general explanation-record work proceeds.
 
 ### IR-509: `sai explain CODE` stays deferred
 
 - **Decision:** The single-code record is not implemented. `sai explain CODE` still reports `FEATURE_NOT_IMPLEMENTED`, and `sai explain --list` is unchanged. No mechanism was chosen for the Markdown record.
-- **Reason:** §11.13.2 requires Explanation prose, an Example that compiles and produces the code, a Fix that compiles and produces no diagnostic, and See also. Appendix A has only a one-line summary per code. The owner documents contain 74 distinct `rejected:` examples and no verified fixes for the 493 registered codes. A partial record would break rules 1 and 4. The existing test `explain_defers_single_code_markdown_until_full_records_exist` pins the deferral.
+- **Reason:** §11.13.2 requires Explanation prose, an Example that compiles and produces the code, a Fix that compiles and produces no diagnostic, and See also. Appendix A has only a one-line summary per code. The owner documents contain 74 distinct `rejected:` examples but do not yet supply complete, verified Example and Fix records for every registered code. A partial record would break rules 1 and 4. The existing test `explain_defers_single_code_markdown_until_full_records_exist` pins the deferral.
 - **Review:** The summary already embedded for `--list` (`EXPLAIN_CODE_SUMMARIES`, generated from Appendix A by `tools/update_summary_snapshot.py`) can supply the Summary section once examples exist.
 - **Human review:** **Review required:** Decide where the examples and fixes live (owner documents, or a checked table), and who writes them for the registered codes.
 - **Remaining scope:** Author and compile-check the Example and Fix blocks of every code, then generate the Markdown record from them with a script under `tools/`.

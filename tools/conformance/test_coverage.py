@@ -9,9 +9,11 @@ from coverage import (
     _document_index,
     _leaf_sections,
     _parse_code_exemptions,
+    _scan_diagnostic_tables,
     _parse_lint_codes,
     _parse_panic_kinds,
     _parse_section_exemptions,
+    _markdown_table_cells,
     _scan_headings,
     _section_ids,
     _canonical_json,
@@ -32,6 +34,15 @@ class CoverageTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return path
+
+    def scan_diagnostic_document(self, content, registry=None):
+        path = self.write("docs/spec/02-document.md", content)
+        document = "spec/02"
+        return _scan_diagnostic_tables(
+            {path.resolve(): document},
+            {path.resolve(): _scan_headings(content, document)},
+            set(registry or {"EXPECTED_TOKEN", "UNUSED_VARIABLE"}),
+        )
 
     def _write_repository(self):
         for area, maximum in (("spec", 16), ("package", 4), ("impl", 15)):
@@ -233,6 +244,330 @@ const C: I32 = 3 //~ error REF_ONLY_CODE
         with self.assertRaisesRegex(CoverageError, "duplicate numbered"):
             _scan_headings("## 2.1 First\n## 2.1 Duplicate\n", "spec/02")
 
+    def test_diagnostic_table_inventory_ignores_fences_and_records_locations(self):
+        content = """# 2. Document
+## 2.1 Parent
+```text
+| Code | Severity | Description |
+|---|---|---|
+| `NOT_REGISTERED` | invalid | ignored fenced table |
+```
+~~~text
+| Code | Severity | Description |
+|---|---|---|
+| `NOT_REGISTERED` | invalid | also ignored |
+~~~
+### 2.1.1 Diagnostics
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | A pipe `|` within code is not a column. |
+| `UNUSED_VARIABLE` | warning (lint), default `allow` | Unused binding. |
+"""
+        rows = self.scan_diagnostic_document(content)
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "document": "spec/02",
+                    "section": "2.1.1",
+                    "line": 16,
+                    "code": "EXPECTED_TOKEN",
+                    "severity": "error",
+                    "description": "A pipe `|` within code is not a column.",
+                },
+                {
+                    "document": "spec/02",
+                    "section": "2.1.1",
+                    "line": 17,
+                    "code": "UNUSED_VARIABLE",
+                    "severity": "warning (lint), default `allow`",
+                    "description": "Unused binding.",
+                },
+            ],
+        )
+
+    def test_diagnostic_table_inventory_preserves_escaped_final_pipe(self):
+        content = """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | Description ending with an escaped pipe \\|
+"""
+        rows = self.scan_diagnostic_document(content)
+        self.assertEqual(
+            [(row["line"], row["description"]) for row in rows],
+            [(5, "Description ending with an escaped pipe \\|")],
+        )
+
+    def test_diagnostic_table_inventory_ignores_indented_code_blocks(self):
+        content = """# 2. Document
+## 2.1 Section
+    | Code | Severity | Description |
+    |---|---|---|
+    | `UNKNOWN_DIAGNOSTIC` | fatal | Indented example, not a table. |
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | Actual diagnostic table. |
+"""
+        rows = self.scan_diagnostic_document(content)
+        self.assertEqual(
+            [(row["code"], row["line"]) for row in rows],
+            [("EXPECTED_TOKEN", 8)],
+        )
+
+    def test_diagnostic_table_inventory_scans_tables_nested_in_list_items(self):
+        content = """# 2. Document
+## 2.1 Section
+- Examples:
+  - Nested diagnostic table:
+    | Code | Severity | Description |
+    |---|---|---|
+    | `EXPECTED_TOKEN` | error | Nested table row. |
+"""
+        rows = self.scan_diagnostic_document(content)
+        self.assertEqual(
+            [(row["section"], row["line"], row["code"]) for row in rows],
+            [("2.1", 7, "EXPECTED_TOKEN")],
+        )
+
+    def test_diagnostic_table_inventory_scans_header_on_list_marker_line(self):
+        content = """# 2. Document
+## 2.1 Section
+- | Code | Severity | Description |
+  |---|---|---|
+  | `EXPECTED_TOKEN` | error | Header shares its list marker line. |
+"""
+        rows = self.scan_diagnostic_document(content)
+        self.assertEqual(
+            [(row["section"], row["line"], row["code"]) for row in rows],
+            [("2.1", 5, "EXPECTED_TOKEN")],
+        )
+
+    def test_diagnostic_table_inventory_preserves_list_context_across_blank_lines(self):
+        content = """# 2. Document
+## 2.1 Section
+- Examples:
+
+  | Code | Severity | Description |
+  |---|---|---|
+  | `EXPECTED_TOKEN` | error | Nested table after a blank line. |
+"""
+        rows = self.scan_diagnostic_document(content)
+        self.assertEqual(
+            [(row["section"], row["line"], row["code"]) for row in rows],
+            [("2.1", 7, "EXPECTED_TOKEN")],
+        )
+
+    def test_diagnostic_table_inventory_ignores_fences_nested_in_list_items(self):
+        content = """# 2. Document
+## 2.1 Section
+- Parent:
+  - Nested item:
+    ```text
+    | Code | Severity | Description |
+    |---|---|---|
+    | `NOT_REGISTERED` | fatal | Fenced nested example. |
+    ```
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | Actual diagnostic table. |
+"""
+        rows = self.scan_diagnostic_document(content)
+        self.assertEqual(
+            [(row["section"], row["line"], row["code"]) for row in rows],
+            [("2.1", 12, "EXPECTED_TOKEN")],
+        )
+
+    def test_diagnostic_table_inventory_ignores_fence_on_list_marker_line(self):
+        content = """# 2. Document
+## 2.1 Section
+- ```text
+  | Code | Severity | Description |
+  |---|---|---|
+  | `NOT_REGISTERED` | fatal | Fenced example. |
+### 2.1.1 Hidden heading inside the list-relative fence.
+  ```
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | Actual diagnostic table. |
+"""
+        rows = self.scan_diagnostic_document(content)
+        self.assertEqual(
+            [(row["section"], row["line"], row["code"]) for row in rows],
+            [("2.1", 11, "EXPECTED_TOKEN")],
+        )
+
+    def test_diagnostic_header_with_indented_separator_is_not_a_table(self):
+        content = """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+    |---|---|---|
+    | `EXPECTED_TOKEN` | error | This is an indented code example. |
+"""
+        self.assertEqual(self.scan_diagnostic_document(content), [])
+
+    def test_markdown_table_cells_only_treat_matched_backticks_as_code_spans(self):
+        self.assertEqual(
+            _markdown_table_cells("| left | middle | unmatched ` run | split here | right |"),
+            ["left", "middle", "unmatched ` run", "split here", "right"],
+        )
+        self.assertEqual(
+            _markdown_table_cells("| left | middle | matched `inside|span` here | right |"),
+            ["left", "middle", "matched `inside|span` here", "right"],
+        )
+        self.assertEqual(
+            _markdown_table_cells("| left | middle | matched `inside|span\\` here | right |"),
+            ["left", "middle", "matched `inside|span\\` here", "right"],
+        )
+        self.assertEqual(
+            _markdown_table_cells("| Code | Severity | Description ending in \\|"),
+            ["Code", "Severity", "Description ending in \\|"],
+        )
+        self.assertEqual(
+            _markdown_table_cells("| Code | Severity | Description ending in \\\\|"),
+            ["Code", "Severity", "Description ending in \\\\"],
+        )
+
+    def test_diagnostic_table_inventory_sorts_documents_and_sections(self):
+        second = self.write(
+            "docs/spec/03-document.md",
+            """# 3. Document
+## 3.2 Later
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | Later section. |
+## 3.1 Earlier
+| Code | Severity | Description |
+|---|---|---|
+| `UNUSED_VARIABLE` | info (lint) | Earlier section. |
+""",
+        )
+        first = self.write(
+            "docs/spec/02-document.md",
+            """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | warning | First document. |
+""",
+        )
+        rows = _scan_diagnostic_tables(
+            {second.resolve(): "spec/03", first.resolve(): "spec/02"},
+            {
+                second.resolve(): _scan_headings(second.read_text(encoding="utf-8"), "spec/03"),
+                first.resolve(): _scan_headings(first.read_text(encoding="utf-8"), "spec/02"),
+            },
+            {"EXPECTED_TOKEN", "UNUSED_VARIABLE"},
+        )
+        self.assertEqual(
+            [(row["document"], row["section"]) for row in rows],
+            [("spec/02", "2.1"), ("spec/03", "3.1"), ("spec/03", "3.2")],
+        )
+
+    def test_diagnostic_table_inventory_expands_rows_with_multiple_codes(self):
+        rows = self.scan_diagnostic_document(
+            """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|---|---|
+| `UNUSED_VARIABLE`, `EXPECTED_TOKEN` | info (lint) | Shared description. |
+"""
+        )
+        self.assertEqual(
+            [(row["code"], row["line"], row["severity"]) for row in rows],
+            [
+                ("EXPECTED_TOKEN", 5, "info (lint)"),
+                ("UNUSED_VARIABLE", 5, "info (lint)"),
+            ],
+        )
+
+    def test_diagnostic_table_inventory_accepts_documented_code_list_qualifiers(self):
+        codes = {
+            "UNKNOWN_OPERATION",
+            "INVALID_OPERATION_ARGUMENT",
+            "INVALID_OPERATION_TARGET",
+            "FILE_HAS_SYNTAX_ERRORS",
+            "OPERATION_INTRODUCES_ERRORS",
+        }
+        rows = self.scan_diagnostic_document(
+            """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|---|---|
+| `UNKNOWN_OPERATION`, `INVALID_OPERATION_ARGUMENT`, `INVALID_OPERATION_TARGET`, `FILE_HAS_SYNTAX_ERRORS`, `OPERATION_INTRODUCES_ERRORS`, and the precondition codes of the operations | error | Operation validation errors. |
+""",
+            registry=codes,
+        )
+        self.assertEqual({row["code"] for row in rows}, codes)
+        lexer_rows = self.scan_diagnostic_document(
+            """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` and every other lexer error | error | Lexer errors. |
+"""
+        )
+        self.assertEqual([row["code"] for row in lexer_rows], ["EXPECTED_TOKEN"])
+
+    def test_diagnostic_table_inventory_rejects_malformed_rows_and_duplicates(self):
+        with self.assertRaisesRegex(CoverageError, "invalid separator"):
+            self.scan_diagnostic_document(
+                """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|left|---|
+| `EXPECTED_TOKEN` | error | Description. |
+"""
+            )
+        with self.assertRaisesRegex(CoverageError, "exactly 3 columns"):
+            self.scan_diagnostic_document(
+                """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | Description | unexpected cell |
+"""
+            )
+        with self.assertRaisesRegex(CoverageError, "invalid diagnostic code"):
+            self.scan_diagnostic_document(
+                """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN`, UNUSED_VARIABLE | error | Malformed code list. |
+"""
+            )
+        with self.assertRaisesRegex(CoverageError, "duplicates EXPECTED_TOKEN"):
+            self.scan_diagnostic_document(
+                """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | First row. |
+| `EXPECTED_TOKEN` | error | First row. |
+"""
+            )
+
+    def test_diagnostic_table_inventory_checks_registry_and_severity_vocabulary(self):
+        with self.assertRaisesRegex(CoverageError, "unregistered diagnostic"):
+            self.scan_diagnostic_document(
+                """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|---|---|
+| `UNKNOWN_DIAGNOSTIC` | error | Unknown code. |
+"""
+            )
+        with self.assertRaisesRegex(CoverageError, "invalid diagnostic severity"):
+            self.scan_diagnostic_document(
+                """# 2. Document
+## 2.1 Section
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | fatal | Unknown severity. |
+"""
+            )
+
     def test_document_index_rejects_duplicate_chapter_numbers(self):
         self.write("docs/spec/02-other-name.md", "# 2. Other document\n")
         with self.assertRaisesRegex(CoverageError, "duplicate numbered document: spec/02"):
@@ -255,7 +590,28 @@ const C: I32 = 3 //~ error REF_ONLY_CODE
         )
 
     def test_report_resolves_aliases_counts_portable_codes_and_ignores_sidecars(self):
+        self.write(
+            "docs/spec/02-document.md",
+            """# 2. Document
+## 2.1 Parent
+### 2.1.1 Leaf
+| Code | Severity | Description |
+|---|---|---|
+| `EXPECTED_TOKEN` | error | Expected a token. |
+""",
+        )
         report = build_report(self.root)
+        self.assertEqual(
+            report["diagnostic_tables"],
+            [{
+                "document": "spec/02",
+                "section": "2.1.1",
+                "line": 6,
+                "code": "EXPECTED_TOKEN",
+                "severity": "error",
+                "description": "Expected a token.",
+            }],
+        )
         records = {test["path"]: test for test in report["fixtures"]}
         portable = records["tests/conformance/cli/pass.sai"]
         self.assertEqual(

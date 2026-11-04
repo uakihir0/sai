@@ -27,13 +27,28 @@ import ndjson_stream
 
 CODE_TEXT = r"[A-Z][A-Z0-9]*(?:_[A-Z][A-Z0-9]*)+"
 CODE = re.compile(CODE_TEXT + r"\Z")
+DIAGNOSTIC_CODE_CELL_SUFFIXES = (
+    ", and the precondition codes of the operations",
+    ", and every other `parser` row",
+    ", and every other `validation` row",
+    " and every other lexer error",
+)
+DIAGNOSTIC_SEVERITIES = {
+    "error",
+    "warning",
+    "info",
+    "warning (lint)",
+    "info (lint)",
+    "warning (lint), default `allow`",
+}
 SECTION = re.compile(r"[0-9]+(?:\.[0-9]+)*\Z")
 SPEC_REFERENCE = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*)"
     r"[ \t]+§([0-9]+(?:\.[0-9]+)*)\Z"
 )
 HEADING = re.compile(r"^(#{1,6})[ \t]+([0-9]+(?:\.[0-9]+)*)(?:[ \t]+.*)?[ \t]*$")
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+DIAGNOSTIC_FENCE = re.compile(r"^([ \t]*)(`{3,}|~{3,})(.*)$")
+LIST_ITEM_MARKER = re.compile(r"^([ \t]*)([-+*]|[0-9]{1,9}[.)])([ \t]+)")
 DOC_FILENAME = re.compile(r"([0-9]{2})-[A-Za-z0-9._-]+\.md\Z")
 PANIC_KIND = re.compile(r"`([^`]+)`")
 SECTION_EXEMPTION = re.compile(
@@ -120,22 +135,55 @@ def _scan_headings(markdown: str, document: str) -> list[dict[str, object]]:
     result = []
     fence_character: str | None = None
     fence_length = 0
+    fence_list_content_indent: int | None = None
+    list_content_indents: list[int] = []
     for line_number, line in enumerate(markdown.splitlines(), 1):
-        fence_match = FENCE.match(line)
         if fence_character is not None:
+            fence_match = _diagnostic_fence_parts(
+                line, fence_list_content_indent
+            )
             if fence_match is not None:
-                marker = fence_match[1]
-                if (marker[0] == fence_character and len(marker) >= fence_length
-                        and re.fullmatch(r" {0,3}" + re.escape(marker[0]) +
-                                         "{" + str(fence_length) + r",}[ \t]*", line)):
+                marker, suffix = fence_match
+                if (
+                    marker[0] == fence_character
+                    and len(marker) >= fence_length
+                    and not suffix.strip()
+                ):
                     fence_character = None
                     fence_length = 0
+                    fence_list_content_indent = None
             continue
+        if line.strip():
+            line_indent = _leading_indentation_columns(line)
+            while list_content_indents and line_indent < list_content_indents[-1]:
+                list_content_indents.pop()
+        active_list_indent = (
+            list_content_indents[-1] if list_content_indents else None
+        )
+        fence_match = _diagnostic_fence_parts(line, active_list_indent)
         if fence_match is not None:
-            marker = fence_match[1]
+            marker, _ = fence_match
             fence_character = marker[0]
             fence_length = len(marker)
+            fence_list_content_indent = active_list_indent
             continue
+        item_content_indent = _list_item_content_indent(line)
+        if item_content_indent is not None:
+            list_content_indents.append(item_content_indent)
+            list_item = LIST_ITEM_MARKER.match(line)
+            assert list_item is not None
+            item_content = line[list_item.end():]
+            fence_match = (
+                _diagnostic_fence_parts(item_content, 0)
+                if item_content.strip()
+                else None
+            )
+            if fence_match is not None:
+                marker, _ = fence_match
+                fence_character = marker[0]
+                fence_length = len(marker)
+                fence_list_content_indent = item_content_indent
+                continue
         heading = HEADING.fullmatch(line)
         if heading is not None:
             result.append({
@@ -327,6 +375,300 @@ def _load_registry(path: Path) -> list[str]:
     if codes != sorted(set(codes)):
         raise CoverageError(f"diagnostic code registry must be unique and sorted: {path.as_posix()}")
     return codes
+
+
+def _markdown_table_cells(line: str) -> list[str] | None:
+    """Split one Markdown table row without splitting escaped or code-span pipes."""
+    text = line.strip()
+    cells: list[str] = []
+    start = 0
+    code_delimiter = 0
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if code_delimiter == 0 and character == "\\" and index + 1 < len(text):
+            index += 2
+            continue
+        if character == "`":
+            end = index + 1
+            while end < len(text) and text[end] == "`":
+                end += 1
+            delimiter_length = end - index
+            if code_delimiter == 0:
+                if _has_matching_backtick_run(text, end, delimiter_length):
+                    code_delimiter = delimiter_length
+            elif delimiter_length == code_delimiter:
+                code_delimiter = 0
+            index = end
+            continue
+        if character == "|" and code_delimiter == 0:
+            cells.append(text[start:index].strip())
+            start = index + 1
+        index += 1
+
+    if not cells:
+        return None
+    cells.append(text[start:].strip())
+    if text.startswith("|"):
+        cells.pop(0)
+    if text.endswith("|"):
+        preceding = len(text) - 2
+        backslashes = 0
+        while preceding >= 0 and text[preceding] == "\\":
+            backslashes += 1
+            preceding -= 1
+        if backslashes % 2 == 0:
+            cells.pop()
+    return cells
+
+
+def _has_matching_backtick_run(text: str, start: int, delimiter_length: int) -> bool:
+    """Return whether a backtick run has an equal-length closer on this line."""
+    index = start
+    while index < len(text):
+        if text[index] != "`":
+            index += 1
+            continue
+        end = index + 1
+        while end < len(text) and text[end] == "`":
+            end += 1
+        if end - index == delimiter_length:
+            return True
+        index = end
+    return False
+
+
+def _leading_indentation_columns(line: str) -> int:
+    indentation = re.match(r"[ \t]*", line)
+    return len(indentation[0].expandtabs(4)) if indentation is not None else 0
+
+
+def _list_item_content_indent(line: str) -> int | None:
+    """Return the content column for conventional space-separated list markers."""
+    marker = LIST_ITEM_MARKER.match(line)
+    if marker is None:
+        return None
+    prefix = marker[1] + marker[2] + marker[3]
+    return len(prefix.expandtabs(4))
+
+
+def _is_indented_code_line(line: str, list_content_indent: int | None = None) -> bool:
+    """Recognize indented code relative to the active list item, when present."""
+    minimum_indent = 4 if list_content_indent is None else list_content_indent + 4
+    return _leading_indentation_columns(line) >= minimum_indent
+
+
+def _diagnostic_fence_parts(
+    line: str, list_content_indent: int | None = None
+) -> tuple[str, str] | None:
+    """Return a fence marker and its suffix at top level or in a list item."""
+    match = DIAGNOSTIC_FENCE.fullmatch(line)
+    if match is None:
+        return None
+    indentation = len(match[1].expandtabs(4))
+    if list_content_indent is None:
+        if indentation > 3:
+            return None
+    elif not list_content_indent <= indentation <= list_content_indent + 3:
+        return None
+    marker, suffix = match[2], match[3]
+    if marker.startswith("`") and "`" in suffix:
+        return None
+    return marker, suffix
+
+
+def _is_table_separator(cells: list[str]) -> bool:
+    return len(cells) == 3 and all(
+        re.fullmatch(r":?-{3,}:?", cell) is not None for cell in cells
+    )
+
+
+def _scan_diagnostic_tables(
+    canonical: dict[Path, str],
+    headings_by_path: dict[Path, list[dict[str, object]]],
+    registry: set[str],
+) -> list[dict[str, object]]:
+    """Inventory exact diagnostic tables outside fenced and indented code.
+
+    List indentation follows conventional space-separated markers; this is not
+    a full CommonMark container parser and does not resolve lazy continuations.
+    """
+    records: list[dict[str, object]] = []
+    for path, document in sorted(canonical.items(), key=lambda item: item[1]):
+        text = _read_regular_utf8(path, "specification document")
+        lines = text.splitlines()
+        headings = headings_by_path[path]
+        headings_by_line = {
+            int(heading["line"]): str(heading["section"])
+            for heading in headings
+        }
+        section: str | None = None
+        fence_character: str | None = None
+        fence_length = 0
+        fence_list_content_indent: int | None = None
+        list_content_indents: list[int] = []
+        line_index = 0
+        while line_index < len(lines):
+            line = lines[line_index]
+            line_number = line_index + 1
+            heading_section = headings_by_line.get(line_number)
+            if heading_section is not None:
+                section = heading_section
+
+            if fence_character is None and line.strip():
+                line_indent = _leading_indentation_columns(line)
+                while list_content_indents and line_indent < list_content_indents[-1]:
+                    list_content_indents.pop()
+            active_list_indent = (
+                list_content_indents[-1] if list_content_indents else None
+            )
+            if fence_character is not None:
+                fence_match = _diagnostic_fence_parts(line, fence_list_content_indent)
+                if fence_match is not None:
+                    marker, suffix = fence_match
+                    if (
+                        marker[0] == fence_character
+                        and len(marker) >= fence_length
+                        and not suffix.strip()
+                    ):
+                        fence_character = None
+                        fence_length = 0
+                        fence_list_content_indent = None
+                line_index += 1
+                continue
+            fence_match = _diagnostic_fence_parts(line, active_list_indent)
+            if fence_match is not None:
+                marker, _ = fence_match
+                fence_character = marker[0]
+                fence_length = len(marker)
+                fence_list_content_indent = active_list_indent
+                line_index += 1
+                continue
+            if _is_indented_code_line(line, active_list_indent):
+                line_index += 1
+                continue
+            list_item = LIST_ITEM_MARKER.match(line)
+            item_content_indent = _list_item_content_indent(line)
+            table_line = line
+            if item_content_indent is not None:
+                list_content_indents.append(item_content_indent)
+                active_list_indent = item_content_indent
+                assert list_item is not None
+                table_line = line[list_item.end():]
+                fence_match = (
+                    _diagnostic_fence_parts(table_line, 0)
+                    if table_line.strip()
+                    else None
+                )
+                fence_container_indent = item_content_indent
+            else:
+                fence_match = _diagnostic_fence_parts(line, active_list_indent)
+                fence_container_indent = active_list_indent
+            if fence_match is not None:
+                marker, _ = fence_match
+                fence_character = marker[0]
+                fence_length = len(marker)
+                fence_list_content_indent = fence_container_indent
+                line_index += 1
+                continue
+            active_list_indent = (
+                list_content_indents[-1] if list_content_indents else None
+            )
+
+            cells = _markdown_table_cells(table_line)
+            if cells != ["Code", "Severity", "Description"]:
+                line_index += 1
+                continue
+
+            table_location = f"{document} §{section or '?'}:{line_number}"
+            if section is None:
+                raise CoverageError(
+                    f"{table_location} diagnostic table is outside a numbered section"
+                )
+            if line_index + 1 >= len(lines):
+                raise CoverageError(f"{table_location} diagnostic table has no separator")
+            if _is_indented_code_line(lines[line_index + 1], active_list_indent):
+                line_index += 1
+                continue
+            separator = _markdown_table_cells(lines[line_index + 1])
+            if separator is None or not _is_table_separator(separator):
+                raise CoverageError(f"{table_location} diagnostic table has an invalid separator")
+
+            table_rows: dict[tuple[str, str, str], int] = {}
+            row_index = line_index + 2
+            while row_index < len(lines):
+                if _is_indented_code_line(lines[row_index], active_list_indent):
+                    break
+                row_cells = _markdown_table_cells(lines[row_index])
+                if row_cells is None:
+                    break
+                row_line = row_index + 1
+                row_location = f"{document} §{section}:{row_line}"
+                if len(row_cells) != 3:
+                    raise CoverageError(
+                        f"{row_location} diagnostic table row must have exactly 3 columns"
+                    )
+                code_cell = row_cells[0]
+                codes = [
+                    match[1]
+                    for match in re.finditer(rf"`({CODE_TEXT})`", code_cell)
+                ]
+                code_list = ", ".join(f"`{code}`" for code in codes)
+                if (not codes or (
+                    code_cell != code_list
+                    and not any(
+                        code_cell == code_list + suffix
+                        for suffix in DIAGNOSTIC_CODE_CELL_SUFFIXES
+                    )
+                )):
+                    raise CoverageError(f"{row_location} has an invalid diagnostic code")
+                severity = row_cells[1]
+                description = row_cells[2]
+                if severity not in DIAGNOSTIC_SEVERITIES:
+                    raise CoverageError(
+                        f"{row_location} has invalid diagnostic severity: {severity}"
+                    )
+                if not description:
+                    raise CoverageError(f"{row_location} has an empty diagnostic description")
+                for code in codes:
+                    row_identity = (code, severity, description)
+                    if row_identity in table_rows:
+                        raise CoverageError(
+                            f"{row_location} duplicates {code} diagnostic row "
+                            f"(first listed at line {table_rows[row_identity]})"
+                        )
+                    table_rows[row_identity] = row_line
+                    if code not in registry:
+                        raise CoverageError(
+                            f"{row_location} names unregistered diagnostic: {code}"
+                        )
+                    records.append({
+                        "document": document,
+                        "section": section,
+                        "line": row_line,
+                        "code": code,
+                        "severity": severity,
+                        "description": description,
+                    })
+                row_index += 1
+            if not table_rows:
+                raise CoverageError(
+                    f"{table_location} diagnostic table has no data rows"
+                )
+            line_index = row_index
+
+        if fence_character is not None:
+            raise CoverageError(f"unterminated fenced block in {document}")
+
+    return sorted(
+        records,
+        key=lambda record: (
+            str(record["document"]),
+            tuple(int(part) for part in str(record["section"]).split(".")),
+            int(record["line"]),
+            str(record["code"]),
+        ),
+    )
 
 
 def _parse_lint_codes(
@@ -540,6 +882,9 @@ def build_report(root: Path) -> dict[str, object]:
     aliases, canonical = _document_index(docs_root)
     inventory, headings_by_path = _build_inventory(docs_root, aliases, canonical)
     registry_codes = _load_registry(root / EXPECTED_REGISTRY)
+    diagnostic_tables = _scan_diagnostic_tables(
+        canonical, headings_by_path, set(registry_codes)
+    )
     section_exemptions = _parse_section_exemptions(
         root / EXPECTED_EXEMPT_SECTIONS, inventory, aliases, canonical, headings_by_path
     )
@@ -692,6 +1037,7 @@ def build_report(root: Path) -> dict[str, object]:
         ),
         "fixtures": test_records,
         "sections": section_records,
+        "diagnostic_tables": diagnostic_tables,
         "diagnostic_codes": code_records,
         "hard_code_json_goldens": hard_code_json_records,
         "panic_kinds": panic_records,

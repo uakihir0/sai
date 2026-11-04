@@ -273,10 +273,17 @@ lexical refusal behavior.
 
 `python3 -B tools/conformance/coverage.py --root . --output target/conformance/coverage.json`
 validates the specification references and diagnostic expectations in every
-discovered fixture, inventories the lowest-level numbered headings in the covered
-document scopes of §15.9.2, and writes a deterministic JSON report containing
+discovered fixture, inventories diagnostic tables and the lowest-level numbered
+headings in the covered document scopes of §15.9.2, and writes a deterministic
+JSON report containing
 section-to-test mappings and uncovered sections, diagnostic codes, panic kinds,
-and hard diagnostic codes without a JSON golden. It reads the lint list from
+and hard diagnostic codes without a JSON golden. The `diagnostic_tables` report
+contains one source-located record per code in each exact `Code | Severity |
+Description` table; malformed rows, duplicate code/severity/description rows,
+unknown registry codes, and unsupported severities fail closed. Fenced and
+indented code examples, including code indented relative to list items, are
+ignored. Conventional list markers are supported, but the inventory is not a
+full CommonMark parser. It reads the lint list from
 spec/15 §15.17.2, selects ordinary and target/profile-specialized JSON sidecars
 for configurations allowed by each fixture's directives using §15.2.5's
 first-existing precedence, validates their common NDJSON envelope and registered
