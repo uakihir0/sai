@@ -129,9 +129,11 @@ source `fmt`, and source `fmt-refuse` fixtures with `kind`, `stage`, and
 resolvable `spec` directives, plus a Stage 3 package `fmt` directory fixture
 rooted at `sai.package`. Source `fmt` fixtures require exactly one sibling
 `<name>.expected.sai`; the package fixture requires exactly
-`expected/sai.package`. `fmt-refuse` requires explicit, nonempty expected
-error diagnostics and rejects every sidecar. Other sidecars and directory
-fixtures remain unsupported. The runner rejects explicit target/profile
+`expected/sai.package`. A single-file `check-pass` or `check-fail` fixture may
+also have one ordinary `<name>.json` sidecar. `fmt-refuse` requires explicit,
+nonempty expected error diagnostics and rejects every sidecar; specialized
+goldens and other sidecars are unsupported, as are directory fixtures other
+than the package `fmt` fixture. The runner rejects explicit target/profile
 restrictions, unsupported directives, an empty fixture set, and inputs whose
 specification references do not resolve beneath `docs/`.
 
@@ -141,7 +143,14 @@ environment. For a check fixture, the runner copies the source unchanged,
 creates the generated package manifest, invokes
 `sai --format=json --max-errors=0 check --jobs=1`, validates the diagnostic
 registry and JSON stream, checks diagnostic order and result semantics, and
-compares expected diagnostics.
+compares expected diagnostics. When the fixture has an ordinary `.json`
+sidecar, it also compares the complete NDJSON stream with that golden after
+normalizing only the header's complete `tool` member and `duration_us` in
+`test` result records as specified by §15.4.4. Record and member order and
+every other value remain part of the comparison. This currently covers
+`impl-13-cli/stage0-check-pass.json` and
+`spec-03-grammar/stage0-check-fail.json`; the smoke report records the golden
+path and pass/fail outcome whenever a golden is present and checked.
 
 For a `fmt` fixture it passes the unchanged source bytes on standard input to
 `sai --format=json --max-errors=0 fmt --stdin-kind source -`, compares the JSON
@@ -217,8 +226,11 @@ requires. The current CLI still executes this generated package as
 the CLI has no targetless Stage 0 mode. The report exposes this compatibility
 execution and always sets `mode` to `partial-smoke` and `claim` to `false`.
 This runner is useful as smoke evidence only; it does not validate suite
-coverage, goldens, all directive applicability, or the complete conformance
-protocol, and cannot substantiate a conformance claim.
+coverage, all goldens, all directive applicability, or the complete conformance
+protocol, and cannot substantiate a conformance claim. Its JSON golden
+comparison is limited to ordinary sidecars on single-file Stage 0 check
+fixtures; it does not cover formatter goldens, target/profile specializations,
+or directory fixtures.
 Formatter coverage is limited to single-file source and one package-manifest
 `fmt` fixture's byte comparisons, fixed-point checks, 16 deterministic layout
 variants, source-stdin, generated
