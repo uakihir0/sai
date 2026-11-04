@@ -14533,9 +14533,8 @@ fn write_human_diagnostics(
                 ));
             }
             None => {
-                // The registry lacks some CLI-owned codes, such as WORKSPACE_LOCK_FAILED, which
-                // impl/13 §13.6.7 defines but Appendix A does not list. They keep their own text
-                // in the heading, and the shared layout is reused with a registered placeholder.
+                // Preserve the diagnostic heading even if a producer supplies a code that has
+                // not yet been added to the shared registry.
                 let shared = shared_diagnostic(diagnostic, UNREGISTERED_CODE_PLACEHOLDER);
                 let text = sai_diagnostics::render_diagnostic(&shared, &snippets, color);
                 rendered.push_str(&text.replacen(
@@ -14562,7 +14561,7 @@ fn write_human_diagnostics(
     writer.write_all(rendered.as_bytes())
 }
 
-/// The registered code that stands in for a CLI code missing from the registry.
+/// The registered code used to render diagnostics whose producer code is not in the registry.
 const UNREGISTERED_CODE_PLACEHOLDER: sai_diagnostics::Code =
     sai_diagnostics::Code::InternalCompilerError;
 
@@ -21657,9 +21656,13 @@ mod tests {
     }
 
     #[test]
-    fn human_diagnostics_keep_codes_missing_from_the_registry_in_the_heading() {
+    fn human_diagnostics_render_registered_workspace_lock_code() {
         let source = Arc::<[u8]>::from(&b"fn main() {\n    let x = 1\n}\n"[..]);
         let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        assert_eq!(
+            sai_diagnostics::Code::from_name("WORKSPACE_LOCK_FAILED"),
+            Some(sai_diagnostics::Code::WorkspaceLockFailed)
+        );
         let diagnostic = CliDiagnostic {
             code: "WORKSPACE_LOCK_FAILED",
             message: "could not lock the package".to_owned(),
@@ -21672,7 +21675,7 @@ mod tests {
         };
         let mut rendered = Vec::new();
         write_human_diagnostics(&mut rendered, "fmt", &[diagnostic], true, false, 1, 50)
-            .expect("render unregistered diagnostic");
+            .expect("render registered diagnostic");
 
         assert_eq!(
             String::from_utf8(rendered).expect("diagnostics are UTF-8"),
@@ -21686,6 +21689,28 @@ mod tests {
                 "\n",
                 "fmt failed: 1 error\n",
             )
+        );
+    }
+
+    #[test]
+    fn human_diagnostics_keep_unknown_codes_in_the_heading() {
+        let diagnostic = CliDiagnostic {
+            code: "FUTURE_PRODUCER_CODE",
+            message: "future diagnostic".to_owned(),
+            primary: None,
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        };
+        let mut rendered = Vec::new();
+        write_human_diagnostics(&mut rendered, "fmt", &[diagnostic], false, false, 1, 50)
+            .expect("render unknown diagnostic");
+
+        assert_eq!(
+            String::from_utf8(rendered).expect("diagnostics are UTF-8"),
+            "error[FUTURE_PRODUCER_CODE]: future diagnostic\n\n"
         );
     }
 

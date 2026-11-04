@@ -487,7 +487,7 @@ Codes owned by the target document (`targets/`). 4 codes.
 
 ## A.5 Toolchain codes
 
-Codes owned by implementation documents (`impl/`). 44 codes.
+Codes owned by implementation documents (`impl/`). 46 codes.
 
 | Code | Severity | Owner | Summary |
 |---|---|---|---|
@@ -536,7 +536,8 @@ Codes owned by implementation documents (`impl/`). 44 codes.
 | `UNKNOWN_REVISION` | error | [impl/13](../impl/13-cli.md) | A revision given to `sai diff` does not resolve to a commit (§13.6.17). |
 | `UNKNOWN_SYMBOL_ID` | error | [impl/12](../impl/12-semantic-tooling.md) | A string that starts with `symbol://` is not a valid symbol ID, or no symbol of the chosen package node has its hexadecimal part (§12.2.5). |
 | `UNKNOWN_SYMBOL_PATH` | error | [impl/12](../impl/12-semantic-tooling.md) | A canonical path does not parse or names no symbol or module, or a node key names no graph node (§12.2.5, §12.4.3). |
+| `WORKSPACE_LOCK_FAILED` | error | [impl/13](../impl/13-cli.md) | A command could not identify or acquire the package workspace lock needed to format selected files (shared for `--check`, exclusive for writes) or the exclusive lock needed to reconcile the symbol index (§12.9.3, §13.5.4, §13.6.2, §13.6.7). |
 
 ## A.6 Counts
 
-v0.1 defines 494 codes: 344 in spec, 101 in package, 4 in targets, 45 in impl. 28 of them are lints.
+v0.1 defines 495 codes: 344 in spec, 101 in package, 4 in targets, 46 in impl. 28 of them are lints.

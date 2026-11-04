@@ -484,6 +484,7 @@ WIT_PACKAGE_MISMATCH|hard|443|The WIT package name or version differs from the p
 WIT_PARSE_ERROR|hard|334|A visible WIT package fails to parse or validate (§13.7.1)
 WIT_REQUIRED|hard|444|An artifact or hybrid package without `wit`
 WIT_UNSUPPORTED_FEATURE|hard|335|Use of a WIT item whose signature contains a construct not supported in v0.1, or, from Stage 5 on, an imported `async` function or a `future` or `stream` type on a target without the Component Model async ABI (§13.9.2)
+WORKSPACE_LOCK_FAILED|hard|494|A command could not identify or acquire the package workspace lock needed to format selected files (shared for `--check`, exclusive for writes) or the exclusive lock needed to reconcile the symbol index (§12.9.3, §13.5.4, §13.6.2, §13.6.7).
 WORLD_DUPLICATE_ITEM|hard|336|An elaborated world imports and exports the same interface, or repeats a name (§13.4.2, §13.5.3)
 WORLD_EXPORT_UNIMPLEMENTED|hard|337|An exported interface or world function has no implementation (§13.4.1)
 WORLD_IMPORT_NEEDS_INTERFACE|hard|338|A world import or export that is not per interface (§3.9)

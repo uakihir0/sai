@@ -905,6 +905,24 @@ fn explain_keeps_unwritten_individual_codes_gated_and_preserves_list() {
     assert!(gated_stdout.contains("\"feature\":\"sai explain\""));
     assert!(!gated_stdout.contains("\"kind\":\"explain\""));
 
+    let workspace_lock = run_explain(&["--format=json", "explain", "WORKSPACE_LOCK_FAILED"]);
+    let workspace_lock_stdout =
+        String::from_utf8(workspace_lock.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        workspace_lock.status.code(),
+        Some(1),
+        "{workspace_lock_stdout}"
+    );
+    assert!(workspace_lock.stderr.is_empty());
+    assert!(
+        workspace_lock_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "{workspace_lock_stdout}"
+    );
+    assert!(
+        !workspace_lock_stdout.contains("\"code\":\"UNKNOWN_DIAGNOSTIC_CODE\""),
+        "{workspace_lock_stdout}"
+    );
+
     let list = run_explain(&["--format=json", "explain", "--list"]);
     let list_stdout = String::from_utf8(list.stdout).expect("CLI stdout is UTF-8");
     assert_eq!(list.status.code(), Some(0), "{list_stdout}");
@@ -964,5 +982,5 @@ fn explain_keeps_unwritten_individual_codes_gated_and_preserves_list() {
         preceding_malformed_number < malformed_number && malformed_number < next_malformed_number
     );
     assert!(list_stdout.contains("\"code\":\"TYPE_MISMATCH\",\"class\":\"hard\""));
-    assert_eq!(list_stdout.matches("\"code\":").count(), 494);
+    assert_eq!(list_stdout.matches("\"code\":").count(), 495);
 }

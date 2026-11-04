@@ -1609,7 +1609,7 @@ sai explain --list
 
 Prints the explanation of a diagnostic code or a lint, as defined by [11-diagnostics.md](11-diagnostics.md) §11.13. Stage 0. The command needs no package, accepts none of the options of §13.4, and reads no file. The human output is the Markdown text of 11 §11.13.2. JSON: kind `explain` (11 §11.13.2), or, with `--list`, one record of kind `explain.list` with `{"codes":[{"code":…,"class":"hard","summary":…}]}` in byte order. Exit codes: 0 if the code is registered; 1 for `UNKNOWN_DIAGNOSTIC_CODE`. `sai explain` without an argument and without `--list` is `MISSING_ARGUMENT`.
 
-**Current implementation slice.** `sai explain --list` is implemented for all 494 registered codes in human and JSON output. `sai explain DUPLICATE_BINDING`, `INVALID_ESCAPE`, `LITERAL_OUT_OF_RANGE`, `MALFORMED_NUMBER`, `TYPE_MISMATCH`, and `UNKNOWN_FIELD` emit their complete metadata and Markdown records in human or JSON output. All other known individual codes still report `FEATURE_NOT_IMPLEMENTED` until their complete metadata and Markdown explanation records are available. An unknown code reports `UNKNOWN_DIAGNOSTIC_CODE` with ranked candidates.
+**Current implementation slice.** `sai explain --list` is implemented for all 495 registered codes in human and JSON output. `sai explain DUPLICATE_BINDING`, `INVALID_ESCAPE`, `LITERAL_OUT_OF_RANGE`, `MALFORMED_NUMBER`, `TYPE_MISMATCH`, and `UNKNOWN_FIELD` emit their complete metadata and Markdown records in human or JSON output. All other known individual codes still report `FEATURE_NOT_IMPLEMENTED` until their complete metadata and Markdown explanation records are available. An unknown code reports `UNKNOWN_DIAGNOSTIC_CODE` with ranked candidates.
 
 ### 13.6.21 `sai lsp`
 
@@ -1990,7 +1990,7 @@ Codes owned by this chapter, and codes of other documents that this chapter repo
 | `TARGET_NOT_RUNNABLE` | error | `sai run` was used with a target that is not a WASI target: a core target or a native target (§13.6.5). |
 | `MISSING_ENTRY_POINT` | error | `sai run` was used on a reactor component; the package has no `main` (§13.6.5). |
 | `PATH_NOT_FOUND` | error | A path given to `sai fmt` does not exist (§13.6.7). |
-| `WORKSPACE_LOCK_FAILED` | error | `sai fmt` could not identify or acquire a selected file's package lock (§13.5.4, §13.6.7). |
+| `WORKSPACE_LOCK_FAILED` | error | A command could not identify or acquire the package workspace lock needed to format selected files (shared for `--check`, exclusive for writes) or the exclusive lock needed to reconcile the symbol index (§12.9.3, §13.5.4, §13.6.2, §13.6.7). |
 | `NOT_PRESENT_IN_BUILD` | info | The item named by `sai size --why` or `sai inspect effects --why` is not in the build or the effect set (§13.6.14, §13.6.15). |
 | `NOT_A_GIT_REPOSITORY` | error | `sai diff` needs a revision, but the workspace root is not in a Git repository (§13.6.17). |
 | `UNKNOWN_REVISION` | error | A revision given to `sai diff` does not resolve to a commit (§13.6.17). |
