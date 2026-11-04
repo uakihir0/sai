@@ -1448,6 +1448,7 @@ def _validate_check_source_size_minimum(
     completed: subprocess.CompletedProcess,
     *,
     registered_codes: set[str],
+    subject: str = "source at the minimum size limit",
 ) -> None:
     records = _records(
         completed.stdout,
@@ -1466,7 +1467,7 @@ def _validate_check_source_size_minimum(
         raise SmokeError("sai check returned the wrong header or root")
     actual = _actual_diagnostics(records, registered_codes)
     if actual:
-        raise SmokeError("source at the minimum size limit produced diagnostics")
+        raise SmokeError(f"{subject} produced diagnostics")
     _validate_check_result(
         records,
         kind="check-pass",
@@ -1495,6 +1496,81 @@ def _check_source_at_minimum_size(minimum_bytes: int) -> bytes:
     if len(source) != minimum_bytes:
         raise SmokeError("generated source-size minimum has the wrong byte length")
     return source
+
+
+def _identifier_at_minimum_size(minimum_bytes: int) -> tuple[bytes, bytes]:
+    identifier = b"A" * minimum_bytes
+    source = b"pub const " + identifier + b": Bool = true\n"
+    if (
+        len(identifier) != minimum_bytes
+        or not re.fullmatch(rb"[A-Z][A-Za-z0-9_]*", identifier)
+    ):
+        raise SmokeError("generated identifier minimum has the wrong byte length or form")
+    return identifier, source
+
+
+def _run_check_identifier_minimum(
+    iut: Path,
+    registered_codes: set[str],
+    *,
+    minimum_bytes: int,
+    timeout: float,
+) -> dict:
+    test = "generated/spec-01-introduction/identifier-minimum-check"
+    output = {
+        "type": "test",
+        "test": test,
+        "mode": "partial-smoke",
+        "claim": False,
+        "configuration": {"target": None, "profile": None},
+        "compatibility_execution": {
+            "manifest_target": "wasm32-core",
+            "cli_target": "wasm32-core",
+            "cli_profile_default": "dev",
+        },
+        "outcome": "fail",
+        "deviations": [],
+        "failures": [],
+        "limit": "length of an identifier",
+        "minimum_bytes": minimum_bytes,
+    }
+    try:
+        _, source = _identifier_at_minimum_size(minimum_bytes)
+        with tempfile.TemporaryDirectory(prefix="sai-stage0-identifier-limit-") as temporary:
+            sandbox_root = Path(temporary)
+            package_root = sandbox_root / "package"
+            source_dir = package_root / "src"
+            source_dir.mkdir(parents=True)
+            (package_root / "sai.package").write_text(
+                PACKAGE_MANIFEST,
+                encoding="utf-8",
+                newline="\n",
+            )
+            (source_dir / "lib.sai").write_bytes(source)
+            completed = _run_iut(
+                iut,
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "check",
+                    "--target=wasm32-core",
+                    "--jobs=1",
+                ],
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+            )
+        _validate_check_source_size_minimum(
+            completed,
+            registered_codes=registered_codes,
+            subject="identifier at its minimum length",
+        )
+        output["outcome"] = "pass"
+    except (SmokeError, ValueError, ndjson_stream.StreamError) as error:
+        output["failures"] = [str(error)]
+    except Exception:
+        output["failures"] = ["unexpected identifier-length smoke-runner failure"]
+    return output
 
 
 def _run_check_source_size_minimum(
@@ -2455,10 +2531,12 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             raise SmokeError("no supported smoke fixtures were discovered")
         codes = _read_registry(iut_path, timeout=timeout)
         docs_root = Path(__file__).resolve().parents[2] / "docs"
-        source_file_minimum = resource_limits.source_file_minimum_bytes(
-            resource_limits.read_implementation_limits(
-                docs_root / "spec/01-introduction.md"
-            )
+        limits = resource_limits.read_implementation_limits(
+            docs_root / "spec/01-introduction.md"
+        )
+        source_file_minimum = resource_limits.source_file_minimum_bytes(limits)
+        identifier_minimum = resource_limits.byte_minimum_for(
+            limits, "length of an identifier"
         )
         results = [
             _run_fixture(fixture, conformance_root, iut_path, codes,
@@ -2468,6 +2546,11 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
         results.append(
             _run_check_source_size_minimum(
                 iut_path, codes, minimum_bytes=source_file_minimum, timeout=timeout
+            )
+        )
+        results.append(
+            _run_check_identifier_minimum(
+                iut_path, codes, minimum_bytes=identifier_minimum, timeout=timeout
             )
         )
         results.append(

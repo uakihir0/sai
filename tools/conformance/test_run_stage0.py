@@ -22,6 +22,7 @@ from run_stage0 import (
     _normalize_diagnostic_json,
     _formatter_refusal_codes,
     _format_source_limit,
+    _identifier_at_minimum_size,
     _resolve_spec_reference,
     _source_position,
     _run_iut,
@@ -188,12 +189,19 @@ class Stage0SmokeRunnerTests(unittest.TestCase):
         self.refusal_line = None
         self.expected_format = None
         self.probe_limit = 64
+        self.identifier_limit = 32
         self.source_file_minimum_patch = patch(
             "run_stage0.resource_limits.source_file_minimum_bytes",
             return_value=self.probe_limit,
         )
         self.source_file_minimum_patch.start()
         self.addCleanup(self.source_file_minimum_patch.stop)
+        self.identifier_minimum_patch = patch(
+            "run_stage0.resource_limits.byte_minimum_for",
+            return_value=self.identifier_limit,
+        )
+        self.identifier_minimum_patch.start()
+        self.addCleanup(self.identifier_minimum_patch.stop)
         self.layout_variants = [f"mock layout {index}\n".encode("utf-8") for index in range(16)]
         self.layout_variants_patch = patch(
             "run_stage0._generate_fmt_layout_variants",
@@ -227,6 +235,14 @@ EXPECTED_SIZE_CHECK = (
     + b"/*"
     + b" " * ({self.probe_limit} - len(EXPECTED_SIZE_CHECK_PREFIX) - 5)
     + b"*/\\n"
+)
+EXPECTED_IDENTIFIER_CHECK_NAME = b"A" * {self.identifier_limit}
+EXPECTED_IDENTIFIER_CHECK_PREFIX = b"pub const "
+EXPECTED_IDENTIFIER_CHECK_SUFFIX = b": Bool = true\\n"
+EXPECTED_IDENTIFIER_CHECK = (
+    EXPECTED_IDENTIFIER_CHECK_PREFIX
+    + EXPECTED_IDENTIFIER_CHECK_NAME
+    + EXPECTED_IDENTIFIER_CHECK_SUFFIX
 )
 EXPECTED_MANIFEST = {PACKAGE_MANIFEST!r}
 SIZE_CHECK_ARGS = ["--format=json", "--max-errors=0", "check", "--target=wasm32-core", "--jobs=1"]
@@ -927,11 +943,15 @@ if args == SIZE_CHECK_ARGS:
     root = Path.cwd()
     source_path = root / "src" / "lib.sai"
     source = source_path.read_bytes()
-    if source.startswith(EXPECTED_SIZE_CHECK_PREFIX):
-        try:
-            receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            receipt = {{}}
+    is_source_size = source == EXPECTED_SIZE_CHECK
+    is_identifier = source == EXPECTED_IDENTIFIER_CHECK
+    if not is_source_size and not is_identifier:
+        raise SystemExit("unexpected generated check source")
+    try:
+        receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        receipt = {{}}
+    if is_source_size:
         receipt["source_size_check_probe"] = {{
             "argv":args,
             "input_length":len(source),
@@ -942,61 +962,79 @@ if args == SIZE_CHECK_ARGS:
             "package_entries":sorted(path.name for path in root.iterdir()),
             "source_entries":sorted(path.name for path in (root / "src").iterdir()),
         }}
-        Path(RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
-        if (
-            source != EXPECTED_SIZE_CHECK
-            or (root / "sai.package").read_text(encoding="utf-8") != EXPECTED_MANIFEST
-        ):
-            raise SystemExit("invalid generated source-size package")
-        if MODE == "source_size_minimum_refuses":
-            diagnostic = {{
-                "type":"diagnostic","code":"IMPLEMENTATION_LIMIT_EXCEEDED",
-                "severity":"error","level":None,
-                "message":"source at the minimum size was refused","primary":None,
-                "primary_label":"","labels":[],"children":[],"fixes":[],
-                "related":[],"data":{{
-                    "limit":"size of a source file","value":len(source)
-                }},"node":None,"symbol":None,"package":None
-            }}
-            print(line(header("check", ROOT)).rstrip("\\n"))
-            print(line(diagnostic).rstrip("\\n"))
-            print(line(summary(errors=1, exit_code=1)).rstrip("\\n"))
-            raise SystemExit(1)
-        records = [
-            header("check", ROOT),
-            {{"type":"result","kind":"check","data":{{
-                "target":"wasm32-core","profile":"dev","tests":False,
-                "packages":1,"fixes_applied":0,"changed_files":[]
-            }}}},
-            summary(),
-        ]
-        if MODE == "source_size_minimum_missing_result":
-            records.pop(1)
-        if MODE == "source_size_minimum_unknown_header_members":
-            records[0]["future_optional"] = "supported"
-            records[0]["tool"]["channel"] = "preview"
-            records[1]["future_optional"] = "supported"
-            records[1]["data"]["future_field"] = "accepted"
-        if MODE == "source_size_minimum_wrong_result_member_order":
-            data = records[1]["data"]
-            records[1]["data"] = {{
-                "profile": data["profile"],
-                "target": data["target"],
-                **{{key: value for key, value in data.items()
-                   if key not in {{"target", "profile"}}}},
-            }}
-        if MODE == "source_size_minimum_wrong_result_envelope_order":
-            result = records[1]
-            records[1] = dict(
-                data=result["data"],
-                type=result["type"],
-                kind=result["kind"],
-            )
-        if MODE == "source_size_minimum_wrong_tool_name":
-            records[0]["tool"]["name"] = "not-sai"
-        for record in records:
-            sys.stdout.write(line(record))
-        raise SystemExit(0)
+    else:
+        receipt["identifier_minimum_check_probe"] = {{
+            "argv":args,
+            "identifier_utf8_bytes":len(EXPECTED_IDENTIFIER_CHECK_NAME),
+            "identifier_matches_generated":(
+                source[len(EXPECTED_IDENTIFIER_CHECK_PREFIX):
+                       -len(EXPECTED_IDENTIFIER_CHECK_SUFFIX)]
+                == EXPECTED_IDENTIFIER_CHECK_NAME
+            ),
+            "source_matches_generated":source == EXPECTED_IDENTIFIER_CHECK,
+            "manifest":(root / "sai.package").read_text(encoding="utf-8"),
+            "package_entries":sorted(path.name for path in root.iterdir()),
+            "source_entries":sorted(path.name for path in (root / "src").iterdir()),
+        }}
+    Path(RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
+    if (root / "sai.package").read_text(encoding="utf-8") != EXPECTED_MANIFEST:
+        raise SystemExit("invalid generated check package")
+    if (
+        (is_source_size and MODE == "source_size_minimum_refuses")
+        or (is_identifier and MODE == "identifier_minimum_refuses")
+    ):
+        limit = "size of a source file" if is_source_size else "length of an identifier"
+        value = len(source) if is_source_size else len(EXPECTED_IDENTIFIER_CHECK_NAME)
+        diagnostic = {{
+            "type":"diagnostic","code":"IMPLEMENTATION_LIMIT_EXCEEDED",
+            "severity":"error","level":None,
+            "message":"generated minimum limit was refused","primary":None,
+            "primary_label":"","labels":[],"children":[],"fixes":[],
+            "related":[],"data":{{"limit":limit,"value":value}},
+            "node":None,"symbol":None,"package":None
+        }}
+        print(line(header("check", ROOT)).rstrip("\\n"))
+        print(line(diagnostic).rstrip("\\n"))
+        print(line(summary(errors=1, exit_code=1)).rstrip("\\n"))
+        raise SystemExit(1)
+    records = [
+        header("check", ROOT),
+        {{"type":"result","kind":"check","data":{{
+            "target":"wasm32-core","profile":"dev","tests":False,
+            "packages":1,"fixes_applied":0,"changed_files":[]
+        }}}},
+        summary(),
+    ]
+    if (
+        (is_source_size and MODE == "source_size_minimum_missing_result")
+        or (is_identifier and MODE == "identifier_minimum_missing_result")
+    ):
+        records.pop(1)
+    if is_source_size and MODE == "source_size_minimum_unknown_header_members":
+        records[0]["future_optional"] = "supported"
+        records[0]["tool"]["channel"] = "preview"
+        records[1]["future_optional"] = "supported"
+        records[1]["data"]["future_field"] = "accepted"
+    if is_source_size and MODE == "source_size_minimum_wrong_result_member_order":
+        data = records[1]["data"]
+        records[1]["data"] = {{
+            "profile": data["profile"],
+            "target": data["target"],
+            **{{key: value for key, value in data.items()
+               if key not in {{"target", "profile"}}}},
+        }}
+    if is_source_size and MODE == "source_size_minimum_wrong_result_envelope_order":
+        result = records[1]
+        records[1] = dict(
+            data=result["data"],
+            type=result["type"],
+            kind=result["kind"],
+        )
+    if is_source_size and MODE == "source_size_minimum_wrong_tool_name":
+        records[0]["tool"]["name"] = "not-sai"
+    for record in records:
+        sys.stdout.write(line(record))
+    raise SystemExit(0)
 
 root = Path.cwd()
 source = (root / "src" / "lib.sai").read_bytes()
@@ -1663,7 +1701,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["tests"], 4 + len(USAGE_ERROR_CASES))
+        self.assertEqual(report["tests"], 5 + len(USAGE_ERROR_CASES))
         self.assertEqual(report["results"][-1]["test"],
                          "generated/impl-14-formatter/reference-source-size-refusal")
         self.assertEqual(report["results"][-1]["outcome"], "pass")
@@ -1706,7 +1744,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["tests"], 4 + len(USAGE_ERROR_CASES))
+        self.assertEqual(report["tests"], 5 + len(USAGE_ERROR_CASES))
         self.assertEqual(
             report["results"][-2]["test"],
             "generated/impl-14-formatter/source-size-minimum",
@@ -1745,15 +1783,15 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["tests"], 4 + len(USAGE_ERROR_CASES))
+        self.assertEqual(report["tests"], 5 + len(USAGE_ERROR_CASES))
         self.assertEqual(
-            report["results"][-3]["test"],
+            report["results"][-4]["test"],
             "generated/spec-01-introduction/source-size-minimum-check",
         )
-        self.assertEqual(report["results"][-3]["minimum_bytes"], self.probe_limit)
-        self.assertEqual(report["results"][-3]["outcome"], "pass")
+        self.assertEqual(report["results"][-4]["minimum_bytes"], self.probe_limit)
+        self.assertEqual(report["results"][-4]["outcome"], "pass")
         self.assertEqual(
-            report["results"][-3]["compatibility_execution"],
+            report["results"][-4]["compatibility_execution"],
             {
                 "manifest_target": "wasm32-core",
                 "cli_target": "wasm32-core",
@@ -1782,7 +1820,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-3]["failures"],
+            report["results"][-4]["failures"],
             ["source at the minimum size limit produced diagnostics"],
         )
 
@@ -1795,7 +1833,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-3]["failures"],
+            report["results"][-4]["failures"],
             ["successful check must have one result and match check-pass"],
         )
 
@@ -1807,7 +1845,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["results"][-3]["outcome"], "pass")
+        self.assertEqual(report["results"][-4]["outcome"], "pass")
 
     def test_check_source_size_minimum_rejects_reordered_known_result_members(self):
         self._fixture()
@@ -1818,7 +1856,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-3]["failures"],
+            report["results"][-4]["failures"],
             ["sai check returned an invalid result schema"],
         )
 
@@ -1831,7 +1869,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-3]["failures"],
+            report["results"][-4]["failures"],
             ["sai check returned an invalid result schema"],
         )
 
@@ -1843,7 +1881,76 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "fail")
-        self.assertTrue(report["results"][-3]["failures"])
+        self.assertTrue(report["results"][-4]["failures"])
+
+    def test_identifier_generator_uses_exact_ascii_token_byte_length(self):
+        identifier, source = _identifier_at_minimum_size(self.identifier_limit)
+
+        self.assertEqual(len(identifier), self.identifier_limit)
+        self.assertEqual(source, b"pub const " + identifier + b": Bool = true\n")
+        self.assertEqual(source.count(identifier), 1)
+
+    def test_check_identifier_minimum_uses_exact_table_limit(self):
+        self._fixture()
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "pass", report)
+        result = report["results"][-3]
+        self.assertEqual(
+            result["test"],
+            "generated/spec-01-introduction/identifier-minimum-check",
+        )
+        self.assertEqual(result["limit"], "length of an identifier")
+        self.assertEqual(result["minimum_bytes"], self.identifier_limit)
+        self.assertEqual(result["outcome"], "pass")
+        self.assertEqual(
+            result["compatibility_execution"],
+            {
+                "manifest_target": "wasm32-core",
+                "cli_target": "wasm32-core",
+                "cli_profile_default": "dev",
+            },
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        probe = receipt["identifier_minimum_check_probe"]
+        self.assertEqual(probe["argv"], [
+            "--format=json", "--max-errors=0", "check",
+            "--target=wasm32-core", "--jobs=1",
+        ])
+        self.assertEqual(probe["identifier_utf8_bytes"], self.identifier_limit)
+        self.assertIs(probe["identifier_matches_generated"], True)
+        self.assertIs(probe["source_matches_generated"], True)
+        self.assertEqual(probe["manifest"], PACKAGE_MANIFEST)
+        self.assertEqual(probe["package_entries"], ["sai.package", "src"])
+        self.assertEqual(probe["source_entries"], ["lib.sai"])
+
+    def test_check_identifier_minimum_rejects_compiler_refusal(self):
+        self._fixture()
+        self.mode = "identifier_minimum_refuses"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(
+            report["results"][-3]["failures"],
+            ["identifier at its minimum length produced diagnostics"],
+        )
+
+    def test_check_identifier_minimum_requires_a_check_result(self):
+        self._fixture()
+        self.mode = "identifier_minimum_missing_result"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(
+            report["results"][-3]["failures"],
+            ["successful check must have one result and match check-pass"],
+        )
 
     def test_usage_error_matrix_checks_required_cli_boundaries(self):
         self._fixture()

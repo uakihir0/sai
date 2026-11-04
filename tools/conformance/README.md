@@ -244,11 +244,14 @@ protocol, and cannot substantiate a conformance claim. Its JSON golden
 comparison is limited to ordinary sidecars on single-file Stage 0 check
 fixtures; it does not cover formatter goldens, target/profile specializations,
 or directory fixtures.
-The source-size probes read the source-file minimum from the numeric table in
-`docs/spec/01-introduction.md` §1.5.4. They check generated minimum-size source
-through formatting and package-file checking, plus the formatter's one-byte
-over-limit refusal; they do not generate the remaining 11 limit cases or the
-full required portable test matrix. Formatter coverage is limited to single-file source and one package-manifest
+The generated minimum-limit probes read their values from the numeric table in
+`docs/spec/01-introduction.md` §1.5.4. They check source-file minimum acceptance
+through formatting and package-file checking, and check identifier-length
+minimum acceptance through package-file checking with an identifier token of
+exactly the table's UTF-8 byte length. The formatter's one-byte-over-source-size
+refusal is specific to the current reference implementation. The probes do not
+generate the remaining 10 limit cases or the full required portable test
+matrix. Formatter coverage is limited to single-file source and one package-manifest
 `fmt` fixture's byte comparisons, fixed-point checks, 16 deterministic layout
 variants, source-stdin, generated
 package-wide `fmt --check` and `fmt --check` with one explicit path,

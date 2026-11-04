@@ -142,7 +142,14 @@ def read_implementation_limits(path: Path) -> tuple[ResourceLimit, ...]:
 
 def source_file_minimum_bytes(limits: tuple[ResourceLimit, ...]) -> int:
     """Return the source-file minimum, requiring a byte-valued table entry."""
-    matches = [limit for limit in limits if limit.name == "size of a source file"]
+    return byte_minimum_for(limits, "size of a source file")
+
+
+def byte_minimum_for(limits: tuple[ResourceLimit, ...], name: str) -> int:
+    """Return one uniquely named minimum whose table unit is bytes."""
+    matches = [limit for limit in limits if limit.name == name]
     if len(matches) != 1 or matches[0].unit not in UNIT_MULTIPLIERS:
-        raise LimitTableError("§1.5.4 must define one byte-valued source-file minimum")
+        raise LimitTableError(
+            f"§1.5.4 must define one byte-valued minimum for {name}"
+        )
     return matches[0].minimum

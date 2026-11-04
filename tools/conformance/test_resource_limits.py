@@ -1,9 +1,10 @@
+import tempfile
 import unittest
 from pathlib import Path
-import tempfile
 
 from resource_limits import (
     LimitTableError,
+    byte_minimum_for,
     parse_implementation_limits,
     read_implementation_limits,
     source_file_minimum_bytes,
@@ -74,8 +75,31 @@ class ResourceLimitTests(unittest.TestCase):
             "| Limit | Minimum |\n|---|---|\n"
             "| nesting | 1,024 |\n"
         )
-        with self.assertRaisesRegex(LimitTableError, "source-file minimum"):
+        with self.assertRaisesRegex(LimitTableError, "byte-valued minimum"):
             source_file_minimum_bytes(limits)
+
+    def test_byte_minimum_lookup_requires_one_matching_byte_valued_row(self):
+        limits = parse_implementation_limits(
+            "### 1.5.4 Implementation limits\n"
+            "| Limit | Minimum |\n|---|---|\n"
+            "| length of an identifier | 1,024 bytes |\n"
+        )
+
+        self.assertEqual(
+            byte_minimum_for(limits, "length of an identifier"),
+            1024,
+        )
+        with self.assertRaisesRegex(LimitTableError, "byte-valued minimum"):
+            byte_minimum_for(limits, "not a limit")
+        with self.assertRaisesRegex(LimitTableError, "byte-valued minimum"):
+            byte_minimum_for(
+                parse_implementation_limits(
+                    "### 1.5.4 Implementation limits\n"
+                    "| Limit | Minimum |\n|---|---|\n"
+                    "| length of an identifier | 1,024 |\n"
+                ),
+                "length of an identifier",
+            )
 
     def test_file_reader_rejects_a_truncated_implementation_limit_table(self):
         with tempfile.TemporaryDirectory() as temporary:
