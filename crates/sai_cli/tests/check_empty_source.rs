@@ -19352,7 +19352,6 @@ fn char_and_byte_comparison_const_mismatches_and_gates_are_preserved() {
         "pub const COMPUTED: Bool = ('a' < 'b') == true\n",
         "pub const NESTED: Bool = 'a' == ('b' < 'c')\n",
         "pub const CHAR_BASE: Char = 'a'\npub const SHORT_CIRCUIT: Bool = false and (CHAR_BASE < 'b')\n",
-        "pub const UNRELATED: Bool = 1 < 2\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
     }
@@ -19417,7 +19416,6 @@ fn str_comparison_const_mismatches_and_gates_are_preserved() {
         "pub const BASE: Str = \"a\"\npub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < \"b\")\n",
         "pub const SHORT_CIRCUIT_COMPUTED: Bool = true or ((\"a\" + \"b\") == \"ab\")\n",
         "pub const BYTE_STRING: Bool = b\"a\" < b\"b\"\n",
-        "pub const UNRELATED: Bool = 1 < 2\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
     }
@@ -19483,6 +19481,192 @@ fn unit_comparison_const_mismatches_and_gates_are_preserved() {
         "pub const MIXED_INT: Bool = () == 1\n",
         "pub const NESTED_COMPARISON: Bool = (() == ()) == true\n",
         "pub const BASE: () = ()\npub const SHORT_CIRCUIT_PATH: Bool = false and (BASE == ())\n",
+    ] {
+        assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn public_integer_literal_comparison_consts_emit_check_results() {
+    let source = concat!(
+        "pub const EQ: Bool = -5 == -5\n",
+        "pub const NE: Bool = -5 != 5\n",
+        "pub const LT: Bool = -5 < 5\n",
+        "pub const LE: Bool = -9223372036854775808 <= 9223372036854775807\n",
+        "pub const GT: Bool = 9223372036854775807 > -9223372036854775808\n",
+        "pub const GE: Bool = -9223372036854775808 >= -9223372036854775808\n",
+        "pub const NEGATIVE_ZERO: Bool = -0 == 0\n",
+        "pub const RADIX: Bool = 0x10 == 16\n",
+        "pub const NESTED: Bool = not (-3 >= -2) and (5 >= 5)\n",
+        "pub const SHORT_CIRCUIT: Bool = false and (1 < 2)\n",
+        "pub const TUPLE: (Bool, Bool) = (-1 < 0, -2 == -1)\n",
+        "pub const ARRAY: Array<Bool, 2> = [0 < 1, 2 <= 1]\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn integer_comparison_ranges_mismatches_and_gates_are_preserved() {
+    for (source, operands) in [
+        (
+            "pub const LEFT: Bool = 9223372036854775808 < 0\n",
+            vec!["9223372036854775808"],
+        ),
+        (
+            "pub const RIGHT: Bool = 0 < 9223372036854775808\n",
+            vec!["9223372036854775808"],
+        ),
+        (
+            "pub const BOTH: Bool = 9223372036854775808 == -9223372036854775809\n",
+            vec!["9223372036854775808", "-9223372036854775809"],
+        ),
+        (
+            "pub const TOO_WIDE: Bool = 340282366920938463463374607431768211456 == 0\n",
+            vec!["340282366920938463463374607431768211456"],
+        ),
+        (
+            "pub const SHORT_CIRCUIT: Bool = false and (9223372036854775808 == 0)\n",
+            vec!["9223372036854775808"],
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: an out-of-range I64 comparison operand should fail:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: invalid integer operands are diagnosed without a result or feature gate:\n{stdout}"
+        );
+        let records = stdout
+            .lines()
+            .filter(|record| record.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records.len(),
+            operands.len(),
+            "{source:?}: each invalid operand gets one diagnostic:\n{stdout}"
+        );
+        let mut search_from = 0;
+        let mut expected_range_spans = Vec::new();
+        for operand in operands {
+            let relative_start = source[search_from..]
+                .find(operand)
+                .expect("out-of-range operand exists");
+            let start = search_from + relative_start;
+            let end = start + operand.len();
+            search_from = end;
+            expected_range_spans.push((start, end));
+        }
+        assert_json_diagnostic_primary_byte_spans(
+            &stdout,
+            "LITERAL_OUT_OF_RANGE",
+            &expected_range_spans,
+        );
+    }
+
+    let mismatch_source = "pub const RANGE_AND_MISMATCH: I32 = 9223372036854775808 < 0\n";
+    let mismatch_output = run_check(mismatch_source, "", &[], &[]);
+    let mismatch_stdout = String::from_utf8(mismatch_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        mismatch_output.status.code(),
+        Some(1),
+        "a wrong result type with an invalid integer literal should fail:\n{mismatch_stdout}"
+    );
+    assert!(
+        mismatch_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && mismatch_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !mismatch_stdout.contains("\"type\":\"result\"")
+            && !mismatch_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "independent operand range and result-type diagnostics should both be retained:\n{mismatch_stdout}"
+    );
+    let mismatch_expression = "9223372036854775808 < 0";
+    let mismatch_start = mismatch_source
+        .find(mismatch_expression)
+        .expect("mismatched comparison initializer exists");
+    assert_json_diagnostic_primary_byte_span(
+        &mismatch_stdout,
+        "TYPE_MISMATCH",
+        mismatch_start,
+        mismatch_start + mismatch_expression.len(),
+    );
+    let range_start = mismatch_source
+        .find("9223372036854775808")
+        .expect("out-of-range integer operand exists");
+    assert_json_diagnostic_primary_byte_span(
+        &mismatch_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        range_start,
+        range_start + "9223372036854775808".len(),
+    );
+
+    for (source, expected_mismatch, has_out_of_range) in [
+        (
+            "pub const ARRAY_ROOT: Array<Bool, 1> = 1 < 2\n",
+            "1 < 2",
+            false,
+        ),
+        ("pub const TUPLE_ROOT: (Bool,) = 1 < 2\n", "1 < 2", false),
+        (
+            "pub const TUPLE_ROOT_RANGE: (Bool,) = 9223372036854775808 < 0\n",
+            "9223372036854775808 < 0",
+            true,
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: Bool-to-aggregate shape mismatch should fail:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: supported Bool result shape mismatch should be diagnosed:\n{stdout}"
+        );
+        if has_out_of_range {
+            assert!(
+                stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""),
+                "{source:?}: invalid integer operands retain their range diagnostic:\n{stdout}"
+            );
+            let range_operand = "9223372036854775808";
+            let range_start = source
+                .find(range_operand)
+                .expect("out-of-range integer operand exists");
+            assert_json_diagnostic_primary_byte_span(
+                &stdout,
+                "LITERAL_OUT_OF_RANGE",
+                range_start,
+                range_start + range_operand.len(),
+            );
+        }
+        let mismatch_start = source
+            .find(expected_mismatch)
+            .expect("mismatched comparison exists");
+        assert_json_diagnostic_primary_byte_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            mismatch_start,
+            mismatch_start + expected_mismatch.len(),
+        );
+    }
+
+    for source in [
+        "pub const BASE: I64 = 1\npub const PATH: Bool = BASE < 2\n",
+        "pub const MIXED_BOOL: Bool = 1 == true\n",
+        "pub const MIXED_FLOAT: Bool = 1 == 1.0\n",
+        "pub const MIXED_CHAR: Bool = 1 == 'a'\n",
+        "pub const MIXED_BYTE: Bool = 1 == b'a'\n",
+        "pub const MIXED_STR: Bool = 1 == \"1\"\n",
+        "pub const COMPUTED: Bool = (1 + 2) < 4\n",
+        "pub const NESTED_COMPARISON: Bool = (1 < 2) == true\n",
+        "pub const SHORT_CIRCUIT_PATH: Bool = false and (BASE < 2)\n",
+        "pub const SHORT_CIRCUIT_COMPUTED: Bool = false and ((1 + 2) < 4)\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
     }
@@ -19654,7 +19838,6 @@ fn f64_comparison_ranges_mismatches_and_gates_are_preserved() {
         "pub const COMPUTED_REMAINDER: Bool = (1.0 % 2.0) < 1.0\n",
         "pub const NESTED: Bool = 1.0 == (2.0 < 3.0)\n",
         "pub const BASE: F64 = 1.0\npub const SHORT_CIRCUIT: Bool = false and (BASE < 2.0)\n",
-        "pub const UNRELATED: Bool = 1 < 2\n",
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), source);
     }
