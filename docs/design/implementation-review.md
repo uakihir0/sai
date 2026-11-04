@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### Stage 0 source-size minimum boundary (2026-11-04)
+
+- **Decision — review required:** Add a generated Stage 0 formatter smoke case whose valid, canonical source is exactly the 16 MiB minimum source-file limit, while retaining the existing 16 MiB + 1 byte refusal case.
+- **Reason:** Spec/01 §1.5.4 requires a conforming compiler to support source files of at least 16 MiB. The existing formatter smoke only checked that an oversized input is refused, so it did not exercise acceptance at the minimum.
+- **Boundary and judgment:** Exercise the source formatter through stdin using one valid block comment padded to the exact byte count and ending in a newline. The final newline makes the formatter's canonical output the same length as the input, so the follow-up parse remains within the limit. Generate both boundary inputs in memory rather than checking in a large fixture. This covers only source formatting at this one limit; it does not test compiler `check`/`build` acceptance, the remaining rows of §1.5.4, or full limit coverage, and it leaves `claim: false`.
+- **Review required:** Human review should challenge the byte-count construction and canonicality, acceptance and byte-identical output at exactly the limit, the existing exact diagnostic at limit + 1, and the limited formatter-only scope.
+- **Verification:** All 64 `test_run_stage0` tests passed. The complete `tools/conformance` Python suite passed 212 tests (3 skipped). The real `sai` binary accepted an exact 16 MiB canonical comment with byte-identical output; the complete Stage 0 smoke passed 34 of 34 cases. Both generated inputs are created in memory and are not persisted.
+- **Hostile review:** Code review found no remaining issue with the boundary or test assertions. Documentation review corrected the description of §15.9.2's build requirement and then found no remaining scope overclaim or actionable issue.
+
 ### Stage 0 check JSON golden boundary (2026-11-04)
 
 - **Decision — review required:** Extend `run_stage0.py` to compare ordinary `.json` sidecars only for single-file Stage 0 `check-pass` and `check-fail` fixtures. Compare the full validated NDJSON stream after normalizing only the header's whole `tool` member and `duration_us` on test result records as required by §15.4.4. The current goldens are `tests/conformance/impl-13-cli/stage0-check-pass.json` and `tests/conformance/spec-03-grammar/stage0-check-fail.json`; the smoke result reports the path and pass/fail outcome for every present golden it attempts to check.

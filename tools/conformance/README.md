@@ -195,12 +195,15 @@ refusal codes from the lexical error table and parser-only rows in the
 syntactic-validation table; parser severities come from the implementation
 diagnostics table, and unknown severities fail closed. Validation and mixed
 parser/validation codes are excluded. This kind also bypasses canonical-input
-preflight and `sai check`. The runner also generates a valid-UTF-8 source input
-of 16 MiB + 1 byte beginning with an unterminated block comment and requires
-the exact `IMPLEMENTATION_LIMIT_EXCEEDED` diagnostic, actual byte length,
-one refused `<stdin>` input, no changed files, no output, and no other
+preflight and `sai check`. The runner generates an exactly 16 MiB valid source
+with a canonical block comment and final newline, and requires formatter
+acceptance with byte-identical output. It also generates a valid-UTF-8 source
+input of 16 MiB + 1 byte beginning with an unterminated block comment and
+requires the exact `IMPLEMENTATION_LIMIT_EXCEEDED` diagnostic, actual byte
+length, one refused `<stdin>` input, no changed files, no output, and no other
 diagnostic. The malformed prefix makes the probe verify that the size check
-precedes lexing. The input is created in memory and is not stored as a fixture.
+precedes lexing. Both inputs are created in memory and are not stored as
+fixtures.
 A timeout is a failure, never a pass.
 
 For the package `fmt` directory fixture, the runner pipes the `sai.package`
@@ -287,9 +290,11 @@ directories, and `.wit` and `.mir` trees do not count as tests.
 
 The inventory is intentionally report-only. It does not run the IUT, check the
 required-content matrix of §15.9.1, compare goldens with IUT output, verify
-code-specific diagnostic data shapes, generate or check the §1.5.4 limit tests,
-or substantiate a claim. The repository does not yet record its implemented
-stages, so coverage is not a CI merge gate.
+code-specific diagnostic data shapes, or generate or check the complete
+§1.5.4 limit-test matrix. The smoke runner's two source-formatter boundary
+probes do not cover the other limits or compiler acceptance at those limits.
+The repository does not yet record its implemented stages, so coverage is not a
+CI merge gate.
 `run-panic` annotations identify a location but not a panic kind, and panic
 reports carry no kind field; therefore the report leaves every panic kind
 uncovered instead of inferring one from source text.
