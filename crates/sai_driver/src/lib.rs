@@ -50073,6 +50073,12 @@ property "shared"() {}
             "    let alias = source\n",
             "    identity_i32(~alias)\n",
             "}\n",
+            "pub fn direct_resolved_bitnot_result_remains_unsupported() -> I32 {\n",
+            "    let source = 7\n",
+            "    let first = ~source\n",
+            "    let copy: I32 = first\n",
+            "    identity_i32(~first)\n",
+            "}\n",
             "fn identity_bool(value: Bool) -> Bool { value }\n",
         )
         .to_string();
@@ -50572,6 +50578,585 @@ property "shared"() {}
                 .is_none(),
             "unresolved literal aliases remain outside this direct-provenance slice"
         );
+
+        let resolved_result_owner = owner_named(
+            &database,
+            &resolved,
+            "direct_resolved_bitnot_result_remains_unsupported",
+        );
+        assert!(
+            matches!(
+                resolved_result_owner
+                    .body_type_check()
+                    .expect("resolved-result body query succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ),
+            "a deferred BitNot result stays gated even after another constraint resolves the shared variable"
+        );
+        assert!(
+            resolved_result_owner
+                .primitive_body_type_results()
+                .expect("resolved-result projection query succeeds")
+                .is_none(),
+            "a resolved deferred BitNot result publishes no primitive facts"
+        );
+    }
+
+    #[test]
+    fn primitive_body_type_results_defer_negation_of_direct_numeric_literal_call_arguments() {
+        use sai_resolve::package_scopes::{PathRes, Res};
+        use sai_resolve::prelude::PrimTy;
+
+        let mut root = concat!(
+            "pub fn direct_root() -> I16 {\n",
+            "    let source = 7\n",
+            "    identity_i16(-source)\n",
+            "}\n",
+            "pub fn direct_nested() -> I16 {\n",
+            "    let source = 7\n",
+            "    identity_i16(identity_i16(-source))\n",
+            "}\n",
+            "pub fn direct_range_recovery() -> I8 {\n",
+            "    let source = 128\n",
+            "    let failed = identity_i8(-source)\n",
+            "    let valid_source = 7\n",
+            "    identity_i8(-valid_source)\n",
+            "}\n",
+            "pub fn direct_argument_type_mismatch() -> Bool {\n",
+            "    let source = 7\n",
+            "    let failed = identity_bool(-source)\n",
+            "    identity_bool(true)\n",
+            "}\n",
+            "pub fn deferred_neg_diagnostic_order(value: I32) -> Bool {\n",
+            "    let source = 7\n",
+            "    let failed = identity_u8(-source)\n",
+            "    identity_bool(value)\n",
+            "}\n",
+            "pub fn direct_alias_remains_unsupported() -> I32 {\n",
+            "    let source = 7\n",
+            "    let alias = source\n",
+            "    identity_i32(-alias)\n",
+            "}\n",
+            "pub fn direct_negated_result_remains_unsupported() -> I32 {\n",
+            "    let source = 7\n",
+            "    let first = -source\n",
+            "    identity_i32(-first)\n",
+            "}\n",
+            "pub fn direct_resolved_negated_result_remains_unsupported() -> I32 {\n",
+            "    let source = 7\n",
+            "    let first = -source\n",
+            "    let copy: I32 = first\n",
+            "    identity_i32(-first)\n",
+            "}\n",
+            "pub fn direct_forward_remains_unsupported() -> I32 {\n",
+            "    let result = identity_i32(-later)\n",
+            "    let later = 1\n",
+            "    result\n",
+            "}\n",
+            "fn identity_bool(value: Bool) -> Bool { value }\n",
+            "fn identity_i16(value: I16) -> I16 { value }\n",
+        )
+        .to_string();
+        let signed_types = [
+            ("i8", "I8", PrimTy::I8),
+            ("i16", "I16", PrimTy::I16),
+            ("i32", "I32", PrimTy::I32),
+            ("i64", "I64", PrimTy::I64),
+            ("isize", "ISize", PrimTy::ISize),
+            ("f32", "F32", PrimTy::F32),
+            ("f64", "F64", PrimTy::F64),
+        ];
+        for (name, type_name, _) in signed_types {
+            let literal = if matches!(type_name, "F32" | "F64") {
+                "1.5"
+            } else {
+                "7"
+            };
+            root.push_str(&format!(
+                "pub fn direct_{name}() -> {type_name} {{\n    let source = {literal}\n    identity_{name}(-source)\n}}\n"
+            ));
+            root.push_str(&format!(
+                "fn identity_{name}(value: {type_name}) -> {type_name} {{ value }}\n"
+            ));
+        }
+        let unsigned_types = [
+            ("u8", "U8", PrimTy::U8),
+            ("u16", "U16", PrimTy::U16),
+            ("u32", "U32", PrimTy::U32),
+            ("u64", "U64", PrimTy::U64),
+            ("usize", "USize", PrimTy::USize),
+        ];
+        for (name, type_name, _) in unsigned_types {
+            root.push_str(&format!(
+                "pub fn direct_{name}() -> {type_name} {{\n    let source = 7\n    identity_{name}(-source)\n}}\n"
+            ));
+            root.push_str(&format!(
+                "fn identity_{name}(value: {type_name}) -> {type_name} {{ value }}\n"
+            ));
+        }
+        let root = root;
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{name}` is present"))
+        }
+
+        fn binding_named(
+            database: &RootDatabase,
+            owner: &FunctionOwnerResolution,
+            name: &str,
+        ) -> sai_hir::BindingId {
+            let bindings = owner
+                .local_resolution()
+                .expect("local results belong to this owner")
+                .expect("function has local resolution")
+                .bindings
+                .iter()
+                .filter_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved| resolved.as_ref() == name)
+                            .map(|_| *binding)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let [binding] = bindings.as_slice() else {
+                panic!("function has exactly one `{name}` binding");
+            };
+            *binding
+        }
+
+        fn ids_for_ranges(
+            database: &mut RootDatabase,
+            collection: &Phase1PackageScopesCollection,
+            snapshot: &WorkspaceSnapshot,
+            owner: &FunctionOwnerResolution,
+            ranges: &[(usize, usize)],
+        ) -> Vec<Vec<sai_hir::HirId>> {
+            let descriptor = *collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .find(|descriptor| descriptor.owner == owner.owner())
+                .expect("function owner has a top-level descriptor");
+            let owner_inputs = database
+                .current_owner_inputs(snapshot, descriptor.file, &collection.target_cfg)
+                .expect("owner inputs are current");
+            let def_paths = Arc::clone(
+                database
+                    .def_paths
+                    .get(&owner.owner().def_id.package())
+                    .expect("package has a definition-path interner"),
+            );
+            let arena = HirArena::new();
+            let lowering_context = HirLoweringContext::new(
+                &owner_inputs.ast_ids,
+                snapshot,
+                &owner_inputs.root,
+                &arena,
+                &database.symbols,
+                &def_paths,
+            );
+            let (_, source_map) = lower_top_level_owner(
+                descriptor,
+                &def_paths
+                    .resolve_def_id(owner.owner().def_id.to_def_id())
+                    .expect("owner path resolves")
+                    .expect("owner path exists"),
+                &owner_inputs.filtered_item_tree,
+                &owner_inputs.retained_item_kinds,
+                &lowering_context,
+            )
+            .expect("function owner lowers");
+
+            ranges
+                .iter()
+                .map(|(start, len)| {
+                    let range = sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(*start as u32),
+                        sai_diagnostics::TextSize::new((*start + *len) as u32),
+                    )
+                    .expect("expression range is ordered");
+                    source_map
+                        .node_to_syntax()
+                        .iter_enumerated()
+                        .filter_map(|(local_id, pointer)| {
+                            (pointer.text_range() == range).then_some(sai_hir::HirId {
+                                owner: owner.owner(),
+                                local_id,
+                            })
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+
+        for (name, type_name, expected_type) in signed_types {
+            let owner = owner_named(&database, &resolved, &format!("direct_{name}"));
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("signed literal call owner body check is available")
+            else {
+                panic!("direct literal-local Neg call argument is supported for {name}");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "the {name} callee parameter infers the direct literal source"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("signed call results query succeeds")
+                .expect("supported signed call publishes primitive facts");
+            assert_eq!(
+                results.binding_type(binding_named(&database, owner, "source")),
+                Some(expected_type),
+                "the {type_name} call parameter selects its source-local type"
+            );
+            assert_eq!(
+                results.expression_types().len(),
+                4,
+                "the {name} initializer, source path, Neg argument, and call each retain a fact"
+            );
+            assert!(
+                results
+                    .expression_types()
+                    .values()
+                    .all(|ty| *ty == expected_type),
+                "the {name} expression facts follow the concrete parameter"
+            );
+        }
+
+        for (name, type_name, expected_type) in unsigned_types {
+            let owner = owner_named(&database, &resolved, &format!("direct_{name}"));
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("unsigned literal call owner body check is available")
+            else {
+                panic!("direct literal-local Neg call argument is supported for {name}");
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>(),
+                [format!(
+                    "operator `-` has no `Neg` implementation for `{type_name}`"
+                )],
+                "the deferred Neg trait check rejects the unsigned {name} resolution"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("unsigned call results query succeeds")
+                .expect("supported unsigned call publishes primitive facts");
+            assert_eq!(
+                results.binding_type(binding_named(&database, owner, "source")),
+                Some(expected_type),
+                "the {name} call parameter still selects its source-local type"
+            );
+            assert_eq!(
+                results.expression_types().len(),
+                2,
+                "the {name} rejected Neg and its call contribute no facts while the literal and path remain"
+            );
+            assert!(
+                results
+                    .expression_types()
+                    .values()
+                    .all(|ty| *ty == expected_type),
+                "the {name} retained expression facts follow the concrete parameter"
+            );
+        }
+
+        let direct_root = owner_named(&database, &resolved, "direct_root");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: root_diagnostics,
+        } = direct_root
+            .body_type_check()
+            .expect("direct-root body check is available")
+        else {
+            panic!("a direct literal-local Neg call argument is supported");
+        };
+        assert!(root_diagnostics.is_empty());
+        let root_results = direct_root
+            .primitive_body_type_results()
+            .expect("direct-root results query succeeds")
+            .expect("direct-root body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, root_results);
+        assert_eq!(
+            root_results.binding_type(binding_named(&database, direct_root, "source")),
+            Some(PrimTy::I16),
+            "the call parameter constrains the source literal local"
+        );
+        let root_unary_start = root.find("identity_i16(-source)").unwrap() + "identity_i16(".len();
+        let root_call_start = root.find("identity_i16(-source)").unwrap();
+        let root_ids = ids_for_ranges(
+            &mut database,
+            &collection,
+            &snapshot,
+            direct_root,
+            &[
+                (root_unary_start, "-source".len()),
+                (root_unary_start + 1, "source".len()),
+                (root_call_start, "identity_i16(-source)".len()),
+            ],
+        );
+        let [root_unary_ids, root_path_ids, root_call_ids] = root_ids.as_slice() else {
+            panic!("direct-root expression ranges were queried");
+        };
+        let [root_unary_id] = root_unary_ids.as_slice() else {
+            panic!("the root unary Neg has one exact HIR node");
+        };
+        let root_local_paths = direct_root
+            .local_resolution()
+            .expect("root local results belong to the owner")
+            .expect("root owner has local resolution");
+        let root_path_candidates = root_path_ids
+            .iter()
+            .filter(|hir_id| {
+                matches!(
+                    root_local_paths.paths.get(hir_id),
+                    Some(PathRes {
+                        base: Res::Local(binding),
+                        resolved_segments: 1,
+                        segment_count: 1,
+                    }) if *binding == binding_named(&database, direct_root, "source")
+                )
+            })
+            .collect::<Vec<_>>();
+        let [root_path_id] = root_path_candidates.as_slice() else {
+            panic!("the unary operand path resolves to the exact source BindingId");
+        };
+        let [root_call_id] = root_call_ids.as_slice() else {
+            panic!("the root direct call has one exact HIR node");
+        };
+        assert_eq!(
+            root_results.expression_type(*root_unary_id),
+            Some(PrimTy::I16),
+            "the root Neg operator fact shares the call parameter type"
+        );
+        assert_eq!(
+            root_results.expression_type(*root_call_id),
+            Some(PrimTy::I16),
+            "the root call fact retains its resolved output type"
+        );
+        assert_eq!(
+            root_local_paths.paths.get(*root_path_id),
+            Some(&PathRes {
+                base: Res::Local(binding_named(&database, direct_root, "source")),
+                resolved_segments: 1,
+                segment_count: 1,
+            }),
+            "the operand path retains its exact local resolution"
+        );
+
+        let direct_nested = owner_named(&database, &resolved, "direct_nested");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: nested_diagnostics,
+        } = direct_nested
+            .body_type_check()
+            .expect("direct-nested body check is available")
+        else {
+            panic!("a one-level nested call Neg argument is supported");
+        };
+        assert!(nested_diagnostics.is_empty());
+        let nested_results = direct_nested
+            .primitive_body_type_results()
+            .expect("nested results query succeeds")
+            .expect("nested body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, nested_results);
+        assert_eq!(
+            nested_results.binding_type(binding_named(&database, direct_nested, "source")),
+            Some(PrimTy::I16)
+        );
+
+        let range_owner = owner_named(&database, &resolved, "direct_range_recovery");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: range_diagnostics,
+        } = range_owner
+            .body_type_check()
+            .expect("range-recovery body check is available")
+        else {
+            panic!("range errors do not make the bounded call body unsupported");
+        };
+        assert_eq!(
+            range_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["integer literal is out of range for `I8`"]
+        );
+        let range_results = range_owner
+            .primitive_body_type_results()
+            .expect("range-recovery results query succeeds")
+            .expect("range-recovery body publishes independent facts");
+        assert_primitive_type_result_parity(&database, range_results);
+        let range_literal_start = root
+            .find("let source = 128")
+            .expect("range source declaration exists")
+            + "let source = ".len();
+        assert_eq!(
+            range_diagnostics[0]
+                .primary()
+                .expect("range diagnostic has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(range_literal_start as u32),
+                sai_diagnostics::TextSize::new((range_literal_start + "128".len()) as u32),
+            )
+            .expect("literal source range is ordered"),
+            "range diagnostics stay anchored to the integer literal"
+        );
+        assert_eq!(
+            range_results.binding_type(binding_named(&database, range_owner, "source")),
+            None,
+            "the unannotated out-of-range source does not publish a binding fact"
+        );
+        assert_eq!(
+            range_results.binding_type(binding_named(&database, range_owner, "valid_source")),
+            Some(PrimTy::I8),
+            "an out-of-range source does not prevent the independent sibling from resolving"
+        );
+        assert_eq!(
+            range_results.expression_types().len(),
+            4,
+            "the range error suppresses its dependent facts while retaining the valid sibling's four facts"
+        );
+        assert!(
+            range_results
+                .expression_types()
+                .values()
+                .all(|ty| *ty == PrimTy::I8),
+            "the retained range-recovery expressions all have the sibling's I8 type"
+        );
+
+        let mismatch_owner = owner_named(&database, &resolved, "direct_argument_type_mismatch");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: mismatch_diagnostics,
+        } = mismatch_owner
+            .body_type_check()
+            .expect("argument-mismatch body check is available")
+        else {
+            panic!("an incompatible call expectation remains a recoverable type error");
+        };
+        assert_eq!(mismatch_diagnostics.len(), 1);
+        assert!(
+            mismatch_diagnostics[0].message.contains("integer literal"),
+            "the incompatible expected type is diagnosed against the integer source"
+        );
+        let mismatch_start = root
+            .find("identity_bool(-source)")
+            .expect("mismatch call argument exists")
+            + "identity_bool(".len();
+        assert_eq!(
+            mismatch_diagnostics[0]
+                .primary()
+                .expect("mismatch diagnostic has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(mismatch_start as u32),
+                sai_diagnostics::TextSize::new((mismatch_start + "-source".len()) as u32),
+            )
+            .expect("mismatch call-argument span is ordered"),
+            "the incompatible parameter expectation is diagnosed on the Neg argument"
+        );
+        let mismatch_results = mismatch_owner
+            .primitive_body_type_results()
+            .expect("mismatch results query succeeds")
+            .expect("the valid sibling remains available");
+        assert_primitive_type_result_parity(&database, mismatch_results);
+        assert_eq!(
+            mismatch_results.binding_type(binding_named(&database, mismatch_owner, "source")),
+            Some(PrimTy::I64),
+            "the unconstrained source falls back to I64 after the incompatible expectation"
+        );
+
+        let order_owner = owner_named(&database, &resolved, "deferred_neg_diagnostic_order");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: order_diagnostics,
+        } = order_owner
+            .body_type_check()
+            .expect("diagnostic-order body check is available")
+        else {
+            panic!("diagnostic ordering remains within the supported body slice");
+        };
+        assert_eq!(
+            order_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "operator `-` has no `Neg` implementation for `U8`",
+                "expected `Bool`, found `I32`",
+            ],
+            "the deferred Neg trait diagnostic precedes the later immediate type-mismatch diagnostic"
+        );
+
+        for name in [
+            "direct_alias_remains_unsupported",
+            "direct_negated_result_remains_unsupported",
+            "direct_resolved_negated_result_remains_unsupported",
+            "direct_forward_remains_unsupported",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("unsupported body query succeeds"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "the `{name}` shape remains outside this deferred-Neg slice"
+            );
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("unsupported projection query succeeds")
+                    .is_none(),
+                "the `{name}` shape publishes no primitive facts"
+            );
+        }
     }
 
     #[test]
@@ -51038,7 +51623,7 @@ property "shared"() {}
             "    let later = value\n",
             "    result\n",
             "}\n",
-            "pub fn direct_neg_unresolved_numeric_local_unsupported() -> I32 {\n",
+            "pub fn direct_neg_integer_literal_local_call_argument() -> I32 {\n",
             "    let copy = 1\n",
             "    apply_i32(-copy)\n",
             "}\n",
@@ -53216,6 +53801,11 @@ property "shared"() {}
         );
         let direct_neg_local_initializer =
             assert_supported(&database, "direct_neg_local_initializer", &[]);
+        let _direct_neg_integer_literal_local_call_argument = assert_supported(
+            &database,
+            "direct_neg_integer_literal_local_call_argument",
+            &[],
+        );
         let shift_i8_call_argument = assert_supported(&database, "shift_i8_call_argument", &[]);
         let shift_i16_call_argument = assert_supported(&database, "shift_i16_call_argument", &[]);
         let shift_i32_call_argument = assert_supported(&database, "shift_i32_call_argument", &[]);
@@ -53772,7 +54362,6 @@ property "shared"() {}
             "direct_neg_unresolved_path_unsupported",
             "direct_neg_self_path_unsupported",
             "direct_neg_forward_path_unsupported",
-            "direct_neg_unresolved_numeric_local_unsupported",
             "direct_neg_global_path_unsupported",
             "direct_neg_deep_nested_call_unsupported",
             "direct_neg_generic_target_unsupported",
