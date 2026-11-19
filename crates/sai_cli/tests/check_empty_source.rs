@@ -19542,6 +19542,46 @@ fn unary_bitwise_not_path_tails_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn unary_not_path_tails_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn parameter_tail(value: Bool) -> Bool { not value }\n",
+        "pub fn int_parameter_tail(value: I32) -> Bool { not value }\n",
+        "pub fn literal_tail() -> Bool {\n",
+        "    let source = true\n",
+        "    not source\n",
+        "}\n",
+        "pub fn alias_tail() -> Bool {\n",
+        "    let source = true\n",
+        "    let copied = source\n",
+        "    not copied\n",
+        "}\n",
+        "pub fn int_literal_tail() -> Bool {\n",
+        "    let source = 7\n",
+        "    not source\n",
+        "}\n",
+        "pub fn mismatch_tail() -> I32 {\n",
+        "    let source = true\n",
+        "    not source\n",
+        "}\n",
+        "pub fn deferred_result_tail() -> Bool {\n",
+        "    let source = true\n",
+        "    let first = not source\n",
+        "    not first\n",
+        "}\n",
+        "pub fn computed_tail(value: Bool) -> Bool { not (value == value) }\n",
+        "pub fn literal_operand_tail() -> Bool { not true }\n",
+        "pub fn double_not_tail(value: Bool) -> Bool { not not value }\n",
+        "pub fn call_operand_tail(value: Bool) -> Bool { not identity_bool(value) }\n",
+        "fn identity_bool(value: Bool) -> Bool { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "unary-not path tails over parameters, locals, and copies",
+    );
+}
+
+#[test]
 fn deferred_bitwise_not_of_flat_integer_literal_locals_remains_behind_the_stage_gate() {
     let source = concat!(
         "const GLOBAL: I32 = 1\n",

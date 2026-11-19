@@ -508,7 +508,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .input
                 .call_signatures
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-        let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot) && matches!(operand.kind, ExprKind::Path(_)));
+        let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)));
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
@@ -2380,13 +2380,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         .ok_or(())?,
                 ),
                 ExprKind::Unary(operator, operand)
-                    if matches!(operator, UnOp::Neg | UnOp::BitNot)
+                    if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not)
                         && matches!(operand.kind, ExprKind::Path(_)) =>
                 {
-                    if operator == UnOp::Neg {
-                        self.check_direct_call_neg_path(operand, expression.hir_id)?
-                    } else {
-                        self.check_bitwise_not_path(operand, expression.hir_id)?
+                    match operator {
+                        UnOp::Neg => self.check_direct_call_neg_path(operand, expression.hir_id)?,
+                        UnOp::BitNot => self.check_bitwise_not_path(operand, expression.hir_id)?,
+                        _ => self.check_logical_not(operand)?,
                     }
                 }
                 _ => self.check_local_path(expression)?,
