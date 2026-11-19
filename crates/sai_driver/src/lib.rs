@@ -50068,9 +50068,37 @@ property "shared"() {}
             "    let failed = identity_bool(~source)\n",
             "    identity_bool(true)\n",
             "}\n",
-            "pub fn direct_alias_remains_unsupported() -> I32 {\n",
+            "pub fn direct_alias() -> I32 {\n",
             "    let source = 7\n",
             "    let alias = source\n",
+            "    identity_i32(~alias)\n",
+            "}\n",
+            "pub fn direct_nested_alias() -> U16 {\n",
+            "    let source = 7\n",
+            "    let alias = source\n",
+            "    identity_u16(identity_u16(~alias))\n",
+            "}\n",
+            "pub fn direct_alias_chain() -> I64 {\n",
+            "    let source = 7\n",
+            "    let first_alias = source\n",
+            "    let second_alias = first_alias\n",
+            "    identity_i64(~second_alias)\n",
+            "}\n",
+            "pub fn direct_alias_mismatch() -> Bool {\n",
+            "    let source = 7\n",
+            "    let alias = source\n",
+            "    let failed = identity_bool(~alias)\n",
+            "    identity_bool(true)\n",
+            "}\n",
+            "pub fn direct_float_alias_remains_unsupported() -> F32 {\n",
+            "    let source = 1.5\n",
+            "    let alias = source\n",
+            "    identity_f32(~alias)\n",
+            "}\n",
+            "pub fn direct_bitnot_result_alias_remains_unsupported() -> I32 {\n",
+            "    let source = 7\n",
+            "    let first = ~source\n",
+            "    let alias = first\n",
             "    identity_i32(~alias)\n",
             "}\n",
             "pub fn direct_resolved_bitnot_result_remains_unsupported() -> I32 {\n",
@@ -50080,6 +50108,7 @@ property "shared"() {}
             "    identity_i32(~first)\n",
             "}\n",
             "fn identity_bool(value: Bool) -> Bool { value }\n",
+            "fn identity_f32(value: F32) -> F32 { value }\n",
         )
         .to_string();
         let integer_types = [
@@ -50564,20 +50593,101 @@ property "shared"() {}
             "the incompatible BitNot/call contribute no facts while the source initializer and Bool sibling remain"
         );
 
-        let alias_owner = owner_named(&database, &resolved, "direct_alias_remains_unsupported");
-        assert!(matches!(
-            alias_owner
-                .body_type_check()
-                .expect("alias body query succeeds"),
-            FunctionBodyTypeCheck::Unsupported
-        ));
-        assert!(
-            alias_owner
+        for (name, expected_type) in [
+            ("direct_alias", PrimTy::I32),
+            ("direct_nested_alias", PrimTy::U16),
+            ("direct_alias_chain", PrimTy::I64),
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } =
+                owner.body_type_check().expect("alias body query succeeds")
+            else {
+                panic!("a simple literal-alias BitNot call argument is supported for `{name}`");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "the `{name}` callee parameter infers the aliased literal source"
+            );
+            let results = owner
                 .primitive_body_type_results()
-                .expect("alias projection query succeeds")
-                .is_none(),
-            "unresolved literal aliases remain outside this direct-provenance slice"
+                .expect("alias results query succeeds")
+                .expect("alias body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+            assert_eq!(
+                results.binding_type(binding_named(&database, owner, "source")),
+                Some(expected_type),
+                "the `{name}` source shares the inferred parameter type"
+            );
+        }
+
+        let alias_owner = owner_named(&database, &resolved, "direct_alias");
+        let alias_results = alias_owner
+            .primitive_body_type_results()
+            .expect("alias results query succeeds")
+            .expect("alias body publishes primitive facts");
+        assert_eq!(
+            alias_results.binding_type(binding_named(&database, alias_owner, "alias")),
+            Some(PrimTy::I32),
+            "the alias binding shares the inferred parameter type"
         );
+        assert_eq!(
+            alias_results.expression_types().len(),
+            5,
+            "the source literal, both alias paths, the BitNot argument, and the call each retain a fact"
+        );
+
+        let chain_owner = owner_named(&database, &resolved, "direct_alias_chain");
+        let chain_results = chain_owner
+            .primitive_body_type_results()
+            .expect("alias-chain results query succeeds")
+            .expect("alias-chain body publishes primitive facts");
+        for name in ["first_alias", "second_alias"] {
+            assert_eq!(
+                chain_results.binding_type(binding_named(&database, chain_owner, name)),
+                Some(PrimTy::I64),
+                "each transitive literal alias shares the inferred parameter type"
+            );
+        }
+
+        let alias_mismatch_owner = owner_named(&database, &resolved, "direct_alias_mismatch");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: alias_mismatch_diagnostics,
+        } = alias_mismatch_owner
+            .body_type_check()
+            .expect("alias-mismatch body query succeeds")
+        else {
+            panic!("an incompatible alias expectation remains a recoverable type error");
+        };
+        assert_eq!(alias_mismatch_diagnostics.len(), 1);
+        assert!(
+            alias_mismatch_diagnostics[0]
+                .message
+                .contains("integer literal"),
+            "the incompatible expected type is diagnosed against the aliased integer source"
+        );
+
+        for name in [
+            "direct_float_alias_remains_unsupported",
+            "direct_bitnot_result_alias_remains_unsupported",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("excluded body query succeeds"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "the `{name}` shape remains outside this BitNot slice"
+            );
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("excluded projection query succeeds")
+                    .is_none(),
+                "the `{name}` shape publishes no primitive facts"
+            );
+        }
 
         let resolved_result_owner = owner_named(
             &database,
