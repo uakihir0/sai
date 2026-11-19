@@ -8564,7 +8564,7 @@ fn check_function_body_primitive_local_block(
             || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
     let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-    let is_supported_neg_tail = matches!(tail.kind, ExprKind::Unary(UnOp::Neg, operand) if matches!(operand.kind, ExprKind::Path(_)));
+    let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot) && matches!(operand.kind, ExprKind::Path(_)));
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8573,7 +8573,7 @@ fn check_function_body_primitive_local_block(
             };
             Some(tail_binding)
         }
-        ExprKind::Unary(UnOp::Neg, operand) if is_supported_neg_tail => {
+        ExprKind::Unary(_, operand) if is_supported_unary_tail => {
             let ExprKind::Path(operand_path) = operand.kind else {
                 return Ok(None);
             };
@@ -8591,7 +8591,7 @@ fn check_function_body_primitive_local_block(
     if block.stmts.is_empty()
         && !is_supported_field_tail
         && !is_supported_call_tail
-        && !is_supported_neg_tail
+        && !is_supported_unary_tail
     {
         return Ok(None);
     }
@@ -51781,6 +51781,335 @@ property "shared"() {}
         );
 
         for name in ["neg_deferred_result_tail", "neg_computed_tail"] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("excluded tail body query succeeds"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "the `{name}` tail shape remains outside this slice"
+            );
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("excluded projection query succeeds")
+                    .is_none(),
+                "the `{name}` tail shape publishes no primitive facts"
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_body_type_results_infer_bitwise_not_tails() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub fn bitnot_parameter(value: I32) -> I32 { ~value }\n",
+            "pub fn bitnot_byte_parameter(value: Byte) -> Byte { ~value }\n",
+            "pub fn bitnot_bool_parameter(value: Bool) -> Bool { ~value }\n",
+            "pub fn bitnot_literal_tail() -> U16 {\n",
+            "    let source = 7\n",
+            "    ~source\n",
+            "}\n",
+            "pub fn bitnot_alias_tail() -> I32 {\n",
+            "    let source = 7\n",
+            "    let alias = source\n",
+            "    ~alias\n",
+            "}\n",
+            "pub fn bitnot_alias_chain_tail() -> I64 {\n",
+            "    let source = 7\n",
+            "    let first_alias = source\n",
+            "    let second_alias = first_alias\n",
+            "    ~second_alias\n",
+            "}\n",
+            "pub fn bitnot_unsigned_tail() -> U8 {\n",
+            "    let source = 7\n",
+            "    ~source\n",
+            "}\n",
+            "pub fn bitnot_float_tail() -> F64 {\n",
+            "    let source = 1.5\n",
+            "    ~source\n",
+            "}\n",
+            "pub fn bitnot_mismatch_tail() -> Bool {\n",
+            "    let source = 7\n",
+            "    ~source\n",
+            "}\n",
+            "pub fn bitnot_range_tail() -> I8 {\n",
+            "    let source: I8 = 128\n",
+            "    ~source\n",
+            "}\n",
+            "pub fn bitnot_deferred_result_tail() -> I32 {\n",
+            "    let source = 7\n",
+            "    let first = ~source\n",
+            "    ~first\n",
+            "}\n",
+            "pub fn bitnot_computed_tail(value: I32) -> I32 {\n",
+            "    ~(value + 1)\n",
+            "}\n",
+        )
+        .to_string();
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{name}` is present"))
+        }
+
+        fn binding_named(
+            database: &RootDatabase,
+            owner: &FunctionOwnerResolution,
+            name: &str,
+        ) -> sai_hir::BindingId {
+            let bindings = owner
+                .local_resolution()
+                .expect("local results belong to this owner")
+                .expect("function has local resolution")
+                .bindings
+                .iter()
+                .filter_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved| resolved.as_ref() == name)
+                            .map(|_| *binding)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let [binding] = bindings.as_slice() else {
+                panic!("function has exactly one `{name}` binding");
+            };
+            *binding
+        }
+
+        for (name, expected_type) in [
+            ("bitnot_parameter", PrimTy::I32),
+            ("bitnot_byte_parameter", PrimTy::Byte),
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("parameter tail body check is available")
+            else {
+                panic!("a concrete integer/Byte path BitNot tail is supported for `{name}`");
+            };
+            assert!(diagnostics.is_empty());
+            let results = owner
+                .primitive_body_type_results()
+                .expect("parameter tail results query succeeds")
+                .expect("parameter tail body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+            assert_eq!(
+                results.expression_types().len(),
+                2,
+                "the parameter path and the BitNot tail each retain a fact"
+            );
+            assert!(
+                results
+                    .expression_types()
+                    .values()
+                    .all(|ty| *ty == expected_type)
+            );
+        }
+
+        let bool_parameter_owner = owner_named(&database, &resolved, "bitnot_bool_parameter");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: bool_parameter_diagnostics,
+        } = bool_parameter_owner
+            .body_type_check()
+            .expect("bool parameter tail body check is available")
+        else {
+            panic!("a concrete Bool path BitNot tail is supported");
+        };
+        assert_eq!(
+            bool_parameter_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["operator `~` has no `BitNot` implementation for `Bool`"],
+            "a Bool parameter reports the immediate BitNot diagnostic"
+        );
+        let bool_parameter_results = bool_parameter_owner
+            .primitive_body_type_results()
+            .expect("bool parameter tail results query succeeds")
+            .expect("bool parameter tail body publishes primitive facts");
+        assert_eq!(
+            bool_parameter_results.expression_types().len(),
+            1,
+            "the rejected BitNot tail contributes no fact while the parameter path remains"
+        );
+        assert_eq!(
+            bool_parameter_results.binding_type(binding_named(
+                &database,
+                bool_parameter_owner,
+                "value"
+            )),
+            Some(PrimTy::Bool)
+        );
+
+        for (name, expected_type) in [
+            ("bitnot_literal_tail", PrimTy::U16),
+            ("bitnot_alias_tail", PrimTy::I32),
+            ("bitnot_alias_chain_tail", PrimTy::I64),
+            ("bitnot_unsigned_tail", PrimTy::U8),
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("literal tail body check is available")
+            else {
+                panic!("a deferred literal-local BitNot tail is supported for `{name}`");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "every integer primitive implements BitNot for `{name}`"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("literal tail results query succeeds")
+                .expect("literal tail body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+            assert_eq!(
+                results.binding_type(binding_named(&database, owner, "source")),
+                Some(expected_type),
+                "the `{name}` return type selects the source-local type"
+            );
+        }
+
+        let literal_tail_owner = owner_named(&database, &resolved, "bitnot_literal_tail");
+        let literal_tail_results = literal_tail_owner
+            .primitive_body_type_results()
+            .expect("literal tail results query succeeds")
+            .expect("literal tail body publishes primitive facts");
+        assert_eq!(
+            literal_tail_results.expression_types().len(),
+            3,
+            "the source literal, its path, and the BitNot tail each retain a fact"
+        );
+        assert!(
+            literal_tail_results
+                .expression_types()
+                .values()
+                .all(|ty| *ty == PrimTy::U16)
+        );
+
+        let alias_tail_owner = owner_named(&database, &resolved, "bitnot_alias_tail");
+        let alias_tail_results = alias_tail_owner
+            .primitive_body_type_results()
+            .expect("alias tail results query succeeds")
+            .expect("alias tail body publishes primitive facts");
+        assert_eq!(
+            alias_tail_results.binding_type(binding_named(&database, alias_tail_owner, "alias")),
+            Some(PrimTy::I32),
+            "the alias binding shares the inferred return type"
+        );
+
+        let mismatch_tail_owner = owner_named(&database, &resolved, "bitnot_mismatch_tail");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: mismatch_tail_diagnostics,
+        } = mismatch_tail_owner
+            .body_type_check()
+            .expect("mismatch tail body check is available")
+        else {
+            panic!("an incompatible BitNot tail remains a recoverable type error");
+        };
+        assert_eq!(mismatch_tail_diagnostics.len(), 1);
+        assert!(
+            mismatch_tail_diagnostics[0]
+                .message
+                .contains("integer literal"),
+            "the incompatible return type is diagnosed against the integer source"
+        );
+        let mismatch_tail_results = mismatch_tail_owner
+            .primitive_body_type_results()
+            .expect("mismatch tail results query succeeds")
+            .expect("mismatch tail body publishes primitive facts");
+        assert_eq!(
+            mismatch_tail_results.binding_type(binding_named(
+                &database,
+                mismatch_tail_owner,
+                "source"
+            )),
+            Some(PrimTy::I64),
+            "the unconstrained source falls back to I64 after the incompatible tail"
+        );
+
+        let range_tail_owner = owner_named(&database, &resolved, "bitnot_range_tail");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: range_tail_diagnostics,
+        } = range_tail_owner
+            .body_type_check()
+            .expect("range tail body check is available")
+        else {
+            panic!("a ranged literal initializer remains recoverable");
+        };
+        assert_eq!(
+            range_tail_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["integer literal is out of range for `I8`"],
+            "the annotated source keeps its range diagnostic"
+        );
+        let range_tail_results = range_tail_owner
+            .primitive_body_type_results()
+            .expect("range tail results query succeeds")
+            .expect("range tail body publishes primitive facts");
+        assert_eq!(
+            range_tail_results.binding_type(binding_named(&database, range_tail_owner, "source")),
+            Some(PrimTy::I8),
+            "the annotated out-of-range source keeps its declared binding type"
+        );
+        assert_eq!(
+            range_tail_results.expression_types().len(),
+            2,
+            "the ranged literal fact is suppressed while the path and BitNot tail remain"
+        );
+
+        for name in [
+            "bitnot_float_tail",
+            "bitnot_deferred_result_tail",
+            "bitnot_computed_tail",
+        ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
                 matches!(
