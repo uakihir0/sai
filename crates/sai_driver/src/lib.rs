@@ -8564,6 +8564,7 @@ fn check_function_body_primitive_local_block(
             || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
     let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
+    let is_supported_neg_tail = matches!(tail.kind, ExprKind::Unary(UnOp::Neg, operand) if matches!(operand.kind, ExprKind::Path(_)));
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8572,11 +8573,26 @@ fn check_function_body_primitive_local_block(
             };
             Some(tail_binding)
         }
+        ExprKind::Unary(UnOp::Neg, operand) if is_supported_neg_tail => {
+            let ExprKind::Path(operand_path) = operand.kind else {
+                return Ok(None);
+            };
+            let Some(operand_binding) =
+                resolved_plain_local_path_binding(operand_path, locals, inputs)
+            else {
+                return Ok(None);
+            };
+            Some(operand_binding)
+        }
         ExprKind::Field { .. } if is_supported_field_tail => None,
         ExprKind::Call { .. } if is_supported_call_tail => None,
         _ => return Ok(None),
     };
-    if block.stmts.is_empty() && !is_supported_field_tail && !is_supported_call_tail {
+    if block.stmts.is_empty()
+        && !is_supported_field_tail
+        && !is_supported_call_tail
+        && !is_supported_neg_tail
+    {
         return Ok(None);
     }
 
@@ -51409,6 +51425,378 @@ property "shared"() {}
                     .expect("unsupported projection query succeeds")
                     .is_none(),
                 "the `{name}` shape publishes no primitive facts"
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_body_type_results_infer_negation_tails() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub fn neg_parameter(value: I32) -> I32 { -value }\n",
+            "pub fn neg_unsigned_parameter(value: U8) -> U8 { -value }\n",
+            "pub fn neg_literal_tail() -> I16 {\n",
+            "    let source = 7\n",
+            "    -source\n",
+            "}\n",
+            "pub fn neg_alias_tail() -> I32 {\n",
+            "    let source = 7\n",
+            "    let alias = source\n",
+            "    -alias\n",
+            "}\n",
+            "pub fn neg_alias_chain_tail() -> I64 {\n",
+            "    let source = 7\n",
+            "    let first_alias = source\n",
+            "    let second_alias = first_alias\n",
+            "    -second_alias\n",
+            "}\n",
+            "pub fn neg_unsigned_tail() -> U8 {\n",
+            "    let source = 7\n",
+            "    -source\n",
+            "}\n",
+            "pub fn neg_float_tail() -> F64 {\n",
+            "    let source = 1.5\n",
+            "    -source\n",
+            "}\n",
+            "pub fn neg_mismatch_tail() -> Bool {\n",
+            "    let source = 7\n",
+            "    -source\n",
+            "}\n",
+            "pub fn neg_range_tail() -> I8 {\n",
+            "    let source: I8 = 128\n",
+            "    -source\n",
+            "}\n",
+            "pub fn neg_deferred_result_tail() -> I32 {\n",
+            "    let source = 7\n",
+            "    let first = -source\n",
+            "    -first\n",
+            "}\n",
+            "pub fn neg_computed_tail(value: I32) -> I32 {\n",
+            "    -(value + 1)\n",
+            "}\n",
+        )
+        .to_string();
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{name}` is present"))
+        }
+
+        fn binding_named(
+            database: &RootDatabase,
+            owner: &FunctionOwnerResolution,
+            name: &str,
+        ) -> sai_hir::BindingId {
+            let bindings = owner
+                .local_resolution()
+                .expect("local results belong to this owner")
+                .expect("function has local resolution")
+                .bindings
+                .iter()
+                .filter_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved| resolved.as_ref() == name)
+                            .map(|_| *binding)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let [binding] = bindings.as_slice() else {
+                panic!("function has exactly one `{name}` binding");
+            };
+            *binding
+        }
+
+        let parameter_owner = owner_named(&database, &resolved, "neg_parameter");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = parameter_owner
+            .body_type_check()
+            .expect("parameter tail body check is available")
+        else {
+            panic!("a concrete signed path Neg tail is supported");
+        };
+        assert!(diagnostics.is_empty());
+        let parameter_results = parameter_owner
+            .primitive_body_type_results()
+            .expect("parameter tail results query succeeds")
+            .expect("parameter tail body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, parameter_results);
+        assert_eq!(
+            parameter_results.expression_types().len(),
+            2,
+            "the parameter path and the Neg tail each retain a fact"
+        );
+        assert!(
+            parameter_results
+                .expression_types()
+                .values()
+                .all(|ty| *ty == PrimTy::I32)
+        );
+
+        let unsigned_parameter_owner = owner_named(&database, &resolved, "neg_unsigned_parameter");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: unsigned_parameter_diagnostics,
+        } = unsigned_parameter_owner
+            .body_type_check()
+            .expect("unsigned parameter tail body check is available")
+        else {
+            panic!("a concrete unsigned path Neg tail is supported");
+        };
+        assert_eq!(
+            unsigned_parameter_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["operator `-` has no `Neg` implementation for `U8`"],
+            "an unsigned concrete parameter reports the immediate Neg diagnostic"
+        );
+        let unsigned_parameter_results = unsigned_parameter_owner
+            .primitive_body_type_results()
+            .expect("unsigned parameter tail results query succeeds")
+            .expect("unsigned parameter tail body publishes primitive facts");
+        assert_eq!(
+            unsigned_parameter_results.expression_types().len(),
+            1,
+            "the rejected Neg tail contributes no fact while the parameter path remains"
+        );
+        assert_eq!(
+            unsigned_parameter_results.binding_type(binding_named(
+                &database,
+                unsigned_parameter_owner,
+                "value"
+            )),
+            Some(PrimTy::U8)
+        );
+
+        for (name, expected_type) in [
+            ("neg_literal_tail", PrimTy::I16),
+            ("neg_alias_tail", PrimTy::I32),
+            ("neg_alias_chain_tail", PrimTy::I64),
+            ("neg_float_tail", PrimTy::F64),
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("literal tail body check is available")
+            else {
+                panic!("a deferred literal-local Neg tail is supported for `{name}`");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "the `{name}` return type infers the shared literal source"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("literal tail results query succeeds")
+                .expect("literal tail body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+            assert_eq!(
+                results.binding_type(binding_named(&database, owner, "source")),
+                Some(expected_type),
+                "the `{name}` return type selects the source-local type"
+            );
+        }
+
+        let literal_tail_owner = owner_named(&database, &resolved, "neg_literal_tail");
+        let literal_tail_results = literal_tail_owner
+            .primitive_body_type_results()
+            .expect("literal tail results query succeeds")
+            .expect("literal tail body publishes primitive facts");
+        assert_eq!(
+            literal_tail_results.expression_types().len(),
+            3,
+            "the source literal, its path, and the Neg tail each retain a fact"
+        );
+        assert!(
+            literal_tail_results
+                .expression_types()
+                .values()
+                .all(|ty| *ty == PrimTy::I16)
+        );
+
+        let alias_tail_owner = owner_named(&database, &resolved, "neg_alias_tail");
+        let alias_tail_results = alias_tail_owner
+            .primitive_body_type_results()
+            .expect("alias tail results query succeeds")
+            .expect("alias tail body publishes primitive facts");
+        assert_eq!(
+            alias_tail_results.binding_type(binding_named(&database, alias_tail_owner, "alias")),
+            Some(PrimTy::I32),
+            "the alias binding shares the inferred return type"
+        );
+
+        let unsigned_tail_owner = owner_named(&database, &resolved, "neg_unsigned_tail");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: unsigned_tail_diagnostics,
+        } = unsigned_tail_owner
+            .body_type_check()
+            .expect("unsigned tail body check is available")
+        else {
+            panic!("an unsigned inferred Neg tail is supported");
+        };
+        assert_eq!(
+            unsigned_tail_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["operator `-` has no `Neg` implementation for `U8`"],
+            "the deferred Neg trait check rejects the unsigned tail resolution"
+        );
+        let unsigned_tail_start = root.find("pub fn neg_unsigned_tail").unwrap()
+            + root[root.find("pub fn neg_unsigned_tail").unwrap()..]
+                .find("-source")
+                .unwrap();
+        assert_eq!(
+            unsigned_tail_diagnostics[0]
+                .primary()
+                .expect("unsigned tail diagnostic has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(unsigned_tail_start as u32),
+                sai_diagnostics::TextSize::new((unsigned_tail_start + "-source".len()) as u32),
+            )
+            .expect("unsigned tail span is ordered"),
+            "the deferred Neg error lands on the tail unary expression"
+        );
+        let unsigned_tail_results = unsigned_tail_owner
+            .primitive_body_type_results()
+            .expect("unsigned tail results query succeeds")
+            .expect("unsigned tail body publishes primitive facts");
+        assert_eq!(
+            unsigned_tail_results.binding_type(binding_named(
+                &database,
+                unsigned_tail_owner,
+                "source"
+            )),
+            Some(PrimTy::U8),
+            "the return type still selects the source-local type"
+        );
+        assert_eq!(
+            unsigned_tail_results.expression_types().len(),
+            2,
+            "the rejected Neg tail contributes no fact while the literal and path remain"
+        );
+
+        let mismatch_tail_owner = owner_named(&database, &resolved, "neg_mismatch_tail");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: mismatch_tail_diagnostics,
+        } = mismatch_tail_owner
+            .body_type_check()
+            .expect("mismatch tail body check is available")
+        else {
+            panic!("an incompatible Neg tail remains a recoverable type error");
+        };
+        assert_eq!(mismatch_tail_diagnostics.len(), 1);
+        assert!(
+            mismatch_tail_diagnostics[0]
+                .message
+                .contains("integer literal"),
+            "the incompatible return type is diagnosed against the integer source"
+        );
+        let mismatch_tail_results = mismatch_tail_owner
+            .primitive_body_type_results()
+            .expect("mismatch tail results query succeeds")
+            .expect("mismatch tail body publishes primitive facts");
+        assert_eq!(
+            mismatch_tail_results.binding_type(binding_named(
+                &database,
+                mismatch_tail_owner,
+                "source"
+            )),
+            Some(PrimTy::I64),
+            "the unconstrained source falls back to I64 after the incompatible tail"
+        );
+
+        let range_tail_owner = owner_named(&database, &resolved, "neg_range_tail");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: range_tail_diagnostics,
+        } = range_tail_owner
+            .body_type_check()
+            .expect("range tail body check is available")
+        else {
+            panic!("a ranged literal initializer remains recoverable");
+        };
+        assert_eq!(
+            range_tail_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["integer literal is out of range for `I8`"],
+            "the annotated negated result keeps its source-literal range diagnostic"
+        );
+        let range_tail_results = range_tail_owner
+            .primitive_body_type_results()
+            .expect("range tail results query succeeds")
+            .expect("range tail body publishes primitive facts");
+        assert_eq!(
+            range_tail_results.binding_type(binding_named(&database, range_tail_owner, "source")),
+            Some(PrimTy::I8),
+            "the annotated out-of-range source keeps its declared binding type"
+        );
+        assert_eq!(
+            range_tail_results.expression_types().len(),
+            2,
+            "the ranged literal fact is suppressed while the path and Neg tail remain"
+        );
+
+        for name in ["neg_deferred_result_tail", "neg_computed_tail"] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("excluded tail body query succeeds"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "the `{name}` tail shape remains outside this slice"
+            );
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("excluded projection query succeeds")
+                    .is_none(),
+                "the `{name}` tail shape publishes no primitive facts"
             );
         }
     }

@@ -508,7 +508,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .input
                 .call_signatures
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-        if block.stmts.is_empty() && !is_supported_field_tail && !is_supported_call_tail {
+        let is_supported_neg_tail = matches!(tail.kind, ExprKind::Unary(UnOp::Neg, operand) if matches!(operand.kind, ExprKind::Path(_)));
+        if block.stmts.is_empty()
+            && !is_supported_field_tail
+            && !is_supported_call_tail
+            && !is_supported_neg_tail
+        {
             return Err(());
         }
         for stmt in block.stmts {
@@ -2374,6 +2379,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         .copied()
                         .ok_or(())?,
                 ),
+                ExprKind::Unary(UnOp::Neg, operand)
+                    if matches!(operand.kind, ExprKind::Path(_)) =>
+                {
+                    self.check_direct_call_neg_path(operand, expression.hir_id)?
+                }
                 _ => self.check_local_path(expression)?,
             }
         };
