@@ -271,8 +271,9 @@ struct LiteralVariable<'hir> {
 /// Unary `~` accepts direct integer/Byte literals, concrete integer/Byte
 /// paths, and unresolved direct integer-literal paths with simple aliases.
 /// Unary `-` in a direct-call argument also defers through an unresolved
-/// direct integer- or float-literal local so the parameter expectation
-/// resolves the shared literal variable before the `Neg` trait check runs.
+/// direct integer- or float-literal local or its simple unannotated
+/// plain-path alias so the parameter expectation resolves the shared
+/// literal variable before the `Neg` trait check runs.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -2653,13 +2654,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         }
         if let LocalType::LiteralVariable(id) = source_type {
-            let is_direct_literal_source = self
-                .direct_unannotated_integer_literals
-                .contains(&source_binding)
-                || self
-                    .direct_unannotated_float_literals
-                    .contains(&source_binding);
-            if is_direct_literal_source
+            let is_eligible_literal_source = self.is_eligible_unannotated_literal_path(operand);
+            if is_eligible_literal_source
                 && self.literal_variables.get(id).is_some_and(|variable| {
                     matches!(
                         variable.kind,
@@ -2667,11 +2663,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     ) && variable.resolved.is_none()
                 })
             {
-                // A direct numeric literal local can share its inference
-                // variable with this Neg result. The enclosing call's
-                // parameter expectation resolves it, and the deferred `Neg`
-                // trait check rejects an unsigned integer resolution at the
-                // unary expression.
+                // A direct numeric literal local or its simple unannotated
+                // alias can share its inference variable with this Neg
+                // result. The enclosing call's parameter expectation
+                // resolves it, and the deferred `Neg` trait check rejects an
+                // unsigned integer resolution at the unary expression.
                 let diagnostic_index = self.errors.len() + self.pending_operator_trait_count;
                 self.pending_operator_trait_count += 1;
                 self.literal_variables
