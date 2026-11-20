@@ -9242,6 +9242,17 @@ fn primitive_if_condition_shape_is_supported(
                 resolved_plain_local_path_binding(operand_path, locals, inputs)
                     .is_some_and(|binding| preceding_bindings.contains(&binding))
             }
+            ExprKind::Binary(operator, ..) => matches!(
+                operator,
+                BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::And
+                    | BinOp::Or
+            ),
             _ => false,
         },
         ExprKind::Lit(Lit::Bool(_)) => true,
@@ -53112,6 +53123,15 @@ property "shared"() {}
             "        value\n",
             "    }\n",
             "}\n",
+            "pub fn late_resolved_outer_local(flag: Bool) -> U16 {\n",
+            "    let chosen = 7\n",
+            "    if flag {\n",
+            "        let probe = 1\n",
+            "        probe\n",
+            "    } else {\n",
+            "        chosen\n",
+            "    }\n",
+            "}\n",
             "pub fn literal_condition() -> I32 { if 1 { 1 } else { 0 } }\n",
             "pub fn nested_branch_tail(first: I32) -> I32 {\n",
             "    if first < 0 { (first + 1) * 2 } else { 0 }\n",
@@ -53173,6 +53193,7 @@ property "shared"() {}
             "branch_statement",
             "annotated_branch_local",
             "both_branches_bind",
+            "late_resolved_outer_local",
         ] {
             let owner = owner_named(&database, &resolved, name);
             let FunctionBodyTypeCheck::Supported { diagnostics } = owner
