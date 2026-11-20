@@ -5035,6 +5035,10 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn literal_var_shift_left(count: U32) -> I32 {\n    var x = 1\n    let r = x << count\n    r\n}\n",
         "pub fn literal_var_shift_count(value: I32) -> I32 {\n    var c = 4\n    let r = value << c\n    r\n}\n",
         "pub fn literal_var_shift_pair() -> I32 {\n    var x = 1\n    var c = 2\n    let r = x << c\n    r\n}\n",
+        "pub fn loop_break() -> I32 {\n    var n: I32 = 0\n    loop { n = n + 1\n break }\n    n\n}\n",
+        "pub fn loop_labeled() -> I32 {\n    var n: I32 = 0\n    'outer: loop { loop { break 'outer }\n break }\n    n\n}\n",
+        "pub fn while_stmt(flag: Bool) -> I32 {\n    var n: I32 = 0\n    while flag { n = n + 1 }\n    n\n}\n",
+        "pub fn while_empty(flag: Bool) -> I32 {\n    while flag { }\n    0\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -20673,5 +20677,20 @@ fn unsupported_direct_function_call_targets_remain_gated() {
     assert!(
         stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
         "unsupported direct calls stay behind the existing gate:\n{stdout}"
+    );
+}
+
+#[test]
+fn unsupported_loop_forms_remain_gated() {
+    let source = concat!(
+        "pub fn break_value_loop() -> I32 { loop { break 1 }\n 0 }\n",
+        "pub fn loop_tail() -> I32 { loop { break } }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(&output, "out-of-slice loop forms");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "break values and loop tails stay behind the existing gate:\n{stdout}"
     );
 }

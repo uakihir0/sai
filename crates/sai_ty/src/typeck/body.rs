@@ -9,11 +9,13 @@ use super::results::{
 };
 use crate::ty::TyInterner;
 use sai_hir::body::Body;
-use sai_hir::expressions::{Arm, BinOp, Block, Expr, ExprKind, MatchSource, Stmt, StmtKind, UnOp};
+use sai_hir::expressions::{
+    Arm, BinOp, Block, Expr, ExprKind, Label, LoopSource, MatchSource, Stmt, StmtKind, UnOp,
+};
 use sai_hir::literals::Lit;
 use sai_hir::patterns::{BindingMode, PatKind, PatRangeEnd};
 use sai_hir::types::PathRoot;
-use sai_hir::{BindingId, HirId, OwnerId, Safety};
+use sai_hir::{BindingId, HirId, OwnerId, Safety, Symbol};
 use sai_intern::Interner;
 use sai_resolve::prelude::PrimTy;
 use std::cell::RefCell;
@@ -178,6 +180,10 @@ pub enum PrimitiveBodyErrorKind {
     },
     AssignToImmutable,
     InvalidAssignTarget,
+    BreakOutsideLoop,
+    ContinueOutsideLoop,
+    InvalidBreakValue,
+    UndeclaredLabel,
     EmptyRangePattern,
     NonExhaustiveMatch,
     UnreachablePattern,
@@ -341,6 +347,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         deferred_bitnot_result_bindings: HashSet::new(),
         pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
+        loop_stack: Vec::new(),
         errors: Vec::new(),
     };
     let ExprKind::Block(block) = context.input.body.value.kind else {
@@ -392,7 +399,15 @@ struct FnCtxt<'a, 'hir> {
     deferred_bitnot_result_bindings: HashSet<BindingId>,
     pending_operator_trait_count: usize,
     literal_variables: Vec<LiteralVariable<'hir>>,
+    loop_stack: Vec<LoopFrame>,
     errors: Vec<PrimitiveBodyError>,
+}
+
+/// One entry of the `Γ.loops` stack (§6.15): the enclosing loop's label and
+/// whether it came from `loop` or a `while`/`for` desugaring.
+struct LoopFrame {
+    label: Option<Symbol>,
+    source: LoopSource,
 }
 
 impl<'a, 'hir> FnCtxt<'a, 'hir> {
@@ -2693,6 +2708,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 arms,
                 source,
             } => return self.check_match_stmt(scrutinee, arms, source),
+            ExprKind::Loop {
+                body,
+                label,
+                source,
+            } => return self.check_loop_stmt(body, label, source),
+            ExprKind::Break { label, value } => {
+                return self.check_break(expression.hir_id, label, value);
+            }
+            ExprKind::Continue { label } => return self.check_continue(expression.hir_id, label),
             ExprKind::Block(_) => return Err(()),
             _ => {}
         }
@@ -2704,14 +2728,128 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// A statement-only block: every admitted statement, no tail expression.
     /// A value tail would be a discarded non-`()` value — out of scope.
     fn check_stmt_block(&mut self, block: &'hir Block<'hir>) -> Result<(), ()> {
-        if block.safety != Safety::Safe || block.tail.is_some() {
+        if block.safety != Safety::Safe {
             return Err(());
         }
         let literal_floor = self.literal_variables.len();
         for stmt in block.stmts {
             self.check_stmt(stmt)?;
         }
+        // A `break`/`continue` tail (including the `while` desugaring's
+        // `else { break }` block) is a statement-shaped exit; other value
+        // tails would discard a non-`()` value — out of scope.
+        match block.tail {
+            None => {}
+            Some(tail) => match tail.kind {
+                ExprKind::Break { label, value } => self.check_break(tail.hir_id, label, value)?,
+                ExprKind::Continue { label } => self.check_continue(tail.hir_id, label)?,
+                _ => return Err(()),
+            },
+        }
         self.default_unresolved_literals(literal_floor);
+        Ok(())
+    }
+
+    /// Statement-position `loop`/`while` (`for` desugars to iterator calls
+    /// and `Option` matches that stay gated inside its body). The loop
+    /// pushes a `Γ.loops` entry so `break`/`continue` inside it resolve.
+    fn check_loop_stmt(
+        &mut self,
+        body: &'hir Block<'hir>,
+        label: Option<Label>,
+        source: LoopSource,
+    ) -> Result<(), ()> {
+        if body.safety != Safety::Safe {
+            return Err(());
+        }
+        self.loop_stack.push(LoopFrame {
+            label: label.map(|label| label.name),
+            source,
+        });
+        let literal_floor = self.literal_variables.len();
+        let result = (|| {
+            for stmt in body.stmts {
+                self.check_stmt(stmt)?;
+            }
+            // The `while` desugaring ends the body with a synthetic `if`
+            // tail; user `loop` bodies admit break/continue tails only —
+            // a value tail would make the block non-`()`.
+            match body.tail {
+                None => Ok(()),
+                Some(tail) => match tail.kind {
+                    ExprKind::Break { label, value } => self.check_break(tail.hir_id, label, value),
+                    ExprKind::Continue { label } => self.check_continue(tail.hir_id, label),
+                    ExprKind::If { .. } | ExprKind::Match { .. } => self.check_expr_stmt(tail),
+                    _ => Err(()),
+                },
+            }
+        })();
+        self.loop_stack.pop();
+        result?;
+        self.default_unresolved_literals(literal_floor);
+        Ok(())
+    }
+
+    /// `break` targets the innermost loop, or the innermost loop carrying
+    /// `label` (§6.16.4). A value is only valid on `loop` — `while`/`for`
+    /// report `INVALID_BREAK_VALUE`; `loop` values stay gated until the
+    /// loop's result type is inferred.
+    fn check_break(
+        &mut self,
+        hir_id: HirId,
+        label: Option<Label>,
+        value: Option<&'hir Expr<'hir>>,
+    ) -> Result<(), ()> {
+        let target = match label {
+            Some(label) => self
+                .loop_stack
+                .iter()
+                .rposition(|frame| frame.label == Some(label.name)),
+            None => self.loop_stack.len().checked_sub(1),
+        };
+        let Some(index) = target else {
+            self.errors.push(PrimitiveBodyError {
+                node: hir_id,
+                kind: if label.is_some() {
+                    PrimitiveBodyErrorKind::UndeclaredLabel
+                } else {
+                    PrimitiveBodyErrorKind::BreakOutsideLoop
+                },
+            });
+            return Ok(());
+        };
+        if let Some(value) = value {
+            if self.loop_stack[index].source != LoopSource::Loop {
+                self.errors.push(PrimitiveBodyError {
+                    node: value.hir_id,
+                    kind: PrimitiveBodyErrorKind::InvalidBreakValue,
+                });
+                return Ok(());
+            }
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// `continue` resolves like `break`, minus the value rule.
+    fn check_continue(&mut self, hir_id: HirId, label: Option<Label>) -> Result<(), ()> {
+        let found = match label {
+            Some(label) => self
+                .loop_stack
+                .iter()
+                .any(|frame| frame.label == Some(label.name)),
+            None => !self.loop_stack.is_empty(),
+        };
+        if !found {
+            self.errors.push(PrimitiveBodyError {
+                node: hir_id,
+                kind: if label.is_some() {
+                    PrimitiveBodyErrorKind::UndeclaredLabel
+                } else {
+                    PrimitiveBodyErrorKind::ContinueOutsideLoop
+                },
+            });
+        }
         Ok(())
     }
 
@@ -5677,6 +5815,10 @@ fn collect_primitive_expression_nodes<'hir>(
                 collect_primitive_expression_nodes(arm.body, nodes);
             }
         }
+        ExprKind::Loop { body, .. } => collect_primitive_block_nodes(body, nodes),
+        ExprKind::Break {
+            value: Some(value), ..
+        } => collect_primitive_expression_nodes(value, nodes),
         ExprKind::Field { base, .. }
         | ExprKind::TupleField { base, .. }
         | ExprKind::Unary(_, base)
@@ -5823,6 +5965,25 @@ fn expression_has_primitive_result_taint(
                     )
                 })
             }
+            // Loop bodies carry the taint of their statements and exits —
+            // an errored `break` value must taint the result like a body
+            // error does.
+            ExprKind::Loop { body, .. } => block_has_primitive_result_taint(
+                body,
+                error_nodes,
+                unknown_self_fields,
+                local_paths,
+                tainted_bindings,
+            ),
+            ExprKind::Break {
+                value: Some(value), ..
+            } => expression_has_primitive_result_taint(
+                value,
+                error_nodes,
+                unknown_self_fields,
+                local_paths,
+                tainted_bindings,
+            ),
             // An error on a pattern, guard, scrutinee, or arm body taints the
             // whole `match` result — otherwise the recorded tail type stays
             // published as trustworthy.

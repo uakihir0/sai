@@ -9362,6 +9362,41 @@ fn primitive_let_statement_shape_is_supported(
                     primitive_types,
                 );
             }
+            ExprKind::Loop { .. } => {
+                return primitive_loop_stmt_shape_is_supported(
+                    expression,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                );
+            }
+            ExprKind::Break { value, .. } => {
+                // `break` is always admitted — without an enclosing loop or
+                // a value on `while`/`for` it reports a diagnostic, never
+                // a gate. A value-bearing `break` on `loop` stays gated in
+                // the checker; the value must still pass value admission.
+                return value.is_none_or(|value| {
+                    primitive_value_expression_shape_is_supported(
+                        value,
+                        preceding_bindings,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        self_field_projections,
+                        unknown_self_fields,
+                        direct_call_signatures,
+                        primitive_types,
+                    )
+                });
+            }
+            ExprKind::Continue { .. } => return true,
             ExprKind::Block(_) => return false,
             _ => {}
         }
@@ -9908,7 +9943,7 @@ fn primitive_stmt_block_shape_is_supported(
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
     primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
-    if block.safety != sai_hir::Safety::Safe || block.tail.is_some() {
+    if block.safety != sai_hir::Safety::Safe {
         return false;
     }
     let mut block_bindings = preceding_bindings.clone();
@@ -9925,7 +9960,120 @@ fn primitive_stmt_block_shape_is_supported(
             unknown_self_fields,
             direct_call_signatures,
         )
-    })
+    }) && match block.tail {
+        // A `break`/`continue` tail (including the `while` desugaring's
+        // `else { break }` block) is a statement-shaped exit; other value
+        // tails would discard a non-`()` value — out of scope.
+        None => true,
+        Some(tail) => match tail.kind {
+            ExprKind::Break { value, .. } => value.is_none_or(|value| {
+                primitive_value_expression_shape_is_supported(
+                    value,
+                    &block_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            }),
+            ExprKind::Continue { .. } => true,
+            _ => false,
+        },
+    }
+}
+
+/// Statement-position `loop`/`while`: the body is a statement-only block
+/// whose tail may be the `while` desugaring's synthetic `if`. `for` loops
+/// stay gated through the iterator calls and `Option` match inside their
+/// desugared body.
+#[allow(clippy::too_many_arguments)]
+fn primitive_loop_stmt_shape_is_supported(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    let ExprKind::Loop { body, .. } = expression.kind else {
+        return false;
+    };
+    if body.safety != sai_hir::Safety::Safe {
+        return false;
+    }
+    let mut block_bindings = preceding_bindings.clone();
+    body.stmts.iter().all(|stmt| {
+        primitive_let_statement_shape_is_supported(
+            stmt,
+            &mut block_bindings,
+            primitive_types,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+        )
+    }) && match body.tail {
+        None => true,
+        Some(tail) => match tail.kind {
+            ExprKind::Break { value, .. } => value.is_none_or(|value| {
+                primitive_value_expression_shape_is_supported(
+                    value,
+                    &block_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            }),
+            ExprKind::Continue { .. } => true,
+            ExprKind::If { .. } => primitive_if_stmt_shape_is_supported(
+                tail,
+                &block_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            ),
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => primitive_match_stmt_shape_is_supported(
+                scrutinee,
+                arms,
+                source,
+                &block_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            ),
+            _ => false,
+        },
+    }
 }
 
 /// Statement-position `if`/`else if`/`else`: branches are statement-only
@@ -10720,6 +10868,42 @@ fn primitive_body_errors_to_diagnostics(
                 "the left-hand side of an assignment is not a place expression".to_owned(),
                 "invalid assignment target",
             )?,
+            PrimitiveBodyErrorKind::BreakOutsideLoop => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::BreakOutsideLoop,
+                "`break` with no enclosing loop in the current body".to_owned(),
+                "break outside loop",
+            )?,
+            PrimitiveBodyErrorKind::ContinueOutsideLoop => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::ContinueOutsideLoop,
+                "`continue` with no enclosing loop in the current body".to_owned(),
+                "continue outside loop",
+            )?,
+            PrimitiveBodyErrorKind::InvalidBreakValue => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::InvalidBreakValue,
+                "`break` with a value targeting `while`, `while let` or `for`".to_owned(),
+                "invalid break value",
+            )?,
+            PrimitiveBodyErrorKind::UndeclaredLabel => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::UndeclaredLabel,
+                "no enclosing loop carries this label".to_owned(),
+                "undeclared label",
+            )?,
         };
         diagnostics.push(diagnostic);
     }
@@ -10761,6 +10945,10 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
             })
         }),
         ExprKind::Block(block) => primitive_body_block_error_span(block, node),
+        ExprKind::Loop { body, .. } => primitive_body_block_error_span(body, node),
+        ExprKind::Break {
+            value: Some(value), ..
+        } => primitive_body_error_span(value, node),
         _ => None,
     }
 }
@@ -77829,6 +78017,76 @@ property "shared"() {}
                     FunctionBodyTypeCheck::Unsupported
                 ),
                 "function owner {index} should remain gated"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_supports_loop_statements() {
+        let root = concat!(
+            "pub fn loop_break() -> I32 {\n    loop { break }\n    0\n}\n",
+            "pub fn loop_continue() -> I32 {\n    loop { continue }\n    0\n}\n",
+            "pub fn while_stmt(flag: Bool) -> I32 {\n    var n: I32 = 0\n    while flag { n = n + 1 }\n    n\n}\n",
+            "pub fn while_block_body(flag: Bool) -> I32 {\n    var i: I32 = 0\n    while flag { i = i + 1\n break }\n    i\n}\n",
+            "pub fn labeled_break() -> I32 {\n    'outer: loop { loop { break 'outer }\n break }\n    0\n}\n",
+            "pub fn labeled_continue() -> I32 {\n    'outer: loop { continue 'outer }\n    0\n}\n",
+            "pub fn break_outside() -> I32 {\n    break\n    0\n}\n",
+            "pub fn continue_outside() -> I32 {\n    continue\n    0\n}\n",
+            "pub fn undeclared_break_label() -> I32 {\n    loop { break 'missing }\n    0\n}\n",
+            "pub fn undeclared_continue_label() -> I32 {\n    loop { continue 'missing }\n    0\n}\n",
+            "pub fn break_value_while(flag: Bool) -> I32 {\n    while flag { break 1 }\n    0\n}\n",
+            "pub fn break_value_loop() -> I32 {\n    loop { break 1 }\n    0\n}\n",
+            "pub fn loop_tail() -> I32 {\n    loop { break }\n}\n",
+            "pub fn while_no_else_shape(flag: Bool) -> I32 {\n    while flag { }\n    0\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 14);
+
+        for index in [0, 1, 2, 3, 4, 5, 13] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a loop statement is checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the loop statement slice: {check:?}"
+            );
+        }
+        for (index, code) in [
+            (6, sai_diagnostics::Code::BreakOutsideLoop),
+            (7, sai_diagnostics::Code::ContinueOutsideLoop),
+            (8, sai_diagnostics::Code::UndeclaredLabel),
+            (9, sai_diagnostics::Code::UndeclaredLabel),
+            (10, sai_diagnostics::Code::InvalidBreakValue),
+        ] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a loop diagnostic is reported");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.iter().any(|diagnostic| diagnostic.code == code)),
+                "function owner {index} must report {code:?}: {check:?}"
+            );
+        }
+        for index in [11, 12] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("an out-of-slice loop form is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the loop slice: {check:?}"
             );
         }
     }
