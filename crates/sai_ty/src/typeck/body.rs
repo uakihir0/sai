@@ -2357,11 +2357,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match local_type {
             LocalType::Error(found) => {
                 if let Some(found) = found {
-                    self.check_concrete_tail_type(found, expression.hir_id);
+                    self.check_concrete_tail_type(found, expected, expression.hir_id);
                 }
             }
             LocalType::Concrete(found) => {
-                self.check_concrete_tail_type(found, expression.hir_id);
+                self.check_concrete_tail_type(found, expected, expression.hir_id);
             }
             LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                 let Some((resolved, kind)) = self
@@ -2372,7 +2372,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     return Err(());
                 };
                 match resolved {
-                    Some(found) => self.check_concrete_tail_type(found, expression.hir_id),
+                    Some(found) => {
+                        self.check_concrete_tail_type(found, expected, expression.hir_id)
+                    }
                     None if literal_family_accepts(kind, expected) => {
                         self.resolve_literal_variable(id, expected)?;
                     }
@@ -4280,14 +4282,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
-    fn check_concrete_tail_type(&mut self, found: PrimTy, node: HirId) {
-        if found != self.input.return_type {
+    fn check_concrete_tail_type(&mut self, found: PrimTy, expected: PrimTy, node: HirId) {
+        if found != expected {
             self.errors.push(PrimitiveBodyError {
                 node,
-                kind: PrimitiveBodyErrorKind::TypeMismatch {
-                    expected: self.input.return_type,
-                    found,
-                },
+                kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
             });
         }
     }
