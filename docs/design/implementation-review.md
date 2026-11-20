@@ -9679,3 +9679,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, assign owner test passes; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Pending — see PR.
 - **Remaining scope:** `x <<= <non-literal non-path>` shift counts, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1049 (2026-11-21): `x <<= e`/`x >>= e` counts accept non-literal non-path right sides
+
+- **Decision:** The shift-count operand of `x <<= e`/`x >>= e` on an unannotated integer literal `var` evaluates a non-literal non-path `e` as the desugared `let t = e` binding: a literal-variable result resolves to `U32`, a concrete result must be `U32` (`TYPE_MISMATCH` otherwise). A count that resolves `x`'s variable while evaluating (`x <<= x - 1` stays unresolved; `x <<= <rhs that fixes x>`) finishes as `x = x << t` on the resolved place through `check_assign_op_rhs_local_type`.
+- **Reason:** Same §6.13.1 desugar as IR-1048; the count keeps its `U32` rule — `x << e`'s right operand is always `U32`.
+- **Failure boundary and judgment:** Counts that produce non-`U32` concretes report `TYPE_MISMATCH{U32, found}`; float/non-integer literal-variable counts gate, as do unsupported initializer shapes.
+- **Review required:** None — the count rules reuse `check_assign_op_rhs_local_type` and the existing `U32` resolution verbatim.
+- **Planned verification matrix:** Driver owners `literal_var_shift_assign_binary_count`, `literal_var_shift_assign_var_count`, `literal_var_shift_assign_self_count` (supported).
+- **Verification:** Pinned Rust 1.99.1, assign owner test passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Pending — see PR.
+- **Remaining scope:** `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.

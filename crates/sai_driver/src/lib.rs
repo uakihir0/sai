@@ -78227,6 +78227,9 @@ property "shared"() {}
             "pub fn literal_var_assign_op_float_binary() -> F64 {\n    var x = 1.0\n    var y = 2.0\n    x += y * 3.0\n    x\n}\n",
             "pub fn literal_var_assign_op_self_rhs(value: I32) -> I32 {\n    var x = 1\n    x += x + value\n    x\n}\n",
             "pub fn literal_var_assign_op_resolved_rhs(value: I32) -> I32 {\n    var x = 1\n    x += value + 2\n    x += value + 2\n    x\n}\n",
+            "pub fn literal_var_shift_assign_binary_count(count: U32) -> I32 {\n    var x = 1\n    x <<= count - 1\n    x\n}\n",
+            "pub fn literal_var_shift_assign_var_count() -> U32 {\n    var x = 1\n    var c = 4\n    x <<= c - 1\n    x\n}\n",
+            "pub fn literal_var_shift_assign_self_count() -> U32 {\n    var x = 1\n    x <<= x - 1\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78242,7 +78245,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 84);
+        assert_eq!(owners.len(), 87);
 
         for index in 0..7 {
             let check = owners[index]

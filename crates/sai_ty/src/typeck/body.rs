@@ -3854,8 +3854,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                     self.check_annotated_literal(PrimTy::U32, literal, kind, rhs.hir_id);
                 } else {
-                    let right_type = match self.check_local_path(rhs) {
-                        Ok(LocalType::LiteralVariable(other))
+                    // A non-literal count checks as the desugared `let t =
+                    // e` binding: a literal variable resolves to `U32`, a
+                    // concrete count must be `U32`. A count mentioning `x`
+                    // — `x <<= x - 1` — can resolve `x`'s variable while
+                    // it evaluates; the desugar then leaves `x = x << t`
+                    // on a concrete place.
+                    let rhs_local = self.check_local_path(rhs).ok().or_else(|| {
+                        self.check_initializer_value(rhs, None)
+                            .ok()
+                            .map(|check| check.local_type)
+                    });
+                    if let Some(place) = self.concrete_local_type(LocalType::LiteralVariable(id)) {
+                        let Some(rhs_local) = rhs_local else {
+                            return Err(());
+                        };
+                        self.check_assign_op_rhs_local_type(stmt_id, op, place, rhs, rhs_local)?;
+                        self.record_expression_type(rhs.hir_id, rhs_local);
+                        self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+                        self.record_expression_type(stmt_id, LocalType::Concrete(place));
+                        return Ok(());
+                    }
+                    let right_type = match rhs_local {
+                        Some(LocalType::LiteralVariable(other))
                             if self.literal_variables.get(other).is_some_and(|v| {
                                 v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
                             }) =>
@@ -3863,9 +3884,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             self.resolve_literal_variable(other, PrimTy::U32)?;
                             PrimTy::U32
                         }
-                        _ => self
-                            .check_local_path(rhs)
-                            .ok()
+                        _ => rhs_local
                             .and_then(|local_type| self.concrete_local_type(local_type))
                             .filter(|primitive| supports_primitive_literal(*primitive))
                             .ok_or(())?,
