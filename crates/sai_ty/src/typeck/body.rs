@@ -2002,7 +2002,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
         // An unresolved literal variable compared to a same-family literal
         // joins the literal as a constraint site on the variable, like the
-        // arithmetic operand slice; the comparison itself yields Bool.
+        // arithmetic operand slice; the comparison itself yields Bool. Only
+        // comparison operators take this path — `check_logical_operand`
+        // routes every binary operand here, so an arithmetic `x + 2` must
+        // keep its out-of-slice behavior rather than claim a Bool result.
+        if !matches!(
+            operator,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        ) {
+            return Err(());
+        }
         for (local_type, literal_expression, literal_entry) in [
             (self.check_local_path(left).ok(), right, right_literal),
             (self.check_local_path(right).ok(), left, left_literal),
