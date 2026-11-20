@@ -9256,10 +9256,13 @@ fn primitive_let_statement_shape_is_supported(
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     if let StmtKind::Expr(expression) = stmt.kind {
-        // Statement-position `if`/`block` expressions unify their branch
-        // tails with the return type, which does not apply to a discarded
-        // result, so they stay outside this slice.
-        if matches!(expression.kind, ExprKind::If { .. } | ExprKind::Block(_)) {
+        // Statement-position `if`/`block`/`match` expressions unify their
+        // branch/arm tails with the return type, which does not apply to a
+        // discarded result, so they stay outside this slice.
+        if matches!(
+            expression.kind,
+            ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::Match { .. }
+        ) {
             return false;
         }
         return primitive_if_branch_tail_shape_is_supported(

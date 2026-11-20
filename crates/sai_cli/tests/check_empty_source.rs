@@ -10192,6 +10192,7 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose(value: I32) -> I32 { match value { 1..=5 => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match 0 { 0 => 1, _ => 2 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { _ => 0, 1 => 1 } }\n",
+        "pub fn choose(value: I32) -> Bool { match value { 0 => 1, _ => 2 }\n true }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
