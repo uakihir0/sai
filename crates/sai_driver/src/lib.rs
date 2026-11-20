@@ -77977,6 +77977,7 @@ property "shared"() {}
             "pub fn rem_float() -> F32 {\n    var x: F32 = 0.0\n    x %= 2.0\n    x\n}\n",
             "pub fn nested_rhs(left: I32, right: I32) -> I32 {\n    var x: I32 = 0\n    x += left + right\n    x\n}\n",
             "pub fn unary_rhs() -> I32 {\n    var x: I32 = 0\n    var y: I32 = 1\n    x += -y\n    x\n}\n",
+            "pub fn unannotated_float_mod() -> F64 {\n    var x = 1.0\n    x %= 2.0\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77992,7 +77993,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 12);
+        assert_eq!(owners.len(), 13);
 
         for index in [0, 1, 2, 3, 7] {
             let check = owners[index]
@@ -78023,6 +78024,14 @@ property "shared"() {}
             owners[9]
                 .body_type_check()
                 .expect("the float-remainder compound assignment is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported
+        ));
+        assert!(matches!(
+            owners[12]
+                .body_type_check()
+                .expect("float remainder on a literal var is diagnosed"),
             FunctionBodyTypeCheck::Supported { diagnostics }
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported

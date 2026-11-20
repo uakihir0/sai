@@ -2663,6 +2663,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.add_integer_literal_constraint(id, literal, rhs.hir_id)?;
                 }
                 PrimitiveLiteralKind::FloatingPoint => {
+                    // Remainder, wrapping, and bitwise operators have no
+                    // float implementation; the desugared `x = x op lit`
+                    // reports the operator, and the literal still joins the
+                    // variable as a constraint site.
+                    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                        self.report_operator_not_supported(
+                            stmt_id,
+                            op,
+                            PrimitiveOperatorOperand::FloatingPointLiteral,
+                        );
+                    }
                     self.add_float_literal_constraint(id, literal, rhs.hir_id)?;
                 }
                 PrimitiveLiteralKind::Bool
