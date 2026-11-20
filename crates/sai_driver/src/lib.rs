@@ -9133,6 +9133,24 @@ fn primitive_break_value_shape_is_supported(
             direct_call_signatures,
             primitive_types,
         ),
+        // A `loop` value yields its own break type — a bare-only inner
+        // loop produces `()` and is rejected by the checker.
+        ExprKind::Loop {
+            body,
+            source: LoopSource::Loop,
+            ..
+        } => primitive_loop_body_shape_is_supported(
+            body,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         _ => primitive_value_expression_shape_is_supported(
             value,
             preceding_bindings,
@@ -78371,6 +78389,14 @@ property "shared"() {}
             "pub fn break_value_neg() -> I32 {\n    loop { break -1 }\n}\n",
             "pub fn break_value_bitnot() -> I32 {\n    loop { break ~1 }\n}\n",
             "pub fn break_value_str() -> I32 {\n    loop { break \"s\" }\n}\n",
+            "pub fn break_value_loop() -> I32 {\n    loop { break loop { break 1 } }\n}\n",
+            "pub fn break_value_loop_init() -> I64 {\n    let x = loop { break loop { break 1 } }\n    x\n}\n",
+            "pub fn break_value_while_inner(flag: Bool) -> I32 {\n    loop { break while flag { } }\n}\n",
+            "pub fn break_value_loop_bare() -> I32 {\n    loop { break loop { break } }\n}\n",
+            "pub fn break_label_inner_same() -> Bool {\n    'a: loop { break 'a loop { break true } }\n}\n",
+            "pub fn break_label_inner_mismatch() -> Bool {\n    'a: loop { break 'a loop { break 'a true\n break 1 } }\n}\n",
+            "pub fn break_label_inner_bare() -> I32 {\n    'a: loop { break 'a loop { break 'a\n break 1 } }\n}\n",
+            "pub fn break_label_inner_resolved_var() -> I64 {\n    var m = 2\n    let n: I64 = m\n    'a: loop { break 'a loop { break 'a 1\n break 'a m\n break 3 } }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78386,11 +78412,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 48);
+        assert_eq!(owners.len(), 56);
 
         for index in [
             0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30, 31, 32,
-            33, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46,
+            33, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 48, 49, 52, 55,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78411,6 +78437,9 @@ property "shared"() {}
             (23, sai_diagnostics::Code::TypeMismatch),
             (24, sai_diagnostics::Code::InvalidBreakValue),
             (25, sai_diagnostics::Code::InvalidBreakValue),
+            (51, sai_diagnostics::Code::InvalidBreakValue),
+            (53, sai_diagnostics::Code::TypeMismatch),
+            (54, sai_diagnostics::Code::InvalidBreakValue),
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78421,7 +78450,7 @@ property "shared"() {}
                 "function owner {index} must report {code:?}: {check:?}"
             );
         }
-        for index in [26, 34, 35, 41, 47] {
+        for index in [26, 34, 35, 41, 47, 50] {
             let check = owners[index]
                 .body_type_check()
                 .expect("an out-of-slice loop form is gated");
@@ -78458,6 +78487,8 @@ property "shared"() {}
             "pub fn return_tail_unbound() -> I32 {\n    return missing\n}\n",
             "pub fn return_tail_let_mismatch(flag: Bool) -> I32 {\n    let x: Bool = if flag { return true } else { false }\n    0\n}\n",
             "pub fn return_tail_let(flag: Bool) -> I32 {\n    let x: Bool = if flag { return 1 } else { false }\n    0\n}\n",
+            "pub fn return_if_value(flag: Bool) -> I32 {\n    return if flag { 1 } else { 2 }\n}\n",
+            "pub fn return_match_value(value: I32) -> I32 {\n    return match value { 1 => 7, _ => 0 }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78473,9 +78504,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 23);
+        assert_eq!(owners.len(), 25);
 
-        for index in [0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13, 15, 16, 18, 19, 22] {
+        for index in [
+            0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13, 15, 16, 18, 19, 22, 23, 24,
+        ] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a return statement is checked");
