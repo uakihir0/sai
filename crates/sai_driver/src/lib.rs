@@ -8776,6 +8776,22 @@ fn check_function_body_primitive_local_block(
         }
     }
 
+    if let (true, ExprKind::Loop { body, .. }) = (is_supported_loop_tail, tail.kind) {
+        if !primitive_loop_body_shape_is_supported(
+            body,
+            &preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            &mut primitive_types,
+        ) {
+            return Ok(None);
+        }
+    }
     if let (true, ExprKind::Return(value)) = (is_supported_return_tail, tail.kind) {
         if !value.is_none_or(|value| {
             primitive_value_expression_shape_is_supported(
@@ -9870,6 +9886,22 @@ fn primitive_if_branch_tail_shape_is_supported(
                 primitive_types,
             )
         }),
+        ExprKind::Loop {
+            body,
+            source: LoopSource::Loop,
+            ..
+        } => primitive_loop_body_shape_is_supported(
+            body,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         _ => false,
     }
 }
@@ -78258,6 +78290,9 @@ property "shared"() {}
             "pub fn loop_init_path(n: I32) -> I32 {\n    let x = loop { break n }\n    x\n}\n",
             "pub fn while_init(flag: Bool) -> I32 {\n    let x = while flag { }\n    0\n}\n",
             "pub fn loop_init_bare() -> I32 {\n    let x = loop { break }\n    0\n}\n",
+            "pub fn loop_tail_inner_annotation() -> I32 {\n    loop { let n: I32 = 1\n break n }\n}\n",
+            "pub fn if_branch_loop_tail(flag: Bool) -> I32 {\n    if flag { loop { break 1 } } else { 2 }\n}\n",
+            "pub fn match_arm_loop_tail(value: I32) -> I32 {\n    match value { 1 => loop { break 1 }, _ => 0 }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78273,10 +78308,10 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 33);
+        assert_eq!(owners.len(), 36);
 
         for index in [
-            0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 25, 26, 27, 28, 29, 30,
+            0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 25, 26, 27, 28, 29, 30, 33, 34, 35,
         ] {
             let check = owners[index]
                 .body_type_check()
