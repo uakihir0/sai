@@ -11,7 +11,7 @@ use crate::ty::TyInterner;
 use sai_hir::body::Body;
 use sai_hir::expressions::{Arm, BinOp, Block, Expr, ExprKind, MatchSource, Stmt, StmtKind, UnOp};
 use sai_hir::literals::Lit;
-use sai_hir::patterns::{BindingMode, PatKind};
+use sai_hir::patterns::{BindingMode, PatKind, PatRangeEnd};
 use sai_hir::types::PathRoot;
 use sai_hir::{BindingId, HirId, OwnerId, Safety};
 use sai_intern::Interner;
@@ -2910,6 +2910,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 for alternative in alternatives {
                     let PatKind::Lit(literal) = alternative.kind else {
+                        return Err(());
+                    };
+                    self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?;
+                }
+            }
+            // `l1..=l2` bounds must both be literals — open ranges and
+            // non-literal bounds stay gated. Diagnosing at the arm
+            // pattern's node keeps the taint walk keyed on
+            // `arm.pat.hir_id` correct.
+            PatKind::Range { start, end, .. } => {
+                for bound in [start, end] {
+                    let Some(PatRangeEnd::Lit(literal)) = bound else {
                         return Err(());
                     };
                     self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?;
