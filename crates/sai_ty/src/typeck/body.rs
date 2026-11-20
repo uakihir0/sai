@@ -185,6 +185,9 @@ pub enum PrimitiveBodyErrorKind {
     InvalidBreakValue,
     UndeclaredLabel,
     LabelShadowed,
+    MissingReturnValue {
+        expected: PrimTy,
+    },
     EmptyRangePattern,
     NonExhaustiveMatch,
     UnreachablePattern,
@@ -2718,6 +2721,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return self.check_break(expression.hir_id, label, value);
             }
             ExprKind::Continue { label } => return self.check_continue(expression.hir_id, label),
+            ExprKind::Return(value) => return self.check_return(expression.hir_id, value),
             ExprKind::Block(_) => return Err(()),
             _ => {}
         }
@@ -2748,6 +2752,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // result like an `if`/`match` statement — the `while`
                 // desugaring's then-block ends with the user's `if`.
                 ExprKind::If { .. } | ExprKind::Match { .. } => self.check_expr_stmt(tail)?,
+                ExprKind::Return(value) => self.check_return(tail.hir_id, value)?,
                 _ => return Err(()),
             },
         }
@@ -2801,6 +2806,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     ExprKind::Break { label, value } => self.check_break(tail.hir_id, label, value),
                     ExprKind::Continue { label } => self.check_continue(tail.hir_id, label),
                     ExprKind::If { .. } | ExprKind::Match { .. } => self.check_expr_stmt(tail),
+                    ExprKind::Return(value) => self.check_return(tail.hir_id, value),
                     _ => Err(()),
                 },
             }
@@ -2853,6 +2859,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     /// `continue` resolves like `break`, minus the value rule.
+    /// `return e` checks `e` against the declared primitive return type like a
+    /// tail; a bare `return` in a non-unit body reports TYPE_MISMATCH (§6.17).
+    fn check_return(&mut self, hir_id: HirId, value: Option<&'hir Expr<'hir>>) -> Result<(), ()> {
+        match value {
+            Some(value) => self.check_expr_expected(value, self.input.return_type),
+            None => {
+                self.errors.push(PrimitiveBodyError {
+                    node: hir_id,
+                    kind: PrimitiveBodyErrorKind::MissingReturnValue {
+                        expected: self.input.return_type,
+                    },
+                });
+                Ok(())
+            }
+        }
+    }
+
     fn check_continue(&mut self, hir_id: HirId, label: Option<Label>) -> Result<(), ()> {
         let found = match label {
             Some(label) => self
@@ -3056,10 +3079,6 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         };
         Ok(local_type)
-    }
-
-    fn check_expr(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
-        self.check_expr_expected(expression, self.input.return_type)
     }
 
     fn check_expr_expected(&mut self, expression: &Expr<'hir>, expected: PrimTy) -> Result<(), ()> {

@@ -5039,6 +5039,8 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn loop_labeled() -> I32 {\n    var n: I32 = 0\n    'outer: loop { loop { break 'outer }\n break }\n    n\n}\n",
         "pub fn while_stmt(flag: Bool) -> I32 {\n    var n: I32 = 0\n    while flag { n = n + 1 }\n    n\n}\n",
         "pub fn while_empty(flag: Bool) -> I32 {\n    while flag { }\n    0\n}\n",
+        "pub fn return_stmt() -> I32 {\n    var x = 1\n    return x\n    0\n}\n",
+        "pub fn return_in_loop() -> I32 {\n    loop { return 7\n break }\n    0\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -20692,5 +20694,20 @@ fn unsupported_loop_forms_remain_gated() {
     assert!(
         stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
         "break values and loop tails stay behind the existing gate:\n{stdout}"
+    );
+}
+
+#[test]
+fn unsupported_return_forms_remain_gated() {
+    let source = concat!(
+        "pub fn return_tail() -> I32 { return 5 }\n",
+        "pub fn return_unbound() -> I32 { return missing\n 0 }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(&output, "out-of-slice return forms");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "tail-position and unbound returns stay behind the existing gate:\n{stdout}"
     );
 }
