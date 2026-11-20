@@ -8515,23 +8515,27 @@ fn check_function_body_primitive_local_block(
     if sig.params.len() != body.params.len() {
         return Ok(None);
     }
+    let mut mutable_params = HashSet::new();
     for (parameter, body_parameter) in sig.params.iter().zip(body.params) {
         if parameter.is_self
-            || parameter.mutable
-            || body_parameter.mutable
+            || parameter.mutable != body_parameter.mutable
             || !parameter
                 .name
                 .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
             || parameter.name != body_parameter.name
-            || !matches!(
-                locals.bindings.get(&body_parameter.binding),
-                Some(sai_resolve::owner::LocalBinding {
-                    kind: sai_resolve::owner::BindingKind::Param,
-                    ..
-                })
-            )
         {
             return Ok(None);
+        }
+        match locals
+            .bindings
+            .get(&body_parameter.binding)
+            .map(|local| local.kind)
+        {
+            Some(sai_resolve::owner::BindingKind::Param) if !body_parameter.mutable => {}
+            Some(sai_resolve::owner::BindingKind::VarParam) if body_parameter.mutable => {
+                mutable_params.insert(body_parameter.binding);
+            }
+            _ => return Ok(None),
         }
         let Some(FunctionDirectType::Primitive(parameter_type)) =
             resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
@@ -8747,6 +8751,7 @@ fn check_function_body_primitive_local_block(
             unknown_self_fields,
             local_paths: &local_paths,
             call_signatures: direct_call_signatures,
+            mutable_params: Some(&mutable_params),
             symbols,
             pointer_width: target_cfg.pointer_width(),
         },
@@ -9221,6 +9226,7 @@ fn primitive_assign_target_shape_is_supported(
             sai_resolve::owner::BindingKind::Let
                 | sai_resolve::owner::BindingKind::Var
                 | sai_resolve::owner::BindingKind::Param
+                | sai_resolve::owner::BindingKind::VarParam
         )
     )
 }
@@ -50370,6 +50376,7 @@ property "shared"() {}
                 unknown_self_fields: None,
                 local_paths: &diagnostic_order_local_paths,
                 call_signatures: None,
+                mutable_params: None,
                 symbols: &database.symbols,
                 pointer_width: target_cfg.pointer_width(),
             },
@@ -70104,6 +70111,8 @@ property "shared"() {}
             "    result\n",
             "}\n",
             "pub fn excluded_mutable_parameter(var value: I32) -> I32 {\n",
+            "    var t = 0\n",
+            "    t += 1\n",
             "    let result = -value\n",
             "    result\n",
             "}\n",
@@ -76635,7 +76644,7 @@ property "shared"() {}
             "pub fn wrong_parameter_type(flag: I32) -> I32 { if flag { 1 } else { 2 } }\n",
             "pub fn aliased_parameter_type(flag: BoolAlias) -> I32 { if flag { 1 } else { 2 } }\n",
             "pub fn other_binding(flag: Bool) -> I32 { if OTHER { 1 } else { 2 } }\n",
-            "pub fn mutable_parameter(var flag: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if flag { 1 } else { 2 }\n}\n",
             "pub fn self_parameter(self: Bool) -> I32 { if self { 1 } else { 2 } }\n",
             "pub fn multiple_parameters(flag: Bool, other: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
             "pub fn non_path_condition(flag: Bool) -> I32 { if 1 { 1 } else { 2 } }\n",
@@ -76724,7 +76733,7 @@ property "shared"() {}
             "pub fn aliased_parameter(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
             "pub fn string_parameter(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
             "pub fn unit_parameter(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
-            "pub fn mutable_parameter(var value: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if value < 10 { 1 } else { 2 }\n}\n",
             "pub fn missing_else(value: I8) -> I32 { if value < 10 { 1 } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -76915,7 +76924,7 @@ property "shared"() {}
             "pub fn other_binding(flag: Bool, other: Bool) -> I32 { if flag and OTHER { 1 } else { 2 } }\n",
             "pub fn wrong_parameter_type(flag: I32, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
             "pub fn aliased_parameter_type(flag: BoolAlias, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
-            "pub fn mutable_parameter(var flag: Bool, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var flag: Bool, other: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if flag and other { 1 } else { 2 }\n}\n",
             "pub fn self_parameter(self: Bool, other: Bool) -> I32 { if self and other { 1 } else { 2 } }\n",
             "pub fn unary_operand(flag: Bool, other: Bool) -> I32 { if not flag and other { 1 } else { 2 } }\n",
             "pub fn one_parameter(flag: Bool) -> I32 { if flag and true { 1 } else { 2 } }\n",
@@ -77044,7 +77053,7 @@ property "shared"() {}
             "pub fn unannotated() -> I32 {\n    var total = 0\n    total\n}\n",
             "pub fn condition(flag: Bool) -> I32 {\n    var enabled: Bool = flag\n    if enabled { 1 } else { 2 }\n}\n",
             "pub fn initializer(flag: Bool) -> Bool {\n    var enabled: Bool = flag\n    let result = enabled and true\n    result\n}\n",
-            "pub fn var_parameter(var value: I32) -> I32 {\n    value\n}\n",
+            "pub fn var_parameter(var value: I32) -> I32 {\n    var t = 0\n    t += 1\n    value\n}\n",
             "pub fn reassigned() -> I32 {\n    var total: I32 = 0\n    total = 1\n    total\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -77265,6 +77274,48 @@ property "shared"() {}
     }
 
     #[test]
+    fn function_body_type_check_accepts_var_parameters() {
+        let root = concat!(
+            "pub fn assign(var x: I32) -> I32 {\n    x = 5\n    x\n}\n",
+            "pub fn compound(var x: I32) -> I32 {\n    x += 1\n    x\n}\n",
+            "pub fn mixed(var x: I32, flag: Bool) -> I32 {\n    if flag { x = 1\n x } else { x = 2\n x }\n}\n",
+            "pub fn immutable(x: I32) -> I32 {\n    x = 5\n    x\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 4);
+        for index in 0..3 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("var-parameter assignments are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the var-parameter slice: {check:?}"
+            );
+        }
+        assert!(matches!(
+            owners[3]
+                .body_type_check()
+                .expect("assigning to an immutable parameter is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::AssignToImmutable
+        ));
+    }
+
+    #[test]
     fn function_body_type_check_accepts_only_or_of_two_bool_parameters() {
         let root = concat!(
             "pub fn disjunction(left: Bool, right: Bool) -> I32 { if left or right { 1 } else { 2 } }\n",
@@ -77359,7 +77410,7 @@ property "shared"() {}
             "pub fn nested_expression(left: Bool, right: Bool) -> I32 { if (left == right) == true { 1 } else { 2 } }\n",
             "pub fn wrong_parameter_type(left: I32, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
             "pub fn aliased_parameter_type(left: BoolAlias, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
-            "pub fn mutable_parameter(var left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if left == right { 1 } else { 2 }\n}\n",
             "pub fn self_parameter(self: Bool, right: Bool) -> I32 { if self == right { 1 } else { 2 } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");

@@ -40,6 +40,9 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// Direct, supported function signatures resolved for call expressions
     /// in this owner's simple block.
     pub call_signatures: Option<&'a HashMap<HirId, PrimitiveCallSignature>>,
+    /// `var` parameter bindings admitted by the owner-aware driver — the
+    /// assignable parameters (§7.2.4).
+    pub mutable_params: Option<&'a HashSet<BindingId>>,
     pub symbols: &'a Interner,
     pub pointer_width: u8,
 }
@@ -300,10 +303,14 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
     if matches!(input.body.value.kind, ExprKind::Block(_)) {
         collect_primitive_expression_nodes(&input.body.value, &mut expression_nodes);
     }
+    let mutable_bindings: HashSet<BindingId> = input
+        .mutable_params
+        .map(|params| params.iter().copied().collect())
+        .unwrap_or_default();
     let mut context = FnCtxt {
         input,
         known_bindings,
-        mutable_bindings: HashSet::new(),
+        mutable_bindings,
         binding_type_candidates,
         binding_candidate_order: Vec::new(),
         binding_initializer_roots: HashMap::new(),

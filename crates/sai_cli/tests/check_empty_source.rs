@@ -4794,7 +4794,7 @@ fn shadowed_parameter_initializer_uses_parameter_and_tail_uses_local_binding() {
 #[test]
 fn unsupported_parameter_local_copy_forms_remain_gated() {
     for source in [
-        "pub fn copy(var source: I32) -> I32 {\n    let copied: I32 = source\n    copied\n}\n",
+        "pub fn copy(var source: I32) -> I32 {\n    var t = 0\n    t += 1\n    let copied: I32 = source\n    copied\n}\n",
         "pub fn copy(self: I32) -> I32 {\n    let copied: I32 = self\n    copied\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -4845,7 +4845,7 @@ fn two_parameter_local_copy_type_mismatch_is_reported_at_initializer() {
 #[test]
 fn unsupported_two_parameter_local_copy_forms_remain_gated() {
     for source in [
-        "pub fn copy_pair(first: I32, var second: Bool) -> I32 {\n    let first_copy: I32 = first\n    let second_copy: Bool = second\n    first_copy\n}\n",
+        "pub fn copy_pair(first: I32, var second: Bool) -> I32 {\n    var t = 0\n    t += 1\n    let first_copy: I32 = first\n    let second_copy: Bool = second\n    first_copy\n}\n",
         "pub fn copy_pair(first: I32, second: Str) -> I32 {\n    let first_copy: I32 = first\n    let second_copy: Str = second\n    first_copy\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10163,7 +10163,7 @@ fn public_bool_parameter_literal_if_function_emits_check_result() {
 #[test]
 fn unsupported_bool_parameter_if_shapes_remain_gated() {
     for source in [
-        "pub fn choose(var flag: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
+        "pub fn choose(var flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if flag { 1 } else { 2 }\n}\n",
         "pub fn choose(flag: Bool) -> I32 { if flag { 1 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10245,7 +10245,7 @@ fn public_bool_parameters_and_if_function_emits_check_result() {
 #[test]
 fn unsupported_bool_parameter_and_shapes_remain_gated() {
     for source in [
-        "pub fn choose(var left: Bool, right: Bool) -> I32 { if left and right { 1 } else { 2 } }\n",
+        "pub fn choose(var left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if left and right { 1 } else { 2 }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left and right) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n    } else {\n        value\n    }\n}\n",
@@ -10433,6 +10433,8 @@ fn public_assign_statements_emit_check_results() {
         "pub fn run() -> I32 { var total: I32 = 0\n    total += 1\n    total\n }\n",
         "pub fn run(left: I32, right: I32) -> I32 { var total: I32 = 0\n    total += left\n    total -= right\n    total\n }\n",
         "pub fn run(left: I32) -> I32 { var total: I32 = 1\n    total <<= 4\n    total |= left\n    total\n }\n",
+        "pub fn run(var total: I32) -> I32 { total = 1\n    total\n }\n",
+        "pub fn run(var total: I32, left: I32) -> I32 { total += left\n    total\n }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10564,7 +10566,7 @@ fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
         "type I8Alias = I8\npub fn choose(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
         "pub fn choose(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
-        "pub fn choose(var value: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+        "pub fn choose(var value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if value < 10 { 1 } else { 2 }\n}\n",
         "pub fn choose(value: I8) -> I32 { if value < 10 { 1 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
