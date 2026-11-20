@@ -2626,11 +2626,38 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let Some((place_type,)) = self.assign_place(lhs)? else {
             return Ok(());
         };
-        // Compound assignment still requires a concrete place type —
-        // `var x = 1; x += 2` needs the operation over an unresolved
-        // literal variable, which stays gated for now.
         let LocalType::Concrete(place_type) = place_type else {
-            return Err(());
+            let LocalType::LiteralVariable(id) = place_type else {
+                return Err(());
+            };
+            // `x op= e` on an unresolved literal variable desugars to
+            // `x = x op e`: the operation admits operand shapes and
+            // constrains the variable, and its result must keep the
+            // same variable for the write-back to type.
+            let result = match op {
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Rem
+                | BinOp::WrapAdd
+                | BinOp::WrapSub
+                | BinOp::WrapMul => self.check_arithmetic(op, lhs, rhs, stmt_id)?,
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                    self.check_bitwise(op, lhs, rhs, stmt_id)?
+                }
+                BinOp::Shl | BinOp::Shr => self.check_shift(op, lhs, rhs, stmt_id, false)?,
+                _ => return Err(()),
+            };
+            let LocalType::LiteralVariable(result_id) = result else {
+                return Err(());
+            };
+            if result_id != id {
+                return Err(());
+            }
+            self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+            self.record_expression_type(stmt_id, LocalType::LiteralVariable(id));
+            return Ok(());
         };
         let result = match op {
             BinOp::Add

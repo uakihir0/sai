@@ -10192,6 +10192,7 @@ fn public_match_tail_bodies_emit_check_results() {
         "pub fn choose(value: I32) -> I32 { var x: I32 = 0\n match value { 0 => { x = 1 }, _ => {} }\n x }\n",
         "pub fn choose(value: I32) -> I32 { match value { 0 if value > 1 => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 1..=5 if value > 1 => 1, _ => 0 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { match flag { _ if flag => 1, _ => 0 } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10211,6 +10212,10 @@ fn match_exhaustiveness_and_unreachable_arms_reach_cli_diagnostics() {
         (
             "pub fn choose(value: I32) -> I32 { match value { _ => 0, 1 => 1 } }\n",
             "UNREACHABLE_PATTERN",
+        ),
+        (
+            "pub fn choose(flag: Bool) -> I32 { match flag { _ if flag => 1 } }\n",
+            "NON_EXHAUSTIVE_MATCH",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);

@@ -9848,7 +9848,7 @@ fn primitive_match_tail_shape_is_supported(
                     return false;
                 }
             }
-            PatKind::Wild => catch_all = true,
+            PatKind::Wild => catch_all = arm.guard.is_none(),
             PatKind::Binding {
                 mode: sai_hir::patterns::BindingMode::Value,
                 binding,
@@ -10060,7 +10060,7 @@ fn primitive_match_stmt_shape_is_supported(
                         return false;
                     }
                 }
-                PatKind::Wild => catch_all = true,
+                PatKind::Wild => catch_all = arm.guard.is_none(),
                 PatKind::Binding {
                     mode: sai_hir::patterns::BindingMode::Value,
                     sub: None,
@@ -77884,6 +77884,8 @@ property "shared"() {}
             "pub fn stmt_match_value_body(value: I32) -> I32 {\n    match value { _ => 1 }\n    0\n}\n",
             "pub fn guarded_bool_nonexhaustive(flag: Bool) -> I32 {\n    match flag { true if flag => 1, false => 0 }\n}\n",
             "pub fn stmt_float_mod(flag: Bool) -> I32 {\n    var x: F32 = 0.0\n    if flag { x %= 2.0 }\n    0\n}\n",
+            "pub fn guarded_wild_nonexhaustive(flag: Bool) -> I32 {\n    match flag { _ if flag => 1 }\n}\n",
+            "pub fn guarded_wild_then_catchall(flag: Bool) -> I32 {\n    match flag { _ if flag => 1, _ => 0 }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77899,10 +77901,10 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 38);
+        assert_eq!(owners.len(), 40);
 
         for index in [
-            0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 26, 29, 31, 32, 33,
+            0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 26, 29, 31, 32, 33, 39,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -77912,7 +77914,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the match-tail slice: {check:?}"
             );
         }
-        for index in [7, 8, 10, 14, 22, 24, 25, 27, 28, 30, 36] {
+        for index in [7, 8, 10, 14, 22, 24, 25, 27, 28, 30, 36, 38] {
             let check = owners[index]
                 .body_type_check()
                 .expect("mismatched match patterns are diagnosed");
