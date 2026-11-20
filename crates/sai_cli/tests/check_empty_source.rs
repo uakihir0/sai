@@ -5025,6 +5025,7 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn merge_add() -> I32 {\n    var a = 1\n    var b = 2\n    let sum = a + b\n    sum\n}\n",
         "pub fn merge_compare() -> Bool {\n    var a = 1\n    var b = 2\n    a < b\n}\n",
         "pub fn merge_assign() -> I32 {\n    var a = 0\n    var b = 2\n    a += b\n    a\n}\n",
+        "pub fn merge_reverse_assign() -> I32 {\n    var a = 0\n    var b = 2\n    a += b\n    b += a\n    a\n}\n",
         "pub fn merge_annotated() -> I8 {\n    var a = 1\n    var b = 2\n    let sum: I8 = a + b\n    sum\n}\n",
         "pub fn merge_bit_or() -> I32 {\n    var a = 1\n    var b = 2\n    let bits = a | b\n    bits\n}\n",
         "pub fn merge_remainder() -> I32 {\n    var a = 9\n    var b = 4\n    let rem = a % b\n    rem\n}\n",
@@ -5035,6 +5036,10 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn literal_var_shift_left(count: U32) -> I32 {\n    var x = 1\n    let r = x << count\n    r\n}\n",
         "pub fn literal_var_shift_count(value: I32) -> I32 {\n    var c = 4\n    let r = value << c\n    r\n}\n",
         "pub fn literal_var_shift_pair() -> I32 {\n    var x = 1\n    var c = 2\n    let r = x << c\n    r\n}\n",
+        "pub fn loop_break() -> I32 {\n    var n: I32 = 0\n    loop { n = n + 1\n break }\n    n\n}\n",
+        "pub fn loop_labeled() -> I32 {\n    var n: I32 = 0\n    'outer: loop { loop { break 'outer }\n break }\n    n\n}\n",
+        "pub fn while_stmt(flag: Bool) -> I32 {\n    var n: I32 = 0\n    while flag { n = n + 1 }\n    n\n}\n",
+        "pub fn while_empty(flag: Bool) -> I32 {\n    while flag { }\n    0\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10273,7 +10278,6 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose() -> I32 { var a = 1\n    var b = 2.5\n    let sum = a + b\n    sum\n }\n",
         "pub fn choose() -> Bool { var a = true\n    var b = false\n    a + b\n }\n",
         "pub fn choose() -> F64 { var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n }\n",
-        "pub fn choose() -> I32 { var a = 0\n    var b = 0\n    a += b\n    b += a\n    a\n }\n",
         "pub fn choose() -> I32 { var x = 0.5\n    let rem = 1 % x\n    rem\n }\n",
         "pub fn choose(value: I32) -> I32 { var c = 0.5\n    let r = value << c\n    r\n }\n",
         "pub fn choose() -> I32 { var x = 0.5\n    var c = 1\n    let r = x << c\n    r\n }\n",
@@ -20673,5 +20677,20 @@ fn unsupported_direct_function_call_targets_remain_gated() {
     assert!(
         stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
         "unsupported direct calls stay behind the existing gate:\n{stdout}"
+    );
+}
+
+#[test]
+fn unsupported_loop_forms_remain_gated() {
+    let source = concat!(
+        "pub fn break_value_loop() -> I32 { loop { break 1 }\n 0 }\n",
+        "pub fn loop_tail() -> I32 { loop { break } }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(&output, "out-of-slice loop forms");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "break values and loop tails stay behind the existing gate:\n{stdout}"
     );
 }
