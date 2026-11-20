@@ -77646,6 +77646,11 @@ property "shared"() {}
             "pub fn literal_var_float_arith() -> F64 {\n    var x = 1.5\n    let y = x * 2.0\n    y\n}\n",
             "pub fn literal_var_pair() -> I32 {\n    var x = 1\n    var y = 2\n    let z = x + y\n    z\n}\n",
             "pub fn literal_var_bool_literal() -> I32 {\n    var x = 1\n    let y = x + true\n    y\n}\n",
+            "pub fn literal_var_cmp_rhs() -> Bool {\n    var x = 1\n    let y = x < 2\n    y\n}\n",
+            "pub fn literal_var_cmp_left() -> Bool {\n    var x = 1\n    let y = 2 <= x\n    y\n}\n",
+            "pub fn literal_var_cmp_float() -> Bool {\n    var x = 1.5\n    let y = x >= 1.0\n    y\n}\n",
+            "pub fn literal_var_cmp_pair() -> Bool {\n    var x = 1\n    var y = 2\n    x < y\n}\n",
+            "pub fn literal_var_resolved_operand() -> I32 {\n    let x = 1\n    let typed: I32 = x\n    let y = 2 + x\n    y\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77661,7 +77666,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 25);
+        assert_eq!(owners.len(), 30);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77730,7 +77735,16 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand merge: {check:?}"
             );
         }
-        for index in [23, 24] {
+        for index in [25, 26, 27, 29] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a literal-variable comparison is checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
+            );
+        }
+        for index in [23, 24, 28] {
             assert!(
                 matches!(
                     owners[index]

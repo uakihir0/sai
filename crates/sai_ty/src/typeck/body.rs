@@ -1047,19 +1047,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let Some(variable) = self.literal_variables.get(id) else {
                         return Err(());
                     };
-                    match (kind, variable.kind) {
-                        (PrimitiveLiteralKind::Integer, PrimitiveLiteralKind::Integer) => {
-                            self.add_integer_literal_constraint(id, literal, left.hir_id)?;
+                    if variable.resolved.is_none() {
+                        match (kind, variable.kind) {
+                            (PrimitiveLiteralKind::Integer, PrimitiveLiteralKind::Integer) => {
+                                self.add_integer_literal_constraint(id, literal, left.hir_id)?;
+                            }
+                            (
+                                PrimitiveLiteralKind::FloatingPoint,
+                                PrimitiveLiteralKind::FloatingPoint,
+                            ) => {
+                                self.add_float_literal_constraint(id, literal, left.hir_id)?;
+                            }
+                            _ => return Err(()),
                         }
-                        (
-                            PrimitiveLiteralKind::FloatingPoint,
-                            PrimitiveLiteralKind::FloatingPoint,
-                        ) => {
-                            self.add_float_literal_constraint(id, literal, left.hir_id)?;
-                        }
-                        _ => return Err(()),
+                        return Ok(LocalType::LiteralVariable(id));
                     }
-                    return Ok(LocalType::LiteralVariable(id));
                 }
             }
             if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
