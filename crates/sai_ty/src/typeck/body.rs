@@ -2898,34 +2898,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         match arm.pat.kind {
             PatKind::Lit(literal) => {
-                let Some(kind) = primitive_literal_kind(literal) else {
+                self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?
+            }
+            // `l1 | l2 | …` alternatives must all be literals — a binding or
+            // wildcard inside an or-pattern is outside this slice. Diagnosing
+            // at the arm pattern's node keeps the taint walk keyed on
+            // `arm.pat.hir_id` correct.
+            PatKind::Or(alternatives) => {
+                if alternatives.is_empty() {
                     return Err(());
-                };
-                match check_primitive_literal(
-                    scrutinee_type,
-                    literal,
-                    self.input.symbols,
-                    self.input.pointer_width,
-                ) {
-                    PrimitiveLiteralResult::Match => {}
-                    PrimitiveLiteralResult::OutOfRange => {
-                        self.errors.push(PrimitiveBodyError {
-                            node: arm.pat.hir_id,
-                            kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                                expected: scrutinee_type,
-                                found: kind,
-                            },
-                        });
-                    }
-                    PrimitiveLiteralResult::TypeMismatch => {
-                        self.errors.push(PrimitiveBodyError {
-                            node: arm.pat.hir_id,
-                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                                expected: scrutinee_type,
-                                found: kind,
-                            },
-                        });
-                    }
+                }
+                for alternative in alternatives {
+                    let PatKind::Lit(literal) = alternative.kind else {
+                        return Err(());
+                    };
+                    self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?;
                 }
             }
             PatKind::Wild => *catch_all = true,
@@ -2945,6 +2932,44 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             _ => return Err(()),
         }
         self.record_expression_type(arm.pat.hir_id, LocalType::Concrete(scrutinee_type));
+        Ok(())
+    }
+
+    fn check_match_literal_pattern(
+        &mut self,
+        literal: Lit<'hir>,
+        node: HirId,
+        scrutinee_type: PrimTy,
+    ) -> Result<(), ()> {
+        let Some(kind) = primitive_literal_kind(literal) else {
+            return Err(());
+        };
+        match check_primitive_literal(
+            scrutinee_type,
+            literal,
+            self.input.symbols,
+            self.input.pointer_width,
+        ) {
+            PrimitiveLiteralResult::Match => {}
+            PrimitiveLiteralResult::OutOfRange => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                        expected: scrutinee_type,
+                        found: kind,
+                    },
+                });
+            }
+            PrimitiveLiteralResult::TypeMismatch => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                        expected: scrutinee_type,
+                        found: kind,
+                    },
+                });
+            }
+        }
         Ok(())
     }
 
