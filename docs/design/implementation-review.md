@@ -9635,3 +9635,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver suite and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Passed — probing `break ~1` confirmed `~`/`−` fold into literals before checking, so the BitNot gate in `check_break_value` is defensive only.
 - **Remaining scope:** `break` values in `return`/`loop`/`Str` shapes (out of the literal slice), `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1045 (2026-11-21): `loop` as a `break` value
+
+- **Decision:** Admit `break loop { .. }` — `check_break_value` runs the inner loop through `check_loop_value` with a fresh `Unfixed` seed and maps the popped `LoopBreakState` to a `LocalType` exactly like the unannotated `let` initializer does: `Concrete(τ)` fixes the outer `β`, `LiteralVariable` binds the inner literal group, `Unfixed`/`Bare` gate.
+- **Reason:** §6.16.1 — `v ⇐ β` where `v` is a loop expression has `v`'s type `τ`: an inner `break 1` yields a literal site joining the outer `β`, so `loop { break loop { break 1 } }` checks `I64 ⇐ β` and `let x = loop { break loop { break 1 } }` binds `x` to the shared literal group (I64 by default).
+- **Failure boundary and judgment:** `break while`/`break for` values stay gated — `while`/`for` are not `loop`-sourced values and the driver mirror admits only `LoopSource::Loop`. `break loop { break }` — inner `τ` is `()`, which no `PrimTy` names — reports `INVALID_BREAK_VALUE` rather than gating, matching the bare-break mixing rule. `break return` stays gated.
+- **Review required:** None — the state-to-`LocalType` mapping is identical to the initializer arm.
+- **Planned verification matrix:** Driver owners `break_value_loop`/`break_value_loop_init` (supported), `break_value_loop_bare` (Supported+INVALID_BREAK_VALUE), `break_value_while_inner` (gated); CLI `break_value_loop` row and a gated `break_value_while_inner` row.
+- **Verification:** Pinned Rust 1.99.1, driver suite and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Pending — see PR.
+- **Remaining scope:** `break` values in `return`/`Str` shapes (out of the literal slice), `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range, move/borrow analysis, lowering/evaluation, CLI Stage 0.

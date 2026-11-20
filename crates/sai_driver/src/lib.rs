@@ -9133,6 +9133,24 @@ fn primitive_break_value_shape_is_supported(
             direct_call_signatures,
             primitive_types,
         ),
+        // A `loop` value yields its own break type — a bare-only inner
+        // loop produces `()` and is rejected by the checker.
+        ExprKind::Loop {
+            body,
+            source: LoopSource::Loop,
+            ..
+        } => primitive_loop_body_shape_is_supported(
+            body,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         _ => primitive_value_expression_shape_is_supported(
             value,
             preceding_bindings,
@@ -78368,6 +78386,10 @@ property "shared"() {}
             "pub fn break_value_neg() -> I32 {\n    loop { break -1 }\n}\n",
             "pub fn break_value_bitnot() -> I32 {\n    loop { break ~1 }\n}\n",
             "pub fn break_value_str() -> I32 {\n    loop { break \"s\" }\n}\n",
+            "pub fn break_value_loop() -> I32 {\n    loop { break loop { break 1 } }\n}\n",
+            "pub fn break_value_loop_init() -> I64 {\n    let x = loop { break loop { break 1 } }\n    x\n}\n",
+            "pub fn break_value_while_inner(flag: Bool) -> I32 {\n    loop { break while flag { } }\n}\n",
+            "pub fn break_value_loop_bare() -> I32 {\n    loop { break loop { break } }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78383,11 +78405,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 45);
+        assert_eq!(owners.len(), 49);
 
         for index in [
             0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35,
-            36, 37, 39, 40, 41, 42, 43,
+            36, 37, 39, 40, 41, 42, 43, 45, 46,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78408,6 +78430,7 @@ property "shared"() {}
             (20, sai_diagnostics::Code::TypeMismatch),
             (21, sai_diagnostics::Code::InvalidBreakValue),
             (22, sai_diagnostics::Code::InvalidBreakValue),
+            (48, sai_diagnostics::Code::InvalidBreakValue),
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78418,7 +78441,7 @@ property "shared"() {}
                 "function owner {index} must report {code:?}: {check:?}"
             );
         }
-        for index in [23, 31, 32, 38, 44] {
+        for index in [23, 31, 32, 38, 44, 47] {
             let check = owners[index]
                 .body_type_check()
                 .expect("an out-of-slice loop form is gated");

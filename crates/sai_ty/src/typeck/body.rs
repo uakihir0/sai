@@ -3044,7 +3044,34 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             } => {
                 return self.check_literal_join_match(scrutinee, arms, source);
             }
-            ExprKind::Return(..) | ExprKind::Loop { .. } => {
+            // A `loop` `break` value yields its own `τ` — the inner `β`
+            // resolved or left as a literal group binds to the outer `β`
+            // like an unannotated `let` initializer binds it.
+            ExprKind::Loop {
+                body,
+                label,
+                source,
+            } => {
+                if source != LoopSource::Loop {
+                    return Err(());
+                }
+                return match self.check_loop_value(
+                    value.hir_id,
+                    body,
+                    label,
+                    LoopBreakState::Unfixed,
+                )? {
+                    LoopBreakState::Concrete(found) => Ok(LocalType::Concrete(found)),
+                    LoopBreakState::LiteralVariable(id) => {
+                        match self.literal_variable_group_type(id) {
+                            Some(found) => Ok(LocalType::Concrete(found)),
+                            None => Ok(LocalType::LiteralVariable(id)),
+                        }
+                    }
+                    LoopBreakState::Unfixed | LoopBreakState::Bare => Err(()),
+                };
+            }
+            ExprKind::Return(..) => {
                 return Err(());
             }
             ExprKind::Unary(UnOp::BitNot, operand) if matches!(operand.kind, ExprKind::Lit(_)) => {
