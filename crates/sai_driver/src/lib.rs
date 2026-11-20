@@ -9996,13 +9996,7 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
     match expression.kind {
         ExprKind::Unary(_, operand) => primitive_body_error_span(operand, node),
         ExprKind::Binary(_, left, right) => {
-            if left.hir_id == node {
-                Some(left.span)
-            } else if right.hir_id == node {
-                Some(right.span)
-            } else {
-                None
-            }
+            primitive_body_error_span(left, node).or_else(|| primitive_body_error_span(right, node))
         }
         ExprKind::Call { callee, args, base } => primitive_body_error_span(callee, node)
             .or_else(|| {
@@ -76961,6 +76955,7 @@ property "shared"() {}
             "pub fn aliased_bool(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn wrong_bool_type(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn extra_parameter(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+            "pub fn nested_range(enabled: Bool, value: I8) -> I32 { if enabled and (value > 0 and value < 300) { 1 } else { 2 } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -76976,7 +76971,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 27);
+        assert_eq!(owners.len(), 28);
 
         for index in 0..13 {
             let check = owners[index]
@@ -77007,7 +77002,29 @@ property "shared"() {}
                 "function owner {index} should report one operand mismatch: {check:?}"
             );
         }
-        for index in [13, 17, 18, 19, 20, 21, 22, 23, 24] {
+        for index in [27] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a diagnostic inside a nested operand is published");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.len() == 1
+                        && diagnostics[0].code == sai_diagnostics::Code::LiteralOutOfRange),
+                "function owner {index} should report the nested operand literal range error: {check:?}"
+            );
+        }
+        for index in [18, 19, 20, 21] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a Bool parameter compared to an integer literal is diagnosed");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.len() == 1
+                        && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch),
+                "function owner {index} should report one comparison mismatch: {check:?}"
+            );
+        }
+        for index in [13, 17, 22, 23, 24] {
             let check = owners[index]
                 .body_type_check()
                 .expect("unsupported nested condition form is gated");
