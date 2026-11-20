@@ -3328,21 +3328,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match operator {
             BinOp::And | BinOp::Or => {
                 for operand in [left, right] {
-                    if let Some(operand_type) = self.known_recovery_operand_type(operand) {
-                        match primitive_bool_operand_result(operand_type) {
-                            PrimitiveBoolOperandResult::Bool => {}
-                            PrimitiveBoolOperandResult::TypeMismatch { found } => {
-                                self.errors.push(PrimitiveBodyError {
-                                    node: operand.hir_id,
-                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                        expected: PrimTy::Bool,
-                                        found,
-                                    },
-                                });
-                            }
-                            PrimitiveBoolOperandResult::Unsupported => return Err(()),
-                        }
-                    }
+                    self.check_error_tainted_logical_operand(operand)?;
                 }
             }
             BinOp::Shl | BinOp::Shr => {
@@ -3676,7 +3662,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
         let shape_is_supported = match operator {
             BinOp::And | BinOp::Or => {
-                is_path_or_unknown_field(left) && is_path_or_unknown_field(right)
+                self.error_tainted_logical_operand_shape(
+                    left,
+                    &is_path_or_unknown_field,
+                    &is_literal,
+                ) && self.error_tainted_logical_operand_shape(
+                    right,
+                    &is_path_or_unknown_field,
+                    &is_literal,
+                )
             }
             BinOp::Shl | BinOp::Shr => {
                 let supported_left_literal = matches!(
@@ -3738,12 +3732,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             )
                         })
                     } else {
-                        self.known_recovery_operand_type(operand).is_some_and(|ty| {
-                            !matches!(
-                                primitive_bool_operand_result(ty),
-                                PrimitiveBoolOperandResult::Unsupported
-                            )
-                        })
+                        self.error_tainted_clean_logical_operand(operand)
                     }
                 }),
             BinOp::Shl | BinOp::Shr => {
@@ -3775,6 +3764,145 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     && error_operand_matches(right, right_has_error, supports_primitive_literal)
                     && (left_has_error || clean_operand_is_comparable(left))
                     && (right_has_error || clean_operand_is_comparable(right))
+            }
+        }
+    }
+
+    // Shape gate for error-tainted `and`/`or` operands, mirroring the nested
+    // operand forms `check_logical_operand` admits so a missing-field or
+    // otherwise-tainted body keeps its diagnostics instead of falling back
+    // to Unsupported.
+    fn error_tainted_logical_operand_shape(
+        &self,
+        operand: &Expr<'hir>,
+        is_path_or_unknown_field: &impl Fn(&Expr<'hir>) -> bool,
+        is_literal: &impl Fn(&Expr<'hir>) -> bool,
+    ) -> bool {
+        match operand.kind {
+            ExprKind::Path(_) | ExprKind::Field { .. } => is_path_or_unknown_field(operand),
+            ExprKind::Lit(Lit::Bool(_)) => true,
+            ExprKind::Unary(UnOp::Not, inner) => self.error_tainted_logical_operand_shape(
+                inner,
+                is_path_or_unknown_field,
+                is_literal,
+            ),
+            ExprKind::Binary(inner_operator, left, right) => match inner_operator {
+                BinOp::And | BinOp::Or => {
+                    self.error_tainted_logical_operand_shape(
+                        left,
+                        is_path_or_unknown_field,
+                        is_literal,
+                    ) && self.error_tainted_logical_operand_shape(
+                        right,
+                        is_path_or_unknown_field,
+                        is_literal,
+                    )
+                }
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    (is_path_or_unknown_field(left) && is_path_or_unknown_field(right))
+                        || (is_path_or_unknown_field(left) && is_literal(right))
+                        || (is_literal(left) && is_path_or_unknown_field(right))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    // Whether a clean (error-free) operand of an error-tainted `and`/`or`
+    // still produces `Bool` during recovery checking, mirroring the nested
+    // operand forms the primary checker admits.
+    fn error_tainted_clean_logical_operand(&self, operand: &Expr<'hir>) -> bool {
+        match operand.kind {
+            ExprKind::Lit(Lit::Bool(_)) => true,
+            ExprKind::Unary(UnOp::Not, inner) => self.error_tainted_clean_logical_operand(inner),
+            ExprKind::Binary(inner_operator, left, right)
+                if matches!(inner_operator, BinOp::And | BinOp::Or) =>
+            {
+                self.error_tainted_clean_logical_operand(left)
+                    && self.error_tainted_clean_logical_operand(right)
+            }
+            ExprKind::Binary(inner_operator, left, right)
+                if matches!(
+                    inner_operator,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                ) =>
+            {
+                let comparable = |expression: &Expr<'hir>| {
+                    self.known_recovery_operand_type(expression).is_some()
+                        || matches!(
+                            expression.kind,
+                            ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some()
+                        )
+                };
+                comparable(left) && comparable(right)
+            }
+            _ => match self.known_recovery_operand_type(operand) {
+                Some(ty) => !matches!(
+                    primitive_bool_operand_result(ty),
+                    PrimitiveBoolOperandResult::Unsupported
+                ),
+                None => false,
+            },
+        }
+    }
+
+    // Diagnostics for operands of an error-tainted `and`/`or`, mirroring the
+    // primary `check_logical`/`check_comparison` diag for each nested leaf the
+    // early-returning primary checker never reached.
+    fn check_error_tainted_logical_operand(&mut self, operand: &Expr<'hir>) -> Result<(), ()> {
+        match operand.kind {
+            ExprKind::Lit(Lit::Bool(_)) => Ok(()),
+            ExprKind::Unary(UnOp::Not, inner) => self.check_error_tainted_logical_operand(inner),
+            ExprKind::Binary(inner_operator, left, right)
+                if matches!(inner_operator, BinOp::And | BinOp::Or) =>
+            {
+                self.check_error_tainted_logical_operand(left)?;
+                self.check_error_tainted_logical_operand(right)
+            }
+            ExprKind::Binary(inner_operator, left, right)
+                if matches!(
+                    inner_operator,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                ) =>
+            {
+                let operand_type = |expression: &Expr<'hir>| match expression.kind {
+                    ExprKind::Lit(Lit::Bool(_)) => Some(PrimTy::Bool),
+                    _ => self.known_recovery_operand_type(expression),
+                };
+                if let (Some(left_type), Some(right_type)) =
+                    (operand_type(left), operand_type(right))
+                {
+                    match primitive_comparison_result(inner_operator, left_type, right_type) {
+                        PrimitiveComparisonResult::Bool => {}
+                        PrimitiveComparisonResult::TypeMismatch { expected, found } => {
+                            self.errors.push(PrimitiveBodyError {
+                                node: right.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                            });
+                        }
+                        PrimitiveComparisonResult::Unsupported => return Err(()),
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                if let Some(operand_type) = self.known_recovery_operand_type(operand) {
+                    match primitive_bool_operand_result(operand_type) {
+                        PrimitiveBoolOperandResult::Bool => {}
+                        PrimitiveBoolOperandResult::TypeMismatch { found } => {
+                            self.errors.push(PrimitiveBodyError {
+                                node: operand.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                    expected: PrimTy::Bool,
+                                    found,
+                                },
+                            });
+                        }
+                        PrimitiveBoolOperandResult::Unsupported => return Err(()),
+                    }
+                }
+                Ok(())
             }
         }
     }
