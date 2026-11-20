@@ -2741,6 +2741,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let Some((place_type,)) = self.assign_place(lhs)? else {
             return Ok(());
         };
+        // A resolved literal variable checks like its concrete type, so a
+        // second `x op= e` after an earlier statement resolved `x` keeps
+        // working.
+        let place_type = match self.concrete_local_type(place_type) {
+            Some(concrete) => LocalType::Concrete(concrete),
+            None => place_type,
+        };
         let LocalType::Concrete(place_type) = place_type else {
             let LocalType::LiteralVariable(id) = place_type else {
                 return Err(());

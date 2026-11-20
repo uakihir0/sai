@@ -77652,6 +77652,9 @@ property "shared"() {}
             "pub fn literal_var_assign_op_path(left: I32) -> I32 {\n    var x = 1\n    x += left\n    x\n}\n",
             "pub fn literal_var_bool_operand(flag: Bool) -> I32 {\n    var x = 1\n    let y = x + flag\n    y\n}\n",
             "pub fn literal_var_arith_in_and() -> Bool {\n    var x = 1\n    let y = (x + 2) and true\n    y\n}\n",
+            "pub fn literal_var_cmp_param(value: I32) -> Bool {\n    var x = 1\n    let y = x < value\n    y\n}\n",
+            "pub fn literal_var_cmp_bool(value: Bool) -> I32 {\n    var x = 1\n    let y = x < value\n    0\n}\n",
+            "pub fn literal_var_repeat_assign_op(value: I32) -> I32 {\n    var x = 0\n    x += value\n    x += value\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77667,7 +77670,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 34);
+        assert_eq!(owners.len(), 37);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77736,7 +77739,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand merge: {check:?}"
             );
         }
-        for index in [25, 26, 27, 29, 30, 31] {
+        for index in [25, 26, 27, 29, 30, 31, 34, 36] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a literal-variable comparison is checked");
