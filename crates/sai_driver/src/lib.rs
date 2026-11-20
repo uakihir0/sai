@@ -10934,6 +10934,15 @@ fn primitive_body_errors_to_diagnostics(
                 "no enclosing loop carries this label".to_owned(),
                 "undeclared label",
             )?,
+            PrimitiveBodyErrorKind::LabelShadowed => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::LabelShadowed,
+                "a loop label that repeats an enclosing label".to_string(),
+                "label shadowed",
+            )?,
         };
         diagnostics.push(diagnostic);
     }
@@ -78068,6 +78077,9 @@ property "shared"() {}
             "pub fn break_value_loop() -> I32 {\n    loop { break 1 }\n    0\n}\n",
             "pub fn loop_tail() -> I32 {\n    loop { break }\n}\n",
             "pub fn while_no_else_shape(flag: Bool) -> I32 {\n    while flag { }\n    0\n}\n",
+            "pub fn while_if_tail(running: Bool, stop: Bool) -> I32 {\n    while running { if stop { break } }\n    0\n}\n",
+            "pub fn loop_inner_literal_var() -> I32 {\n    var x = 2\n    loop { var n = 1\n n += x\n break }\n    x\n}\n",
+            "pub fn label_shadowed() -> I32 {\n    'a: loop { 'a: loop { break }\n break }\n    0\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78083,9 +78095,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 14);
+        assert_eq!(owners.len(), 17);
 
-        for index in [0, 1, 2, 3, 4, 5, 13] {
+        for index in [0, 1, 2, 3, 4, 5, 13, 14, 15] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a loop statement is checked");
@@ -78100,6 +78112,7 @@ property "shared"() {}
             (8, sai_diagnostics::Code::UndeclaredLabel),
             (9, sai_diagnostics::Code::UndeclaredLabel),
             (10, sai_diagnostics::Code::InvalidBreakValue),
+            (16, sai_diagnostics::Code::LabelShadowed),
         ] {
             let check = owners[index]
                 .body_type_check()

@@ -184,6 +184,7 @@ pub enum PrimitiveBodyErrorKind {
     ContinueOutsideLoop,
     InvalidBreakValue,
     UndeclaredLabel,
+    LabelShadowed,
     EmptyRangePattern,
     NonExhaustiveMatch,
     UnreachablePattern,
@@ -2712,7 +2713,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 body,
                 label,
                 source,
-            } => return self.check_loop_stmt(body, label, source),
+            } => return self.check_loop_stmt(expression.hir_id, body, label, source),
             ExprKind::Break { label, value } => {
                 return self.check_break(expression.hir_id, label, value);
             }
@@ -2759,12 +2760,28 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// pushes a `Γ.loops` entry so `break`/`continue` inside it resolve.
     fn check_loop_stmt(
         &mut self,
+        hir_id: HirId,
         body: &'hir Block<'hir>,
         label: Option<Label>,
         source: LoopSource,
     ) -> Result<(), ()> {
         if body.safety != Safety::Safe {
             return Err(());
+        }
+        // §6.16.4: a label that repeats an enclosing label in the same
+        // body is LABEL_SHADOWED — the inner frame still shadows for
+        // resolution.
+        if let Some(label) = label {
+            if self
+                .loop_stack
+                .iter()
+                .any(|frame| frame.label == Some(label.name))
+            {
+                self.errors.push(PrimitiveBodyError {
+                    node: hir_id,
+                    kind: PrimitiveBodyErrorKind::LabelShadowed,
+                });
+            }
         }
         self.loop_stack.push(LoopFrame {
             label: label.map(|label| label.name),
