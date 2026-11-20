@@ -40018,7 +40018,7 @@ interface api { resource canvas { invalid: static func(items: map<string, u32>);
                     && owner.file == module_tree.modules[0].file
             })
             .collect::<Vec<_>>();
-        assert_eq!(owners.len(), 4);
+        assert_eq!(owners.len(), 2);
         let owner_paths = owners
             .iter()
             .map(|owner| {
@@ -77998,7 +77998,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed: {check:?}"
             );
         }
-        for index in [20, 21, 22] {
+        for index in [20, 21, 22, 57] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a literal-variable operand pair is checked");
@@ -78019,7 +78019,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
-        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 57, 63, 67, 68] {
+        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 63, 67, 68] {
             assert!(
                 matches!(
                     owners[index]
