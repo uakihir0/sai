@@ -78393,6 +78393,7 @@ property "shared"() {}
             "pub fn break_label_inner_same() -> Bool {\n    'a: loop { break 'a loop { break true } }\n}\n",
             "pub fn break_label_inner_mismatch() -> Bool {\n    'a: loop { break 'a loop { break 'a true\n break 1 } }\n}\n",
             "pub fn break_label_inner_bare() -> I32 {\n    'a: loop { break 'a loop { break 'a\n break 1 } }\n}\n",
+            "pub fn break_label_inner_resolved_var() -> I64 {\n    var m = 2\n    let n: I64 = m\n    'a: loop { break 'a loop { break 'a 1\n break 'a m\n break 3 } }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78408,11 +78409,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 52);
+        assert_eq!(owners.len(), 53);
 
         for index in [
             0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35,
-            36, 37, 39, 40, 41, 42, 43, 45, 46, 49,
+            36, 37, 39, 40, 41, 42, 43, 45, 46, 49, 52,
         ] {
             let check = owners[index]
                 .body_type_check()

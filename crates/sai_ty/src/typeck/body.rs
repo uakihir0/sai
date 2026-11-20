@@ -2967,6 +2967,27 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         value: &'hir Expr<'hir>,
         local_type: LocalType,
     ) -> Result<(), ()> {
+        // A `LiteralVariable` value or state whose group already resolved
+        // behaves like the concrete type it resolved to — the same
+        // resolved-carry rule the `Unfixed` arm applies. Without this, a
+        // group resolved mid-evaluation (e.g. a labeled `break 'l m`
+        // merging `β` into an already-resolved group) would hit
+        // `resolve_literal_variable`'s re-resolution refusal and gate a
+        // sound program.
+        let local_type = match local_type {
+            LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                match self.literal_variable_group_type(id) {
+                    Some(found) => LocalType::Concrete(found),
+                    None => local_type,
+                }
+            }
+            other => other,
+        };
+        if let LoopBreakState::LiteralVariable(id) = self.loop_stack[index].break_state
+            && let Some(found) = self.literal_variable_group_type(id)
+        {
+            self.loop_stack[index].break_state = LoopBreakState::Concrete(found);
+        }
         match self.loop_stack[index].break_state {
             LoopBreakState::Unfixed => {
                 self.loop_stack[index].break_state = match local_type {
