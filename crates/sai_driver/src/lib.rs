@@ -50632,9 +50632,42 @@ property "shared"() {}
             "    let failed = identity_u8(-source)\n",
             "    identity_bool(value)\n",
             "}\n",
-            "pub fn direct_alias_remains_unsupported() -> I32 {\n",
+            "pub fn direct_alias() -> I32 {\n",
             "    let source = 7\n",
             "    let alias = source\n",
+            "    identity_i32(-alias)\n",
+            "}\n",
+            "pub fn direct_nested_alias() -> I16 {\n",
+            "    let source = 7\n",
+            "    let alias = source\n",
+            "    identity_i16(identity_i16(-alias))\n",
+            "}\n",
+            "pub fn direct_alias_chain() -> I32 {\n",
+            "    let source = 7\n",
+            "    let first_alias = source\n",
+            "    let second_alias = first_alias\n",
+            "    identity_i32(-second_alias)\n",
+            "}\n",
+            "pub fn direct_unsigned_alias() -> U8 {\n",
+            "    let source = 7\n",
+            "    let alias = source\n",
+            "    identity_u8(-alias)\n",
+            "}\n",
+            "pub fn direct_float_alias() -> F64 {\n",
+            "    let source = 1.5\n",
+            "    let alias = source\n",
+            "    identity_f64(-alias)\n",
+            "}\n",
+            "pub fn direct_alias_mismatch() -> Bool {\n",
+            "    let source = 7\n",
+            "    let alias = source\n",
+            "    let failed = identity_bool(-alias)\n",
+            "    identity_bool(true)\n",
+            "}\n",
+            "pub fn direct_negated_result_alias_remains_unsupported() -> I32 {\n",
+            "    let source = 7\n",
+            "    let first = -source\n",
+            "    let alias = first\n",
             "    identity_i32(-alias)\n",
             "}\n",
             "pub fn direct_negated_result_remains_unsupported() -> I32 {\n",
@@ -51134,7 +51167,118 @@ property "shared"() {}
         );
 
         for name in [
-            "direct_alias_remains_unsupported",
+            "direct_alias",
+            "direct_nested_alias",
+            "direct_alias_chain",
+            "direct_float_alias",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } =
+                owner.body_type_check().expect("alias body query succeeds")
+            else {
+                panic!("a simple literal-alias Neg call argument is supported for `{name}`");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "the `{name}` callee parameter infers the aliased literal source"
+            );
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("alias results query succeeds")
+                    .is_some(),
+                "the `{name}` body publishes primitive facts"
+            );
+        }
+
+        let alias_owner = owner_named(&database, &resolved, "direct_alias");
+        let alias_results = alias_owner
+            .primitive_body_type_results()
+            .expect("alias results query succeeds")
+            .expect("alias body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, alias_results);
+        assert_eq!(
+            alias_results.binding_type(binding_named(&database, alias_owner, "source")),
+            Some(PrimTy::I32)
+        );
+        assert_eq!(
+            alias_results.binding_type(binding_named(&database, alias_owner, "alias")),
+            Some(PrimTy::I32),
+            "the alias binding shares the inferred parameter type"
+        );
+        assert_eq!(
+            alias_results.expression_types().len(),
+            5,
+            "the source literal, both alias paths, the Neg argument, and the call each retain a fact"
+        );
+
+        let chain_owner = owner_named(&database, &resolved, "direct_alias_chain");
+        let chain_results = chain_owner
+            .primitive_body_type_results()
+            .expect("alias-chain results query succeeds")
+            .expect("alias-chain body publishes primitive facts");
+        for name in ["source", "first_alias", "second_alias"] {
+            assert_eq!(
+                chain_results.binding_type(binding_named(&database, chain_owner, name)),
+                Some(PrimTy::I32),
+                "each transitive literal alias shares the inferred parameter type"
+            );
+        }
+
+        let unsigned_alias_owner = owner_named(&database, &resolved, "direct_unsigned_alias");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: unsigned_alias_diagnostics,
+        } = unsigned_alias_owner
+            .body_type_check()
+            .expect("unsigned-alias body query succeeds")
+        else {
+            panic!("a literal-alias Neg call argument against an unsigned parameter is supported");
+        };
+        assert_eq!(
+            unsigned_alias_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["operator `-` has no `Neg` implementation for `U8`"],
+            "the deferred Neg trait check rejects the aliased unsigned resolution"
+        );
+        let unsigned_alias_start = root
+            .find("identity_u8(-alias)")
+            .expect("unsigned alias call exists")
+            + "identity_u8(".len();
+        assert_eq!(
+            unsigned_alias_diagnostics[0]
+                .primary()
+                .expect("unsigned-alias diagnostic has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(unsigned_alias_start as u32),
+                sai_diagnostics::TextSize::new((unsigned_alias_start + "-alias".len()) as u32),
+            )
+            .expect("unsigned-alias span is ordered"),
+            "the deferred Neg error lands on the aliased unary argument"
+        );
+
+        let alias_mismatch_owner = owner_named(&database, &resolved, "direct_alias_mismatch");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: alias_mismatch_diagnostics,
+        } = alias_mismatch_owner
+            .body_type_check()
+            .expect("alias-mismatch body query succeeds")
+        else {
+            panic!("an incompatible alias expectation remains a recoverable type error");
+        };
+        assert_eq!(alias_mismatch_diagnostics.len(), 1);
+        assert!(
+            alias_mismatch_diagnostics[0]
+                .message
+                .contains("integer literal"),
+            "the incompatible expected type is diagnosed against the aliased integer source"
+        );
+
+        for name in [
+            "direct_negated_result_alias_remains_unsupported",
             "direct_negated_result_remains_unsupported",
             "direct_resolved_negated_result_remains_unsupported",
             "direct_forward_remains_unsupported",
