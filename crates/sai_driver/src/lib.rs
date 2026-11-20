@@ -9034,18 +9034,60 @@ fn primitive_logical_init_operand_shape_is_supported(
 /// right-hand side of an assignment (§6.13.1 lists the assignment
 /// right-hand side as a coercion site, so it mirrors the annotated
 /// initializer admission set).
+#[allow(clippy::too_many_arguments)]
 fn primitive_value_expression_shape_is_supported(
     expression: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     let init = expression;
     match init.kind {
         ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
+        // Value-producing `if`/`match` unify each branch/arm body against
+        // the let annotation or the assign place type; unannotated
+        // initializers join the branch literal tails through the checker's
+        // shared literal-variable machinery, which gates the wider shapes.
+        ExprKind::If { .. } => {
+            return primitive_if_tail_shape_is_supported(
+                init,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            );
+        }
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source,
+        } => {
+            return primitive_match_tail_shape_is_supported(
+                scrutinee,
+                arms,
+                source,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            );
+        }
         ExprKind::Field { .. }
             if self_field_projections.is_some_and(|fields| fields.contains_key(&init.hir_id))
                 || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id)) => {}
@@ -9282,14 +9324,46 @@ fn primitive_let_statement_shape_is_supported(
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     if let StmtKind::Expr(expression) = stmt.kind {
-        // Statement-position `if`/`block`/`match` expressions unify their
-        // branch/arm tails with the return type, which does not apply to a
-        // discarded result, so they stay outside this slice.
-        if matches!(
-            expression.kind,
-            ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::Match { .. }
-        ) {
-            return false;
+        // Statement-position `if`/`match` expressions discard their result;
+        // branches and arms admit only statement blocks so the discarded
+        // value is `()` (§6.11.1). Bare `block` statements stay gated.
+        match expression.kind {
+            ExprKind::If { .. } => {
+                return primitive_if_stmt_shape_is_supported(
+                    expression,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                );
+            }
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => {
+                return primitive_match_stmt_shape_is_supported(
+                    scrutinee,
+                    arms,
+                    source,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                );
+            }
+            ExprKind::Block(_) => return false,
+            _ => {}
         }
         return primitive_if_branch_tail_shape_is_supported(
             expression,
@@ -9321,9 +9395,12 @@ fn primitive_let_statement_shape_is_supported(
                 preceding_bindings,
                 locals,
                 inputs,
+                symbols,
+                type_paths,
                 self_field_projections,
                 unknown_self_fields,
                 direct_call_signatures,
+                primitive_types,
             );
     }
     if let StmtKind::AssignOp { op, lhs, rhs } = stmt.kind {
@@ -9409,9 +9486,12 @@ fn primitive_let_statement_shape_is_supported(
         preceding_bindings,
         locals,
         inputs,
+        symbols,
+        type_paths,
         self_field_projections,
         unknown_self_fields,
         direct_call_signatures,
+        primitive_types,
     ) {
         return false;
     }
@@ -9711,25 +9791,86 @@ fn primitive_match_tail_shape_is_supported(
     }
     let mut catch_all = false;
     for arm in arms {
-        if catch_all || arm.guard.is_some() {
-            return false;
+        if catch_all {
+            // An arm after an unguarded catch-all is diagnosed
+            // `UNREACHABLE_PATTERN` by the checker — only its body still
+            // needs the shape check, with the arm's own pattern binding
+            // visible to it.
+            let mut extended = preceding_bindings.clone();
+            if let PatKind::Binding {
+                mode: sai_hir::patterns::BindingMode::Value,
+                binding,
+                sub: None,
+                ..
+            } = arm.pat.kind
+            {
+                extended.insert(binding);
+            }
+            if !primitive_if_branch_tail_shape_is_supported(
+                arm.body,
+                &extended,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            ) {
+                return false;
+            }
+            continue;
         }
         let mut arm_bindings = None;
         match arm.pat.kind {
             PatKind::Lit(_) => {}
-            PatKind::Wild => catch_all = true,
+            // Or-patterns admit literal alternatives only — bindings,
+            // wildcards and nested compound patterns inside `l1 | l2`
+            // stay gated, matching the checker's arm-pattern admission.
+            PatKind::Or(alternatives) => {
+                if alternatives.is_empty()
+                    || !alternatives
+                        .iter()
+                        .all(|alternative| matches!(alternative.kind, PatKind::Lit(_)))
+                {
+                    return false;
+                }
+            }
+            // Range patterns admit literal bounds on both ends — open
+            // ranges and non-literal bounds stay gated, matching the
+            // checker's arm-pattern admission.
+            PatKind::Range { start, end, .. } => {
+                if ![start, end]
+                    .iter()
+                    .all(|bound| matches!(bound, Some(sai_hir::patterns::PatRangeEnd::Lit(_))))
+                {
+                    return false;
+                }
+            }
+            PatKind::Wild => catch_all = arm.guard.is_none(),
             PatKind::Binding {
                 mode: sai_hir::patterns::BindingMode::Value,
                 binding,
                 sub: None,
                 ..
             } => {
-                catch_all = true;
+                // A guarded binding arm is not a catch-all — the guard may
+                // fail, so an unguarded catch-all arm is still required.
+                catch_all = arm.guard.is_none();
                 let mut extended = preceding_bindings.clone();
                 extended.insert(binding);
                 arm_bindings = Some(extended);
             }
             _ => return false,
+        }
+        // The guard's condition sees the arm's binding when the pattern
+        // binds one, and the enclosing bindings otherwise.
+        if let Some(guard) = arm.guard {
+            let bindings = arm_bindings.as_ref().unwrap_or(preceding_bindings);
+            if !primitive_if_condition_shape_is_supported(guard, bindings, locals, inputs) {
+                return false;
+            }
         }
         if !primitive_if_branch_tail_shape_is_supported(
             arm.body,
@@ -9746,7 +9887,217 @@ fn primitive_match_tail_shape_is_supported(
             return false;
         }
     }
-    catch_all
+    // Missing catch-alls and non-Bool coverage are diagnosed
+    // `NON_EXHAUSTIVE_MATCH` by the checker — the shape is admitted.
+    true
+}
+
+/// A statement-only block: every admitted statement, no tail expression —
+/// a value tail would be a discarded non-`()` value, out of this slice.
+/// Bindings stay scoped to the block.
+#[allow(clippy::too_many_arguments)]
+fn primitive_stmt_block_shape_is_supported(
+    block: &HirBlock<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    if block.safety != sai_hir::Safety::Safe || block.tail.is_some() {
+        return false;
+    }
+    let mut block_bindings = preceding_bindings.clone();
+    block.stmts.iter().all(|stmt| {
+        primitive_let_statement_shape_is_supported(
+            stmt,
+            &mut block_bindings,
+            primitive_types,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+        )
+    })
+}
+
+/// Statement-position `if`/`else if`/`else`: branches are statement-only
+/// blocks, so an `else` is optional.
+#[allow(clippy::too_many_arguments)]
+fn primitive_if_stmt_shape_is_supported(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    let ExprKind::If { cond, then, els } = expression.kind else {
+        return false;
+    };
+    if !primitive_if_condition_shape_is_supported(cond, preceding_bindings, locals, inputs) {
+        return false;
+    }
+    if !primitive_stmt_block_shape_is_supported(
+        then,
+        preceding_bindings,
+        locals,
+        inputs,
+        symbols,
+        type_paths,
+        self_field_projections,
+        unknown_self_fields,
+        direct_call_signatures,
+        primitive_types,
+    ) {
+        return false;
+    }
+    match els {
+        None => true,
+        Some(els) => match els.kind {
+            ExprKind::Block(block) => primitive_stmt_block_shape_is_supported(
+                block,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            ),
+            ExprKind::If { .. } => primitive_if_stmt_shape_is_supported(
+                els,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            ),
+            _ => false,
+        },
+    }
+}
+
+/// Statement-position `match`: the same scrutinee, pattern and guard
+/// admission as `primitive_match_tail_shape_is_supported`, but arm bodies
+/// must be statement-only blocks.
+#[allow(clippy::too_many_arguments)]
+fn primitive_match_stmt_shape_is_supported(
+    scrutinee: &HirExpr<'_>,
+    arms: &[HirArm<'_>],
+    source: MatchSource,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    if !matches!(source, MatchSource::Normal) {
+        return false;
+    }
+    let ExprKind::Path(path) = scrutinee.kind else {
+        return false;
+    };
+    if !resolved_plain_local_path_binding(path, locals, inputs)
+        .is_some_and(|binding| preceding_bindings.contains(&binding))
+    {
+        return false;
+    }
+    let mut catch_all = false;
+    for arm in arms {
+        let mut arm_bindings = None;
+        if let PatKind::Binding {
+            mode: sai_hir::patterns::BindingMode::Value,
+            binding,
+            sub: None,
+            ..
+        } = arm.pat.kind
+        {
+            let mut extended = preceding_bindings.clone();
+            extended.insert(binding);
+            arm_bindings = Some(extended);
+        }
+        if catch_all {
+            // `UNREACHABLE_PATTERN` — only the body still shape-checks.
+        } else {
+            match arm.pat.kind {
+                PatKind::Lit(_) => {}
+                PatKind::Or(alternatives) => {
+                    if alternatives.is_empty()
+                        || !alternatives
+                            .iter()
+                            .all(|alternative| matches!(alternative.kind, PatKind::Lit(_)))
+                    {
+                        return false;
+                    }
+                }
+                PatKind::Range { start, end, .. } => {
+                    if ![start, end]
+                        .iter()
+                        .all(|bound| matches!(bound, Some(sai_hir::patterns::PatRangeEnd::Lit(_))))
+                    {
+                        return false;
+                    }
+                }
+                PatKind::Wild => catch_all = arm.guard.is_none(),
+                PatKind::Binding {
+                    mode: sai_hir::patterns::BindingMode::Value,
+                    sub: None,
+                    ..
+                } => {
+                    catch_all = arm.guard.is_none();
+                }
+                _ => return false,
+            }
+            if let Some(guard) = arm.guard {
+                let bindings = arm_bindings.as_ref().unwrap_or(preceding_bindings);
+                if !primitive_if_condition_shape_is_supported(guard, bindings, locals, inputs) {
+                    return false;
+                }
+            }
+        }
+        let ExprKind::Block(block) = arm.body.kind else {
+            return false;
+        };
+        if !primitive_stmt_block_shape_is_supported(
+            block,
+            arm_bindings.as_ref().unwrap_or(preceding_bindings),
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ) {
+            return false;
+        }
+    }
+    // Missing catch-alls and non-Bool coverage are diagnosed
+    // `NON_EXHAUSTIVE_MATCH` by the checker — the shape is admitted.
+    true
 }
 
 fn is_supported_direct_call_arithmetic_argument_shape(
@@ -10178,6 +10529,33 @@ fn primitive_body_errors_to_diagnostics(
                     "literal out of range",
                 )?
             }
+            PrimitiveBodyErrorKind::NonExhaustiveMatch => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::NonExhaustiveMatch,
+                "match does not cover every value".to_owned(),
+                "non-exhaustive match",
+            )?,
+            PrimitiveBodyErrorKind::UnreachablePattern => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::UnreachablePattern,
+                "arm can never match".to_owned(),
+                "unreachable pattern",
+            )?,
+            PrimitiveBodyErrorKind::EmptyRangePattern => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::EmptyRangePattern,
+                "range pattern matches no value".to_owned(),
+                "empty range",
+            )?,
             PrimitiveBodyErrorKind::TypeMismatch { expected, found } => const_literal_diagnostic(
                 owner.id,
                 inputs,
@@ -10394,16 +10772,22 @@ fn primitive_body_block_error_span(
     block
         .stmts
         .iter()
-        .find_map(|stmt| match stmt.kind {
-            StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
-                primitive_body_error_span(init, node)
-            }
-            StmtKind::Assert { cond, msg, .. } => primitive_body_error_span(cond, node)
-                .or_else(|| msg.and_then(|msg| primitive_body_error_span(msg, node))),
-            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
-                primitive_body_error_span(lhs, node)
-                    .or_else(|| primitive_body_error_span(rhs, node))
-            }
+        .find_map(|stmt| {
+            // Statement-anchored errors (`x %= 2.0` on a non-`%`-implementing
+            // primitive) match the statement itself — recurse for the rest.
+            (stmt.hir_id == node)
+                .then_some(stmt.span)
+                .or_else(|| match stmt.kind {
+                    StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
+                        primitive_body_error_span(init, node)
+                    }
+                    StmtKind::Assert { cond, msg, .. } => primitive_body_error_span(cond, node)
+                        .or_else(|| msg.and_then(|msg| primitive_body_error_span(msg, node))),
+                    StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                        primitive_body_error_span(lhs, node)
+                            .or_else(|| primitive_body_error_span(rhs, node))
+                    }
+                })
         })
         .or_else(|| {
             block
@@ -50196,7 +50580,6 @@ property "shared"() {}
             "negated_result_alias",
             "negated_result_later_constraint",
             "negated_result_alias_later_constraint",
-            "mutable_source",
             "deep_nested_source",
             "forward_source",
             "global_source",
@@ -50758,7 +51141,6 @@ property "shared"() {}
             "computed_literal_source",
             "direct_call_operand",
             "compound_operand",
-            "mutable_source",
             "global_source",
             "forward_source",
             "deep_nested_source",
@@ -53200,6 +53582,7 @@ property "shared"() {}
             ("sub_parameter_literal", PrimTy::I32),
             ("add_literals", PrimTy::I32),
             ("mul_annotated_locals", PrimTy::I16),
+            ("mul_literal_locals", PrimTy::I16),
             ("rem_locals", PrimTy::U8),
             ("wrap_add", PrimTy::U8),
             ("bitand_local", PrimTy::U8),
@@ -53243,7 +53626,7 @@ property "shared"() {}
             );
         }
 
-        for name in ["eq_parameters", "lt_local", "and_parameters"] {
+        for name in ["eq_parameters", "lt_local", "lt_literal", "and_parameters"] {
             let owner = owner_named(&database, &resolved, name);
             let FunctionBodyTypeCheck::Supported { diagnostics } = owner
                 .body_type_check()
@@ -53275,26 +53658,6 @@ property "shared"() {}
                 .contains("expected `Bool`, found `I32`"),
             "the arithmetic result mismatches the Bool return type"
         );
-
-        for name in ["mul_literal_locals", "lt_literal"] {
-            let owner = owner_named(&database, &resolved, name);
-            assert!(
-                matches!(
-                    owner
-                        .body_type_check()
-                        .expect("literal-variable tail body query succeeds"),
-                    FunctionBodyTypeCheck::Unsupported
-                ),
-                "the `{name}` unresolved literal operand stays outside this slice"
-            );
-            assert!(
-                owner
-                    .primitive_body_type_results()
-                    .expect("literal-variable projection query succeeds")
-                    .is_none(),
-                "the `{name}` shape publishes no primitive facts"
-            );
-        }
 
         let nested_owner = owner_named(&database, &resolved, "nested_tail");
         assert!(
@@ -53654,6 +54017,7 @@ property "shared"() {}
             "negated_conjunction",
             "discarded_branch_statement",
             "discarded_expression_statements",
+            "double_negation",
         ] {
             let owner = owner_named(&database, &resolved, name);
             let FunctionBodyTypeCheck::Supported { diagnostics } = owner
@@ -53765,7 +54129,6 @@ property "shared"() {}
             "if_expression_statement",
             "literal_condition",
             "nested_branch_tail",
-            "double_negation",
         ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
@@ -56940,7 +57303,6 @@ property "shared"() {}
             "remainder_path_pair_unresolved_right_unsupported",
             "remainder_path_pair_self_right_unsupported",
             "remainder_path_pair_forward_right_unsupported",
-            "remainder_path_pair_unresolved_numeric_right_unsupported",
             "remainder_path_pair_bool_operands_unsupported",
             "remainder_path_pair_byte_operands_unsupported",
             "remainder_path_pair_char_operands_unsupported",
@@ -57043,7 +57405,6 @@ property "shared"() {}
             "bitwise_literal_rhs_byte_string_unsupported",
             "bitwise_literal_rhs_computed_unsupported",
             "bitwise_literal_rhs_nested_unsupported",
-            "bitwise_literal_rhs_unresolved_path_unsupported",
             "bitwise_literal_rhs_self_path_unsupported",
             "bitwise_literal_rhs_forward_path_unsupported",
             "bitwise_literal_rhs_deep_call_unsupported",
@@ -57051,8 +57412,6 @@ property "shared"() {}
             "bitwise_literal_rhs_unsupported_signature",
             "bitwise_literal_rhs_char_unsupported",
             "bitwise_literal_rhs_float_unsupported",
-            "bitwise_unresolved_integer_literal_path_unsupported",
-            "bitwise_unresolved_integer_literal_left_unsupported",
             "bitwise_integer_literal_forward_left_unsupported",
             "bitwise_integer_literal_computed_left_unsupported",
             "bitwise_integer_literal_nested_operator_unsupported",
@@ -57111,7 +57470,6 @@ property "shared"() {}
             "bitwise_nested_operator_unsupported",
             "bitwise_call_operand_unsupported",
             "bitwise_forward_local_unsupported",
-            "bitwise_unresolved_local_unsupported",
             "bitwise_char_unresolved_rhs_unsupported",
             "bitwise_generic_target_unsupported",
             "bitwise_deep_nested_call_unsupported",
@@ -57131,7 +57489,6 @@ property "shared"() {}
             "computed_comparison_operand_unsupported",
             "call_comparison_operand_unsupported",
             "deep_comparison_call_unsupported",
-            "unresolved_comparison_local_unsupported",
         ] {
             assert!(
                 matches!(
@@ -70622,8 +70979,6 @@ property "shared"() {}
             "excluded_forward",
             "excluded_unresolved",
             "excluded_nested_block",
-            "excluded_mutable_source",
-            "excluded_mutable_parameter",
         ] {
             assert!(
                 matches!(
@@ -76531,7 +76886,6 @@ property "shared"() {}
             "}\n",
             "pub fn nested(left: I32, right: I32, extra: I32) -> I32 {\n    let value = left & (right ^ extra)\n    value\n}\n",
             "pub fn computed(left: I32, right: I32) -> I32 {\n    let value = (left + right) & right\n    value\n}\n",
-            "pub fn unresolved(left: I32) -> I32 {\n    let bits = 1\n    let value = bits & left\n    value\n}\n",
             "pub fn alias(left: Word, right: Word) -> Word {\n    let value = left & right\n    value\n}\n",
             "pub fn nested_bit_not(left: I32) -> I32 {\n    let value = ~(~left)\n    value\n}\n",
             "pub fn shift_literal_pair() -> I32 {\n    let value = 1 << 2\n    value\n}\n",
@@ -76556,7 +76910,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 84);
+        assert_eq!(resolved.owners().len(), 83);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
@@ -76573,9 +76927,7 @@ property "shared"() {}
         let root = concat!(
             "const ONE: I32 = 1\n",
             "type Number = I32\n",
-            "pub fn mutable() -> I32 {\n    var value = 42\n    value += 1\n    value\n}\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
-            "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second = 2\n    second += first\n    first\n}\n",
             "pub fn raw_copy() -> I32 {\n    let value: I32 = 42\n    let copy: I32 = r#value\n    copy\n}\n",
             "pub fn forward_copy() -> I32 {\n    let first: I32 = second\n    let second: I32 = 2\n    first\n}\n",
             "pub fn self_copy() -> I32 {\n    let value: I32 = value\n    value\n}\n",
@@ -76586,8 +76938,6 @@ property "shared"() {}
             "pub fn unannotated_copy_from_constant() -> I32 {\n    let copy = ONE\n    copy\n}\n",
             "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source % (1 + 0)\n    copy\n}\n",
             "pub fn unannotated_raw_copy() -> I32 {\n    let source: I32 = 42\n    let copy = r#source\n    copy\n}\n",
-            "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = 0\n    copy += source\n    copy\n}\n",
-            "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    var copy = 0\n    copy += source\n    copy\n}\n",
             "pub fn unannotated_string() -> Str {\n    let value = \"text\"\n    value\n}\n",
             "pub fn destructured() -> I32 {\n    let (first, second): (I32, I32) = (1, 2)\n    first\n}\n",
             "pub fn alias() -> I32 {\n    let value: Number = 42\n    value\n}\n",
@@ -76606,7 +76956,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 18);
+        assert_eq!(resolved.owners().len(), 14);
         for owner in resolved.owners() {
             assert!(matches!(
                 owner
@@ -76827,7 +77177,7 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
-        for index in [6, 8] {
+        for index in [4, 6, 8] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76835,7 +77185,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [2, 3, 4, 5, 7, 9] {
+        for index in [2, 3, 5, 7, 9] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76982,7 +77332,7 @@ property "shared"() {}
                 .expect("a negated literal-parameter comparison is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [21, 24] {
+        for index in [21, 23, 24, 29] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76990,7 +77340,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [19, 20, 23, 26, 27, 28, 29, 30] {
+        for index in [19, 20, 26, 27, 28, 30] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77031,7 +77381,7 @@ property "shared"() {}
         let owners = resolved.owners();
         assert_eq!(owners.len(), 9);
 
-        for index in [0, 7, 8] {
+        for index in [0, 1, 6, 7, 8] {
             let check = owners[index]
                 .body_type_check()
                 .expect("not conditions over admitted operand shapes are supported");
@@ -77054,7 +77404,7 @@ property "shared"() {}
                 .expect("a Bool literal operand in a conjunction is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [1, 2, 4, 6] {
+        for index in [2, 4] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77099,7 +77449,7 @@ property "shared"() {}
         let owners = resolved.owners();
         assert_eq!(owners.len(), 13);
 
-        for index in [0, 1] {
+        for index in [0, 1, 6] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77129,7 +77479,7 @@ property "shared"() {}
                 .expect("a Bool literal operand in a conjunction is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [3, 5, 6, 7, 11, 12] {
+        for index in [3, 5, 7, 11, 12] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77223,7 +77573,7 @@ property "shared"() {}
         let owners = resolved.owners();
         assert_eq!(owners.len(), 6);
 
-        for index in 0..4 {
+        for index in 0..5 {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77236,12 +77586,6 @@ property "shared"() {}
                 .body_type_check()
                 .expect("an assignment to a var local is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
-        ));
-        assert!(matches!(
-            owners[4]
-                .body_type_check()
-                .expect("var parameters stay gated"),
-            FunctionBodyTypeCheck::Unsupported
         ));
     }
 
@@ -77268,6 +77612,46 @@ property "shared"() {}
             "pub fn unbound_target() -> I32 {\n    missing = 5\n    0\n}\n",
             "pub fn call_rhs() -> I32 {\n    var x: I32 = 0\n    let seed: I32 = 4\n    x = identity(seed)\n    x\n}\n",
             "pub fn identity(value: I32) -> I32 {\n    value\n}\n",
+            "pub fn literal_var_arith_rhs() -> I32 {\n    var x = 1\n    let y = x + 2\n    y\n}\n",
+            "pub fn literal_var_arith_left() -> I32 {\n    var x = 1\n    let y = 1 + x\n    y\n}\n",
+            "pub fn literal_var_float_arith() -> F64 {\n    var x = 1.5\n    let y = x * 2.0\n    y\n}\n",
+            "pub fn literal_var_pair() -> I32 {\n    var x = 1\n    var y = 2\n    let z = x + y\n    z\n}\n",
+            "pub fn literal_var_bool_literal() -> I32 {\n    var x = 1\n    let y = x + true\n    y\n}\n",
+            "pub fn literal_var_cmp_rhs() -> Bool {\n    var x = 1\n    let y = x < 2\n    y\n}\n",
+            "pub fn literal_var_cmp_left() -> Bool {\n    var x = 1\n    let y = 2 <= x\n    y\n}\n",
+            "pub fn literal_var_cmp_float() -> Bool {\n    var x = 1.5\n    let y = x >= 1.0\n    y\n}\n",
+            "pub fn literal_var_cmp_pair() -> Bool {\n    var x = 1\n    var y = 2\n    x < y\n}\n",
+            "pub fn literal_var_resolved_operand() -> I32 {\n    let x = 1\n    let typed: I32 = x\n    let y = 2 + x\n    y\n}\n",
+            "pub fn literal_var_param_rhs(left: I32) -> I32 {\n    var x = 1\n    let y = x + left\n    y\n}\n",
+            "pub fn literal_var_assign_op_path(left: I32) -> I32 {\n    var x = 1\n    x += left\n    x\n}\n",
+            "pub fn literal_var_bool_operand(flag: Bool) -> I32 {\n    var x = 1\n    let y = x + flag\n    y\n}\n",
+            "pub fn literal_var_arith_in_and() -> Bool {\n    var x = 1\n    let y = (x + 2) and true\n    y\n}\n",
+            "pub fn literal_var_cmp_param(value: I32) -> Bool {\n    var x = 1\n    let y = x < value\n    y\n}\n",
+            "pub fn literal_var_cmp_bool(value: Bool) -> I32 {\n    var x = 1\n    let y = x < value\n    0\n}\n",
+            "pub fn literal_var_repeat_assign_op(value: I32) -> I32 {\n    var x = 0\n    x += value\n    x += value\n    x\n}\n",
+            "pub fn literal_var_rem_path(value: I32) -> I32 {\n    var x = 1\n    let y = x % value\n    y\n}\n",
+            "pub fn literal_var_rem_literal() -> I32 {\n    var x = 1\n    let y = x % 3\n    y\n}\n",
+            "pub fn literal_var_wrap_path(value: I32) -> I32 {\n    var x = 1\n    let y = x +% value\n    y\n}\n",
+            "pub fn literal_var_rem_assign(value: I32) -> I32 {\n    var x = 0\n    x %= value\n    x\n}\n",
+            "pub fn literal_var_wrap_assign(value: I32) -> I32 {\n    var x = 0\n    x +%= value\n    x\n}\n",
+            "pub fn literal_var_rem_float(value: F32) -> I32 {\n    var x = 0.5\n    let y = x % value\n    0\n}\n",
+            "pub fn literal_var_bit_and_path(value: I32) -> I32 {\n    var x = 1\n    let y = x & value\n    y\n}\n",
+            "pub fn literal_var_bit_or_literal() -> I32 {\n    var x = 1\n    let y = x | 4\n    y\n}\n",
+            "pub fn literal_var_bit_xor_assign(value: I32) -> I32 {\n    var x = 0\n    x ^= value\n    x\n}\n",
+            "pub fn literal_var_rhs_arith(value: I32) -> I32 {\n    var x = 1\n    let y = value + x\n    y\n}\n",
+            "pub fn literal_var_rhs_rem(value: I32) -> I32 {\n    var x = 1\n    let y = value % x\n    y\n}\n",
+            "pub fn literal_var_rhs_wrap(value: I32) -> I32 {\n    var x = 1\n    let y = value +% x\n    y\n}\n",
+            "pub fn literal_var_rhs_bit(value: I32) -> I32 {\n    var x = 1\n    let y = value & x\n    y\n}\n",
+            "pub fn literal_var_rhs_float(value: I32) -> I32 {\n    var x = 0.5\n    let y = value + x\n    y\n}\n",
+            "pub fn literal_var_merge_assign() -> I32 {\n    var x = 0\n    var y = 2\n    x += y\n    x\n}\n",
+            "pub fn literal_var_merge_annotated() -> I8 {\n    var x = 1\n    var y = 2\n    let z: I8 = x + y\n    z\n}\n",
+            "pub fn literal_var_merge_family() -> I32 {\n    var x = 1\n    var y = 2.5\n    let z = x + y\n    z\n}\n",
+            "pub fn literal_var_pair_bool() -> Bool {\n    var a = true\n    var b = false\n    a + b\n}\n",
+            "pub fn literal_var_cmp_bool_pair() -> Bool {\n    var a = true\n    var b = false\n    a < b\n}\n",
+            "pub fn literal_var_assign_float_rem() -> F64 {\n    var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n}\n",
+            "pub fn literal_var_merge_cycle() -> I32 {\n    var a = 0\n    var b = 0\n    a += b\n    b += a\n    a\n}\n",
+            "pub fn literal_var_merge_block_scope(flag: Bool) -> I32 {\n    var a = 1\n    if flag {\n        var b = 2\n        a += b\n    }\n    a\n}\n",
+            "pub fn literal_var_merge_pending_neg() -> U8 {\n    var x = 1\n    var y = 2\n    let n = -x\n    let s = y + x\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77283,7 +77667,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 20);
+        assert_eq!(owners.len(), 60);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77343,6 +77727,55 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed: {check:?}"
             );
         }
+        for index in [20, 21, 22] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a literal-variable operand pair is checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the literal-operand merge: {check:?}"
+            );
+        }
+        for index in [
+            23, 25, 26, 27, 28, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49,
+            51, 52, 55, 58,
+        ] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a literal-variable comparison is checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
+            );
+        }
+        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 57] {
+            assert!(
+                matches!(
+                    owners[index]
+                        .body_type_check()
+                        .expect("a literal-variable operand boundary stays gated"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "function owner {index} unexpectedly passed the literal-operand merge boundary"
+            );
+        }
+        // `x` merges under `y` at `y + x`, so the merge child precedes its
+        // parent in declaration order — a per-index deferred pass would
+        // skip the child's pending `-x` diagnostic.
+        assert!(
+            matches!(
+                owners[59]
+                    .body_type_check()
+                    .expect("a merged deferred-neg site is diagnosed"),
+                FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code
+                            == sai_diagnostics::Code::OperatorNotSupported)
+            ),
+            "a deferred `-x` on a merge child declared before its parent must still error: {:?}",
+            owners[59].body_type_check()
+        );
         for index in [13, 14, 17] {
             assert!(
                 matches!(
@@ -77352,6 +77785,109 @@ property "shared"() {}
                     FunctionBodyTypeCheck::Unsupported
                 ),
                 "function owner {index} should remain gated"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_control_flow_initializers() {
+        let root = concat!(
+            "pub fn annotated_if(flag: Bool) -> I32 {\n    let x: I32 = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn annotated_match(value: I32) -> I32 {\n    let x: I32 = match value { 0 => 1, _ => 2 }\n    x\n}\n",
+            "pub fn assign_if(flag: Bool) -> I32 {\n    var x: I32 = 0\n    x = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn assign_match(value: I32) -> I32 {\n    var x: I32 = 0\n    x = match value { 0 => 1, _ => 2 }\n    x\n}\n",
+            "pub fn nested(flag: Bool, value: I32) -> I32 {\n    let x: I32 = if flag { match value { 0 => 1, _ => 2 } } else { 3 }\n    x\n}\n",
+            "pub fn branch_stmts(flag: Bool) -> I32 {\n    let x: I32 = if flag { let t: I32 = 1\n t } else { 2 }\n    x\n}\n",
+            "pub fn concrete_branches(flag: Bool, a: I32, b: I32) -> Bool {\n    let x: I32 = if flag { a } else { b }\n    flag\n}\n",
+            "pub fn concrete_mismatch(flag: Bool, a: I32, b: I32) -> Bool {\n    let x: U8 = if flag { a } else { b }\n    flag\n}\n",
+            "pub fn branch_mismatch(flag: Bool) -> Bool {\n    let x: Bool = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn assign_mismatch(flag: Bool) -> Bool {\n    var x: Bool = true\n    x = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn unannotated_if(flag: Bool) -> I32 {\n    let x = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn unannotated_match(value: I32) -> I32 {\n    let x = match value { 0 => 1, _ => 2 }\n    x\n}\n",
+            "pub fn unannotated_out_of_range(flag: Bool) -> U8 {\n    let x = if flag { 300 } else { 2 }\n    x\n}\n",
+            "pub fn if_no_else(flag: Bool) -> I32 {\n    let x: I32 = if flag { 1 }\n    x\n}\n",
+            "pub fn literal_var_assign(flag: Bool) -> I32 {\n    var x = 0\n    x = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn mixed_branch_kinds(flag: Bool) -> I32 {\n    let x = if flag { 1 } else { 1.0 }\n    x\n}\n",
+            "pub fn nonliteral_branch(flag: Bool, a: I32) -> I32 {\n    let x = if flag { 1 } else { a }\n    x\n}\n",
+            "pub fn third_literal_site(value: I32) -> I32 {\n    let x = match value { 0 => 1, 1 => 2, _ => 3 }\n    x\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 18);
+
+        for index in 0..7 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("annotated if/match initializers are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the slice: {check:?}"
+            );
+        }
+        // `branch_mismatch` reports both arm/branch bodies against `Bool`;
+        // `concrete_mismatch`/`assign_mismatch` do the same through the
+        // annotation/place type rather than the return type.
+        for index in [7, 8, 9] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("mismatched branch bodies are diagnosed");
+            assert!(
+                matches!(
+                    check,
+                    FunctionBodyTypeCheck::Supported { diagnostics }
+                        if diagnostics.len() == 2
+                            && diagnostics
+                                .iter()
+                                .all(|diagnostic| diagnostic.code
+                                    == sai_diagnostics::Code::TypeMismatch)
+                ),
+                "function owner {index} should report two branch diagnostics: {check:?}"
+            );
+        }
+        // Unannotated literal-join initializers resolve the shared variable
+        // at the `x` tail; the out-of-range join reports the deferred error.
+        for index in [10, 11] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("literal-join initializers are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the slice: {check:?}"
+            );
+        }
+        let check = owners[12]
+            .body_type_check()
+            .expect("the out-of-range join is diagnosed");
+        assert!(
+            matches!(
+                check,
+                FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code
+                            == sai_diagnostics::Code::LiteralOutOfRange)
+            ),
+            "function owner 12 should report a deferred out-of-range diagnostic: {check:?}"
+        );
+        for index in 13..18 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("unannotated and non-exhaustive forms are gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} should remain gated: {check:?}"
             );
         }
     }
@@ -77380,6 +77916,27 @@ property "shared"() {}
             "pub fn sibling_leak(value: I32) -> I32 {\n    match value { n => 0, _ => n }\n}\n",
             "pub fn stmt_match(value: I32) -> Bool {\n    match value { 0 => 1, _ => 2 }\n    true\n}\n",
             "pub fn annotated_arm_branch(value: I32, flag: Bool) -> I32 {\n    match value { 0 => if flag { let x: I32 = 1\n x } else { 2 }, _ => 3 }\n}\n",
+            "pub fn or_with_binding(value: I32) -> I32 {\n    match value { 0 | n => 1, _ => 0 }\n}\n",
+            "pub fn or_mismatch(value: I32) -> I32 {\n    match value { 0 | true => 1, _ => 0 }\n}\n",
+            "pub fn open_range(value: I32) -> I32 {\n    match value { 1.. => 1, _ => 0 }\n}\n",
+            "pub fn range_mismatch(value: I32) -> I32 {\n    match value { 1..='a' => 1, _ => 0 }\n}\n",
+            "pub fn guarded_no_catch_all(value: I32) -> I32 {\n    match value { n if n > 0 => 1 }\n}\n",
+            "pub fn guarded_literal(value: I32) -> I32 {\n    match value { 0 if value > 1 => 1, _ => 0 }\n}\n",
+            "pub fn empty_range(value: I32) -> I32 {\n    match value { 5..=1 => 1, _ => 0 }\n}\n",
+            "pub fn negated_range_bound(value: I32) -> I32 {\n    match value { -170141183460469231731687303715884105728..=1 => 1, _ => 0 }\n}\n",
+            "pub fn negated_zero_bound(value: I32) -> I32 {\n    match value { 0..=-0 => 1, _ => 0 }\n}\n",
+            "pub fn unreachable_binding(value: I32) -> I32 {\n    match value { _ => 0, n => n + 1 }\n}\n",
+            "pub fn stmt_if(flag: Bool) -> I32 {\n    var x: I32 = 0\n    if flag { x = 1 }\n    x\n}\n",
+            "pub fn stmt_if_else(flag: Bool) -> I32 {\n    var x: I32 = 0\n    if flag { x = 1 } else if flag { x = 2 } else { x = 3 }\n    x\n}\n",
+            "pub fn stmt_match(value: I32) -> I32 {\n    var x: I32 = 0\n    match value { 0 => { x = 1 }, _ => {} }\n    x\n}\n",
+            "pub fn stmt_if_value_tail(flag: Bool) -> I32 {\n    var x: I32 = 0\n    if flag { x = 1\n 5 }\n    x\n}\n",
+            "pub fn stmt_match_value_body(value: I32) -> I32 {\n    match value { _ => 1 }\n    0\n}\n",
+            "pub fn guarded_bool_nonexhaustive(flag: Bool) -> I32 {\n    match flag { true if flag => 1, false => 0 }\n}\n",
+            "pub fn stmt_float_mod(flag: Bool) -> I32 {\n    var x: F32 = 0.0\n    if flag { x %= 2.0 }\n    0\n}\n",
+            "pub fn guarded_wild_nonexhaustive(flag: Bool) -> I32 {\n    match flag { _ if flag => 1 }\n}\n",
+            "pub fn guarded_wild_then_catchall(flag: Bool) -> I32 {\n    match flag { _ if flag => 1, _ => 0 }\n}\n",
+            "pub fn assign_op_literal_var() -> I32 {\n    var x = 1\n    x += 2\n    x\n}\n",
+            "pub fn assign_op_literal_var_mismatch(flag: Bool) -> I32 {\n    var x = 1\n    x += flag\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77395,9 +77952,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 21);
+        assert_eq!(owners.len(), 42);
 
-        for index in [0, 1, 2, 3, 4, 5, 6, 17, 20] {
+        for index in [
+            0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 26, 29, 31, 32, 33, 39, 40,
+        ] {
             let check = owners[index]
                 .body_type_check()
                 .expect("supported match-tail shapes are checked");
@@ -77406,7 +77965,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the match-tail slice: {check:?}"
             );
         }
-        for index in [7, 8] {
+        for index in [7, 8, 10, 14, 22, 24, 25, 27, 28, 30, 36, 38] {
             let check = owners[index]
                 .body_type_check()
                 .expect("mismatched match patterns are diagnosed");
@@ -77419,11 +77978,25 @@ property "shared"() {}
                                 diagnostics[0].code,
                                 sai_diagnostics::Code::TypeMismatch
                                     | sai_diagnostics::Code::LiteralOutOfRange
+                                    | sai_diagnostics::Code::EmptyRangePattern
+                                    | sai_diagnostics::Code::NonExhaustiveMatch
+                                    | sai_diagnostics::Code::UnreachablePattern
                             )
                 ),
                 "function owner {index} should report one pattern diagnostic: {check:?}"
             );
         }
+        // A statement-anchored error inside a nested statement block still
+        // reaches the public result — `x %= 2.0` anchors to the `AssignOp`
+        // statement's own id.
+        assert!(matches!(
+            owners[37]
+                .body_type_check()
+                .expect("statement-position compound-assign errors are diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported
+        ));
         // `arm_type_mismatch` checks every arm body independently, so both
         // literal arm bodies report the `Bool` return-type mismatch.
         assert!(matches!(
@@ -77438,7 +78011,7 @@ property "shared"() {}
         ));
         // `stmt_match` stays gated: statement-position `match` discards its
         // arm values, so unifying them with the return type would be wrong.
-        for index in [10, 11, 12, 13, 14, 15, 16, 18, 19] {
+        for index in [15, 18, 19, 21, 23, 34, 35, 41] {
             let check = owners[index]
                 .body_type_check()
                 .expect("match shapes outside the slice are gated");
@@ -77464,6 +78037,7 @@ property "shared"() {}
             "pub fn rem_float() -> F32 {\n    var x: F32 = 0.0\n    x %= 2.0\n    x\n}\n",
             "pub fn nested_rhs(left: I32, right: I32) -> I32 {\n    var x: I32 = 0\n    x += left + right\n    x\n}\n",
             "pub fn unary_rhs() -> I32 {\n    var x: I32 = 0\n    var y: I32 = 1\n    x += -y\n    x\n}\n",
+            "pub fn unannotated_float_mod() -> F64 {\n    var x = 1.0\n    x %= 2.0\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77479,9 +78053,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 12);
+        assert_eq!(owners.len(), 13);
 
-        for index in 0..4 {
+        for index in [0, 1, 2, 3, 7] {
             let check = owners[index]
                 .body_type_check()
                 .expect("supported compound-assignment shapes are checked");
@@ -77514,12 +78088,20 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported
         ));
+        assert!(matches!(
+            owners[12]
+                .body_type_check()
+                .expect("float remainder on a literal var is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported
+        ));
         // `x += flag` gates exactly like `let t = x + flag`: a Bool operand
         // is outside the admitted arithmetic shapes, so the desugared
         // assignment is equivalently unsupported rather than diagnosed. The
         // nested-expression and unary right operands follow operand
         // admission and stay gated with the other unresolved shapes.
-        for index in [6, 7, 8, 10, 11] {
+        for index in [6, 8, 10, 11] {
             assert!(
                 matches!(
                     owners[index]
@@ -77758,7 +78340,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the supported comparison slice: {check:?}"
             );
         }
-        for index in [38, 40] {
+        for index in [29, 31, 32, 38, 40, 45] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77802,7 +78384,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [27, 28, 29, 31, 32, 39, 42, 44, 45, 46] {
+        for index in [27, 28, 39, 42, 44, 46] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77875,7 +78457,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the mixed condition slice: {check:?}"
             );
         }
-        for index in [13, 14, 15, 16, 17, 26, 28, 29, 30, 32] {
+        for index in [13, 14, 15, 16, 17, 22, 23, 26, 28, 29, 30, 32] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a nested logical or extra-parameter condition is checked");
@@ -77917,7 +78499,7 @@ property "shared"() {}
                 "function owner {index} should report one comparison mismatch: {check:?}"
             );
         }
-        for index in [22, 23, 24] {
+        for index in [24] {
             let check = owners[index]
                 .body_type_check()
                 .expect("unsupported nested condition form is gated");

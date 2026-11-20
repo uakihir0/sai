@@ -11,7 +11,7 @@ use crate::ty::TyInterner;
 use sai_hir::body::Body;
 use sai_hir::expressions::{Arm, BinOp, Block, Expr, ExprKind, MatchSource, Stmt, StmtKind, UnOp};
 use sai_hir::literals::Lit;
-use sai_hir::patterns::{BindingMode, PatKind};
+use sai_hir::patterns::{BindingMode, PatKind, PatRangeEnd};
 use sai_hir::types::PathRoot;
 use sai_hir::{BindingId, HirId, OwnerId, Safety};
 use sai_intern::Interner;
@@ -178,6 +178,9 @@ pub enum PrimitiveBodyErrorKind {
     },
     AssignToImmutable,
     InvalidAssignTarget,
+    EmptyRangePattern,
+    NonExhaustiveMatch,
+    UnreachablePattern,
 }
 
 /// An operand description for an unsupported primitive operator diagnostic.
@@ -253,6 +256,9 @@ struct LiteralVariable<'hir> {
     kind: PrimitiveLiteralKind,
     origin: HirId,
     additional_site: Option<LiteralSite<'hir>>,
+    /// `x + y`-style operands merge two variables: a child resolves to
+    /// whatever type its parent resolves to.
+    merged_with: Option<usize>,
     resolved: Option<PrimTy>,
     pending_operator_traits: Vec<PendingOperatorTraitSite>,
     pending_neg_traits: Vec<PendingNegTraitSite>,
@@ -1035,6 +1041,33 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Err(());
             };
             if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                && matches!(
+                    kind,
+                    PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                )
+            {
+                if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+                    let Some(variable) = self.literal_variables.get(id) else {
+                        return Err(());
+                    };
+                    if variable.resolved.is_none() {
+                        match (kind, variable.kind) {
+                            (PrimitiveLiteralKind::Integer, PrimitiveLiteralKind::Integer) => {
+                                self.add_integer_literal_constraint(id, literal, left.hir_id)?;
+                            }
+                            (
+                                PrimitiveLiteralKind::FloatingPoint,
+                                PrimitiveLiteralKind::FloatingPoint,
+                            ) => {
+                                self.add_float_literal_constraint(id, literal, left.hir_id)?;
+                            }
+                            _ => return Err(()),
+                        }
+                        return Ok(LocalType::LiteralVariable(id));
+                    }
+                }
+            }
+            if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
                 && kind == PrimitiveLiteralKind::Integer
                 && matches!(right.kind, ExprKind::Lit(Lit::Int { .. }))
             {
@@ -1080,11 +1113,80 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             };
         }
 
-        let left_type = self
-            .check_local_path(left)
-            .ok()
-            .and_then(|local_type| self.concrete_local_type(local_type))
-            .ok_or(())?;
+        let left_local_type = self.check_local_path(left).ok().ok_or(())?;
+        let unresolved_literal_variable = matches!(left_local_type, LocalType::LiteralVariable(id)
+            if self
+                .literal_variables
+                .get(id)
+                .is_some_and(|variable| variable.resolved.is_none()));
+        if unresolved_literal_variable {
+            let LocalType::LiteralVariable(id) = left_local_type else {
+                return Err(());
+            };
+            if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                return Err(());
+            }
+            if !matches!(right.kind, ExprKind::Lit(_)) {
+                // `x op path` with a concretely typed right operand resolves
+                // the variable to the operand's type when the family admits
+                // it and the operator exists for that type pair.
+                if let Some(right_type) = self
+                    .check_local_path(right)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                {
+                    match primitive_arithmetic_result(operator, right_type, right_type) {
+                        PrimitiveArithmeticResult::Type(_) => {
+                            self.resolve_literal_variable(id, right_type)?;
+                            return Ok(left_local_type);
+                        }
+                        _ => return Err(()),
+                    }
+                }
+                // `x op y` with both sides unresolved literal variables of
+                // one kind merges them so they resolve to a single type.
+                // The left variable must be numeric: the merge defers the
+                // operator check, and `+ - * /` only exist on integer and
+                // floating-point primitives.
+                if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok()
+                    && self.literal_variables.get(id).is_some_and(|variable| {
+                        matches!(
+                            variable.kind,
+                            PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                        )
+                    })
+                {
+                    let Some(other_variable) = self.literal_variables.get(other) else {
+                        return Err(());
+                    };
+                    if other_variable.resolved.is_none() {
+                        self.merge_literal_variables(id, other)?;
+                        return Ok(left_local_type);
+                    }
+                }
+                return Err(());
+            }
+            let ExprKind::Lit(literal) = right.kind else {
+                return Err(());
+            };
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            match (variable.kind, primitive_literal_kind(literal)) {
+                (PrimitiveLiteralKind::Integer, Some(PrimitiveLiteralKind::Integer)) => {
+                    self.add_integer_literal_constraint(id, literal, right.hir_id)?;
+                }
+                (
+                    PrimitiveLiteralKind::FloatingPoint,
+                    Some(PrimitiveLiteralKind::FloatingPoint),
+                ) => {
+                    self.add_float_literal_constraint(id, literal, right.hir_id)?;
+                }
+                _ => return Err(()),
+            }
+            return Ok(left_local_type);
+        }
+        let left_type = self.concrete_local_type(left_local_type).ok_or(())?;
 
         if let ExprKind::Lit(literal) = right.kind {
             let Some(found) = primitive_literal_kind(literal) else {
@@ -1099,6 +1201,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // The built-in operator's result is determined by the synthesized
             // left operand, including after a literal type or range error.
             return Ok(LocalType::Concrete(left_type));
+        }
+
+        // `p + x` with a concretely typed left operand resolves an
+        // unresolved literal variable on the right to that type — the
+        // symmetric rule for the left-side literal-variable branch.
+        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                match primitive_arithmetic_result(operator, left_type, left_type) {
+                    PrimitiveArithmeticResult::Type(_) => {
+                        self.resolve_literal_variable(id, left_type)?;
+                        return Ok(LocalType::Concrete(left_type));
+                    }
+                    _ => return Err(()),
+                }
+            }
         }
 
         let right_type = self
@@ -1199,6 +1319,53 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Ok(local_type);
         }
 
+        // `x % path` with a concretely typed operand resolves an unresolved
+        // integer literal variable to the operand's type — the `x = x % path`
+        // desugar does the same. Float variables stay gated because the
+        // remainder has no float implementation.
+        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(left).ok() {
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                if let ExprKind::Lit(literal) = right.kind {
+                    if variable.kind != PrimitiveLiteralKind::Integer {
+                        return Err(());
+                    }
+                    self.add_integer_literal_constraint(id, literal, right.hir_id)?;
+                    return Ok(LocalType::LiteralVariable(id));
+                }
+                if let Some(right_type) = self
+                    .check_local_path(right)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                {
+                    if variable.kind != PrimitiveLiteralKind::Integer
+                        || !is_integer_primitive(right_type)
+                    {
+                        return Err(());
+                    }
+                    self.resolve_literal_variable(id, right_type)?;
+                    return Ok(LocalType::LiteralVariable(id));
+                }
+                // `x % y` merges two unresolved integer literal variables.
+                if variable.kind == PrimitiveLiteralKind::Integer
+                    && let Some(LocalType::LiteralVariable(other)) =
+                        self.check_local_path(right).ok()
+                {
+                    if self
+                        .literal_variables
+                        .get(other)
+                        .is_some_and(|v| v.resolved.is_none())
+                    {
+                        self.merge_literal_variables(id, other)?;
+                        return Ok(LocalType::LiteralVariable(id));
+                    }
+                }
+                return Err(());
+            }
+        }
+
         let left_type = self
             .check_local_path(left)
             .ok()
@@ -1220,6 +1387,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             self.check_annotated_literal(left_type, literal, found, right.hir_id);
         } else {
+            // `p % x` resolves an unresolved integer literal variable on
+            // the right to the concrete left operand's type.
+            if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+                let Some(variable) = self.literal_variables.get(id) else {
+                    return Err(());
+                };
+                if variable.resolved.is_none() {
+                    if variable.kind != PrimitiveLiteralKind::Integer
+                        || !is_integer_primitive(left_type)
+                    {
+                        return Err(());
+                    }
+                    self.resolve_literal_variable(id, left_type)?;
+                }
+            }
             let right_type = self
                 .check_local_path(right)
                 .ok()
@@ -1317,6 +1499,52 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             };
         }
 
+        // `x wrapping+ path` resolves an unresolved integer literal
+        // variable to the operand's type, as the wrapping desugar does.
+        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(left).ok() {
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                if variable.kind != PrimitiveLiteralKind::Integer {
+                    return Err(());
+                }
+                if let ExprKind::Lit(literal) = right.kind {
+                    self.add_integer_literal_constraint(id, literal, right.hir_id)?;
+                    return Ok(LocalType::LiteralVariable(id));
+                }
+                if let Some(right_type) = self
+                    .check_local_path(right)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                {
+                    return match primitive_wrapping_literal_left_result(
+                        operator,
+                        PrimitiveLiteralKind::Integer,
+                        right_type,
+                    ) {
+                        PrimitiveArithmeticResult::Type(expected) => {
+                            self.resolve_literal_variable(id, expected)?;
+                            Ok(LocalType::LiteralVariable(id))
+                        }
+                        _ => Err(()),
+                    };
+                }
+                // `x +% y` merges two unresolved integer literal variables.
+                if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok() {
+                    if self
+                        .literal_variables
+                        .get(other)
+                        .is_some_and(|v| v.resolved.is_none())
+                    {
+                        self.merge_literal_variables(id, other)?;
+                        return Ok(LocalType::LiteralVariable(id));
+                    }
+                }
+                return Err(());
+            }
+        }
+
         let left_type = self
             .check_local_path(left)
             .ok()
@@ -1336,6 +1564,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 right.hir_id,
             );
             return Ok(LocalType::Concrete(left_type));
+        }
+        // `p +% x` resolves an unresolved integer literal variable on the
+        // right to the concrete left operand's type.
+        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                if variable.kind != PrimitiveLiteralKind::Integer
+                    || !is_integer_primitive(left_type)
+                {
+                    return Err(());
+                }
+                self.resolve_literal_variable(id, left_type)?;
+            }
         }
         let right_type = self
             .check_local_path(right)
@@ -1647,6 +1890,50 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             };
         }
 
+        // `x & path` resolves an unresolved integer literal variable to the
+        // operand's type; a literal right side joins it as a constraint
+        // site. Bool and float variables stay gated — they have no bitwise
+        // operators to fall back on.
+        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(left).ok() {
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                if variable.kind != PrimitiveLiteralKind::Integer {
+                    return Err(());
+                }
+                if let ExprKind::Lit(literal) = right.kind {
+                    self.add_integer_literal_constraint(id, literal, right.hir_id)?;
+                    return Ok(LocalType::LiteralVariable(id));
+                }
+                if let Some(right_type) = self
+                    .check_local_path(right)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                {
+                    return match primitive_bitwise_literal_left_result(operator, right_type) {
+                        PrimitiveArithmeticResult::Type(expected) => {
+                            self.resolve_literal_variable(id, expected)?;
+                            Ok(LocalType::LiteralVariable(id))
+                        }
+                        _ => Err(()),
+                    };
+                }
+                // `x & y` merges two unresolved integer literal variables.
+                if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok() {
+                    if self
+                        .literal_variables
+                        .get(other)
+                        .is_some_and(|v| v.resolved.is_none())
+                    {
+                        self.merge_literal_variables(id, other)?;
+                        return Ok(LocalType::LiteralVariable(id));
+                    }
+                }
+                return Err(());
+            }
+        }
+
         let left_type = self
             .check_local_path(left)
             .ok()
@@ -1776,6 +2063,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     return Ok(LocalType::Concrete(left_type));
                 }
                 _ => return Err(()),
+            }
+        }
+
+        // `p & x` resolves an unresolved integer literal variable on the
+        // right to the concrete left operand's type.
+        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                if variable.kind != PrimitiveLiteralKind::Integer
+                    || (!is_integer_primitive(left_type) && left_type != PrimTy::Byte)
+                {
+                    return Err(());
+                }
+                self.resolve_literal_variable(id, left_type)?;
             }
         }
 
@@ -1940,6 +2243,81 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Lit(literal) => primitive_literal_kind(literal).map(|kind| (literal, kind)),
             _ => None,
         };
+
+        // An unresolved literal variable compared to a same-family literal
+        // joins the literal as a constraint site on the variable, like the
+        // arithmetic operand slice; the comparison itself yields Bool. Only
+        // comparison operators take this path — `check_logical_operand`
+        // routes every binary operand here, so an arithmetic `x + 2` must
+        // keep its out-of-slice behavior rather than claim a Bool result.
+        if !matches!(
+            operator,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        ) {
+            return Err(());
+        }
+        for (local_type, literal_expression, literal_entry) in [
+            (self.check_local_path(left).ok(), right, right_literal),
+            (self.check_local_path(right).ok(), left, left_literal),
+        ] {
+            let Some(LocalType::LiteralVariable(id)) = local_type else {
+                continue;
+            };
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_some() {
+                continue;
+            }
+            let Some((literal, kind)) = literal_entry else {
+                // `x < path` with a concretely typed operand resolves the
+                // variable to the operand's type when the comparison is
+                // defined for the pair — the same rule the arithmetic
+                // operand slice uses.
+                if let Some(path_type) = self
+                    .check_local_path(literal_expression)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                {
+                    match primitive_comparison_result(operator, path_type, path_type) {
+                        PrimitiveComparisonResult::Bool => {
+                            self.resolve_literal_variable(id, path_type)?;
+                            return Ok(LocalType::Concrete(PrimTy::Bool));
+                        }
+                        _ => return Err(()),
+                    }
+                }
+                // `x < y` merges two unresolved literal variables of one
+                // kind; the comparison yields Bool either way. Only
+                // numeric variables merge — the deferred operator check
+                // cannot reject `<` on Bool or Char once resolved.
+                if let Some(LocalType::LiteralVariable(other)) =
+                    self.check_local_path(literal_expression).ok()
+                    && matches!(
+                        variable.kind,
+                        PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                    )
+                    && self
+                        .literal_variables
+                        .get(other)
+                        .is_some_and(|v| v.resolved.is_none())
+                {
+                    self.merge_literal_variables(id, other)?;
+                    return Ok(LocalType::Concrete(PrimTy::Bool));
+                }
+                return Err(());
+            };
+            match (variable.kind, kind) {
+                (PrimitiveLiteralKind::Integer, PrimitiveLiteralKind::Integer) => {
+                    self.add_integer_literal_constraint(id, literal, literal_expression.hir_id)?;
+                }
+                (PrimitiveLiteralKind::FloatingPoint, PrimitiveLiteralKind::FloatingPoint) => {
+                    self.add_float_literal_constraint(id, literal, literal_expression.hir_id)?;
+                }
+                _ => return Err(()),
+            }
+            return Ok(LocalType::Concrete(PrimTy::Bool));
+        }
 
         match (left_path_type, right_path_type, left_literal, right_literal) {
             (Some(left_type), Some(right_type), None, None) => {
@@ -2181,6 +2559,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     kind,
                     origin,
                     additional_site: None,
+                    merged_with: None,
                     resolved: None,
                     pending_operator_traits: Vec::new(),
                     pending_neg_traits: Vec::new(),
@@ -2245,17 +2624,130 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_expr_stmt(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
-        // Statement-position `if`/`block`/`match` expressions unify their
-        // branch/arm tails with the return type, which does not apply to a
-        // discarded result, so they stay outside this slice.
-        if matches!(
-            expression.kind,
-            ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::Match { .. }
-        ) {
-            return Err(());
+        // Statement-position `if`/`match` expressions discard their result;
+        // branches and arms admit only statement blocks so the discarded
+        // value is `()` (§6.11.1). Bare `block` statements stay gated.
+        match expression.kind {
+            ExprKind::If { cond, then, els } => return self.check_if_stmt(cond, then, els),
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => return self.check_match_stmt(scrutinee, arms, source),
+            ExprKind::Block(_) => return Err(()),
+            _ => {}
         }
         let local_type = self.check_expr_value(expression, self.input.return_type)?;
         self.record_expression_type(expression.hir_id, local_type);
+        Ok(())
+    }
+
+    /// A statement-only block: every admitted statement, no tail expression.
+    /// A value tail would be a discarded non-`()` value — out of scope.
+    fn check_stmt_block(&mut self, block: &'hir Block<'hir>) -> Result<(), ()> {
+        if block.safety != Safety::Safe || block.tail.is_some() {
+            return Err(());
+        }
+        let literal_floor = self.literal_variables.len();
+        for stmt in block.stmts {
+            self.check_stmt(stmt)?;
+        }
+        self.default_unresolved_literals(literal_floor);
+        Ok(())
+    }
+
+    /// Statement-position `if`/`else if`/`else`: branches are statement-only
+    /// blocks, so the expression is `()` and an `else` is optional.
+    fn check_if_stmt(
+        &mut self,
+        condition: &'hir Expr<'hir>,
+        then: &'hir Block<'hir>,
+        els: Option<&'hir Expr<'hir>>,
+    ) -> Result<(), ()> {
+        self.check_if_condition(condition)?;
+        self.check_stmt_block(then)?;
+        match els {
+            None => Ok(()),
+            Some(els) => match els.kind {
+                ExprKind::Block(block) => self.check_stmt_block(block),
+                ExprKind::If { cond, then, els } => self.check_if_stmt(cond, then, els),
+                _ => Err(()),
+            },
+        }
+    }
+
+    /// Statement-position `match`: the same scrutinee, pattern, guard and
+    /// exhaustiveness admission as `check_match_tail`, but arm bodies must
+    /// be statement-only blocks.
+    fn check_match_stmt(
+        &mut self,
+        scrutinee: &'hir Expr<'hir>,
+        arms: &'hir [Arm<'hir>],
+        source: MatchSource,
+    ) -> Result<(), ()> {
+        if !matches!(source, MatchSource::Normal) {
+            return Err(());
+        }
+        let ExprKind::Path(_) = scrutinee.kind else {
+            return Err(());
+        };
+        let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
+            return Err(());
+        };
+        let mut catch_all = false;
+        let mut bool_cover = (false, false);
+        let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
+        for arm in arms {
+            let check_body = |this: &mut Self| -> Result<(), ()> {
+                let ExprKind::Block(block) = arm.body.kind else {
+                    return Err(());
+                };
+                this.check_stmt_block(block)
+            };
+            if catch_all {
+                self.errors.push(PrimitiveBodyError {
+                    node: arm.pat.hir_id,
+                    kind: PrimitiveBodyErrorKind::UnreachablePattern,
+                });
+                if let PatKind::Binding {
+                    mode: BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } = arm.pat.kind
+                {
+                    arm_binding = Some((
+                        binding,
+                        self.known_bindings
+                            .insert(binding, LocalType::Concrete(scrutinee_type)),
+                    ));
+                }
+                let body_result = check_body(self);
+                self.restore_arm_binding(&mut arm_binding);
+                body_result?;
+                continue;
+            }
+            self.check_match_arm_pattern(
+                arm,
+                scrutinee_type,
+                &mut catch_all,
+                &mut bool_cover,
+                &mut arm_binding,
+            )?;
+            let body_result = arm
+                .guard
+                .map(|guard| self.check_if_condition(guard))
+                .unwrap_or(Ok(()))
+                .and_then(|_| check_body(self));
+            self.restore_arm_binding(&mut arm_binding);
+            body_result?;
+        }
+        if !catch_all && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true)) {
+            self.errors.push(PrimitiveBodyError {
+                node: scrutinee.hir_id,
+                kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
+            });
+        }
         Ok(())
     }
 
@@ -2510,11 +3002,152 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let Some((place_type,)) = self.assign_place(lhs)? else {
             return Ok(());
         };
-        // Compound assignment still requires a concrete place type —
-        // `var x = 1; x += 2` needs the operation over an unresolved
-        // literal variable, which stays gated for now.
+        // A resolved literal variable checks like its concrete type, so a
+        // second `x op= e` after an earlier statement resolved `x` keeps
+        // working.
+        let place_type = match self.concrete_local_type(place_type) {
+            Some(concrete) => LocalType::Concrete(concrete),
+            None => place_type,
+        };
         let LocalType::Concrete(place_type) = place_type else {
-            return Err(());
+            let LocalType::LiteralVariable(id) = place_type else {
+                return Err(());
+            };
+            // `x op= literal` on an unresolved literal variable desugars
+            // to `x = x op literal`: the result keeps the variable, so the
+            // literal becomes another constraint site on it, exactly as
+            // `x = literal` does. Path right-hand sides and shifts —
+            // where the right operand's type is independent of the
+            // place's — stay gated.
+            if !matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Rem
+                    | BinOp::WrapAdd
+                    | BinOp::WrapSub
+                    | BinOp::WrapMul
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+            ) {
+                return Err(());
+            }
+            if !matches!(rhs.kind, ExprKind::Lit(_)) {
+                // `x op= path` with a concretely typed right operand
+                // resolves the variable to the operand's type when the
+                // family admits it and the operator exists for that type
+                // pair — the `x = x op path` desugar does the same. With an
+                // unresolved literal-variable right side the two variables
+                // merge instead, like `x op y` in an initializer.
+                let right_type = self
+                    .check_local_path(rhs)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type));
+                if right_type.is_none() {
+                    // The merged pair resolves without an operator check,
+                    // so the place's kind must admit the operator for every
+                    // type it could resolve to: `+ - * /` on numeric
+                    // primitives, the rest on integers only.
+                    let kind_eligible =
+                        self.literal_variables
+                            .get(id)
+                            .is_some_and(|variable| match op {
+                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => matches!(
+                                    variable.kind,
+                                    PrimitiveLiteralKind::Integer
+                                        | PrimitiveLiteralKind::FloatingPoint
+                                ),
+                                _ => variable.kind == PrimitiveLiteralKind::Integer,
+                            });
+                    if kind_eligible
+                        && let Some(LocalType::LiteralVariable(other)) =
+                            self.check_local_path(rhs).ok()
+                        && self
+                            .literal_variables
+                            .get(other)
+                            .is_some_and(|v| v.resolved.is_none())
+                    {
+                        self.merge_literal_variables(id, other)?;
+                        self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
+                        self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+                        self.record_expression_type(stmt_id, LocalType::LiteralVariable(id));
+                        return Ok(());
+                    }
+                    return Err(());
+                }
+                let right_type = right_type.unwrap();
+                let resolved_type = match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        match primitive_arithmetic_result(op, right_type, right_type) {
+                            PrimitiveArithmeticResult::Type(result) => result,
+                            _ => return Err(()),
+                        }
+                    }
+                    BinOp::Rem => {
+                        if !is_integer_primitive(right_type) {
+                            return Err(());
+                        }
+                        right_type
+                    }
+                    BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
+                        match primitive_wrapping_literal_left_result(
+                            op,
+                            PrimitiveLiteralKind::Integer,
+                            right_type,
+                        ) {
+                            PrimitiveArithmeticResult::Type(result) => result,
+                            _ => return Err(()),
+                        }
+                    }
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                        match primitive_bitwise_literal_left_result(op, right_type) {
+                            PrimitiveArithmeticResult::Type(result) => result,
+                            _ => return Err(()),
+                        }
+                    }
+                    _ => return Err(()),
+                };
+                self.resolve_literal_variable(id, resolved_type)?;
+                self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
+                self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+                self.record_expression_type(stmt_id, LocalType::LiteralVariable(id));
+                return Ok(());
+            }
+            let ExprKind::Lit(literal) = rhs.kind else {
+                return Err(());
+            };
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            match variable.kind {
+                PrimitiveLiteralKind::Integer => {
+                    self.add_integer_literal_constraint(id, literal, rhs.hir_id)?;
+                }
+                PrimitiveLiteralKind::FloatingPoint => {
+                    // Remainder, wrapping, and bitwise operators have no
+                    // float implementation; the desugared `x = x op lit`
+                    // reports the operator, and the literal still joins the
+                    // variable as a constraint site.
+                    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                        self.report_operator_not_supported(
+                            stmt_id,
+                            op,
+                            PrimitiveOperatorOperand::FloatingPointLiteral,
+                        );
+                    }
+                    self.add_float_literal_constraint(id, literal, rhs.hir_id)?;
+                }
+                PrimitiveLiteralKind::Bool
+                | PrimitiveLiteralKind::Byte
+                | PrimitiveLiteralKind::Character => return Err(()),
+            }
+            self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
+            self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+            self.record_expression_type(stmt_id, LocalType::LiteralVariable(id));
+            return Ok(());
         };
         let result = match op {
             BinOp::Add
@@ -2599,27 +3232,28 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 // Annotated `if`/`match` initializers check each branch/arm
                 // body against the annotation through the shared
-                // expected-type path; unannotated forms stay gated since
-                // joining the branches' literal variables is a wider
-                // inference question.
-                ExprKind::If { cond, then, els } => {
-                    let Some(expected) = annotation else {
-                        return Err(());
-                    };
-                    self.check_if_tail(cond, then, els, expected)?;
-                    LocalType::Concrete(expected)
-                }
+                // expected-type path. Unannotated forms join the branch/arm
+                // literal tails as sites of one shared literal variable —
+                // the `var x = 1; x = 2` join — so the local resolves later
+                // through the usual tail/annotation path.
+                ExprKind::If { cond, then, els } => match annotation {
+                    Some(expected) => {
+                        self.check_if_tail(cond, then, els, expected)?;
+                        LocalType::Concrete(expected)
+                    }
+                    None => self.check_literal_join_if(cond, then, els)?,
+                },
                 ExprKind::Match {
                     scrutinee,
                     arms,
                     source,
-                } => {
-                    let Some(expected) = annotation else {
-                        return Err(());
-                    };
-                    self.check_match_tail(scrutinee, arms, source, expected)?;
-                    LocalType::Concrete(expected)
-                }
+                } => match annotation {
+                    Some(expected) => {
+                        self.check_match_tail(scrutinee, arms, source, expected)?;
+                        LocalType::Concrete(expected)
+                    }
+                    None => self.check_literal_join_match(scrutinee, arms, source)?,
+                },
                 ExprKind::Field { .. } => {
                     let Some(field_type) = self
                         .input
@@ -2865,80 +3499,368 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         };
         let mut catch_all = false;
+        // Bool literal coverage: `match flag { true => …, false => … }` is
+        // exhaustive without a catch-all (§6.22).
+        let mut bool_cover = (false, false);
         let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
         for arm in arms {
-            if catch_all || arm.guard.is_some() {
-                return Err(());
-            }
-            match arm.pat.kind {
-                PatKind::Lit(literal) => {
-                    let Some(kind) = primitive_literal_kind(literal) else {
-                        return Err(());
-                    };
-                    match check_primitive_literal(
-                        scrutinee_type,
-                        literal,
-                        self.input.symbols,
-                        self.input.pointer_width,
-                    ) {
-                        PrimitiveLiteralResult::Match => {}
-                        PrimitiveLiteralResult::OutOfRange => {
-                            self.errors.push(PrimitiveBodyError {
-                                node: arm.pat.hir_id,
-                                kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                                    expected: scrutinee_type,
-                                    found: kind,
-                                },
-                            });
-                        }
-                        PrimitiveLiteralResult::TypeMismatch => {
-                            self.errors.push(PrimitiveBodyError {
-                                node: arm.pat.hir_id,
-                                kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                                    expected: scrutinee_type,
-                                    found: kind,
-                                },
-                            });
-                        }
-                    }
-                }
-                PatKind::Wild => catch_all = true,
-                PatKind::Binding {
+            if catch_all {
+                // An arm after an unguarded catch-all can never match
+                // (§6.22.4): diagnose but still check its body — the arm's
+                // own pattern binding stays visible to that body.
+                self.errors.push(PrimitiveBodyError {
+                    node: arm.pat.hir_id,
+                    kind: PrimitiveBodyErrorKind::UnreachablePattern,
+                });
+                if let PatKind::Binding {
                     mode: BindingMode::Value,
                     binding,
                     sub: None,
                     ..
-                } => {
-                    catch_all = true;
+                } = arm.pat.kind
+                {
                     arm_binding = Some((
                         binding,
                         self.known_bindings
                             .insert(binding, LocalType::Concrete(scrutinee_type)),
                     ));
                 }
-                _ => return Err(()),
+                let body_result = self.check_expr_expected(arm.body, expected);
+                self.restore_arm_binding(&mut arm_binding);
+                body_result?;
+                continue;
             }
-            self.record_expression_type(arm.pat.hir_id, LocalType::Concrete(scrutinee_type));
+            self.check_match_arm_pattern(
+                arm,
+                scrutinee_type,
+                &mut catch_all,
+                &mut bool_cover,
+                &mut arm_binding,
+            )?;
             // Arm patterns bind only inside their arm body — restore the
             // previous binding (or its absence) so sibling arms and the
-            // enclosing scope never observe the arm-local name.
-            let body_result = self.check_expr_expected(arm.body, expected);
-            if let Some((binding, previous)) = arm_binding.take() {
-                match previous {
-                    Some(previous) => {
-                        self.known_bindings.insert(binding, previous);
-                    }
-                    None => {
-                        self.known_bindings.remove(&binding);
-                    }
-                }
-            }
+            // enclosing scope never observe the arm-local name. A guard
+            // runs inside the same scope with the binding installed.
+            let body_result = arm
+                .guard
+                .map(|guard| self.check_if_condition(guard))
+                .unwrap_or(Ok(()))
+                .and_then(|_| self.check_expr_expected(arm.body, expected));
+            self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
-        if !catch_all {
-            return Err(());
+        if !catch_all && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true)) {
+            self.errors.push(PrimitiveBodyError {
+                node: scrutinee.hir_id,
+                kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
+            });
         }
         Ok(LocalType::Concrete(expected))
+    }
+
+    /// Validates one arm's pattern under the bounded exhaustiveness rule:
+    /// literal patterns check against the scrutinee type, wildcard and plain
+    /// `binding` patterns mark the catch-all (with the binding installed at
+    /// `scrutinee_type`), guards on non-binding arms gate, and Bool literal
+    /// patterns record domain coverage in `bool_cover`.
+    fn check_match_arm_pattern(
+        &mut self,
+        arm: &'hir Arm<'hir>,
+        scrutinee_type: PrimTy,
+        catch_all: &mut bool,
+        bool_cover: &mut (bool, bool),
+        arm_binding: &mut Option<(BindingId, Option<LocalType>)>,
+    ) -> Result<(), ()> {
+        match arm.pat.kind {
+            PatKind::Lit(literal) => {
+                // A guarded arm cannot fail its pattern but its guard may,
+                // so it does not count toward Bool-domain coverage.
+                if arm.guard.is_none() {
+                    if let Lit::Bool(value) = literal {
+                        if value {
+                            bool_cover.0 = true;
+                        } else {
+                            bool_cover.1 = true;
+                        }
+                    }
+                }
+                self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?
+            }
+            // `l1 | l2 | …` alternatives must all be literals — a binding or
+            // wildcard inside an or-pattern is outside this slice. Diagnosing
+            // at the arm pattern's node keeps the taint walk keyed on
+            // `arm.pat.hir_id` correct.
+            PatKind::Or(alternatives) => {
+                if alternatives.is_empty() {
+                    return Err(());
+                }
+                for alternative in alternatives {
+                    let PatKind::Lit(literal) = alternative.kind else {
+                        return Err(());
+                    };
+                    if arm.guard.is_none() {
+                        if let Lit::Bool(value) = literal {
+                            if value {
+                                bool_cover.0 = true;
+                            } else {
+                                bool_cover.1 = true;
+                            }
+                        }
+                    }
+                    self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?;
+                }
+            }
+            // `l1..=l2` bounds must both be literals — open ranges and
+            // non-literal bounds stay gated. Diagnosing at the arm
+            // pattern's node keeps the taint walk keyed on
+            // `arm.pat.hir_id` correct.
+            PatKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                for bound in [start, end] {
+                    let Some(PatRangeEnd::Lit(literal)) = bound else {
+                        return Err(());
+                    };
+                    self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?;
+                }
+                // §6.21.3: `a ≤ b` for `..=`, `a < b` for `..` — an empty
+                // range is `EMPTY_RANGE_PATTERN`.
+                if literal_range_is_empty(&start, &end, inclusive) == Some(true) {
+                    self.errors.push(PrimitiveBodyError {
+                        node: arm.pat.hir_id,
+                        kind: PrimitiveBodyErrorKind::EmptyRangePattern,
+                    });
+                }
+            }
+            PatKind::Wild => *catch_all = arm.guard.is_none(),
+            PatKind::Binding {
+                mode: BindingMode::Value,
+                binding,
+                sub: None,
+                ..
+            } => {
+                // A guarded binding arm is not a catch-all — the guard may
+                // fail, so an unguarded catch-all arm is still required.
+                *catch_all = arm.guard.is_none();
+                *arm_binding = Some((
+                    binding,
+                    self.known_bindings
+                        .insert(binding, LocalType::Concrete(scrutinee_type)),
+                ));
+            }
+            _ => return Err(()),
+        }
+        self.record_expression_type(arm.pat.hir_id, LocalType::Concrete(scrutinee_type));
+        Ok(())
+    }
+
+    fn check_match_literal_pattern(
+        &mut self,
+        literal: Lit<'hir>,
+        node: HirId,
+        scrutinee_type: PrimTy,
+    ) -> Result<(), ()> {
+        let Some(kind) = primitive_literal_kind(literal) else {
+            return Err(());
+        };
+        match check_primitive_literal(
+            scrutinee_type,
+            literal,
+            self.input.symbols,
+            self.input.pointer_width,
+        ) {
+            PrimitiveLiteralResult::Match => {}
+            PrimitiveLiteralResult::OutOfRange => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                        expected: scrutinee_type,
+                        found: kind,
+                    },
+                });
+            }
+            PrimitiveLiteralResult::TypeMismatch => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                        expected: scrutinee_type,
+                        found: kind,
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_arm_binding(&mut self, arm_binding: &mut Option<(BindingId, Option<LocalType>)>) {
+        if let Some((binding, previous)) = arm_binding.take() {
+            match previous {
+                Some(previous) => {
+                    self.known_bindings.insert(binding, previous);
+                }
+                None => {
+                    self.known_bindings.remove(&binding);
+                }
+            }
+        }
+    }
+
+    /// Unannotated `let x = if flag { 1 } else { 2 }` joins both branch
+    /// literal tails as sites of one shared literal variable — the
+    /// `var x = 1; x = 2` join — so the local resolves later through the
+    /// usual tail/annotation path. Only empty branches with a literal tail
+    /// are admitted: statement-bearing branches, `else if` chains, and a
+    /// missing `else` stay gated.
+    fn check_literal_join_if(
+        &mut self,
+        condition: &'hir Expr<'hir>,
+        then: &'hir Block<'hir>,
+        els: Option<&'hir Expr<'hir>>,
+    ) -> Result<LocalType, ()> {
+        let Some(els) = els else {
+            return Err(());
+        };
+        let ExprKind::Block(else_block) = els.kind else {
+            return Err(());
+        };
+        self.check_if_condition(condition)?;
+        let mut joined = None;
+        for branch in [then, else_block] {
+            let tail = Self::literal_join_branch_tail(branch)?;
+            self.join_literal_site(tail, &mut joined)?;
+        }
+        let Some(local) = joined else {
+            return Err(());
+        };
+        Ok(local)
+    }
+
+    fn literal_join_branch_tail(block: &'hir Block<'hir>) -> Result<&'hir Expr<'hir>, ()> {
+        if block.safety != Safety::Safe || !block.stmts.is_empty() {
+            return Err(());
+        }
+        let Some(tail) = block.tail else {
+            return Err(());
+        };
+        if !matches!(tail.kind, ExprKind::Lit(_)) {
+            return Err(());
+        }
+        Ok(tail)
+    }
+
+    /// Unannotated `let x = match value { 0 => 1, _ => 2 }` joins the arm
+    /// body literals as sites of one shared literal variable, like the `if`
+    /// join. Pattern and scrutinee admission mirrors `check_match_tail`;
+    /// every arm body must be a literal tail (a third literal site or a
+    /// kind mismatch gates through the shared additional-site machinery).
+    fn check_literal_join_match(
+        &mut self,
+        scrutinee: &'hir Expr<'hir>,
+        arms: &'hir [Arm<'hir>],
+        source: MatchSource,
+    ) -> Result<LocalType, ()> {
+        if !matches!(source, MatchSource::Normal) {
+            return Err(());
+        }
+        let ExprKind::Path(_) = scrutinee.kind else {
+            return Err(());
+        };
+        let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
+            return Err(());
+        };
+        let mut catch_all = false;
+        let mut bool_cover = (false, false);
+        let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
+        let mut joined = None;
+        for arm in arms {
+            if catch_all {
+                self.errors.push(PrimitiveBodyError {
+                    node: arm.pat.hir_id,
+                    kind: PrimitiveBodyErrorKind::UnreachablePattern,
+                });
+                if let PatKind::Binding {
+                    mode: BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } = arm.pat.kind
+                {
+                    arm_binding = Some((
+                        binding,
+                        self.known_bindings
+                            .insert(binding, LocalType::Concrete(scrutinee_type)),
+                    ));
+                }
+                let body_result = self.join_literal_site(arm.body, &mut joined);
+                self.restore_arm_binding(&mut arm_binding);
+                body_result?;
+                continue;
+            }
+            self.check_match_arm_pattern(
+                arm,
+                scrutinee_type,
+                &mut catch_all,
+                &mut bool_cover,
+                &mut arm_binding,
+            )?;
+            let body_result = arm
+                .guard
+                .map(|guard| self.check_if_condition(guard))
+                .unwrap_or(Ok(()))
+                .and_then(|_| self.join_literal_site(arm.body, &mut joined));
+            self.restore_arm_binding(&mut arm_binding);
+            body_result?;
+        }
+        if !catch_all && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true)) {
+            self.errors.push(PrimitiveBodyError {
+                node: scrutinee.hir_id,
+                kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
+            });
+        }
+        let Some(local) = joined else {
+            return Err(());
+        };
+        Ok(local)
+    }
+
+    /// Joins one literal tail into the shared literal variable: the first
+    /// site creates it, a second site joins through the existing
+    /// additional-site machinery (kind mismatches and further sites gate).
+    /// Concrete literal kinds (`Bool`/`Byte`/`Char`) gate — the binding's
+    /// branch tails must agree on one concrete type, which the shared
+    /// literal-variable machinery does not express yet.
+    fn join_literal_site(
+        &mut self,
+        expression: &'hir Expr<'hir>,
+        joined: &mut Option<LocalType>,
+    ) -> Result<(), ()> {
+        let ExprKind::Lit(literal) = expression.kind else {
+            return Err(());
+        };
+        let Some(kind) = primitive_literal_kind(literal) else {
+            return Err(());
+        };
+        match joined {
+            None => {
+                match self.local_type_for_unannotated_literal(literal, kind, expression.hir_id) {
+                    local @ LocalType::LiteralVariable(_) => *joined = Some(local),
+                    _ => return Err(()),
+                }
+            }
+            Some(LocalType::LiteralVariable(id)) => match kind {
+                PrimitiveLiteralKind::Integer => {
+                    self.add_integer_literal_constraint(*id, literal, expression.hir_id)?;
+                }
+                PrimitiveLiteralKind::FloatingPoint => {
+                    self.add_float_literal_constraint(*id, literal, expression.hir_id)?;
+                }
+                _ => return Err(()),
+            },
+            _ => return Err(()),
+        }
+        Ok(())
     }
 
     fn check_if_condition(&mut self, condition: &'hir Expr<'hir>) -> Result<(), ()> {
@@ -4335,7 +5257,60 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(())
     }
 
+    /// Links `other` into `id` so both resolve to one type — the merge an
+    /// `x + y`-style operand pair needs. Same-kind unresolved variables
+    /// only; a variable joins at most one parent and chains resolve
+    /// recursively, so merges stay acyclic.
+    fn merge_literal_variables(&mut self, id: usize, other: usize) -> Result<(), ()> {
+        if id == other {
+            return Err(());
+        }
+        let Some(variable) = self.literal_variables.get(id) else {
+            return Err(());
+        };
+        let Some(other_variable) = self.literal_variables.get(other) else {
+            return Err(());
+        };
+        if variable.kind != other_variable.kind
+            || variable.resolved.is_some()
+            || other_variable.resolved.is_some()
+            || other_variable.merged_with.is_some()
+        {
+            return Err(());
+        }
+        // `other` may not be an ancestor of `id` — linking it back would
+        // close a `a += b; b += a` cycle and infinite-loop resolution.
+        let mut cursor = variable.merged_with;
+        while let Some(parent) = cursor {
+            if parent == other {
+                return Err(());
+            }
+            cursor = self
+                .literal_variables
+                .get(parent)
+                .and_then(|ancestor| ancestor.merged_with);
+        }
+        self.literal_variables[other].merged_with = Some(id);
+        Ok(())
+    }
+
     fn resolve_literal_variable(&mut self, id: usize, expected: PrimTy) -> Result<(), ()> {
+        // A merge child resolves through its parent so the whole group ends
+        // up with one type.
+        if let Some(parent) = self
+            .literal_variables
+            .get(id)
+            .and_then(|variable| variable.merged_with)
+        {
+            return self.resolve_literal_variable(parent, expected);
+        }
+        self.resolve_literal_variable_direct(id, expected)
+    }
+
+    /// Resolves `id` itself and every merge child below it — children call
+    /// this directly rather than `resolve_literal_variable` so their
+    /// `merged_with` redirect does not re-enter the parent resolution.
+    fn resolve_literal_variable_direct(&mut self, id: usize, expected: PrimTy) -> Result<(), ()> {
         let symbols = self.input.symbols;
         let pointer_width = self.input.pointer_width;
         let errors = &mut self.errors;
@@ -4370,6 +5345,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
             }
         }
+        // A merged variable resolves to its parent's type; chains are
+        // shallow so recursion is fine.
+        let children: Vec<usize> = (0..self.literal_variables.len())
+            .filter(|index| self.literal_variables[*index].merged_with == Some(id))
+            .collect();
+        for child in children {
+            self.resolve_literal_variable_direct(child, expected)?;
+        }
         Ok(())
     }
 
@@ -4378,75 +5361,109 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let pointer_width = self.input.pointer_width;
         let mut deferred_errors = Vec::new();
         let mut deferred_operator_errors = Vec::new();
-        for variable in &mut self.literal_variables[literal_floor..] {
-            if variable.resolved.is_none() {
-                let expected = match variable.kind {
-                    PrimitiveLiteralKind::Integer => PrimTy::I64,
-                    PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
-                    PrimitiveLiteralKind::Bool
-                    | PrimitiveLiteralKind::Byte
-                    | PrimitiveLiteralKind::Character => unreachable!(),
-                };
-                variable.resolved = Some(expected);
-                if check_primitive_literal(expected, variable.literal, symbols, pointer_width)
-                    == PrimitiveLiteralResult::OutOfRange
-                {
-                    deferred_errors.push(PrimitiveBodyError {
-                        node: variable.origin,
-                        kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                            expected,
-                            found: variable.kind,
-                        },
-                    });
-                }
-                if let Some(site) = variable.additional_site {
-                    if check_primitive_literal(expected, site.literal, symbols, pointer_width)
+        let variable_count = self.literal_variables.len();
+        for index in literal_floor..variable_count {
+            // Merge children are handled through their group's root — the
+            // root may come after a child (the right operand of `x + y`
+            // merges under the left), so a per-index visit would either
+            // default a child alone (leaving its parent unresolved) or
+            // skip its deferred diagnostics when the group resolves at a
+            // later index.
+            if self.literal_variables[index].merged_with.is_some() {
+                continue;
+            }
+            let mut group = vec![index];
+            let mut cursor = 0;
+            while cursor < group.len() {
+                let parent = group[cursor];
+                cursor += 1;
+                group.extend(
+                    (0..variable_count)
+                        .filter(|i| self.literal_variables[*i].merged_with == Some(parent)),
+                );
+            }
+            group.sort_unstable();
+            if self.literal_variables[index].resolved.is_none() {
+                for member in &group {
+                    let variable = &mut self.literal_variables[*member];
+                    let expected = match variable.kind {
+                        PrimitiveLiteralKind::Integer => PrimTy::I64,
+                        PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
+                        PrimitiveLiteralKind::Bool
+                        | PrimitiveLiteralKind::Byte
+                        | PrimitiveLiteralKind::Character => unreachable!(),
+                    };
+                    variable.resolved = Some(expected);
+                    if check_primitive_literal(expected, variable.literal, symbols, pointer_width)
                         == PrimitiveLiteralResult::OutOfRange
                     {
                         deferred_errors.push(PrimitiveBodyError {
-                            node: site.origin,
+                            node: variable.origin,
                             kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
                                 expected,
                                 found: variable.kind,
                             },
                         });
                     }
+                    if let Some(site) = variable.additional_site {
+                        if check_primitive_literal(expected, site.literal, symbols, pointer_width)
+                            == PrimitiveLiteralResult::OutOfRange
+                        {
+                            deferred_errors.push(PrimitiveBodyError {
+                                node: site.origin,
+                                kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                                    expected,
+                                    found: variable.kind,
+                                },
+                            });
+                        }
+                    }
                 }
             }
-            if let Some(right) = variable.resolved {
-                deferred_operator_errors.extend(variable.pending_operator_traits.iter().map(
-                    |site| {
-                        (
-                            site.diagnostic_index,
-                            PrimitiveBodyError {
-                                node: site.expression,
-                                kind: PrimitiveBodyErrorKind::DeferredOperatorTraitNotSupported {
-                                    operator: site.operator,
-                                    left: PrimTy::Char,
-                                    right,
-                                },
-                            },
-                        )
-                    },
-                ));
-                deferred_operator_errors.extend(
-                    variable
-                        .pending_neg_traits
-                        .iter()
-                        .filter(|_| !is_neg_primitive(right))
-                        .map(|site| {
+            for member in group {
+                // Group members below this block's literal floor emit
+                // their deferred diagnostics in the enclosing block's
+                // pass, which visits the group again.
+                if member < literal_floor {
+                    continue;
+                }
+                let variable = &mut self.literal_variables[member];
+                if let Some(right) = variable.resolved {
+                    deferred_operator_errors.extend(variable.pending_operator_traits.iter().map(
+                        |site| {
                             (
                                 site.diagnostic_index,
                                 PrimitiveBodyError {
                                     node: site.expression,
-                                    kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
-                                        operator: UnOp::Neg,
-                                        operand: right,
-                                    },
+                                    kind:
+                                        PrimitiveBodyErrorKind::DeferredOperatorTraitNotSupported {
+                                            operator: site.operator,
+                                            left: PrimTy::Char,
+                                            right,
+                                        },
                                 },
                             )
-                        }),
-                );
+                        },
+                    ));
+                    deferred_operator_errors.extend(
+                        variable
+                            .pending_neg_traits
+                            .iter()
+                            .filter(|_| !is_neg_primitive(right))
+                            .map(|site| {
+                                (
+                                    site.diagnostic_index,
+                                    PrimitiveBodyError {
+                                        node: site.expression,
+                                        kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                                            operator: UnOp::Neg,
+                                            operand: right,
+                                        },
+                                    },
+                                )
+                            }),
+                    );
+                }
             }
         }
         self.errors.extend(deferred_errors);
@@ -4919,6 +5936,68 @@ fn can_track_unannotated_integer_remainder_pair_alias(
     source_has_integer_remainder_pair_provenance
         && initializer_is_plain_path
         && !alias_has_annotation
+}
+
+/// `Some(is_empty)` when both literal bounds are comparable same-kind
+/// literals; `None` leaves non-comparable bound pairs to the per-literal
+/// type checks that already ran.
+fn literal_range_is_empty<'hir>(
+    start: &Option<PatRangeEnd<'hir>>,
+    end: &Option<PatRangeEnd<'hir>>,
+    inclusive: bool,
+) -> Option<bool> {
+    let (Some(start_bound), Some(end_bound)) = (start, end) else {
+        return None;
+    };
+    let (
+        PatRangeEnd::Lit(Lit::Int {
+            value: Some(start_value),
+            negated: start_negated,
+        }),
+        PatRangeEnd::Lit(Lit::Int {
+            value: Some(end_value),
+            negated: end_negated,
+        }),
+    ) = (start_bound, end_bound)
+    else {
+        let (PatRangeEnd::Lit(start_literal), PatRangeEnd::Lit(end_literal)) =
+            (start_bound, end_bound)
+        else {
+            return None;
+        };
+        let (start_value, end_value) = match (start_literal, end_literal) {
+            (Lit::Char(start_value), Lit::Char(end_value)) => {
+                (*start_value as u128, *end_value as u128)
+            }
+            (Lit::Byte(start_value), Lit::Byte(end_value)) => {
+                (*start_value as u128, *end_value as u128)
+            }
+            _ => return None,
+        };
+        return Some(if inclusive {
+            start_value > end_value
+        } else {
+            start_value >= end_value
+        });
+    };
+    // Compare sign-aware without materializing an `i128`: a negated bound
+    // sorts before any non-negated bound, and among negated bounds the
+    // larger magnitude is the smaller value. A `u128` magnitude can exceed
+    // `i128::MAX` (`-2^127`), so `-(value as i128)` would overflow. `-0`
+    // equals `0`, so a zero magnitude is never treated as negated.
+    let start_negated = *start_negated && *start_value != 0;
+    let end_negated = *end_negated && *end_value != 0;
+    let ordering = match (start_negated, end_negated) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (true, true) => end_value.cmp(start_value),
+        (false, false) => start_value.cmp(end_value),
+    };
+    Some(if inclusive {
+        ordering == std::cmp::Ordering::Greater
+    } else {
+        ordering != std::cmp::Ordering::Less
+    })
 }
 
 fn primitive_comparison_result(

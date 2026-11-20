@@ -4701,8 +4701,6 @@ fn unsupported_unannotated_copy_local_forms_remain_gated() {
     for source in [
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = source / (1 / 1)\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = r#source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    var copied = 0\n    copied += source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    var source: I32 = 42\n    var copied = 0\n    copied += source\n    copied\n}\n",
         "const SOURCE: I32 = 42\npub fn copy() -> I32 {\n    let copied = SOURCE\n    copied\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -4793,10 +4791,7 @@ fn shadowed_parameter_initializer_uses_parameter_and_tail_uses_local_binding() {
 
 #[test]
 fn unsupported_parameter_local_copy_forms_remain_gated() {
-    for source in [
-        "pub fn copy(var source: I32) -> I32 {\n    var t = 0\n    t += 1\n    let copied: I32 = source\n    copied\n}\n",
-        "pub fn copy(self: I32) -> I32 {\n    let copied: I32 = self\n    copied\n}\n",
-    ] {
+    for source in ["pub fn copy(self: I32) -> I32 {\n    let copied: I32 = self\n    copied\n}\n"] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 }
@@ -4845,7 +4840,6 @@ fn two_parameter_local_copy_type_mismatch_is_reported_at_initializer() {
 #[test]
 fn unsupported_two_parameter_local_copy_forms_remain_gated() {
     for source in [
-        "pub fn copy_pair(first: I32, var second: Bool) -> I32 {\n    var t = 0\n    t += 1\n    let first_copy: I32 = first\n    let second_copy: Bool = second\n    first_copy\n}\n",
         "pub fn copy_pair(first: I32, second: Str) -> I32 {\n    let first_copy: I32 = first\n    let second_copy: Str = second\n    first_copy\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -4990,10 +4984,7 @@ fn unannotated_literal_copy_reports_semantic_errors_at_the_source_and_tail() {
 fn unsupported_unannotated_literal_copy_forms_remain_gated() {
     for source in [
         "pub fn copy() -> I32 {\n    let source = 42\n    let copied = r#source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    let source = 42\n    let copied = source + 1\n    copied\n}\n",
         "const SOURCE: I32 = 42\npub fn copy() -> I32 {\n    let source = 7\n    let copied = SOURCE\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    let source = 42\n    var copied = source\n    copied += 0\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    var source = 42\n    let copied = source\n    copied += 0\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let var source = 42\n    let copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source = 42\n    let var copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let (source, other) = (42, 7)\n    let copied = source\n    copied\n}\n",
@@ -5008,6 +4999,35 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn copy_chain() -> I8 {\n    let source = 127\n    let first = source\n    let second = first\n    let copied = second\n    copied\n}\n",
         "pub fn copy_source_tail() -> I32 {\n    let source = 42\n    let copied = source\n    source\n}\n",
         "pub fn earlier_tail() -> I8 {\n    let earlier = 42\n    let later = 7\n    earlier\n}\n",
+        "pub fn computed() -> I32 {\n    let source = 1\n    let copied = source + 1\n    copied\n}\n",
+        "pub fn var_computed() -> I32 {\n    var source = 1\n    let copied = source + 1\n    copied\n}\n",
+        "pub fn compare() -> Bool {\n    let inferred = 1\n    let result = inferred < 2\n    result\n}\n",
+        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    var copied = 0\n    copied += source\n    copied\n}\n",
+        "pub fn copy_var_source() -> I32 {\n    var source: I32 = 42\n    var copied = 0\n    copied += source\n    copied\n}\n",
+        "pub fn div_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one / left\n    result\n}\n",
+        "pub fn mul(left: I32, right: I32) -> I32 {\n    let one = 1\n    let result = one * left\n    result\n}\n",
+        "pub fn add(left: I32, right: I32) -> I32 {\n    let one = 1\n    let sum = one + right\n    sum\n}\n",
+        "pub fn add_assign(left: I32) -> I32 {\n    var sum = 0\n    sum += left\n    sum\n}\n",
+        "pub fn local_assign_op() -> I32 {\nlet first: I32 = 1\nvar second = 2\nsecond += first\nfirst\n}\n",
+        "pub fn mutable(left: I32, right: I32) -> I32 {\n    var result = 0\n    result += left\n    result\n}\n",
+        "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
+        "pub fn remainder_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one % left\n    result\n}\n",
+        "pub fn wrapping_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one +% left\n    result\n}\n",
+        "pub fn remainder_assign_local(left: I32) -> I32 {\n    var result = 0\n    result %= left\n    result\n}\n",
+        "pub fn wrapping_assign_local(left: I32) -> I32 {\n    var result = 0\n    result +%= left\n    result\n}\n",
+        "pub fn bit_and_unresolved_local(left: I32) -> I32 {\n    let bits = 1\n    let result = bits & left\n    result\n}\n",
+        "pub fn bit_or_literal_right() -> I32 {\n    var bits = 1\n    let result = bits | 4\n    result\n}\n",
+        "pub fn bit_xor_assign_local(left: I32) -> I32 {\n    var result = 0\n    result ^= left\n    result\n}\n",
+        "pub fn add_unresolved_rhs(value: I32) -> I32 {\n    let number = 1\n    let result = value + number\n    result\n}\n",
+        "pub fn remainder_unresolved_rhs(value: I32) -> I32 {\n    let number = 1\n    let result = value % number\n    result\n}\n",
+        "pub fn wrapping_unresolved_rhs(value: I32) -> I32 {\n    let number = 1\n    let result = value +% number\n    result\n}\n",
+        "pub fn bit_and_unresolved_rhs(value: I32) -> I32 {\n    let bits = 1\n    let result = value & bits\n    result\n}\n",
+        "pub fn merge_add() -> I32 {\n    var a = 1\n    var b = 2\n    let sum = a + b\n    sum\n}\n",
+        "pub fn merge_compare() -> Bool {\n    var a = 1\n    var b = 2\n    a < b\n}\n",
+        "pub fn merge_assign() -> I32 {\n    var a = 0\n    var b = 2\n    a += b\n    a\n}\n",
+        "pub fn merge_annotated() -> I8 {\n    var a = 1\n    var b = 2\n    let sum: I8 = a + b\n    sum\n}\n",
+        "pub fn merge_bit_or() -> I32 {\n    var a = 1\n    var b = 2\n    let bits = a | b\n    bits\n}\n",
+        "pub fn merge_remainder() -> I32 {\n    var a = 9\n    var b = 4\n    let rem = a % b\n    rem\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -5129,8 +5149,6 @@ fn unsupported_flat_unannotated_primitive_local_forms_remain_gated() {
     for source in [
         "pub fn self_reference() -> I32 {\n    let source = source\n    source\n}\n",
         "pub fn forward_reference() -> I32 {\n    let copied = later\n    let later = 1\n    copied\n}\n",
-        "pub fn computed() -> I32 {\n    let source = 1\n    let copied = source + 1\n    copied\n}\n",
-        "pub fn mutable() -> I32 {\n    var source = 1\n    source += 2\n    source\n}\n",
         "pub fn destructured() -> I32 {\n    let (source, other) = (1, 2)\n    source\n}\n",
         "pub fn raw_path() -> I32 {\n    let source = 1\n    let copied = r#source\n    copied\n}\n",
         "pub fn qualified_path() -> I32 {\n    let source = 1\n    let copied = values.VALUE\n    copied\n}\n",
@@ -9036,7 +9054,6 @@ fn unsupported_primitive_add_local_literal_shapes_remain_gated() {
         "pub fn fixed_literal(value: I32) -> I32 {\n    let result = value + true\n    result\n}\n",
         "pub fn fixed_literal_left(value: I32) -> I32 {\n    let result = true + value\n    result\n}\n",
         "pub fn byte_path(value: Byte) -> Byte {\n    let result = value + 1\n    result\n}\n",
-        "pub fn unresolved_number(value: I32) -> I32 {\n    let number = 1\n    let result = value + number\n    result\n}\n",
         "pub fn nested(value: I32) -> I32 {\n    let result = value + (1 + 1)\n    result\n}\n",
         "pub fn computed_left(value: I32) -> I32 {\n    let result = (value + 1) + value\n    result\n}\n",
         "pub fn forward(value: I32) -> I32 {\n    let result = later + 1\n    let later = value\n    result\n}\n",
@@ -9204,15 +9221,12 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
     for source in [
         "pub fn float_division() -> F64 {\n    let result = 1.0 / 2.0\n    result\n}\n",
         "pub fn mixed_division() -> I64 {\n    let result = 1 / 2.0\n    result\n}\n",
-        "pub fn div_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one / left\n    result\n}\n",
         "pub fn div_nested_right(left: I32, right: I32) -> I32 {\n    let result = left / (right / 1)\n    result\n}\n",
         "pub fn div_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left / right) / left\n    result\n}\n",
         "type IntegerAlias = I32\npub fn div_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left / right\n    result\n}\n",
-        "pub fn mul(left: I32, right: I32) -> I32 {\n    let one = 1\n    let result = one * left\n    result\n}\n",
         "pub fn float_mul() -> F64 {\n    let result = 1.0 * 2.0\n    result\n}\n",
         "pub fn mixed_mul() -> I64 {\n    let result = 1 * 2.0\n    result\n}\n",
         "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
-        "pub fn remainder_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one % left\n    result\n}\n",
         "pub fn remainder_nested_right(left: I32, right: I32) -> I32 {\n    let result = left % (right % 1)\n    result\n}\n",
         "pub fn remainder_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left % right) % left\n    result\n}\n",
         "type IntegerAlias = I32\npub fn remainder_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left % right\n    result\n}\n",
@@ -9246,7 +9260,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn wrapping_float_left_literal(right: I32) -> I32 {\n    let result = 1.0 +% right\n    result\n}\n",
         "pub fn wrapping_float_literal_right(left: I32) -> I32 {\n    let result = left +% 1.0\n    result\n}\n",
         "pub fn wrapping_integer_literal_non_integer_path(left: F32) -> F32 {\n    let result = left +% 1\n    result\n}\n",
-        "pub fn wrapping_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one +% left\n    result\n}\n",
         "pub fn wrapping_left_unresolved_local(right: I32) -> I32 {\n    let one = 1\n    let result = 1 +% one\n    result\n}\n",
         "pub fn wrapping_left_nested(right: I32) -> I32 {\n    let result = (1 +% right) +% right\n    result\n}\n",
         "pub fn wrapping_nested(left: I32, right: I32) -> I32 {\n    let result = left +% (right +% left)\n    result\n}\n",
@@ -9260,7 +9273,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left * right\n    result\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let result = later * left\n    let later: I32 = 1\n    result\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let result = result - left\n    result\n}\n",
-        "pub fn mutable(left: I32, right: I32) -> I32 {\n    var result = 0\n    result += left\n    result\n}\n",
         "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let result = first - second\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -9343,7 +9355,6 @@ fn primitive_add_diagnostics_follow_source_order_after_shadowed_binding_resoluti
 #[test]
 fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn add(left: I32, right: I32) -> I32 {\n    let one = 1\n    let sum = one + right\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n",
         "pub fn add(left: Byte, right: Byte) -> Byte {\n    let sum = left + right\n    sum\n}\n",
         "pub fn add(left: Char, right: Char) -> Char {\n    let sum = left + right\n    sum\n}\n",
@@ -9351,7 +9362,6 @@ fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn add(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let sum = left + right\n    sum\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let sum = later + left\n    let later: I32 = 1\n    sum\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let sum = sum + left\n    sum\n}\n",
-        "pub fn add(left: I32, right: I32) -> I32 {\n    var sum = 0\n    sum += left\n    sum\n}\n",
         "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let sum = first + second\n    sum\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -9456,7 +9466,6 @@ fn primitive_comparison_local_uses_shadowed_binding_and_source_order() {
 #[test]
 fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
         "pub fn compare(left: Str, right: Str) -> Bool {\n    let result = left == right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left as I64 == right as I64\n    result\n}\n",
         "type IntegerAlias = I32\npub fn compare(left: IntegerAlias, right: IntegerAlias) -> Bool {\n    let result = left == right\n    result\n}\n",
@@ -9705,7 +9714,6 @@ fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
         "pub fn compare(value: I32) -> Bool {\n    let result = 1 == 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < (1 + 2)\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = (value + 1) < 2\n    result\n}\n",
-        "pub fn compare() -> Bool {\n    let inferred = 1\n    let result = inferred < 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < later\n    let later: I32 = 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = result < 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < missing\n    result\n}\n",
@@ -10163,10 +10171,7 @@ fn public_bool_parameter_literal_if_function_emits_check_result() {
 
 #[test]
 fn unsupported_bool_parameter_if_shapes_remain_gated() {
-    for source in [
-        "pub fn choose(var flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if flag { 1 } else { 2 }\n}\n",
-        "pub fn choose(flag: Bool) -> I32 { if flag { 1 } }\n",
-    ] {
+    for source in ["pub fn choose(flag: Bool) -> I32 { if flag { 1 } }\n"] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 }
@@ -10178,24 +10183,113 @@ fn public_match_tail_bodies_emit_check_results() {
         "pub fn choose(value: I32) -> I32 { match value { n => n + 1 } }\n",
         "pub fn choose(flag: Bool) -> I32 { match flag { true => 1, _ => 0 } }\n",
         "pub fn choose(value: I32, flag: Bool) -> I32 { match value { 0 => if flag { 1 } else { 2 }, _ => 3 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { let x: I32 = if flag { 1 } else { 2 }\n x }\n",
+        "pub fn choose(value: I32) -> I32 { let x: I32 = match value { 0 => 1, _ => 2 }\n x }\n",
+        "pub fn choose(flag: Bool) -> I32 { var x: I32 = 0\n x = if flag { 1 } else { 2 }\n x }\n",
+        "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 2 }\n x }\n",
+        "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, _ => 2 }\n x }\n",
+        "pub fn choose(value: I32) -> I32 { match value { 0 | 1 => 1, _ => 0 } }\n",
+        "pub fn choose(value: I32) -> I32 { match value { 1..=5 => 1, _ => 0 } }\n",
+        "pub fn choose(value: I32) -> I32 { match value { n if n > 0 => 1, _ => 0 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { match flag { true => 1, false => 0 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { match flag { true | false => 1 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { var x: I32 = 0\n if flag { x = 1 } else { x = 2 }\n x }\n",
+        "pub fn choose(value: I32) -> I32 { var x: I32 = 0\n match value { 0 => { x = 1 }, _ => {} }\n x }\n",
+        "pub fn choose(value: I32) -> I32 { match value { 0 if value > 1 => 1, _ => 0 } }\n",
+        "pub fn choose(value: I32) -> I32 { match value { 1..=5 if value > 1 => 1, _ => 0 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { match flag { _ if flag => 1, _ => 0 } }\n",
+        "pub fn choose() -> I32 { var x = 1\n x += 2\n x }\n",
+        "pub fn run() -> I32 { var total = 0\n    total += 1\n    total\n }\n",
+        "pub fn copy(var source: I32) -> I32 {\n    var t = 0\n    t += 1\n    let copied: I32 = source\n    copied\n}\n",
+        "pub fn copy_pair(first: I32, var second: Bool) -> I32 {\n    var t = 0\n    t += 1\n    let first_copy: I32 = first\n    let second_copy: Bool = second\n    first_copy\n}\n",
+        "pub fn copy() -> I32 {\n    let source = 42\n    var copied = source\n    copied += 0\n    copied\n}\n",
+        "pub fn mutable() -> I32 {\n    var source = 1\n    source += 2\n    source\n}\n",
+        "pub fn choose(var flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if flag { 1 } else { 2 }\n}\n",
+        "pub fn choose(flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not flag { 1 } else { 2 }\n}\n",
+        "pub fn choose(var left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if left and right { 1 } else { 2 }\n}\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left and right) { 1 } else { 2 }\n}\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left or right) { 1 } else { 2 }\n}\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled and value >= 18) { 1 } else { 2 }\n}\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled or value >= 18) { 1 } else { 2 }\n}\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left < right) { 1 } else { 2 }\n}\n",
+        "pub fn choose(value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if not not (value < 10) { 1 } else { 2 }\n}\n",
+        "pub fn choose(var value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if value < 10 { 1 } else { 2 }\n}\n",
+        "pub fn local() -> I32 {\nvar value = 42\nvalue += 1\nvalue\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
 }
 
 #[test]
+fn match_exhaustiveness_and_unreachable_arms_reach_cli_diagnostics() {
+    for (source, code) in [
+        (
+            "pub fn choose(value: I32) -> I32 { match value { 0 => 1, 1 => 2 } }\n",
+            "NON_EXHAUSTIVE_MATCH",
+        ),
+        (
+            "pub fn choose(value: I32) -> I32 { match value { n if n > 0 => 1 } }\n",
+            "NON_EXHAUSTIVE_MATCH",
+        ),
+        (
+            "pub fn choose(value: I32) -> I32 { match value { _ => 0, 1 => 1 } }\n",
+            "UNREACHABLE_PATTERN",
+        ),
+        (
+            "pub fn choose(flag: Bool) -> I32 { match flag { _ if flag => 1 } }\n",
+            "NON_EXHAUSTIVE_MATCH",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{code} must fail the check:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\"")),
+            "{code} must reach CLI diagnostics:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn unsupported_match_tail_shapes_remain_gated() {
     for source in [
-        "pub fn choose(value: I32) -> I32 { match value { 0 => 1, 1 => 2 } }\n",
-        "pub fn choose(flag: Bool) -> I32 { match flag { true => 1, false => 0 } }\n",
-        "pub fn choose(value: I32) -> I32 { match value { n if n > 0 => 1, _ => 0 } }\n",
-        "pub fn choose(value: I32) -> I32 { match value { 1..=5 => 1, _ => 0 } }\n",
+        "pub fn choose(value: I32) -> I32 { match value { 1.. => 1, _ => 0 } }\n",
+        "pub fn choose(value: I32) -> I32 { match value { 0 | n => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match 0 { 0 => 1, _ => 2 } }\n",
-        "pub fn choose(value: I32) -> I32 { match value { _ => 0, 1 => 1 } }\n",
         "pub fn choose(value: I32) -> Bool { match value { 0 => 1, _ => 2 }\n true }\n",
+        "pub fn choose(value: I32) -> I32 { match value { _ => 1 }\n 0 }\n",
+        "pub fn choose(flag: Bool) -> I32 { var x: I32 = 0\n if flag { x = 1\n 5 }\n x }\n",
+        "pub fn choose(flag: Bool) -> I32 { var x = 1\n x += flag\n x }\n",
+        "pub fn choose() -> I32 { var a = 1\n    var b = 2.5\n    let sum = a + b\n    sum\n }\n",
+        "pub fn choose() -> Bool { var a = true\n    var b = false\n    a + b\n }\n",
+        "pub fn choose() -> F64 { var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n }\n",
+        "pub fn choose() -> I32 { var a = 0\n    var b = 0\n    a += b\n    b += a\n    a\n }\n",
+        "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 1.0 }\n x }\n",
+        "pub fn choose(flag: Bool, a: I32) -> I32 { let x = if flag { 1 } else { a }\n x }\n",
+        "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, 1 => 2, _ => 3 }\n x }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
+}
+
+#[test]
+fn empty_range_pattern_reaches_cli_diagnostics() {
+    let source = "pub fn choose(value: I32) -> I32 { match value { 5..=1 => 1, _ => 0 } }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an empty range pattern must fail the check:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"EMPTY_RANGE_PATTERN\""),
+        "EMPTY_RANGE_PATTERN must reach CLI diagnostics:\n{stdout}"
+    );
 }
 
 #[test]
@@ -10213,10 +10307,7 @@ fn public_bool_parameter_not_if_function_emits_check_result() {
 
 #[test]
 fn unsupported_bool_parameter_negation_shapes_remain_gated() {
-    for source in [
-        "pub fn choose(flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not flag { 1 } else { 2 }\n}\n",
-        "pub fn choose(flag: Bool) -> I32 { if not flag { 1 } }\n",
-    ] {
+    for source in ["pub fn choose(flag: Bool) -> I32 { if not flag { 1 } }\n"] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 }
@@ -10280,9 +10371,7 @@ fn public_bool_parameters_and_if_function_emits_check_result() {
 #[test]
 fn unsupported_bool_parameter_and_shapes_remain_gated() {
     for source in [
-        "pub fn choose(var left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if left and right { 1 } else { 2 }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left and right) { 1 } else { 2 }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n    } else {\n        value\n    }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        1\n    } else {\n        2\n    }\n    0\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    let value = 1\n    { value }\n    value\n}\n",
@@ -10309,10 +10398,7 @@ fn public_bool_parameters_or_if_function_emits_check_result() {
 
 #[test]
 fn unsupported_bool_parameter_or_shapes_remain_gated() {
-    for source in [
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left or right) { 1 } else { 2 }\n}\n",
-    ] {
+    for source in ["pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } }\n"] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 }
@@ -10371,8 +10457,6 @@ fn unsupported_mixed_bool_logical_comparison_conditions_remain_gated() {
         "type BoolAlias = Bool\npub fn choose(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } }\n",
-        "pub fn choose(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled and value >= 18) { 1 } else { 2 }\n}\n",
-        "pub fn choose(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled or value >= 18) { 1 } else { 2 }\n}\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10489,6 +10573,10 @@ fn assign_statement_errors_emit_their_diagnostics() {
             "ASSIGN_TO_IMMUTABLE",
         ),
         (
+            "pub fn copy() -> I32 {\n    var source = 42\n    let copied = source\n    copied += 0\n    copied\n}\n",
+            "ASSIGN_TO_IMMUTABLE",
+        ),
+        (
             "pub fn run() -> I32 { var total: I32 = 0\n    total + 1 = 5\n    total\n }\n",
             "INVALID_ASSIGN_TARGET",
         ),
@@ -10510,7 +10598,6 @@ fn assign_statement_errors_emit_their_diagnostics() {
 fn unsupported_var_forms_remain_gated() {
     for source in [
         "pub fn run(var value: I32) -> I32 { value\n }\n",
-        "pub fn run() -> I32 { var total = 0\n    total += 1\n    total\n }\n",
         "pub fn run() -> I32 { var total: I32 = 0\n    missing = 1\n    total\n }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10551,7 +10638,6 @@ fn unsupported_primitive_parameter_comparison_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn choose(left: IntegerAlias, right: IntegerAlias) -> I32 { if left < right { 1 } else { 2 } }\n",
         "pub fn choose(left: (), right: ()) -> I32 { if left == right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left < right) { 1 } else { 2 }\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -10598,11 +10684,9 @@ fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
         "pub fn choose(value: I8) -> I32 { if 10 < 11 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < other { 1 } else { 2 } }\n",
-        "pub fn choose(value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if not not (value < 10) { 1 } else { 2 }\n}\n",
         "type I8Alias = I8\npub fn choose(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
         "pub fn choose(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
-        "pub fn choose(var value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if value < 10 { 1 } else { 2 }\n}\n",
         "pub fn choose(value: I8) -> I32 { if value < 10 { 1 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -11176,10 +11260,8 @@ fn target_filtered_public_name_does_not_report_a_name_error() {
 fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     for source in [
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
-        "pub fn local() -> I32 {\nvar value = 42\nvalue += 1\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
-        "pub fn local() -> I32 {\nlet first: I32 = 1\nvar second = 2\nsecond += first\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % (1 + 0)\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",
@@ -16133,10 +16215,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn computed(left: I32, right: I32) -> I32",
             "let result = (left + right) & right",
         ),
-        fixture(
-            "pub fn unresolved(left: I32) -> I32",
-            "let bits = 1\n    let result = bits & left",
-        ),
         format!(
             "type Word = I32\n{}",
             fixture(
@@ -18754,7 +18832,6 @@ fn primitive_bitwise_left_integer_literal_annotation_mismatch_recovers() {
 fn unsupported_primitive_bitwise_right_integer_literal_forms_remain_gated() {
     for source in [
         "pub fn literal_pair() -> I32 { let result = 1 ^ 2; result }\n",
-        "pub fn unresolved(value: I32) -> I32 { let bits = 1; let result = value & bits; result }\n",
         "type Word = I32\npub fn alias(left: Word, right: Word) -> Word { let result = left & right; result }\n",
         "pub fn nested(left: I32, right: I32, extra: I32) -> I32 { let result = left & (right ^ extra); result }\n",
         "pub fn computed(left: I32, right: I32) -> I32 { let result = (left ^ right) & right; result }\n",
