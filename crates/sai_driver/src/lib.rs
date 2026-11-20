@@ -9972,7 +9972,7 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
         return Some(expression.span);
     }
     match expression.kind {
-        ExprKind::Unary(_, operand) if operand.hir_id == node => Some(operand.span),
+        ExprKind::Unary(_, operand) => primitive_body_error_span(operand, node),
         ExprKind::Binary(_, left, right) => {
             if left.hir_id == node {
                 Some(left.span)
@@ -53132,6 +53132,41 @@ property "shared"() {}
             "        chosen\n",
             "    }\n",
             "}\n",
+            "pub fn negated_comparison(flag: Bool, limit: I32) -> I32 {\n",
+            "    let bound = limit\n",
+            "    if not (bound < 0) {\n",
+            "        1\n",
+            "    } else {\n",
+            "        0\n",
+            "    }\n",
+            "}\n",
+            "pub fn negated_conjunction(flag: Bool, other: Bool, third: Bool) -> I32 {\n",
+            "    if not (flag and other) {\n",
+            "        if third {\n",
+            "            1\n",
+            "        } else {\n",
+            "            2\n",
+            "        }\n",
+            "    } else {\n",
+            "        0\n",
+            "    }\n",
+            "}\n",
+            "pub fn negated_mismatch(value: I32, flag: Bool) -> I32 {\n",
+            "    let probe = flag\n",
+            "    if not (value and probe) {\n",
+            "        1\n",
+            "    } else {\n",
+            "        0\n",
+            "    }\n",
+            "}\n",
+            "pub fn flat_negated_expression(value: I32, flag: Bool) -> I32 {\n",
+            "    if not (value and flag) {\n",
+            "        1\n",
+            "    } else {\n",
+            "        0\n",
+            "    }\n",
+            "}\n",
+            "pub fn double_negation(flag: Bool) -> I32 { if not not flag { 1 } else { 0 } }\n",
             "pub fn literal_condition() -> I32 { if 1 { 1 } else { 0 } }\n",
             "pub fn nested_branch_tail(first: I32) -> I32 {\n",
             "    if first < 0 { (first + 1) * 2 } else { 0 }\n",
@@ -53194,6 +53229,8 @@ property "shared"() {}
             "annotated_branch_local",
             "both_branches_bind",
             "late_resolved_outer_local",
+            "negated_comparison",
+            "negated_conjunction",
         ] {
             let owner = owner_named(&database, &resolved, name);
             let FunctionBodyTypeCheck::Supported { diagnostics } = owner
@@ -53281,12 +53318,27 @@ property "shared"() {}
             "the branch-local annotation and the Bool-typed branch tail both mismatch"
         );
 
+        for name in ["negated_mismatch", "flat_negated_expression"] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner.body_type_check(),
+                    Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+                        if diagnostics.len() == 1
+                            && diagnostics.iter().all(|diagnostic| {
+                                diagnostic.code == sai_diagnostics::Code::TypeMismatch
+                            })
+                ),
+                "the `{name}` non-Bool operand under `not` is a recoverable type error"
+            );
+        }
         for name in [
             "no_else",
             "sibling_scope_leak",
             "unsupported_branch_statement",
             "literal_condition",
             "nested_branch_tail",
+            "double_negation",
         ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
@@ -76495,7 +76547,13 @@ property "shared"() {}
                 .expect("a two-parameter literal comparison is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30] {
+        assert!(matches!(
+            owners[25]
+                .body_type_check()
+                .expect("a negated literal-parameter comparison is checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for index in [19, 20, 21, 23, 24, 26, 27, 28, 29, 30] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76780,7 +76838,13 @@ property "shared"() {}
                             .all(|d| d.code == sai_diagnostics::Code::TypeMismatch)
             ));
         }
-        for index in [27, 28, 29, 30, 31, 32, 33, 34, 35, 39, 41, 42, 44, 45, 46] {
+        assert!(matches!(
+            owners[35]
+                .body_type_check()
+                .expect("a negated logical condition over one parameter is checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for index in [27, 28, 29, 30, 31, 32, 33, 34, 39, 41, 42, 44, 45, 46] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
