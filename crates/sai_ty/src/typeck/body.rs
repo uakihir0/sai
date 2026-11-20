@@ -2882,7 +2882,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.loop_stack[index].break_state = match local_type {
                         LocalType::Concrete(found) => LoopBreakState::Concrete(found),
                         LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
-                            LoopBreakState::LiteralVariable(id)
+                            // A break value may carry an already-resolved
+                            // literal variable (`break 1 + n` where `n` has
+                            // a concrete type) — `β` is fixed, not fresh.
+                            match self.literal_variable_group_type(id) {
+                                Some(found) => LoopBreakState::Concrete(found),
+                                None => LoopBreakState::LiteralVariable(id),
+                            }
                         }
                         LocalType::Error(_) => LoopBreakState::Unfixed,
                     };
@@ -2891,6 +2897,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.check_expr_expected(value, expected)?;
                 }
                 LoopBreakState::LiteralVariable(id) => {
+                    // `β`'s group may have resolved through another
+                    // constraint site between breaks — behave as if `β`
+                    // were concrete from the start.
+                    if let Some(found) = self.literal_variable_group_type(id) {
+                        self.loop_stack[index].break_state = LoopBreakState::Concrete(found);
+                        self.check_expr_expected(value, found)?;
+                        return Ok(());
+                    }
                     let local_type = self.check_break_value(value)?;
                     match local_type {
                         // A concrete break value fixes `β` — later literal
@@ -2929,7 +2943,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             ) else {
                                 return Err(());
                             };
-                            if kind == other_kind {
+                            if self.literal_variable_group_root(id)
+                                == self.literal_variable_group_root(other)
+                            {
+                                // The same variable (or merge group) breaks
+                                // twice — `β` and the value already share a
+                                // group, nothing to join.
+                            } else if kind == other_kind {
                                 self.merge_literal_variables(id, other)?;
                             } else {
                                 self.errors.push(PrimitiveBodyError {
@@ -5709,6 +5729,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         self.literal_variables[other].merged_with = Some(id);
         Ok(())
+    }
+
+    /// The variable's merge-group root — merge children chain upward.
+    fn literal_variable_group_root(&self, mut id: usize) -> usize {
+        while let Some(parent) = self
+            .literal_variables
+            .get(id)
+            .and_then(|variable| variable.merged_with)
+        {
+            id = parent;
+        }
+        id
+    }
+
+    /// The resolved type of the variable's merge group, if any.
+    fn literal_variable_group_type(&self, id: usize) -> Option<PrimTy> {
+        self.literal_variables
+            .get(self.literal_variable_group_root(id))
+            .and_then(|variable| variable.resolved)
     }
 
     fn resolve_literal_variable(&mut self, id: usize, expected: PrimTy) -> Result<(), ()> {

@@ -78190,6 +78190,8 @@ property "shared"() {}
             "pub fn bare_then_break() -> I32 {\n    loop { break\n break 1 }\n    0\n}\n",
             "pub fn break_value_unbound() -> I32 {\n    loop { break missing }\n    0\n}\n",
             "pub fn break_value_if(flag: Bool) -> I32 {\n    loop { break if flag { 1 } else { 2 } }\n    0\n}\n",
+            "pub fn break_joined_value(n: I32) -> I32 {\n    loop { break 1 + n\n break n }\n    0\n}\n",
+            "pub fn break_same_local(flag: Bool) -> I32 {\n    var x = 1\n    loop { if flag { break x } else { break x } }\n    0\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78205,9 +78207,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 25);
+        assert_eq!(owners.len(), 27);
 
-        for index in [0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19] {
+        for index in [0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 25, 26] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a loop statement is checked");
