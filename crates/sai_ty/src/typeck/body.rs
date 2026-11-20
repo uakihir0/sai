@@ -2000,6 +2000,37 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             _ => None,
         };
 
+        // An unresolved literal variable compared to a same-family literal
+        // joins the literal as a constraint site on the variable, like the
+        // arithmetic operand slice; the comparison itself yields Bool.
+        for (local_type, literal_expression, literal_entry) in [
+            (self.check_local_path(left).ok(), right, right_literal),
+            (self.check_local_path(right).ok(), left, left_literal),
+        ] {
+            let Some(LocalType::LiteralVariable(id)) = local_type else {
+                continue;
+            };
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_some() {
+                continue;
+            }
+            let Some((literal, kind)) = literal_entry else {
+                return Err(());
+            };
+            match (variable.kind, kind) {
+                (PrimitiveLiteralKind::Integer, PrimitiveLiteralKind::Integer) => {
+                    self.add_integer_literal_constraint(id, literal, literal_expression.hir_id)?;
+                }
+                (PrimitiveLiteralKind::FloatingPoint, PrimitiveLiteralKind::FloatingPoint) => {
+                    self.add_float_literal_constraint(id, literal, literal_expression.hir_id)?;
+                }
+                _ => return Err(()),
+            }
+            return Ok(LocalType::Concrete(PrimTy::Bool));
+        }
+
         match (left_path_type, right_path_type, left_literal, right_literal) {
             (Some(left_type), Some(right_type), None, None) => {
                 match primitive_comparison_result(operator, left_type, right_type) {

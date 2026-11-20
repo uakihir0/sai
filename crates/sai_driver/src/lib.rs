@@ -53625,7 +53625,7 @@ property "shared"() {}
             );
         }
 
-        for name in ["eq_parameters", "lt_local", "and_parameters"] {
+        for name in ["eq_parameters", "lt_local", "lt_literal", "and_parameters"] {
             let owner = owner_named(&database, &resolved, name);
             let FunctionBodyTypeCheck::Supported { diagnostics } = owner
                 .body_type_check()
@@ -53658,7 +53658,7 @@ property "shared"() {}
             "the arithmetic result mismatches the Bool return type"
         );
 
-        for name in ["mul_literal_locals", "lt_literal"] {
+        for name in ["mul_literal_locals"] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
                 matches!(

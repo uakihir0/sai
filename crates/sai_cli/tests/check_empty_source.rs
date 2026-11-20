@@ -5003,6 +5003,7 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn earlier_tail() -> I8 {\n    let earlier = 42\n    let later = 7\n    earlier\n}\n",
         "pub fn computed() -> I32 {\n    let source = 1\n    let copied = source + 1\n    copied\n}\n",
         "pub fn var_computed() -> I32 {\n    var source = 1\n    let copied = source + 1\n    copied\n}\n",
+        "pub fn compare() -> Bool {\n    let inferred = 1\n    let result = inferred < 2\n    result\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -9698,7 +9699,6 @@ fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
         "pub fn compare(value: I32) -> Bool {\n    let result = 1 == 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < (1 + 2)\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = (value + 1) < 2\n    result\n}\n",
-        "pub fn compare() -> Bool {\n    let inferred = 1\n    let result = inferred < 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < later\n    let later: I32 = 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = result < 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < missing\n    result\n}\n",
