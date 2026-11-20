@@ -489,6 +489,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if block.safety != Safety::Safe {
             return Err(());
         }
+        // Only literals created inside this block may be defaulted here:
+        // outer literal variables can still be constrained by sibling
+        // branches or the outer tail after this block returns.
+        let literal_floor = self.literal_variables.len();
 
         let Some(tail) = block.tail else {
             return Err(());
@@ -527,7 +531,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         self.check_expr(tail)?;
-        self.default_unresolved_literals();
+        self.default_unresolved_literals(literal_floor);
         Ok(())
     }
 
@@ -2501,25 +2505,45 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(LocalType::Concrete(self.input.return_type))
     }
 
-    // `if` branches are checked tail-first through `check_expr` rather than
-    // `check_block`'s empty-statement gate, which deliberately excludes plain
-    // `Path` tails (flat path tails belong to the direct-parameter slice).
+    // Empty `if` branches are checked tail-first through `check_expr` rather
+    // than `check_block`'s empty-statement gate, which deliberately excludes
+    // plain `Path` tails (flat path tails belong to the direct-parameter
+    // slice). Statement-bearing branches reuse `check_block` directly so
+    // their `let` bindings follow the same boundary as the outer block.
     fn check_if_branch(&mut self, block: &'hir Block<'hir>) -> Result<(), ()> {
-        if block.safety != Safety::Safe || !block.stmts.is_empty() {
-            return Err(());
+        if block.stmts.is_empty() {
+            if block.safety != Safety::Safe {
+                return Err(());
+            }
+            let Some(tail) = block.tail else {
+                return Err(());
+            };
+            self.check_expr(tail)
+        } else {
+            self.check_block(block)
         }
-        let Some(tail) = block.tail else {
-            return Err(());
-        };
-        self.check_expr(tail)
     }
 
     fn check_if_condition(&mut self, condition: &'hir Expr<'hir>) -> Result<(), ()> {
         let local_type = match condition.kind {
             ExprKind::Path(_) => self.check_local_path(condition)?,
-            ExprKind::Unary(UnOp::Not, operand) if matches!(operand.kind, ExprKind::Path(_)) => {
-                self.check_logical_not(operand)?
-            }
+            ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
+                ExprKind::Path(_) => self.check_logical_not(operand)?,
+                ExprKind::Binary(operator, left, right)
+                    if matches!(operator, BinOp::And | BinOp::Or) =>
+                {
+                    self.check_logical(operator, left, right)?
+                }
+                ExprKind::Binary(operator, left, right)
+                    if matches!(
+                        operator,
+                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                    ) =>
+                {
+                    self.check_comparison(operator, left, right)?
+                }
+                _ => return Err(()),
+            },
             ExprKind::Binary(operator, left, right)
                 if matches!(operator, BinOp::And | BinOp::Or) =>
             {
@@ -3816,12 +3840,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(())
     }
 
-    fn default_unresolved_literals(&mut self) {
+    fn default_unresolved_literals(&mut self, literal_floor: usize) {
         let symbols = self.input.symbols;
         let pointer_width = self.input.pointer_width;
         let mut deferred_errors = Vec::new();
         let mut deferred_operator_errors = Vec::new();
-        for variable in &mut self.literal_variables {
+        for variable in &mut self.literal_variables[literal_floor..] {
             if variable.resolved.is_none() {
                 let expected = match variable.kind {
                     PrimitiveLiteralKind::Integer => PrimTy::I64,

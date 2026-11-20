@@ -8660,226 +8660,20 @@ fn check_function_body_primitive_local_block(
     let mut primitive_types = HashMap::new();
     let mut preceding_bindings = initial_bindings.keys().copied().collect::<HashSet<_>>();
     for stmt in block.stmts {
-        let StmtKind::Let {
-            pat,
-            ty,
-            init,
-            els: None,
-        } = stmt.kind
-        else {
-            return Ok(None);
-        };
-        let PatKind::Binding {
-            mode: sai_hir::patterns::BindingMode::Value,
-            name,
-            binding,
-            sub: None,
-            ..
-        } = pat.kind
-        else {
-            return Ok(None);
-        };
-        if !function_name_is_supported(name, symbols, inputs)
-            || !matches!(
-                locals.bindings.get(&binding),
-                Some(sai_resolve::owner::LocalBinding {
-                    kind: sai_resolve::owner::BindingKind::Let,
-                    ..
-                })
-            )
-        {
+        if !primitive_let_statement_shape_is_supported(
+            stmt,
+            &mut preceding_bindings,
+            &mut primitive_types,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+        ) {
             return Ok(None);
         }
-        if let Some(ty) = ty {
-            let Some(FunctionDirectType::Primitive(local_type)) =
-                resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-            else {
-                return Ok(None);
-            };
-            primitive_types.insert(ty.hir_id, local_type);
-        }
-
-        match init.kind {
-            ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
-            ExprKind::Field { .. }
-                if self_field_projections
-                    .is_some_and(|fields| fields.contains_key(&init.hir_id))
-                    || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id)) => {}
-            ExprKind::Call {
-                args, base: None, ..
-            } if direct_call_signatures
-                .and_then(|signatures| signatures.get(&init.hir_id))
-                .is_some_and(|signature| {
-                    args.iter()
-                        .take(signature.parameters.len())
-                        .all(|argument| {
-                            is_supported_direct_call_argument_shape(
-                                argument.expr,
-                                &preceding_bindings,
-                                locals,
-                                inputs,
-                                direct_call_signatures,
-                            )
-                        })
-                }) => {}
-            ExprKind::Path(path) => {
-                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
-                else {
-                    return Ok(None);
-                };
-                if !preceding_bindings.contains(&source_binding) {
-                    return Ok(None);
-                }
-            }
-            ExprKind::Unary(UnOp::Not, operand) => {
-                let ExprKind::Path(path) = operand.kind else {
-                    return Ok(None);
-                };
-                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
-                else {
-                    return Ok(None);
-                };
-                if !preceding_bindings.contains(&source_binding) {
-                    return Ok(None);
-                }
-            }
-            ExprKind::Unary(UnOp::Neg, operand) => {
-                let ExprKind::Path(path) = operand.kind else {
-                    return Ok(None);
-                };
-                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
-                else {
-                    return Ok(None);
-                };
-                if !preceding_bindings.contains(&source_binding) {
-                    return Ok(None);
-                }
-            }
-            ExprKind::Unary(UnOp::BitNot, operand) => {
-                if !is_direct_function_integer_literal(operand)
-                    && !matches!(operand.kind, ExprKind::Lit(Lit::Byte(_)))
-                {
-                    let ExprKind::Path(path) = operand.kind else {
-                        return Ok(None);
-                    };
-                    let Some(source_binding) =
-                        resolved_plain_local_path_binding(path, locals, inputs)
-                    else {
-                        return Ok(None);
-                    };
-                    if !preceding_bindings.contains(&source_binding) {
-                        return Ok(None);
-                    }
-                }
-            }
-            ExprKind::Binary(operator, left, right)
-                if is_function_primitive_local_binary_operator(operator) =>
-            {
-                let is_preceding_path = |operand: &HirExpr<'_>| {
-                    let ExprKind::Path(path) = operand.kind else {
-                        return false;
-                    };
-                    resolved_plain_local_path_binding(path, locals, inputs)
-                        .is_some_and(|binding| preceding_bindings.contains(&binding))
-                };
-                let is_unknown_self_field = |operand: &HirExpr<'_>| {
-                    matches!(operand.kind, ExprKind::Field { .. })
-                        && unknown_self_fields
-                            .is_some_and(|fields| fields.contains(&operand.hir_id))
-                };
-                let is_preceding_path_or_unknown_field = |operand: &HirExpr<'_>| {
-                    is_preceding_path(operand) || is_unknown_self_field(operand)
-                };
-                let supported_shape = match operator {
-                    BinOp::And | BinOp::Or => {
-                        is_preceding_path_or_unknown_field(left)
-                            && is_preceding_path_or_unknown_field(right)
-                    }
-                    BinOp::Shl | BinOp::Shr => {
-                        (is_preceding_path_or_unknown_field(left)
-                            && (is_preceding_path_or_unknown_field(right)
-                                || is_direct_function_integer_literal(right)))
-                            || (is_direct_function_integer_literal(left)
-                                && is_preceding_path_or_unknown_field(right))
-                            || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
-                                && (is_preceding_path_or_unknown_field(right)
-                                    || is_direct_function_integer_literal(right)))
-                    }
-                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
-                        (is_preceding_path_or_unknown_field(left)
-                            && is_preceding_path_or_unknown_field(right))
-                            || (is_preceding_path_or_unknown_field(left)
-                                && is_direct_function_integer_literal(right))
-                            || (is_preceding_path_or_unknown_field(left)
-                                && matches!(right.kind, ExprKind::Lit(Lit::Byte(_))))
-                            || (is_preceding_path_or_unknown_field(left)
-                                && matches!(
-                                    right.kind,
-                                    ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. })
-                                ))
-                            || (is_direct_function_integer_literal(left)
-                                && is_preceding_path_or_unknown_field(right))
-                            || (is_direct_function_integer_literal(left)
-                                && is_direct_function_integer_literal(right))
-                            || (matches!(left.kind, ExprKind::Lit(Lit::Bool(_)))
-                                && matches!(right.kind, ExprKind::Lit(Lit::Bool(_))))
-                            || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
-                                && matches!(
-                                    right.kind,
-                                    ExprKind::Lit(
-                                        Lit::Char(_)
-                                            | Lit::Bool(_)
-                                            | Lit::Byte(_)
-                                            | Lit::Float { .. }
-                                    )
-                                ))
-                            || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
-                                && is_direct_function_integer_literal(right))
-                            || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
-                                && is_preceding_path_or_unknown_field(right))
-                            || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
-                                && (is_preceding_path_or_unknown_field(right)
-                                    || is_direct_function_scalar_literal(right)))
-                    }
-                    BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
-                        (is_preceding_path_or_unknown_field(left)
-                            && is_preceding_path_or_unknown_field(right))
-                            || (is_preceding_path_or_unknown_field(left)
-                                && is_direct_function_integer_literal(right))
-                            || (is_direct_function_integer_literal(left)
-                                && is_preceding_path_or_unknown_field(right))
-                            || (is_direct_function_integer_literal(left)
-                                && is_direct_function_integer_literal(right))
-                    }
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                        (is_preceding_path_or_unknown_field(left)
-                            && is_preceding_path_or_unknown_field(right))
-                            || (is_preceding_path_or_unknown_field(left)
-                                && is_direct_function_numeric_literal(right))
-                            || (is_direct_function_numeric_literal(left)
-                                && is_preceding_path_or_unknown_field(right))
-                            || (matches!(
-                                operator,
-                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
-                            ) && is_direct_function_integer_literal(left)
-                                && is_direct_function_integer_literal(right))
-                    }
-                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        (is_preceding_path_or_unknown_field(left)
-                            && is_preceding_path_or_unknown_field(right))
-                            || (is_preceding_path_or_unknown_field(left)
-                                && is_direct_function_scalar_literal(right))
-                            || (is_direct_function_scalar_literal(left)
-                                && is_preceding_path_or_unknown_field(right))
-                    }
-                };
-                if !supported_shape {
-                    return Ok(None);
-                }
-            }
-            _ => return Ok(None),
-        }
-        preceding_bindings.insert(binding);
     }
     if tail_binding.is_some_and(|binding| !preceding_bindings.contains(&binding)) {
         return Ok(None);
@@ -8890,9 +8684,12 @@ fn check_function_body_primitive_local_block(
             &preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            &mut primitive_types,
         )
     {
         return Ok(None);
@@ -9134,14 +8931,248 @@ fn is_supported_direct_call_argument_shape(
 
 // `if` tails admit empty-statement branches whose own tails stay inside the
 // same shapes the flat block tail admits, with `else if` chains recursing.
+
+#[allow(clippy::too_many_arguments)]
+fn primitive_let_statement_shape_is_supported(
+    stmt: &Stmt<'_>,
+    preceding_bindings: &mut HashSet<sai_hir::BindingId>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> bool {
+    let StmtKind::Let {
+        pat,
+        ty,
+        init,
+        els: None,
+    } = stmt.kind
+    else {
+        return false;
+    };
+    let PatKind::Binding {
+        mode: sai_hir::patterns::BindingMode::Value,
+        name,
+        binding,
+        sub: None,
+        ..
+    } = pat.kind
+    else {
+        return false;
+    };
+    if !function_name_is_supported(name, symbols, inputs)
+        || !matches!(
+            locals.bindings.get(&binding),
+            Some(sai_resolve::owner::LocalBinding {
+                kind: sai_resolve::owner::BindingKind::Let,
+                ..
+            })
+        )
+    {
+        return false;
+    }
+    if let Some(ty) = ty {
+        let Some(FunctionDirectType::Primitive(local_type)) =
+            resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+        else {
+            return false;
+        };
+        primitive_types.insert(ty.hir_id, local_type);
+    }
+
+    match init.kind {
+        ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
+        ExprKind::Field { .. }
+            if self_field_projections.is_some_and(|fields| fields.contains_key(&init.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id)) => {}
+        ExprKind::Call {
+            args, base: None, ..
+        } if direct_call_signatures
+            .and_then(|signatures| signatures.get(&init.hir_id))
+            .is_some_and(|signature| {
+                args.iter()
+                    .take(signature.parameters.len())
+                    .all(|argument| {
+                        is_supported_direct_call_argument_shape(
+                            argument.expr,
+                            &preceding_bindings,
+                            locals,
+                            inputs,
+                            direct_call_signatures,
+                        )
+                    })
+            }) => {}
+        ExprKind::Path(path) => {
+            let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
+            else {
+                return false;
+            };
+            if !preceding_bindings.contains(&source_binding) {
+                return false;
+            }
+        }
+        ExprKind::Unary(UnOp::Not, operand) => {
+            let ExprKind::Path(path) = operand.kind else {
+                return false;
+            };
+            let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
+            else {
+                return false;
+            };
+            if !preceding_bindings.contains(&source_binding) {
+                return false;
+            }
+        }
+        ExprKind::Unary(UnOp::Neg, operand) => {
+            let ExprKind::Path(path) = operand.kind else {
+                return false;
+            };
+            let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
+            else {
+                return false;
+            };
+            if !preceding_bindings.contains(&source_binding) {
+                return false;
+            }
+        }
+        ExprKind::Unary(UnOp::BitNot, operand) => {
+            if !is_direct_function_integer_literal(operand)
+                && !matches!(operand.kind, ExprKind::Lit(Lit::Byte(_)))
+            {
+                let ExprKind::Path(path) = operand.kind else {
+                    return false;
+                };
+                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
+                else {
+                    return false;
+                };
+                if !preceding_bindings.contains(&source_binding) {
+                    return false;
+                }
+            }
+        }
+        ExprKind::Binary(operator, left, right)
+            if is_function_primitive_local_binary_operator(operator) =>
+        {
+            let is_preceding_path = |operand: &HirExpr<'_>| {
+                let ExprKind::Path(path) = operand.kind else {
+                    return false;
+                };
+                resolved_plain_local_path_binding(path, locals, inputs)
+                    .is_some_and(|binding| preceding_bindings.contains(&binding))
+            };
+            let is_unknown_self_field = |operand: &HirExpr<'_>| {
+                matches!(operand.kind, ExprKind::Field { .. })
+                    && unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+            };
+            let is_preceding_path_or_unknown_field = |operand: &HirExpr<'_>| {
+                is_preceding_path(operand) || is_unknown_self_field(operand)
+            };
+            let supported_shape = match operator {
+                BinOp::And | BinOp::Or => {
+                    is_preceding_path_or_unknown_field(left)
+                        && is_preceding_path_or_unknown_field(right)
+                }
+                BinOp::Shl | BinOp::Shr => {
+                    (is_preceding_path_or_unknown_field(left)
+                        && (is_preceding_path_or_unknown_field(right)
+                            || is_direct_function_integer_literal(right)))
+                        || (is_direct_function_integer_literal(left)
+                            && is_preceding_path_or_unknown_field(right))
+                        || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
+                            && (is_preceding_path_or_unknown_field(right)
+                                || is_direct_function_integer_literal(right)))
+                }
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                    (is_preceding_path_or_unknown_field(left)
+                        && is_preceding_path_or_unknown_field(right))
+                        || (is_preceding_path_or_unknown_field(left)
+                            && is_direct_function_integer_literal(right))
+                        || (is_preceding_path_or_unknown_field(left)
+                            && matches!(right.kind, ExprKind::Lit(Lit::Byte(_))))
+                        || (is_preceding_path_or_unknown_field(left)
+                            && matches!(
+                                right.kind,
+                                ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. })
+                            ))
+                        || (is_direct_function_integer_literal(left)
+                            && is_preceding_path_or_unknown_field(right))
+                        || (is_direct_function_integer_literal(left)
+                            && is_direct_function_integer_literal(right))
+                        || (matches!(left.kind, ExprKind::Lit(Lit::Bool(_)))
+                            && matches!(right.kind, ExprKind::Lit(Lit::Bool(_))))
+                        || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
+                            && matches!(
+                                right.kind,
+                                ExprKind::Lit(
+                                    Lit::Char(_) | Lit::Bool(_) | Lit::Byte(_) | Lit::Float { .. }
+                                )
+                            ))
+                        || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
+                            && is_direct_function_integer_literal(right))
+                        || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
+                            && is_preceding_path_or_unknown_field(right))
+                        || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
+                            && (is_preceding_path_or_unknown_field(right)
+                                || is_direct_function_scalar_literal(right)))
+                }
+                BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
+                    (is_preceding_path_or_unknown_field(left)
+                        && is_preceding_path_or_unknown_field(right))
+                        || (is_preceding_path_or_unknown_field(left)
+                            && is_direct_function_integer_literal(right))
+                        || (is_direct_function_integer_literal(left)
+                            && is_preceding_path_or_unknown_field(right))
+                        || (is_direct_function_integer_literal(left)
+                            && is_direct_function_integer_literal(right))
+                }
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                    (is_preceding_path_or_unknown_field(left)
+                        && is_preceding_path_or_unknown_field(right))
+                        || (is_preceding_path_or_unknown_field(left)
+                            && is_direct_function_numeric_literal(right))
+                        || (is_direct_function_numeric_literal(left)
+                            && is_preceding_path_or_unknown_field(right))
+                        || (matches!(
+                            operator,
+                            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+                        ) && is_direct_function_integer_literal(left)
+                            && is_direct_function_integer_literal(right))
+                }
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    (is_preceding_path_or_unknown_field(left)
+                        && is_preceding_path_or_unknown_field(right))
+                        || (is_preceding_path_or_unknown_field(left)
+                            && is_direct_function_scalar_literal(right))
+                        || (is_direct_function_scalar_literal(left)
+                            && is_preceding_path_or_unknown_field(right))
+                }
+            };
+            if !supported_shape {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    preceding_bindings.insert(binding);
+    true
+}
+
 fn primitive_if_tail_shape_is_supported(
     expression: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     let ExprKind::If {
         cond,
@@ -9159,9 +9190,12 @@ fn primitive_if_tail_shape_is_supported(
         preceding_bindings,
         locals,
         inputs,
+        symbols,
+        type_paths,
         self_field_projections,
         unknown_self_fields,
         direct_call_signatures,
+        primitive_types,
     ) {
         return false;
     }
@@ -9171,18 +9205,24 @@ fn primitive_if_tail_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            primitive_types,
         ),
         ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
             els,
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            primitive_types,
         ),
         _ => false,
     }
@@ -9202,6 +9242,17 @@ fn primitive_if_condition_shape_is_supported(
                 resolved_plain_local_path_binding(operand_path, locals, inputs)
                     .is_some_and(|binding| preceding_bindings.contains(&binding))
             }
+            ExprKind::Binary(operator, ..) => matches!(
+                operator,
+                BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::And
+                    | BinOp::Or
+            ),
             _ => false,
         },
         ExprKind::Lit(Lit::Bool(_)) => true,
@@ -9220,28 +9271,69 @@ fn primitive_if_condition_shape_is_supported(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn primitive_if_branch_shape_is_supported(
     block: &HirBlock<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
-    block.safety == sai_hir::Safety::Safe
-        && block.stmts.is_empty()
-        && block.tail.is_some_and(|tail| {
+    if block.safety != sai_hir::Safety::Safe {
+        return false;
+    }
+    if block.stmts.is_empty() {
+        return block.tail.is_some_and(|tail| {
             primitive_if_branch_tail_shape_is_supported(
                 tail,
                 preceding_bindings,
                 locals,
                 inputs,
+                symbols,
+                type_paths,
                 self_field_projections,
                 unknown_self_fields,
                 direct_call_signatures,
+                primitive_types,
             )
-        })
+        });
+    }
+    // Branch-local bindings are scoped to the branch: they extend the
+    // preceding set for this branch's statements and tail without leaking
+    // into the sibling branch or the outer block.
+    let mut branch_bindings = preceding_bindings.clone();
+    block.stmts.iter().all(|stmt| {
+        primitive_let_statement_shape_is_supported(
+            stmt,
+            &mut branch_bindings,
+            primitive_types,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+        )
+    }) && block.tail.is_some_and(|tail| {
+        primitive_if_branch_tail_shape_is_supported(
+            tail,
+            &branch_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        )
+    })
 }
 
 fn primitive_if_branch_tail_shape_is_supported(
@@ -9249,9 +9341,12 @@ fn primitive_if_branch_tail_shape_is_supported(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     match tail.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
@@ -9293,9 +9388,12 @@ fn primitive_if_branch_tail_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            primitive_types,
         ),
         _ => false,
     }
@@ -9874,7 +9972,7 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
         return Some(expression.span);
     }
     match expression.kind {
-        ExprKind::Unary(_, operand) if operand.hir_id == node => Some(operand.span),
+        ExprKind::Unary(_, operand) => primitive_body_error_span(operand, node),
         ExprKind::Binary(_, left, right) => {
             if left.hir_id == node {
                 Some(left.span)
@@ -52983,6 +53081,92 @@ property "shared"() {}
             "        value\n",
             "    }\n",
             "}\n",
+            "pub fn annotated_branch_local(value: I32) -> I32 {\n",
+            "    if value < 0 {\n",
+            "        let negated: I32 = -value\n",
+            "        negated\n",
+            "    } else {\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
+            "pub fn both_branches_bind(value: I32) -> I32 {\n",
+            "    if value < 0 {\n",
+            "        let negated = -value\n",
+            "        negated\n",
+            "    } else {\n",
+            "        let doubled = value + value\n",
+            "        doubled\n",
+            "    }\n",
+            "}\n",
+            "pub fn branch_local_mismatch(value: I32) -> I32 {\n",
+            "    if value < 0 {\n",
+            "        let negated: Bool = -value\n",
+            "        negated\n",
+            "    } else {\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
+            "pub fn sibling_scope_leak(value: I32) -> I32 {\n",
+            "    if value < 0 {\n",
+            "        let negated = -value\n",
+            "        negated\n",
+            "    } else {\n",
+            "        negated\n",
+            "    }\n",
+            "}\n",
+            "pub fn unsupported_branch_statement(value: I32) -> I32 {\n",
+            "    if value < 0 {\n",
+            "        let negated = -value\n",
+            "        value\n",
+            "        negated\n",
+            "    } else {\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
+            "pub fn late_resolved_outer_local(flag: Bool) -> U16 {\n",
+            "    let chosen = 7\n",
+            "    if flag {\n",
+            "        let probe = 1\n",
+            "        probe\n",
+            "    } else {\n",
+            "        chosen\n",
+            "    }\n",
+            "}\n",
+            "pub fn negated_comparison(flag: Bool, limit: I32) -> I32 {\n",
+            "    let bound = limit\n",
+            "    if not (bound < 0) {\n",
+            "        1\n",
+            "    } else {\n",
+            "        0\n",
+            "    }\n",
+            "}\n",
+            "pub fn negated_conjunction(flag: Bool, other: Bool, third: Bool) -> I32 {\n",
+            "    if not (flag and other) {\n",
+            "        if third {\n",
+            "            1\n",
+            "        } else {\n",
+            "            2\n",
+            "        }\n",
+            "    } else {\n",
+            "        0\n",
+            "    }\n",
+            "}\n",
+            "pub fn negated_mismatch(value: I32, flag: Bool) -> I32 {\n",
+            "    let probe = flag\n",
+            "    if not (value and probe) {\n",
+            "        1\n",
+            "    } else {\n",
+            "        0\n",
+            "    }\n",
+            "}\n",
+            "pub fn flat_negated_expression(value: I32, flag: Bool) -> I32 {\n",
+            "    if not (value and flag) {\n",
+            "        1\n",
+            "    } else {\n",
+            "        0\n",
+            "    }\n",
+            "}\n",
+            "pub fn double_negation(flag: Bool) -> I32 { if not not flag { 1 } else { 0 } }\n",
             "pub fn literal_condition() -> I32 { if 1 { 1 } else { 0 } }\n",
             "pub fn nested_branch_tail(first: I32) -> I32 {\n",
             "    if first < 0 { (first + 1) * 2 } else { 0 }\n",
@@ -53041,6 +53225,12 @@ property "shared"() {}
             "choose_paths",
             "choose_literal",
             "else_if_chain",
+            "branch_statement",
+            "annotated_branch_local",
+            "both_branches_bind",
+            "late_resolved_outer_local",
+            "negated_comparison",
+            "negated_conjunction",
         ] {
             let owner = owner_named(&database, &resolved, name);
             let FunctionBodyTypeCheck::Supported { diagnostics } = owner
@@ -53107,11 +53297,48 @@ property "shared"() {}
             "an I32 condition reports the expected `Bool` diagnostic"
         );
 
+        let branch_mismatch_owner = owner_named(&database, &resolved, "branch_local_mismatch");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: branch_mismatch_diagnostics,
+        } = branch_mismatch_owner
+            .body_type_check()
+            .expect("branch annotation mismatch body check is available")
+        else {
+            panic!("a branch-local annotation mismatch remains a recoverable type error");
+        };
+        assert_eq!(
+            branch_mismatch_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected `Bool`, found `I32`",
+                "expected `I32`, found `Bool`"
+            ],
+            "the branch-local annotation and the Bool-typed branch tail both mismatch"
+        );
+
+        for name in ["negated_mismatch", "flat_negated_expression"] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner.body_type_check(),
+                    Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+                        if diagnostics.len() == 1
+                            && diagnostics.iter().all(|diagnostic| {
+                                diagnostic.code == sai_diagnostics::Code::TypeMismatch
+                            })
+                ),
+                "the `{name}` non-Bool operand under `not` is a recoverable type error"
+            );
+        }
         for name in [
             "no_else",
-            "branch_statement",
+            "sibling_scope_leak",
+            "unsupported_branch_statement",
             "literal_condition",
             "nested_branch_tail",
+            "double_negation",
         ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
@@ -76107,15 +76334,15 @@ property "shared"() {}
             );
         }
 
-        for index in [7, 10] {
+        for index in [7, 8, 10] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
-                    .expect("else-if and literal-operator branches are checked"),
+                    .expect("else-if, statement-bearing, and literal-operator branches are checked"),
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [5, 6, 8, 9, 11, 12, 13] {
+        for index in [5, 6, 9, 11, 12, 13] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76320,7 +76547,13 @@ property "shared"() {}
                 .expect("a two-parameter literal comparison is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30] {
+        assert!(matches!(
+            owners[25]
+                .body_type_check()
+                .expect("a negated literal-parameter comparison is checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for index in [19, 20, 21, 23, 24, 26, 27, 28, 29, 30] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76605,7 +76838,13 @@ property "shared"() {}
                             .all(|d| d.code == sai_diagnostics::Code::TypeMismatch)
             ));
         }
-        for index in [27, 28, 29, 30, 31, 32, 33, 34, 35, 39, 41, 42, 44, 45, 46] {
+        assert!(matches!(
+            owners[35]
+                .body_type_check()
+                .expect("a negated logical condition over one parameter is checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for index in [27, 28, 29, 30, 31, 32, 33, 34, 39, 41, 42, 44, 45, 46] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()

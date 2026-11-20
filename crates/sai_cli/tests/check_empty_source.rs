@@ -10160,6 +10160,8 @@ fn public_if_tail_bodies_emit_check_results() {
         "pub fn choose() -> I32 { if true { 1 + 2 } else { 2 } }\n",
         "pub fn choose() -> I32 { if true { 1 } else if false { 2 } else { 3 } }\n",
         "pub fn choose() -> I32 { if true { if false { 1 } else { 2 } } else { 3 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n    } else {\n        2\n    }\n}\n",
+        "pub fn choose(value: I32) -> I32 {\n    if value < 0 {\n        let negated = -value\n        negated\n    } else {\n        value\n    }\n}\n",
     ] {
         let output = run_check(source, "", &[], &[]);
         assert!(
@@ -10188,6 +10190,7 @@ fn public_bool_parameters_and_if_function_emits_check_result() {
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and right) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and left { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and left) { 1 } else { 2 } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10200,10 +10203,10 @@ fn unsupported_bool_parameter_and_shapes_remain_gated() {
         "pub fn choose(var left: Bool, right: Bool) -> I32 { if left and right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left and right) { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and left) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and right and left) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left == right and left) { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n    } else {\n        2\n    }\n}\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n        value\n    } else {\n        2\n    }\n}\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n    } else {\n        value\n    }\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -10364,6 +10367,7 @@ fn public_single_primitive_parameter_comparison_with_literal_emits_check_results
         "pub fn choose(value: UInt) -> I32 { if value > 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8, other: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8, other: I8) -> I32 { if 10 < value { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8, other: I8) -> I32 { if not (10 < value) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == true { 1 } else { 2 } }\n",
     ] {
@@ -10379,7 +10383,6 @@ fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
         "pub fn choose(value: I8) -> I32 { if 10 < 11 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if value < 1 and true { 1 } else { 2 } }\n",
-        "pub fn choose(value: I8, other: I8) -> I32 { if not (10 < value) { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < other { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if not not (value < 10) { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if not (value < 1 and true) { 1 } else { 2 } }\n",
