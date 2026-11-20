@@ -9690,3 +9690,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, assign owner test passes; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Pending — see PR.
 - **Remaining scope:** `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1050 (2026-11-21): Nested binary operands `(a + b) * c`
+
+- **Decision:** Binary operator operands may themselves be binary trees — `(left + right) + left`, `value + (1 + 1)`, `left & (right ^ extra)`, `(value + 1) + value`, `value < (1 + 2)` — evaluated through the shared `check_operand_local_type` helper: `check_local_path` first (literal-vs-path discrimination), then `check_initializer_value` for everything else, with a `Lit` guard that keeps literals on the literal-specific branches.
+- **Reason:** An operand that is not a literal or path is an initializer-shape expression; routing it through the initializer checker is exactly the `let t = e` binding the operand desugars to.
+- **Failure boundary and judgment:** Nested subtrees mixing a path leaf with an unresolved integer literal (`left / (right / 1)`, `(value + 1) < 2`) stay gated — integer-literal leaves beside path leaves have no type context. Pure literal-literal subtrees (`(1 + 1)`, `(1 + 2)`, `('b' | 'c')`, `1 << 2`) resolve as literal groups. Unary operands (`-rhs`, `~x`) and calls/fields stay gated.
+- **Review required:** None — operand admission reuses `check_initializer_value` and the recursive shape mirror admits only primitive-local binary operators over scalar literals, preceding paths, and unknown self fields.
+- **Planned verification matrix:** Driver `nested_tail`/`nested_branch_tail`/`nested_right_operand` flipped to supported, bitwise owners 29/33 (`OperatorNotSupported` diagnostics) and 76 (`1 << 2` clean); CLI flipped fixtures asserted in their former gated tests.
+- **Verification:** Pinned Rust 1.99.1, driver suite (775) and CLI suite (387) pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Passed — the `Lit` guard in `check_operand_local_type` was required: without it literal operands fell through to `check_initializer_value`, returned `Some`, and literal-vs-path discrimination in `comparison_literal_left_range_and_mismatch`/`mixed_logical` inverted. A pre-admission probe (`let value = 1 << value`) confirmed self-references still gate.
+- **Remaining scope:** Nested operands with path+integer-literal mixed leaves, unary/call/field operands, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.

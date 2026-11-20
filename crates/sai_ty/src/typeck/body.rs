@@ -1090,7 +1090,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
                 )
             {
-                if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+                if let Some(LocalType::LiteralVariable(id)) =
+                    self.check_operand_local_type(right).ok()
+                {
                     let Some(variable) = self.literal_variables.get(id) else {
                         return Err(());
                     };
@@ -1157,7 +1159,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             };
         }
 
-        let left_local_type = self.check_local_path(left).ok().ok_or(())?;
+        let left_local_type = self.check_operand_local_type(left).ok().ok_or(())?;
         let unresolved_literal_variable = matches!(left_local_type, LocalType::LiteralVariable(id)
             if self
                 .literal_variables
@@ -1192,7 +1194,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // The left variable must be numeric: the merge defers the
                 // operator check, and `+ - * /` only exist on integer and
                 // floating-point primitives.
-                if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok()
+                if let Some(LocalType::LiteralVariable(other)) =
+                    self.check_operand_local_type(right).ok()
                     && self.literal_variables.get(id).is_some_and(|variable| {
                         matches!(
                             variable.kind,
@@ -1250,7 +1253,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // `p + x` with a concretely typed left operand resolves an
         // unresolved literal variable on the right to that type — the
         // symmetric rule for the left-side literal-variable branch.
-        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+        if let Some(LocalType::LiteralVariable(id)) = self.check_operand_local_type(right).ok() {
             let Some(variable) = self.literal_variables.get(id) else {
                 return Err(());
             };
@@ -1318,7 +1321,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // `1 % x` joins the literal as a constraint site on the
             // unresolved integer literal variable, like `x % 1`.
             if kind == PrimitiveLiteralKind::Integer
-                && let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok()
+                && let Some(LocalType::LiteralVariable(other)) =
+                    self.check_operand_local_type(right).ok()
                 && self.literal_variables.get(other).is_some_and(|v| {
                     v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
                 })
@@ -1378,7 +1382,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // integer literal variable to the operand's type — the `x = x % path`
         // desugar does the same. Float variables stay gated because the
         // remainder has no float implementation.
-        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(left).ok() {
+        if let Some(LocalType::LiteralVariable(id)) = self.check_operand_local_type(left).ok() {
             let Some(variable) = self.literal_variables.get(id) else {
                 return Err(());
             };
@@ -1406,7 +1410,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // `x % y` merges two unresolved integer literal variables.
                 if variable.kind == PrimitiveLiteralKind::Integer
                     && let Some(LocalType::LiteralVariable(other)) =
-                        self.check_local_path(right).ok()
+                        self.check_operand_local_type(right).ok()
                 {
                     if self
                         .literal_variables
@@ -1444,7 +1448,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         } else {
             // `p % x` resolves an unresolved integer literal variable on
             // the right to the concrete left operand's type.
-            if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+            if let Some(LocalType::LiteralVariable(id)) = self.check_operand_local_type(right).ok()
+            {
                 let Some(variable) = self.literal_variables.get(id) else {
                     return Err(());
                 };
@@ -1520,7 +1525,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             // `1 +% x` joins the literal as a constraint site on the
             // unresolved integer literal variable, like `x +% 1`.
-            if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok()
+            if let Some(LocalType::LiteralVariable(other)) =
+                self.check_operand_local_type(right).ok()
                 && self.literal_variables.get(other).is_some_and(|v| {
                     v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
                 })
@@ -1566,7 +1572,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
         // `x wrapping+ path` resolves an unresolved integer literal
         // variable to the operand's type, as the wrapping desugar does.
-        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(left).ok() {
+        if let Some(LocalType::LiteralVariable(id)) = self.check_operand_local_type(left).ok() {
             let Some(variable) = self.literal_variables.get(id) else {
                 return Err(());
             };
@@ -1596,7 +1602,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     };
                 }
                 // `x +% y` merges two unresolved integer literal variables.
-                if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok() {
+                if let Some(LocalType::LiteralVariable(other)) =
+                    self.check_operand_local_type(right).ok()
+                {
                     if self
                         .literal_variables
                         .get(other)
@@ -1632,7 +1640,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         // `p +% x` resolves an unresolved integer literal variable on the
         // right to the concrete left operand's type.
-        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+        if let Some(LocalType::LiteralVariable(id)) = self.check_operand_local_type(right).ok() {
             let Some(variable) = self.literal_variables.get(id) else {
                 return Err(());
             };
@@ -1761,7 +1769,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 if primitive_literal_kind(literal) == Some(PrimitiveLiteralKind::Character) {
                     let ExprKind::Lit(right_literal) = right.kind else {
-                        let right_local_type = self.check_local_path(right)?;
+                        let right_local_type = self.check_operand_local_type(right)?;
                         let eligible_unannotated_literal_path =
                             self.is_eligible_unannotated_literal_path(right);
                         let eligible_resolved_computed_literal_path =
@@ -1924,7 +1932,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
             // `1 & x` joins the literal as a constraint site on the
             // unresolved integer literal variable, like `x & 1`.
-            if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok()
+            if let Some(LocalType::LiteralVariable(other)) =
+                self.check_operand_local_type(right).ok()
                 && self.literal_variables.get(other).is_some_and(|v| {
                     v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
                 })
@@ -1970,7 +1979,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // operand's type; a literal right side joins it as a constraint
         // site. Bool and float variables stay gated — they have no bitwise
         // operators to fall back on.
-        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(left).ok() {
+        if let Some(LocalType::LiteralVariable(id)) = self.check_operand_local_type(left).ok() {
             let Some(variable) = self.literal_variables.get(id) else {
                 return Err(());
             };
@@ -1996,7 +2005,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     };
                 }
                 // `x & y` merges two unresolved integer literal variables.
-                if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok() {
+                if let Some(LocalType::LiteralVariable(other)) =
+                    self.check_operand_local_type(right).ok()
+                {
                     if self
                         .literal_variables
                         .get(other)
@@ -2144,7 +2155,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
         // `p & x` resolves an unresolved integer literal variable on the
         // right to the concrete left operand's type.
-        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+        if let Some(LocalType::LiteralVariable(id)) = self.check_operand_local_type(right).ok() {
             let Some(variable) = self.literal_variables.get(id) else {
                 return Err(());
             };
@@ -2237,7 +2248,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // `x << count` keeps an unresolved integer literal variable as
             // the result — the variable resolves through an annotation or
             // the function tail, like `x % 1`.
-            match self.check_local_path(left) {
+            match self.check_operand_local_type(left) {
                 Ok(local_type @ LocalType::LiteralVariable(id))
                     if self.literal_variables.get(id).is_some_and(|v| {
                         v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
@@ -2269,7 +2280,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // `x << c` resolves an unresolved integer literal-variable
             // count to U32 — the shift count's required type — like an
             // annotated `U32` local.
-            let right_type = match self.check_local_path(right) {
+            let right_type = match self.check_operand_local_type(right) {
                 Ok(LocalType::LiteralVariable(id))
                     if self.literal_variables.get(id).is_some_and(|v| {
                         v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
@@ -2360,8 +2371,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         }
         for (local_type, literal_expression, literal_entry) in [
-            (self.check_local_path(left).ok(), right, right_literal),
-            (self.check_local_path(right).ok(), left, left_literal),
+            (
+                self.check_operand_local_type(left).ok(),
+                right,
+                right_literal,
+            ),
+            (
+                self.check_operand_local_type(right).ok(),
+                left,
+                left_literal,
+            ),
         ] {
             let Some(LocalType::LiteralVariable(id)) = local_type else {
                 continue;
@@ -2394,10 +2413,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // kind; the comparison yields Bool either way. Only
                 // numeric variables merge — the deferred operator check
                 // cannot reject `<` on Bool or Char once resolved.
+                let variable_kind = variable.kind;
                 if let Some(LocalType::LiteralVariable(other)) =
-                    self.check_local_path(literal_expression).ok()
+                    self.check_operand_local_type(literal_expression).ok()
                     && matches!(
-                        variable.kind,
+                        variable_kind,
                         PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
                     )
                     && self
@@ -6493,6 +6513,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.record_expression_type(expression.hir_id, local_type);
         }
         Ok(local_type)
+    }
+
+    // A binary operand that is not a plain path evaluates like the
+    // desugared `let t = e` binding its subtree stands for.
+    fn check_operand_local_type(&mut self, expression: &'hir Expr<'hir>) -> Result<LocalType, ()> {
+        // Literal operands stay on the literal-specific branches: an
+        // `Err` here is how those branches tell literals from paths.
+        if matches!(expression.kind, ExprKind::Lit(_)) {
+            return Err(());
+        }
+        match self.check_local_path(expression) {
+            Ok(local_type) => Ok(local_type),
+            Err(()) => self
+                .check_initializer_value(expression, None)
+                .map(|check| check.local_type),
+        }
     }
 
     fn resolve_local_path(&self, expression: &Expr<'hir>) -> Result<LocalType, ()> {

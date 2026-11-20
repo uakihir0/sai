@@ -4699,12 +4699,14 @@ fn unannotated_copy_of_annotated_primitive_local_reports_semantic_errors() {
 #[test]
 fn unsupported_unannotated_copy_local_forms_remain_gated() {
     for source in [
-        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = source / (1 / 1)\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = r#source\n    copied\n}\n",
         "const SOURCE: I32 = 42\npub fn copy() -> I32 {\n    let copied = SOURCE\n    copied\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
+
+    let source = "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = source / (1 / 1)\n    copied\n}\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
 
 #[test]
@@ -9082,11 +9084,16 @@ fn unsupported_primitive_add_local_literal_shapes_remain_gated() {
         "pub fn fixed_literal(value: I32) -> I32 {\n    let result = value + true\n    result\n}\n",
         "pub fn fixed_literal_left(value: I32) -> I32 {\n    let result = true + value\n    result\n}\n",
         "pub fn byte_path(value: Byte) -> Byte {\n    let result = value + 1\n    result\n}\n",
-        "pub fn nested(value: I32) -> I32 {\n    let result = value + (1 + 1)\n    result\n}\n",
-        "pub fn computed_left(value: I32) -> I32 {\n    let result = (value + 1) + value\n    result\n}\n",
         "pub fn forward(value: I32) -> I32 {\n    let result = later + 1\n    let later = value\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+
+    for source in [
+        "pub fn nested(value: I32) -> I32 {\n    let result = value + (1 + 1)\n    result\n}\n",
+        "pub fn computed_left(value: I32) -> I32 {\n    let result = (value + 1) + value\n    result\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
 }
 
@@ -9250,11 +9257,9 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn float_division() -> F64 {\n    let result = 1.0 / 2.0\n    result\n}\n",
         "pub fn mixed_division() -> I64 {\n    let result = 1 / 2.0\n    result\n}\n",
         "pub fn div_nested_right(left: I32, right: I32) -> I32 {\n    let result = left / (right / 1)\n    result\n}\n",
-        "pub fn div_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left / right) / left\n    result\n}\n",
         "type IntegerAlias = I32\npub fn div_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left / right\n    result\n}\n",
         "pub fn float_mul() -> F64 {\n    let result = 1.0 * 2.0\n    result\n}\n",
         "pub fn mixed_mul() -> I64 {\n    let result = 1 * 2.0\n    result\n}\n",
-        "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
         "pub fn remainder_nested_right(left: I32, right: I32) -> I32 {\n    let result = left % (right % 1)\n    result\n}\n",
         "pub fn remainder_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left % right) % left\n    result\n}\n",
         "type IntegerAlias = I32\npub fn remainder_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left % right\n    result\n}\n",
@@ -9303,6 +9308,13 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let result = first - second\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+
+    for source in [
+        "pub fn div_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left / right) / left\n    result\n}\n",
+        "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
 
     for (function, operator) in [("sub", "-"), ("mul", "*"), ("div", "/")] {
@@ -9382,7 +9394,6 @@ fn primitive_add_diagnostics_follow_source_order_after_shadowed_binding_resoluti
 #[test]
 fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n",
         "pub fn add(left: Byte, right: Byte) -> Byte {\n    let sum = left + right\n    sum\n}\n",
         "pub fn add(left: Char, right: Char) -> Char {\n    let sum = left + right\n    sum\n}\n",
         "pub fn add(left: Bool, right: Bool) -> Bool {\n    let sum = left + right\n    sum\n}\n",
@@ -9393,6 +9404,9 @@ fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
+
+    let source = "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 
     let source = "use acme:empty/values as values\npub fn add(right: I32) -> I32 {\n    let sum = values.VALUE + right\n    sum\n}\n";
     assert_check_stays_gated(
@@ -9739,7 +9753,6 @@ fn primitive_comparison_local_literal_errors_use_operand_spans_and_recover_as_bo
 fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
     for source in [
         "pub fn compare(value: I32) -> Bool {\n    let result = 1 == 2\n    result\n}\n",
-        "pub fn compare(value: I32) -> Bool {\n    let result = value < (1 + 2)\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = (value + 1) < 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < later\n    let later: I32 = 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = result < 1\n    result\n}\n",
@@ -9751,6 +9764,10 @@ fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
+
+    let source =
+        "pub fn compare(value: I32) -> Bool {\n    let result = value < (1 + 2)\n    result\n}\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 
     let qualified = concat!(
         "use acme:empty/values as values\n",
@@ -10711,7 +10728,6 @@ fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
         "const LIMIT: I8 = 10\npub fn choose(value: I8) -> I32 { if value < LIMIT { 1 } else { 2 } }\n",
         "const LIMIT: I8 = 10\npub fn choose(value: I8) -> I32 { if LIMIT < value { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < 11 { 1 } else { 2 } }\n",
-        "pub fn choose(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < other { 1 } else { 2 } }\n",
         "type I8Alias = I8\npub fn choose(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
@@ -10720,6 +10736,9 @@ fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
+
+    let source = "pub fn choose(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
 
 #[test]
@@ -15902,14 +15921,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn char_literal_generic_path_rhs(right: I32) -> Char",
             "let result = 'a' & right<I32>",
         ),
-        fixture(
-            "pub fn char_literal_computed_path_rhs(left: I32, right: I32) -> Char",
-            "let result = 'a' & (left + right)",
-        ),
-        fixture(
-            "pub fn char_literal_nested_path_rhs(left: I32, right: I32) -> Char",
-            "let result = 'a' & (left ^ right)",
-        ),
         format!(
             "type CharAlias = Char\n{}",
             fixture(
@@ -15941,10 +15952,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         fixture(
             "pub fn char_literal_byte_string_pair() -> Char",
             "let result = 'a' & b\"text\"",
-        ),
-        fixture(
-            "pub fn nested_char_literal_pair_rhs() -> Char",
-            "let result = 'a' & ('b' | 'c')",
         ),
         fixture(
             "pub fn nested_char_literal_pair_left() -> Char",
@@ -16045,10 +16052,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         fixture(
             "pub fn chained_integer_literal_pairs() -> I32",
             "let result = 1 & 2 | 3",
-        ),
-        fixture(
-            "pub fn integer_literal_shift_pair() -> I32",
-            "let result = 1 << 2",
         ),
         fixture(
             "pub fn generic_integer_literal_pair<T>() -> I32",
@@ -16361,6 +16364,36 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         .to_owned(),
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(&source, "", &[], &[]), &source);
+    }
+
+    let source = fixture(
+        "pub fn integer_literal_shift_pair() -> I32",
+        "let result = 1 << 2",
+    );
+    assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+
+    for source in [
+        fixture(
+            "pub fn char_literal_computed_path_rhs(left: I32, right: I32) -> Char",
+            "let result = 'a' & (left + right)",
+        ),
+        fixture(
+            "pub fn char_literal_nested_path_rhs(left: I32, right: I32) -> Char",
+            "let result = 'a' & (left ^ right)",
+        ),
+        fixture(
+            "pub fn nested_char_literal_pair_rhs() -> Char",
+            "let result = 'a' & ('b' | 'c')",
+        ),
+    ] {
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source}: nested bitwise operands surface operator diagnostics:\n{stdout}"
+        );
     }
 }
 
