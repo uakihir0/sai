@@ -2217,6 +2217,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Bool));
                 Ok(PrimTy::Bool)
             }
+            // `not` operands recurse into the same operand gate so
+            // `enabled and not (value >= 18)` and `not (enabled and value >= 18)`
+            // stay in source order; `not not` and other unary operators still
+            // reject through the path fallback below.
+            ExprKind::Unary(UnOp::Not, operand) => {
+                let operand_type = self.check_logical_operand(operand)?;
+                self.check_logical_operand_type(operand, operand_type)?;
+                Ok(PrimTy::Bool)
+            }
             _ => self
                 .check_local_path(operand)
                 .ok()
