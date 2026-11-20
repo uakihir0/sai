@@ -9996,13 +9996,7 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
     match expression.kind {
         ExprKind::Unary(_, operand) => primitive_body_error_span(operand, node),
         ExprKind::Binary(_, left, right) => {
-            if left.hir_id == node {
-                Some(left.span)
-            } else if right.hir_id == node {
-                Some(right.span)
-            } else {
-                None
-            }
+            primitive_body_error_span(left, node).or_else(|| primitive_body_error_span(right, node))
         }
         ExprKind::Call { callee, args, base } => primitive_body_error_span(callee, node)
             .or_else(|| {
@@ -76601,7 +76595,15 @@ property "shared"() {}
                 .expect("a negated literal-parameter comparison is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [19, 20, 21, 23, 24, 26, 27, 28, 29, 30] {
+        for index in [21, 24] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("a nested logical operand over a literal comparison is checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for index in [19, 20, 23, 26, 27, 28, 29, 30] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76654,7 +76656,13 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
-        for index in [1, 2, 4, 5, 6] {
+        assert!(matches!(
+            owners[5]
+                .body_type_check()
+                .expect("a Bool literal operand in a conjunction is checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for index in [1, 2, 4, 6] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76723,7 +76731,13 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
-        for index in [3, 5, 6, 7, 8, 9, 11, 12] {
+        assert!(matches!(
+            owners[9]
+                .body_type_check()
+                .expect("a Bool literal operand in a conjunction is checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for index in [3, 5, 6, 7, 8, 11, 12] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76769,10 +76783,10 @@ property "shared"() {}
         for (index, owner) in owners.iter().enumerate().skip(2) {
             let check = owner
                 .body_type_check()
-                .expect("mixed or nested boolean operator is gated");
+                .expect("mixed or nested boolean operator is checked");
             assert!(
-                matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the supported slice: {check:?}"
             );
         }
     }
@@ -76892,7 +76906,15 @@ property "shared"() {}
                 .expect("a negated logical condition over one parameter is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [27, 28, 29, 30, 31, 32, 33, 34, 39, 41, 42, 44, 45, 46] {
+        for index in [30, 33, 34, 41] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("a comparison operand nested inside a logical expression is checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for index in [27, 28, 29, 31, 32, 39, 42, 44, 45, 46] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76933,6 +76955,7 @@ property "shared"() {}
             "pub fn aliased_bool(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn wrong_bool_type(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn extra_parameter(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+            "pub fn nested_range(enabled: Bool, value: I8) -> I32 { if enabled and (value > 0 and value < 300) { 1 } else { 2 } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -76948,7 +76971,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 27);
+        assert_eq!(owners.len(), 28);
 
         for index in 0..13 {
             let check = owners[index]
@@ -76959,13 +76982,55 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the mixed condition slice: {check:?}"
             );
         }
-        for (index, owner) in owners.iter().enumerate().skip(13) {
-            let check = owner
+        for index in [14, 15, 16, 26] {
+            let check = owners[index]
                 .body_type_check()
-                .expect("unsupported mixed condition shape is gated");
+                .expect("a nested logical or extra-parameter condition is checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the nested operand slice: {check:?}"
+            );
+        }
+        for index in [25] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a non-Bool operand inside a nested logical condition is diagnosed");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.len() == 1
+                        && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch),
+                "function owner {index} should report one operand mismatch: {check:?}"
+            );
+        }
+        for index in [27] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a diagnostic inside a nested operand is published");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.len() == 1
+                        && diagnostics[0].code == sai_diagnostics::Code::LiteralOutOfRange),
+                "function owner {index} should report the nested operand literal range error: {check:?}"
+            );
+        }
+        for index in [18, 19, 20, 21] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a Bool parameter compared to an integer literal is diagnosed");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.len() == 1
+                        && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch),
+                "function owner {index} should report one comparison mismatch: {check:?}"
+            );
+        }
+        for index in [13, 17, 22, 23, 24] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("unsupported nested condition form is gated");
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "function owner {index} unexpectedly passed the mixed condition slice: {check:?}"
+                "function owner {index} unexpectedly passed the nested operand boundary: {check:?}"
             );
         }
     }

@@ -2189,17 +2189,40 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // Typecheck in written order without lowering or reordering the
         // operands, preserving the source operator's short-circuit behavior.
         for operand in [left, right] {
-            let operand_type = self
-                .check_local_path(operand)
-                .ok()
-                .and_then(|local_type| self.concrete_local_type(local_type))
-                .ok_or(())?;
+            let operand_type = self.check_logical_operand(operand)?;
             self.check_logical_operand_type(operand, operand_type)?;
         }
 
         // Both `and` and `or` have Bool result type, including after an
         // operand mismatch, so downstream local and tail checks can recover.
         Ok(LocalType::Concrete(PrimTy::Bool))
+    }
+
+    fn check_logical_operand(&mut self, operand: &'hir Expr<'hir>) -> Result<PrimTy, ()> {
+        match operand.kind {
+            // Nested logical operands recurse so `left and right and left`
+            // keeps source order; comparison operands reuse the same
+            // bounded comparison checker.
+            ExprKind::Binary(operator, left, right)
+                if matches!(operator, BinOp::And | BinOp::Or) =>
+            {
+                self.check_logical(operator, left, right)?;
+                Ok(PrimTy::Bool)
+            }
+            ExprKind::Binary(operator, left, right) => {
+                self.check_comparison(operator, left, right)?;
+                Ok(PrimTy::Bool)
+            }
+            ExprKind::Lit(Lit::Bool(_)) => {
+                self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Bool));
+                Ok(PrimTy::Bool)
+            }
+            _ => self
+                .check_local_path(operand)
+                .ok()
+                .and_then(|local_type| self.concrete_local_type(local_type))
+                .ok_or(()),
+        }
     }
 
     fn check_direct_call_logical(
