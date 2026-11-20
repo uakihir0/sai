@@ -1123,6 +1123,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
                 return Err(());
             }
+            if !matches!(right.kind, ExprKind::Lit(_)) {
+                // `x op path` with a concretely typed right operand resolves
+                // the variable to the operand's type when the family admits
+                // it and the operator exists for that type pair.
+                let Some(right_type) = self
+                    .check_local_path(right)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                else {
+                    return Err(());
+                };
+                match primitive_arithmetic_result(operator, right_type, right_type) {
+                    PrimitiveArithmeticResult::Type(_) => {
+                        self.resolve_literal_variable(id, right_type)?;
+                        return Ok(left_local_type);
+                    }
+                    _ => return Err(()),
+                }
+            }
             let ExprKind::Lit(literal) = right.kind else {
                 return Err(());
             };
@@ -2747,6 +2766,32 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     | BinOp::BitXor
             ) {
                 return Err(());
+            }
+            if !matches!(rhs.kind, ExprKind::Lit(_)) {
+                // `x op= path` with a concretely typed right operand
+                // resolves the variable to the operand's type when the
+                // family admits it and the operator exists for that type
+                // pair — the `x = x op path` desugar does the same.
+                if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                    return Err(());
+                }
+                let Some(right_type) = self
+                    .check_local_path(rhs)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                else {
+                    return Err(());
+                };
+                match primitive_arithmetic_result(op, right_type, right_type) {
+                    PrimitiveArithmeticResult::Type(_) => {
+                        self.resolve_literal_variable(id, right_type)?;
+                    }
+                    _ => return Err(()),
+                }
+                self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
+                self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+                self.record_expression_type(stmt_id, LocalType::LiteralVariable(id));
+                return Ok(());
             }
             let ExprKind::Lit(literal) = rhs.kind else {
                 return Err(());

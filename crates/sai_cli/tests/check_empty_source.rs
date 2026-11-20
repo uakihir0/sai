@@ -4701,8 +4701,6 @@ fn unsupported_unannotated_copy_local_forms_remain_gated() {
     for source in [
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = source / (1 / 1)\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = r#source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    var copied = 0\n    copied += source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    var source: I32 = 42\n    var copied = 0\n    copied += source\n    copied\n}\n",
         "const SOURCE: I32 = 42\npub fn copy() -> I32 {\n    let copied = SOURCE\n    copied\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -5004,6 +5002,14 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn computed() -> I32 {\n    let source = 1\n    let copied = source + 1\n    copied\n}\n",
         "pub fn var_computed() -> I32 {\n    var source = 1\n    let copied = source + 1\n    copied\n}\n",
         "pub fn compare() -> Bool {\n    let inferred = 1\n    let result = inferred < 2\n    result\n}\n",
+        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    var copied = 0\n    copied += source\n    copied\n}\n",
+        "pub fn copy_var_source() -> I32 {\n    var source: I32 = 42\n    var copied = 0\n    copied += source\n    copied\n}\n",
+        "pub fn div_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one / left\n    result\n}\n",
+        "pub fn mul(left: I32, right: I32) -> I32 {\n    let one = 1\n    let result = one * left\n    result\n}\n",
+        "pub fn add(left: I32, right: I32) -> I32 {\n    let one = 1\n    let sum = one + right\n    sum\n}\n",
+        "pub fn add_assign(left: I32) -> I32 {\n    var sum = 0\n    sum += left\n    sum\n}\n",
+        "pub fn local_assign_op() -> I32 {\nlet first: I32 = 1\nvar second = 2\nsecond += first\nfirst\n}\n",
+        "pub fn mutable(left: I32, right: I32) -> I32 {\n    var result = 0\n    result += left\n    result\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -9198,11 +9204,9 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
     for source in [
         "pub fn float_division() -> F64 {\n    let result = 1.0 / 2.0\n    result\n}\n",
         "pub fn mixed_division() -> I64 {\n    let result = 1 / 2.0\n    result\n}\n",
-        "pub fn div_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one / left\n    result\n}\n",
         "pub fn div_nested_right(left: I32, right: I32) -> I32 {\n    let result = left / (right / 1)\n    result\n}\n",
         "pub fn div_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left / right) / left\n    result\n}\n",
         "type IntegerAlias = I32\npub fn div_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left / right\n    result\n}\n",
-        "pub fn mul(left: I32, right: I32) -> I32 {\n    let one = 1\n    let result = one * left\n    result\n}\n",
         "pub fn float_mul() -> F64 {\n    let result = 1.0 * 2.0\n    result\n}\n",
         "pub fn mixed_mul() -> I64 {\n    let result = 1 * 2.0\n    result\n}\n",
         "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
@@ -9254,7 +9258,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left * right\n    result\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let result = later * left\n    let later: I32 = 1\n    result\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let result = result - left\n    result\n}\n",
-        "pub fn mutable(left: I32, right: I32) -> I32 {\n    var result = 0\n    result += left\n    result\n}\n",
         "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let result = first - second\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -9337,7 +9340,6 @@ fn primitive_add_diagnostics_follow_source_order_after_shadowed_binding_resoluti
 #[test]
 fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn add(left: I32, right: I32) -> I32 {\n    let one = 1\n    let sum = one + right\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n",
         "pub fn add(left: Byte, right: Byte) -> Byte {\n    let sum = left + right\n    sum\n}\n",
         "pub fn add(left: Char, right: Char) -> Char {\n    let sum = left + right\n    sum\n}\n",
@@ -9345,7 +9347,6 @@ fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn add(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let sum = left + right\n    sum\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let sum = later + left\n    let later: I32 = 1\n    sum\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let sum = sum + left\n    sum\n}\n",
-        "pub fn add(left: I32, right: I32) -> I32 {\n    var sum = 0\n    sum += left\n    sum\n}\n",
         "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let sum = first + second\n    sum\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -11243,7 +11244,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
-        "pub fn local() -> I32 {\nlet first: I32 = 1\nvar second = 2\nsecond += first\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % (1 + 0)\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",

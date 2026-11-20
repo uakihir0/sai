@@ -76954,7 +76954,6 @@ property "shared"() {}
             "const ONE: I32 = 1\n",
             "type Number = I32\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
-            "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second = 2\n    second += first\n    first\n}\n",
             "pub fn raw_copy() -> I32 {\n    let value: I32 = 42\n    let copy: I32 = r#value\n    copy\n}\n",
             "pub fn forward_copy() -> I32 {\n    let first: I32 = second\n    let second: I32 = 2\n    first\n}\n",
             "pub fn self_copy() -> I32 {\n    let value: I32 = value\n    value\n}\n",
@@ -76965,8 +76964,6 @@ property "shared"() {}
             "pub fn unannotated_copy_from_constant() -> I32 {\n    let copy = ONE\n    copy\n}\n",
             "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source % (1 + 0)\n    copy\n}\n",
             "pub fn unannotated_raw_copy() -> I32 {\n    let source: I32 = 42\n    let copy = r#source\n    copy\n}\n",
-            "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = 0\n    copy += source\n    copy\n}\n",
-            "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    var copy = 0\n    copy += source\n    copy\n}\n",
             "pub fn unannotated_string() -> Str {\n    let value = \"text\"\n    value\n}\n",
             "pub fn destructured() -> I32 {\n    let (first, second): (I32, I32) = (1, 2)\n    first\n}\n",
             "pub fn alias() -> I32 {\n    let value: Number = 42\n    value\n}\n",
@@ -76985,7 +76982,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 17);
+        assert_eq!(resolved.owners().len(), 14);
         for owner in resolved.owners() {
             assert!(matches!(
                 owner
@@ -77651,6 +77648,9 @@ property "shared"() {}
             "pub fn literal_var_cmp_float() -> Bool {\n    var x = 1.5\n    let y = x >= 1.0\n    y\n}\n",
             "pub fn literal_var_cmp_pair() -> Bool {\n    var x = 1\n    var y = 2\n    x < y\n}\n",
             "pub fn literal_var_resolved_operand() -> I32 {\n    let x = 1\n    let typed: I32 = x\n    let y = 2 + x\n    y\n}\n",
+            "pub fn literal_var_param_rhs(left: I32) -> I32 {\n    var x = 1\n    let y = x + left\n    y\n}\n",
+            "pub fn literal_var_assign_op_path(left: I32) -> I32 {\n    var x = 1\n    x += left\n    x\n}\n",
+            "pub fn literal_var_bool_operand(flag: Bool) -> I32 {\n    var x = 1\n    let y = x + flag\n    y\n}\n",
             "pub fn literal_var_arith_in_and() -> Bool {\n    var x = 1\n    let y = (x + 2) and true\n    y\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -77667,7 +77667,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 31);
+        assert_eq!(owners.len(), 34);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77736,7 +77736,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand merge: {check:?}"
             );
         }
-        for index in [25, 26, 27, 29] {
+        for index in [25, 26, 27, 29, 30, 31] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a literal-variable comparison is checked");
@@ -77745,7 +77745,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
-        for index in [23, 24, 28, 30] {
+        for index in [23, 24, 28, 32, 33] {
             assert!(
                 matches!(
                     owners[index]
