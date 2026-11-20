@@ -9778,7 +9778,9 @@ fn primitive_body_errors_to_diagnostics(
                 .stmts
                 .iter()
                 .find_map(|stmt| match stmt.kind {
-                    StmtKind::Let { init, .. } => primitive_body_error_span(init, error.node),
+                    StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
+                        primitive_body_error_span(init, error.node)
+                    }
                     _ => None,
                 })
                 .or_else(|| primitive_body_error_span(tail, error.node)),
@@ -10024,7 +10026,9 @@ fn primitive_body_block_error_span(
         .stmts
         .iter()
         .find_map(|stmt| match stmt.kind {
-            StmtKind::Let { init, .. } => primitive_body_error_span(init, node),
+            StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
+                primitive_body_error_span(init, node)
+            }
             _ => None,
         })
         .or_else(|| {
@@ -10492,9 +10496,11 @@ fn direct_primitive_call_sites(
         }
     };
     for statement in block.stmts {
-        if let StmtKind::Let { init, .. } = statement.kind
-            && matches!(init.kind, ExprKind::Call { .. })
-        {
+        let init = match statement.kind {
+            StmtKind::Let { init, .. } | StmtKind::Expr(init) => init,
+            _ => continue,
+        };
+        if matches!(init.kind, ExprKind::Call { .. }) {
             index_root_and_one_level_arguments(init);
         }
     }
@@ -53148,6 +53154,10 @@ property "shared"() {}
             "    value + 1\n",
             "    value\n",
             "}\n",
+            "pub fn discarded_expression_mismatch(value: I32) -> I32 {\n",
+            "    not value\n",
+            "    value\n",
+            "}\n",
             "pub fn if_expression_statement(flag: Bool, value: I32) -> I32 {\n",
             "    if flag {\n",
             "        1\n",
@@ -53353,7 +53363,11 @@ property "shared"() {}
             "the branch-local annotation and the Bool-typed branch tail both mismatch"
         );
 
-        for name in ["negated_mismatch", "flat_negated_expression"] {
+        for name in [
+            "negated_mismatch",
+            "flat_negated_expression",
+            "discarded_expression_mismatch",
+        ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
                 matches!(
