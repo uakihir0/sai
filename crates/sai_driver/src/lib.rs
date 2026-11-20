@@ -10772,16 +10772,22 @@ fn primitive_body_block_error_span(
     block
         .stmts
         .iter()
-        .find_map(|stmt| match stmt.kind {
-            StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
-                primitive_body_error_span(init, node)
-            }
-            StmtKind::Assert { cond, msg, .. } => primitive_body_error_span(cond, node)
-                .or_else(|| msg.and_then(|msg| primitive_body_error_span(msg, node))),
-            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
-                primitive_body_error_span(lhs, node)
-                    .or_else(|| primitive_body_error_span(rhs, node))
-            }
+        .find_map(|stmt| {
+            // Statement-anchored errors (`x %= 2.0` on a non-`%`-implementing
+            // primitive) match the statement itself — recurse for the rest.
+            (stmt.hir_id == node)
+                .then_some(stmt.span)
+                .or_else(|| match stmt.kind {
+                    StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
+                        primitive_body_error_span(init, node)
+                    }
+                    StmtKind::Assert { cond, msg, .. } => primitive_body_error_span(cond, node)
+                        .or_else(|| msg.and_then(|msg| primitive_body_error_span(msg, node))),
+                    StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                        primitive_body_error_span(lhs, node)
+                            .or_else(|| primitive_body_error_span(rhs, node))
+                    }
+                })
         })
         .or_else(|| {
             block
@@ -77877,6 +77883,7 @@ property "shared"() {}
             "pub fn stmt_if_value_tail(flag: Bool) -> I32 {\n    var x: I32 = 0\n    if flag { x = 1\n 5 }\n    x\n}\n",
             "pub fn stmt_match_value_body(value: I32) -> I32 {\n    match value { _ => 1 }\n    0\n}\n",
             "pub fn guarded_bool_nonexhaustive(flag: Bool) -> I32 {\n    match flag { true if flag => 1, false => 0 }\n}\n",
+            "pub fn stmt_float_mod(flag: Bool) -> I32 {\n    var x: F32 = 0.0\n    if flag { x %= 2.0 }\n    0\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77892,7 +77899,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 37);
+        assert_eq!(owners.len(), 38);
 
         for index in [
             0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 26, 29, 31, 32, 33,
@@ -77926,6 +77933,17 @@ property "shared"() {}
                 "function owner {index} should report one pattern diagnostic: {check:?}"
             );
         }
+        // A statement-anchored error inside a nested statement block still
+        // reaches the public result — `x %= 2.0` anchors to the `AssignOp`
+        // statement's own id.
+        assert!(matches!(
+            owners[37]
+                .body_type_check()
+                .expect("statement-position compound-assign errors are diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported
+        ));
         // `arm_type_mismatch` checks every arm body independently, so both
         // literal arm bodies report the `Bool` return-type mismatch.
         assert!(matches!(
