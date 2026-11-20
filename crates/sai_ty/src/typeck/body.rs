@@ -511,12 +511,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)));
         let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
         let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some());
+        let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
             && !is_supported_unary_tail
             && !is_supported_binary_tail
             && !is_supported_literal_tail
+            && !is_supported_if_tail
         {
             return Err(());
         }
@@ -2426,6 +2428,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     };
                     self.local_type_for_unannotated_literal(literal, kind, expression.hir_id)
                 }
+                // `if` tails reuse `check_block` for each branch so the
+                // branch tails unify with the return type the way the
+                // outer tail does. Branches with statements stay outside
+                // this slice, mirroring the driver admission.
+                ExprKind::If { cond, then, els } => self.check_if_tail(cond, then, els)?,
                 _ => self.check_local_path(expression)?,
             }
         };
@@ -2465,6 +2472,87 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         self.record_expression_type(expression.hir_id, local_type);
         Ok(())
+    }
+
+    fn check_if_tail(
+        &mut self,
+        condition: &'hir Expr<'hir>,
+        then: &'hir Block<'hir>,
+        els: Option<&'hir Expr<'hir>>,
+    ) -> Result<LocalType, ()> {
+        let Some(els) = els else {
+            return Err(());
+        };
+        self.check_if_condition(condition)?;
+        self.check_if_branch(then)?;
+        match els.kind {
+            ExprKind::Block(block) => {
+                self.check_if_branch(block)?;
+                self.record_expression_type(
+                    els.hir_id,
+                    LocalType::Concrete(self.input.return_type),
+                );
+            }
+            ExprKind::If { .. } => {
+                self.check_expr(els)?;
+            }
+            _ => return Err(()),
+        }
+        Ok(LocalType::Concrete(self.input.return_type))
+    }
+
+    // `if` branches are checked tail-first through `check_expr` rather than
+    // `check_block`'s empty-statement gate, which deliberately excludes plain
+    // `Path` tails (flat path tails belong to the direct-parameter slice).
+    fn check_if_branch(&mut self, block: &'hir Block<'hir>) -> Result<(), ()> {
+        if block.safety != Safety::Safe || !block.stmts.is_empty() {
+            return Err(());
+        }
+        let Some(tail) = block.tail else {
+            return Err(());
+        };
+        self.check_expr(tail)
+    }
+
+    fn check_if_condition(&mut self, condition: &'hir Expr<'hir>) -> Result<(), ()> {
+        let local_type = match condition.kind {
+            ExprKind::Path(_) => self.check_local_path(condition)?,
+            ExprKind::Unary(UnOp::Not, operand) if matches!(operand.kind, ExprKind::Path(_)) => {
+                self.check_logical_not(operand)?
+            }
+            ExprKind::Binary(operator, left, right)
+                if matches!(operator, BinOp::And | BinOp::Or) =>
+            {
+                self.check_logical(operator, left, right)?
+            }
+            ExprKind::Binary(operator, left, right)
+                if matches!(
+                    operator,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                ) =>
+            {
+                self.check_comparison(operator, left, right)?
+            }
+            ExprKind::Lit(Lit::Bool(_)) => LocalType::Concrete(PrimTy::Bool),
+            _ => return Err(()),
+        };
+        match local_type {
+            LocalType::Concrete(PrimTy::Bool) => {
+                self.record_expression_type(condition.hir_id, local_type);
+                Ok(())
+            }
+            LocalType::Concrete(found) => {
+                self.errors.push(PrimitiveBodyError {
+                    node: condition.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                        expected: PrimTy::Bool,
+                        found,
+                    },
+                });
+                Ok(())
+            }
+            _ => Err(()),
+        }
     }
 
     fn check_direct_call(
