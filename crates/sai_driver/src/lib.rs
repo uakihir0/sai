@@ -9034,18 +9034,60 @@ fn primitive_logical_init_operand_shape_is_supported(
 /// right-hand side of an assignment (§6.13.1 lists the assignment
 /// right-hand side as a coercion site, so it mirrors the annotated
 /// initializer admission set).
+#[allow(clippy::too_many_arguments)]
 fn primitive_value_expression_shape_is_supported(
     expression: &HirExpr<'_>,
+    annotated: bool,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     let init = expression;
     match init.kind {
         ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
+        // Value-producing `if`/`match` need an expected type to unify each
+        // branch/arm body against — the let annotation or the assign place
+        // type — so unannotated initializers stay gated.
+        ExprKind::If { .. } if annotated => {
+            return primitive_if_tail_shape_is_supported(
+                init,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            );
+        }
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source,
+        } if annotated => {
+            return primitive_match_tail_shape_is_supported(
+                scrutinee,
+                arms,
+                source,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            );
+        }
         ExprKind::Field { .. }
             if self_field_projections.is_some_and(|fields| fields.contains_key(&init.hir_id))
                 || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id)) => {}
@@ -9315,15 +9357,21 @@ fn primitive_let_statement_shape_is_supported(
         // tuple-field, index, and dereference places stay gated, and a
         // `let`/parameter target or a non-place target surfaces the
         // checker's ASSIGN_TO_IMMUTABLE / INVALID_ASSIGN_TARGET diagnostic.
+        // The assign place supplies the expected type for `if`/`match`
+        // right-hand sides, like an annotation does for `let`.
         return primitive_assign_target_shape_is_supported(lhs, preceding_bindings, locals, inputs)
             && primitive_value_expression_shape_is_supported(
                 rhs,
+                true,
                 preceding_bindings,
                 locals,
                 inputs,
+                symbols,
+                type_paths,
                 self_field_projections,
                 unknown_self_fields,
                 direct_call_signatures,
+                primitive_types,
             );
     }
     if let StmtKind::AssignOp { op, lhs, rhs } = stmt.kind {
@@ -9406,12 +9454,16 @@ fn primitive_let_statement_shape_is_supported(
 
     if !primitive_value_expression_shape_is_supported(
         init,
+        ty.is_some(),
         preceding_bindings,
         locals,
         inputs,
+        symbols,
+        type_paths,
         self_field_projections,
         unknown_self_fields,
         direct_call_signatures,
+        primitive_types,
     ) {
         return false;
     }
@@ -77352,6 +77404,77 @@ property "shared"() {}
                     FunctionBodyTypeCheck::Unsupported
                 ),
                 "function owner {index} should remain gated"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_control_flow_initializers() {
+        let root = concat!(
+            "pub fn annotated_if(flag: Bool) -> I32 {\n    let x: I32 = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn annotated_match(value: I32) -> I32 {\n    let x: I32 = match value { 0 => 1, _ => 2 }\n    x\n}\n",
+            "pub fn assign_if(flag: Bool) -> I32 {\n    var x: I32 = 0\n    x = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn assign_match(value: I32) -> I32 {\n    var x: I32 = 0\n    x = match value { 0 => 1, _ => 2 }\n    x\n}\n",
+            "pub fn nested(flag: Bool, value: I32) -> I32 {\n    let x: I32 = if flag { match value { 0 => 1, _ => 2 } } else { 3 }\n    x\n}\n",
+            "pub fn branch_stmts(flag: Bool) -> I32 {\n    let x: I32 = if flag { let t: I32 = 1\n t } else { 2 }\n    x\n}\n",
+            "pub fn branch_mismatch(flag: Bool) -> Bool {\n    let x: Bool = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn assign_mismatch(flag: Bool) -> Bool {\n    var x: Bool = true\n    x = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn unannotated_if(flag: Bool) -> I32 {\n    let x = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn unannotated_match(value: I32) -> I32 {\n    let x = match value { 0 => 1, _ => 2 }\n    x\n}\n",
+            "pub fn if_no_else(flag: Bool) -> I32 {\n    let x: I32 = if flag { 1 }\n    x\n}\n",
+            "pub fn literal_var_assign(flag: Bool) -> I32 {\n    var x = 0\n    x = if flag { 1 } else { 2 }\n    x\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 12);
+
+        for index in 0..6 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("annotated if/match initializers are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the slice: {check:?}"
+            );
+        }
+        // `branch_mismatch` reports both arm/branch bodies against `Bool`;
+        // `assign_mismatch` does the same through the place type.
+        for index in [6, 7] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("mismatched branch bodies are diagnosed");
+            assert!(
+                matches!(
+                    check,
+                    FunctionBodyTypeCheck::Supported { diagnostics }
+                        if diagnostics.len() == 2
+                            && diagnostics
+                                .iter()
+                                .all(|diagnostic| diagnostic.code
+                                    == sai_diagnostics::Code::TypeMismatch)
+                ),
+                "function owner {index} should report two branch diagnostics: {check:?}"
+            );
+        }
+        for index in 8..12 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("unannotated and non-exhaustive forms are gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} should remain gated: {check:?}"
             );
         }
     }
