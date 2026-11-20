@@ -8988,87 +8988,20 @@ fn primitive_logical_init_operand_shape_is_supported(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn primitive_let_statement_shape_is_supported(
-    stmt: &Stmt<'_>,
-    preceding_bindings: &mut HashSet<sai_hir::BindingId>,
-    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+/// The admissible expression shapes shared by `let` initializers and the
+/// right-hand side of an assignment (§6.13.1 lists the assignment
+/// right-hand side as a coercion site, so it mirrors the annotated
+/// initializer admission set).
+fn primitive_value_expression_shape_is_supported(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
-    symbols: &Interner,
-    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
-    if let StmtKind::Expr(expression) = stmt.kind {
-        // Statement-position `if`/`block` expressions unify their branch
-        // tails with the return type, which does not apply to a discarded
-        // result, so they stay outside this slice.
-        if matches!(expression.kind, ExprKind::If { .. } | ExprKind::Block(_)) {
-            return false;
-        }
-        return primitive_if_branch_tail_shape_is_supported(
-            expression,
-            preceding_bindings,
-            locals,
-            inputs,
-            symbols,
-            type_paths,
-            self_field_projections,
-            unknown_self_fields,
-            direct_call_signatures,
-            primitive_types,
-        );
-    }
-    if let StmtKind::Assert { cond, msg, .. } = stmt.kind {
-        // `assert` takes the same condition gate as `if`; the optional
-        // message is a `Str` literal (N-C-20).
-        return primitive_if_condition_shape_is_supported(cond, preceding_bindings, locals, inputs)
-            && msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))));
-    }
-    let StmtKind::Let {
-        pat,
-        ty,
-        init,
-        els: None,
-    } = stmt.kind
-    else {
-        return false;
-    };
-    let PatKind::Binding {
-        mode,
-        name,
-        binding,
-        sub: None,
-        ..
-    } = pat.kind
-    else {
-        return false;
-    };
-    if !function_name_is_supported(name, symbols, inputs)
-        || !matches!(
-            (locals.bindings.get(&binding).map(|local| local.kind), mode),
-            (
-                Some(sai_resolve::owner::BindingKind::Let),
-                sai_hir::patterns::BindingMode::Value
-            ) | (
-                Some(sai_resolve::owner::BindingKind::Var),
-                sai_hir::patterns::BindingMode::Var
-            )
-        )
-    {
-        return false;
-    }
-    if let Some(ty) = ty {
-        let Some(FunctionDirectType::Primitive(local_type)) =
-            resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-        else {
-            return false;
-        };
-        primitive_types.insert(ty.hir_id, local_type);
-    }
-
+    let init = expression;
     match init.kind {
         ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
         ExprKind::Field { .. }
@@ -9250,6 +9183,153 @@ fn primitive_let_statement_shape_is_supported(
             }
         }
         _ => return false,
+    }
+    true
+}
+
+/// The left-hand side of `place = e` (§6.13.1): a plain path that resolves
+/// to a preceding local binding (the checker reports ASSIGN_TO_IMMUTABLE
+/// for `let`/parameter targets), or a syntactically non-place target the
+/// checker reports as INVALID_ASSIGN_TARGET. Field, tuple-field, index,
+/// and dereference places stay outside this slice.
+fn primitive_assign_target_shape_is_supported(
+    target: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let ExprKind::Path(path) = target.kind else {
+        return !matches!(
+            target.kind,
+            ExprKind::Field { .. }
+                | ExprKind::TupleField { .. }
+                | ExprKind::Index(..)
+                | ExprKind::Unary(UnOp::Deref, _)
+        );
+    };
+    let Some(binding) = resolved_plain_local_path_binding(path, locals, inputs) else {
+        return false;
+    };
+    if !preceding_bindings.contains(&binding) {
+        return false;
+    }
+    matches!(
+        locals.bindings.get(&binding).map(|local| local.kind),
+        Some(
+            sai_resolve::owner::BindingKind::Let
+                | sai_resolve::owner::BindingKind::Var
+                | sai_resolve::owner::BindingKind::Param
+        )
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn primitive_let_statement_shape_is_supported(
+    stmt: &Stmt<'_>,
+    preceding_bindings: &mut HashSet<sai_hir::BindingId>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> bool {
+    if let StmtKind::Expr(expression) = stmt.kind {
+        // Statement-position `if`/`block` expressions unify their branch
+        // tails with the return type, which does not apply to a discarded
+        // result, so they stay outside this slice.
+        if matches!(expression.kind, ExprKind::If { .. } | ExprKind::Block(_)) {
+            return false;
+        }
+        return primitive_if_branch_tail_shape_is_supported(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        );
+    }
+    if let StmtKind::Assert { cond, msg, .. } = stmt.kind {
+        // `assert` takes the same condition gate as `if`; the optional
+        // message is a `Str` literal (N-C-20).
+        return primitive_if_condition_shape_is_supported(cond, preceding_bindings, locals, inputs)
+            && msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))));
+    }
+    if let StmtKind::Assign { lhs, rhs } = stmt.kind {
+        // `place = e` (§6.13.1): a plain path to a preceding local; field,
+        // tuple-field, index, and dereference places stay gated, and a
+        // `let`/parameter target or a non-place target surfaces the
+        // checker's ASSIGN_TO_IMMUTABLE / INVALID_ASSIGN_TARGET diagnostic.
+        return primitive_assign_target_shape_is_supported(lhs, preceding_bindings, locals, inputs)
+            && primitive_value_expression_shape_is_supported(
+                rhs,
+                preceding_bindings,
+                locals,
+                inputs,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+            );
+    }
+    let StmtKind::Let {
+        pat,
+        ty,
+        init,
+        els: None,
+    } = stmt.kind
+    else {
+        return false;
+    };
+    let PatKind::Binding {
+        mode,
+        name,
+        binding,
+        sub: None,
+        ..
+    } = pat.kind
+    else {
+        return false;
+    };
+    if !function_name_is_supported(name, symbols, inputs)
+        || !matches!(
+            (locals.bindings.get(&binding).map(|local| local.kind), mode),
+            (
+                Some(sai_resolve::owner::BindingKind::Let),
+                sai_hir::patterns::BindingMode::Value
+            ) | (
+                Some(sai_resolve::owner::BindingKind::Var),
+                sai_hir::patterns::BindingMode::Var
+            )
+        )
+    {
+        return false;
+    }
+    if let Some(ty) = ty {
+        let Some(FunctionDirectType::Primitive(local_type)) =
+            resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+        else {
+            return false;
+        };
+        primitive_types.insert(ty.hir_id, local_type);
+    }
+
+    if !primitive_value_expression_shape_is_supported(
+        init,
+        preceding_bindings,
+        locals,
+        inputs,
+        self_field_projections,
+        unknown_self_fields,
+        direct_call_signatures,
+    ) {
+        return false;
     }
     preceding_bindings.insert(binding);
     true
@@ -9859,7 +9939,10 @@ fn primitive_body_errors_to_diagnostics(
                             msg.and_then(|msg| primitive_body_error_span(msg, error.node))
                         })
                     }
-                    _ => None,
+                    StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                        primitive_body_error_span(lhs, error.node)
+                            .or_else(|| primitive_body_error_span(rhs, error.node))
+                    }
                 })
                 .or_else(|| primitive_body_error_span(tail, error.node)),
         };
@@ -10058,6 +10141,24 @@ fn primitive_body_errors_to_diagnostics(
                 "named arguments are only allowed when constructing a record".to_owned(),
                 "named argument is not allowed in a function call",
             )?,
+            PrimitiveBodyErrorKind::AssignToImmutable => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::AssignToImmutable,
+                "cannot assign to an immutable place".to_owned(),
+                "assignment target is not mutable",
+            )?,
+            PrimitiveBodyErrorKind::InvalidAssignTarget => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::InvalidAssignTarget,
+                "the left-hand side of an assignment is not a place expression".to_owned(),
+                "invalid assignment target",
+            )?,
         };
         diagnostics.push(diagnostic);
     }
@@ -10103,7 +10204,10 @@ fn primitive_body_block_error_span(
             }
             StmtKind::Assert { cond, msg, .. } => primitive_body_error_span(cond, node)
                 .or_else(|| msg.and_then(|msg| primitive_body_error_span(msg, node))),
-            _ => None,
+            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                primitive_body_error_span(lhs, node)
+                    .or_else(|| primitive_body_error_span(rhs, node))
+            }
         })
         .or_else(|| {
             block
@@ -49384,7 +49488,7 @@ property "shared"() {}
             "}\n",
             "pub fn mutable_source() -> I32 {\n",
             "    var source = 1\n",
-            "    source = 2\n",
+            "    source += 2\n",
             "    let result = -source\n",
             "    result\n",
             "}\n",
@@ -50002,7 +50106,7 @@ property "shared"() {}
             "}\n",
             "pub fn mutable_source() -> I32 {\n",
             "    var source = 1\n",
-            "    source = 2\n",
+            "    source += 2\n",
             "    let result = ~source\n",
             "    result\n",
             "}\n",
@@ -69950,7 +70054,7 @@ property "shared"() {}
             "}\n",
             "pub fn excluded_mutable_source(value: I32) -> I32 {\n",
             "    var source: I32 = value\n",
-            "    source = 0\n",
+            "    source += 0\n",
             "    let result = -source\n",
             "    result\n",
             "}\n",
@@ -76269,9 +76373,9 @@ property "shared"() {}
         let root = concat!(
             "const ONE: I32 = 1\n",
             "type Number = I32\n",
-            "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value = 1\n    value\n}\n",
+            "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value += 1\n    value\n}\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
-            "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second: I32 = 2\n    second = 3\n    first\n}\n",
+            "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second: I32 = 2\n    second += 3\n    first\n}\n",
             "pub fn raw_copy() -> I32 {\n    let value: I32 = 42\n    let copy: I32 = r#value\n    copy\n}\n",
             "pub fn forward_copy() -> I32 {\n    let first: I32 = second\n    let second: I32 = 2\n    first\n}\n",
             "pub fn self_copy() -> I32 {\n    let value: I32 = value\n    value\n}\n",
@@ -76282,8 +76386,8 @@ property "shared"() {}
             "pub fn unannotated_copy_from_constant() -> I32 {\n    let copy = ONE\n    copy\n}\n",
             "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source % (1 + 0)\n    copy\n}\n",
             "pub fn unannotated_raw_copy() -> I32 {\n    let source: I32 = 42\n    let copy = r#source\n    copy\n}\n",
-            "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = source\n    copy = 0\n    copy\n}\n",
-            "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    let copy = source\n    copy = 0\n    copy\n}\n",
+            "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = source\n    copy += 0\n    copy\n}\n",
+            "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    let copy = source\n    copy += 0\n    copy\n}\n",
             "pub fn unannotated_string() -> Str {\n    let value = \"text\"\n    value\n}\n",
             "pub fn destructured() -> I32 {\n    let (first, second): (I32, I32) = (1, 2)\n    first\n}\n",
             "pub fn alias() -> I32 {\n    let value: Number = 42\n    value\n}\n",
@@ -76922,13 +77026,102 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [4, 5] {
-            assert!(matches!(
-                owners[index]
-                    .body_type_check()
-                    .expect("var parameters and assignment statements stay gated"),
-                FunctionBodyTypeCheck::Unsupported
-            ));
+        assert!(matches!(
+            owners[5]
+                .body_type_check()
+                .expect("an assignment to a var local is checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        assert!(matches!(
+            owners[4]
+                .body_type_check()
+                .expect("var parameters stay gated"),
+            FunctionBodyTypeCheck::Unsupported
+        ));
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_assign_statements() {
+        let root = concat!(
+            "pub fn literal() -> I32 {\n    var x: I32 = 0\n    x = 5\n    x\n}\n",
+            "pub fn path_rhs() -> I32 {\n    var x: I32 = 0\n    let y: I32 = 2\n    x = y\n    x\n}\n",
+            "pub fn computed_rhs(left: I32, right: I32) -> I32 {\n    var x: I32 = 0\n    x = left + right\n    x\n}\n",
+            "pub fn comparison_rhs(left: I32, right: I32) -> Bool {\n    var flag: Bool = false\n    flag = left < right\n    flag\n}\n",
+            "pub fn logical_rhs(flag: Bool, other: Bool) -> I32 {\n    var enabled: Bool = false\n    enabled = flag and other\n    0\n}\n",
+            "pub fn not_rhs(flag: Bool) -> I32 {\n    var enabled: Bool = true\nenabled = not flag\n    0\n}\n",
+            "pub fn branch_assign(flag: Bool) -> I32 {\n    var x: I32 = 0\n    if flag { x = 1\n x } else { x = 2\n x }\n}\n",
+            "pub fn let_target() -> I32 {\n    let x: I32 = 0\n    x = 5\n    x\n}\n",
+            "pub fn param_target(value: I32) -> I32 {\n    value = 5\n    value\n}\n",
+            "pub fn nonplace_target() -> I32 {\n    var x: I32 = 0\n    x + 1 = 5\n    x\n}\n",
+            "pub fn rhs_mismatch() -> I32 {\n    var x: I32 = 0\n    x = true\n    x\n}\n",
+            "pub fn unannotated_literal_var() -> I32 {\n    var x = 1\n    x = 2\n    x\n}\n",
+            "pub fn compound() -> I32 {\n    var x: I32 = 0\n    x += 1\n    x\n}\n",
+            "pub fn unbound_target() -> I32 {\n    missing = 5\n    0\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 14);
+
+        for index in 0..7 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("supported assignment shapes are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the assignment slice: {check:?}"
+            );
+        }
+        for index in [7, 8] {
+            assert!(
+                matches!(
+                    owners[index]
+                        .body_type_check()
+                        .expect("assigning to an immutable binding is diagnosed"),
+                    FunctionBodyTypeCheck::Supported { diagnostics }
+                        if diagnostics.len() == 1
+                            && diagnostics[0].code == sai_diagnostics::Code::AssignToImmutable
+                ),
+                "function owner {index} should report ASSIGN_TO_IMMUTABLE"
+            );
+        }
+        assert!(matches!(
+            owners[9]
+                .body_type_check()
+                .expect("a non-place assignment target is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::InvalidAssignTarget
+        ));
+        assert!(matches!(
+            owners[10]
+                .body_type_check()
+                .expect("a mismatched right-hand side is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        for index in [11, 12, 13] {
+            assert!(
+                matches!(
+                    owners[index]
+                        .body_type_check()
+                        .expect("unsupported assignment form is gated"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "function owner {index} should remain gated"
+            );
         }
     }
 
