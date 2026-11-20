@@ -19629,6 +19629,29 @@ fn binary_expression_tails_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn primitive_literal_tails_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn int_tail() -> I32 { 7 }\n",
+        "pub fn bool_tail() -> Bool { true }\n",
+        "pub fn byte_tail() -> Byte { b'z' }\n",
+        "pub fn char_tail() -> Char { 'x' }\n",
+        "pub fn float_tail() -> F32 { 1.5 }\n",
+        "pub fn int_after_local() -> I64 {\n",
+        "    let source = 1\n",
+        "    7\n",
+        "}\n",
+        "pub fn int_mismatch() -> Bool { 7 }\n",
+        "pub fn int_range() -> I8 { 128 }\n",
+        "pub fn str_tail() -> I32 { \"text\" }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "primitive literal tails at root and after locals",
+    );
+}
+
+#[test]
 fn deferred_bitwise_not_of_flat_integer_literal_locals_remains_behind_the_stage_gate() {
     let source = concat!(
         "const GLOBAL: I32 = 1\n",
