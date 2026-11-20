@@ -179,6 +179,8 @@ pub enum PrimitiveBodyErrorKind {
     AssignToImmutable,
     InvalidAssignTarget,
     EmptyRangePattern,
+    NonExhaustiveMatch,
+    UnreachablePattern,
 }
 
 /// An operand description for an unsupported primitive operator diagnostic.
@@ -2867,9 +2869,44 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         };
         let mut catch_all = false;
+        // Bool literal coverage: `match flag { true => …, false => … }` is
+        // exhaustive without a catch-all (§6.22).
+        let mut bool_cover = (false, false);
         let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
         for arm in arms {
-            self.check_match_arm_pattern(arm, scrutinee_type, &mut catch_all, &mut arm_binding)?;
+            if catch_all {
+                // An arm after an unguarded catch-all can never match
+                // (§6.22.4): diagnose but still check its body — the arm's
+                // own pattern binding stays visible to that body.
+                self.errors.push(PrimitiveBodyError {
+                    node: arm.pat.hir_id,
+                    kind: PrimitiveBodyErrorKind::UnreachablePattern,
+                });
+                if let PatKind::Binding {
+                    mode: BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } = arm.pat.kind
+                {
+                    arm_binding = Some((
+                        binding,
+                        self.known_bindings
+                            .insert(binding, LocalType::Concrete(scrutinee_type)),
+                    ));
+                }
+                let body_result = self.check_expr_expected(arm.body, expected);
+                self.restore_arm_binding(&mut arm_binding);
+                body_result?;
+                continue;
+            }
+            self.check_match_arm_pattern(
+                arm,
+                scrutinee_type,
+                &mut catch_all,
+                &mut bool_cover,
+                &mut arm_binding,
+            )?;
             // Arm patterns bind only inside their arm body — restore the
             // previous binding (or its absence) so sibling arms and the
             // enclosing scope never observe the arm-local name. A guard
@@ -2882,8 +2919,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
-        if !catch_all {
-            return Err(());
+        if !catch_all && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true)) {
+            self.errors.push(PrimitiveBodyError {
+                node: scrutinee.hir_id,
+                kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
+            });
         }
         Ok(LocalType::Concrete(expected))
     }
@@ -2891,17 +2931,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// Validates one arm's pattern under the bounded exhaustiveness rule:
     /// literal patterns check against the scrutinee type, wildcard and plain
     /// `binding` patterns mark the catch-all (with the binding installed at
-    /// `scrutinee_type`), guards and arms after the catch-all gate.
+    /// `scrutinee_type`), guards on non-binding arms gate, and Bool literal
+    /// patterns record domain coverage in `bool_cover`.
     fn check_match_arm_pattern(
         &mut self,
         arm: &'hir Arm<'hir>,
         scrutinee_type: PrimTy,
         catch_all: &mut bool,
+        bool_cover: &mut (bool, bool),
         arm_binding: &mut Option<(BindingId, Option<LocalType>)>,
     ) -> Result<(), ()> {
-        if *catch_all {
-            return Err(());
-        }
         // Guards admit only the plain-`binding` catch-all arm — the guard
         // runs with the binding installed. Guards on literal, or or range
         // patterns stay gated.
@@ -2919,6 +2958,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         match arm.pat.kind {
             PatKind::Lit(literal) => {
+                if let Lit::Bool(value) = literal {
+                    if value {
+                        bool_cover.0 = true;
+                    } else {
+                        bool_cover.1 = true;
+                    }
+                }
                 self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?
             }
             // `l1 | l2 | …` alternatives must all be literals — a binding or
@@ -2933,6 +2979,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let PatKind::Lit(literal) = alternative.kind else {
                         return Err(());
                     };
+                    if let Lit::Bool(value) = literal {
+                        if value {
+                            bool_cover.0 = true;
+                        } else {
+                            bool_cover.1 = true;
+                        }
+                    }
                     self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?;
                 }
             }
@@ -3097,10 +3150,40 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         };
         let mut catch_all = false;
+        let mut bool_cover = (false, false);
         let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
         let mut joined = None;
         for arm in arms {
-            self.check_match_arm_pattern(arm, scrutinee_type, &mut catch_all, &mut arm_binding)?;
+            if catch_all {
+                self.errors.push(PrimitiveBodyError {
+                    node: arm.pat.hir_id,
+                    kind: PrimitiveBodyErrorKind::UnreachablePattern,
+                });
+                if let PatKind::Binding {
+                    mode: BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } = arm.pat.kind
+                {
+                    arm_binding = Some((
+                        binding,
+                        self.known_bindings
+                            .insert(binding, LocalType::Concrete(scrutinee_type)),
+                    ));
+                }
+                let body_result = self.join_literal_site(arm.body, &mut joined);
+                self.restore_arm_binding(&mut arm_binding);
+                body_result?;
+                continue;
+            }
+            self.check_match_arm_pattern(
+                arm,
+                scrutinee_type,
+                &mut catch_all,
+                &mut bool_cover,
+                &mut arm_binding,
+            )?;
             let body_result = arm
                 .guard
                 .map(|guard| self.check_if_condition(guard))
@@ -3109,8 +3192,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
-        if !catch_all {
-            return Err(());
+        if !catch_all && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true)) {
+            self.errors.push(PrimitiveBodyError {
+                node: scrutinee.hir_id,
+                kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
+            });
         }
         let Some(local) = joined else {
             return Err(());

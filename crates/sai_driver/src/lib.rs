@@ -9760,7 +9760,35 @@ fn primitive_match_tail_shape_is_supported(
     let mut catch_all = false;
     for arm in arms {
         if catch_all {
-            return false;
+            // An arm after an unguarded catch-all is diagnosed
+            // `UNREACHABLE_PATTERN` by the checker — only its body still
+            // needs the shape check, with the arm's own pattern binding
+            // visible to it.
+            let mut extended = preceding_bindings.clone();
+            if let PatKind::Binding {
+                mode: sai_hir::patterns::BindingMode::Value,
+                binding,
+                sub: None,
+                ..
+            } = arm.pat.kind
+            {
+                extended.insert(binding);
+            }
+            if !primitive_if_branch_tail_shape_is_supported(
+                arm.body,
+                &extended,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            ) {
+                return false;
+            }
+            continue;
         }
         let mut arm_bindings = None;
         match arm.pat.kind {
@@ -9829,7 +9857,9 @@ fn primitive_match_tail_shape_is_supported(
             return false;
         }
     }
-    catch_all
+    // Missing catch-alls and non-Bool coverage are diagnosed
+    // `NON_EXHAUSTIVE_MATCH` by the checker — the shape is admitted.
+    true
 }
 
 fn is_supported_direct_call_arithmetic_argument_shape(
@@ -10261,6 +10291,24 @@ fn primitive_body_errors_to_diagnostics(
                     "literal out of range",
                 )?
             }
+            PrimitiveBodyErrorKind::NonExhaustiveMatch => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::NonExhaustiveMatch,
+                "match does not cover every value".to_owned(),
+                "non-exhaustive match",
+            )?,
+            PrimitiveBodyErrorKind::UnreachablePattern => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::UnreachablePattern,
+                "arm can never match".to_owned(),
+                "unreachable pattern",
+            )?,
             PrimitiveBodyErrorKind::EmptyRangePattern => const_literal_diagnostic(
                 owner.id,
                 inputs,
@@ -77584,6 +77632,7 @@ property "shared"() {}
             "pub fn empty_range(value: I32) -> I32 {\n    match value { 5..=1 => 1, _ => 0 }\n}\n",
             "pub fn negated_range_bound(value: I32) -> I32 {\n    match value { -170141183460469231731687303715884105728..=1 => 1, _ => 0 }\n}\n",
             "pub fn negated_zero_bound(value: I32) -> I32 {\n    match value { 0..=-0 => 1, _ => 0 }\n}\n",
+            "pub fn unreachable_binding(value: I32) -> I32 {\n    match value { _ => 0, n => n + 1 }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77599,9 +77648,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 30);
+        assert_eq!(owners.len(), 31);
 
-        for index in [0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 17, 20, 29] {
+        for index in [0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 29] {
             let check = owners[index]
                 .body_type_check()
                 .expect("supported match-tail shapes are checked");
@@ -77610,7 +77659,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the match-tail slice: {check:?}"
             );
         }
-        for index in [7, 8, 22, 24, 27, 28] {
+        for index in [7, 8, 10, 14, 22, 24, 25, 27, 28, 30] {
             let check = owners[index]
                 .body_type_check()
                 .expect("mismatched match patterns are diagnosed");
@@ -77624,6 +77673,8 @@ property "shared"() {}
                                 sai_diagnostics::Code::TypeMismatch
                                     | sai_diagnostics::Code::LiteralOutOfRange
                                     | sai_diagnostics::Code::EmptyRangePattern
+                                    | sai_diagnostics::Code::NonExhaustiveMatch
+                                    | sai_diagnostics::Code::UnreachablePattern
                             )
                 ),
                 "function owner {index} should report one pattern diagnostic: {check:?}"
@@ -77643,7 +77694,7 @@ property "shared"() {}
         ));
         // `stmt_match` stays gated: statement-position `match` discards its
         // arm values, so unifying them with the return type would be wrong.
-        for index in [10, 14, 15, 16, 18, 19, 21, 23, 25, 26] {
+        for index in [15, 18, 19, 21, 23, 26] {
             let check = owners[index]
                 .body_type_check()
                 .expect("match shapes outside the slice are gated");

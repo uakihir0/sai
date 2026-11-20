@@ -10186,22 +10186,50 @@ fn public_match_tail_bodies_emit_check_results() {
         "pub fn choose(value: I32) -> I32 { match value { 0 | 1 => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 1..=5 => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { n if n > 0 => 1, _ => 0 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { match flag { true => 1, false => 0 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { match flag { true | false => 1 } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
 }
 
 #[test]
+fn match_exhaustiveness_and_unreachable_arms_reach_cli_diagnostics() {
+    for (source, code) in [
+        (
+            "pub fn choose(value: I32) -> I32 { match value { 0 => 1, 1 => 2 } }\n",
+            "NON_EXHAUSTIVE_MATCH",
+        ),
+        (
+            "pub fn choose(value: I32) -> I32 { match value { n if n > 0 => 1 } }\n",
+            "NON_EXHAUSTIVE_MATCH",
+        ),
+        (
+            "pub fn choose(value: I32) -> I32 { match value { _ => 0, 1 => 1 } }\n",
+            "UNREACHABLE_PATTERN",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{code} must fail the check:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\"")),
+            "{code} must reach CLI diagnostics:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn unsupported_match_tail_shapes_remain_gated() {
     for source in [
-        "pub fn choose(value: I32) -> I32 { match value { 0 => 1, 1 => 2 } }\n",
-        "pub fn choose(flag: Bool) -> I32 { match flag { true => 1, false => 0 } }\n",
-        "pub fn choose(value: I32) -> I32 { match value { n if n > 0 => 1 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 0 if value > 1 => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 1.. => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 0 | n => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match 0 { 0 => 1, _ => 2 } }\n",
-        "pub fn choose(value: I32) -> I32 { match value { _ => 0, 1 => 1 } }\n",
         "pub fn choose(value: I32) -> Bool { match value { 0 => 1, _ => 2 }\n true }\n",
         "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 1.0 }\n x }\n",
         "pub fn choose(flag: Bool, a: I32) -> I32 { let x = if flag { 1 } else { a }\n x }\n",
