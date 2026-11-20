@@ -54616,6 +54616,17 @@ property "shared"() {}
             "    let total = missing() + left\n",
             "    total\n",
             "}\n",
+            "pub fn id(value: I32) -> I32 { value }\n",
+            "pub fn literal_var_call_arg() -> I32 {\n",
+            "    let x = 1\n",
+            "    let total = x + id(x)\n",
+            "    total\n",
+            "}\n",
+            "pub fn literal_var_call_compare() -> Bool {\n",
+            "    let x = 1\n",
+            "    let result = x == id(x)\n",
+            "    result\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54667,6 +54678,7 @@ property "shared"() {}
             ("call_tail_operand", PrimTy::I32),
             ("call_nested_call_operand", PrimTy::I32),
             ("call_unsupported_arg", PrimTy::I32),
+            ("literal_var_call_arg", PrimTy::I32),
         ] {
             let owner = owner_named(&database, &resolved, name);
             let FunctionBodyTypeCheck::Supported { diagnostics } = owner
@@ -54722,6 +54734,25 @@ property "shared"() {}
                     .any(|ty| *ty == PrimTy::Bool),
             "the `call_right` facts cover both the call's I32 and the comparison's Bool"
         );
+
+        let literal_var_compare = owner_named(&database, &resolved, "literal_var_call_compare");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: compare_diagnostics,
+        } = literal_var_compare
+            .body_type_check()
+            .expect("literal-variable call comparison body check is available")
+        else {
+            panic!("a literal-variable call operand comparison is supported");
+        };
+        assert!(
+            compare_diagnostics.is_empty(),
+            "the `literal_var_call_compare` operand checks without diagnostics: {compare_diagnostics:?}"
+        );
+        let compare_results = literal_var_compare
+            .primitive_body_type_results()
+            .expect("literal-variable call comparison results query succeeds")
+            .expect("literal-variable call comparison body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, compare_results);
 
         let logical_owner = owner_named(&database, &resolved, "call_logical_leaf");
         let FunctionBodyTypeCheck::Supported {

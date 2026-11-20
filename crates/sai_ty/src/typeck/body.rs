@@ -2343,14 +2343,6 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         left: &'hir Expr<'hir>,
         right: &'hir Expr<'hir>,
     ) -> Result<LocalType, ()> {
-        let left_path_type = self
-            .check_operand_local_type(left)
-            .ok()
-            .and_then(|local_type| self.concrete_local_type(local_type));
-        let right_path_type = self
-            .check_operand_local_type(right)
-            .ok()
-            .and_then(|local_type| self.concrete_local_type(local_type));
         let left_literal = match left.kind {
             ExprKind::Lit(literal) => primitive_literal_kind(literal).map(|kind| (literal, kind)),
             _ => None,
@@ -2444,6 +2436,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             return Ok(LocalType::Concrete(PrimTy::Bool));
         }
+
+        // Re-derive the operand types after the literal-variable pass: an
+        // operand evaluated in the loop above (e.g. a call argument in
+        // `x == id(x)`) may have resolved the other side's literal
+        // variable, so the types are read post-evaluation.
+        let left_path_type = self
+            .check_operand_local_type(left)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type));
+        let right_path_type = self
+            .check_operand_local_type(right)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type));
 
         match (left_path_type, right_path_type, left_literal, right_literal) {
             (Some(left_type), Some(right_type), None, None) => {
@@ -6326,7 +6331,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let Some(variable) = self.literal_variables.get_mut(id) else {
             return Err(());
         };
-        if variable.resolved.is_some() || !literal_family_accepts(variable.kind, expected) {
+        if let Some(resolved) = variable.resolved {
+            // Re-resolution to the same type is a no-op: an intervening
+            // constraint site (e.g. a call argument inside `x + id(x)`)
+            // may already have fixed the group to the demanded type.
+            return if resolved == expected {
+                Ok(())
+            } else {
+                Err(())
+            };
+        }
+        if !literal_family_accepts(variable.kind, expected) {
             return Err(());
         }
         variable.resolved = Some(expected);
