@@ -54,8 +54,8 @@ use sai_hir::arena::HirArena;
 use sai_hir::attrs::{ReprAttr, ValidatedAttrs};
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::expressions::{
-    Arg as HirArg, BinOp, Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind,
-    UnOp,
+    Arg as HirArg, Arm as HirArm, BinOp, Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece,
+    MatchSource, Stmt, StmtKind, UnOp,
 };
 use sai_hir::item_tree::{
     ItemTree, ItemTreeEntry, ItemTreeKind, TargetFilterError, TargetFilterResult,
@@ -8574,6 +8574,13 @@ fn check_function_body_primitive_local_block(
     let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
     let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(_));
     let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
+    let is_supported_match_tail = matches!(
+        tail.kind,
+        ExprKind::Match {
+            source: MatchSource::Normal,
+            ..
+        }
+    );
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8598,6 +8605,7 @@ fn check_function_body_primitive_local_block(
         ExprKind::Field { .. } if is_supported_field_tail => None,
         ExprKind::Call { .. } if is_supported_call_tail => None,
         ExprKind::If { .. } if is_supported_if_tail => None,
+        ExprKind::Match { .. } if is_supported_match_tail => None,
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
@@ -8607,6 +8615,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_binary_tail
         && !is_supported_literal_tail
         && !is_supported_if_tail
+        && !is_supported_match_tail
     {
         return Ok(None);
     }
@@ -9618,8 +9627,97 @@ fn primitive_if_branch_tail_shape_is_supported(
             direct_call_signatures,
             primitive_types,
         ),
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source,
+        } => primitive_match_tail_shape_is_supported(
+            scrutinee,
+            arms,
+            source,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         _ => false,
     }
+}
+
+/// `match` tails: a preceding-binding path scrutinee, literal / wildcard /
+/// plain-binding patterns, a required catch-all arm, no guards, and no arms
+/// after the catch-all — the bounded exhaustiveness rule the checker mirrors.
+/// Arm bodies reuse the shared tail-shape admission; a `binding` arm's name
+/// is visible only inside its own body.
+#[allow(clippy::too_many_arguments)]
+fn primitive_match_tail_shape_is_supported(
+    scrutinee: &HirExpr<'_>,
+    arms: &[HirArm<'_>],
+    source: MatchSource,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    if !matches!(source, MatchSource::Normal) {
+        return false;
+    }
+    let ExprKind::Path(path) = scrutinee.kind else {
+        return false;
+    };
+    if !resolved_plain_local_path_binding(path, locals, inputs)
+        .is_some_and(|binding| preceding_bindings.contains(&binding))
+    {
+        return false;
+    }
+    let mut catch_all = false;
+    for arm in arms {
+        if catch_all || arm.guard.is_some() {
+            return false;
+        }
+        let mut arm_bindings = None;
+        match arm.pat.kind {
+            PatKind::Lit(_) => {}
+            PatKind::Wild => catch_all = true,
+            PatKind::Binding {
+                mode: sai_hir::patterns::BindingMode::Value,
+                binding,
+                sub: None,
+                ..
+            } => {
+                catch_all = true;
+                let mut extended = preceding_bindings.clone();
+                extended.insert(binding);
+                arm_bindings = Some(extended);
+            }
+            _ => return false,
+        }
+        if !primitive_if_branch_tail_shape_is_supported(
+            arm.body,
+            arm_bindings.as_ref().unwrap_or(preceding_bindings),
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ) {
+            return false;
+        }
+    }
+    catch_all
 }
 
 fn is_supported_direct_call_arithmetic_argument_shape(
@@ -10242,6 +10340,19 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
         ExprKind::If { cond, then, els } => primitive_body_error_span(cond, node)
             .or_else(|| primitive_body_block_error_span(then, node))
             .or_else(|| els.and_then(|els| primitive_body_error_span(els, node))),
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => primitive_body_error_span(scrutinee, node).or_else(|| {
+            arms.iter().find_map(|arm| {
+                (arm.pat.hir_id == node)
+                    .then_some(arm.pat.span)
+                    .or_else(|| {
+                        arm.guard
+                            .and_then(|guard| primitive_body_error_span(guard, node))
+                    })
+                    .or_else(|| primitive_body_error_span(arm.body, node))
+            })
+        }),
         ExprKind::Block(block) => primitive_body_block_error_span(block, node),
         _ => None,
     }
@@ -77212,6 +77323,95 @@ property "shared"() {}
                     FunctionBodyTypeCheck::Unsupported
                 ),
                 "function owner {index} should remain gated"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_match_tails() {
+        let root = concat!(
+            "pub fn literal_arms(value: I32) -> I32 {\n    match value { 0 => 1, _ => 2 }\n}\n",
+            "pub fn binding_arm(value: I32) -> I32 {\n    match value { n => n + 1 }\n}\n",
+            "pub fn multi_literal(value: I32) -> I32 {\n    match value { 0 => 0, 1 => 1, _ => value }\n}\n",
+            "pub fn nested_arm(value: I32, flag: Bool) -> I32 {\n    match value { 0 => if flag { 1 } else { 2 }, _ => 3 }\n}\n",
+            "pub fn char_arms(c: Char) -> I32 {\n    match c { 'a' => 1, _ => 0 }\n}\n",
+            "pub fn bool_catch_all(flag: Bool) -> I32 {\n    match flag { true => 1, _ => 0 }\n}\n",
+            "pub fn arm_statement(value: I32) -> I32 {\n    match value { n => n + 1 }\n}\n",
+            "pub fn wrong_literal(value: I32) -> I32 {\n    match value { true => 1, _ => 0 }\n}\n",
+            "pub fn out_of_range(value: I8) -> I32 {\n    match value { 300 => 1, _ => 0 }\n}\n",
+            "pub fn arm_type_mismatch(value: I32) -> Bool {\n    match value { 0 => 1, _ => 2 }\n}\n",
+            "pub fn no_catch_all(value: I32) -> I32 {\n    match value { 0 => 1, 1 => 2 }\n}\n",
+            "pub fn guarded_arm(value: I32) -> I32 {\n    match value { n if n > 0 => 1, _ => 0 }\n}\n",
+            "pub fn range_pattern(value: I32) -> I32 {\n    match value { 1..=5 => 1, _ => 0 }\n}\n",
+            "pub fn or_pattern(value: I32) -> I32 {\n    match value { 0 | 1 => 1, _ => 0 }\n}\n",
+            "pub fn after_catch_all(value: I32) -> I32 {\n    match value { _ => 0, 1 => 1 }\n}\n",
+            "pub fn literal_scrutinee() -> I32 {\n    match 0 { 0 => 1, _ => 2 }\n}\n",
+            "pub fn bool_no_catch_all(flag: Bool) -> I32 {\n    match flag { true => 1, false => 0 }\n}\n",
+            "pub fn shadowed_binding(value: I32) -> I32 {\n    let n: I32 = 9\n    match value { n => n + 1 }\n}\n",
+            "pub fn sibling_leak(value: I32) -> I32 {\n    match value { n => 0, _ => n }\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 19);
+
+        for index in [0, 1, 2, 3, 4, 5, 6, 17] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("supported match-tail shapes are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the match-tail slice: {check:?}"
+            );
+        }
+        for index in [7, 8] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("mismatched match patterns are diagnosed");
+            assert!(
+                matches!(
+                    check,
+                    FunctionBodyTypeCheck::Supported { diagnostics }
+                        if diagnostics.len() == 1
+                            && matches!(
+                                diagnostics[0].code,
+                                sai_diagnostics::Code::TypeMismatch
+                                    | sai_diagnostics::Code::LiteralOutOfRange
+                            )
+                ),
+                "function owner {index} should report one pattern diagnostic: {check:?}"
+            );
+        }
+        // `arm_type_mismatch` checks every arm body independently, so both
+        // literal arm bodies report the `Bool` return-type mismatch.
+        assert!(matches!(
+            owners[9]
+                .body_type_check()
+                .expect("mismatched match arm bodies are diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 2
+                    && diagnostics
+                        .iter()
+                        .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+        ));
+        for index in [10, 11, 12, 13, 14, 15, 16, 18] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("match shapes outside the slice are gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} should remain gated: {check:?}"
             );
         }
     }

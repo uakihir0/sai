@@ -10172,6 +10172,32 @@ fn unsupported_bool_parameter_if_shapes_remain_gated() {
 }
 
 #[test]
+fn public_match_tail_bodies_emit_check_results() {
+    for source in [
+        "pub fn choose(value: I32) -> I32 { match value { 0 => 1, _ => 2 } }\n",
+        "pub fn choose(value: I32) -> I32 { match value { n => n + 1 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { match flag { true => 1, _ => 0 } }\n",
+        "pub fn choose(value: I32, flag: Bool) -> I32 { match value { 0 => if flag { 1 } else { 2 }, _ => 3 } }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn unsupported_match_tail_shapes_remain_gated() {
+    for source in [
+        "pub fn choose(value: I32) -> I32 { match value { 0 => 1, 1 => 2 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { match flag { true => 1, false => 0 } }\n",
+        "pub fn choose(value: I32) -> I32 { match value { n if n > 0 => 1, _ => 0 } }\n",
+        "pub fn choose(value: I32) -> I32 { match value { 1..=5 => 1, _ => 0 } }\n",
+        "pub fn choose(value: I32) -> I32 { match 0 { 0 => 1, _ => 2 } }\n",
+        "pub fn choose(value: I32) -> I32 { match value { _ => 0, 1 => 1 } }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_bool_parameter_not_if_function_emits_check_result() {
     for source in [
         "pub fn choose(flag: Bool) -> I32 { if not flag { 1 } else { 2 } }\n",
