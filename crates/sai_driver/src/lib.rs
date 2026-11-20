@@ -9041,14 +9041,16 @@ fn primitive_value_expression_shape_is_supported(
             }
         }
         ExprKind::Unary(UnOp::Not, operand) => {
-            let ExprKind::Path(path) = operand.kind else {
-                return false;
-            };
-            let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
-            else {
-                return false;
-            };
-            if !preceding_bindings.contains(&source_binding) {
+            // `let x = not e` follows operand-position logical admission
+            // (path, `Bool` literal, `not`, `and`/`or`, comparison), the
+            // same gate `if` conditions use for `not e`.
+            if !primitive_logical_init_operand_shape_is_supported(
+                operand,
+                preceding_bindings,
+                locals,
+                inputs,
+                unknown_self_fields,
+            ) {
                 return false;
             }
         }
@@ -77266,6 +77268,67 @@ property "shared"() {}
                     owners[index]
                         .body_type_check()
                         .expect("unsupported compound-assignment form is gated"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "function owner {index} should remain gated"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_not_initializers() {
+        let root = concat!(
+            "pub fn comparison(left: I8, right: I8) -> Bool {\n    let x = not (left < right)\n    x\n}\n",
+            "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let x = not (left and right)\n    x\n}\n",
+            "pub fn double_not(flag: Bool) -> Bool {\n    let x = not not flag\n    x\n}\n",
+            "pub fn literal() -> Bool {\n    let x = not true\n    x\n}\n",
+            "pub fn assign(left: I8, right: I8) -> Bool {\n    var x: Bool = false\n    x = not (left >= right)\n    x\n}\n",
+            "pub fn annotated_mismatch(flag: Bool) -> I32 {\n    let x: I32 = not flag\n    0\n}\n",
+            "pub fn operand_mismatch(value: I32) -> Bool {\n    let x = not value\n    x\n}\n",
+            "pub fn arithmetic_operand(left: I32, right: I32) -> Bool {\n    let x = not (left + right)\n    x\n}\n",
+            "pub fn unbound_operand(flag: Bool) -> Bool {\n    let x = not missing\n    x\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 9);
+        for index in 0..5 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("not-initializer shapes are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the not-initializer slice: {check:?}"
+            );
+        }
+        for (index, function) in [(5, "annotated_mismatch"), (6, "operand_mismatch")] {
+            let check = owners[index]
+                .body_type_check()
+                .unwrap_or_else(|_| panic!("{function} produces a supported diagnostic"));
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.len() == 1
+                        && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch),
+                "function owner {index} should report one TYPE_MISMATCH: {check:?}"
+            );
+        }
+        for index in [7, 8] {
+            assert!(
+                matches!(
+                    owners[index]
+                        .body_type_check()
+                        .expect("unsupported not-initializer form is gated"),
                     FunctionBodyTypeCheck::Unsupported
                 ),
                 "function owner {index} should remain gated"

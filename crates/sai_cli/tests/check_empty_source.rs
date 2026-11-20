@@ -9705,7 +9705,6 @@ fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
         "pub fn compare(value: I32) -> Bool {\n    let result = 1 == 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < (1 + 2)\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = (value + 1) < 2\n    result\n}\n",
-        "pub fn compare(value: I32) -> Bool {\n    let result = not (value < 1)\n    result\n}\n",
         "pub fn compare() -> Bool {\n    let inferred = 1\n    let result = inferred < 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < later\n    let later: I32 = 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = result < 1\n    result\n}\n",
@@ -9749,6 +9748,12 @@ fn primitive_logical_local_initializers_accept_parameter_and_local_paths() {
         "pub fn comparison_operand(left: Bool, right: Bool) -> Bool {\n    let result = left and (right == left)\n    result\n}\n",
         "pub fn comparison_operands(left: I32, right: I32) -> Bool {\n    let result = (left == right) and (left < right)\n    result\n}\n",
         "pub fn comparison_literal_operand(value: I32) -> Bool {\n    let result = value < 1 and true\n    result\n}\n",
+        "pub fn not_comparison(left: I32, right: I32) -> Bool {\n    let result = not (left == right)\n    result\n}\n",
+        "pub fn not_comparison_param(value: I32) -> Bool {\n    let result = not (value < 1)\n    result\n}\n",
+        "pub fn not_logical(left: Bool, right: Bool) -> Bool {\n    let result = not (left and right)\n    result\n}\n",
+        "pub fn not_not(flag: Bool) -> Bool {\n    let result = not not flag\n    result\n}\n",
+        "pub fn not_literal() -> Bool {\n    let result = not true\n    result\n}\n",
+        "pub fn not_assign(left: I32, right: I32) -> Bool {\n    var result: Bool = false\n    result = not (left >= right)\n    result\n}\n",
         "pub fn repeated(flag: Bool) -> Bool {\n    let result = flag and flag\n    result\n}\n",
         "pub fn shadowed(source: I32, other: Bool) -> Bool {\n    let source: Bool = true\n    let result = source and other\n    result\n}\n",
     ] {
@@ -9968,11 +9973,7 @@ fn primitive_local_not_diagnostics_follow_initializer_source_order() {
 #[test]
 fn unsupported_primitive_local_not_shapes_remain_gated() {
     for source in [
-        "pub fn logical(flag: Bool) -> Bool {\n    let result = not not flag\n    result\n}\n",
-        "pub fn logical(flag: Bool) -> Bool {\n    let result = not true\n    result\n}\n",
         "pub fn logical() -> Bool {\n    let inferred = 1\n    let result = not inferred\n    result\n}\n",
-        "pub fn logical(left: I32, right: I32) -> Bool {\n    let result = not (left == right)\n    result\n}\n",
-        "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = not (left and right)\n    result\n}\n",
         "pub fn logical(left: I32, right: I32) -> Bool {\n    let result = not (left + right)\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let result = not missing\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let result = not later\n    let later: Bool = flag\n    result\n}\n",

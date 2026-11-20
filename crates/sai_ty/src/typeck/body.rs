@@ -2586,7 +2586,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                 }
                 ExprKind::Unary(UnOp::Not, operand) => {
-                    let result = self.check_logical_not(operand)?;
+                    // `let x = not e` admits operand-position logical shapes
+                    // (path, `Bool` literal, `not`, `and`/`or`, comparison) —
+                    // the same admission `if` conditions use for `not e`.
+                    let operand_type = self.check_logical_operand(operand)?;
+                    self.check_logical_operand_type(operand, operand_type)?;
                     if let Some(expected) = annotation {
                         if expected != PrimTy::Bool {
                             self.errors.push(PrimitiveBodyError {
@@ -2598,7 +2602,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             });
                         }
                     }
-                    result
+                    LocalType::Concrete(PrimTy::Bool)
                 }
                 ExprKind::Unary(UnOp::Neg, operand) => {
                     let (result, is_deferred_neg_result) =
