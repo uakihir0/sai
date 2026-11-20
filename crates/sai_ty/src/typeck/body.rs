@@ -9,7 +9,7 @@ use super::results::{
 };
 use crate::ty::TyInterner;
 use sai_hir::body::Body;
-use sai_hir::expressions::{BinOp, Block, Expr, ExprKind, Stmt, StmtKind, UnOp};
+use sai_hir::expressions::{Arm, BinOp, Block, Expr, ExprKind, MatchSource, Stmt, StmtKind, UnOp};
 use sai_hir::literals::Lit;
 use sai_hir::patterns::{BindingMode, PatKind};
 use sai_hir::types::PathRoot;
@@ -505,6 +505,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_block(&mut self, block: &Block<'hir>) -> Result<(), ()> {
+        self.check_block_expected(block, self.input.return_type)
+    }
+
+    fn check_block_expected(&mut self, block: &Block<'hir>, expected: PrimTy) -> Result<(), ()> {
         if block.safety != Safety::Safe {
             return Err(());
         }
@@ -535,6 +539,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
         let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some());
         let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
+        let is_supported_match_tail = matches!(
+            tail.kind,
+            ExprKind::Match {
+                source: MatchSource::Normal,
+                ..
+            }
+        );
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
@@ -542,6 +553,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             && !is_supported_binary_tail
             && !is_supported_literal_tail
             && !is_supported_if_tail
+            && !is_supported_match_tail
         {
             return Err(());
         }
@@ -549,7 +561,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.check_stmt(stmt)?;
         }
 
-        self.check_expr(tail)?;
+        self.check_expr_expected(tail, expected)?;
         self.default_unresolved_literals(literal_floor);
         Ok(())
     }
@@ -2233,18 +2245,28 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_expr_stmt(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
-        // Statement-position `if`/`block` expressions unify their branch
-        // tails with the return type, which does not apply to a discarded
-        // result, so they stay outside this slice.
-        if matches!(expression.kind, ExprKind::If { .. } | ExprKind::Block(_)) {
+        // Statement-position `if`/`block`/`match` expressions unify their
+        // branch/arm tails with the return type, which does not apply to a
+        // discarded result, so they stay outside this slice.
+        if matches!(
+            expression.kind,
+            ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::Match { .. }
+        ) {
             return Err(());
         }
-        let local_type = self.check_expr_value(expression)?;
+        let local_type = self.check_expr_value(expression, self.input.return_type)?;
         self.record_expression_type(expression.hir_id, local_type);
         Ok(())
     }
 
-    fn check_expr_value(&mut self, expression: &Expr<'hir>) -> Result<LocalType, ()> {
+    /// `expected` is the type the expression's value unifies with: the
+    /// return type at tail positions, or the annotation at annotated
+    /// initializer/assign positions.
+    fn check_expr_value(
+        &mut self,
+        expression: &Expr<'hir>,
+        expected: PrimTy,
+    ) -> Result<LocalType, ()> {
         let local_type = if self.expression_has_unknown_field_error(expression) {
             if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. }) {
                 return Err(());
@@ -2312,7 +2334,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // branch tails unify with the return type the way the
                 // outer tail does. Branches with statements stay outside
                 // this slice, mirroring the driver admission.
-                ExprKind::If { cond, then, els } => self.check_if_tail(cond, then, els)?,
+                ExprKind::If { cond, then, els } => {
+                    self.check_if_tail(cond, then, els, expected)?
+                }
+                ExprKind::Match {
+                    scrutinee,
+                    arms,
+                    source,
+                } => self.check_match_tail(scrutinee, arms, source, expected)?,
                 _ => self.check_local_path(expression)?,
             }
         };
@@ -2320,15 +2349,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_expr(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
-        let local_type = self.check_expr_value(expression)?;
+        self.check_expr_expected(expression, self.input.return_type)
+    }
+
+    fn check_expr_expected(&mut self, expression: &Expr<'hir>, expected: PrimTy) -> Result<(), ()> {
+        let local_type = self.check_expr_value(expression, expected)?;
         match local_type {
             LocalType::Error(found) => {
                 if let Some(found) = found {
-                    self.check_concrete_tail_type(found, expression.hir_id);
+                    self.check_concrete_tail_type(found, expected, expression.hir_id);
                 }
             }
             LocalType::Concrete(found) => {
-                self.check_concrete_tail_type(found, expression.hir_id);
+                self.check_concrete_tail_type(found, expected, expression.hir_id);
             }
             LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                 let Some((resolved, kind)) = self
@@ -2339,15 +2372,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     return Err(());
                 };
                 match resolved {
-                    Some(found) => self.check_concrete_tail_type(found, expression.hir_id),
-                    None if literal_family_accepts(kind, self.input.return_type) => {
-                        self.resolve_literal_variable(id, self.input.return_type)?;
+                    Some(found) => {
+                        self.check_concrete_tail_type(found, expected, expression.hir_id)
+                    }
+                    None if literal_family_accepts(kind, expected) => {
+                        self.resolve_literal_variable(id, expected)?;
                     }
                     None => {
                         self.errors.push(PrimitiveBodyError {
                             node: expression.hir_id,
                             kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                                expected: self.input.return_type,
+                                expected,
                                 found: kind,
                             },
                         });
@@ -2562,6 +2597,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         source_type
                     }
                 }
+                // Annotated `if`/`match` initializers check each branch/arm
+                // body against the annotation through the shared
+                // expected-type path; unannotated forms stay gated since
+                // joining the branches' literal variables is a wider
+                // inference question.
+                ExprKind::If { cond, then, els } => {
+                    let Some(expected) = annotation else {
+                        return Err(());
+                    };
+                    self.check_if_tail(cond, then, els, expected)?;
+                    LocalType::Concrete(expected)
+                }
+                ExprKind::Match {
+                    scrutinee,
+                    arms,
+                    source,
+                } => {
+                    let Some(expected) = annotation else {
+                        return Err(());
+                    };
+                    self.check_match_tail(scrutinee, arms, source, expected)?;
+                    LocalType::Concrete(expected)
+                }
                 ExprKind::Field { .. } => {
                     let Some(field_type) = self
                         .input
@@ -2744,26 +2802,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         condition: &'hir Expr<'hir>,
         then: &'hir Block<'hir>,
         els: Option<&'hir Expr<'hir>>,
+        expected: PrimTy,
     ) -> Result<LocalType, ()> {
         let Some(els) = els else {
             return Err(());
         };
         self.check_if_condition(condition)?;
-        self.check_if_branch(then)?;
+        self.check_if_branch(then, expected)?;
         match els.kind {
             ExprKind::Block(block) => {
-                self.check_if_branch(block)?;
-                self.record_expression_type(
-                    els.hir_id,
-                    LocalType::Concrete(self.input.return_type),
-                );
+                self.check_if_branch(block, expected)?;
+                self.record_expression_type(els.hir_id, LocalType::Concrete(expected));
             }
             ExprKind::If { .. } => {
-                self.check_expr(els)?;
+                self.check_expr_expected(els, expected)?;
             }
             _ => return Err(()),
         }
-        Ok(LocalType::Concrete(self.input.return_type))
+        Ok(LocalType::Concrete(expected))
     }
 
     // Empty `if` branches are checked tail-first through `check_expr` rather
@@ -2771,7 +2827,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     // plain `Path` tails (flat path tails belong to the direct-parameter
     // slice). Statement-bearing branches reuse `check_block` directly so
     // their `let` bindings follow the same boundary as the outer block.
-    fn check_if_branch(&mut self, block: &'hir Block<'hir>) -> Result<(), ()> {
+    fn check_if_branch(&mut self, block: &'hir Block<'hir>, expected: PrimTy) -> Result<(), ()> {
         if block.stmts.is_empty() {
             if block.safety != Safety::Safe {
                 return Err(());
@@ -2779,10 +2835,110 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             let Some(tail) = block.tail else {
                 return Err(());
             };
-            self.check_expr(tail)
+            self.check_expr_expected(tail, expected)
         } else {
-            self.check_block(block)
+            self.check_block_expected(block, expected)
         }
+    }
+
+    /// `match` tails admit a concrete preceding-path scrutinee and literal,
+    /// wildcard, or plain `binding` patterns, with a required catch-all arm —
+    /// the bounded exhaustiveness rule of this slice, since every admitted
+    /// match is then trivially exhaustive (§6.22). Guards, or/range/compound
+    /// patterns, arms after the catch-all (unreachable, warning-gated), and
+    /// non-`match` desugarings (`if let`, loops) stay outside. Arm bodies
+    /// unify with the return type through `check_expr`, like `if` branches.
+    fn check_match_tail(
+        &mut self,
+        scrutinee: &'hir Expr<'hir>,
+        arms: &'hir [Arm<'hir>],
+        source: MatchSource,
+        expected: PrimTy,
+    ) -> Result<LocalType, ()> {
+        if !matches!(source, MatchSource::Normal) {
+            return Err(());
+        }
+        let ExprKind::Path(_) = scrutinee.kind else {
+            return Err(());
+        };
+        let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
+            return Err(());
+        };
+        let mut catch_all = false;
+        let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
+        for arm in arms {
+            if catch_all || arm.guard.is_some() {
+                return Err(());
+            }
+            match arm.pat.kind {
+                PatKind::Lit(literal) => {
+                    let Some(kind) = primitive_literal_kind(literal) else {
+                        return Err(());
+                    };
+                    match check_primitive_literal(
+                        scrutinee_type,
+                        literal,
+                        self.input.symbols,
+                        self.input.pointer_width,
+                    ) {
+                        PrimitiveLiteralResult::Match => {}
+                        PrimitiveLiteralResult::OutOfRange => {
+                            self.errors.push(PrimitiveBodyError {
+                                node: arm.pat.hir_id,
+                                kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                                    expected: scrutinee_type,
+                                    found: kind,
+                                },
+                            });
+                        }
+                        PrimitiveLiteralResult::TypeMismatch => {
+                            self.errors.push(PrimitiveBodyError {
+                                node: arm.pat.hir_id,
+                                kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                    expected: scrutinee_type,
+                                    found: kind,
+                                },
+                            });
+                        }
+                    }
+                }
+                PatKind::Wild => catch_all = true,
+                PatKind::Binding {
+                    mode: BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } => {
+                    catch_all = true;
+                    arm_binding = Some((
+                        binding,
+                        self.known_bindings
+                            .insert(binding, LocalType::Concrete(scrutinee_type)),
+                    ));
+                }
+                _ => return Err(()),
+            }
+            self.record_expression_type(arm.pat.hir_id, LocalType::Concrete(scrutinee_type));
+            // Arm patterns bind only inside their arm body — restore the
+            // previous binding (or its absence) so sibling arms and the
+            // enclosing scope never observe the arm-local name.
+            let body_result = self.check_expr_expected(arm.body, expected);
+            if let Some((binding, previous)) = arm_binding.take() {
+                match previous {
+                    Some(previous) => {
+                        self.known_bindings.insert(binding, previous);
+                    }
+                    None => {
+                        self.known_bindings.remove(&binding);
+                    }
+                }
+            }
+            body_result?;
+        }
+        if !catch_all {
+            return Err(());
+        }
+        Ok(LocalType::Concrete(expected))
     }
 
     fn check_if_condition(&mut self, condition: &'hir Expr<'hir>) -> Result<(), ()> {
@@ -4126,14 +4282,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
-    fn check_concrete_tail_type(&mut self, found: PrimTy, node: HirId) {
-        if found != self.input.return_type {
+    fn check_concrete_tail_type(&mut self, found: PrimTy, expected: PrimTy, node: HirId) {
+        if found != expected {
             self.errors.push(PrimitiveBodyError {
                 node,
-                kind: PrimitiveBodyErrorKind::TypeMismatch {
-                    expected: self.input.return_type,
-                    found,
-                },
+                kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
             });
         }
     }
@@ -4437,6 +4590,17 @@ fn collect_primitive_expression_nodes<'hir>(
                 collect_primitive_expression_nodes(els, nodes);
             }
         }
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_primitive_expression_nodes(scrutinee, nodes);
+            for arm in arms {
+                if let Some(guard) = arm.guard {
+                    collect_primitive_expression_nodes(guard, nodes);
+                }
+                collect_primitive_expression_nodes(arm.body, nodes);
+            }
+        }
         ExprKind::Field { base, .. }
         | ExprKind::TupleField { base, .. }
         | ExprKind::Unary(_, base)
@@ -4581,6 +4745,38 @@ fn expression_has_primitive_result_taint(
                         local_paths,
                         tainted_bindings,
                     )
+                })
+            }
+            // An error on a pattern, guard, scrutinee, or arm body taints the
+            // whole `match` result — otherwise the recorded tail type stays
+            // published as trustworthy.
+            ExprKind::Match {
+                scrutinee, arms, ..
+            } => {
+                expression_has_primitive_result_taint(
+                    scrutinee,
+                    error_nodes,
+                    unknown_self_fields,
+                    local_paths,
+                    tainted_bindings,
+                ) || arms.iter().any(|arm| {
+                    error_nodes.contains(&arm.pat.hir_id)
+                        || arm.guard.is_some_and(|guard| {
+                            expression_has_primitive_result_taint(
+                                guard,
+                                error_nodes,
+                                unknown_self_fields,
+                                local_paths,
+                                tainted_bindings,
+                            )
+                        })
+                        || expression_has_primitive_result_taint(
+                            arm.body,
+                            error_nodes,
+                            unknown_self_fields,
+                            local_paths,
+                            tainted_bindings,
+                        )
                 })
             }
             _ => false,
