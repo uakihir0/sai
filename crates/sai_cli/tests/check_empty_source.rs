@@ -19500,6 +19500,48 @@ fn unary_neg_path_tails_remain_behind_the_stage_gate() {
 }
 
 #[test]
+fn unary_bitwise_not_path_tails_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn parameter_tail(value: I32) -> I32 { ~value }\n",
+        "pub fn byte_tail(value: Byte) -> Byte { ~value }\n",
+        "pub fn bool_tail(value: Bool) -> Bool { ~value }\n",
+        "pub fn local_tail() -> I32 {\n",
+        "    let source: I32 = 7\n",
+        "    ~source\n",
+        "}\n",
+        "pub fn literal_tail() -> U16 {\n",
+        "    let source = 7\n",
+        "    ~source\n",
+        "}\n",
+        "pub fn literal_alias_tail() -> I32 {\n",
+        "    let source = 7\n",
+        "    let copied = source\n",
+        "    ~copied\n",
+        "}\n",
+        "pub fn float_tail() -> F64 {\n",
+        "    let source = 1.5\n",
+        "    ~source\n",
+        "}\n",
+        "pub fn deferred_result_tail() -> I64 {\n",
+        "    let source = 7\n",
+        "    let first = ~source\n",
+        "    ~first\n",
+        "}\n",
+        "pub fn computed_tail(value: I32) -> I32 { ~(value + 1) }\n",
+        "pub fn literal_operand_tail() -> I32 { ~7 }\n",
+        "pub fn double_bitnot_tail(value: I32) -> I32 { ~ ~value }\n",
+        "pub fn call_operand_tail(value: I32) -> I32 { ~identity_i32(value) }\n",
+        "pub fn not_tail(value: Bool) -> Bool { not value }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "unary-bitnot path tails over parameters, locals, and literal deferrals",
+    );
+}
+
+#[test]
 fn deferred_bitwise_not_of_flat_integer_literal_locals_remains_behind_the_stage_gate() {
     let source = concat!(
         "const GLOBAL: I32 = 1\n",
