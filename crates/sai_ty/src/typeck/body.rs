@@ -5483,9 +5483,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if id == other {
             return Err(());
         }
-        // Merging an already-merged variable merges its whole group: with
-        // `x` linked under `n`, `m += x` links `n`'s group under `m`.
-        // Repeating the same merge (`a += b` twice) is a no-op.
+        // Merging merged variables merges their whole groups through
+        // the roots: with `x` under `n`, `m += x` links `n`'s group
+        // under `m`. Repeating a merge (`a += b` twice), or one that is
+        // already satisfied (`a += b; c += b; a += b`), is a no-op.
+        let mut id_root = id;
+        while let Some(parent) = self
+            .literal_variables
+            .get(id_root)
+            .and_then(|variable| variable.merged_with)
+        {
+            id_root = parent;
+        }
         let mut other_root = other;
         while let Some(parent) = self
             .literal_variables
@@ -5494,11 +5503,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         {
             other_root = parent;
         }
-        if other_root == id {
+        if id_root == other_root {
             return Ok(());
         }
-        if other_root != other {
-            return self.merge_literal_variables(id, other_root);
+        if id_root != id || other_root != other {
+            return self.merge_literal_variables(id_root, other_root);
         }
         let Some(variable) = self.literal_variables.get(id) else {
             return Err(());
