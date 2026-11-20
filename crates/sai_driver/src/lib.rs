@@ -9166,6 +9166,45 @@ fn primitive_break_value_shape_is_supported(
     }
 }
 
+// A nested binary operand — `(a + b) * c` — desugars to a `let t`
+// binding whose initializer the checker evaluates, so operand admission
+// accepts any operand-shaped tree of supported primitive binary
+// operators, literal leaves, preceding paths, and unknown self fields.
+fn primitive_nested_operand_shape_is_supported(
+    operand: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+) -> bool {
+    match operand.kind {
+        ExprKind::Lit(_) => is_direct_function_scalar_literal(operand),
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Field { .. } => {
+            unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+        }
+        ExprKind::Binary(operator, left, right)
+            if is_function_primitive_local_binary_operator(operator) =>
+        {
+            primitive_nested_operand_shape_is_supported(
+                left,
+                preceding_bindings,
+                locals,
+                inputs,
+                unknown_self_fields,
+            ) && primitive_nested_operand_shape_is_supported(
+                right,
+                preceding_bindings,
+                locals,
+                inputs,
+                unknown_self_fields,
+            )
+        }
+        _ => false,
+    }
+}
+
 fn primitive_value_expression_shape_is_supported(
     expression: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
@@ -9325,7 +9364,15 @@ fn primitive_value_expression_shape_is_supported(
                     && unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
             };
             let is_preceding_path_or_unknown_field = |operand: &HirExpr<'_>| {
-                is_preceding_path(operand) || is_unknown_self_field(operand)
+                is_preceding_path(operand)
+                    || is_unknown_self_field(operand)
+                    || primitive_nested_operand_shape_is_supported(
+                        operand,
+                        preceding_bindings,
+                        locals,
+                        inputs,
+                        unknown_self_fields,
+                    )
             };
             let supported_shape = match operator {
                 BinOp::And | BinOp::Or => {
@@ -54176,22 +54223,23 @@ property "shared"() {}
         );
 
         let nested_owner = owner_named(&database, &resolved, "nested_tail");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: nested_diagnostics,
+        } = nested_owner
+            .body_type_check()
+            .expect("nested tail body query succeeds")
+        else {
+            panic!("a nested binary operand tail is supported");
+        };
         assert!(
-            matches!(
-                nested_owner
-                    .body_type_check()
-                    .expect("nested tail body query succeeds"),
-                FunctionBodyTypeCheck::Unsupported
-            ),
-            "a computed operand stays outside the flat binary tail slice"
+            nested_diagnostics.is_empty(),
+            "the `(first + 1) * 2` nested tail checks cleanly: {nested_diagnostics:?}"
         );
-        assert!(
-            nested_owner
-                .primitive_body_type_results()
-                .expect("nested projection query succeeds")
-                .is_none(),
-            "a nested binary tail publishes no primitive facts"
-        );
+        let nested_results = nested_owner
+            .primitive_body_type_results()
+            .expect("nested projection query succeeds")
+            .expect("a nested binary tail publishes primitive facts");
+        assert_primitive_type_result_parity(&database, nested_results);
     }
 
     #[test]
@@ -54534,6 +54582,7 @@ property "shared"() {}
             "discarded_branch_statement",
             "discarded_expression_statements",
             "double_negation",
+            "nested_branch_tail",
         ] {
             let owner = owner_named(&database, &resolved, name);
             let FunctionBodyTypeCheck::Supported { diagnostics } = owner
@@ -54644,7 +54693,6 @@ property "shared"() {}
             "sibling_scope_leak",
             "if_expression_statement",
             "literal_condition",
-            "nested_branch_tail",
         ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
@@ -77466,10 +77514,44 @@ property "shared"() {}
             let check = owner
                 .body_type_check()
                 .expect("unsupported bitwise body check is gated");
+            if matches!(
+                index,
+                12 | 13 | 17 | 29 | 33 | 34 | 35 | 65 | 66 | 72 | 73 | 76
+            ) {
+                continue;
+            }
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
                 "function owner {index} unexpectedly passed the bounded bitwise slice: {check:?}"
             );
+        }
+        // `(left ^ right)`, `('b' | 'c')` and the path-plus-scalar nested
+        // operands evaluate through the operand probes, surfacing the
+        // operator-trait diagnostics inside them.
+        for index in [12, 13, 17, 29, 33, 34, 35, 65, 66] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("nested-operand bitwise body check is available")
+            else {
+                panic!("function owner {index} stays gated");
+            };
+            assert!(!diagnostics.is_empty());
+            assert!(
+                diagnostics.iter().all(
+                    |diagnostic| diagnostic.code == sai_diagnostics::Code::OperatorNotSupported
+                )
+            );
+        }
+        // `left & (right ^ extra)`, `(left + right) & right` and `1 << 2`
+        // evaluate cleanly through the operand probes.
+        for index in [72, 73, 76] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("nested-operand body check is available")
+            else {
+                panic!("function owner {index} stays gated");
+            };
+            assert!(diagnostics.is_empty());
         }
     }
 
@@ -77508,13 +77590,27 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         assert_eq!(resolved.owners().len(), 14);
-        for owner in resolved.owners() {
-            assert!(matches!(
-                owner
-                    .body_type_check()
-                    .expect("unsupported local form is gated"),
-                FunctionBodyTypeCheck::Unsupported
-            ));
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            if index == 9 {
+                // `source % (1 + 0)` resolves the literal-literal nested
+                // operand through the operand probe and gives `copy` I32.
+                assert!(matches!(
+                    owner
+                        .body_type_check()
+                        .expect("nested-operand initializer is checked"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ));
+                continue;
+            }
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("unsupported local form is gated"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "function owner {index} unexpectedly passed the local-forms gate"
+            );
         }
     }
 
@@ -77883,7 +77979,7 @@ property "shared"() {}
                 .expect("a negated literal-parameter comparison is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [21, 23, 24, 29] {
+        for index in [20, 21, 23, 24, 29] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77891,7 +77987,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [19, 20, 26, 27, 28, 30] {
+        for index in [19, 26, 27, 28, 30] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -79181,7 +79277,7 @@ property "shared"() {}
                 .expect("a negated logical condition over one parameter is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [30, 33, 34, 41] {
+        for index in [30, 33, 34, 41, 42] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -79189,7 +79285,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [27, 28, 39, 42, 44, 46] {
+        for index in [27, 28, 39, 44, 46] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
