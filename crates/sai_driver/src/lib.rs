@@ -57421,7 +57421,6 @@ property "shared"() {}
             "bitwise_integer_literal_deep_nested_call_unsupported",
             "bitwise_integer_literal_generic_target_unsupported",
             "bitwise_integer_literal_left_generic_target_unsupported",
-            "bitwise_integer_literal_left_unresolved_path_unsupported",
             "bitwise_integer_literal_left_forward_path_unsupported",
             "bitwise_integer_literal_left_computed_path_unsupported",
             "bitwise_integer_literal_left_call_path_unsupported",
@@ -57507,6 +57506,25 @@ property "shared"() {}
                 "unsupported direct-call target `{name}` publishes no primitive facts"
             );
         }
+
+        // `1 & right` joins the literal as a constraint site on the
+        // unresolved literal variable — the `apply_i32` parameter resolves
+        // the group to I32.
+        let literal_left_var_owner = owner_named(
+            &database,
+            &resolved,
+            "bitwise_integer_literal_left_unresolved_path_unsupported",
+        );
+        assert!(
+            matches!(
+                literal_left_var_owner
+                    .body_type_check()
+                    .expect("literal-left literal-variable right is checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "a `1 & x` constraint-site join is supported: {:?}",
+            literal_left_var_owner.body_type_check()
+        );
 
         let mut source_hir_ids_by_owner =
             HashMap::<OwnerId, HashMap<sai_diagnostics::TextRange, Vec<HirId>>>::new();
@@ -77652,6 +77670,10 @@ property "shared"() {}
             "pub fn literal_var_merge_cycle() -> I32 {\n    var a = 0\n    var b = 0\n    a += b\n    b += a\n    a\n}\n",
             "pub fn literal_var_merge_block_scope(flag: Bool) -> I32 {\n    var a = 1\n    if flag {\n        var b = 2\n        a += b\n    }\n    a\n}\n",
             "pub fn literal_var_merge_pending_neg() -> U8 {\n    var x = 1\n    var y = 2\n    let n = -x\n    let s = y + x\n    s\n}\n",
+            "pub fn literal_var_lhs_rem() -> I32 {\n    var x = 4\n    let r = 1 % x\n    r\n}\n",
+            "pub fn literal_var_lhs_wrap() -> I32 {\n    var x = 2\n    let r = 1 +% x\n    r\n}\n",
+            "pub fn literal_var_lhs_bit() -> I32 {\n    var x = 3\n    let b = 1 & x\n    b\n}\n",
+            "pub fn literal_var_lhs_rem_float() -> I32 {\n    var x = 0.5\n    let r = 1 % x\n    r\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77667,7 +77689,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 60);
+        assert_eq!(owners.len(), 64);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77738,7 +77760,7 @@ property "shared"() {}
         }
         for index in [
             23, 25, 26, 27, 28, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49,
-            51, 52, 55, 58,
+            51, 52, 55, 58, 60, 61, 62,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -77748,7 +77770,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
-        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 57] {
+        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 57, 63] {
             assert!(
                 matches!(
                     owners[index]
