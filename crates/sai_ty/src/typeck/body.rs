@@ -3769,16 +3769,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Err(());
             }
             if !matches!(rhs.kind, ExprKind::Lit(_)) {
-                // `x op= path` with a concretely typed right operand
-                // resolves the variable to the operand's type when the
-                // family admits it and the operator exists for that type
-                // pair — the `x = x op path` desugar does the same. With an
+                // `x op= e` with a concretely typed right operand resolves
+                // the variable to the operand's type when the family
+                // admits it and the operator exists for that type pair —
+                // the `x = x op e` desugar does the same. With an
                 // unresolved literal-variable right side the two variables
-                // merge instead, like `x op y` in an initializer.
-                let right_type = self
-                    .check_local_path(rhs)
-                    .ok()
-                    .and_then(|local_type| self.concrete_local_type(local_type));
+                // merge instead, like `x op y` in an initializer. Non-path
+                // right sides evaluate as the desugared `let t = e`
+                // binding's initializer.
+                let rhs_local = self.check_local_path(rhs).ok().or_else(|| {
+                    self.check_initializer_value(rhs, None)
+                        .ok()
+                        .map(|check| check.local_type)
+                });
+                let right_type = rhs_local
+                    .as_ref()
+                    .and_then(|local_type| self.concrete_local_type(*local_type));
                 if right_type.is_none() {
                     // The merged pair resolves without an operator check,
                     // so the place's kind must admit the operator for every
@@ -3796,8 +3802,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                                 _ => variable.kind == PrimitiveLiteralKind::Integer,
                             });
                     if kind_eligible
-                        && let Some(LocalType::LiteralVariable(other)) =
-                            self.check_local_path(rhs).ok()
+                        && let Some(LocalType::LiteralVariable(other)) = rhs_local
                         && self
                             .literal_variables
                             .get(other)
