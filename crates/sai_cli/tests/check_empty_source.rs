@@ -5018,6 +5018,10 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn bit_and_unresolved_local(left: I32) -> I32 {\n    let bits = 1\n    let result = bits & left\n    result\n}\n",
         "pub fn bit_or_literal_right() -> I32 {\n    var bits = 1\n    let result = bits | 4\n    result\n}\n",
         "pub fn bit_xor_assign_local(left: I32) -> I32 {\n    var result = 0\n    result ^= left\n    result\n}\n",
+        "pub fn add_unresolved_rhs(value: I32) -> I32 {\n    let number = 1\n    let result = value + number\n    result\n}\n",
+        "pub fn remainder_unresolved_rhs(value: I32) -> I32 {\n    let number = 1\n    let result = value % number\n    result\n}\n",
+        "pub fn wrapping_unresolved_rhs(value: I32) -> I32 {\n    let number = 1\n    let result = value +% number\n    result\n}\n",
+        "pub fn bit_and_unresolved_rhs(value: I32) -> I32 {\n    let bits = 1\n    let result = value & bits\n    result\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -9044,7 +9048,6 @@ fn unsupported_primitive_add_local_literal_shapes_remain_gated() {
         "pub fn fixed_literal(value: I32) -> I32 {\n    let result = value + true\n    result\n}\n",
         "pub fn fixed_literal_left(value: I32) -> I32 {\n    let result = true + value\n    result\n}\n",
         "pub fn byte_path(value: Byte) -> Byte {\n    let result = value + 1\n    result\n}\n",
-        "pub fn unresolved_number(value: I32) -> I32 {\n    let number = 1\n    let result = value + number\n    result\n}\n",
         "pub fn nested(value: I32) -> I32 {\n    let result = value + (1 + 1)\n    result\n}\n",
         "pub fn computed_left(value: I32) -> I32 {\n    let result = (value + 1) + value\n    result\n}\n",
         "pub fn forward(value: I32) -> I32 {\n    let result = later + 1\n    let later = value\n    result\n}\n",
@@ -18819,7 +18822,6 @@ fn primitive_bitwise_left_integer_literal_annotation_mismatch_recovers() {
 fn unsupported_primitive_bitwise_right_integer_literal_forms_remain_gated() {
     for source in [
         "pub fn literal_pair() -> I32 { let result = 1 ^ 2; result }\n",
-        "pub fn unresolved(value: I32) -> I32 { let bits = 1; let result = value & bits; result }\n",
         "type Word = I32\npub fn alias(left: Word, right: Word) -> Word { let result = left & right; result }\n",
         "pub fn nested(left: I32, right: I32, extra: I32) -> I32 { let result = left & (right ^ extra); result }\n",
         "pub fn computed(left: I32, right: I32) -> I32 { let result = (left ^ right) & right; result }\n",

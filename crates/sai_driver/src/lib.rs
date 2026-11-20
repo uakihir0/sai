@@ -57322,7 +57322,6 @@ property "shared"() {}
             "remainder_path_pair_unresolved_right_unsupported",
             "remainder_path_pair_self_right_unsupported",
             "remainder_path_pair_forward_right_unsupported",
-            "remainder_path_pair_unresolved_numeric_right_unsupported",
             "remainder_path_pair_bool_operands_unsupported",
             "remainder_path_pair_byte_operands_unsupported",
             "remainder_path_pair_char_operands_unsupported",
@@ -57425,7 +57424,6 @@ property "shared"() {}
             "bitwise_literal_rhs_byte_string_unsupported",
             "bitwise_literal_rhs_computed_unsupported",
             "bitwise_literal_rhs_nested_unsupported",
-            "bitwise_literal_rhs_unresolved_path_unsupported",
             "bitwise_literal_rhs_self_path_unsupported",
             "bitwise_literal_rhs_forward_path_unsupported",
             "bitwise_literal_rhs_deep_call_unsupported",
@@ -57433,8 +57431,6 @@ property "shared"() {}
             "bitwise_literal_rhs_unsupported_signature",
             "bitwise_literal_rhs_char_unsupported",
             "bitwise_literal_rhs_float_unsupported",
-            "bitwise_unresolved_integer_literal_path_unsupported",
-            "bitwise_unresolved_integer_literal_left_unsupported",
             "bitwise_integer_literal_forward_left_unsupported",
             "bitwise_integer_literal_computed_left_unsupported",
             "bitwise_integer_literal_nested_operator_unsupported",
@@ -57493,7 +57489,6 @@ property "shared"() {}
             "bitwise_nested_operator_unsupported",
             "bitwise_call_operand_unsupported",
             "bitwise_forward_local_unsupported",
-            "bitwise_unresolved_local_unsupported",
             "bitwise_char_unresolved_rhs_unsupported",
             "bitwise_generic_target_unsupported",
             "bitwise_deep_nested_call_unsupported",
@@ -76910,7 +76905,6 @@ property "shared"() {}
             "}\n",
             "pub fn nested(left: I32, right: I32, extra: I32) -> I32 {\n    let value = left & (right ^ extra)\n    value\n}\n",
             "pub fn computed(left: I32, right: I32) -> I32 {\n    let value = (left + right) & right\n    value\n}\n",
-            "pub fn unresolved(left: I32) -> I32 {\n    let bits = 1\n    let value = bits & left\n    value\n}\n",
             "pub fn alias(left: Word, right: Word) -> Word {\n    let value = left & right\n    value\n}\n",
             "pub fn nested_bit_not(left: I32) -> I32 {\n    let value = ~(~left)\n    value\n}\n",
             "pub fn shift_literal_pair() -> I32 {\n    let value = 1 << 2\n    value\n}\n",
@@ -76935,7 +76929,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 84);
+        assert_eq!(resolved.owners().len(), 83);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
@@ -77663,6 +77657,11 @@ property "shared"() {}
             "pub fn literal_var_bit_and_path(value: I32) -> I32 {\n    var x = 1\n    let y = x & value\n    y\n}\n",
             "pub fn literal_var_bit_or_literal() -> I32 {\n    var x = 1\n    let y = x | 4\n    y\n}\n",
             "pub fn literal_var_bit_xor_assign(value: I32) -> I32 {\n    var x = 0\n    x ^= value\n    x\n}\n",
+            "pub fn literal_var_rhs_arith(value: I32) -> I32 {\n    var x = 1\n    let y = value + x\n    y\n}\n",
+            "pub fn literal_var_rhs_rem(value: I32) -> I32 {\n    var x = 1\n    let y = value % x\n    y\n}\n",
+            "pub fn literal_var_rhs_wrap(value: I32) -> I32 {\n    var x = 1\n    let y = value +% x\n    y\n}\n",
+            "pub fn literal_var_rhs_bit(value: I32) -> I32 {\n    var x = 1\n    let y = value & x\n    y\n}\n",
+            "pub fn literal_var_rhs_float(value: I32) -> I32 {\n    var x = 0.5\n    let y = value + x\n    y\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77678,7 +77677,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 46);
+        assert_eq!(owners.len(), 51);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77758,7 +77757,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
-        for index in [23, 24, 28, 32, 33, 35, 42] {
+        for index in [23, 24, 28, 32, 33, 35, 42, 50] {
             assert!(
                 matches!(
                     owners[index]

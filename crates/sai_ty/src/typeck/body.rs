@@ -1179,6 +1179,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Ok(LocalType::Concrete(left_type));
         }
 
+        // `p + x` with a concretely typed left operand resolves an
+        // unresolved literal variable on the right to that type — the
+        // symmetric rule for the left-side literal-variable branch.
+        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                match primitive_arithmetic_result(operator, left_type, left_type) {
+                    PrimitiveArithmeticResult::Type(_) => {
+                        self.resolve_literal_variable(id, left_type)?;
+                        return Ok(LocalType::Concrete(left_type));
+                    }
+                    _ => return Err(()),
+                }
+            }
+        }
+
         let right_type = self
             .check_local_path(right)
             .ok()
@@ -1331,6 +1349,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             self.check_annotated_literal(left_type, literal, found, right.hir_id);
         } else {
+            // `p % x` resolves an unresolved integer literal variable on
+            // the right to the concrete left operand's type.
+            if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+                let Some(variable) = self.literal_variables.get(id) else {
+                    return Err(());
+                };
+                if variable.resolved.is_none() {
+                    if variable.kind != PrimitiveLiteralKind::Integer
+                        || !is_integer_primitive(left_type)
+                    {
+                        return Err(());
+                    }
+                    self.resolve_literal_variable(id, left_type)?;
+                }
+            }
             let right_type = self
                 .check_local_path(right)
                 .ok()
@@ -1482,6 +1515,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 right.hir_id,
             );
             return Ok(LocalType::Concrete(left_type));
+        }
+        // `p +% x` resolves an unresolved integer literal variable on the
+        // right to the concrete left operand's type.
+        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                if variable.kind != PrimitiveLiteralKind::Integer
+                    || !is_integer_primitive(left_type)
+                {
+                    return Err(());
+                }
+                self.resolve_literal_variable(id, left_type)?;
+            }
         }
         let right_type = self
             .check_local_path(right)
@@ -1955,6 +2003,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     return Ok(LocalType::Concrete(left_type));
                 }
                 _ => return Err(()),
+            }
+        }
+
+        // `p & x` resolves an unresolved integer literal variable on the
+        // right to the concrete left operand's type.
+        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                if variable.kind != PrimitiveLiteralKind::Integer
+                    || (!is_integer_primitive(left_type) && left_type != PrimTy::Byte)
+                {
+                    return Err(());
+                }
+                self.resolve_literal_variable(id, left_type)?;
             }
         }
 

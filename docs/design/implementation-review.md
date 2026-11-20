@@ -9511,3 +9511,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver suite (773) and CLI suite (385) pass; `cargo fmt --all -- --check` and `git diff --check` clean.
 - **Hostile review:** Passed. `primitive_bitwise_literal_left_result` rejects non-integer operands before resolution; resolved variables fall through to the concrete path unchanged.
 - **Remaining scope:** right-side literal variables (`p & x`, `p + x` style), shifts, lit-var × lit-var merges, and the earlier remaining lists.
+
+### IR-1034 (2026-11-20): Right-side literal-variable operands
+
+- **Decision:** Admit `p op x` where `p` checks to a concrete primitive and `x` is an unresolved literal variable — for `+ - * /` (resolve to the left type when the pair is defined), `%` and `+% -% *%` (integer variables and integer left types only), and `& | ^` (integer variables, integer/Byte left types). Comparisons were already symmetric through IR-1031's loop.
+- **Reason:** §6.12 — operand typing is left-directed for these families, so the concrete left operand pins the literal variable exactly as a left-side variable is pinned by a concrete right operand.
+- **Failure boundary and judgment:** Literal-variable × literal-variable pairs (`x + y`), literal-left × literal-variable right (`1 +% x` in wrapping, which keeps the literal's left-directed typing), shift counts, and `x op= y` stay gated.
+- **Review required:** None beyond IR-1026's flag.
+- **Planned verification matrix:** Driver owners `literal_var_rhs_arith`/`literal_var_rhs_rem`/`literal_var_rhs_wrap`/`literal_var_rhs_bit` (supported) and `literal_var_rhs_float` (gated); gated fixtures `unresolved` (bitwise file), `bitwise_unresolved_integer_literal_left_unsupported`, `bitwise_literal_rhs_unresolved_path_unsupported`, `bitwise_unresolved_integer_literal_path_unsupported`, `remainder_path_pair_unresolved_numeric_right_unsupported`, `bitwise_unresolved_local_unsupported` reclassified; CLI rows moved.
+- **Verification:** Pinned Rust 1.99.1, driver suite (773) and CLI suite (385) pass; `cargo fmt --all -- --check` and `git diff --check` clean.
+- **Hostile review:** Passed. Each family verifies the operator for the concrete (T,T) pair (or `is_integer_primitive`/`primitive_bitwise_literal_left_result`) before resolving; family mismatches return Err without recording a site.
+- **Remaining scope:** `x op= y`, literal-left × literal-variable right forms, shifts, lit-var × lit-var merges, and the earlier remaining lists.
