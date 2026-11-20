@@ -10645,7 +10645,6 @@ fn unsupported_zero_parameter_function_shapes_remain_gated() {
     for source in [
         "pub fn answer() { 42 }\n",
         "pub fn answer() -> Byte { b\"text\" }\n",
-        "pub fn answer() -> I32 { 40 + 2 }\n",
         "pub fn answer() -> I32 { let value = 42; value }\n",
         "pub fn answer() -> () { 42 }\n",
         "pub fn answer() -> () { let value = (); }\n",
@@ -10902,7 +10901,6 @@ fn target_filtered_public_name_does_not_report_a_name_error() {
 #[test]
 fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     for source in [
-        "pub fn add(value: I32) -> I32 { value + 1 }\n",
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
         "pub fn local() -> I32 {\nvar value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",

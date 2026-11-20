@@ -52355,6 +52355,7 @@ property "shared"() {}
         let root = concat!(
             "pub fn add_parameters(first: I32, second: I32) -> I32 { first + second }\n",
             "pub fn sub_parameter_literal(value: I32) -> I32 { value - 1 }\n",
+            "pub fn add_literals() -> I32 { 40 + 2 }\n",
             "pub fn mul_annotated_locals() -> I16 {\n",
             "    let left: I16 = 7\n",
             "    let right: I16 = 3\n",
@@ -52470,6 +52471,7 @@ property "shared"() {}
         for (name, expected_type) in [
             ("add_parameters", PrimTy::I32),
             ("sub_parameter_literal", PrimTy::I32),
+            ("add_literals", PrimTy::I32),
             ("mul_annotated_locals", PrimTy::I16),
             ("rem_locals", PrimTy::U8),
             ("wrap_add", PrimTy::U8),
