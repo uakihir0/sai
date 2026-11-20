@@ -2919,19 +2919,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }),
                 LoopBreakState::Unfixed => {
                     let local_type = self.check_break_value(value)?;
-                    self.loop_stack[index].break_state = match local_type {
-                        LocalType::Concrete(found) => LoopBreakState::Concrete(found),
-                        LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
-                            // A break value may carry an already-resolved
-                            // literal variable (`break 1 + n` where `n` has
-                            // a concrete type) — `β` is fixed, not fresh.
-                            match self.literal_variable_group_type(id) {
-                                Some(found) => LoopBreakState::Concrete(found),
-                                None => LoopBreakState::LiteralVariable(id),
-                            }
-                        }
-                        LocalType::Error(_) => LoopBreakState::Unfixed,
-                    };
+                    self.record_break_value_type(index, value, local_type)?;
                 }
                 LoopBreakState::Concrete(expected) => {
                     self.check_expr_expected(value, expected)?;
@@ -2946,63 +2934,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         return Ok(());
                     }
                     let local_type = self.check_break_value(value)?;
-                    match local_type {
-                        // A concrete break value fixes `β` — later literal
-                        // breaks keep flowing through it.
-                        LocalType::Concrete(found) => {
-                            let Some(kind) =
-                                self.literal_variables.get(id).map(|variable| variable.kind)
-                            else {
-                                return Err(());
-                            };
-                            if literal_family_accepts(kind, found) {
-                                self.resolve_literal_variable(id, found)?;
-                                self.loop_stack[index].break_state =
-                                    LoopBreakState::Concrete(found);
-                            } else {
-                                // `break 1` then `break true`: the value
-                                // cannot join `β`'s literal family — the
-                                // diagnostic names `β`'s default.
-                                self.errors.push(PrimitiveBodyError {
-                                    node: value.hir_id,
-                                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                                        expected: literal_variable_default_type(kind),
-                                        found: concrete_literal_family(found),
-                                    },
-                                });
-                            }
-                        }
-                        // Another literal break value joins `β`'s group so
-                        // all of them resolve to the same eventual type.
-                        LocalType::LiteralVariable(other) => {
-                            let (Some(kind), Some(other_kind)) = (
-                                self.literal_variables.get(id).map(|variable| variable.kind),
-                                self.literal_variables
-                                    .get(other)
-                                    .map(|variable| variable.kind),
-                            ) else {
-                                return Err(());
-                            };
-                            if self.literal_variable_group_root(id)
-                                == self.literal_variable_group_root(other)
-                            {
-                                // The same variable (or merge group) breaks
-                                // twice — `β` and the value already share a
-                                // group, nothing to join.
-                            } else if kind == other_kind {
-                                self.merge_literal_variables(id, other)?;
-                            } else {
-                                self.errors.push(PrimitiveBodyError {
-                                    node: value.hir_id,
-                                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                                        expected: literal_variable_default_type(kind),
-                                        found: other_kind,
-                                    },
-                                });
-                            }
-                        }
-                        _ => return Err(()),
-                    }
+                    self.record_break_value_type(index, value, local_type)?;
                 }
             }
             return Ok(());
@@ -3020,6 +2952,139 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     kind: PrimitiveBodyErrorKind::InvalidBreakValue,
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Records a checked `break` value against the frame's `β`. The
+    /// state is re-read rather than assumed to match the one the `break`
+    /// entered with: checking `value` can itself resolve `β` when the
+    /// value is a nested `loop` containing a labeled `break` into this
+    /// very frame (`break 'l loop { break 'l true, break 1 }`).
+    fn record_break_value_type(
+        &mut self,
+        index: usize,
+        value: &'hir Expr<'hir>,
+        local_type: LocalType,
+    ) -> Result<(), ()> {
+        match self.loop_stack[index].break_state {
+            LoopBreakState::Unfixed => {
+                self.loop_stack[index].break_state = match local_type {
+                    LocalType::Concrete(found) => LoopBreakState::Concrete(found),
+                    LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                        // A break value may carry an already-resolved
+                        // literal variable (`break 1 + n` where `n` has
+                        // a concrete type) — `β` is fixed, not fresh.
+                        match self.literal_variable_group_type(id) {
+                            Some(found) => LoopBreakState::Concrete(found),
+                            None => LoopBreakState::LiteralVariable(id),
+                        }
+                    }
+                    LocalType::Error(_) => LoopBreakState::Unfixed,
+                };
+            }
+            // A bare `break` inside `value` unified `β` with `()` — this
+            // valued `break` can no longer apply.
+            LoopBreakState::Bare => self.errors.push(PrimitiveBodyError {
+                node: value.hir_id,
+                kind: PrimitiveBodyErrorKind::InvalidBreakValue,
+            }),
+            LoopBreakState::Concrete(expected) => match local_type {
+                LocalType::Concrete(found) => {
+                    if found != expected {
+                        self.errors.push(PrimitiveBodyError {
+                            node: value.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                        });
+                    }
+                }
+                LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                    match self.literal_variable_group_type(id) {
+                        Some(found) => {
+                            if found != expected {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: value.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                                });
+                            }
+                        }
+                        None => {
+                            let Some(kind) =
+                                self.literal_variables.get(id).map(|variable| variable.kind)
+                            else {
+                                return Err(());
+                            };
+                            if literal_family_accepts(kind, expected) {
+                                self.resolve_literal_variable(id, expected)?;
+                            } else {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: value.hir_id,
+                                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                        expected: literal_variable_default_type(kind),
+                                        found: concrete_literal_family(expected),
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                LocalType::Error(_) => {}
+            },
+            LoopBreakState::LiteralVariable(id) => match local_type {
+                // A concrete break value fixes `β` — later literal
+                // breaks keep flowing through it.
+                LocalType::Concrete(found) => {
+                    let Some(kind) = self.literal_variables.get(id).map(|variable| variable.kind)
+                    else {
+                        return Err(());
+                    };
+                    if literal_family_accepts(kind, found) {
+                        self.resolve_literal_variable(id, found)?;
+                        self.loop_stack[index].break_state = LoopBreakState::Concrete(found);
+                    } else {
+                        // `break 1` then `break true`: the value
+                        // cannot join `β`'s literal family — the
+                        // diagnostic names `β`'s default.
+                        self.errors.push(PrimitiveBodyError {
+                            node: value.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                expected: literal_variable_default_type(kind),
+                                found: concrete_literal_family(found),
+                            },
+                        });
+                    }
+                }
+                // Another literal break value joins `β`'s group so
+                // all of them resolve to the same eventual type.
+                LocalType::LiteralVariable(other) => {
+                    let (Some(kind), Some(other_kind)) = (
+                        self.literal_variables.get(id).map(|variable| variable.kind),
+                        self.literal_variables
+                            .get(other)
+                            .map(|variable| variable.kind),
+                    ) else {
+                        return Err(());
+                    };
+                    if self.literal_variable_group_root(id)
+                        == self.literal_variable_group_root(other)
+                    {
+                        // The same variable (or merge group) breaks
+                        // twice — `β` and the value already share a
+                        // group, nothing to join.
+                    } else if kind == other_kind {
+                        self.merge_literal_variables(id, other)?;
+                    } else {
+                        self.errors.push(PrimitiveBodyError {
+                            node: value.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                expected: literal_variable_default_type(kind),
+                                found: other_kind,
+                            },
+                        });
+                    }
+                }
+                _ => return Err(()),
+            },
         }
         Ok(())
     }

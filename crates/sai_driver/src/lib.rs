@@ -78390,6 +78390,9 @@ property "shared"() {}
             "pub fn break_value_loop_init() -> I64 {\n    let x = loop { break loop { break 1 } }\n    x\n}\n",
             "pub fn break_value_while_inner(flag: Bool) -> I32 {\n    loop { break while flag { } }\n}\n",
             "pub fn break_value_loop_bare() -> I32 {\n    loop { break loop { break } }\n}\n",
+            "pub fn break_label_inner_same() -> Bool {\n    'a: loop { break 'a loop { break true } }\n}\n",
+            "pub fn break_label_inner_mismatch() -> Bool {\n    'a: loop { break 'a loop { break 'a true\n break 1 } }\n}\n",
+            "pub fn break_label_inner_bare() -> I32 {\n    'a: loop { break 'a loop { break 'a\n break 1 } }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78405,11 +78408,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 49);
+        assert_eq!(owners.len(), 52);
 
         for index in [
             0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35,
-            36, 37, 39, 40, 41, 42, 43, 45, 46,
+            36, 37, 39, 40, 41, 42, 43, 45, 46, 49,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78431,6 +78434,8 @@ property "shared"() {}
             (21, sai_diagnostics::Code::InvalidBreakValue),
             (22, sai_diagnostics::Code::InvalidBreakValue),
             (48, sai_diagnostics::Code::InvalidBreakValue),
+            (50, sai_diagnostics::Code::TypeMismatch),
+            (51, sai_diagnostics::Code::InvalidBreakValue),
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78478,6 +78483,8 @@ property "shared"() {}
             "pub fn return_tail_unbound() -> I32 {\n    return missing\n}\n",
             "pub fn return_tail_let_mismatch(flag: Bool) -> I32 {\n    let x: Bool = if flag { return true } else { false }\n    0\n}\n",
             "pub fn return_tail_let(flag: Bool) -> I32 {\n    let x: Bool = if flag { return 1 } else { false }\n    0\n}\n",
+            "pub fn return_if_value(flag: Bool) -> I32 {\n    return if flag { 1 } else { 2 }\n}\n",
+            "pub fn return_match_value(value: I32) -> I32 {\n    return match value { 1 => 7, _ => 0 }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78493,9 +78500,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 23);
+        assert_eq!(owners.len(), 25);
 
-        for index in [0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13, 15, 16, 18, 19, 22] {
+        for index in [
+            0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13, 15, 16, 18, 19, 22, 23, 24,
+        ] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a return statement is checked");
