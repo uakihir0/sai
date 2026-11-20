@@ -3677,6 +3677,143 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// (decisions.md:489). Checking `place op e` against the place type is
     /// equivalent: `t` is a fresh binding whose literal variable resolves
     /// through the operation exactly as `e` does inside `place op e`.
+    // `x = x op t` once the desugared `let t = e` binding's type is
+    // known: arithmetic and bitwise operands must equal the place type,
+    // a shift count must be `U32`, logical operands `Bool`; an
+    // unresolved literal-variable right side resolves to the demanded
+    // type.
+    fn check_assign_op_rhs_local_type(
+        &mut self,
+        stmt_id: HirId,
+        op: BinOp,
+        place: PrimTy,
+        rhs: &'hir Expr<'hir>,
+        rhs_local: LocalType,
+    ) -> Result<(), ()> {
+        let demanded = match op {
+            BinOp::Shl | BinOp::Shr => PrimTy::U32,
+            BinOp::And | BinOp::Or => PrimTy::Bool,
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::WrapAdd
+            | BinOp::WrapSub
+            | BinOp::WrapMul
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor => place,
+            _ => return Err(()),
+        };
+        let right_type = match self.concrete_local_type(rhs_local) {
+            Some(primitive) => primitive,
+            None => {
+                let LocalType::LiteralVariable(other) = rhs_local else {
+                    return Err(());
+                };
+                let joinable = self.literal_variables.get(other).is_some_and(|variable| {
+                    variable.resolved.is_none()
+                        && match op {
+                            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => matches!(
+                                variable.kind,
+                                PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                            ),
+                            BinOp::And | BinOp::Or => variable.kind == PrimitiveLiteralKind::Bool,
+                            _ => variable.kind == PrimitiveLiteralKind::Integer,
+                        }
+                });
+                if !joinable {
+                    return Err(());
+                }
+                self.resolve_literal_variable(other, demanded)?;
+                demanded
+            }
+        };
+        match op {
+            BinOp::Shl | BinOp::Shr => {
+                if right_type != demanded {
+                    self.errors.push(PrimitiveBodyError {
+                        node: rhs.hir_id,
+                        kind: PrimitiveBodyErrorKind::TypeMismatch {
+                            expected: demanded,
+                            found: right_type,
+                        },
+                    });
+                }
+                if is_integer_primitive(place) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            BinOp::And | BinOp::Or => {
+                if right_type != PrimTy::Bool {
+                    self.errors.push(PrimitiveBodyError {
+                        node: rhs.hir_id,
+                        kind: PrimitiveBodyErrorKind::TypeMismatch {
+                            expected: PrimTy::Bool,
+                            found: right_type,
+                        },
+                    });
+                }
+                if place == PrimTy::Bool {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            _ => {
+                if right_type != place {
+                    self.errors.push(PrimitiveBodyError {
+                        node: rhs.hir_id,
+                        kind: PrimitiveBodyErrorKind::TypeMismatch {
+                            expected: place,
+                            found: right_type,
+                        },
+                    });
+                    return Ok(());
+                }
+                match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        match primitive_arithmetic_result(op, place, right_type) {
+                            PrimitiveArithmeticResult::Type(result) => {
+                                if result == place {
+                                    Ok(())
+                                } else {
+                                    self.errors.push(PrimitiveBodyError {
+                                        node: stmt_id,
+                                        kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                            expected: place,
+                                            found: result,
+                                        },
+                                    });
+                                    Ok(())
+                                }
+                            }
+                            _ => Err(()),
+                        }
+                    }
+                    BinOp::Rem => {
+                        if is_integer_primitive(place) {
+                            Ok(())
+                        } else {
+                            self.report_unsupported_float_remainder(stmt_id, place);
+                            Ok(())
+                        }
+                    }
+                    _ => {
+                        if is_integer_primitive(place) {
+                            Ok(())
+                        } else {
+                            Err(())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn check_assign_op_stmt(
         &mut self,
         stmt_id: HirId,
@@ -3769,16 +3906,36 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Err(());
             }
             if !matches!(rhs.kind, ExprKind::Lit(_)) {
-                // `x op= path` with a concretely typed right operand
-                // resolves the variable to the operand's type when the
-                // family admits it and the operator exists for that type
-                // pair — the `x = x op path` desugar does the same. With an
+                // `x op= e` with a concretely typed right operand resolves
+                // the variable to the operand's type when the family
+                // admits it and the operator exists for that type pair —
+                // the `x = x op e` desugar does the same. With an
                 // unresolved literal-variable right side the two variables
-                // merge instead, like `x op y` in an initializer.
-                let right_type = self
-                    .check_local_path(rhs)
-                    .ok()
-                    .and_then(|local_type| self.concrete_local_type(local_type));
+                // merge instead, like `x op y` in an initializer. Non-path
+                // right sides evaluate as the desugared `let t = e`
+                // binding's initializer.
+                let rhs_local = self.check_local_path(rhs).ok().or_else(|| {
+                    self.check_initializer_value(rhs, None)
+                        .ok()
+                        .map(|check| check.local_type)
+                });
+                let right_type = rhs_local
+                    .as_ref()
+                    .and_then(|local_type| self.concrete_local_type(*local_type));
+                // A right side mentioning `x` — `x += x + value` — can
+                // resolve the place's variable while it evaluates; the
+                // desugared `let t = e` then leaves `x = x op t` on a
+                // concrete place.
+                if let Some(place) = self.concrete_local_type(LocalType::LiteralVariable(id)) {
+                    let Some(rhs_local) = rhs_local else {
+                        return Err(());
+                    };
+                    self.check_assign_op_rhs_local_type(stmt_id, op, place, rhs, rhs_local)?;
+                    self.record_expression_type(rhs.hir_id, rhs_local);
+                    self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+                    self.record_expression_type(stmt_id, LocalType::Concrete(place));
+                    return Ok(());
+                }
                 if right_type.is_none() {
                     // The merged pair resolves without an operator check,
                     // so the place's kind must admit the operator for every
@@ -3796,8 +3953,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                                 _ => variable.kind == PrimitiveLiteralKind::Integer,
                             });
                     if kind_eligible
-                        && let Some(LocalType::LiteralVariable(other)) =
-                            self.check_local_path(rhs).ok()
+                        && let Some(LocalType::LiteralVariable(other)) = rhs_local
                         && self
                             .literal_variables
                             .get(other)
@@ -3882,6 +4038,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.record_expression_type(stmt_id, LocalType::LiteralVariable(id));
             return Ok(());
         };
+        if !matches!(rhs.kind, ExprKind::Lit(_) | ExprKind::Path(_)) {
+            // `x op= e` desugars to `{ let t = e; x = x op t }`: the
+            // operand checkers only accept operand shapes, so the
+            // binding type is checked directly.
+            let rhs_local = self.check_initializer_value(rhs, None)?.local_type;
+            self.check_assign_op_rhs_local_type(stmt_id, op, place_type, rhs, rhs_local)?;
+            self.record_expression_type(rhs.hir_id, rhs_local);
+            self.record_expression_type(lhs.hir_id, LocalType::Concrete(place_type));
+            self.record_expression_type(stmt_id, LocalType::Concrete(place_type));
+            return Ok(());
+        }
         let result = match op {
             BinOp::Add
             | BinOp::Sub

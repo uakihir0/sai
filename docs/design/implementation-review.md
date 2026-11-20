@@ -9668,3 +9668,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, assign owner test passes; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Pending — see PR.
 - **Remaining scope:** `x op= <non-literal non-path>` (needs the desugared `let t = e` form), `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1048 (2026-11-21): `x op= e` on literal-variable targets accepts non-literal non-path right sides
+
+- **Decision:** `x op= e` where `x` is an unannotated-literal `var` and `e` is a supported initializer shape (binary operands such as `a + 2`, `2 + 3`, `y * 3.0`) evaluates `e` as the desugared `let t = e` binding's initializer — a literal-variable result merges into `x`'s group (with the operator's kind eligibility checked up front), a `Concrete` result resolves `x` through the same per-operator table as the path operand.
+- **Reason:** §6.13.1 desugars `place op= e` to `{ let t = e; place = place op t }`; evaluating `e` through `check_initializer_value` and feeding the resulting `LocalType` into the path-operand logic is exactly that desugar.
+- **Failure boundary and judgment:** Right sides the initializer slice does not support (calls, field projections, unsupported operand mixes — e.g. `2.0 * 3.0` bare float-literal binary, which gates the same way in `let` position) still gate. Shift counts keep the literal/path boundary (`x <<= a + b` gates) — shift right operands are `U32` counts, not desugared bindings.
+- **Review required:** None — `check_initializer_value`, `merge_literal_variables` and the concrete-operand resolve table are reused verbatim.
+- **Planned verification matrix:** Driver owners `literal_var_assign_op_binary`, `literal_var_assign_op_binary_path`, `literal_var_assign_op_float_binary` (supported). Driver admission widens the AssignOp right side from literal/path to `primitive_value_expression_shape_is_supported`.
+- **Verification:** Pinned Rust 1.99.1, assign owner test passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Pending — see PR.
+- **Remaining scope:** `x <<= <non-literal non-path>` shift counts, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
