@@ -5181,8 +5181,11 @@ fn literal_range_is_empty<'hir>(
     // Compare sign-aware without materializing an `i128`: a negated bound
     // sorts before any non-negated bound, and among negated bounds the
     // larger magnitude is the smaller value. A `u128` magnitude can exceed
-    // `i128::MAX` (`-2^127`), so `-(value as i128)` would overflow.
-    let ordering = match (*start_negated, *end_negated) {
+    // `i128::MAX` (`-2^127`), so `-(value as i128)` would overflow. `-0`
+    // equals `0`, so a zero magnitude is never treated as negated.
+    let start_negated = *start_negated && *start_value != 0;
+    let end_negated = *end_negated && *end_value != 0;
+    let ordering = match (start_negated, end_negated) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         (true, true) => end_value.cmp(start_value),
