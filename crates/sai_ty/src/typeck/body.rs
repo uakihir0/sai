@@ -178,6 +178,7 @@ pub enum PrimitiveBodyErrorKind {
     },
     AssignToImmutable,
     InvalidAssignTarget,
+    EmptyRangePattern,
 }
 
 /// An operand description for an unsupported primitive operator diagnostic.
@@ -2919,12 +2920,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // non-literal bounds stay gated. Diagnosing at the arm
             // pattern's node keeps the taint walk keyed on
             // `arm.pat.hir_id` correct.
-            PatKind::Range { start, end, .. } => {
+            PatKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
                 for bound in [start, end] {
                     let Some(PatRangeEnd::Lit(literal)) = bound else {
                         return Err(());
                     };
                     self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?;
+                }
+                // §6.21.3: `a ≤ b` for `..=`, `a < b` for `..` — an empty
+                // range is `EMPTY_RANGE_PATTERN`.
+                if literal_range_is_empty(&start, &end, inclusive) == Some(true) {
+                    self.errors.push(PrimitiveBodyError {
+                        node: arm.pat.hir_id,
+                        kind: PrimitiveBodyErrorKind::EmptyRangePattern,
+                    });
                 }
             }
             PatKind::Wild => *catch_all = true,
@@ -5095,6 +5108,66 @@ fn can_track_unannotated_integer_remainder_pair_alias(
     source_has_integer_remainder_pair_provenance
         && initializer_is_plain_path
         && !alias_has_annotation
+}
+
+/// `Some(is_empty)` when both literal bounds are comparable same-kind
+/// literals; `None` leaves non-comparable bound pairs to the per-literal
+/// type checks that already ran.
+fn literal_range_is_empty<'hir>(
+    start: &Option<PatRangeEnd<'hir>>,
+    end: &Option<PatRangeEnd<'hir>>,
+    inclusive: bool,
+) -> Option<bool> {
+    let (Some(start_bound), Some(end_bound)) = (start, end) else {
+        return None;
+    };
+    let (
+        PatRangeEnd::Lit(Lit::Int {
+            value: Some(start_value),
+            negated: start_negated,
+        }),
+        PatRangeEnd::Lit(Lit::Int {
+            value: Some(end_value),
+            negated: end_negated,
+        }),
+    ) = (start_bound, end_bound)
+    else {
+        let (PatRangeEnd::Lit(start_literal), PatRangeEnd::Lit(end_literal)) =
+            (start_bound, end_bound)
+        else {
+            return None;
+        };
+        let (start_value, end_value) = match (start_literal, end_literal) {
+            (Lit::Char(start_value), Lit::Char(end_value)) => {
+                (*start_value as u128, *end_value as u128)
+            }
+            (Lit::Byte(start_value), Lit::Byte(end_value)) => {
+                (*start_value as u128, *end_value as u128)
+            }
+            _ => return None,
+        };
+        return Some(if inclusive {
+            start_value > end_value
+        } else {
+            start_value >= end_value
+        });
+    };
+    let signed = |value: u128, negated: bool| -> i128 {
+        if negated {
+            -(value as i128)
+        } else {
+            value as i128
+        }
+    };
+    let (start_value, end_value) = (
+        signed(*start_value, *start_negated),
+        signed(*end_value, *end_negated),
+    );
+    Some(if inclusive {
+        start_value > end_value
+    } else {
+        start_value >= end_value
+    })
 }
 
 fn primitive_comparison_result(

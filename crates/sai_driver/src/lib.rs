@@ -10249,6 +10249,15 @@ fn primitive_body_errors_to_diagnostics(
                     "literal out of range",
                 )?
             }
+            PrimitiveBodyErrorKind::EmptyRangePattern => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::EmptyRangePattern,
+                "range pattern matches no value".to_owned(),
+                "empty range",
+            )?,
             PrimitiveBodyErrorKind::TypeMismatch { expected, found } => const_literal_diagnostic(
                 owner.id,
                 inputs,

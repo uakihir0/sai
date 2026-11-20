@@ -10210,6 +10210,22 @@ fn unsupported_match_tail_shapes_remain_gated() {
 }
 
 #[test]
+fn empty_range_pattern_reaches_cli_diagnostics() {
+    let source = "pub fn choose(value: I32) -> I32 { match value { 5..=1 => 1, _ => 0 } }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an empty range pattern must fail the check:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"EMPTY_RANGE_PATTERN\""),
+        "EMPTY_RANGE_PATTERN must reach CLI diagnostics:\n{stdout}"
+    );
+}
+
+#[test]
 fn public_bool_parameter_not_if_function_emits_check_result() {
     for source in [
         "pub fn choose(flag: Bool) -> I32 { if not flag { 1 } else { 2 } }\n",
