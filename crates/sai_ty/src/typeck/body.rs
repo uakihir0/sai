@@ -536,6 +536,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_stmt(&mut self, stmt: &Stmt<'hir>) -> Result<(), ()> {
+        if let StmtKind::Expr(expression) = stmt.kind {
+            return self.check_expr_stmt(expression);
+        }
         let StmtKind::Let {
             pat,
             ty,
@@ -2368,7 +2371,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(())
     }
 
-    fn check_expr(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
+    fn check_expr_stmt(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
+        // Statement-position `if`/`block` expressions unify their branch
+        // tails with the return type, which does not apply to a discarded
+        // result, so they stay outside this slice.
+        if matches!(expression.kind, ExprKind::If { .. } | ExprKind::Block(_)) {
+            return Err(());
+        }
+        let local_type = self.check_expr_value(expression)?;
+        self.record_expression_type(expression.hir_id, local_type);
+        Ok(())
+    }
+
+    fn check_expr_value(&mut self, expression: &Expr<'hir>) -> Result<LocalType, ()> {
         let local_type = if self.expression_has_unknown_field_error(expression) {
             if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. }) {
                 return Err(());
@@ -2440,6 +2455,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 _ => self.check_local_path(expression)?,
             }
         };
+        Ok(local_type)
+    }
+
+    fn check_expr(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
+        let local_type = self.check_expr_value(expression)?;
         match local_type {
             LocalType::Error(found) => {
                 if let Some(found) = found {
@@ -4086,9 +4106,11 @@ fn collect_primitive_block_nodes<'hir>(
     nodes: &mut HashMap<HirId, Expr<'hir>>,
 ) {
     for stmt in block.stmts {
-        if let StmtKind::Let { init, .. } = stmt.kind {
-            collect_primitive_expression_nodes(init, nodes);
-        }
+        let init = match stmt.kind {
+            StmtKind::Let { init, .. } | StmtKind::Expr(init) => init,
+            _ => continue,
+        };
+        collect_primitive_expression_nodes(init, nodes);
     }
     if let Some(tail) = block.tail {
         collect_primitive_expression_nodes(tail, nodes);
@@ -4203,7 +4225,7 @@ fn block_has_primitive_result_taint(
     tainted_bindings: &HashSet<BindingId>,
 ) -> bool {
     block.stmts.iter().any(|stmt| match stmt.kind {
-        StmtKind::Let { init, .. } => expression_has_primitive_result_taint(
+        StmtKind::Let { init, .. } | StmtKind::Expr(init) => expression_has_primitive_result_taint(
             init,
             error_nodes,
             unknown_self_fields,

@@ -8945,6 +8945,26 @@ fn primitive_let_statement_shape_is_supported(
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
+    if let StmtKind::Expr(expression) = stmt.kind {
+        // Statement-position `if`/`block` expressions unify their branch
+        // tails with the return type, which does not apply to a discarded
+        // result, so they stay outside this slice.
+        if matches!(expression.kind, ExprKind::If { .. } | ExprKind::Block(_)) {
+            return false;
+        }
+        return primitive_if_branch_tail_shape_is_supported(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        );
+    }
     let StmtKind::Let {
         pat,
         ty,
@@ -9758,7 +9778,9 @@ fn primitive_body_errors_to_diagnostics(
                 .stmts
                 .iter()
                 .find_map(|stmt| match stmt.kind {
-                    StmtKind::Let { init, .. } => primitive_body_error_span(init, error.node),
+                    StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
+                        primitive_body_error_span(init, error.node)
+                    }
                     _ => None,
                 })
                 .or_else(|| primitive_body_error_span(tail, error.node)),
@@ -10004,7 +10026,9 @@ fn primitive_body_block_error_span(
         .stmts
         .iter()
         .find_map(|stmt| match stmt.kind {
-            StmtKind::Let { init, .. } => primitive_body_error_span(init, node),
+            StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
+                primitive_body_error_span(init, node)
+            }
             _ => None,
         })
         .or_else(|| {
@@ -10472,9 +10496,11 @@ fn direct_primitive_call_sites(
         }
     };
     for statement in block.stmts {
-        if let StmtKind::Let { init, .. } = statement.kind
-            && matches!(init.kind, ExprKind::Call { .. })
-        {
+        let init = match statement.kind {
+            StmtKind::Let { init, .. } | StmtKind::Expr(init) => init,
+            _ => continue,
+        };
+        if matches!(init.kind, ExprKind::Call { .. }) {
             index_root_and_one_level_arguments(init);
         }
     }
@@ -53114,7 +53140,7 @@ property "shared"() {}
             "        negated\n",
             "    }\n",
             "}\n",
-            "pub fn unsupported_branch_statement(value: I32) -> I32 {\n",
+            "pub fn discarded_branch_statement(value: I32) -> I32 {\n",
             "    if value < 0 {\n",
             "        let negated = -value\n",
             "        value\n",
@@ -53122,6 +53148,23 @@ property "shared"() {}
             "    } else {\n",
             "        value\n",
             "    }\n",
+            "}\n",
+            "pub fn discarded_expression_statements(flag: Bool, other: Bool, value: I32) -> I32 {\n",
+            "    flag and other\n",
+            "    value + 1\n",
+            "    value\n",
+            "}\n",
+            "pub fn discarded_expression_mismatch(value: I32) -> I32 {\n",
+            "    not value\n",
+            "    value\n",
+            "}\n",
+            "pub fn if_expression_statement(flag: Bool, value: I32) -> I32 {\n",
+            "    if flag {\n",
+            "        1\n",
+            "    } else {\n",
+            "        0\n",
+            "    }\n",
+            "    value\n",
             "}\n",
             "pub fn late_resolved_outer_local(flag: Bool) -> U16 {\n",
             "    let chosen = 7\n",
@@ -53231,6 +53274,8 @@ property "shared"() {}
             "late_resolved_outer_local",
             "negated_comparison",
             "negated_conjunction",
+            "discarded_branch_statement",
+            "discarded_expression_statements",
         ] {
             let owner = owner_named(&database, &resolved, name);
             let FunctionBodyTypeCheck::Supported { diagnostics } = owner
@@ -53318,7 +53363,11 @@ property "shared"() {}
             "the branch-local annotation and the Bool-typed branch tail both mismatch"
         );
 
-        for name in ["negated_mismatch", "flat_negated_expression"] {
+        for name in [
+            "negated_mismatch",
+            "flat_negated_expression",
+            "discarded_expression_mismatch",
+        ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
                 matches!(
@@ -53335,7 +53384,7 @@ property "shared"() {}
         for name in [
             "no_else",
             "sibling_scope_leak",
-            "unsupported_branch_statement",
+            "if_expression_statement",
             "literal_condition",
             "nested_branch_tail",
             "double_negation",
@@ -76146,7 +76195,6 @@ property "shared"() {}
             "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value\n}\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
             "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second: I32 = 2\n    first\n}\n",
-            "pub fn multiple_expr_stmt() -> I32 {\n    let first: I32 = 1\n    first\n    first\n}\n",
             "pub fn raw_copy() -> I32 {\n    let value: I32 = 42\n    let copy: I32 = r#value\n    copy\n}\n",
             "pub fn forward_copy() -> I32 {\n    let first: I32 = second\n    let second: I32 = 2\n    first\n}\n",
             "pub fn self_copy() -> I32 {\n    let value: I32 = value\n    value\n}\n",
@@ -76177,7 +76225,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 19);
+        assert_eq!(resolved.owners().len(), 18);
         for owner in resolved.owners() {
             assert!(matches!(
                 owner
