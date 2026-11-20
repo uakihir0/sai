@@ -3054,28 +3054,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         bool_cover: &mut (bool, bool),
         arm_binding: &mut Option<(BindingId, Option<LocalType>)>,
     ) -> Result<(), ()> {
-        // Guards admit only the plain-`binding` catch-all arm — the guard
-        // runs with the binding installed. Guards on literal, or or range
-        // patterns stay gated.
-        if arm.guard.is_some()
-            && !matches!(
-                arm.pat.kind,
-                PatKind::Binding {
-                    mode: BindingMode::Value,
-                    sub: None,
-                    ..
-                }
-            )
-        {
-            return Err(());
-        }
         match arm.pat.kind {
             PatKind::Lit(literal) => {
-                if let Lit::Bool(value) = literal {
-                    if value {
-                        bool_cover.0 = true;
-                    } else {
-                        bool_cover.1 = true;
+                // A guarded arm cannot fail its pattern but its guard may,
+                // so it does not count toward Bool-domain coverage.
+                if arm.guard.is_none() {
+                    if let Lit::Bool(value) = literal {
+                        if value {
+                            bool_cover.0 = true;
+                        } else {
+                            bool_cover.1 = true;
+                        }
                     }
                 }
                 self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?
@@ -3092,11 +3081,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let PatKind::Lit(literal) = alternative.kind else {
                         return Err(());
                     };
-                    if let Lit::Bool(value) = literal {
-                        if value {
-                            bool_cover.0 = true;
-                        } else {
-                            bool_cover.1 = true;
+                    if arm.guard.is_none() {
+                        if let Lit::Bool(value) = literal {
+                            if value {
+                                bool_cover.0 = true;
+                            } else {
+                                bool_cover.1 = true;
+                            }
                         }
                     }
                     self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?;

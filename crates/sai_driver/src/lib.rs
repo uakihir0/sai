@@ -9864,12 +9864,10 @@ fn primitive_match_tail_shape_is_supported(
             }
             _ => return false,
         }
-        // Guards admit the plain-`binding` catch-all arm only; the guard's
-        // condition sees the arm's binding, matching the checker's rule.
+        // The guard's condition sees the arm's binding when the pattern
+        // binds one, and the enclosing bindings otherwise.
         if let Some(guard) = arm.guard {
-            let Some(bindings) = arm_bindings.as_ref() else {
-                return false;
-            };
+            let bindings = arm_bindings.as_ref().unwrap_or(preceding_bindings);
             if !primitive_if_condition_shape_is_supported(guard, bindings, locals, inputs) {
                 return false;
             }
@@ -10073,9 +10071,7 @@ fn primitive_match_stmt_shape_is_supported(
                 _ => return false,
             }
             if let Some(guard) = arm.guard {
-                let Some(bindings) = arm_bindings.as_ref() else {
-                    return false;
-                };
+                let bindings = arm_bindings.as_ref().unwrap_or(preceding_bindings);
                 if !primitive_if_condition_shape_is_supported(guard, bindings, locals, inputs) {
                     return false;
                 }
@@ -77880,6 +77876,7 @@ property "shared"() {}
             "pub fn stmt_match(value: I32) -> I32 {\n    var x: I32 = 0\n    match value { 0 => { x = 1 }, _ => {} }\n    x\n}\n",
             "pub fn stmt_if_value_tail(flag: Bool) -> I32 {\n    var x: I32 = 0\n    if flag { x = 1\n 5 }\n    x\n}\n",
             "pub fn stmt_match_value_body(value: I32) -> I32 {\n    match value { _ => 1 }\n    0\n}\n",
+            "pub fn guarded_bool_nonexhaustive(flag: Bool) -> I32 {\n    match flag { true if flag => 1, false => 0 }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77895,9 +77892,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 36);
+        assert_eq!(owners.len(), 37);
 
-        for index in [0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 29, 31, 32, 33] {
+        for index in [
+            0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 26, 29, 31, 32, 33,
+        ] {
             let check = owners[index]
                 .body_type_check()
                 .expect("supported match-tail shapes are checked");
@@ -77906,7 +77905,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the match-tail slice: {check:?}"
             );
         }
-        for index in [7, 8, 10, 14, 22, 24, 25, 27, 28, 30] {
+        for index in [7, 8, 10, 14, 22, 24, 25, 27, 28, 30, 36] {
             let check = owners[index]
                 .body_type_check()
                 .expect("mismatched match patterns are diagnosed");
@@ -77941,7 +77940,7 @@ property "shared"() {}
         ));
         // `stmt_match` stays gated: statement-position `match` discards its
         // arm values, so unifying them with the return type would be wrong.
-        for index in [15, 18, 19, 21, 23, 26, 34, 35] {
+        for index in [15, 18, 19, 21, 23, 34, 35] {
             let check = owners[index]
                 .body_type_check()
                 .expect("match shapes outside the slice are gated");

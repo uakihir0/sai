@@ -10190,6 +10190,8 @@ fn public_match_tail_bodies_emit_check_results() {
         "pub fn choose(flag: Bool) -> I32 { match flag { true | false => 1 } }\n",
         "pub fn choose(flag: Bool) -> I32 { var x: I32 = 0\n if flag { x = 1 } else { x = 2 }\n x }\n",
         "pub fn choose(value: I32) -> I32 { var x: I32 = 0\n match value { 0 => { x = 1 }, _ => {} }\n x }\n",
+        "pub fn choose(value: I32) -> I32 { match value { 0 if value > 1 => 1, _ => 0 } }\n",
+        "pub fn choose(value: I32) -> I32 { match value { 1..=5 if value > 1 => 1, _ => 0 } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10228,7 +10230,6 @@ fn match_exhaustiveness_and_unreachable_arms_reach_cli_diagnostics() {
 #[test]
 fn unsupported_match_tail_shapes_remain_gated() {
     for source in [
-        "pub fn choose(value: I32) -> I32 { match value { 0 if value > 1 => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 1.. => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 0 | n => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match 0 { 0 => 1, _ => 2 } }\n",
