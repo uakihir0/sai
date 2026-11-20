@@ -565,6 +565,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if let StmtKind::Assign { lhs, rhs } = stmt.kind {
             return self.check_assign_stmt(lhs, rhs);
         }
+        if let StmtKind::AssignOp { op, lhs, rhs } = stmt.kind {
+            return self.check_assign_op_stmt(stmt.hir_id, op, lhs, rhs);
+        }
         let StmtKind::Let {
             pat,
             ty,
@@ -2349,13 +2352,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(())
     }
 
-    /// `place = e` (§6.13.1): a plain path to a preceding local whose
-    /// right-hand side is an admissible value expression, coerced to the
-    /// place's type. Assigning to a `let` local or a parameter is
-    /// `ASSIGN_TO_IMMUTABLE` (§7.2.4); field, tuple-field, index, and
-    /// dereference places and paths outside the admitted local set stay
-    /// gated, and non-place targets are `INVALID_ASSIGN_TARGET` (§3.16).
-    fn check_assign_stmt(&mut self, lhs: &Expr<'hir>, rhs: &Expr<'hir>) -> Result<(), ()> {
+    /// Validates an assignment place: a plain path to a preceding local whose
+    /// type is already concrete. Field/tuple/index/dereference places stay
+    /// gated (`Err`), a non-place target pushes `INVALID_ASSIGN_TARGET` and
+    /// returns `Ok(None)`, and an immutable target pushes `ASSIGN_TO_IMMUTABLE`
+    /// while still returning the place so the right side is checked too.
+    fn assign_place(&mut self, lhs: &Expr<'hir>) -> Result<Option<(PrimTy,)>, ()> {
         let ExprKind::Path(_) = lhs.kind else {
             return match lhs.kind {
                 ExprKind::Field { .. }
@@ -2367,7 +2369,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         node: lhs.hir_id,
                         kind: PrimitiveBodyErrorKind::InvalidAssignTarget,
                     });
-                    Ok(())
+                    Ok(None)
                 }
             };
         };
@@ -2386,8 +2388,51 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 kind: PrimitiveBodyErrorKind::AssignToImmutable,
             });
         }
+        Ok(Some((place_type,)))
+    }
+
+    fn check_assign_stmt(&mut self, lhs: &Expr<'hir>, rhs: &Expr<'hir>) -> Result<(), ()> {
+        let Some((place_type,)) = self.assign_place(lhs)? else {
+            return Ok(());
+        };
         self.check_initializer_value(rhs, Some(place_type))?;
-        self.record_expression_type(lhs.hir_id, local_type);
+        self.record_expression_type(lhs.hir_id, LocalType::Concrete(place_type));
+        Ok(())
+    }
+
+    /// `place op= e` desugars to `{ let t = e; place = place op t }`
+    /// (decisions.md:489). Checking `place op e` against the place type is
+    /// equivalent: `t` is a fresh binding whose literal variable resolves
+    /// through the operation exactly as `e` does inside `place op e`.
+    fn check_assign_op_stmt(
+        &mut self,
+        stmt_id: HirId,
+        op: BinOp,
+        lhs: &'hir Expr<'hir>,
+        rhs: &'hir Expr<'hir>,
+    ) -> Result<(), ()> {
+        let Some((place_type,)) = self.assign_place(lhs)? else {
+            return Ok(());
+        };
+        let result = match op {
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::WrapAdd
+            | BinOp::WrapSub
+            | BinOp::WrapMul => self.check_arithmetic(op, lhs, rhs, stmt_id)?,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                self.check_bitwise(op, lhs, rhs, stmt_id)?
+            }
+            BinOp::Shl | BinOp::Shr => self.check_shift(op, lhs, rhs, stmt_id, false)?,
+            BinOp::And | BinOp::Or => self.check_logical(op, lhs, rhs)?,
+            _ => self.check_comparison(op, lhs, rhs)?,
+        };
+        self.check_annotated_path(result, place_type, stmt_id)?;
+        self.record_expression_type(lhs.hir_id, LocalType::Concrete(place_type));
+        self.record_expression_type(stmt_id, LocalType::Concrete(place_type));
         Ok(())
     }
 
