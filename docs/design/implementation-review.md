@@ -9624,3 +9624,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver suite and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Pending — see PR.
 - **Remaining scope:** `break` values in `return`/`~literal`/`loop` shapes, `Str`/byte/char break values, `for`/`while let`, `if let`, tuple/index tails, match patterns beyond literal/wildcard, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1044 (2026-11-21): concrete-literal-kind `break` values
+
+- **Decision:** Coverage-only — verify `break 'a'` (Char), `break b'a'` (Byte), `break -1` and `break ~1` (folded unary literals) on `loop` work through IR-1041's `_` arm: folded literals arrive as `ExprKind::Lit` and concrete literal kinds (`local_type_for_unannotated_literal`) return `Concrete`, fixing `β` directly.
+- **Reason:** §6.16.1 T-Loop — each `break v` checks `v ⇐ β`; a concrete-typed `v` unifies `β` like any other value.
+- **Failure boundary and judgment:** `break "s"` stays gated — `Str` is not part of the primitive-literal slice; `break return`/`break loop` stay gated (they read `expected`, meaningless under a fresh `β`). No checker or driver change was needed — the folded-literal and concrete-kind paths already ran through `check_break_value`'s default arm.
+- **Review required:** None — admission mirrors the checker one-for-one since no code changed.
+- **Planned verification matrix:** Driver owners `break_value_char`/`break_value_byte`/`break_value_neg`/`break_value_bitnot` (supported), `break_value_str` (gated); CLI `break_value_byte`/`break_value_char` rows and a gated `break_value_str` row.
+- **Verification:** Pinned Rust 1.99.1, driver suite and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Passed — probing `break ~1` confirmed `~`/`−` fold into literals before checking, so the BitNot gate in `check_break_value` is defensive only.
+- **Remaining scope:** `break` values in `return`/`loop`/`Str` shapes (out of the literal slice), `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range, move/borrow analysis, lowering/evaluation, CLI Stage 0.

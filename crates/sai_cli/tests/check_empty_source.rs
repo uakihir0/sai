@@ -5040,6 +5040,8 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn break_value_loop() -> I32 {\n    loop { break 1 }\n    0\n}\n",
         "pub fn break_value_if(flag: Bool) -> I32 {\n    loop { break if flag { 1 } else { 2 } }\n    0\n}\n",
         "pub fn break_value_match(value: I32) -> I32 {\n    loop { break match value { 1 => 7, _ => 0 } }\n    0\n}\n",
+        "pub fn break_value_byte() -> Byte {\n    loop { break b'a' }\n    b'z'\n}\n",
+        "pub fn break_value_char() -> Char {\n    loop { break 'a' }\n    'z'\n}\n",
         "pub fn break_value_loop_pair(flag: Bool) -> I32 {\n    loop { if flag { break 1 } else { break 2 } }\n    0\n}\n",
         "pub fn break_value_labeled() -> I32 {\n    'outer: loop { loop { break 'outer 5 }\n break 'outer 6 }\n    0\n}\n",
         "pub fn loop_tail_break_value() -> I32 {\n    loop { break 1 }\n}\n",
@@ -20699,6 +20701,7 @@ fn unsupported_loop_forms_remain_gated() {
         "pub fn while_init(flag: Bool) -> I32 { let x = while flag { }\n 0 }\n",
         "pub fn loop_init_bare() -> I32 { let x = loop { break }\n 0 }\n",
         "pub fn break_value_return(flag: Bool) -> I32 { loop { break return 5 }\n 0 }\n",
+        "pub fn break_value_str() -> I32 { loop { break \"s\" }\n 0 }\n",
     );
     let output = run_check(source, "", &[], &[]);
     assert_check_stays_gated_without_syntax_errors(&output, "out-of-slice loop forms");

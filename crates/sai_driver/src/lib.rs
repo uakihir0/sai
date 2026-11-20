@@ -78363,6 +78363,11 @@ property "shared"() {}
             "pub fn break_value_match_arm(value: I32) -> I32 {\n    loop { break match value { 1 => 7, _ => 0 } }\n}\n",
             "pub fn break_value_return(flag: Bool) -> I32 {\n    loop { break return 5 }\n}\n",
             "pub fn break_value_if_nonliteral(flag: Bool, n: I32) -> I32 {\n    let x: I32 = loop { break if flag { n } else { 0 } }\n    x\n}\n",
+            "pub fn break_value_char() -> Char {\n    loop { break 'a' }\n}\n",
+            "pub fn break_value_byte() -> Byte {\n    loop { break b'a' }\n}\n",
+            "pub fn break_value_neg() -> I32 {\n    loop { break -1 }\n}\n",
+            "pub fn break_value_bitnot() -> I32 {\n    loop { break ~1 }\n}\n",
+            "pub fn break_value_str() -> I32 {\n    loop { break \"s\" }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78378,11 +78383,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 40);
+        assert_eq!(owners.len(), 45);
 
         for index in [
             0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35,
-            36, 37, 39,
+            36, 37, 39, 40, 41, 42, 43,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78413,7 +78418,7 @@ property "shared"() {}
                 "function owner {index} must report {code:?}: {check:?}"
             );
         }
-        for index in [23, 31, 32, 38] {
+        for index in [23, 31, 32, 38, 44] {
             let check = owners[index]
                 .body_type_check()
                 .expect("an out-of-slice loop form is gated");
