@@ -3123,22 +3123,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     source,
                 } => self.check_match_tail(scrutinee, arms, source, expected)?,
                 // A `return` in tail position is the never-typed exit
-                // expression: the value is checked against the expected
-                // type, and a bare `return` reports the same
+                // expression: the value is checked against the
+                // function's return type (not the surrounding expected
+                // type — an annotated `let x: Bool = if flag { return true }
+                // else { false }` in an I32 body still checks `true`
+                // against I32), and a bare `return` reports the same
                 // missing-value diagnostic as the statement form.
-                ExprKind::Return(value) => match value {
-                    Some(value) => {
-                        self.check_expr_expected(value, expected)?;
-                        LocalType::Concrete(expected)
-                    }
-                    None => {
-                        self.errors.push(PrimitiveBodyError {
-                            node: expression.hir_id,
-                            kind: PrimitiveBodyErrorKind::MissingReturnValue { expected },
-                        });
-                        LocalType::Concrete(expected)
-                    }
-                },
+                ExprKind::Return(value) => {
+                    self.check_return(expression.hir_id, value)?;
+                    LocalType::Concrete(expected)
+                }
                 _ => self.check_local_path(expression)?,
             }
         };

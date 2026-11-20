@@ -78260,6 +78260,8 @@ property "shared"() {}
             "pub fn return_tail_in_if(flag: Bool) -> I32 {\n    if flag { return 1 } else { 2 }\n}\n",
             "pub fn return_tail_in_match(value: I32) -> I32 {\n    match value { 1 => return 5, _ => 0 }\n}\n",
             "pub fn return_tail_unbound() -> I32 {\n    return missing\n}\n",
+            "pub fn return_tail_let_mismatch(flag: Bool) -> I32 {\n    let x: Bool = if flag { return true } else { false }\n    0\n}\n",
+            "pub fn return_tail_let(flag: Bool) -> I32 {\n    let x: Bool = if flag { return 1 } else { false }\n    0\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78275,9 +78277,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 21);
+        assert_eq!(owners.len(), 23);
 
-        for index in [0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13, 15, 16, 18, 19] {
+        for index in [0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13, 15, 16, 18, 19, 22] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a return statement is checked");
@@ -78290,6 +78292,7 @@ property "shared"() {}
             (6, sai_diagnostics::Code::TypeMismatch),
             (7, sai_diagnostics::Code::TypeMismatch),
             (17, sai_diagnostics::Code::TypeMismatch),
+            (21, sai_diagnostics::Code::TypeMismatch),
         ] {
             let check = owners[index]
                 .body_type_check()
