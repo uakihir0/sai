@@ -1129,7 +1129,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Ok(local_type);
             }
             let right_type = self
-                .check_local_path(right)
+                .check_operand_local_type(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
@@ -1177,7 +1177,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // the variable to the operand's type when the family admits
                 // it and the operator exists for that type pair.
                 if let Some(right_type) = self
-                    .check_local_path(right)
+                    .check_operand_local_type(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
                 {
@@ -1269,7 +1269,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let right_type = self
-            .check_local_path(right)
+            .check_operand_local_type(right)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .ok_or(())?;
@@ -1331,7 +1331,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Ok(LocalType::LiteralVariable(other));
             }
             let right_type = self
-                .check_local_path(right)
+                .check_operand_local_type(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
@@ -1386,20 +1386,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             let Some(variable) = self.literal_variables.get(id) else {
                 return Err(());
             };
-            if variable.resolved.is_none() {
+            let variable_kind = variable.kind;
+            let variable_unresolved = variable.resolved.is_none();
+            if variable_unresolved {
                 if let ExprKind::Lit(literal) = right.kind {
-                    if variable.kind != PrimitiveLiteralKind::Integer {
+                    if variable_kind != PrimitiveLiteralKind::Integer {
                         return Err(());
                     }
                     self.add_integer_literal_constraint(id, literal, right.hir_id)?;
                     return Ok(LocalType::LiteralVariable(id));
                 }
                 if let Some(right_type) = self
-                    .check_local_path(right)
+                    .check_operand_local_type(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
                 {
-                    if variable.kind != PrimitiveLiteralKind::Integer
+                    if variable_kind != PrimitiveLiteralKind::Integer
                         || !is_integer_primitive(right_type)
                     {
                         return Err(());
@@ -1408,7 +1410,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     return Ok(LocalType::LiteralVariable(id));
                 }
                 // `x % y` merges two unresolved integer literal variables.
-                if variable.kind == PrimitiveLiteralKind::Integer
+                if variable_kind == PrimitiveLiteralKind::Integer
                     && let Some(LocalType::LiteralVariable(other)) =
                         self.check_operand_local_type(right).ok()
                 {
@@ -1426,7 +1428,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let left_type = self
-            .check_local_path(left)
+            .check_operand_local_type(left)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .ok_or(())?;
@@ -1463,7 +1465,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
             let right_type = self
-                .check_local_path(right)
+                .check_operand_local_type(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
@@ -1535,7 +1537,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Ok(LocalType::LiteralVariable(other));
             }
             let right_type = self
-                .check_local_path(right)
+                .check_operand_local_type(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
@@ -1585,7 +1587,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     return Ok(LocalType::LiteralVariable(id));
                 }
                 if let Some(right_type) = self
-                    .check_local_path(right)
+                    .check_operand_local_type(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
                 {
@@ -1619,7 +1621,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let left_type = self
-            .check_local_path(left)
+            .check_operand_local_type(left)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
@@ -1654,7 +1656,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
         let right_type = self
-            .check_local_path(right)
+            .check_operand_local_type(right)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
@@ -1726,7 +1728,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
 
                 let right_type = self
-                    .check_local_path(right)
+                    .check_operand_local_type(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
                     .filter(|primitive| supports_primitive_literal(*primitive))
@@ -1943,7 +1945,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
 
             let right_type = self
-                .check_local_path(right)
+                .check_operand_local_type(right)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .filter(|primitive| supports_primitive_literal(*primitive))
@@ -1992,7 +1994,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     return Ok(LocalType::LiteralVariable(id));
                 }
                 if let Some(right_type) = self
-                    .check_local_path(right)
+                    .check_operand_local_type(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
                 {
@@ -2022,7 +2024,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let left_type = self
-            .check_local_path(left)
+            .check_operand_local_type(left)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
@@ -2170,7 +2172,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let right_type = self
-            .check_local_path(right)
+            .check_operand_local_type(right)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
@@ -2258,7 +2260,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 _ => {
                     let local_type = self
-                        .check_local_path(left)
+                        .check_operand_local_type(left)
                         .ok()
                         .and_then(|local_type| self.concrete_local_type(local_type))
                         .filter(|primitive| supports_primitive_literal(*primitive))
@@ -2290,7 +2292,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     PrimTy::U32
                 }
                 _ => self
-                    .check_local_path(right)
+                    .check_operand_local_type(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
                     .filter(|primitive| supports_primitive_literal(*primitive))
@@ -2342,11 +2344,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         right: &'hir Expr<'hir>,
     ) -> Result<LocalType, ()> {
         let left_path_type = self
-            .check_local_path(left)
+            .check_operand_local_type(left)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type));
         let right_path_type = self
-            .check_local_path(right)
+            .check_operand_local_type(right)
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type));
         let left_literal = match left.kind {
@@ -2388,7 +2390,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             let Some(variable) = self.literal_variables.get(id) else {
                 return Err(());
             };
-            if variable.resolved.is_some() {
+            let variable_kind = variable.kind;
+            let variable_unresolved = variable.resolved.is_none();
+            if !variable_unresolved {
                 continue;
             }
             let Some((literal, kind)) = literal_entry else {
@@ -2397,7 +2401,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // defined for the pair — the same rule the arithmetic
                 // operand slice uses.
                 if let Some(path_type) = self
-                    .check_local_path(literal_expression)
+                    .check_operand_local_type(literal_expression)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
                 {
@@ -2413,7 +2417,6 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // kind; the comparison yields Bool either way. Only
                 // numeric variables merge — the deferred operator check
                 // cannot reject `<` on Bool or Char once resolved.
-                let variable_kind = variable.kind;
                 if let Some(LocalType::LiteralVariable(other)) =
                     self.check_operand_local_type(literal_expression).ok()
                     && matches!(
@@ -2569,7 +2572,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 Ok(PrimTy::Bool)
             }
             _ => self
-                .check_local_path(operand)
+                .check_operand_local_type(operand)
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(()),
@@ -2593,7 +2596,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     PrimTy::Bool
                 }
                 ExprKind::Path(_) => self
-                    .check_local_path(operand)
+                    .check_operand_local_type(operand)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
                     .ok_or(())?,
@@ -6525,9 +6528,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         match self.check_local_path(expression) {
             Ok(local_type) => Ok(local_type),
-            Err(()) => self
-                .check_initializer_value(expression, None)
-                .map(|check| check.local_type),
+            Err(()) => {
+                // A nested operand can be reached through several operand
+                // checks (e.g. once per comparison loop iteration); reuse
+                // the recorded type so a literal group created by the first
+                // evaluation is not orphaned by a second one.
+                if let Some(local_type) = self
+                    .expression_type_candidates
+                    .borrow()
+                    .get(&expression.hir_id)
+                    .copied()
+                {
+                    return Ok(local_type);
+                }
+                let local_type = self
+                    .check_initializer_value(expression, None)
+                    .map(|check| check.local_type)?;
+                self.record_expression_type(expression.hir_id, local_type);
+                Ok(local_type)
+            }
         }
     }
 

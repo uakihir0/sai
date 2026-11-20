@@ -9256,12 +9256,9 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
     for source in [
         "pub fn float_division() -> F64 {\n    let result = 1.0 / 2.0\n    result\n}\n",
         "pub fn mixed_division() -> I64 {\n    let result = 1 / 2.0\n    result\n}\n",
-        "pub fn div_nested_right(left: I32, right: I32) -> I32 {\n    let result = left / (right / 1)\n    result\n}\n",
         "type IntegerAlias = I32\npub fn div_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left / right\n    result\n}\n",
         "pub fn float_mul() -> F64 {\n    let result = 1.0 * 2.0\n    result\n}\n",
         "pub fn mixed_mul() -> I64 {\n    let result = 1 * 2.0\n    result\n}\n",
-        "pub fn remainder_nested_right(left: I32, right: I32) -> I32 {\n    let result = left % (right % 1)\n    result\n}\n",
-        "pub fn remainder_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left % right) % left\n    result\n}\n",
         "type IntegerAlias = I32\npub fn remainder_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left % right\n    result\n}\n",
         "pub fn remainder_byte(left: Byte, right: Byte) -> Byte {\n    let result = left % right\n    result\n}\n",
         "pub fn remainder_bool(left: Bool, right: Bool) -> Bool {\n    let result = left % right\n    result\n}\n",
@@ -9293,8 +9290,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn wrapping_float_left_literal(right: I32) -> I32 {\n    let result = 1.0 +% right\n    result\n}\n",
         "pub fn wrapping_float_literal_right(left: I32) -> I32 {\n    let result = left +% 1.0\n    result\n}\n",
         "pub fn wrapping_integer_literal_non_integer_path(left: F32) -> F32 {\n    let result = left +% 1\n    result\n}\n",
-        "pub fn wrapping_left_nested(right: I32) -> I32 {\n    let result = (1 +% right) +% right\n    result\n}\n",
-        "pub fn wrapping_nested(left: I32, right: I32) -> I32 {\n    let result = left +% (right +% left)\n    result\n}\n",
         "type IntegerAlias = I32\npub fn wrapping_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left +% right\n    result\n}\n",
         "type IntegerAlias = I32\npub fn wrapping_left_alias(right: IntegerAlias) -> IntegerAlias {\n    let result = 1 +% right\n    result\n}\n",
         "pub fn byte(left: Byte, right: Byte) -> Byte {\n    let result = left - right\n    result\n}\n",
@@ -9312,7 +9307,12 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
 
     for source in [
         "pub fn div_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left / right) / left\n    result\n}\n",
+        "pub fn div_nested_right(left: I32, right: I32) -> I32 {\n    let result = left / (right / 1)\n    result\n}\n",
         "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
+        "pub fn remainder_nested_right(left: I32, right: I32) -> I32 {\n    let result = left % (right % 1)\n    result\n}\n",
+        "pub fn remainder_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left % right) % left\n    result\n}\n",
+        "pub fn wrapping_left_nested(right: I32) -> I32 {\n    let result = (1 +% right) +% right\n    result\n}\n",
+        "pub fn wrapping_nested(left: I32, right: I32) -> I32 {\n    let result = left +% (right +% left)\n    result\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -9753,7 +9753,6 @@ fn primitive_comparison_local_literal_errors_use_operand_spans_and_recover_as_bo
 fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
     for source in [
         "pub fn compare(value: I32) -> Bool {\n    let result = 1 == 2\n    result\n}\n",
-        "pub fn compare(value: I32) -> Bool {\n    let result = (value + 1) < 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < later\n    let later: I32 = 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = result < 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < missing\n    result\n}\n",
@@ -9765,9 +9764,12 @@ fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 
-    let source =
-        "pub fn compare(value: I32) -> Bool {\n    let result = value < (1 + 2)\n    result\n}\n";
-    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    for source in [
+        "pub fn compare(value: I32) -> Bool {\n    let result = value < (1 + 2)\n    result\n}\n",
+        "pub fn compare(value: I32) -> Bool {\n    let result = (value + 1) < 2\n    result\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
 
     let qualified = concat!(
         "use acme:empty/values as values\n",
@@ -11310,7 +11312,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
-        "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % (1 + 0)\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = value\nvalue\n}\n",
@@ -11391,6 +11392,17 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
             "function body outside the direct parameter slice",
         );
     }
+
+    assert_success_result(
+        run_check(
+            "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % (1 + 0)\nfirst\n}\n",
+            "",
+            &[],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
 }
 
 #[cfg(all(
@@ -15706,14 +15718,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = true & (false | true)",
         ),
         fixture(
-            "pub fn nested_bool_literal_pair_left() -> Bool",
-            "let result = (true & false) ^ true",
-        ),
-        fixture(
-            "pub fn chained_bool_literal_pairs() -> Bool",
-            "let result = true & false | true",
-        ),
-        fixture(
             "pub fn generic_bool_literal_pair<T>() -> Bool",
             "let result = true ^ false",
         ),
@@ -15738,10 +15742,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         fixture(
             "pub fn char_computed_integer_literal_rhs() -> Char",
             "let result = 'a' & (1 + 2)",
-        ),
-        fixture(
-            "pub fn char_nested_negative_float_literal_rhs() -> Char",
-            "let result = ('a' & -1.0) ^ 'b'",
         ),
         format!(
             "type BoolAlias = Bool\n{}",
@@ -15954,14 +15954,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = 'a' & b\"text\"",
         ),
         fixture(
-            "pub fn nested_char_literal_pair_left() -> Char",
-            "let result = ('a' & 'b') ^ 'c'",
-        ),
-        fixture(
-            "pub fn chained_char_literal_pairs() -> Char",
-            "let result = 'a' & 'b' | 'c'",
-        ),
-        fixture(
             "pub fn computed_char_literal_pair_rhs() -> Char",
             "let result = 'a' & ('b' + 'c')",
         ),
@@ -16106,14 +16098,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = b'a' & later\n    let later: Byte = b'b'",
         ),
         fixture(
-            "pub fn byte_nested_rhs(left: Byte, right: Byte) -> Byte",
-            "let result = b'a' & (left & right)",
-        ),
-        fixture(
-            "pub fn byte_nested_left(right: Byte, right2: Byte) -> Byte",
-            "let result = (b'a' & right) ^ right2",
-        ),
-        fixture(
             "pub fn byte_computed_left(right: Byte) -> Byte",
             "let result = (~b'a') & right",
         ),
@@ -16193,14 +16177,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn char_nested_rhs_float(left: Char) -> Char",
             "let result = left & (1.0 + 1.0)",
         ),
-        fixture(
-            "pub fn f64_nested_left_float(left: F64) -> F64",
-            "let result = (left | 1.0) ^ 2.0",
-        ),
-        fixture(
-            "pub fn f32_computed_rhs_float(left: F32, right: F32) -> F32",
-            "let result = left ^ (right + 1.0)",
-        ),
         format!(
             "type ByteAlias = Byte\n{}",
             fixture(
@@ -16230,22 +16206,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         fixture(
             "pub fn bool_nested_rhs_scalar() -> Bool",
             "let result = true & (false | true)",
-        ),
-        fixture(
-            "pub fn bool_nested_left_scalar_rhs(left: Bool, right: Bool) -> Bool",
-            "let result = (left & right) ^ true",
-        ),
-        fixture(
-            "pub fn bool_computed_rhs_scalar(left: Bool) -> Bool",
-            "let result = left & (true and false)",
-        ),
-        fixture(
-            "pub fn nested(left: I32, right: I32, extra: I32) -> I32",
-            "let result = left & (right ^ extra)",
-        ),
-        fixture(
-            "pub fn computed(left: I32, right: I32) -> I32",
-            "let result = (left + right) & right",
         ),
         format!(
             "type Word = I32\n{}",
@@ -16366,11 +16326,30 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         assert_check_stays_gated_without_syntax_errors(&run_check(&source, "", &[], &[]), &source);
     }
 
-    let source = fixture(
-        "pub fn integer_literal_shift_pair() -> I32",
-        "let result = 1 << 2",
-    );
-    assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+    for source in [
+        fixture(
+            "pub fn integer_literal_shift_pair() -> I32",
+            "let result = 1 << 2",
+        ),
+        fixture(
+            "pub fn byte_nested_rhs(left: Byte, right: Byte) -> Byte",
+            "let result = b'a' & (left & right)",
+        ),
+        fixture(
+            "pub fn byte_nested_left(right: Byte, right2: Byte) -> Byte",
+            "let result = (b'a' & right) ^ right2",
+        ),
+        fixture(
+            "pub fn nested(left: I32, right: I32, extra: I32) -> I32",
+            "let result = left & (right ^ extra)",
+        ),
+        fixture(
+            "pub fn computed(left: I32, right: I32) -> I32",
+            "let result = (left + right) & right",
+        ),
+    ] {
+        assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+    }
 
     for source in [
         fixture(
@@ -16384,6 +16363,42 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         fixture(
             "pub fn nested_char_literal_pair_rhs() -> Char",
             "let result = 'a' & ('b' | 'c')",
+        ),
+        fixture(
+            "pub fn nested_bool_literal_pair_left() -> Bool",
+            "let result = (true & false) ^ true",
+        ),
+        fixture(
+            "pub fn chained_bool_literal_pairs() -> Bool",
+            "let result = true & false | true",
+        ),
+        fixture(
+            "pub fn char_nested_negative_float_literal_rhs() -> Char",
+            "let result = ('a' & -1.0) ^ 'b'",
+        ),
+        fixture(
+            "pub fn nested_char_literal_pair_left() -> Char",
+            "let result = ('a' & 'b') ^ 'c'",
+        ),
+        fixture(
+            "pub fn chained_char_literal_pairs() -> Char",
+            "let result = 'a' & 'b' | 'c'",
+        ),
+        fixture(
+            "pub fn f64_nested_left_float(left: F64) -> F64",
+            "let result = (left | 1.0) ^ 2.0",
+        ),
+        fixture(
+            "pub fn f32_computed_rhs_float(left: F32, right: F32) -> F32",
+            "let result = left ^ (right + 1.0)",
+        ),
+        fixture(
+            "pub fn bool_nested_left_scalar_rhs(left: Bool, right: Bool) -> Bool",
+            "let result = (left & right) ^ true",
+        ),
+        fixture(
+            "pub fn bool_computed_rhs_scalar(left: Bool) -> Bool",
+            "let result = left & (true and false)",
         ),
     ] {
         let output = run_check(&source, "", &[], &[]);

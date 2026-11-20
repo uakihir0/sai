@@ -77514,7 +77514,10 @@ property "shared"() {}
             let check = owner
                 .body_type_check()
                 .expect("unsupported bitwise body check is gated");
-            if matches!(index, 29 | 33 | 76) {
+            if matches!(
+                index,
+                12 | 13 | 17 | 29 | 33 | 34 | 35 | 65 | 66 | 72 | 73 | 76
+            ) {
                 continue;
             }
             assert!(
@@ -77522,9 +77525,10 @@ property "shared"() {}
                 "function owner {index} unexpectedly passed the bounded bitwise slice: {check:?}"
             );
         }
-        // `(left ^ right)` and `('b' | 'c')` are nested operands that now
-        // evaluate, surfacing the operator-trait diagnostics inside them.
-        for index in [29, 33] {
+        // `(left ^ right)`, `('b' | 'c')` and the path-plus-scalar nested
+        // operands evaluate through the operand probes, surfacing the
+        // operator-trait diagnostics inside them.
+        for index in [12, 13, 17, 29, 33, 34, 35, 65, 66] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
                 .expect("nested-operand bitwise body check is available")
@@ -77538,14 +77542,17 @@ property "shared"() {}
                 )
             );
         }
-        // `1 << 2` is a literal-pair shift that the count machinery resolves.
-        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[76]
-            .body_type_check()
-            .expect("literal shift body check is available")
-        else {
-            panic!("function owner 76 stays gated");
-        };
-        assert!(diagnostics.is_empty());
+        // `left & (right ^ extra)`, `(left + right) & right` and `1 << 2`
+        // evaluate cleanly through the operand probes.
+        for index in [72, 73, 76] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("nested-operand body check is available")
+            else {
+                panic!("function owner {index} stays gated");
+            };
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]
@@ -77583,13 +77590,27 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         assert_eq!(resolved.owners().len(), 14);
-        for owner in resolved.owners() {
-            assert!(matches!(
-                owner
-                    .body_type_check()
-                    .expect("unsupported local form is gated"),
-                FunctionBodyTypeCheck::Unsupported
-            ));
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            if index == 9 {
+                // `source % (1 + 0)` resolves the literal-literal nested
+                // operand through the operand probe and gives `copy` I32.
+                assert!(matches!(
+                    owner
+                        .body_type_check()
+                        .expect("nested-operand initializer is checked"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ));
+                continue;
+            }
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("unsupported local form is gated"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "function owner {index} unexpectedly passed the local-forms gate"
+            );
         }
     }
 
@@ -79256,7 +79277,7 @@ property "shared"() {}
                 .expect("a negated logical condition over one parameter is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [30, 33, 34, 41] {
+        for index in [30, 33, 34, 41, 42] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -79264,7 +79285,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [27, 28, 39, 42, 44, 46] {
+        for index in [27, 28, 39, 44, 46] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
