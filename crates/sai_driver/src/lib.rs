@@ -78205,6 +78205,9 @@ property "shared"() {}
             "pub fn literal_var_shift_assign_path(count: U32) -> I32 {\n    var x = 1\n    x <<= count\n    x\n}\n",
             "pub fn literal_var_shift_assign_pair() -> I32 {\n    var x = 1\n    var c = 4\n    x <<= c\n    x\n}\n",
             "pub fn literal_var_shift_assign_float() -> I32 {\n    var x = 0.5\n    x <<= 1\n    x\n}\n",
+            "pub fn literal_var_assign_path() -> I32 {\n    var x = 1\n    var y = 2\n    x = y\n    x\n}\n",
+            "pub fn literal_var_assign_binary() -> I32 {\n    var x = 1\n    var y = 2\n    x = y + 1\n    x\n}\n",
+            "pub fn literal_var_assign_float_var() -> I32 {\n    var x = 1\n    var y = 0.5\n    x = y\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78220,7 +78223,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 73);
+        assert_eq!(owners.len(), 76);
 
         for index in 0..7 {
             let check = owners[index]
@@ -78271,6 +78274,14 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
+        assert!(matches!(
+            owners[75]
+                .body_type_check()
+                .expect("assigning a float literal variable to an integer one is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
         for index in [11, 12, 16, 18, 19] {
             let check = owners[index]
                 .body_type_check()
@@ -78291,7 +78302,7 @@ property "shared"() {}
         }
         for index in [
             23, 25, 26, 27, 28, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49,
-            51, 52, 55, 58, 60, 61, 62, 64, 65, 66, 69, 70, 71,
+            51, 52, 55, 58, 60, 61, 62, 64, 65, 66, 69, 70, 71, 73, 74,
         ] {
             let check = owners[index]
                 .body_type_check()

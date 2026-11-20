@@ -3587,23 +3587,57 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
                 } else {
                     let check = self.check_initializer_value(rhs, None)?;
-                    let LocalType::Concrete(found) = check.local_type else {
-                        return Err(());
-                    };
-                    // A variable already resolved by an earlier assignment
-                    // coerces the right side to the resolved place type; an
-                    // unresolved one resolves to the right side's type.
-                    match self.literal_variables.get(id).and_then(|v| v.resolved) {
-                        Some(expected) => self.check_annotated_path(
-                            LocalType::Concrete(found),
-                            expected,
-                            rhs.hir_id,
-                        )?,
-                        None => self.check_annotated_path(
-                            LocalType::LiteralVariable(id),
-                            found,
-                            rhs.hir_id,
-                        )?,
+                    match check.local_type {
+                        LocalType::Concrete(found) => {
+                            // A variable already resolved by an earlier
+                            // assignment coerces the right side to the
+                            // resolved place type; an unresolved one
+                            // resolves to the right side's type.
+                            match self.literal_variables.get(id).and_then(|v| v.resolved) {
+                                Some(expected) => self.check_annotated_path(
+                                    LocalType::Concrete(found),
+                                    expected,
+                                    rhs.hir_id,
+                                )?,
+                                None => self.check_annotated_path(
+                                    LocalType::LiteralVariable(id),
+                                    found,
+                                    rhs.hir_id,
+                                )?,
+                            }
+                        }
+                        // `x = y`/`x = y + 1` — the right side is itself a
+                        // literal variable: the two variables share one
+                        // group and resolve together, like `x op y`
+                        // operand merges.
+                        LocalType::LiteralVariable(other)
+                        | LocalType::ErrorLiteralVariable(other) => {
+                            if self.literal_variable_group_root(id)
+                                != self.literal_variable_group_root(other)
+                            {
+                                let (Some(kind), Some(other_kind)) = (
+                                    self.literal_variables.get(id).map(|variable| variable.kind),
+                                    self.literal_variables
+                                        .get(other)
+                                        .map(|variable| variable.kind),
+                                ) else {
+                                    return Err(());
+                                };
+                                if kind == other_kind {
+                                    self.merge_literal_variables(id, other)?;
+                                } else {
+                                    self.errors.push(PrimitiveBodyError {
+                                        node: rhs.hir_id,
+                                        kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                            expected: literal_variable_default_type(kind),
+                                            found: other_kind,
+                                        },
+                                    });
+                                }
+                            }
+                            self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
+                        }
+                        _ => return Err(()),
                     }
                 }
                 self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
