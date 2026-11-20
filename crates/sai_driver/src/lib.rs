@@ -77417,6 +77417,8 @@ property "shared"() {}
             "pub fn assign_match(value: I32) -> I32 {\n    var x: I32 = 0\n    x = match value { 0 => 1, _ => 2 }\n    x\n}\n",
             "pub fn nested(flag: Bool, value: I32) -> I32 {\n    let x: I32 = if flag { match value { 0 => 1, _ => 2 } } else { 3 }\n    x\n}\n",
             "pub fn branch_stmts(flag: Bool) -> I32 {\n    let x: I32 = if flag { let t: I32 = 1\n t } else { 2 }\n    x\n}\n",
+            "pub fn concrete_branches(flag: Bool, a: I32, b: I32) -> Bool {\n    let x: I32 = if flag { a } else { b }\n    flag\n}\n",
+            "pub fn concrete_mismatch(flag: Bool, a: I32, b: I32) -> Bool {\n    let x: U8 = if flag { a } else { b }\n    flag\n}\n",
             "pub fn branch_mismatch(flag: Bool) -> Bool {\n    let x: Bool = if flag { 1 } else { 2 }\n    x\n}\n",
             "pub fn assign_mismatch(flag: Bool) -> Bool {\n    var x: Bool = true\n    x = if flag { 1 } else { 2 }\n    x\n}\n",
             "pub fn unannotated_if(flag: Bool) -> I32 {\n    let x = if flag { 1 } else { 2 }\n    x\n}\n",
@@ -77438,9 +77440,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 12);
+        assert_eq!(owners.len(), 14);
 
-        for index in 0..6 {
+        for index in 0..7 {
             let check = owners[index]
                 .body_type_check()
                 .expect("annotated if/match initializers are checked");
@@ -77450,8 +77452,9 @@ property "shared"() {}
             );
         }
         // `branch_mismatch` reports both arm/branch bodies against `Bool`;
-        // `assign_mismatch` does the same through the place type.
-        for index in [6, 7] {
+        // `concrete_mismatch`/`assign_mismatch` do the same through the
+        // annotation/place type rather than the return type.
+        for index in [7, 8, 9] {
             let check = owners[index]
                 .body_type_check()
                 .expect("mismatched branch bodies are diagnosed");
@@ -77468,7 +77471,7 @@ property "shared"() {}
                 "function owner {index} should report two branch diagnostics: {check:?}"
             );
         }
-        for index in 8..12 {
+        for index in 10..14 {
             let check = owners[index]
                 .body_type_check()
                 .expect("unannotated and non-exhaustive forms are gated");
