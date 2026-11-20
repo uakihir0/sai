@@ -256,6 +256,9 @@ struct LiteralVariable<'hir> {
     kind: PrimitiveLiteralKind,
     origin: HirId,
     additional_site: Option<LiteralSite<'hir>>,
+    /// `x + y`-style operands merge two variables: a child resolves to
+    /// whatever type its parent resolves to.
+    merged_with: Option<usize>,
     resolved: Option<PrimTy>,
     pending_operator_traits: Vec<PendingOperatorTraitSite>,
     pending_neg_traits: Vec<PendingNegTraitSite>,
@@ -1127,20 +1130,41 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // `x op path` with a concretely typed right operand resolves
                 // the variable to the operand's type when the family admits
                 // it and the operator exists for that type pair.
-                let Some(right_type) = self
+                if let Some(right_type) = self
                     .check_local_path(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
-                else {
-                    return Err(());
-                };
-                match primitive_arithmetic_result(operator, right_type, right_type) {
-                    PrimitiveArithmeticResult::Type(_) => {
-                        self.resolve_literal_variable(id, right_type)?;
+                {
+                    match primitive_arithmetic_result(operator, right_type, right_type) {
+                        PrimitiveArithmeticResult::Type(_) => {
+                            self.resolve_literal_variable(id, right_type)?;
+                            return Ok(left_local_type);
+                        }
+                        _ => return Err(()),
+                    }
+                }
+                // `x op y` with both sides unresolved literal variables of
+                // one kind merges them so they resolve to a single type.
+                // The left variable must be numeric: the merge defers the
+                // operator check, and `+ - * /` only exist on integer and
+                // floating-point primitives.
+                if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok()
+                    && self.literal_variables.get(id).is_some_and(|variable| {
+                        matches!(
+                            variable.kind,
+                            PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                        )
+                    })
+                {
+                    let Some(other_variable) = self.literal_variables.get(other) else {
+                        return Err(());
+                    };
+                    if other_variable.resolved.is_none() {
+                        self.merge_literal_variables(id, other)?;
                         return Ok(left_local_type);
                     }
-                    _ => return Err(()),
                 }
+                return Err(());
             }
             let ExprKind::Lit(literal) = right.kind else {
                 return Err(());
@@ -1311,20 +1335,34 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.add_integer_literal_constraint(id, literal, right.hir_id)?;
                     return Ok(LocalType::LiteralVariable(id));
                 }
-                let Some(right_type) = self
+                if let Some(right_type) = self
                     .check_local_path(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
-                else {
-                    return Err(());
-                };
-                if variable.kind != PrimitiveLiteralKind::Integer
-                    || !is_integer_primitive(right_type)
                 {
-                    return Err(());
+                    if variable.kind != PrimitiveLiteralKind::Integer
+                        || !is_integer_primitive(right_type)
+                    {
+                        return Err(());
+                    }
+                    self.resolve_literal_variable(id, right_type)?;
+                    return Ok(LocalType::LiteralVariable(id));
                 }
-                self.resolve_literal_variable(id, right_type)?;
-                return Ok(LocalType::LiteralVariable(id));
+                // `x % y` merges two unresolved integer literal variables.
+                if variable.kind == PrimitiveLiteralKind::Integer
+                    && let Some(LocalType::LiteralVariable(other)) =
+                        self.check_local_path(right).ok()
+                {
+                    if self
+                        .literal_variables
+                        .get(other)
+                        .is_some_and(|v| v.resolved.is_none())
+                    {
+                        self.merge_literal_variables(id, other)?;
+                        return Ok(LocalType::LiteralVariable(id));
+                    }
+                }
+                return Err(());
             }
         }
 
@@ -1475,24 +1513,35 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.add_integer_literal_constraint(id, literal, right.hir_id)?;
                     return Ok(LocalType::LiteralVariable(id));
                 }
-                let Some(right_type) = self
+                if let Some(right_type) = self
                     .check_local_path(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
-                else {
-                    return Err(());
-                };
-                match primitive_wrapping_literal_left_result(
-                    operator,
-                    PrimitiveLiteralKind::Integer,
-                    right_type,
-                ) {
-                    PrimitiveArithmeticResult::Type(expected) => {
-                        self.resolve_literal_variable(id, expected)?;
+                {
+                    return match primitive_wrapping_literal_left_result(
+                        operator,
+                        PrimitiveLiteralKind::Integer,
+                        right_type,
+                    ) {
+                        PrimitiveArithmeticResult::Type(expected) => {
+                            self.resolve_literal_variable(id, expected)?;
+                            Ok(LocalType::LiteralVariable(id))
+                        }
+                        _ => Err(()),
+                    };
+                }
+                // `x +% y` merges two unresolved integer literal variables.
+                if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok() {
+                    if self
+                        .literal_variables
+                        .get(other)
+                        .is_some_and(|v| v.resolved.is_none())
+                    {
+                        self.merge_literal_variables(id, other)?;
                         return Ok(LocalType::LiteralVariable(id));
                     }
-                    _ => return Err(()),
                 }
+                return Err(());
             }
         }
 
@@ -1857,20 +1906,31 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.add_integer_literal_constraint(id, literal, right.hir_id)?;
                     return Ok(LocalType::LiteralVariable(id));
                 }
-                let Some(right_type) = self
+                if let Some(right_type) = self
                     .check_local_path(right)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
-                else {
-                    return Err(());
-                };
-                match primitive_bitwise_literal_left_result(operator, right_type) {
-                    PrimitiveArithmeticResult::Type(expected) => {
-                        self.resolve_literal_variable(id, expected)?;
+                {
+                    return match primitive_bitwise_literal_left_result(operator, right_type) {
+                        PrimitiveArithmeticResult::Type(expected) => {
+                            self.resolve_literal_variable(id, expected)?;
+                            Ok(LocalType::LiteralVariable(id))
+                        }
+                        _ => Err(()),
+                    };
+                }
+                // `x & y` merges two unresolved integer literal variables.
+                if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok() {
+                    if self
+                        .literal_variables
+                        .get(other)
+                        .is_some_and(|v| v.resolved.is_none())
+                    {
+                        self.merge_literal_variables(id, other)?;
                         return Ok(LocalType::LiteralVariable(id));
                     }
-                    _ => return Err(()),
                 }
+                return Err(());
             }
         }
 
@@ -2214,20 +2274,38 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // variable to the operand's type when the comparison is
                 // defined for the pair — the same rule the arithmetic
                 // operand slice uses.
-                let Some(path_type) = self
+                if let Some(path_type) = self
                     .check_local_path(literal_expression)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
-                else {
-                    return Err(());
-                };
-                match primitive_comparison_result(operator, path_type, path_type) {
-                    PrimitiveComparisonResult::Bool => {
-                        self.resolve_literal_variable(id, path_type)?;
-                        return Ok(LocalType::Concrete(PrimTy::Bool));
+                {
+                    match primitive_comparison_result(operator, path_type, path_type) {
+                        PrimitiveComparisonResult::Bool => {
+                            self.resolve_literal_variable(id, path_type)?;
+                            return Ok(LocalType::Concrete(PrimTy::Bool));
+                        }
+                        _ => return Err(()),
                     }
-                    _ => return Err(()),
                 }
+                // `x < y` merges two unresolved literal variables of one
+                // kind; the comparison yields Bool either way. Only
+                // numeric variables merge — the deferred operator check
+                // cannot reject `<` on Bool or Char once resolved.
+                if let Some(LocalType::LiteralVariable(other)) =
+                    self.check_local_path(literal_expression).ok()
+                    && matches!(
+                        variable.kind,
+                        PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                    )
+                    && self
+                        .literal_variables
+                        .get(other)
+                        .is_some_and(|v| v.resolved.is_none())
+                {
+                    self.merge_literal_variables(id, other)?;
+                    return Ok(LocalType::Concrete(PrimTy::Bool));
+                }
+                return Err(());
             };
             match (variable.kind, kind) {
                 (PrimitiveLiteralKind::Integer, PrimitiveLiteralKind::Integer) => {
@@ -2481,6 +2559,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     kind,
                     origin,
                     additional_site: None,
+                    merged_with: None,
                     resolved: None,
                     pending_operator_traits: Vec::new(),
                     pending_neg_traits: Vec::new(),
@@ -2960,14 +3039,46 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // `x op= path` with a concretely typed right operand
                 // resolves the variable to the operand's type when the
                 // family admits it and the operator exists for that type
-                // pair — the `x = x op path` desugar does the same.
-                let Some(right_type) = self
+                // pair — the `x = x op path` desugar does the same. With an
+                // unresolved literal-variable right side the two variables
+                // merge instead, like `x op y` in an initializer.
+                let right_type = self
                     .check_local_path(rhs)
                     .ok()
-                    .and_then(|local_type| self.concrete_local_type(local_type))
-                else {
+                    .and_then(|local_type| self.concrete_local_type(local_type));
+                if right_type.is_none() {
+                    // The merged pair resolves without an operator check,
+                    // so the place's kind must admit the operator for every
+                    // type it could resolve to: `+ - * /` on numeric
+                    // primitives, the rest on integers only.
+                    let kind_eligible =
+                        self.literal_variables
+                            .get(id)
+                            .is_some_and(|variable| match op {
+                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => matches!(
+                                    variable.kind,
+                                    PrimitiveLiteralKind::Integer
+                                        | PrimitiveLiteralKind::FloatingPoint
+                                ),
+                                _ => variable.kind == PrimitiveLiteralKind::Integer,
+                            });
+                    if kind_eligible
+                        && let Some(LocalType::LiteralVariable(other)) =
+                            self.check_local_path(rhs).ok()
+                        && self
+                            .literal_variables
+                            .get(other)
+                            .is_some_and(|v| v.resolved.is_none())
+                    {
+                        self.merge_literal_variables(id, other)?;
+                        self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
+                        self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+                        self.record_expression_type(stmt_id, LocalType::LiteralVariable(id));
+                        return Ok(());
+                    }
                     return Err(());
-                };
+                }
+                let right_type = right_type.unwrap();
                 let resolved_type = match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
                         match primitive_arithmetic_result(op, right_type, right_type) {
@@ -5146,7 +5257,48 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(())
     }
 
+    /// Links `other` into `id` so both resolve to one type — the merge an
+    /// `x + y`-style operand pair needs. Same-kind unresolved variables
+    /// only; a variable joins at most one parent and chains resolve
+    /// recursively, so merges stay acyclic.
+    fn merge_literal_variables(&mut self, id: usize, other: usize) -> Result<(), ()> {
+        if id == other {
+            return Err(());
+        }
+        let Some(variable) = self.literal_variables.get(id) else {
+            return Err(());
+        };
+        let Some(other_variable) = self.literal_variables.get(other) else {
+            return Err(());
+        };
+        if variable.kind != other_variable.kind
+            || variable.resolved.is_some()
+            || other_variable.resolved.is_some()
+            || other_variable.merged_with.is_some()
+        {
+            return Err(());
+        }
+        self.literal_variables[other].merged_with = Some(id);
+        Ok(())
+    }
+
     fn resolve_literal_variable(&mut self, id: usize, expected: PrimTy) -> Result<(), ()> {
+        // A merge child resolves through its parent so the whole group ends
+        // up with one type.
+        if let Some(parent) = self
+            .literal_variables
+            .get(id)
+            .and_then(|variable| variable.merged_with)
+        {
+            return self.resolve_literal_variable(parent, expected);
+        }
+        self.resolve_literal_variable_direct(id, expected)
+    }
+
+    /// Resolves `id` itself and every merge child below it — children call
+    /// this directly rather than `resolve_literal_variable` so their
+    /// `merged_with` redirect does not re-enter the parent resolution.
+    fn resolve_literal_variable_direct(&mut self, id: usize, expected: PrimTy) -> Result<(), ()> {
         let symbols = self.input.symbols;
         let pointer_width = self.input.pointer_width;
         let errors = &mut self.errors;
@@ -5180,6 +5332,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     },
                 });
             }
+        }
+        // A merged variable resolves to its parent's type; chains are
+        // shallow so recursion is fine.
+        let children: Vec<usize> = (0..self.literal_variables.len())
+            .filter(|index| self.literal_variables[*index].merged_with == Some(id))
+            .collect();
+        for child in children {
+            self.resolve_literal_variable_direct(child, expected)?;
         }
         Ok(())
     }

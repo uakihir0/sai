@@ -53582,6 +53582,7 @@ property "shared"() {}
             ("sub_parameter_literal", PrimTy::I32),
             ("add_literals", PrimTy::I32),
             ("mul_annotated_locals", PrimTy::I16),
+            ("mul_literal_locals", PrimTy::I16),
             ("rem_locals", PrimTy::U8),
             ("wrap_add", PrimTy::U8),
             ("bitand_local", PrimTy::U8),
@@ -53657,26 +53658,6 @@ property "shared"() {}
                 .contains("expected `Bool`, found `I32`"),
             "the arithmetic result mismatches the Bool return type"
         );
-
-        for name in ["mul_literal_locals"] {
-            let owner = owner_named(&database, &resolved, name);
-            assert!(
-                matches!(
-                    owner
-                        .body_type_check()
-                        .expect("literal-variable tail body query succeeds"),
-                    FunctionBodyTypeCheck::Unsupported
-                ),
-                "the `{name}` unresolved literal operand stays outside this slice"
-            );
-            assert!(
-                owner
-                    .primitive_body_type_results()
-                    .expect("literal-variable projection query succeeds")
-                    .is_none(),
-                "the `{name}` shape publishes no primitive facts"
-            );
-        }
 
         let nested_owner = owner_named(&database, &resolved, "nested_tail");
         assert!(
@@ -77662,6 +77643,12 @@ property "shared"() {}
             "pub fn literal_var_rhs_wrap(value: I32) -> I32 {\n    var x = 1\n    let y = value +% x\n    y\n}\n",
             "pub fn literal_var_rhs_bit(value: I32) -> I32 {\n    var x = 1\n    let y = value & x\n    y\n}\n",
             "pub fn literal_var_rhs_float(value: I32) -> I32 {\n    var x = 0.5\n    let y = value + x\n    y\n}\n",
+            "pub fn literal_var_merge_assign() -> I32 {\n    var x = 0\n    var y = 2\n    x += y\n    x\n}\n",
+            "pub fn literal_var_merge_annotated() -> I8 {\n    var x = 1\n    var y = 2\n    let z: I8 = x + y\n    z\n}\n",
+            "pub fn literal_var_merge_family() -> I32 {\n    var x = 1\n    var y = 2.5\n    let z = x + y\n    z\n}\n",
+            "pub fn literal_var_pair_bool() -> Bool {\n    var a = true\n    var b = false\n    a + b\n}\n",
+            "pub fn literal_var_cmp_bool_pair() -> Bool {\n    var a = true\n    var b = false\n    a < b\n}\n",
+            "pub fn literal_var_assign_float_rem() -> F64 {\n    var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77677,7 +77664,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 51);
+        assert_eq!(owners.len(), 57);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77747,7 +77734,8 @@ property "shared"() {}
             );
         }
         for index in [
-            25, 26, 27, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41, 43, 44, 45,
+            23, 25, 26, 27, 28, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49,
+            51, 52, 55,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -77757,7 +77745,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
-        for index in [23, 24, 28, 32, 33, 35, 42, 50] {
+        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56] {
             assert!(
                 matches!(
                     owners[index]
