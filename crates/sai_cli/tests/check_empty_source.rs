@@ -3687,6 +3687,34 @@ fn unknown_direct_self_field_binary_initializer_keeps_known_sibling_errors() {
 }
 
 #[test]
+fn unknown_direct_self_field_in_nested_logical_initializer_keeps_missing_field_error() {
+    let source = concat!(
+        "type User { count: I32 }\n",
+        "impl User {\n",
+        "    pub fn preserve_field_error(self: borrow Self) -> Bool {\n",
+        "        let flag: Bool = true\n",
+        "        let count: I32 = 1\n",
+        "        let result = self.missing and true\n",
+        "        result\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a nested logical operand must not swallow the unknown-field error:\n{stdout}"
+    );
+}
+
+#[test]
 fn unknown_direct_self_field_keeps_known_bitwise_operator_errors() {
     let source = concat!(
         "type User { count: I32 }\n",
