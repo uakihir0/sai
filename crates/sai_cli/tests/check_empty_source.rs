@@ -5025,6 +5025,7 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn merge_add() -> I32 {\n    var a = 1\n    var b = 2\n    let sum = a + b\n    sum\n}\n",
         "pub fn merge_compare() -> Bool {\n    var a = 1\n    var b = 2\n    a < b\n}\n",
         "pub fn merge_assign() -> I32 {\n    var a = 0\n    var b = 2\n    a += b\n    a\n}\n",
+        "pub fn merge_reverse_assign() -> I32 {\n    var a = 0\n    var b = 2\n    a += b\n    b += a\n    a\n}\n",
         "pub fn merge_annotated() -> I8 {\n    var a = 1\n    var b = 2\n    let sum: I8 = a + b\n    sum\n}\n",
         "pub fn merge_bit_or() -> I32 {\n    var a = 1\n    var b = 2\n    let bits = a | b\n    bits\n}\n",
         "pub fn merge_remainder() -> I32 {\n    var a = 9\n    var b = 4\n    let rem = a % b\n    rem\n}\n",
@@ -10277,7 +10278,7 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose() -> I32 { var a = 1\n    var b = 2.5\n    let sum = a + b\n    sum\n }\n",
         "pub fn choose() -> Bool { var a = true\n    var b = false\n    a + b\n }\n",
         "pub fn choose() -> F64 { var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n }\n",
-        "pub fn choose() -> I32 { var a = 0\n    var b = 0\n    a += b\n    b += a\n    a\n }\n",
+
         "pub fn choose() -> I32 { var x = 0.5\n    let rem = 1 % x\n    rem\n }\n",
         "pub fn choose(value: I32) -> I32 { var c = 0.5\n    let r = value << c\n    r\n }\n",
         "pub fn choose() -> I32 { var x = 0.5\n    var c = 1\n    let r = x << c\n    r\n }\n",
