@@ -40018,7 +40018,7 @@ interface api { resource canvas { invalid: static func(items: map<string, u32>);
                     && owner.file == module_tree.modules[0].file
             })
             .collect::<Vec<_>>();
-        assert_eq!(owners.len(), 2);
+        assert_eq!(owners.len(), 4);
         let owner_paths = owners
             .iter()
             .map(|owner| {
@@ -78080,6 +78080,8 @@ property "shared"() {}
             "pub fn while_if_tail(running: Bool, stop: Bool) -> I32 {\n    while running { if stop { break } }\n    0\n}\n",
             "pub fn loop_inner_literal_var() -> I32 {\n    var x = 2\n    loop { var n = 1\n n += x\n break }\n    x\n}\n",
             "pub fn label_shadowed() -> I32 {\n    'a: loop { 'a: loop { break }\n break }\n    0\n}\n",
+            "pub fn two_loops_share_literal_var() -> I32 {\n    var x = 2\n    loop { var n = 1\n n += x\n break }\n    loop { var m = 1\n m += x\n break }\n    x\n}\n",
+            "pub fn repeated_compound_merge() -> I32 {\n    var a = 1\n    var b = 2\n    a += b\n    a += b\n    a\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78095,9 +78097,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 17);
+        assert_eq!(owners.len(), 19);
 
-        for index in [0, 1, 2, 3, 4, 5, 13, 14, 15] {
+        for index in [0, 1, 2, 3, 4, 5, 13, 14, 15, 17, 18] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a loop statement is checked");
