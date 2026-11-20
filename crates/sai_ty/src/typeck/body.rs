@@ -4591,6 +4591,17 @@ fn collect_primitive_expression_nodes<'hir>(
                 collect_primitive_expression_nodes(els, nodes);
             }
         }
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_primitive_expression_nodes(scrutinee, nodes);
+            for arm in arms {
+                if let Some(guard) = arm.guard {
+                    collect_primitive_expression_nodes(guard, nodes);
+                }
+                collect_primitive_expression_nodes(arm.body, nodes);
+            }
+        }
         ExprKind::Field { base, .. }
         | ExprKind::TupleField { base, .. }
         | ExprKind::Unary(_, base)
@@ -4735,6 +4746,38 @@ fn expression_has_primitive_result_taint(
                         local_paths,
                         tainted_bindings,
                     )
+                })
+            }
+            // An error on a pattern, guard, scrutinee, or arm body taints the
+            // whole `match` result — otherwise the recorded tail type stays
+            // published as trustworthy.
+            ExprKind::Match {
+                scrutinee, arms, ..
+            } => {
+                expression_has_primitive_result_taint(
+                    scrutinee,
+                    error_nodes,
+                    unknown_self_fields,
+                    local_paths,
+                    tainted_bindings,
+                ) || arms.iter().any(|arm| {
+                    error_nodes.contains(&arm.pat.hir_id)
+                        || arm.guard.is_some_and(|guard| {
+                            expression_has_primitive_result_taint(
+                                guard,
+                                error_nodes,
+                                unknown_self_fields,
+                                local_paths,
+                                tainted_bindings,
+                            )
+                        })
+                        || expression_has_primitive_result_taint(
+                            arm.body,
+                            error_nodes,
+                            unknown_self_fields,
+                            local_paths,
+                            tainted_bindings,
+                        )
                 })
             }
             _ => false,
