@@ -10362,6 +10362,54 @@ fn public_bool_parameter_compared_to_integer_literal_emits_type_mismatch() {
 }
 
 #[test]
+fn public_assert_statements_emit_check_results() {
+    for source in [
+        "pub fn run(flag: Bool) -> I32 { assert flag\n    1\n }\n",
+        "pub fn run(flag: Bool, other: Bool) -> I32 { assert flag and other\n    1\n }\n",
+        "pub fn run(value: I32) -> I32 { assert value >= 0\n    1\n }\n",
+        "pub fn run(flag: Bool) -> I32 { assert not flag\n    1\n }\n",
+        "pub fn run(flag: Bool, value: I32) -> I32 { assert flag and (value > 0 and value < 10)\n    1\n }\n",
+        "pub fn run(flag: Bool) -> I32 { assert flag, \"must hold\"\n    1\n }\n",
+        "pub fn run(flag: Bool) -> I32 { assert (flag)\n    1\n }\n",
+        "pub fn run(flag: Bool) -> I32 { assert flag\n    let value: I32 = 7\n    value\n }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_non_bool_assert_condition_emits_type_mismatch() {
+    let source = "pub fn run(value: I32) -> I32 { assert value\n    1\n }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("expected `Bool`, found `I32`"),
+        "the assert condition reports the Bool requirement:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "a mismatched assert condition is still checked:\n{stdout}"
+    );
+}
+
+#[test]
+fn unsupported_assert_statement_shapes_remain_gated() {
+    for source in [
+        "pub fn run(flag: Bool) -> I32 { assert flag, 1\n    1\n }\n",
+        "pub fn helper() -> Bool { true }\npub fn run(flag: Bool) -> I32 { assert helper()\n    1\n }\n",
+        "pub fn run(flag: Bool) -> I32 { assert flag and missing\n    1\n }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_primitive_parameter_comparison_if_functions_emit_check_results() {
     for source in [
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",

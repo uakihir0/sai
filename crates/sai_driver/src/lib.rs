@@ -9021,6 +9021,12 @@ fn primitive_let_statement_shape_is_supported(
             primitive_types,
         );
     }
+    if let StmtKind::Assert { cond, msg, .. } = stmt.kind {
+        // `assert` takes the same condition gate as `if`; the optional
+        // message is a `Str` literal (N-C-20).
+        return primitive_if_condition_shape_is_supported(cond, preceding_bindings, locals, inputs)
+            && msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))));
+    }
     let StmtKind::Let {
         pat,
         ty,
@@ -9845,6 +9851,11 @@ fn primitive_body_errors_to_diagnostics(
                     StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
                         primitive_body_error_span(init, error.node)
                     }
+                    StmtKind::Assert { cond, msg, .. } => {
+                        primitive_body_error_span(cond, error.node).or_else(|| {
+                            msg.and_then(|msg| primitive_body_error_span(msg, error.node))
+                        })
+                    }
                     _ => None,
                 })
                 .or_else(|| primitive_body_error_span(tail, error.node)),
@@ -10087,6 +10098,8 @@ fn primitive_body_block_error_span(
             StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
                 primitive_body_error_span(init, node)
             }
+            StmtKind::Assert { cond, msg, .. } => primitive_body_error_span(cond, node)
+                .or_else(|| msg.and_then(|msg| primitive_body_error_span(msg, node))),
             _ => None,
         })
         .or_else(|| {
@@ -76806,6 +76819,64 @@ property "shared"() {}
                 owners[index]
                     .body_type_check()
                     .expect("unsupported two-parameter form is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_assert_statements() {
+        let root = concat!(
+            "pub fn path_condition(flag: Bool) -> I32 {\n    assert flag\n    1\n}\n",
+            "pub fn logical_condition(flag: Bool, other: Bool) -> I32 {\n    assert flag and other\n    1\n}\n",
+            "pub fn comparison_condition(value: I32) -> I32 {\n    assert value >= 0\n    1\n}\n",
+            "pub fn not_condition(flag: Bool) -> I32 {\n    assert not flag\n    1\n}\n",
+            "pub fn nested_condition(flag: Bool, value: I32) -> I32 {\n    assert flag and (value > 0 and value < 10)\n    1\n}\n",
+            "pub fn str_message(flag: Bool) -> I32 {\n    assert flag, \"must hold\"\n    1\n}\n",
+            "pub fn trailing_let(flag: Bool) -> I32 {\n    assert flag\n    let value: I32 = 7\n    value\n}\n",
+            "pub fn mismatched_condition(value: I32) -> I32 {\n    assert value\n    1\n}\n",
+            "pub fn non_str_message(flag: Bool) -> I32 {\n    assert flag, 1\n    1\n}\n",
+            "pub fn parenthesized_condition(flag: Bool) -> I32 {\n    assert (flag)\n    1\n}\n",
+            "pub fn condition_call(flag: Bool) -> I32 {\n    assert helper()\n    1\n}\n",
+            "pub fn missing_condition(flag: Bool) -> I32 {\n    assert flag and missing\n    1\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 12);
+
+        for index in [0, 1, 2, 3, 4, 5, 6, 9] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("assert statements with supported conditions are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        assert!(matches!(
+            owners[7]
+                .body_type_check()
+                .expect("a non-Bool assert condition is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        for index in [8, 10, 11] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("unsupported assert form is gated"),
                 FunctionBodyTypeCheck::Unsupported
             ));
         }
