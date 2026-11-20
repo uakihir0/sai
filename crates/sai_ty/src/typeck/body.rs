@@ -5278,6 +5278,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         {
             return Err(());
         }
+        // `other` may not be an ancestor of `id` — linking it back would
+        // close a `a += b; b += a` cycle and infinite-loop resolution.
+        let mut cursor = variable.merged_with;
+        while let Some(parent) = cursor {
+            if parent == other {
+                return Err(());
+            }
+            cursor = self
+                .literal_variables
+                .get(parent)
+                .and_then(|ancestor| ancestor.merged_with);
+        }
         self.literal_variables[other].merged_with = Some(id);
         Ok(())
     }

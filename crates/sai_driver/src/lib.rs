@@ -77649,6 +77649,7 @@ property "shared"() {}
             "pub fn literal_var_pair_bool() -> Bool {\n    var a = true\n    var b = false\n    a + b\n}\n",
             "pub fn literal_var_cmp_bool_pair() -> Bool {\n    var a = true\n    var b = false\n    a < b\n}\n",
             "pub fn literal_var_assign_float_rem() -> F64 {\n    var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n}\n",
+            "pub fn literal_var_merge_cycle() -> I32 {\n    var a = 0\n    var b = 0\n    a += b\n    b += a\n    a\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77664,7 +77665,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 57);
+        assert_eq!(owners.len(), 58);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77745,7 +77746,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
-        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56] {
+        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 57] {
             assert!(
                 matches!(
                     owners[index]
