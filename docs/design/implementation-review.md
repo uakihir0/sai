@@ -9500,3 +9500,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver suite (773) and CLI suite (385) pass; `cargo fmt --all -- --check` and `git diff --check` clean.
 - **Hostile review:** Passed. Remainder requires `is_integer_primitive` on the operand before resolution; wrapping verifies via `primitive_wrapping_literal_left_result`; float variables return Err before any site is recorded.
 - **Remaining scope:** bitwise `x & path`, shift operands, lit-var × lit-var merges, and the earlier remaining lists.
+
+### IR-1033 (2026-11-20): Literal-variable operands in bitwise expressions and compound assignments
+
+- **Decision:** Admit `x &/|/^ path` and `x &/|/^ literal` when `x` is an unresolved integer literal variable: literal right sides join as constraint sites, concrete right operands resolve the variable through `primitive_bitwise_literal_left_result`. `x &=/|=/^= path` follows in `check_assign_op_stmt`.
+- **Reason:** §6.12.5 — bitwise operators exist on integer primitives (and Byte pairs handled by their own literal rules); the `x = x & path` desugar resolves the variable identically.
+- **Failure boundary and judgment:** Bool, float, and char literal variables, right-side literal variables (`p & x`), and shift operands stay gated. A resolved Bool variable already reports `OperatorNotSupported` through the concrete path.
+- **Review required:** None beyond IR-1026's flag.
+- **Planned verification matrix:** Driver owners `literal_var_bit_and_path`/`literal_var_bit_or_literal`/`literal_var_bit_xor_assign` (supported); CLI `bits & left` reclassified plus new `| 4` and `^=` rows.
+- **Verification:** Pinned Rust 1.99.1, driver suite (773) and CLI suite (385) pass; `cargo fmt --all -- --check` and `git diff --check` clean.
+- **Hostile review:** Passed. `primitive_bitwise_literal_left_result` rejects non-integer operands before resolution; resolved variables fall through to the concrete path unchanged.
+- **Remaining scope:** right-side literal variables (`p & x`, `p + x` style), shifts, lit-var × lit-var merges, and the earlier remaining lists.

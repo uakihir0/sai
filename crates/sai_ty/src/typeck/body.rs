@@ -1793,6 +1793,39 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             };
         }
 
+        // `x & path` resolves an unresolved integer literal variable to the
+        // operand's type; a literal right side joins it as a constraint
+        // site. Bool and float variables stay gated — they have no bitwise
+        // operators to fall back on.
+        if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(left).ok() {
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                if variable.kind != PrimitiveLiteralKind::Integer {
+                    return Err(());
+                }
+                if let ExprKind::Lit(literal) = right.kind {
+                    self.add_integer_literal_constraint(id, literal, right.hir_id)?;
+                    return Ok(LocalType::LiteralVariable(id));
+                }
+                let Some(right_type) = self
+                    .check_local_path(right)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                else {
+                    return Err(());
+                };
+                match primitive_bitwise_literal_left_result(operator, right_type) {
+                    PrimitiveArithmeticResult::Type(expected) => {
+                        self.resolve_literal_variable(id, expected)?;
+                        return Ok(LocalType::LiteralVariable(id));
+                    }
+                    _ => return Err(()),
+                }
+            }
+        }
+
         let left_type = self
             .check_local_path(left)
             .ok()
@@ -2890,6 +2923,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             PrimitiveLiteralKind::Integer,
                             right_type,
                         ) {
+                            PrimitiveArithmeticResult::Type(result) => result,
+                            _ => return Err(()),
+                        }
+                    }
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                        match primitive_bitwise_literal_left_result(op, right_type) {
                             PrimitiveArithmeticResult::Type(result) => result,
                             _ => return Err(()),
                         }

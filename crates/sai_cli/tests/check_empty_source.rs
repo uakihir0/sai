@@ -5015,6 +5015,9 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn wrapping_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one +% left\n    result\n}\n",
         "pub fn remainder_assign_local(left: I32) -> I32 {\n    var result = 0\n    result %= left\n    result\n}\n",
         "pub fn wrapping_assign_local(left: I32) -> I32 {\n    var result = 0\n    result +%= left\n    result\n}\n",
+        "pub fn bit_and_unresolved_local(left: I32) -> I32 {\n    let bits = 1\n    let result = bits & left\n    result\n}\n",
+        "pub fn bit_or_literal_right() -> I32 {\n    var bits = 1\n    let result = bits | 4\n    result\n}\n",
+        "pub fn bit_xor_assign_local(left: I32) -> I32 {\n    var result = 0\n    result ^= left\n    result\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -16198,10 +16201,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         fixture(
             "pub fn computed(left: I32, right: I32) -> I32",
             "let result = (left + right) & right",
-        ),
-        fixture(
-            "pub fn unresolved(left: I32) -> I32",
-            "let bits = 1\n    let result = bits & left",
         ),
         format!(
             "type Word = I32\n{}",
