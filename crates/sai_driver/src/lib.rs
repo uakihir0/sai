@@ -9397,6 +9397,22 @@ fn primitive_let_statement_shape_is_supported(
                 });
             }
             ExprKind::Continue { .. } => return true,
+            ExprKind::Return(value) => {
+                return value.is_none_or(|value| {
+                    primitive_value_expression_shape_is_supported(
+                        value,
+                        preceding_bindings,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        self_field_projections,
+                        unknown_self_fields,
+                        direct_call_signatures,
+                        primitive_types,
+                    )
+                });
+            }
             ExprKind::Block(_) => return false,
             _ => {}
         }
@@ -10011,6 +10027,20 @@ fn primitive_stmt_block_shape_is_supported(
                 direct_call_signatures,
                 primitive_types,
             ),
+            ExprKind::Return(value) => value.is_none_or(|value| {
+                primitive_value_expression_shape_is_supported(
+                    value,
+                    &block_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            }),
             _ => false,
         },
     }
@@ -10101,6 +10131,20 @@ fn primitive_loop_stmt_shape_is_supported(
                 direct_call_signatures,
                 primitive_types,
             ),
+            ExprKind::Return(value) => value.is_none_or(|value| {
+                primitive_value_expression_shape_is_supported(
+                    value,
+                    &block_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            }),
             _ => false,
         },
     }
@@ -10943,6 +10987,15 @@ fn primitive_body_errors_to_diagnostics(
                 "a loop label that repeats an enclosing label".to_string(),
                 "label shadowed",
             )?,
+            PrimitiveBodyErrorKind::MissingReturnValue { expected } => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `{}`, found `()`", const_primitive_name(expected)),
+                "type mismatch",
+            )?,
         };
         diagnostics.push(diagnostic);
     }
@@ -10988,6 +11041,7 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
         ExprKind::Break {
             value: Some(value), ..
         } => primitive_body_error_span(value, node),
+        ExprKind::Return(Some(value)) => primitive_body_error_span(value, node),
         _ => None,
     }
 }
@@ -11486,16 +11540,28 @@ fn direct_primitive_call_sites(
             StmtKind::Assign { rhs, .. } | StmtKind::AssignOp { rhs, .. } => rhs,
             _ => continue,
         };
+        let expression = primitive_call_site_root(expression);
         if matches!(expression.kind, ExprKind::Call { .. }) {
             index_root_and_one_level_arguments(expression);
         }
     }
-    if let Some(tail) = block.tail
-        && matches!(tail.kind, ExprKind::Call { .. })
-    {
-        index_root_and_one_level_arguments(tail);
+    if let Some(tail) = block.tail {
+        let tail = primitive_call_site_root(tail);
+        if matches!(tail.kind, ExprKind::Call { .. }) {
+            index_root_and_one_level_arguments(tail);
+        }
     }
     calls
+}
+
+fn primitive_call_site_root<'hir>(expression: &'hir HirExpr<'hir>) -> &'hir HirExpr<'hir> {
+    match expression.kind {
+        ExprKind::Return(Some(value))
+        | ExprKind::Break {
+            value: Some(value), ..
+        } => value,
+        _ => expression,
+    }
 }
 
 fn direct_primitive_call_site(
@@ -78135,6 +78201,72 @@ property "shared"() {}
                 "function owner {index} unexpectedly passed the loop slice: {check:?}"
             );
         }
+    }
+
+    #[test]
+    fn function_body_type_check_supports_return_statements() {
+        let root = concat!(
+            "pub fn return_value() -> I32 {\n    return 5\n 0\n}\n",
+            "pub fn return_path(a: I32) -> I32 {\n    return a\n 0\n}\n",
+            "pub fn return_binary(a: I32) -> I32 {\n    return a + 1\n 0\n}\n",
+            "pub fn return_in_if(flag: Bool) -> I32 {\n    if flag { return 1 }\n    0\n}\n",
+            "pub fn return_in_loop() -> I32 {\n    loop { return 7\n break }\n    0\n}\n",
+            "pub fn return_literal_var() -> I32 {\n    var x = 1\n    return x\n 0\n}\n",
+            "pub fn return_mismatch() -> I32 {\n    return true\n 0\n}\n",
+            "pub fn return_bare() -> I32 {\n    return\n 0\n}\n",
+            "pub fn return_tail() -> I32 {\n    let x: I32 = 1\n    return x\n 0\n}\n",
+            "pub fn return_unbound() -> I32 {\n    return missing\n 0\n}\n",
+            "pub fn return_call() -> I32 {\n    var x = 1\n    return helper(x)\n    0\n}\n",
+            "pub fn return_not_literal() -> Bool {\n    return not true\n    true\n}\n",
+            "pub fn return_bitnot_literal() -> I32 {\n    return ~42\n    0\n}\n",
+            "pub fn return_not_nested(flag: Bool) -> Bool {\n    return not not flag\n    true\n}\n",
+            "fn helper(value: I32) -> I32 {\n    value\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 15);
+
+        for index in [0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a return statement is checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the return slice: {check:?}"
+            );
+        }
+        for (index, code) in [
+            (6, sai_diagnostics::Code::TypeMismatch),
+            (7, sai_diagnostics::Code::TypeMismatch),
+        ] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a return diagnostic is reported");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.iter().any(|diagnostic| diagnostic.code == code)),
+                "function owner {index} must report {code:?}: {check:?}"
+            );
+        }
+        let check = owners[9]
+            .body_type_check()
+            .expect("an unbound return value is gated");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "function owner 9 unexpectedly passed the return slice: {check:?}"
+        );
     }
 
     #[test]

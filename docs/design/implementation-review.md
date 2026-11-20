@@ -9569,3 +9569,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
  n += x
  break }; x` vs `-> I32`) defaulted the whole group to `I64` at loop end — groups straddling the literal floor now stay unresolved for a later site. `while running { if stop { break } }` was gated because statement blocks rejected `if`/`match` tails — admitted through the statement-position checkers (branches stay statement-only). Duplicate loop labels were silently accepted — `check_loop_stmt` now reports `LABEL_SHADOWED` per §6.16.4 before pushing the shadowing frame.
 - **Remaining scope:** `break` with a value on `loop` (needs loop-β inference), `for`/`while let` (iterator + Option desugaring), loop tails/initializers, `if let`, tuple/index tails, match patterns beyond literal/wildcard, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1039 (2026-11-20): `return` statements in primitive bodies
+
+- **Decision:** Admit `return e` and bare `return` statements in statement position (own statements, statement-block tails, and loop-body tails). `return e` checks `e` against the declared primitive return type through the same `check_expr_expected` the body tail uses; a bare `return` in a non-`()` primitive body reports `TYPE_MISMATCH` (expected `<ret>`, found `()`) as a recoverable diagnostic rather than gating.
+- **Reason:** §6.16 — `return` is statement-level control flow with type `!`; the value operand must match the function's return type, and a missing value requires the `()` return type, which primitive bodies never have.
+- **Failure boundary and judgment:** `return` in tail or initializer position stays gated (tail admission treats it like any non-value expression), and an unbound operand stays gated. Nothing after a `return` is checked for reachability — statement-position `return` followed by more statements remains admitted.
+- **Review required:** None — the value check reuses the tail machinery unchanged; the bare-return diagnostic anchors at the `return` expression itself.
+- **Planned verification matrix:** Driver owners `return_value`/`return_path`/`return_binary`/`return_in_if`/`return_in_loop`/`return_literal_var`/`return_tail` (supported), `return_mismatch`/`return_bare` (Supported+TYPE_MISMATCH), `return_unbound` (gated); CLI `return_stmt`/`return_in_loop` rows plus gated tail/unbound rows.
+- **Verification:** Pinned Rust 1.99.1, driver suite (775) and CLI suite (387) pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Passed after one fixture correction — a `return` written as a function body's only expression is the tail, not a statement; fixtures place a trailing literal tail so `return` stays in statement position.
+- **Remaining scope:** `return` in tail position, `break` with a value on `loop`, `for`/`while let`, loop tails/initializers, tuple/index tails, match patterns beyond literal/wildcard, move/borrow analysis, lowering/evaluation, CLI Stage 0.
