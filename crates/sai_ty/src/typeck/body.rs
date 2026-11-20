@@ -3020,14 +3020,59 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         .copied()
                         .ok_or(())?,
                 ),
+                ExprKind::Unary(UnOp::Not, operand) => {
+                    // `not e` admits the same operand-position logical
+                    // shapes as `let x = not e` (path, `Bool` literal,
+                    // `not`, `and`/`or`, comparison).
+                    let operand_type = self.check_logical_operand(operand)?;
+                    self.check_logical_operand_type(operand, operand_type)?;
+                    LocalType::Concrete(PrimTy::Bool)
+                }
+                ExprKind::Unary(UnOp::BitNot, operand)
+                    if matches!(operand.kind, ExprKind::Lit(_)) =>
+                {
+                    // Literal `~` operands follow the let-initializer
+                    // shapes: integer literals take the expected type,
+                    // byte literals are `Byte`.
+                    let ExprKind::Lit(literal) = operand.kind else {
+                        return Err(());
+                    };
+                    match primitive_literal_kind(literal) {
+                        Some(PrimitiveLiteralKind::Integer) => {
+                            self.check_annotated_literal(
+                                expected,
+                                literal,
+                                PrimitiveLiteralKind::Integer,
+                                operand.hir_id,
+                            );
+                            LocalType::Concrete(expected)
+                        }
+                        Some(PrimitiveLiteralKind::Byte) => {
+                            self.record_expression_type(
+                                operand.hir_id,
+                                LocalType::Concrete(PrimTy::Byte),
+                            );
+                            if expected != PrimTy::Byte {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: expression.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                        expected,
+                                        found: PrimTy::Byte,
+                                    },
+                                });
+                            }
+                            LocalType::Concrete(expected)
+                        }
+                        _ => return Err(()),
+                    }
+                }
                 ExprKind::Unary(operator, operand)
-                    if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not)
+                    if matches!(operator, UnOp::Neg | UnOp::BitNot)
                         && matches!(operand.kind, ExprKind::Path(_)) =>
                 {
                     match operator {
                         UnOp::Neg => self.check_direct_call_neg_path(operand, expression.hir_id)?,
-                        UnOp::BitNot => self.check_bitwise_not_path(operand, expression.hir_id)?,
-                        _ => self.check_logical_not(operand)?,
+                        _ => self.check_bitwise_not_path(operand, expression.hir_id)?,
                     }
                 }
                 // Binary tails share the local-initializer family checkers:

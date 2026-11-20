@@ -11540,16 +11540,28 @@ fn direct_primitive_call_sites(
             StmtKind::Assign { rhs, .. } | StmtKind::AssignOp { rhs, .. } => rhs,
             _ => continue,
         };
+        let expression = primitive_call_site_root(expression);
         if matches!(expression.kind, ExprKind::Call { .. }) {
             index_root_and_one_level_arguments(expression);
         }
     }
-    if let Some(tail) = block.tail
-        && matches!(tail.kind, ExprKind::Call { .. })
-    {
-        index_root_and_one_level_arguments(tail);
+    if let Some(tail) = block.tail {
+        let tail = primitive_call_site_root(tail);
+        if matches!(tail.kind, ExprKind::Call { .. }) {
+            index_root_and_one_level_arguments(tail);
+        }
     }
     calls
+}
+
+fn primitive_call_site_root<'hir>(expression: &'hir HirExpr<'hir>) -> &'hir HirExpr<'hir> {
+    match expression.kind {
+        ExprKind::Return(Some(value))
+        | ExprKind::Break {
+            value: Some(value), ..
+        } => value,
+        _ => expression,
+    }
 }
 
 fn direct_primitive_call_site(
@@ -78201,6 +78213,11 @@ property "shared"() {}
             "pub fn return_bare() -> I32 {\n    return\n 0\n}\n",
             "pub fn return_tail() -> I32 {\n    let x: I32 = 1\n    return x\n 0\n}\n",
             "pub fn return_unbound() -> I32 {\n    return missing\n 0\n}\n",
+            "pub fn return_call() -> I32 {\n    var x = 1\n    return helper(x)\n    0\n}\n",
+            "pub fn return_not_literal() -> Bool {\n    return not true\n    true\n}\n",
+            "pub fn return_bitnot_literal() -> I32 {\n    return ~42\n    0\n}\n",
+            "pub fn return_not_nested(flag: Bool) -> Bool {\n    return not not flag\n    true\n}\n",
+            "fn helper(value: I32) -> I32 {\n    value\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78216,9 +78233,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 10);
+        assert_eq!(owners.len(), 15);
 
-        for index in [0, 1, 2, 3, 4, 5, 8] {
+        for index in [0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a return statement is checked");
