@@ -9082,6 +9082,72 @@ fn primitive_logical_init_operand_shape_is_supported(
 /// right-hand side as a coercion site, so it mirrors the annotated
 /// initializer admission set).
 #[allow(clippy::too_many_arguments)]
+/// `break v` admission: `if`/`match` values join the break-type
+/// variable's literal group like unannotated `let` initializers —
+/// branches must be empty blocks with literal tails (match arm bodies
+/// literal expressions). Other values pass value admission.
+#[allow(clippy::too_many_arguments)]
+fn primitive_break_value_shape_is_supported(
+    value: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    match value.kind {
+        // `if`/`match` values admit the full tail shape — a concrete `β`
+        // (`let x: I32 = loop {..}`) checks them like any tail; a fresh `β`
+        // joins only literal branches, and the checker rejects the rest.
+        ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
+            value,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source,
+        } => primitive_match_tail_shape_is_supported(
+            scrutinee,
+            arms,
+            source,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+        _ => primitive_value_expression_shape_is_supported(
+            value,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+    }
+}
+
 fn primitive_value_expression_shape_is_supported(
     expression: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
@@ -9449,7 +9515,7 @@ fn primitive_let_statement_shape_is_supported(
                 // a gate. A value-bearing `break` on `loop` stays gated in
                 // the checker; the value must still pass value admission.
                 return value.is_none_or(|value| {
-                    primitive_value_expression_shape_is_supported(
+                    primitive_break_value_shape_is_supported(
                         value,
                         preceding_bindings,
                         locals,
@@ -10080,7 +10146,7 @@ fn primitive_stmt_block_shape_is_supported(
         None => true,
         Some(tail) => match tail.kind {
             ExprKind::Break { value, .. } => value.is_none_or(|value| {
-                primitive_value_expression_shape_is_supported(
+                primitive_break_value_shape_is_supported(
                     value,
                     &block_bindings,
                     locals,
@@ -10215,7 +10281,7 @@ fn primitive_loop_body_shape_is_supported(
         None => true,
         Some(tail) => match tail.kind {
             ExprKind::Break { value, .. } => value.is_none_or(|value| {
-                primitive_value_expression_shape_is_supported(
+                primitive_break_value_shape_is_supported(
                     value,
                     &block_bindings,
                     locals,
@@ -78296,6 +78362,10 @@ property "shared"() {}
             "pub fn loop_tail_inner_annotation() -> I32 {\n    loop { let n: I32 = 1\n break n }\n}\n",
             "pub fn if_branch_loop_tail(flag: Bool) -> I32 {\n    if flag { loop { break 1 } } else { 2 }\n}\n",
             "pub fn match_arm_loop_tail(value: I32) -> I32 {\n    match value { 1 => loop { break 1 }, _ => 0 }\n}\n",
+            "pub fn break_value_match(flag: Bool) -> I32 {\n    loop { break if flag { 1 } else { 2 } }\n}\n",
+            "pub fn break_value_match_arm(value: I32) -> I32 {\n    loop { break match value { 1 => 7, _ => 0 } }\n}\n",
+            "pub fn break_value_return(flag: Bool) -> I32 {\n    loop { break return 5 }\n}\n",
+            "pub fn break_value_if_nonliteral(flag: Bool, n: I32) -> I32 {\n    let x: I32 = loop { break if flag { n } else { 0 } }\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78311,11 +78381,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 39);
+        assert_eq!(owners.len(), 43);
 
         for index in [
-            0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 20, 21, 22, 28, 29, 30, 31, 32, 33,
-            36, 37, 38,
+            0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30, 31, 32,
+            33, 36, 37, 38, 39, 40, 42,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78346,7 +78416,7 @@ property "shared"() {}
                 "function owner {index} must report {code:?}: {check:?}"
             );
         }
-        for index in [26, 27, 34, 35] {
+        for index in [26, 34, 35, 41] {
             let check = owners[index]
                 .body_type_check()
                 .expect("an out-of-slice loop form is gated");

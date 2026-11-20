@@ -9613,3 +9613,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver suite and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Passed after one test-design fix — an unannotated `let x = loop { break 1 }` correctly defaults `β` (and `x`) to `I64`, so its owner returns `I64` rather than faking an `I32` coercion.
 - **Remaining scope:** `break` values in `if`/`match`/`return`/`~literal`/`loop` shapes, `Str`/byte/char break values, `for`/`while let`, `if let`, tuple/index tails, match patterns beyond literal/wildcard, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1043 (2026-11-20): `if`/`match` `break` values join `β`'s literal group
+
+- **Decision:** Admit `break if c { l } else { l' }` and `break match s { .. => l }` on `loop` — `check_break_value` routes `If`/`Match` values to `check_literal_join_if`/`check_literal_join_match`, joining the branch literals as sites of `β`'s literal-variable group, exactly like unannotated `let` initializers.
+- **Reason:** §6.16.1 — each `break v` checks `v ⇐ β`; with a fresh literal `β` the joined literal sites merge into `β`'s group, and with a resolved or concrete `β` (`break 1` then `break if c {2} else {3}`) the later literals constrain the same variable through the shared join machinery.
+- **Failure boundary and judgment:** Join branches must be statement-free blocks with literal tails — statement-bearing branches, `else if` chains, missing `else`, and non-literal arm bodies stay gated through the existing join gates. `break return e`/`break loop {..}`/`break ~lit` stay gated (they read `expected`, which has no meaning under a fresh `β`). The driver mirrors the join admission in `primitive_break_value_shape_is_supported`: `if` conditions plus literal-only branch blocks, and `match` tails with the same arm admission restricted to literal arm bodies.
+- **Review required:** None — the join helpers already gate the same shapes for `let` initializers.
+- **Planned verification matrix:** Driver owners `break_value_if` (reclassified supported), `break_value_match`/`break_value_match_arm` (supported), `break_value_return` (gated); CLI `break_value_if`/`break_value_match` rows and a gated `break_value_return` row.
+- **Verification:** Pinned Rust 1.99.1, driver suite and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Pending — see PR.
+- **Remaining scope:** `break` values in `return`/`~literal`/`loop` shapes, `Str`/byte/char break values, `for`/`while let`, `if let`, tuple/index tails, match patterns beyond literal/wildcard, move/borrow analysis, lowering/evaluation, CLI Stage 0.
