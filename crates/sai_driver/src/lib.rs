@@ -78201,6 +78201,10 @@ property "shared"() {}
             "pub fn literal_var_shift_pair() -> I32 {\n    var x = 1\n    var c = 2\n    let r = x << c\n    r\n}\n",
             "pub fn literal_var_shift_left_float() -> I32 {\n    var x = 0.5\n    var c = 1\n    let r = x << c\n    r\n}\n",
             "pub fn literal_var_shift_count_float(value: I32) -> I32 {\n    var c = 0.5\n    let r = value << c\n    r\n}\n",
+            "pub fn literal_var_shift_assign() -> I32 {\n    var x = 1\n    x <<= 2\n    x\n}\n",
+            "pub fn literal_var_shift_assign_path(count: U32) -> I32 {\n    var x = 1\n    x <<= count\n    x\n}\n",
+            "pub fn literal_var_shift_assign_pair() -> I32 {\n    var x = 1\n    var c = 4\n    x <<= c\n    x\n}\n",
+            "pub fn literal_var_shift_assign_float() -> I32 {\n    var x = 0.5\n    x <<= 1\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78216,7 +78220,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 69);
+        assert_eq!(owners.len(), 73);
 
         for index in 0..7 {
             let check = owners[index]
@@ -78287,7 +78291,7 @@ property "shared"() {}
         }
         for index in [
             23, 25, 26, 27, 28, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49,
-            51, 52, 55, 58, 60, 61, 62, 64, 65, 66,
+            51, 52, 55, 58, 60, 61, 62, 64, 65, 66, 69, 70, 71,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78297,7 +78301,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
-        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 63, 67, 68] {
+        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 63, 67, 68, 72] {
             assert!(
                 matches!(
                     owners[index]
