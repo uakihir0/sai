@@ -8564,7 +8564,7 @@ fn check_function_body_primitive_local_block(
             || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
     let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-    let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot) && matches!(operand.kind, ExprKind::Path(_)));
+    let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)));
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -52109,6 +52109,221 @@ property "shared"() {}
             "bitnot_float_tail",
             "bitnot_deferred_result_tail",
             "bitnot_computed_tail",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("excluded tail body query succeeds"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "the `{name}` tail shape remains outside this slice"
+            );
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("excluded projection query succeeds")
+                    .is_none(),
+                "the `{name}` tail shape publishes no primitive facts"
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_body_type_results_infer_not_tails() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub fn not_parameter(value: Bool) -> Bool { not value }\n",
+            "pub fn not_int_parameter(value: I32) -> Bool { not value }\n",
+            "pub fn not_literal_tail() -> Bool {\n",
+            "    let source = true\n",
+            "    not source\n",
+            "}\n",
+            "pub fn not_alias_tail() -> Bool {\n",
+            "    let source = true\n",
+            "    let alias = source\n",
+            "    not alias\n",
+            "}\n",
+            "pub fn not_int_literal_tail() -> Bool {\n",
+            "    let source = 7\n",
+            "    not source\n",
+            "}\n",
+            "pub fn not_mismatch_tail() -> I32 {\n",
+            "    let source = true\n",
+            "    not source\n",
+            "}\n",
+            "pub fn not_deferred_result_tail() -> Bool {\n",
+            "    let source = true\n",
+            "    let first = not source\n",
+            "    not first\n",
+            "}\n",
+            "pub fn not_computed_tail(value: Bool) -> Bool {\n",
+            "    not (value == value)\n",
+            "}\n",
+            "pub fn not_double_tail(value: Bool) -> Bool { not not value }\n",
+        )
+        .to_string();
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{name}` is present"))
+        }
+
+        fn binding_named(
+            database: &RootDatabase,
+            owner: &FunctionOwnerResolution,
+            name: &str,
+        ) -> sai_hir::BindingId {
+            let bindings = owner
+                .local_resolution()
+                .expect("local results belong to this owner")
+                .expect("function has local resolution")
+                .bindings
+                .iter()
+                .filter_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved| resolved.as_ref() == name)
+                            .map(|_| *binding)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let [binding] = bindings.as_slice() else {
+                panic!("function has exactly one `{name}` binding");
+            };
+            *binding
+        }
+
+        let parameter_owner = owner_named(&database, &resolved, "not_parameter");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = parameter_owner
+            .body_type_check()
+            .expect("parameter tail body check is available")
+        else {
+            panic!("a concrete Bool path Not tail is supported");
+        };
+        assert!(diagnostics.is_empty());
+        let parameter_results = parameter_owner
+            .primitive_body_type_results()
+            .expect("parameter tail results query succeeds")
+            .expect("parameter tail body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, parameter_results);
+        assert!(
+            parameter_results
+                .expression_types()
+                .values()
+                .all(|ty| *ty == PrimTy::Bool)
+        );
+
+        let int_parameter_owner = owner_named(&database, &resolved, "not_int_parameter");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: int_parameter_diagnostics,
+        } = int_parameter_owner
+            .body_type_check()
+            .expect("int parameter tail body check is available")
+        else {
+            panic!("a concrete non-Bool path Not tail is supported");
+        };
+        assert_eq!(
+            int_parameter_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["expected `Bool`, found `I32`"],
+            "a non-Bool operand reports the Bool expectation"
+        );
+
+        for name in [
+            "not_literal_tail",
+            "not_alias_tail",
+            "not_deferred_result_tail",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("bool tail body check is available")
+            else {
+                panic!("a Bool local Not tail is supported for `{name}`");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "Bool literals and copies carry concrete types for `{name}`"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("bool tail results query succeeds")
+                .expect("bool tail body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+            assert_eq!(
+                results.binding_type(binding_named(&database, owner, "source")),
+                Some(PrimTy::Bool),
+                "the `{name}` source stays Bool"
+            );
+        }
+
+        let mismatch_tail_owner = owner_named(&database, &resolved, "not_mismatch_tail");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: mismatch_tail_diagnostics,
+        } = mismatch_tail_owner
+            .body_type_check()
+            .expect("mismatch tail body check is available")
+        else {
+            panic!("an incompatible Not tail remains a recoverable type error");
+        };
+        assert_eq!(
+            mismatch_tail_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["expected `I32`, found `Bool`"],
+            "the Bool result mismatches the I32 return type"
+        );
+
+        for name in [
+            "not_int_literal_tail",
+            "not_computed_tail",
+            "not_double_tail",
         ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
