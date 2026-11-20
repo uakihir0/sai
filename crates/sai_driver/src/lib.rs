@@ -8711,6 +8711,32 @@ fn check_function_body_primitive_local_block(
     }
     if let (
         true,
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source,
+        },
+    ) = (is_supported_match_tail, tail.kind)
+    {
+        if !primitive_match_tail_shape_is_supported(
+            scrutinee,
+            arms,
+            source,
+            &preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            &mut primitive_types,
+        ) {
+            return Ok(None);
+        }
+    }
+    if let (
+        true,
         ExprKind::Call {
             args, base: None, ..
         },
@@ -77352,6 +77378,8 @@ property "shared"() {}
             "pub fn bool_no_catch_all(flag: Bool) -> I32 {\n    match flag { true => 1, false => 0 }\n}\n",
             "pub fn shadowed_binding(value: I32) -> I32 {\n    let n: I32 = 9\n    match value { n => n + 1 }\n}\n",
             "pub fn sibling_leak(value: I32) -> I32 {\n    match value { n => 0, _ => n }\n}\n",
+            "pub fn stmt_match(value: I32) -> Bool {\n    match value { 0 => 1, _ => 2 }\n    true\n}\n",
+            "pub fn annotated_arm_branch(value: I32, flag: Bool) -> I32 {\n    match value { 0 => if flag { let x: I32 = 1\n x } else { 2 }, _ => 3 }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77367,9 +77395,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 19);
+        assert_eq!(owners.len(), 21);
 
-        for index in [0, 1, 2, 3, 4, 5, 6, 17] {
+        for index in [0, 1, 2, 3, 4, 5, 6, 17, 20] {
             let check = owners[index]
                 .body_type_check()
                 .expect("supported match-tail shapes are checked");
@@ -77408,7 +77436,9 @@ property "shared"() {}
                         .iter()
                         .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
         ));
-        for index in [10, 11, 12, 13, 14, 15, 16, 18] {
+        // `stmt_match` stays gated: statement-position `match` discards its
+        // arm values, so unifying them with the return type would be wrong.
+        for index in [10, 11, 12, 13, 14, 15, 16, 18, 19] {
             let check = owners[index]
                 .body_type_check()
                 .expect("match shapes outside the slice are gated");
