@@ -1271,6 +1271,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             else {
                 return Err(());
             };
+            // `1 % x` joins the literal as a constraint site on the
+            // unresolved integer literal variable, like `x % 1`.
+            if kind == PrimitiveLiteralKind::Integer
+                && let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok()
+                && self.literal_variables.get(other).is_some_and(|v| {
+                    v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
+                })
+            {
+                self.add_integer_literal_constraint(other, literal, left.hir_id)?;
+                return Ok(LocalType::LiteralVariable(other));
+            }
             let right_type = self
                 .check_local_path(right)
                 .ok()
@@ -1462,6 +1473,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if let ExprKind::Lit(literal) = left.kind {
             if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
                 return Err(());
+            }
+            // `1 +% x` joins the literal as a constraint site on the
+            // unresolved integer literal variable, like `x +% 1`.
+            if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok()
+                && self.literal_variables.get(other).is_some_and(|v| {
+                    v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
+                })
+            {
+                self.add_integer_literal_constraint(other, literal, left.hir_id)?;
+                return Ok(LocalType::LiteralVariable(other));
             }
             let right_type = self
                 .check_local_path(right)
@@ -1855,6 +1876,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 };
                 self.add_integer_literal_constraint(id, right_literal, right.hir_id)?;
                 return Ok(local_type);
+            }
+
+            // `1 & x` joins the literal as a constraint site on the
+            // unresolved integer literal variable, like `x & 1`.
+            if let Some(LocalType::LiteralVariable(other)) = self.check_local_path(right).ok()
+                && self.literal_variables.get(other).is_some_and(|v| {
+                    v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
+                })
+            {
+                self.add_integer_literal_constraint(other, literal, left.hir_id)?;
+                return Ok(LocalType::LiteralVariable(other));
             }
 
             let right_type = self

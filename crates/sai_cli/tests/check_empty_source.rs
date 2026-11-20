@@ -5028,6 +5028,10 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn merge_annotated() -> I8 {\n    var a = 1\n    var b = 2\n    let sum: I8 = a + b\n    sum\n}\n",
         "pub fn merge_bit_or() -> I32 {\n    var a = 1\n    var b = 2\n    let bits = a | b\n    bits\n}\n",
         "pub fn merge_remainder() -> I32 {\n    var a = 9\n    var b = 4\n    let rem = a % b\n    rem\n}\n",
+        "pub fn literal_left_rem() -> I32 {\n    var x = 4\n    let rem = 1 % x\n    rem\n}\n",
+        "pub fn literal_left_wrap() -> I32 {\n    var x = 2\n    let wrapped = 1 +% x\n    wrapped\n}\n",
+        "pub fn literal_left_bit() -> I32 {\n    var x = 3\n    let bits = 1 & x\n    bits\n}\n",
+        "pub fn literal_left_wrap_unresolved() -> I32 {\n    let one = 1\n    let result = 1 +% one\n    result\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -9260,7 +9264,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn wrapping_float_left_literal(right: I32) -> I32 {\n    let result = 1.0 +% right\n    result\n}\n",
         "pub fn wrapping_float_literal_right(left: I32) -> I32 {\n    let result = left +% 1.0\n    result\n}\n",
         "pub fn wrapping_integer_literal_non_integer_path(left: F32) -> F32 {\n    let result = left +% 1\n    result\n}\n",
-        "pub fn wrapping_left_unresolved_local(right: I32) -> I32 {\n    let one = 1\n    let result = 1 +% one\n    result\n}\n",
         "pub fn wrapping_left_nested(right: I32) -> I32 {\n    let result = (1 +% right) +% right\n    result\n}\n",
         "pub fn wrapping_nested(left: I32, right: I32) -> I32 {\n    let result = left +% (right +% left)\n    result\n}\n",
         "type IntegerAlias = I32\npub fn wrapping_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left +% right\n    result\n}\n",
@@ -10268,6 +10271,7 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose() -> Bool { var a = true\n    var b = false\n    a + b\n }\n",
         "pub fn choose() -> F64 { var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n }\n",
         "pub fn choose() -> I32 { var a = 0\n    var b = 0\n    a += b\n    b += a\n    a\n }\n",
+        "pub fn choose() -> I32 { var x = 0.5\n    let rem = 1 % x\n    rem\n }\n",
         "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 1.0 }\n x }\n",
         "pub fn choose(flag: Bool, a: I32) -> I32 { let x = if flag { 1 } else { a }\n x }\n",
         "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, 1 => 2, _ => 3 }\n x }\n",
