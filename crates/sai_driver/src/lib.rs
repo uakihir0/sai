@@ -76715,11 +76715,11 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [2, 10] {
+        for index in [2, 8, 10] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
-                    .expect("repeated and three-parameter conditions are checked"),
+                    .expect("repeated, not-operand and three-parameter conditions are checked"),
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
@@ -76737,7 +76737,7 @@ property "shared"() {}
                 .expect("a Bool literal operand in a conjunction is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [3, 5, 6, 7, 8, 11, 12] {
+        for index in [3, 5, 6, 7, 11, 12] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -76956,6 +76956,11 @@ property "shared"() {}
             "pub fn wrong_bool_type(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn extra_parameter(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn nested_range(enabled: Bool, value: I8) -> I32 { if enabled and (value > 0 and value < 300) { 1 } else { 2 } }\n",
+            "pub fn not_operand_path(enabled: Bool, value: I32) -> I32 { if not enabled and value >= 18 { 1 } else { 2 } }\n",
+            "pub fn not_operand_nested(enabled: Bool, value: I32) -> I32 { if enabled and not (value > 0 and value < 10) { 1 } else { 2 } }\n",
+            "pub fn not_operand_disjunction(enabled: Bool, value: I32) -> I32 { if enabled or not (value > 0 or value < 10) { 1 } else { 2 } }\n",
+            "pub fn not_operand_mismatch(enabled: Bool, value: I32) -> I32 { if enabled and not (enabled >= 18) { 1 } else { 2 } }\n",
+            "pub fn not_not_operand(enabled: Bool, value: I32) -> I32 { if not not enabled and value >= 18 { 1 } else { 2 } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -76971,7 +76976,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 28);
+        assert_eq!(owners.len(), 33);
 
         for index in 0..13 {
             let check = owners[index]
@@ -76982,7 +76987,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the mixed condition slice: {check:?}"
             );
         }
-        for index in [14, 15, 16, 26] {
+        for index in [13, 14, 15, 16, 17, 26, 28, 29, 30, 32] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a nested logical or extra-parameter condition is checked");
@@ -76991,7 +76996,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the nested operand slice: {check:?}"
             );
         }
-        for index in [25] {
+        for index in [25, 31] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a non-Bool operand inside a nested logical condition is diagnosed");
@@ -77024,7 +77029,7 @@ property "shared"() {}
                 "function owner {index} should report one comparison mismatch: {check:?}"
             );
         }
-        for index in [13, 17, 22, 23, 24] {
+        for index in [22, 23, 24] {
             let check = owners[index]
                 .body_type_check()
                 .expect("unsupported nested condition form is gated");
