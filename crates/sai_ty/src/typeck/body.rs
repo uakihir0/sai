@@ -3676,12 +3676,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
         let shape_is_supported = match operator {
             BinOp::And | BinOp::Or => {
-                self.error_tainted_logical_operand_shape(left, &is_path_or_unknown_field, &is_literal)
-                    && self.error_tainted_logical_operand_shape(
-                        right,
-                        &is_path_or_unknown_field,
-                        &is_literal,
-                    )
+                self.error_tainted_logical_operand_shape(
+                    left,
+                    &is_path_or_unknown_field,
+                    &is_literal,
+                ) && self.error_tainted_logical_operand_shape(
+                    right,
+                    &is_path_or_unknown_field,
+                    &is_literal,
+                )
             }
             BinOp::Shl | BinOp::Shr => {
                 let supported_left_literal = matches!(
@@ -3826,9 +3829,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     fn error_tainted_clean_logical_operand(&self, operand: &Expr<'hir>) -> bool {
         match operand.kind {
             ExprKind::Lit(Lit::Bool(_)) => true,
-            ExprKind::Unary(UnOp::Not, inner) => {
-                self.error_tainted_clean_logical_operand(inner)
-            }
+            ExprKind::Unary(UnOp::Not, inner) => self.error_tainted_clean_logical_operand(inner),
             ExprKind::Binary(inner_operator, left, right)
                 if matches!(inner_operator, BinOp::And | BinOp::Or) =>
             {
