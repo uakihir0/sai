@@ -2190,13 +2190,27 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 _ => return Err(()),
             }
         } else {
-            let local_type = self
-                .check_local_path(left)
-                .ok()
-                .and_then(|local_type| self.concrete_local_type(local_type))
-                .filter(|primitive| supports_primitive_literal(*primitive))
-                .ok_or(())?;
-            LocalType::Concrete(local_type)
+            // `x << count` keeps an unresolved integer literal variable as
+            // the result — the variable resolves through an annotation or
+            // the function tail, like `x % 1`.
+            match self.check_local_path(left) {
+                Ok(local_type @ LocalType::LiteralVariable(id))
+                    if self.literal_variables.get(id).is_some_and(|v| {
+                        v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
+                    }) =>
+                {
+                    local_type
+                }
+                _ => {
+                    let local_type = self
+                        .check_local_path(left)
+                        .ok()
+                        .and_then(|local_type| self.concrete_local_type(local_type))
+                        .filter(|primitive| supports_primitive_literal(*primitive))
+                        .ok_or(())?;
+                    LocalType::Concrete(local_type)
+                }
+            }
         };
 
         if let ExprKind::Lit(literal) = right.kind {
@@ -2208,12 +2222,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             self.check_annotated_literal(PrimTy::U32, literal, kind, right.hir_id);
         } else {
-            let right_type = self
-                .check_local_path(right)
-                .ok()
-                .and_then(|local_type| self.concrete_local_type(local_type))
-                .filter(|primitive| supports_primitive_literal(*primitive))
-                .ok_or(())?;
+            // `x << c` resolves an unresolved integer literal-variable
+            // count to U32 — the shift count's required type — like an
+            // annotated `U32` local.
+            let right_type = match self.check_local_path(right) {
+                Ok(LocalType::LiteralVariable(id))
+                    if self.literal_variables.get(id).is_some_and(|v| {
+                        v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
+                    }) =>
+                {
+                    self.resolve_literal_variable(id, PrimTy::U32)?;
+                    PrimTy::U32
+                }
+                _ => self
+                    .check_local_path(right)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                    .filter(|primitive| supports_primitive_literal(*primitive))
+                    .ok_or(())?,
+            };
             if right_type != PrimTy::U32 {
                 self.errors.push(PrimitiveBodyError {
                     node: right.hir_id,
