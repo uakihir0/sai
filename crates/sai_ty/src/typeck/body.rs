@@ -2501,17 +2501,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(LocalType::Concrete(self.input.return_type))
     }
 
-    // `if` branches are checked tail-first through `check_expr` rather than
-    // `check_block`'s empty-statement gate, which deliberately excludes plain
-    // `Path` tails (flat path tails belong to the direct-parameter slice).
+    // Empty `if` branches are checked tail-first through `check_expr` rather
+    // than `check_block`'s empty-statement gate, which deliberately excludes
+    // plain `Path` tails (flat path tails belong to the direct-parameter
+    // slice). Statement-bearing branches reuse `check_block` directly so
+    // their `let` bindings follow the same boundary as the outer block.
     fn check_if_branch(&mut self, block: &'hir Block<'hir>) -> Result<(), ()> {
-        if block.safety != Safety::Safe || !block.stmts.is_empty() {
-            return Err(());
+        if block.stmts.is_empty() {
+            if block.safety != Safety::Safe {
+                return Err(());
+            }
+            let Some(tail) = block.tail else {
+                return Err(());
+            };
+            self.check_expr(tail)
+        } else {
+            self.check_block(block)
         }
-        let Some(tail) = block.tail else {
-            return Err(());
-        };
-        self.check_expr(tail)
     }
 
     fn check_if_condition(&mut self, condition: &'hir Expr<'hir>) -> Result<(), ()> {
