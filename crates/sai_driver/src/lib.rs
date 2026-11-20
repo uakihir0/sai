@@ -77120,6 +77120,9 @@ property "shared"() {}
             "pub fn nonplace_target() -> I32 {\n    var x: I32 = 0\n    x + 1 = 5\n    x\n}\n",
             "pub fn rhs_mismatch() -> I32 {\n    var x: I32 = 0\n    x = true\n    x\n}\n",
             "pub fn unannotated_literal_var() -> I32 {\n    var x = 1\n    x = 2\n    x\n}\n",
+            "pub fn literal_var_path_rhs(value: I32) -> I32 {\n    var x = 1\n    x = value\n    x\n}\n",
+            "pub fn literal_var_float_rhs() -> I32 {\n    var x = 1\n    x = 2.5\n    x\n}\n",
+            "pub fn literal_var_second_literal() -> I32 {\n    var x = 1\n    x = 2\n    x = 3\n    x\n}\n",
             "pub fn compound() -> I32 {\n    var x: I32 = 0\n    x += 5\n    x\n}\n",
             "pub fn unbound_target() -> I32 {\n    missing = 5\n    0\n}\n",
             "pub fn call_rhs() -> I32 {\n    var x: I32 = 0\n    let seed: I32 = 4\n    x = identity(seed)\n    x\n}\n",
@@ -77139,7 +77142,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 16);
+        assert_eq!(owners.len(), 19);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77179,16 +77182,16 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
-        for index in [12, 14, 15] {
+        for index in [11, 12, 15, 17, 18] {
             let check = owners[index]
                 .body_type_check()
-                .expect("compound and call assignments are checked");
+                .expect("literal-var, compound and call assignments are checked");
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {index} unexpectedly failed: {check:?}"
             );
         }
-        for index in [11, 13] {
+        for index in [13, 14, 16] {
             assert!(
                 matches!(
                     owners[index]

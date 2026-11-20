@@ -10441,6 +10441,8 @@ fn public_assign_statements_emit_check_results() {
         "pub fn run() -> I32 { var total: I32 = 0\n    total += 1\n    total\n }\n",
         "pub fn run(left: I32, right: I32) -> I32 { var total: I32 = 0\n    total += left\n    total -= right\n    total\n }\n",
         "pub fn run(left: I32) -> I32 { var total: I32 = 1\n    total <<= 4\n    total |= left\n    total\n }\n",
+        "pub fn run() -> I32 { var total = 0\n    total = 1\n    total\n }\n",
+        "pub fn run(value: I32) -> I32 { var total = 0\n    total = value\n    total\n }\n",
         "pub fn run(var total: I32) -> I32 { total = 1\n    total\n }\n",
         "pub fn run(var total: I32, left: I32) -> I32 { total += left\n    total\n }\n",
     ] {
@@ -10482,7 +10484,6 @@ fn unsupported_var_forms_remain_gated() {
     for source in [
         "pub fn run(var value: I32) -> I32 { value\n }\n",
         "pub fn run() -> I32 { var total = 0\n    total += 1\n    total\n }\n",
-        "pub fn run() -> I32 { var total = 0\n    total = 1\n    total\n }\n",
         "pub fn run() -> I32 { var total: I32 = 0\n    missing = 1\n    total\n }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);

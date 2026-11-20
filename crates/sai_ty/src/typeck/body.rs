@@ -2364,7 +2364,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// gated (`Err`), a non-place target pushes `INVALID_ASSIGN_TARGET` and
     /// returns `Ok(None)`, and an immutable target pushes `ASSIGN_TO_IMMUTABLE`
     /// while still returning the place so the right side is checked too.
-    fn assign_place(&mut self, lhs: &Expr<'hir>) -> Result<Option<(PrimTy,)>, ()> {
+    fn assign_place(&mut self, lhs: &Expr<'hir>) -> Result<Option<(LocalType,)>, ()> {
         let ExprKind::Path(_) = lhs.kind else {
             return match lhs.kind {
                 ExprKind::Field { .. }
@@ -2386,25 +2386,65 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let Some(local_type) = self.known_bindings.get(&binding).copied() else {
             return Err(());
         };
-        let LocalType::Concrete(place_type) = local_type else {
+        if !matches!(
+            local_type,
+            LocalType::Concrete(_) | LocalType::LiteralVariable(_)
+        ) {
             return Err(());
-        };
+        }
         if !self.mutable_bindings.contains(&binding) {
             self.errors.push(PrimitiveBodyError {
                 node: lhs.hir_id,
                 kind: PrimitiveBodyErrorKind::AssignToImmutable,
             });
         }
-        Ok(Some((place_type,)))
+        Ok(Some((local_type,)))
     }
 
+    /// Simple assignment `place = e`. A concrete place checks `e` at the
+    /// coercion site to the place type. An unannotated literal `var` place
+    /// (`var x = 1; x = 2`) keeps the binding's shared literal variable: a
+    /// literal right side joins it as an additional literal site, and a
+    /// concretely typed right side resolves the variable at the assignment.
     fn check_assign_stmt(&mut self, lhs: &Expr<'hir>, rhs: &Expr<'hir>) -> Result<(), ()> {
         let Some((place_type,)) = self.assign_place(lhs)? else {
             return Ok(());
         };
-        self.check_initializer_value(rhs, Some(place_type))?;
-        self.record_expression_type(lhs.hir_id, LocalType::Concrete(place_type));
-        Ok(())
+        match place_type {
+            LocalType::Concrete(place_type) => {
+                self.check_initializer_value(rhs, Some(place_type))?;
+                self.record_expression_type(lhs.hir_id, LocalType::Concrete(place_type));
+                Ok(())
+            }
+            LocalType::LiteralVariable(id) => {
+                if let ExprKind::Lit(literal) = rhs.kind {
+                    let Some(variable) = self.literal_variables.get(id) else {
+                        return Err(());
+                    };
+                    match variable.kind {
+                        PrimitiveLiteralKind::Integer => {
+                            self.add_integer_literal_constraint(id, literal, rhs.hir_id)?;
+                        }
+                        PrimitiveLiteralKind::FloatingPoint => {
+                            self.add_float_literal_constraint(id, literal, rhs.hir_id)?;
+                        }
+                        PrimitiveLiteralKind::Bool
+                        | PrimitiveLiteralKind::Byte
+                        | PrimitiveLiteralKind::Character => return Err(()),
+                    }
+                    self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
+                } else {
+                    let check = self.check_initializer_value(rhs, None)?;
+                    let LocalType::Concrete(found) = check.local_type else {
+                        return Err(());
+                    };
+                    self.check_annotated_path(LocalType::LiteralVariable(id), found, rhs.hir_id)?;
+                }
+                self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+                Ok(())
+            }
+            _ => Err(()),
+        }
     }
 
     /// `place op= e` desugars to `{ let t = e; place = place op t }`
@@ -2420,6 +2460,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     ) -> Result<(), ()> {
         let Some((place_type,)) = self.assign_place(lhs)? else {
             return Ok(());
+        };
+        // Compound assignment still requires a concrete place type —
+        // `var x = 1; x += 2` needs the operation over an unresolved
+        // literal variable, which stays gated for now.
+        let LocalType::Concrete(place_type) = place_type else {
+            return Err(());
         };
         let result = match op {
             BinOp::Add
