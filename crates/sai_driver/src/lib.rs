@@ -78182,6 +78182,14 @@ property "shared"() {}
             "pub fn while_if_tail(running: Bool, stop: Bool) -> I32 {\n    while running { if stop { break } }\n    0\n}\n",
             "pub fn loop_inner_literal_var() -> I32 {\n    var x = 2\n    loop { var n = 1\n n += x\n break }\n    x\n}\n",
             "pub fn label_shadowed() -> I32 {\n    'a: loop { 'a: loop { break }\n break }\n    0\n}\n",
+            "pub fn break_value_loop_path() -> I32 {\n    var n: I32 = 0\n    loop { n = n + 1\n break n }\n    n\n}\n",
+            "pub fn break_value_loop_pair(flag: Bool) -> I32 {\n    loop { if flag { break 1 } else { break 2 } }\n    0\n}\n",
+            "pub fn break_value_labeled() -> I32 {\n    'outer: loop { loop { break 'outer 5 }\n break 'outer 6 }\n    0\n}\n",
+            "pub fn break_value_loop_mismatch() -> I32 {\n    loop { break 1\n break true }\n    0\n}\n",
+            "pub fn break_then_bare() -> I32 {\n    loop { break 1\n break }\n    0\n}\n",
+            "pub fn bare_then_break() -> I32 {\n    loop { break\n break 1 }\n    0\n}\n",
+            "pub fn break_value_unbound() -> I32 {\n    loop { break missing }\n    0\n}\n",
+            "pub fn break_value_if(flag: Bool) -> I32 {\n    loop { break if flag { 1 } else { 2 } }\n    0\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78197,9 +78205,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 17);
+        assert_eq!(owners.len(), 25);
 
-        for index in [0, 1, 2, 3, 4, 5, 13, 14, 15] {
+        for index in [0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a loop statement is checked");
@@ -78215,6 +78223,9 @@ property "shared"() {}
             (9, sai_diagnostics::Code::UndeclaredLabel),
             (10, sai_diagnostics::Code::InvalidBreakValue),
             (16, sai_diagnostics::Code::LabelShadowed),
+            (20, sai_diagnostics::Code::TypeMismatch),
+            (21, sai_diagnostics::Code::InvalidBreakValue),
+            (22, sai_diagnostics::Code::InvalidBreakValue),
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78225,7 +78236,7 @@ property "shared"() {}
                 "function owner {index} must report {code:?}: {check:?}"
             );
         }
-        for index in [11, 12] {
+        for index in [12, 23, 24] {
             let check = owners[index]
                 .body_type_check()
                 .expect("an out-of-slice loop form is gated");
