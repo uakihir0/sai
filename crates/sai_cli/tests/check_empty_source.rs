@@ -5032,6 +5032,9 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn literal_left_wrap() -> I32 {\n    var x = 2\n    let wrapped = 1 +% x\n    wrapped\n}\n",
         "pub fn literal_left_bit() -> I32 {\n    var x = 3\n    let bits = 1 & x\n    bits\n}\n",
         "pub fn literal_left_wrap_unresolved() -> I32 {\n    let one = 1\n    let result = 1 +% one\n    result\n}\n",
+        "pub fn literal_var_shift_left(count: U32) -> I32 {\n    var x = 1\n    let r = x << count\n    r\n}\n",
+        "pub fn literal_var_shift_count(value: I32) -> I32 {\n    var c = 4\n    let r = value << c\n    r\n}\n",
+        "pub fn literal_var_shift_pair() -> I32 {\n    var x = 1\n    var c = 2\n    let r = x << c\n    r\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10272,6 +10275,8 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose() -> F64 { var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n }\n",
         "pub fn choose() -> I32 { var a = 0\n    var b = 0\n    a += b\n    b += a\n    a\n }\n",
         "pub fn choose() -> I32 { var x = 0.5\n    let rem = 1 % x\n    rem\n }\n",
+        "pub fn choose(value: I32) -> I32 { var c = 0.5\n    let r = value << c\n    r\n }\n",
+        "pub fn choose() -> I32 { var x = 0.5\n    var c = 1\n    let r = x << c\n    r\n }\n",
         "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 1.0 }\n x }\n",
         "pub fn choose(flag: Bool, a: I32) -> I32 { let x = if flag { 1 } else { a }\n x }\n",
         "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, 1 => 2, _ => 3 }\n x }\n",

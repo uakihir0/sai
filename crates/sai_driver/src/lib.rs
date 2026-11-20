@@ -57361,8 +57361,6 @@ property "shared"() {}
             "shift_generic_target_unsupported",
             "shift_forward_local_unsupported",
             "shift_deep_nested_call_unsupported",
-            "shift_unresolved_local_unsupported",
-            "shift_unresolved_left_local_unsupported",
             "shift_integer_literal_rhs_computed_lhs_unsupported",
             "shift_integer_literal_rhs_computed_unsupported",
             "shift_integer_literal_rhs_unary_computed_unsupported",
@@ -57386,13 +57384,11 @@ property "shared"() {}
             "shift_integer_literal_lhs_deep_nested_unsupported",
             "shift_integer_literal_lhs_generic_target_unsupported",
             "shift_integer_literal_lhs_unsupported_signature",
-            "shift_integer_literal_lhs_unresolved_path_unsupported",
             "shift_integer_literal_lhs_forward_path_unsupported",
             "shift_integer_literal_lhs_self_path_unsupported",
             "shift_integer_literal_lhs_global_path_unsupported",
             "shift_byte_literal_lhs_computed_rhs_unsupported",
             "shift_byte_literal_lhs_computed_left_unsupported",
-            "shift_byte_literal_lhs_unresolved_count_unsupported",
             "shift_byte_literal_lhs_self_count_unsupported",
             "shift_byte_literal_lhs_forward_count_unsupported",
             "shift_byte_literal_lhs_deep_nested_unsupported",
@@ -57510,6 +57506,28 @@ property "shared"() {}
         // `1 & right` joins the literal as a constraint site on the
         // unresolved literal variable — the `apply_i32` parameter resolves
         // the group to I32.
+        // Literal-variable shift operands now join: unresolved integer
+        // literal-variable counts resolve to U32 and literal-variable left
+        // operands keep the shift result unresolved.
+        for name in [
+            "shift_unresolved_local_unsupported",
+            "shift_unresolved_left_local_unsupported",
+            "shift_integer_literal_lhs_unresolved_path_unsupported",
+            "shift_byte_literal_lhs_unresolved_count_unsupported",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("literal-variable shift shape is checked"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ),
+                "literal-variable shift `{name}` is supported: {:?}",
+                owner.body_type_check()
+            );
+        }
+
         let literal_left_var_owner = owner_named(
             &database,
             &resolved,
@@ -76908,7 +76926,6 @@ property "shared"() {}
             "pub fn nested_bit_not(left: I32) -> I32 {\n    let value = ~(~left)\n    value\n}\n",
             "pub fn shift_literal_pair() -> I32 {\n    let value = 1 << 2\n    value\n}\n",
             "pub fn aliased_shift_count(amount: ShiftCount) -> I32 {\n    let value = 1 << amount\n    value\n}\n",
-            "pub fn unresolved_shift_count() -> I32 {\n    let amount = 1\n    let value = 1 << amount\n    value\n}\n",
             "pub fn self_referenced_shift_count() -> I32 {\n    let value = 1 << value\n    value\n}\n",
             "pub fn forward_shift_count() -> I32 {\n    let value = 1 << future\n    let future: U32 = 1\n    value\n}\n",
             "pub fn self_reference(left: I32) -> I32 {\n    let value = value & left\n    value\n}\n",
@@ -76928,7 +76945,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 83);
+        assert_eq!(resolved.owners().len(), 82);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
@@ -77674,6 +77691,11 @@ property "shared"() {}
             "pub fn literal_var_lhs_wrap() -> I32 {\n    var x = 2\n    let r = 1 +% x\n    r\n}\n",
             "pub fn literal_var_lhs_bit() -> I32 {\n    var x = 3\n    let b = 1 & x\n    b\n}\n",
             "pub fn literal_var_lhs_rem_float() -> I32 {\n    var x = 0.5\n    let r = 1 % x\n    r\n}\n",
+            "pub fn literal_var_shift_left(count: U32) -> I32 {\n    var x = 1\n    let r = x << count\n    r\n}\n",
+            "pub fn literal_var_shift_count(value: I32) -> I32 {\n    var c = 4\n    let r = value << c\n    r\n}\n",
+            "pub fn literal_var_shift_pair() -> I32 {\n    var x = 1\n    var c = 2\n    let r = x << c\n    r\n}\n",
+            "pub fn literal_var_shift_left_float() -> I32 {\n    var x = 0.5\n    var c = 1\n    let r = x << c\n    r\n}\n",
+            "pub fn literal_var_shift_count_float(value: I32) -> I32 {\n    var c = 0.5\n    let r = value << c\n    r\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77689,7 +77711,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 64);
+        assert_eq!(owners.len(), 69);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77760,7 +77782,7 @@ property "shared"() {}
         }
         for index in [
             23, 25, 26, 27, 28, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49,
-            51, 52, 55, 58, 60, 61, 62,
+            51, 52, 55, 58, 60, 61, 62, 64, 65, 66,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -77770,7 +77792,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
-        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 57, 63] {
+        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 57, 63, 67, 68] {
             assert!(
                 matches!(
                     owners[index]
