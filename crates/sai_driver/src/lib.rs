@@ -8053,8 +8053,10 @@ fn check_inherent_method_body_type(
     let mut unknown_self_fields = HashSet::new();
     let mut diagnostics = Vec::new();
     for stmt in method_block.stmts {
-        let StmtKind::Let { init, .. } = stmt.kind else {
-            continue;
+        let init = match stmt.kind {
+            StmtKind::Let { init, .. } => init,
+            StmtKind::Assign { rhs, .. } | StmtKind::AssignOp { rhs, .. } => rhs,
+            _ => continue,
         };
         match init.kind {
             ExprKind::Field { .. } => {
@@ -10674,12 +10676,13 @@ fn direct_primitive_call_sites(
         }
     };
     for statement in block.stmts {
-        let init = match statement.kind {
+        let expression = match statement.kind {
             StmtKind::Let { init, .. } | StmtKind::Expr(init) => init,
+            StmtKind::Assign { rhs, .. } | StmtKind::AssignOp { rhs, .. } => rhs,
             _ => continue,
         };
-        if matches!(init.kind, ExprKind::Call { .. }) {
-            index_root_and_one_level_arguments(init);
+        if matches!(expression.kind, ExprKind::Call { .. }) {
+            index_root_and_one_level_arguments(expression);
         }
     }
     if let Some(tail) = block.tail
@@ -77057,6 +77060,8 @@ property "shared"() {}
             "pub fn unannotated_literal_var() -> I32 {\n    var x = 1\n    x = 2\n    x\n}\n",
             "pub fn compound() -> I32 {\n    var x: I32 = 0\n    x += 1\n    x\n}\n",
             "pub fn unbound_target() -> I32 {\n    missing = 5\n    0\n}\n",
+            "pub fn call_rhs() -> I32 {\n    var x: I32 = 0\n    let seed: I32 = 4\n    x = identity(seed)\n    x\n}\n",
+            "pub fn identity(value: I32) -> I32 {\n    value\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77072,7 +77077,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 14);
+        assert_eq!(owners.len(), 16);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77121,6 +77126,15 @@ property "shared"() {}
                     FunctionBodyTypeCheck::Unsupported
                 ),
                 "function owner {index} should remain gated"
+            );
+        }
+        for index in [14, 15] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("an assignment whose right side is a direct call is checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the call right-hand side slice: {check:?}"
             );
         }
     }

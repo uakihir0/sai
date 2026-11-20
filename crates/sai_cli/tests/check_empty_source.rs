@@ -10429,6 +10429,7 @@ fn public_assign_statements_emit_check_results() {
         "pub fn run(left: I32, right: I32) -> I32 { var total: I32 = 0\n    total = left + right\n    total\n }\n",
         "pub fn run(flag: Bool, other: Bool) -> Bool { var enabled: Bool = false\n    enabled = flag and other\n    enabled\n }\n",
         "pub fn run(flag: Bool) -> I32 { var total: I32 = 0\n    if flag { total = 1\n    total } else { total = 2\n    total }\n }\n",
+        "type Counter { marker: I32 }\nimpl Counter {\n    pub fn run(self: borrow Self) -> I32 {\n        var total: I32 = 0\n        total = self.marker\n        total\n    }\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }

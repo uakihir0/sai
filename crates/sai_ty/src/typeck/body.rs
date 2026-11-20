@@ -4369,7 +4369,10 @@ fn collect_primitive_block_nodes<'hir>(
                     collect_primitive_expression_nodes(msg, nodes);
                 }
             }
-            _ => continue,
+            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                collect_primitive_expression_nodes(lhs, nodes);
+                collect_primitive_expression_nodes(rhs, nodes);
+            }
         };
     }
     if let Some(tail) = block.tail {
