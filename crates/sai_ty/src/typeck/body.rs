@@ -539,6 +539,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if let StmtKind::Expr(expression) = stmt.kind {
             return self.check_expr_stmt(expression);
         }
+        if let StmtKind::Assert { cond, msg, .. } = stmt.kind {
+            // `assert` conditions take the same Bool-condition gate as `if`,
+            // and the optional message is a `Str` literal per N-C-20.
+            self.check_if_condition(cond)?;
+            if let Some(msg) = msg {
+                if !matches!(msg.kind, ExprKind::Lit(Lit::Str(_))) {
+                    return Err(());
+                }
+            }
+            return Ok(());
+        }
         let StmtKind::Let {
             pat,
             ty,
@@ -4266,11 +4277,18 @@ fn collect_primitive_block_nodes<'hir>(
     nodes: &mut HashMap<HirId, Expr<'hir>>,
 ) {
     for stmt in block.stmts {
-        let init = match stmt.kind {
-            StmtKind::Let { init, .. } | StmtKind::Expr(init) => init,
+        match stmt.kind {
+            StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
+                collect_primitive_expression_nodes(init, nodes)
+            }
+            StmtKind::Assert { cond, msg, .. } => {
+                collect_primitive_expression_nodes(cond, nodes);
+                if let Some(msg) = msg {
+                    collect_primitive_expression_nodes(msg, nodes);
+                }
+            }
             _ => continue,
         };
-        collect_primitive_expression_nodes(init, nodes);
     }
     if let Some(tail) = block.tail {
         collect_primitive_expression_nodes(tail, nodes);
@@ -4392,6 +4410,23 @@ fn block_has_primitive_result_taint(
             local_paths,
             tainted_bindings,
         ),
+        StmtKind::Assert { cond, msg, .. } => {
+            expression_has_primitive_result_taint(
+                cond,
+                error_nodes,
+                unknown_self_fields,
+                local_paths,
+                tainted_bindings,
+            ) || msg.is_some_and(|msg| {
+                expression_has_primitive_result_taint(
+                    msg,
+                    error_nodes,
+                    unknown_self_fields,
+                    local_paths,
+                    tainted_bindings,
+                )
+            })
+        }
         _ => false,
     }) || block.tail.is_some_and(|tail| {
         expression_has_primitive_result_taint(
