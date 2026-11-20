@@ -3328,21 +3328,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match operator {
             BinOp::And | BinOp::Or => {
                 for operand in [left, right] {
-                    if let Some(operand_type) = self.known_recovery_operand_type(operand) {
-                        match primitive_bool_operand_result(operand_type) {
-                            PrimitiveBoolOperandResult::Bool => {}
-                            PrimitiveBoolOperandResult::TypeMismatch { found } => {
-                                self.errors.push(PrimitiveBodyError {
-                                    node: operand.hir_id,
-                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                        expected: PrimTy::Bool,
-                                        found,
-                                    },
-                                });
-                            }
-                            PrimitiveBoolOperandResult::Unsupported => return Err(()),
-                        }
-                    }
+                    self.check_error_tainted_logical_operand(operand)?;
                 }
             }
             BinOp::Shl | BinOp::Shr => {
@@ -3851,12 +3837,73 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 };
                 comparable(left) && comparable(right)
             }
-            _ => self.known_recovery_operand_type(operand).is_some_and(|ty| {
-                !matches!(
+            _ => match self.known_recovery_operand_type(operand) {
+                Some(ty) => !matches!(
                     primitive_bool_operand_result(ty),
                     PrimitiveBoolOperandResult::Unsupported
-                )
-            }),
+                ),
+                None => false,
+            },
+        }
+    }
+
+    // Diagnostics for operands of an error-tainted `and`/`or`, mirroring the
+    // primary `check_logical`/`check_comparison` diag for each nested leaf the
+    // early-returning primary checker never reached.
+    fn check_error_tainted_logical_operand(&mut self, operand: &Expr<'hir>) -> Result<(), ()> {
+        match operand.kind {
+            ExprKind::Lit(Lit::Bool(_)) => Ok(()),
+            ExprKind::Unary(UnOp::Not, inner) => self.check_error_tainted_logical_operand(inner),
+            ExprKind::Binary(inner_operator, left, right)
+                if matches!(inner_operator, BinOp::And | BinOp::Or) =>
+            {
+                self.check_error_tainted_logical_operand(left)?;
+                self.check_error_tainted_logical_operand(right)
+            }
+            ExprKind::Binary(inner_operator, left, right)
+                if matches!(
+                    inner_operator,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                ) =>
+            {
+                let operand_type = |expression: &Expr<'hir>| match expression.kind {
+                    ExprKind::Lit(Lit::Bool(_)) => Some(PrimTy::Bool),
+                    _ => self.known_recovery_operand_type(expression),
+                };
+                if let (Some(left_type), Some(right_type)) =
+                    (operand_type(left), operand_type(right))
+                {
+                    match primitive_comparison_result(inner_operator, left_type, right_type) {
+                        PrimitiveComparisonResult::Bool => {}
+                        PrimitiveComparisonResult::TypeMismatch { expected, found } => {
+                            self.errors.push(PrimitiveBodyError {
+                                node: right.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                            });
+                        }
+                        PrimitiveComparisonResult::Unsupported => return Err(()),
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                if let Some(operand_type) = self.known_recovery_operand_type(operand) {
+                    match primitive_bool_operand_result(operand_type) {
+                        PrimitiveBoolOperandResult::Bool => {}
+                        PrimitiveBoolOperandResult::TypeMismatch { found } => {
+                            self.errors.push(PrimitiveBodyError {
+                                node: operand.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                    expected: PrimTy::Bool,
+                                    found,
+                                },
+                            });
+                        }
+                        PrimitiveBoolOperandResult::Unsupported => return Err(()),
+                    }
+                }
+                Ok(())
+            }
         }
     }
 

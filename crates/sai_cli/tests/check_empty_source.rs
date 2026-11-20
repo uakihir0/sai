@@ -3694,7 +3694,7 @@ fn unknown_direct_self_field_in_nested_logical_initializer_keeps_missing_field_e
         "    pub fn preserve_field_error(self: borrow Self) -> Bool {\n",
         "        let flag: Bool = true\n",
         "        let count: I32 = 1\n",
-        "        let result = self.missing and true\n",
+        "        let result = self.missing and (true and count)\n",
         "        result\n",
         "    }\n",
         "}\n",
@@ -3706,6 +3706,15 @@ fn unknown_direct_self_field_in_nested_logical_initializer_keeps_missing_field_e
         stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
         1,
         "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "a nested operand keeps its own Bool requirement diagnostic:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("expected `Bool`, found `I32`"),
+        "the nested I32 operand reports the Bool requirement:\n{stdout}"
     );
     assert!(
         !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
