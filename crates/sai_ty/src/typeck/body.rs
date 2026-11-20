@@ -587,6 +587,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         );
         let is_supported_return_tail = matches!(tail.kind, ExprKind::Return(..));
+        let is_supported_loop_tail = matches!(
+            tail.kind,
+            ExprKind::Loop {
+                source: LoopSource::Loop,
+                ..
+            }
+        );
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
@@ -596,6 +603,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             && !is_supported_if_tail
             && !is_supported_match_tail
             && !is_supported_return_tail
+            && !is_supported_loop_tail
         {
             return Err(());
         }
@@ -2787,6 +2795,36 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         label: Option<Label>,
         source: LoopSource,
     ) -> Result<(), ()> {
+        self.check_loop_core(hir_id, body, label, source, LoopBreakState::Unfixed)?;
+        Ok(())
+    }
+
+    /// A `loop` in value position: `β` starts at the caller's seed — the
+    /// expected type when one is known (tail / annotated initializer) or
+    /// `Unfixed` for a fresh `β` (unannotated initializer). Returns the
+    /// frame's break state so the caller can bind `τ = β`.
+    fn check_loop_value(
+        &mut self,
+        hir_id: HirId,
+        body: &'hir Block<'hir>,
+        label: Option<Label>,
+        seed: LoopBreakState,
+    ) -> Result<LoopBreakState, ()> {
+        self.check_loop_core(hir_id, body, label, LoopSource::Loop, seed)
+    }
+
+    /// Shared body checking for statement- and value-position loops: the
+    /// label-shadow diagnostic, the frame's lifetime across the body's
+    /// statements and tail, and the body's literal defaulting once the
+    /// frame is popped.
+    fn check_loop_core(
+        &mut self,
+        hir_id: HirId,
+        body: &'hir Block<'hir>,
+        label: Option<Label>,
+        source: LoopSource,
+        break_state: LoopBreakState,
+    ) -> Result<LoopBreakState, ()> {
         if body.safety != Safety::Safe {
             return Err(());
         }
@@ -2808,7 +2846,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         self.loop_stack.push(LoopFrame {
             label: label.map(|label| label.name),
             source,
-            break_state: LoopBreakState::Unfixed,
+            break_state,
         });
         let literal_floor = self.literal_variables.len();
         let result = (|| {
@@ -2829,10 +2867,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 },
             }
         })();
-        self.loop_stack.pop();
+        let frame = self.loop_stack.pop();
         result?;
         self.default_unresolved_literals(literal_floor);
-        Ok(())
+        Ok(frame
+            .map(|frame| frame.break_state)
+            .unwrap_or(LoopBreakState::Unfixed))
     }
 
     /// `break` targets the innermost loop, or the innermost loop carrying
@@ -2991,7 +3031,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// shapes (the function's return type is passed as an inert stand-in).
     fn check_break_value(&mut self, value: &'hir Expr<'hir>) -> Result<LocalType, ()> {
         match value.kind {
-            ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::Return(..) => {
+            ExprKind::If { .. }
+            | ExprKind::Match { .. }
+            | ExprKind::Return(..)
+            | ExprKind::Loop { .. } => {
                 return Err(());
             }
             ExprKind::Unary(UnOp::BitNot, operand) if matches!(operand.kind, ExprKind::Lit(_)) => {
@@ -3273,6 +3316,28 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // missing-value diagnostic as the statement form.
                 ExprKind::Return(value) => {
                     self.check_return(expression.hir_id, value)?;
+                    LocalType::Concrete(expected)
+                }
+                // A `loop` tail yields the type `break` values fix through
+                // `β` — here `β` is the expected type, so each `break v`
+                // checks `v ⇐ expected` directly (§6.16.1: `β = X` when the
+                // loop has a known expected type). A bare-only loop unifies
+                // `β` with `()` and reports INVALID_BREAK_VALUE — `PrimTy`
+                // has no `()` member to name in a TypeMismatch.
+                ExprKind::Loop {
+                    body,
+                    label,
+                    source,
+                } => {
+                    if source != LoopSource::Loop {
+                        return Err(());
+                    }
+                    self.check_loop_value(
+                        expression.hir_id,
+                        body,
+                        label,
+                        LoopBreakState::Concrete(expected),
+                    )?;
                     LocalType::Concrete(expected)
                 }
                 _ => self.check_local_path(expression)?,
@@ -3691,6 +3756,49 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                     None => self.check_literal_join_match(scrutinee, arms, source)?,
                 },
+                // A `loop` initializer binds `τ = β`: with an annotation
+                // `β` is the annotation and each `break v` checks against
+                // it; without one `β` is fresh and the local joins `β`'s
+                // literal group. `while`/`for` always type `()` and a
+                // bare-only `loop` unifies `β` with `()` — neither can
+                // bind a primitive local.
+                ExprKind::Loop {
+                    body,
+                    label,
+                    source,
+                } => {
+                    if source != LoopSource::Loop {
+                        return Err(());
+                    }
+                    match annotation {
+                        Some(expected) => {
+                            self.check_loop_value(
+                                init.hir_id,
+                                body,
+                                label,
+                                LoopBreakState::Concrete(expected),
+                            )?;
+                            LocalType::Concrete(expected)
+                        }
+                        None => {
+                            match self.check_loop_value(
+                                init.hir_id,
+                                body,
+                                label,
+                                LoopBreakState::Unfixed,
+                            )? {
+                                LoopBreakState::Concrete(found) => LocalType::Concrete(found),
+                                LoopBreakState::LiteralVariable(id) => {
+                                    match self.literal_variable_group_type(id) {
+                                        Some(found) => LocalType::Concrete(found),
+                                        None => LocalType::LiteralVariable(id),
+                                    }
+                                }
+                                LoopBreakState::Unfixed | LoopBreakState::Bare => return Err(()),
+                            }
+                        }
+                    }
+                }
                 ExprKind::Field { .. } => {
                     let Some(field_type) = self
                         .input

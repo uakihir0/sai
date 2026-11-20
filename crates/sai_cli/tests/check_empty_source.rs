@@ -5040,6 +5040,9 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn break_value_loop() -> I32 {\n    loop { break 1 }\n    0\n}\n",
         "pub fn break_value_loop_pair(flag: Bool) -> I32 {\n    loop { if flag { break 1 } else { break 2 } }\n    0\n}\n",
         "pub fn break_value_labeled() -> I32 {\n    'outer: loop { loop { break 'outer 5 }\n break 'outer 6 }\n    0\n}\n",
+        "pub fn loop_tail_break_value() -> I32 {\n    loop { break 1 }\n}\n",
+        "pub fn loop_init_annotated() -> I32 {\n    let x: I32 = loop { break 1 }\n    x\n}\n",
+        "pub fn loop_init_unannotated() -> I64 {\n    let x = loop { break 1 }\n    x\n}\n",
         "pub fn while_stmt(flag: Bool) -> I32 {\n    var n: I32 = 0\n    while flag { n = n + 1 }\n    n\n}\n",
         "pub fn while_empty(flag: Bool) -> I32 {\n    while flag { }\n    0\n}\n",
         "pub fn return_stmt() -> I32 {\n    var x = 1\n    return x\n    0\n}\n",
@@ -20691,7 +20694,8 @@ fn unsupported_direct_function_call_targets_remain_gated() {
 #[test]
 fn unsupported_loop_forms_remain_gated() {
     let source = concat!(
-        "pub fn loop_tail() -> I32 { loop { break } }\n",
+        "pub fn while_init(flag: Bool) -> I32 { let x = while flag { }\n 0 }\n",
+        "pub fn loop_init_bare() -> I32 { let x = loop { break }\n 0 }\n",
         "pub fn break_value_if(flag: Bool) -> I32 { loop { break if flag { 1 } else { 2 } }\n 0 }\n",
     );
     let output = run_check(source, "", &[], &[]);
@@ -20699,7 +20703,7 @@ fn unsupported_loop_forms_remain_gated() {
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert!(
         stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
-        "loop tails and out-of-slice break values stay behind the existing gate:\n{stdout}"
+        "unit-valued loop binds and out-of-slice break values stay behind the existing gate:\n{stdout}"
     );
 }
 
