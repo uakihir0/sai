@@ -9037,7 +9037,7 @@ fn primitive_let_statement_shape_is_supported(
         return false;
     };
     let PatKind::Binding {
-        mode: sai_hir::patterns::BindingMode::Value,
+        mode,
         name,
         binding,
         sub: None,
@@ -9048,11 +9048,14 @@ fn primitive_let_statement_shape_is_supported(
     };
     if !function_name_is_supported(name, symbols, inputs)
         || !matches!(
-            locals.bindings.get(&binding),
-            Some(sai_resolve::owner::LocalBinding {
-                kind: sai_resolve::owner::BindingKind::Let,
-                ..
-            })
+            (locals.bindings.get(&binding).map(|local| local.kind), mode),
+            (
+                Some(sai_resolve::owner::BindingKind::Let),
+                sai_hir::patterns::BindingMode::Value
+            ) | (
+                Some(sai_resolve::owner::BindingKind::Var),
+                sai_hir::patterns::BindingMode::Var
+            )
         )
     {
         return false;
@@ -49381,6 +49384,7 @@ property "shared"() {}
             "}\n",
             "pub fn mutable_source() -> I32 {\n",
             "    var source = 1\n",
+            "    source = 2\n",
             "    let result = -source\n",
             "    result\n",
             "}\n",
@@ -49998,6 +50002,7 @@ property "shared"() {}
             "}\n",
             "pub fn mutable_source() -> I32 {\n",
             "    var source = 1\n",
+            "    source = 2\n",
             "    let result = ~source\n",
             "    result\n",
             "}\n",
@@ -69945,6 +69950,7 @@ property "shared"() {}
             "}\n",
             "pub fn excluded_mutable_source(value: I32) -> I32 {\n",
             "    var source: I32 = value\n",
+            "    source = 0\n",
             "    let result = -source\n",
             "    result\n",
             "}\n",
@@ -76263,9 +76269,9 @@ property "shared"() {}
         let root = concat!(
             "const ONE: I32 = 1\n",
             "type Number = I32\n",
-            "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value\n}\n",
+            "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value = 1\n    value\n}\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
-            "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second: I32 = 2\n    first\n}\n",
+            "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second: I32 = 2\n    second = 3\n    first\n}\n",
             "pub fn raw_copy() -> I32 {\n    let value: I32 = 42\n    let copy: I32 = r#value\n    copy\n}\n",
             "pub fn forward_copy() -> I32 {\n    let first: I32 = second\n    let second: I32 = 2\n    first\n}\n",
             "pub fn self_copy() -> I32 {\n    let value: I32 = value\n    value\n}\n",
@@ -76276,8 +76282,8 @@ property "shared"() {}
             "pub fn unannotated_copy_from_constant() -> I32 {\n    let copy = ONE\n    copy\n}\n",
             "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source % (1 + 0)\n    copy\n}\n",
             "pub fn unannotated_raw_copy() -> I32 {\n    let source: I32 = 42\n    let copy = r#source\n    copy\n}\n",
-            "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = source\n    copy\n}\n",
-            "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    let copy = source\n    copy\n}\n",
+            "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = source\n    copy = 0\n    copy\n}\n",
+            "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    let copy = source\n    copy = 0\n    copy\n}\n",
             "pub fn unannotated_string() -> Str {\n    let value = \"text\"\n    value\n}\n",
             "pub fn destructured() -> I32 {\n    let (first, second): (I32, I32) = (1, 2)\n    first\n}\n",
             "pub fn alias() -> I32 {\n    let value: Number = 42\n    value\n}\n",
@@ -76877,6 +76883,50 @@ property "shared"() {}
                 owners[index]
                     .body_type_check()
                     .expect("unsupported assert form is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_var_declarations() {
+        let root = concat!(
+            "pub fn annotated() -> I32 {\n    var total: I32 = 0\n    total\n}\n",
+            "pub fn unannotated() -> I32 {\n    var total = 0\n    total\n}\n",
+            "pub fn condition(flag: Bool) -> I32 {\n    var enabled: Bool = flag\n    if enabled { 1 } else { 2 }\n}\n",
+            "pub fn initializer(flag: Bool) -> Bool {\n    var enabled: Bool = flag\n    let result = enabled and true\n    result\n}\n",
+            "pub fn var_parameter(var value: I32) -> I32 {\n    value\n}\n",
+            "pub fn reassigned() -> I32 {\n    var total: I32 = 0\n    total = 1\n    total\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 6);
+
+        for index in 0..4 {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("var declarations with supported initializers are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for index in [4, 5] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("var parameters and assignment statements stay gated"),
                 FunctionBodyTypeCheck::Unsupported
             ));
         }

@@ -4701,8 +4701,8 @@ fn unsupported_unannotated_copy_local_forms_remain_gated() {
     for source in [
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = source / (1 / 1)\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = r#source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    var copied = source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    var source: I32 = 42\n    let copied = source\n    copied\n}\n",
+        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    var copied = source\n    copied = 0\n    copied\n}\n",
+        "pub fn copy() -> I32 {\n    var source: I32 = 42\n    let copied = source\n    copied = 0\n    copied\n}\n",
         "const SOURCE: I32 = 42\npub fn copy() -> I32 {\n    let copied = SOURCE\n    copied\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -4992,8 +4992,8 @@ fn unsupported_unannotated_literal_copy_forms_remain_gated() {
         "pub fn copy() -> I32 {\n    let source = 42\n    let copied = r#source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source = 42\n    let copied = source + 1\n    copied\n}\n",
         "const SOURCE: I32 = 42\npub fn copy() -> I32 {\n    let source = 7\n    let copied = SOURCE\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    let source = 42\n    var copied = source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    var source = 42\n    let copied = source\n    copied\n}\n",
+        "pub fn copy() -> I32 {\n    let source = 42\n    var copied = source\n    copied = 0\n    copied\n}\n",
+        "pub fn copy() -> I32 {\n    var source = 42\n    let copied = source\n    copied = 0\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let var source = 42\n    let copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source = 42\n    let var copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let (source, other) = (42, 7)\n    let copied = source\n    copied\n}\n",
@@ -5130,7 +5130,7 @@ fn unsupported_flat_unannotated_primitive_local_forms_remain_gated() {
         "pub fn self_reference() -> I32 {\n    let source = source\n    source\n}\n",
         "pub fn forward_reference() -> I32 {\n    let copied = later\n    let later = 1\n    copied\n}\n",
         "pub fn computed() -> I32 {\n    let source = 1\n    let copied = source + 1\n    copied\n}\n",
-        "pub fn mutable() -> I32 {\n    var source = 1\n    source\n}\n",
+        "pub fn mutable() -> I32 {\n    var source = 1\n    source = 2\n    source\n}\n",
         "pub fn destructured() -> I32 {\n    let (source, other) = (1, 2)\n    source\n}\n",
         "pub fn raw_path() -> I32 {\n    let source = 1\n    let copied = r#source\n    copied\n}\n",
         "pub fn qualified_path() -> I32 {\n    let source = 1\n    let copied = values.VALUE\n    copied\n}\n",
@@ -9260,7 +9260,7 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left * right\n    result\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let result = later * left\n    let later: I32 = 1\n    result\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let result = result - left\n    result\n}\n",
-        "pub fn mutable(left: I32, right: I32) -> I32 {\n    var result = left * right\n    result\n}\n",
+        "pub fn mutable(left: I32, right: I32) -> I32 {\n    var result = left * right\n    result = 0\n    result\n}\n",
         "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let result = first - second\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -9351,7 +9351,7 @@ fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn add(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let sum = left + right\n    sum\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let sum = later + left\n    let later: I32 = 1\n    sum\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let sum = sum + left\n    sum\n}\n",
-        "pub fn add(left: I32, right: I32) -> I32 {\n    var sum = left + right\n    sum\n}\n",
+        "pub fn add(left: I32, right: I32) -> I32 {\n    var sum = left + right\n    sum = 0\n    sum\n}\n",
         "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let sum = first + second\n    sum\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10410,6 +10410,28 @@ fn unsupported_assert_statement_shapes_remain_gated() {
 }
 
 #[test]
+fn public_var_declarations_emit_check_results() {
+    for source in [
+        "pub fn run() -> I32 { var total: I32 = 0\n    total\n }\n",
+        "pub fn run() -> I32 { var total = 0\n    total\n }\n",
+        "pub fn run(flag: Bool) -> I32 { var enabled: Bool = flag\n    if enabled { 1 } else { 2 }\n }\n",
+        "pub fn run(flag: Bool) -> Bool { var enabled: Bool = flag\n    let result = enabled and true\n    result\n }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn unsupported_var_forms_remain_gated() {
+    for source in [
+        "pub fn run(var value: I32) -> I32 { value\n }\n",
+        "pub fn run() -> I32 { var total: I32 = 0\n    total = 1\n    total\n }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_primitive_parameter_comparison_if_functions_emit_check_results() {
     for source in [
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
@@ -11068,10 +11090,10 @@ fn target_filtered_public_name_does_not_report_a_name_error() {
 fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     for source in [
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
-        "pub fn local() -> I32 {\nvar value: I32 = 42\nvalue\n}\n",
+        "pub fn local() -> I32 {\nvar value: I32 = 42\nvalue = 1\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
-        "pub fn local() -> I32 {\nlet first: I32 = 1\nvar second: I32 = 2\nfirst\n}\n",
+        "pub fn local() -> I32 {\nlet first: I32 = 1\nvar second: I32 = 2\nsecond = 3\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % (1 + 0)\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",
