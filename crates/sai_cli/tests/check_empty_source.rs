@@ -10645,7 +10645,6 @@ fn unsupported_zero_parameter_function_shapes_remain_gated() {
     for source in [
         "pub fn answer() { 42 }\n",
         "pub fn answer() -> Byte { b\"text\" }\n",
-        "pub fn answer() -> I32 { 40 + 2 }\n",
         "pub fn answer() -> I32 { let value = 42; value }\n",
         "pub fn answer() -> () { 42 }\n",
         "pub fn answer() -> () { let value = (); }\n",
@@ -10902,7 +10901,6 @@ fn target_filtered_public_name_does_not_report_a_name_error() {
 #[test]
 fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     for source in [
-        "pub fn add(value: I32) -> I32 { value + 1 }\n",
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
         "pub fn local() -> I32 {\nvar value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
@@ -19578,6 +19576,55 @@ fn unary_not_path_tails_remain_behind_the_stage_gate() {
     assert_check_stays_gated_without_syntax_errors(
         &output,
         "unary-not path tails over parameters, locals, and copies",
+    );
+}
+
+#[test]
+fn binary_expression_tails_remain_behind_the_stage_gate() {
+    let source = concat!(
+        "pub fn add_parameters(first: I32, second: I32) -> I32 { first + second }\n",
+        "pub fn sub_literal(value: I32) -> I32 { value - 1 }\n",
+        "pub fn mul_local() -> I16 {\n",
+        "    let source: I16 = 7\n",
+        "    source * 3\n",
+        "}\n",
+        "pub fn rem_local() -> U8 {\n",
+        "    let source: U8 = 10\n",
+        "    source % 3\n",
+        "}\n",
+        "pub fn wrap_local() -> U8 {\n",
+        "    let source: U8 = 200\n",
+        "    source +% 60\n",
+        "}\n",
+        "pub fn bitand_local() -> U8 {\n",
+        "    let source: U8 = 10\n",
+        "    source & 3\n",
+        "}\n",
+        "pub fn shl_local() -> U32 {\n",
+        "    let source: U32 = 4\n",
+        "    source << 2\n",
+        "}\n",
+        "pub fn eq_tail(first: I32, second: I32) -> Bool { first == second }\n",
+        "pub fn lt_tail() -> Bool {\n",
+        "    let source: I64 = 7\n",
+        "    source < 10\n",
+        "}\n",
+        "pub fn and_tail(first: Bool, second: Bool) -> Bool { first and second }\n",
+        "pub fn or_tail(value: Bool) -> Bool { value or false }\n",
+        "pub fn mismatch_tail(first: I32, second: I32) -> Bool { first + second }\n",
+        "pub fn literal_pair_tail() -> I16 {\n",
+        "    let left = 7\n",
+        "    let right = 3\n",
+        "    left * right\n",
+        "}\n",
+        "pub fn nested_tail(first: I32) -> I32 { (first + 1) * 2 }\n",
+        "pub fn call_operand_tail(first: I32) -> I32 { identity_i32(first) + 1 }\n",
+        "fn identity_i32(value: I32) -> I32 { value }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "arithmetic, bitwise, shift, comparison, and logical tails",
     );
 }
 

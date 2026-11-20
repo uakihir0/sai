@@ -8565,6 +8565,7 @@ fn check_function_body_primitive_local_block(
     let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
     let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)));
+    let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8584,6 +8585,7 @@ fn check_function_body_primitive_local_block(
             };
             Some(operand_binding)
         }
+        ExprKind::Binary(..) if is_supported_binary_tail => None,
         ExprKind::Field { .. } if is_supported_field_tail => None,
         ExprKind::Call { .. } if is_supported_call_tail => None,
         _ => return Ok(None),
@@ -8592,6 +8594,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_field_tail
         && !is_supported_call_tail
         && !is_supported_unary_tail
+        && !is_supported_binary_tail
     {
         return Ok(None);
     }
@@ -47496,7 +47499,14 @@ property "shared"() {}
             ));
         }
 
-        for owner in &resolved.owners()[4..] {
+        assert!(matches!(
+            resolved.owners()[4]
+                .body_type_check()
+                .expect("computed body check succeeds"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+
+        for owner in &resolved.owners()[5..] {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -47654,9 +47664,17 @@ property "shared"() {}
             );
         }
 
+        assert!(matches!(
+            owners[17]
+                .body_type_check()
+                .expect("literal operand tail body check succeeds"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+
         for owner in owners[12..13]
             .iter()
-            .chain(owners[16..19].iter())
+            .chain(owners[16..17].iter())
+            .chain(owners[18..19].iter())
             .chain(owners[20..].iter())
         {
             assert!(matches!(
@@ -52343,6 +52361,246 @@ property "shared"() {}
                 "the `{name}` tail shape publishes no primitive facts"
             );
         }
+    }
+
+    #[test]
+    fn primitive_body_type_results_infer_binary_tails() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub fn add_parameters(first: I32, second: I32) -> I32 { first + second }\n",
+            "pub fn sub_parameter_literal(value: I32) -> I32 { value - 1 }\n",
+            "pub fn add_literals() -> I32 { 40 + 2 }\n",
+            "pub fn mul_annotated_locals() -> I16 {\n",
+            "    let left: I16 = 7\n",
+            "    let right: I16 = 3\n",
+            "    left * right\n",
+            "}\n",
+            "pub fn mul_literal_locals() -> I16 {\n",
+            "    let left = 7\n",
+            "    let right = 3\n",
+            "    left * right\n",
+            "}\n",
+            "pub fn rem_locals() -> U8 {\n",
+            "    let source: U8 = 10\n",
+            "    let divisor: U8 = 3\n",
+            "    source % divisor\n",
+            "}\n",
+            "pub fn wrap_add() -> U8 {\n",
+            "    let source: U8 = 200\n",
+            "    source +% 60\n",
+            "}\n",
+            "pub fn bitand_local() -> U8 {\n",
+            "    let source: U8 = 10\n",
+            "    source & 3\n",
+            "}\n",
+            "pub fn shl_local() -> U32 {\n",
+            "    let source: U32 = 4\n",
+            "    source << 2\n",
+            "}\n",
+            "pub fn eq_parameters(first: I32, second: I32) -> Bool { first == second }\n",
+            "pub fn lt_local() -> Bool {\n",
+            "    let source: I64 = 7\n",
+            "    source < 10\n",
+            "}\n",
+            "pub fn lt_literal() -> Bool {\n",
+            "    let source = 7\n",
+            "    source < 10\n",
+            "}\n",
+            "pub fn and_parameters(first: Bool, second: Bool) -> Bool { first and second }\n",
+            "pub fn arithmetic_mismatch(first: I32, second: I32) -> Bool { first + second }\n",
+            "pub fn nested_tail(first: I32) -> I32 { (first + 1) * 2 }\n",
+        )
+        .to_string();
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{name}` is present"))
+        }
+
+        fn binding_named(
+            database: &RootDatabase,
+            owner: &FunctionOwnerResolution,
+            name: &str,
+        ) -> sai_hir::BindingId {
+            let bindings = owner
+                .local_resolution()
+                .expect("local results belong to this owner")
+                .expect("function has local resolution")
+                .bindings
+                .iter()
+                .filter_map(|(binding, local)| {
+                    local.name.and_then(|symbol| {
+                        database
+                            .symbols
+                            .resolve(symbol)
+                            .ok()
+                            .filter(|resolved| resolved.as_ref() == name)
+                            .map(|_| *binding)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let [binding] = bindings.as_slice() else {
+                panic!("function has exactly one `{name}` binding");
+            };
+            *binding
+        }
+
+        for (name, expected_type) in [
+            ("add_parameters", PrimTy::I32),
+            ("sub_parameter_literal", PrimTy::I32),
+            ("add_literals", PrimTy::I32),
+            ("mul_annotated_locals", PrimTy::I16),
+            ("rem_locals", PrimTy::U8),
+            ("wrap_add", PrimTy::U8),
+            ("bitand_local", PrimTy::U8),
+            ("shl_local", PrimTy::U32),
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("binary tail body check is available")
+            else {
+                panic!("a `{name}` binary tail is supported");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "the `{name}` binary tail checks without diagnostics"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("binary tail results query succeeds")
+                .expect("binary tail body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+            assert!(
+                results
+                    .expression_types()
+                    .values()
+                    .all(|ty| *ty == expected_type),
+                "every `{name}` expression fact is {expected_type:?}"
+            );
+        }
+
+        let mul_owner = owner_named(&database, &resolved, "mul_annotated_locals");
+        let mul_results = mul_owner
+            .primitive_body_type_results()
+            .expect("mul results query succeeds")
+            .expect("mul body publishes primitive facts");
+        for local in ["left", "right"] {
+            assert_eq!(
+                mul_results.binding_type(binding_named(&database, mul_owner, local)),
+                Some(PrimTy::I16),
+                "the `{local}` annotated binding keeps I16"
+            );
+        }
+
+        for name in ["eq_parameters", "lt_local", "and_parameters"] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("bool tail body check is available")
+            else {
+                panic!("a `{name}` Bool-producing tail is supported");
+            };
+            assert!(diagnostics.is_empty());
+            let results = owner
+                .primitive_body_type_results()
+                .expect("bool tail results query succeeds")
+                .expect("bool tail body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+        }
+
+        let mismatch_owner = owner_named(&database, &resolved, "arithmetic_mismatch");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: mismatch_diagnostics,
+        } = mismatch_owner
+            .body_type_check()
+            .expect("mismatch tail body check is available")
+        else {
+            panic!("an incompatible binary tail remains a recoverable type error");
+        };
+        assert_eq!(mismatch_diagnostics.len(), 1);
+        assert!(
+            mismatch_diagnostics[0]
+                .message
+                .contains("expected `Bool`, found `I32`"),
+            "the arithmetic result mismatches the Bool return type"
+        );
+
+        for name in ["mul_literal_locals", "lt_literal"] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("literal-variable tail body query succeeds"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "the `{name}` unresolved literal operand stays outside this slice"
+            );
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("literal-variable projection query succeeds")
+                    .is_none(),
+                "the `{name}` shape publishes no primitive facts"
+            );
+        }
+
+        let nested_owner = owner_named(&database, &resolved, "nested_tail");
+        assert!(
+            matches!(
+                nested_owner
+                    .body_type_check()
+                    .expect("nested tail body query succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ),
+            "a computed operand stays outside the flat binary tail slice"
+        );
+        assert!(
+            nested_owner
+                .primitive_body_type_results()
+                .expect("nested projection query succeeds")
+                .is_none(),
+            "a nested binary tail publishes no primitive facts"
+        );
     }
 
     #[test]
