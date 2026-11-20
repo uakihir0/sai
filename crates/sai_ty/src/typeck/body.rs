@@ -3612,27 +3612,53 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         // operand merges.
                         LocalType::LiteralVariable(other)
                         | LocalType::ErrorLiteralVariable(other) => {
-                            if self.literal_variable_group_root(id)
-                                != self.literal_variable_group_root(other)
-                            {
-                                let (Some(kind), Some(other_kind)) = (
-                                    self.literal_variables.get(id).map(|variable| variable.kind),
-                                    self.literal_variables
-                                        .get(other)
-                                        .map(|variable| variable.kind),
-                                ) else {
-                                    return Err(());
-                                };
-                                if kind == other_kind {
-                                    self.merge_literal_variables(id, other)?;
-                                } else {
-                                    self.errors.push(PrimitiveBodyError {
-                                        node: rhs.hir_id,
-                                        kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                                            expected: literal_variable_default_type(kind),
-                                            found: other_kind,
-                                        },
-                                    });
+                            // A resolved group on either side checks like
+                            // its concrete type instead of merging.
+                            match (
+                                self.literal_variable_group_type(id),
+                                self.literal_variable_group_type(other),
+                            ) {
+                                (Some(expected), Some(found)) => self.check_annotated_path(
+                                    LocalType::Concrete(found),
+                                    expected,
+                                    rhs.hir_id,
+                                )?,
+                                (Some(expected), None) => self.check_annotated_path(
+                                    LocalType::LiteralVariable(other),
+                                    expected,
+                                    rhs.hir_id,
+                                )?,
+                                (None, Some(found)) => self.check_annotated_path(
+                                    LocalType::LiteralVariable(id),
+                                    found,
+                                    rhs.hir_id,
+                                )?,
+                                (None, None) => {
+                                    if self.literal_variable_group_root(id)
+                                        != self.literal_variable_group_root(other)
+                                    {
+                                        let (Some(kind), Some(other_kind)) = (
+                                            self.literal_variables
+                                                .get(id)
+                                                .map(|variable| variable.kind),
+                                            self.literal_variables
+                                                .get(other)
+                                                .map(|variable| variable.kind),
+                                        ) else {
+                                            return Err(());
+                                        };
+                                        if kind != other_kind {
+                                            self.errors.push(PrimitiveBodyError {
+                                                node: rhs.hir_id,
+                                                kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                                    expected: literal_variable_default_type(kind),
+                                                    found: other_kind,
+                                                },
+                                            });
+                                        } else {
+                                            self.merge_literal_variables(id, other)?;
+                                        }
+                                    }
                                 }
                             }
                             self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
@@ -6012,8 +6038,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// only; a variable joins at most one parent and chains resolve
     /// recursively, so merges stay acyclic.
     fn merge_literal_variables(&mut self, id: usize, other: usize) -> Result<(), ()> {
+        // Merge children link upward, so both ids are normalized to their
+        // group roots first — reusing a merged variable (`x = y; z = y`,
+        // `x + y` twice) merges into its group instead of being refused.
+        let id = self.literal_variable_group_root(id);
+        let other = self.literal_variable_group_root(other);
         if id == other {
-            return Err(());
+            return Ok(());
         }
         let Some(variable) = self.literal_variables.get(id) else {
             return Err(());
