@@ -9037,7 +9037,6 @@ fn primitive_logical_init_operand_shape_is_supported(
 #[allow(clippy::too_many_arguments)]
 fn primitive_value_expression_shape_is_supported(
     expression: &HirExpr<'_>,
-    annotated: bool,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
@@ -9051,10 +9050,11 @@ fn primitive_value_expression_shape_is_supported(
     let init = expression;
     match init.kind {
         ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
-        // Value-producing `if`/`match` need an expected type to unify each
-        // branch/arm body against — the let annotation or the assign place
-        // type — so unannotated initializers stay gated.
-        ExprKind::If { .. } if annotated => {
+        // Value-producing `if`/`match` unify each branch/arm body against
+        // the let annotation or the assign place type; unannotated
+        // initializers join the branch literal tails through the checker's
+        // shared literal-variable machinery, which gates the wider shapes.
+        ExprKind::If { .. } => {
             return primitive_if_tail_shape_is_supported(
                 init,
                 preceding_bindings,
@@ -9072,7 +9072,7 @@ fn primitive_value_expression_shape_is_supported(
             scrutinee,
             arms,
             source,
-        } if annotated => {
+        } => {
             return primitive_match_tail_shape_is_supported(
                 scrutinee,
                 arms,
@@ -9357,12 +9357,9 @@ fn primitive_let_statement_shape_is_supported(
         // tuple-field, index, and dereference places stay gated, and a
         // `let`/parameter target or a non-place target surfaces the
         // checker's ASSIGN_TO_IMMUTABLE / INVALID_ASSIGN_TARGET diagnostic.
-        // The assign place supplies the expected type for `if`/`match`
-        // right-hand sides, like an annotation does for `let`.
         return primitive_assign_target_shape_is_supported(lhs, preceding_bindings, locals, inputs)
             && primitive_value_expression_shape_is_supported(
                 rhs,
-                true,
                 preceding_bindings,
                 locals,
                 inputs,
@@ -9454,7 +9451,6 @@ fn primitive_let_statement_shape_is_supported(
 
     if !primitive_value_expression_shape_is_supported(
         init,
-        ty.is_some(),
         preceding_bindings,
         locals,
         inputs,
@@ -77423,8 +77419,12 @@ property "shared"() {}
             "pub fn assign_mismatch(flag: Bool) -> Bool {\n    var x: Bool = true\n    x = if flag { 1 } else { 2 }\n    x\n}\n",
             "pub fn unannotated_if(flag: Bool) -> I32 {\n    let x = if flag { 1 } else { 2 }\n    x\n}\n",
             "pub fn unannotated_match(value: I32) -> I32 {\n    let x = match value { 0 => 1, _ => 2 }\n    x\n}\n",
+            "pub fn unannotated_out_of_range(flag: Bool) -> U8 {\n    let x = if flag { 300 } else { 2 }\n    x\n}\n",
             "pub fn if_no_else(flag: Bool) -> I32 {\n    let x: I32 = if flag { 1 }\n    x\n}\n",
             "pub fn literal_var_assign(flag: Bool) -> I32 {\n    var x = 0\n    x = if flag { 1 } else { 2 }\n    x\n}\n",
+            "pub fn mixed_branch_kinds(flag: Bool) -> I32 {\n    let x = if flag { 1 } else { 1.0 }\n    x\n}\n",
+            "pub fn nonliteral_branch(flag: Bool, a: I32) -> I32 {\n    let x = if flag { 1 } else { a }\n    x\n}\n",
+            "pub fn third_literal_site(value: I32) -> I32 {\n    let x = match value { 0 => 1, 1 => 2, _ => 3 }\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77440,7 +77440,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 14);
+        assert_eq!(owners.len(), 18);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77471,7 +77471,32 @@ property "shared"() {}
                 "function owner {index} should report two branch diagnostics: {check:?}"
             );
         }
-        for index in 10..14 {
+        // Unannotated literal-join initializers resolve the shared variable
+        // at the `x` tail; the out-of-range join reports the deferred error.
+        for index in [10, 11] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("literal-join initializers are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the slice: {check:?}"
+            );
+        }
+        let check = owners[12]
+            .body_type_check()
+            .expect("the out-of-range join is diagnosed");
+        assert!(
+            matches!(
+                check,
+                FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code
+                            == sai_diagnostics::Code::LiteralOutOfRange)
+            ),
+            "function owner 12 should report a deferred out-of-range diagnostic: {check:?}"
+        );
+        for index in 13..18 {
             let check = owners[index]
                 .body_type_check()
                 .expect("unannotated and non-exhaustive forms are gated");

@@ -2599,27 +2599,28 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 // Annotated `if`/`match` initializers check each branch/arm
                 // body against the annotation through the shared
-                // expected-type path; unannotated forms stay gated since
-                // joining the branches' literal variables is a wider
-                // inference question.
-                ExprKind::If { cond, then, els } => {
-                    let Some(expected) = annotation else {
-                        return Err(());
-                    };
-                    self.check_if_tail(cond, then, els, expected)?;
-                    LocalType::Concrete(expected)
-                }
+                // expected-type path. Unannotated forms join the branch/arm
+                // literal tails as sites of one shared literal variable —
+                // the `var x = 1; x = 2` join — so the local resolves later
+                // through the usual tail/annotation path.
+                ExprKind::If { cond, then, els } => match annotation {
+                    Some(expected) => {
+                        self.check_if_tail(cond, then, els, expected)?;
+                        LocalType::Concrete(expected)
+                    }
+                    None => self.check_literal_join_if(cond, then, els)?,
+                },
                 ExprKind::Match {
                     scrutinee,
                     arms,
                     source,
-                } => {
-                    let Some(expected) = annotation else {
-                        return Err(());
-                    };
-                    self.check_match_tail(scrutinee, arms, source, expected)?;
-                    LocalType::Concrete(expected)
-                }
+                } => match annotation {
+                    Some(expected) => {
+                        self.check_match_tail(scrutinee, arms, source, expected)?;
+                        LocalType::Concrete(expected)
+                    }
+                    None => self.check_literal_join_match(scrutinee, arms, source)?,
+                },
                 ExprKind::Field { .. } => {
                     let Some(field_type) = self
                         .input
@@ -2867,78 +2868,216 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let mut catch_all = false;
         let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
         for arm in arms {
-            if catch_all || arm.guard.is_some() {
-                return Err(());
-            }
-            match arm.pat.kind {
-                PatKind::Lit(literal) => {
-                    let Some(kind) = primitive_literal_kind(literal) else {
-                        return Err(());
-                    };
-                    match check_primitive_literal(
-                        scrutinee_type,
-                        literal,
-                        self.input.symbols,
-                        self.input.pointer_width,
-                    ) {
-                        PrimitiveLiteralResult::Match => {}
-                        PrimitiveLiteralResult::OutOfRange => {
-                            self.errors.push(PrimitiveBodyError {
-                                node: arm.pat.hir_id,
-                                kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                                    expected: scrutinee_type,
-                                    found: kind,
-                                },
-                            });
-                        }
-                        PrimitiveLiteralResult::TypeMismatch => {
-                            self.errors.push(PrimitiveBodyError {
-                                node: arm.pat.hir_id,
-                                kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                                    expected: scrutinee_type,
-                                    found: kind,
-                                },
-                            });
-                        }
-                    }
-                }
-                PatKind::Wild => catch_all = true,
-                PatKind::Binding {
-                    mode: BindingMode::Value,
-                    binding,
-                    sub: None,
-                    ..
-                } => {
-                    catch_all = true;
-                    arm_binding = Some((
-                        binding,
-                        self.known_bindings
-                            .insert(binding, LocalType::Concrete(scrutinee_type)),
-                    ));
-                }
-                _ => return Err(()),
-            }
-            self.record_expression_type(arm.pat.hir_id, LocalType::Concrete(scrutinee_type));
+            self.check_match_arm_pattern(arm, scrutinee_type, &mut catch_all, &mut arm_binding)?;
             // Arm patterns bind only inside their arm body — restore the
             // previous binding (or its absence) so sibling arms and the
             // enclosing scope never observe the arm-local name.
             let body_result = self.check_expr_expected(arm.body, expected);
-            if let Some((binding, previous)) = arm_binding.take() {
-                match previous {
-                    Some(previous) => {
-                        self.known_bindings.insert(binding, previous);
-                    }
-                    None => {
-                        self.known_bindings.remove(&binding);
-                    }
-                }
-            }
+            self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
         if !catch_all {
             return Err(());
         }
         Ok(LocalType::Concrete(expected))
+    }
+
+    /// Validates one arm's pattern under the bounded exhaustiveness rule:
+    /// literal patterns check against the scrutinee type, wildcard and plain
+    /// `binding` patterns mark the catch-all (with the binding installed at
+    /// `scrutinee_type`), guards and arms after the catch-all gate.
+    fn check_match_arm_pattern(
+        &mut self,
+        arm: &'hir Arm<'hir>,
+        scrutinee_type: PrimTy,
+        catch_all: &mut bool,
+        arm_binding: &mut Option<(BindingId, Option<LocalType>)>,
+    ) -> Result<(), ()> {
+        if *catch_all || arm.guard.is_some() {
+            return Err(());
+        }
+        match arm.pat.kind {
+            PatKind::Lit(literal) => {
+                let Some(kind) = primitive_literal_kind(literal) else {
+                    return Err(());
+                };
+                match check_primitive_literal(
+                    scrutinee_type,
+                    literal,
+                    self.input.symbols,
+                    self.input.pointer_width,
+                ) {
+                    PrimitiveLiteralResult::Match => {}
+                    PrimitiveLiteralResult::OutOfRange => {
+                        self.errors.push(PrimitiveBodyError {
+                            node: arm.pat.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                                expected: scrutinee_type,
+                                found: kind,
+                            },
+                        });
+                    }
+                    PrimitiveLiteralResult::TypeMismatch => {
+                        self.errors.push(PrimitiveBodyError {
+                            node: arm.pat.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                expected: scrutinee_type,
+                                found: kind,
+                            },
+                        });
+                    }
+                }
+            }
+            PatKind::Wild => *catch_all = true,
+            PatKind::Binding {
+                mode: BindingMode::Value,
+                binding,
+                sub: None,
+                ..
+            } => {
+                *catch_all = true;
+                *arm_binding = Some((
+                    binding,
+                    self.known_bindings
+                        .insert(binding, LocalType::Concrete(scrutinee_type)),
+                ));
+            }
+            _ => return Err(()),
+        }
+        self.record_expression_type(arm.pat.hir_id, LocalType::Concrete(scrutinee_type));
+        Ok(())
+    }
+
+    fn restore_arm_binding(&mut self, arm_binding: &mut Option<(BindingId, Option<LocalType>)>) {
+        if let Some((binding, previous)) = arm_binding.take() {
+            match previous {
+                Some(previous) => {
+                    self.known_bindings.insert(binding, previous);
+                }
+                None => {
+                    self.known_bindings.remove(&binding);
+                }
+            }
+        }
+    }
+
+    /// Unannotated `let x = if flag { 1 } else { 2 }` joins both branch
+    /// literal tails as sites of one shared literal variable — the
+    /// `var x = 1; x = 2` join — so the local resolves later through the
+    /// usual tail/annotation path. Only empty branches with a literal tail
+    /// are admitted: statement-bearing branches, `else if` chains, and a
+    /// missing `else` stay gated.
+    fn check_literal_join_if(
+        &mut self,
+        condition: &'hir Expr<'hir>,
+        then: &'hir Block<'hir>,
+        els: Option<&'hir Expr<'hir>>,
+    ) -> Result<LocalType, ()> {
+        let Some(els) = els else {
+            return Err(());
+        };
+        let ExprKind::Block(else_block) = els.kind else {
+            return Err(());
+        };
+        self.check_if_condition(condition)?;
+        let mut joined = None;
+        for branch in [then, else_block] {
+            let tail = Self::literal_join_branch_tail(branch)?;
+            self.join_literal_site(tail, &mut joined)?;
+        }
+        let Some(local) = joined else {
+            return Err(());
+        };
+        Ok(local)
+    }
+
+    fn literal_join_branch_tail(block: &'hir Block<'hir>) -> Result<&'hir Expr<'hir>, ()> {
+        if block.safety != Safety::Safe || !block.stmts.is_empty() {
+            return Err(());
+        }
+        let Some(tail) = block.tail else {
+            return Err(());
+        };
+        if !matches!(tail.kind, ExprKind::Lit(_)) {
+            return Err(());
+        }
+        Ok(tail)
+    }
+
+    /// Unannotated `let x = match value { 0 => 1, _ => 2 }` joins the arm
+    /// body literals as sites of one shared literal variable, like the `if`
+    /// join. Pattern and scrutinee admission mirrors `check_match_tail`;
+    /// every arm body must be a literal tail (a third literal site or a
+    /// kind mismatch gates through the shared additional-site machinery).
+    fn check_literal_join_match(
+        &mut self,
+        scrutinee: &'hir Expr<'hir>,
+        arms: &'hir [Arm<'hir>],
+        source: MatchSource,
+    ) -> Result<LocalType, ()> {
+        if !matches!(source, MatchSource::Normal) {
+            return Err(());
+        }
+        let ExprKind::Path(_) = scrutinee.kind else {
+            return Err(());
+        };
+        let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
+            return Err(());
+        };
+        let mut catch_all = false;
+        let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
+        let mut joined = None;
+        for arm in arms {
+            self.check_match_arm_pattern(arm, scrutinee_type, &mut catch_all, &mut arm_binding)?;
+            let body_result = self.join_literal_site(arm.body, &mut joined);
+            self.restore_arm_binding(&mut arm_binding);
+            body_result?;
+        }
+        if !catch_all {
+            return Err(());
+        }
+        let Some(local) = joined else {
+            return Err(());
+        };
+        Ok(local)
+    }
+
+    /// Joins one literal tail into the shared literal variable: the first
+    /// site creates it, a second site joins through the existing
+    /// additional-site machinery (kind mismatches and further sites gate).
+    /// Concrete literal kinds (`Bool`/`Byte`/`Char`) gate — the binding's
+    /// branch tails must agree on one concrete type, which the shared
+    /// literal-variable machinery does not express yet.
+    fn join_literal_site(
+        &mut self,
+        expression: &'hir Expr<'hir>,
+        joined: &mut Option<LocalType>,
+    ) -> Result<(), ()> {
+        let ExprKind::Lit(literal) = expression.kind else {
+            return Err(());
+        };
+        let Some(kind) = primitive_literal_kind(literal) else {
+            return Err(());
+        };
+        match joined {
+            None => {
+                match self.local_type_for_unannotated_literal(literal, kind, expression.hir_id) {
+                    local @ LocalType::LiteralVariable(_) => *joined = Some(local),
+                    _ => return Err(()),
+                }
+            }
+            Some(LocalType::LiteralVariable(id)) => match kind {
+                PrimitiveLiteralKind::Integer => {
+                    self.add_integer_literal_constraint(*id, literal, expression.hir_id)?;
+                }
+                PrimitiveLiteralKind::FloatingPoint => {
+                    self.add_float_literal_constraint(*id, literal, expression.hir_id)?;
+                }
+                _ => return Err(()),
+            },
+            _ => return Err(()),
+        }
+        Ok(())
     }
 
     fn check_if_condition(&mut self, condition: &'hir Expr<'hir>) -> Result<(), ()> {

@@ -10181,6 +10181,8 @@ fn public_match_tail_bodies_emit_check_results() {
         "pub fn choose(flag: Bool) -> I32 { let x: I32 = if flag { 1 } else { 2 }\n x }\n",
         "pub fn choose(value: I32) -> I32 { let x: I32 = match value { 0 => 1, _ => 2 }\n x }\n",
         "pub fn choose(flag: Bool) -> I32 { var x: I32 = 0\n x = if flag { 1 } else { 2 }\n x }\n",
+        "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 2 }\n x }\n",
+        "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, _ => 2 }\n x }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10196,8 +10198,9 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose(value: I32) -> I32 { match 0 { 0 => 1, _ => 2 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { _ => 0, 1 => 1 } }\n",
         "pub fn choose(value: I32) -> Bool { match value { 0 => 1, _ => 2 }\n true }\n",
-        "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 2 }\n x }\n",
-        "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, _ => 2 }\n x }\n",
+        "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 1.0 }\n x }\n",
+        "pub fn choose(flag: Bool, a: I32) -> I32 { let x = if flag { 1 } else { a }\n x }\n",
+        "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, 1 => 2, _ => 3 }\n x }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
