@@ -9420,7 +9420,6 @@ fn primitive_comparison_local_uses_shadowed_binding_and_source_order() {
 fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
     for source in [
         "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
-        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = (left == right) and (left < right)\n    result\n}\n",
         "pub fn compare(left: Str, right: Str) -> Bool {\n    let result = left == right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left as I64 == right as I64\n    result\n}\n",
         "type IntegerAlias = I32\npub fn compare(left: IntegerAlias, right: IntegerAlias) -> Bool {\n    let result = left == right\n    result\n}\n",
@@ -9670,7 +9669,6 @@ fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
         "pub fn compare(value: I32) -> Bool {\n    let result = value < (1 + 2)\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = (value + 1) < 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = not (value < 1)\n    result\n}\n",
-        "pub fn compare(value: I32) -> Bool {\n    let result = value < 1 and true\n    result\n}\n",
         "pub fn compare() -> Bool {\n    let inferred = 1\n    let result = inferred < 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < later\n    let later: I32 = 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = result < 1\n    result\n}\n",
@@ -9708,6 +9706,12 @@ fn primitive_logical_local_initializers_accept_parameter_and_local_paths() {
         "pub fn either(left: Bool, right: Bool) -> Bool {\n    let result: Bool = left or right\n    result\n}\n",
         "pub fn local_values() -> Bool {\n    let left: Bool = true\n    let right: Bool = false\n    let result = left and right\n    result\n}\n",
         "pub fn mixed(left: Bool, right: Bool) -> Bool {\n    let local: Bool = left\n    let result = local or right\n    result\n}\n",
+        "pub fn nested(left: Bool, right: Bool) -> Bool {\n    let result = (left and right) or right\n    result\n}\n",
+        "pub fn not_operand(left: Bool, right: Bool) -> Bool {\n    let result = not left and right\n    result\n}\n",
+        "pub fn bool_literal_operand(left: Bool, right: Bool) -> Bool {\n    let result = left and true\n    result\n}\n",
+        "pub fn comparison_operand(left: Bool, right: Bool) -> Bool {\n    let result = left and (right == left)\n    result\n}\n",
+        "pub fn comparison_operands(left: I32, right: I32) -> Bool {\n    let result = (left == right) and (left < right)\n    result\n}\n",
+        "pub fn comparison_literal_operand(value: I32) -> Bool {\n    let result = value < 1 and true\n    result\n}\n",
         "pub fn repeated(flag: Bool) -> Bool {\n    let result = flag and flag\n    result\n}\n",
         "pub fn shadowed(source: I32, other: Bool) -> Bool {\n    let source: Bool = true\n    let result = source and other\n    result\n}\n",
     ] {
@@ -9797,11 +9801,7 @@ fn primitive_logical_non_bool_annotation_reports_and_recovers_as_bool() {
 #[test]
 fn unsupported_primitive_logical_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = (left and right) or right\n    result\n}\n",
-        "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = not left and right\n    result\n}\n",
-        "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and true\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let inferred = 1\n    let result = inferred and flag\n    result\n}\n",
-        "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and (right == left)\n    result\n}\n",
         "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and right + true\n    result\n}\n",
         "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and later\n    let later: Bool = right\n    result\n}\n",
         "pub fn logical(right: Bool) -> Bool {\n    let result = result and right\n    result\n}\n",

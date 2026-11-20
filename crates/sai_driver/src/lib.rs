@@ -8932,6 +8932,62 @@ fn is_supported_direct_call_argument_shape(
 // `if` tails admit empty-statement branches whose own tails stay inside the
 // same shapes the flat block tail admits, with `else if` chains recursing.
 
+// Logical initializer operands admit the same shapes the checker's
+// `check_logical_operand` does: preceding paths (or unknown self-fields),
+// `Bool` literals, nested `and`/`or`, `not` operands, and comparisons whose
+// operands are preceding paths/fields or scalar literals.
+fn primitive_logical_init_operand_shape_is_supported(
+    operand: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+) -> bool {
+    let is_preceding_or_field = |operand: &HirExpr<'_>| match operand.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Field { .. } => {
+            unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+        }
+        _ => false,
+    };
+    match operand.kind {
+        ExprKind::Path(_) | ExprKind::Field { .. } => is_preceding_or_field(operand),
+        ExprKind::Lit(Lit::Bool(_)) => true,
+        ExprKind::Unary(UnOp::Not, inner) => primitive_logical_init_operand_shape_is_supported(
+            inner,
+            preceding_bindings,
+            locals,
+            inputs,
+            unknown_self_fields,
+        ),
+        ExprKind::Binary(operator, left, right) => match operator {
+            BinOp::And | BinOp::Or => {
+                primitive_logical_init_operand_shape_is_supported(
+                    left,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    unknown_self_fields,
+                ) && primitive_logical_init_operand_shape_is_supported(
+                    right,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    unknown_self_fields,
+                )
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                (is_preceding_or_field(left) && is_preceding_or_field(right))
+                    || (is_preceding_or_field(left) && is_direct_function_scalar_literal(right))
+                    || (is_direct_function_scalar_literal(left) && is_preceding_or_field(right))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn primitive_let_statement_shape_is_supported(
     stmt: &Stmt<'_>,
@@ -9094,8 +9150,16 @@ fn primitive_let_statement_shape_is_supported(
             };
             let supported_shape = match operator {
                 BinOp::And | BinOp::Or => {
-                    is_preceding_path_or_unknown_field(left)
-                        && is_preceding_path_or_unknown_field(right)
+                    let operand_is_supported = |operand: &HirExpr<'_>| {
+                        primitive_logical_init_operand_shape_is_supported(
+                            operand,
+                            preceding_bindings,
+                            locals,
+                            inputs,
+                            unknown_self_fields,
+                        )
+                    };
+                    operand_is_supported(left) && operand_is_supported(right)
                 }
                 BinOp::Shl | BinOp::Shr => {
                     (is_preceding_path_or_unknown_field(left)
