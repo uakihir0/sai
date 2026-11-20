@@ -78225,6 +78225,8 @@ property "shared"() {}
             "pub fn literal_var_assign_op_binary() -> I32 {\n    var x = 1\n    x += 2 + 3\n    x\n}\n",
             "pub fn literal_var_assign_op_binary_path(value: I32) -> I32 {\n    var x = 1\n    x += value + 2\n    x\n}\n",
             "pub fn literal_var_assign_op_float_binary() -> F64 {\n    var x = 1.0\n    var y = 2.0\n    x += y * 3.0\n    x\n}\n",
+            "pub fn literal_var_assign_op_self_rhs(value: I32) -> I32 {\n    var x = 1\n    x += x + value\n    x\n}\n",
+            "pub fn literal_var_assign_op_resolved_rhs(value: I32) -> I32 {\n    var x = 1\n    x += value + 2\n    x += value + 2\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78240,7 +78242,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 82);
+        assert_eq!(owners.len(), 84);
 
         for index in 0..7 {
             let check = owners[index]
@@ -78320,6 +78322,7 @@ property "shared"() {}
         for index in [
             23, 25, 26, 27, 28, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49,
             51, 52, 55, 57, 58, 60, 61, 62, 64, 65, 66, 69, 70, 71, 73, 74, 76, 77, 78, 79, 80, 81,
+            82, 83,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78854,7 +78857,7 @@ property "shared"() {}
         let owners = resolved.owners();
         assert_eq!(owners.len(), 13);
 
-        for index in [0, 1, 2, 3, 7] {
+        for index in [0, 1, 2, 3, 7, 10, 11] {
             let check = owners[index]
                 .body_type_check()
                 .expect("supported compound-assignment shapes are checked");
@@ -78897,10 +78900,10 @@ property "shared"() {}
         ));
         // `x += flag` gates exactly like `let t = x + flag`: a Bool operand
         // is outside the admitted arithmetic shapes, so the desugared
-        // assignment is equivalently unsupported rather than diagnosed. The
-        // nested-expression and unary right operands follow operand
-        // admission and stay gated with the other unresolved shapes.
-        for index in [6, 8, 10, 11] {
+        // assignment is equivalently unsupported rather than diagnosed.
+        // The nested-expression and unary right operands check through the
+        // `let t = e` desugar like `let t = left + right`.
+        for index in [6, 8] {
             assert!(
                 matches!(
                     owners[index]
