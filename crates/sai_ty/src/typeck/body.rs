@@ -3587,23 +3587,83 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
                 } else {
                     let check = self.check_initializer_value(rhs, None)?;
-                    let LocalType::Concrete(found) = check.local_type else {
-                        return Err(());
-                    };
-                    // A variable already resolved by an earlier assignment
-                    // coerces the right side to the resolved place type; an
-                    // unresolved one resolves to the right side's type.
-                    match self.literal_variables.get(id).and_then(|v| v.resolved) {
-                        Some(expected) => self.check_annotated_path(
-                            LocalType::Concrete(found),
-                            expected,
-                            rhs.hir_id,
-                        )?,
-                        None => self.check_annotated_path(
-                            LocalType::LiteralVariable(id),
-                            found,
-                            rhs.hir_id,
-                        )?,
+                    match check.local_type {
+                        LocalType::Concrete(found) => {
+                            // A variable already resolved by an earlier
+                            // assignment coerces the right side to the
+                            // resolved place type; an unresolved one
+                            // resolves to the right side's type.
+                            match self.literal_variables.get(id).and_then(|v| v.resolved) {
+                                Some(expected) => self.check_annotated_path(
+                                    LocalType::Concrete(found),
+                                    expected,
+                                    rhs.hir_id,
+                                )?,
+                                None => self.check_annotated_path(
+                                    LocalType::LiteralVariable(id),
+                                    found,
+                                    rhs.hir_id,
+                                )?,
+                            }
+                        }
+                        // `x = y`/`x = y + 1` — the right side is itself a
+                        // literal variable: the two variables share one
+                        // group and resolve together, like `x op y`
+                        // operand merges.
+                        LocalType::LiteralVariable(other)
+                        | LocalType::ErrorLiteralVariable(other) => {
+                            // A resolved group on either side checks like
+                            // its concrete type instead of merging.
+                            match (
+                                self.literal_variable_group_type(id),
+                                self.literal_variable_group_type(other),
+                            ) {
+                                (Some(expected), Some(found)) => self.check_annotated_path(
+                                    LocalType::Concrete(found),
+                                    expected,
+                                    rhs.hir_id,
+                                )?,
+                                (Some(expected), None) => self.check_annotated_path(
+                                    LocalType::LiteralVariable(other),
+                                    expected,
+                                    rhs.hir_id,
+                                )?,
+                                (None, Some(found)) => self.check_annotated_path(
+                                    LocalType::LiteralVariable(id),
+                                    found,
+                                    rhs.hir_id,
+                                )?,
+                                (None, None) => {
+                                    if self.literal_variable_group_root(id)
+                                        != self.literal_variable_group_root(other)
+                                    {
+                                        let (Some(kind), Some(other_kind)) = (
+                                            self.literal_variables
+                                                .get(id)
+                                                .map(|variable| variable.kind),
+                                            self.literal_variables
+                                                .get(other)
+                                                .map(|variable| variable.kind),
+                                        ) else {
+                                            return Err(());
+                                        };
+                                        if kind != other_kind {
+                                            self.errors.push(PrimitiveBodyError {
+                                                node: rhs.hir_id,
+                                                kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                                    expected: literal_variable_default_type(kind),
+                                                    found: other_kind,
+                                                },
+                                            });
+                                        } else {
+                                            self.merge_literal_variables(id, other)?;
+                                        }
+                                    }
+                                }
+                            }
+                            self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
+                        }
+                        _ => return Err(()),
                     }
                 }
                 self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
@@ -5978,34 +6038,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// only; a variable joins at most one parent and chains resolve
     /// recursively, so merges stay acyclic.
     fn merge_literal_variables(&mut self, id: usize, other: usize) -> Result<(), ()> {
+        // Merge children link upward, so both ids are normalized to their
+        // group roots first — reusing a merged variable (`x = y; z = y`,
+        // `x + y` twice) merges into its group instead of being refused.
+        let id = self.literal_variable_group_root(id);
+        let other = self.literal_variable_group_root(other);
         if id == other {
-            return Err(());
-        }
-        // Merging merged variables merges their whole groups through
-        // the roots: with `x` under `n`, `m += x` links `n`'s group
-        // under `m`. Repeating a merge (`a += b` twice), or one that is
-        // already satisfied (`a += b; c += b; a += b`), is a no-op.
-        let mut id_root = id;
-        while let Some(parent) = self
-            .literal_variables
-            .get(id_root)
-            .and_then(|variable| variable.merged_with)
-        {
-            id_root = parent;
-        }
-        let mut other_root = other;
-        while let Some(parent) = self
-            .literal_variables
-            .get(other_root)
-            .and_then(|variable| variable.merged_with)
-        {
-            other_root = parent;
-        }
-        if id_root == other_root {
             return Ok(());
-        }
-        if id_root != id || other_root != other {
-            return self.merge_literal_variables(id_root, other_root);
         }
         let Some(variable) = self.literal_variables.get(id) else {
             return Err(());

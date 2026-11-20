@@ -78205,6 +78205,12 @@ property "shared"() {}
             "pub fn literal_var_shift_assign_path(count: U32) -> I32 {\n    var x = 1\n    x <<= count\n    x\n}\n",
             "pub fn literal_var_shift_assign_pair() -> I32 {\n    var x = 1\n    var c = 4\n    x <<= c\n    x\n}\n",
             "pub fn literal_var_shift_assign_float() -> I32 {\n    var x = 0.5\n    x <<= 1\n    x\n}\n",
+            "pub fn literal_var_assign_path() -> I32 {\n    var x = 1\n    var y = 2\n    x = y\n    x\n}\n",
+            "pub fn literal_var_assign_binary() -> I32 {\n    var x = 1\n    var y = 2\n    x = y + 1\n    x\n}\n",
+            "pub fn literal_var_assign_float_var() -> I32 {\n    var x = 1\n    var y = 0.5\n    x = y\n    x\n}\n",
+            "pub fn literal_var_assign_reuse_merged() -> I32 {\n    var x = 1\n    var y = 2\n    var z = 3\n    x = y\n    z = y\n    x + z\n}\n",
+            "pub fn literal_var_assign_resolved() -> I64 {\n    var x = 1\n    var y = 2\n    let w: I64 = x\n    y = x\n    w + y\n}\n",
+            "pub fn literal_var_assign_merged_op() -> I32 {\n    var x = 1\n    var y = 2\n    x = y\n    x + y\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78220,7 +78226,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 73);
+        assert_eq!(owners.len(), 79);
 
         for index in 0..7 {
             let check = owners[index]
@@ -78271,6 +78277,14 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
+        assert!(matches!(
+            owners[75]
+                .body_type_check()
+                .expect("assigning a float literal variable to an integer one is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
         for index in [11, 12, 16, 18, 19] {
             let check = owners[index]
                 .body_type_check()
@@ -78291,7 +78305,7 @@ property "shared"() {}
         }
         for index in [
             23, 25, 26, 27, 28, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49,
-            51, 52, 55, 58, 60, 61, 62, 64, 65, 66, 69, 70, 71,
+            51, 52, 55, 57, 58, 60, 61, 62, 64, 65, 66, 69, 70, 71, 73, 74, 76, 77, 78,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78301,6 +78315,9 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
+        // Owner 57 (`a += b; b += a`) used to gate on the merge-cycle
+        // check: root normalization makes the second merge a same-group
+        // no-op, so it is genuinely supported now.
         for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 63, 67, 68, 72] {
             assert!(
                 matches!(
@@ -78419,8 +78436,8 @@ property "shared"() {}
         assert_eq!(owners.len(), 56);
 
         for index in [
-            0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30, 31, 32,
-            33, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 48, 49, 52, 55,
+            0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30, 31, 32, 33,
+            36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 48, 49, 52, 55,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78639,7 +78656,10 @@ property "shared"() {}
             ),
             "function owner 12 should report a deferred out-of-range diagnostic: {check:?}"
         );
-        for index in 13..18 {
+        // Owner 14 (`x = if flag { 1 } else { 2 }` on a literal variable)
+        // is supported: the if-join's literal variable merges into `x`'s
+        // group through the assignment merge arm.
+        for index in [13, 15, 16, 17] {
             let check = owners[index]
                 .body_type_check()
                 .expect("unannotated and non-exhaustive forms are gated");
@@ -78648,6 +78668,13 @@ property "shared"() {}
                 "function owner {index} should remain gated: {check:?}"
             );
         }
+        let check = owners[14]
+            .body_type_check()
+            .expect("a literal-variable if right side is checked");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+            "function owner 14 unexpectedly failed: {check:?}"
+        );
     }
 
     #[test]

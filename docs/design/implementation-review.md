@@ -9657,3 +9657,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver suite (775) and CLI suite (387) pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Pending — see PR.
 - **Remaining scope:** `x op= <non-literal non-path>` (needs the desugared `let t = e` form), `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1047 (2026-11-21): `x = e` on literal-variable targets merges right-side literal variables
+
+- **Decision:** `x = e` where `x` is an unannotated-literal `var` and `e` yields a literal variable (`x = y`, `x = y + 1`) merges the two groups like `x op y` operand merges — they resolve together at the next constraint site. Kind mismatches (`x = y` with `y` a float variable) get `LITERAL_TYPE_MISMATCH`; a `Concrete` right side keeps the existing resolve/coerce behavior.
+- **Reason:** `x = e` is the `Var` analog of `let x = e` merging, which already merges right-side literal variables into `x`'s group.
+- **Failure boundary and judgment:** `Error` right sides and non-variable non-concrete shapes still gate; resolved-`x` keeps the coerce path (right side must equal `x`'s type).
+- **Review required:** None — merges reuse `merge_literal_variables`/`literal_variable_group_root` verbatim.
+- **Planned verification matrix:** Driver owners `literal_var_assign_path`/`literal_var_assign_binary` (supported), `literal_var_assign_float_var` (`TYPE_MISMATCH`). No driver-mirror change — path and binary right sides were already admitted.
+- **Verification:** Pinned Rust 1.99.1, assign owner test passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Pending — see PR.
+- **Remaining scope:** `x op= <non-literal non-path>` (needs the desugared `let t = e` form), `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
