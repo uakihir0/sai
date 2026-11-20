@@ -4025,14 +4025,12 @@ fn collect_primitive_expression_nodes<'hir>(
 ) {
     nodes.insert(expression.hir_id, *expression);
     match expression.kind {
-        ExprKind::Block(block) => {
-            for stmt in block.stmts {
-                if let StmtKind::Let { init, .. } = stmt.kind {
-                    collect_primitive_expression_nodes(init, nodes);
-                }
-            }
-            if let Some(tail) = block.tail {
-                collect_primitive_expression_nodes(tail, nodes);
+        ExprKind::Block(block) => collect_primitive_block_nodes(block, nodes),
+        ExprKind::If { cond, then, els } => {
+            collect_primitive_expression_nodes(cond, nodes);
+            collect_primitive_block_nodes(then, nodes);
+            if let Some(els) = els {
+                collect_primitive_expression_nodes(els, nodes);
             }
         }
         ExprKind::Field { base, .. }
@@ -4056,6 +4054,20 @@ fn collect_primitive_expression_nodes<'hir>(
             }
         }
         _ => {}
+    }
+}
+
+fn collect_primitive_block_nodes<'hir>(
+    block: &'hir Block<'hir>,
+    nodes: &mut HashMap<HirId, Expr<'hir>>,
+) {
+    for stmt in block.stmts {
+        if let StmtKind::Let { init, .. } = stmt.kind {
+            collect_primitive_expression_nodes(init, nodes);
+        }
+    }
+    if let Some(tail) = block.tail {
+        collect_primitive_expression_nodes(tail, nodes);
     }
 }
 
@@ -4125,8 +4137,65 @@ fn expression_has_primitive_result_taint(
                     )
                 })
             }
+            ExprKind::Block(block) => block_has_primitive_result_taint(
+                block,
+                error_nodes,
+                unknown_self_fields,
+                local_paths,
+                tainted_bindings,
+            ),
+            ExprKind::If { cond, then, els } => {
+                expression_has_primitive_result_taint(
+                    cond,
+                    error_nodes,
+                    unknown_self_fields,
+                    local_paths,
+                    tainted_bindings,
+                ) || block_has_primitive_result_taint(
+                    then,
+                    error_nodes,
+                    unknown_self_fields,
+                    local_paths,
+                    tainted_bindings,
+                ) || els.is_some_and(|els| {
+                    expression_has_primitive_result_taint(
+                        els,
+                        error_nodes,
+                        unknown_self_fields,
+                        local_paths,
+                        tainted_bindings,
+                    )
+                })
+            }
             _ => false,
         }
+}
+
+fn block_has_primitive_result_taint(
+    block: &Block<'_>,
+    error_nodes: &HashSet<HirId>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    local_paths: &HashMap<HirId, BindingId>,
+    tainted_bindings: &HashSet<BindingId>,
+) -> bool {
+    block.stmts.iter().any(|stmt| match stmt.kind {
+        StmtKind::Let { init, .. } => expression_has_primitive_result_taint(
+            init,
+            error_nodes,
+            unknown_self_fields,
+            local_paths,
+            tainted_bindings,
+        ),
+        _ => false,
+    }) || block.tail.is_some_and(|tail| {
+        expression_has_primitive_result_taint(
+            tail,
+            error_nodes,
+            unknown_self_fields,
+            local_paths,
+            tainted_bindings,
+        )
+    })
 }
 
 fn can_track_unannotated_float_literal_alias(
