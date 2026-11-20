@@ -4793,10 +4793,7 @@ fn shadowed_parameter_initializer_uses_parameter_and_tail_uses_local_binding() {
 
 #[test]
 fn unsupported_parameter_local_copy_forms_remain_gated() {
-    for source in [
-        "pub fn copy(var source: I32) -> I32 {\n    var t = 0\n    t += 1\n    let copied: I32 = source\n    copied\n}\n",
-        "pub fn copy(self: I32) -> I32 {\n    let copied: I32 = self\n    copied\n}\n",
-    ] {
+    for source in ["pub fn copy(self: I32) -> I32 {\n    let copied: I32 = self\n    copied\n}\n"] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 }
@@ -4845,7 +4842,6 @@ fn two_parameter_local_copy_type_mismatch_is_reported_at_initializer() {
 #[test]
 fn unsupported_two_parameter_local_copy_forms_remain_gated() {
     for source in [
-        "pub fn copy_pair(first: I32, var second: Bool) -> I32 {\n    var t = 0\n    t += 1\n    let first_copy: I32 = first\n    let second_copy: Bool = second\n    first_copy\n}\n",
         "pub fn copy_pair(first: I32, second: Str) -> I32 {\n    let first_copy: I32 = first\n    let second_copy: Str = second\n    first_copy\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -4992,8 +4988,6 @@ fn unsupported_unannotated_literal_copy_forms_remain_gated() {
         "pub fn copy() -> I32 {\n    let source = 42\n    let copied = r#source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source = 42\n    let copied = source + 1\n    copied\n}\n",
         "const SOURCE: I32 = 42\npub fn copy() -> I32 {\n    let source = 7\n    let copied = SOURCE\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    let source = 42\n    var copied = source\n    copied += 0\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    var source = 42\n    let copied = source\n    copied += 0\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let var source = 42\n    let copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source = 42\n    let var copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let (source, other) = (42, 7)\n    let copied = source\n    copied\n}\n",
@@ -5130,7 +5124,6 @@ fn unsupported_flat_unannotated_primitive_local_forms_remain_gated() {
         "pub fn self_reference() -> I32 {\n    let source = source\n    source\n}\n",
         "pub fn forward_reference() -> I32 {\n    let copied = later\n    let later = 1\n    copied\n}\n",
         "pub fn computed() -> I32 {\n    let source = 1\n    let copied = source + 1\n    copied\n}\n",
-        "pub fn mutable() -> I32 {\n    var source = 1\n    source += 2\n    source\n}\n",
         "pub fn destructured() -> I32 {\n    let (source, other) = (1, 2)\n    source\n}\n",
         "pub fn raw_path() -> I32 {\n    let source = 1\n    let copied = r#source\n    copied\n}\n",
         "pub fn qualified_path() -> I32 {\n    let source = 1\n    let copied = values.VALUE\n    copied\n}\n",
@@ -10163,10 +10156,7 @@ fn public_bool_parameter_literal_if_function_emits_check_result() {
 
 #[test]
 fn unsupported_bool_parameter_if_shapes_remain_gated() {
-    for source in [
-        "pub fn choose(var flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if flag { 1 } else { 2 }\n}\n",
-        "pub fn choose(flag: Bool) -> I32 { if flag { 1 } }\n",
-    ] {
+    for source in ["pub fn choose(flag: Bool) -> I32 { if flag { 1 } }\n"] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 }
@@ -10193,6 +10183,23 @@ fn public_match_tail_bodies_emit_check_results() {
         "pub fn choose(value: I32) -> I32 { match value { 0 if value > 1 => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 1..=5 if value > 1 => 1, _ => 0 } }\n",
         "pub fn choose(flag: Bool) -> I32 { match flag { _ if flag => 1, _ => 0 } }\n",
+        "pub fn choose() -> I32 { var x = 1\n x += 2\n x }\n",
+        "pub fn run() -> I32 { var total = 0\n    total += 1\n    total\n }\n",
+        "pub fn copy(var source: I32) -> I32 {\n    var t = 0\n    t += 1\n    let copied: I32 = source\n    copied\n}\n",
+        "pub fn copy_pair(first: I32, var second: Bool) -> I32 {\n    var t = 0\n    t += 1\n    let first_copy: I32 = first\n    let second_copy: Bool = second\n    first_copy\n}\n",
+        "pub fn copy() -> I32 {\n    let source = 42\n    var copied = source\n    copied += 0\n    copied\n}\n",
+        "pub fn mutable() -> I32 {\n    var source = 1\n    source += 2\n    source\n}\n",
+        "pub fn choose(var flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if flag { 1 } else { 2 }\n}\n",
+        "pub fn choose(flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not flag { 1 } else { 2 }\n}\n",
+        "pub fn choose(var left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if left and right { 1 } else { 2 }\n}\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left and right) { 1 } else { 2 }\n}\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left or right) { 1 } else { 2 }\n}\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled and value >= 18) { 1 } else { 2 }\n}\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled or value >= 18) { 1 } else { 2 }\n}\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left < right) { 1 } else { 2 }\n}\n",
+        "pub fn choose(value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if not not (value < 10) { 1 } else { 2 }\n}\n",
+        "pub fn choose(var value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if value < 10 { 1 } else { 2 }\n}\n",
+        "pub fn local() -> I32 {\nvar value = 42\nvalue += 1\nvalue\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10241,6 +10248,7 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose(value: I32) -> Bool { match value { 0 => 1, _ => 2 }\n true }\n",
         "pub fn choose(value: I32) -> I32 { match value { _ => 1 }\n 0 }\n",
         "pub fn choose(flag: Bool) -> I32 { var x: I32 = 0\n if flag { x = 1\n 5 }\n x }\n",
+        "pub fn choose(flag: Bool) -> I32 { var x = 1\n x += flag\n x }\n",
         "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 1.0 }\n x }\n",
         "pub fn choose(flag: Bool, a: I32) -> I32 { let x = if flag { 1 } else { a }\n x }\n",
         "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, 1 => 2, _ => 3 }\n x }\n",
@@ -10280,10 +10288,7 @@ fn public_bool_parameter_not_if_function_emits_check_result() {
 
 #[test]
 fn unsupported_bool_parameter_negation_shapes_remain_gated() {
-    for source in [
-        "pub fn choose(flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not flag { 1 } else { 2 }\n}\n",
-        "pub fn choose(flag: Bool) -> I32 { if not flag { 1 } }\n",
-    ] {
+    for source in ["pub fn choose(flag: Bool) -> I32 { if not flag { 1 } }\n"] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 }
@@ -10347,9 +10352,7 @@ fn public_bool_parameters_and_if_function_emits_check_result() {
 #[test]
 fn unsupported_bool_parameter_and_shapes_remain_gated() {
     for source in [
-        "pub fn choose(var left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if left and right { 1 } else { 2 }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left and right) { 1 } else { 2 }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n    } else {\n        value\n    }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        1\n    } else {\n        2\n    }\n    0\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    let value = 1\n    { value }\n    value\n}\n",
@@ -10376,10 +10379,7 @@ fn public_bool_parameters_or_if_function_emits_check_result() {
 
 #[test]
 fn unsupported_bool_parameter_or_shapes_remain_gated() {
-    for source in [
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left or right) { 1 } else { 2 }\n}\n",
-    ] {
+    for source in ["pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } }\n"] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 }
@@ -10438,8 +10438,6 @@ fn unsupported_mixed_bool_logical_comparison_conditions_remain_gated() {
         "type BoolAlias = Bool\npub fn choose(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } }\n",
-        "pub fn choose(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled and value >= 18) { 1 } else { 2 }\n}\n",
-        "pub fn choose(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled or value >= 18) { 1 } else { 2 }\n}\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10556,6 +10554,10 @@ fn assign_statement_errors_emit_their_diagnostics() {
             "ASSIGN_TO_IMMUTABLE",
         ),
         (
+            "pub fn copy() -> I32 {\n    var source = 42\n    let copied = source\n    copied += 0\n    copied\n}\n",
+            "ASSIGN_TO_IMMUTABLE",
+        ),
+        (
             "pub fn run() -> I32 { var total: I32 = 0\n    total + 1 = 5\n    total\n }\n",
             "INVALID_ASSIGN_TARGET",
         ),
@@ -10577,7 +10579,6 @@ fn assign_statement_errors_emit_their_diagnostics() {
 fn unsupported_var_forms_remain_gated() {
     for source in [
         "pub fn run(var value: I32) -> I32 { value\n }\n",
-        "pub fn run() -> I32 { var total = 0\n    total += 1\n    total\n }\n",
         "pub fn run() -> I32 { var total: I32 = 0\n    missing = 1\n    total\n }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10618,7 +10619,6 @@ fn unsupported_primitive_parameter_comparison_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn choose(left: IntegerAlias, right: IntegerAlias) -> I32 { if left < right { 1 } else { 2 } }\n",
         "pub fn choose(left: (), right: ()) -> I32 { if left == right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left < right) { 1 } else { 2 }\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -10665,11 +10665,9 @@ fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
         "pub fn choose(value: I8) -> I32 { if 10 < 11 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < other { 1 } else { 2 } }\n",
-        "pub fn choose(value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if not not (value < 10) { 1 } else { 2 }\n}\n",
         "type I8Alias = I8\npub fn choose(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
         "pub fn choose(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
-        "pub fn choose(var value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if value < 10 { 1 } else { 2 }\n}\n",
         "pub fn choose(value: I8) -> I32 { if value < 10 { 1 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -11243,7 +11241,6 @@ fn target_filtered_public_name_does_not_report_a_name_error() {
 fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     for source in [
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
-        "pub fn local() -> I32 {\nvar value = 42\nvalue += 1\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nvar second = 2\nsecond += first\nfirst\n}\n",

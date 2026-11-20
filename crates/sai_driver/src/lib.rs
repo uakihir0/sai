@@ -50580,7 +50580,6 @@ property "shared"() {}
             "negated_result_alias",
             "negated_result_later_constraint",
             "negated_result_alias_later_constraint",
-            "mutable_source",
             "deep_nested_source",
             "forward_source",
             "global_source",
@@ -51142,7 +51141,6 @@ property "shared"() {}
             "computed_literal_source",
             "direct_call_operand",
             "compound_operand",
-            "mutable_source",
             "global_source",
             "forward_source",
             "deep_nested_source",
@@ -54038,6 +54036,7 @@ property "shared"() {}
             "negated_conjunction",
             "discarded_branch_statement",
             "discarded_expression_statements",
+            "double_negation",
         ] {
             let owner = owner_named(&database, &resolved, name);
             let FunctionBodyTypeCheck::Supported { diagnostics } = owner
@@ -54149,7 +54148,6 @@ property "shared"() {}
             "if_expression_statement",
             "literal_condition",
             "nested_branch_tail",
-            "double_negation",
         ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
@@ -71006,8 +71004,6 @@ property "shared"() {}
             "excluded_forward",
             "excluded_unresolved",
             "excluded_nested_block",
-            "excluded_mutable_source",
-            "excluded_mutable_parameter",
         ] {
             assert!(
                 matches!(
@@ -76957,7 +76953,6 @@ property "shared"() {}
         let root = concat!(
             "const ONE: I32 = 1\n",
             "type Number = I32\n",
-            "pub fn mutable() -> I32 {\n    var value = 42\n    value += 1\n    value\n}\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
             "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second = 2\n    second += first\n    first\n}\n",
             "pub fn raw_copy() -> I32 {\n    let value: I32 = 42\n    let copy: I32 = r#value\n    copy\n}\n",
@@ -76990,7 +76985,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 18);
+        assert_eq!(resolved.owners().len(), 17);
         for owner in resolved.owners() {
             assert!(matches!(
                 owner
@@ -77211,7 +77206,7 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
-        for index in [6, 8] {
+        for index in [4, 6, 8] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77219,7 +77214,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [2, 3, 4, 5, 7, 9] {
+        for index in [2, 3, 5, 7, 9] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77366,7 +77361,7 @@ property "shared"() {}
                 .expect("a negated literal-parameter comparison is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [21, 24] {
+        for index in [21, 23, 24, 29] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77374,7 +77369,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [19, 20, 23, 26, 27, 28, 29, 30] {
+        for index in [19, 20, 26, 27, 28, 30] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77415,7 +77410,7 @@ property "shared"() {}
         let owners = resolved.owners();
         assert_eq!(owners.len(), 9);
 
-        for index in [0, 7, 8] {
+        for index in [0, 1, 6, 7, 8] {
             let check = owners[index]
                 .body_type_check()
                 .expect("not conditions over admitted operand shapes are supported");
@@ -77438,7 +77433,7 @@ property "shared"() {}
                 .expect("a Bool literal operand in a conjunction is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [1, 2, 4, 6] {
+        for index in [2, 4] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77483,7 +77478,7 @@ property "shared"() {}
         let owners = resolved.owners();
         assert_eq!(owners.len(), 13);
 
-        for index in [0, 1] {
+        for index in [0, 1, 6] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77513,7 +77508,7 @@ property "shared"() {}
                 .expect("a Bool literal operand in a conjunction is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [3, 5, 6, 7, 11, 12] {
+        for index in [3, 5, 7, 11, 12] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77607,7 +77602,7 @@ property "shared"() {}
         let owners = resolved.owners();
         assert_eq!(owners.len(), 6);
 
-        for index in 0..4 {
+        for index in 0..5 {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -77620,12 +77615,6 @@ property "shared"() {}
                 .body_type_check()
                 .expect("an assignment to a var local is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
-        ));
-        assert!(matches!(
-            owners[4]
-                .body_type_check()
-                .expect("var parameters stay gated"),
-            FunctionBodyTypeCheck::Unsupported
         ));
     }
 
@@ -77886,6 +77875,8 @@ property "shared"() {}
             "pub fn stmt_float_mod(flag: Bool) -> I32 {\n    var x: F32 = 0.0\n    if flag { x %= 2.0 }\n    0\n}\n",
             "pub fn guarded_wild_nonexhaustive(flag: Bool) -> I32 {\n    match flag { _ if flag => 1 }\n}\n",
             "pub fn guarded_wild_then_catchall(flag: Bool) -> I32 {\n    match flag { _ if flag => 1, _ => 0 }\n}\n",
+            "pub fn assign_op_literal_var() -> I32 {\n    var x = 1\n    x += 2\n    x\n}\n",
+            "pub fn assign_op_literal_var_mismatch(flag: Bool) -> I32 {\n    var x = 1\n    x += flag\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77901,10 +77892,10 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 40);
+        assert_eq!(owners.len(), 42);
 
         for index in [
-            0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 26, 29, 31, 32, 33, 39,
+            0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 26, 29, 31, 32, 33, 39, 40,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -77960,7 +77951,7 @@ property "shared"() {}
         ));
         // `stmt_match` stays gated: statement-position `match` discards its
         // arm values, so unifying them with the return type would be wrong.
-        for index in [15, 18, 19, 21, 23, 34, 35] {
+        for index in [15, 18, 19, 21, 23, 34, 35, 41] {
             let check = owners[index]
                 .body_type_check()
                 .expect("match shapes outside the slice are gated");
@@ -78003,7 +77994,7 @@ property "shared"() {}
         let owners = resolved.owners();
         assert_eq!(owners.len(), 12);
 
-        for index in 0..4 {
+        for index in [0, 1, 2, 3, 7] {
             let check = owners[index]
                 .body_type_check()
                 .expect("supported compound-assignment shapes are checked");
@@ -78041,7 +78032,7 @@ property "shared"() {}
         // assignment is equivalently unsupported rather than diagnosed. The
         // nested-expression and unary right operands follow operand
         // admission and stay gated with the other unresolved shapes.
-        for index in [6, 7, 8, 10, 11] {
+        for index in [6, 8, 10, 11] {
             assert!(
                 matches!(
                     owners[index]
@@ -78280,7 +78271,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the supported comparison slice: {check:?}"
             );
         }
-        for index in [38, 40] {
+        for index in [29, 31, 32, 38, 40, 45] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -78324,7 +78315,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [27, 28, 29, 31, 32, 39, 42, 44, 45, 46] {
+        for index in [27, 28, 39, 42, 44, 46] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -78397,7 +78388,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the mixed condition slice: {check:?}"
             );
         }
-        for index in [13, 14, 15, 16, 17, 26, 28, 29, 30, 32] {
+        for index in [13, 14, 15, 16, 17, 22, 23, 26, 28, 29, 30, 32] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a nested logical or extra-parameter condition is checked");
@@ -78439,7 +78430,7 @@ property "shared"() {}
                 "function owner {index} should report one comparison mismatch: {check:?}"
             );
         }
-        for index in [22, 23, 24] {
+        for index in [24] {
             let check = owners[index]
                 .body_type_check()
                 .expect("unsupported nested condition form is gated");

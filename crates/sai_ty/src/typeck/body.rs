@@ -2630,31 +2630,46 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             let LocalType::LiteralVariable(id) = place_type else {
                 return Err(());
             };
-            // `x op= e` on an unresolved literal variable desugars to
-            // `x = x op e`: the operation admits operand shapes and
-            // constrains the variable, and its result must keep the
-            // same variable for the write-back to type.
-            let result = match op {
+            // `x op= literal` on an unresolved literal variable desugars
+            // to `x = x op literal`: the result keeps the variable, so the
+            // literal becomes another constraint site on it, exactly as
+            // `x = literal` does. Path right-hand sides and shifts —
+            // where the right operand's type is independent of the
+            // place's — stay gated.
+            if !matches!(
+                op,
                 BinOp::Add
-                | BinOp::Sub
-                | BinOp::Mul
-                | BinOp::Div
-                | BinOp::Rem
-                | BinOp::WrapAdd
-                | BinOp::WrapSub
-                | BinOp::WrapMul => self.check_arithmetic(op, lhs, rhs, stmt_id)?,
-                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
-                    self.check_bitwise(op, lhs, rhs, stmt_id)?
-                }
-                BinOp::Shl | BinOp::Shr => self.check_shift(op, lhs, rhs, stmt_id, false)?,
-                _ => return Err(()),
-            };
-            let LocalType::LiteralVariable(result_id) = result else {
-                return Err(());
-            };
-            if result_id != id {
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Rem
+                    | BinOp::WrapAdd
+                    | BinOp::WrapSub
+                    | BinOp::WrapMul
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+            ) {
                 return Err(());
             }
+            let ExprKind::Lit(literal) = rhs.kind else {
+                return Err(());
+            };
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            match variable.kind {
+                PrimitiveLiteralKind::Integer => {
+                    self.add_integer_literal_constraint(id, literal, rhs.hir_id)?;
+                }
+                PrimitiveLiteralKind::FloatingPoint => {
+                    self.add_float_literal_constraint(id, literal, rhs.hir_id)?;
+                }
+                PrimitiveLiteralKind::Bool
+                | PrimitiveLiteralKind::Byte
+                | PrimitiveLiteralKind::Character => return Err(()),
+            }
+            self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
             self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
             self.record_expression_type(stmt_id, LocalType::LiteralVariable(id));
             return Ok(());
@@ -3144,7 +3159,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     });
                 }
             }
-            PatKind::Wild => *catch_all = true,
+            PatKind::Wild => *catch_all = arm.guard.is_none(),
             PatKind::Binding {
                 mode: BindingMode::Value,
                 binding,
