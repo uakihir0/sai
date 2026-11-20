@@ -2045,7 +2045,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 continue;
             }
             let Some((literal, kind)) = literal_entry else {
-                return Err(());
+                // `x < path` with a concretely typed operand resolves the
+                // variable to the operand's type when the comparison is
+                // defined for the pair — the same rule the arithmetic
+                // operand slice uses.
+                let Some(path_type) = self
+                    .check_local_path(literal_expression)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                else {
+                    return Err(());
+                };
+                match primitive_comparison_result(operator, path_type, path_type) {
+                    PrimitiveComparisonResult::Bool => {
+                        self.resolve_literal_variable(id, path_type)?;
+                        return Ok(LocalType::Concrete(PrimTy::Bool));
+                    }
+                    _ => return Err(()),
+                }
             };
             match (variable.kind, kind) {
                 (PrimitiveLiteralKind::Integer, PrimitiveLiteralKind::Integer) => {

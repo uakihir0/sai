@@ -5010,6 +5010,7 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn add_assign(left: I32) -> I32 {\n    var sum = 0\n    sum += left\n    sum\n}\n",
         "pub fn local_assign_op() -> I32 {\nlet first: I32 = 1\nvar second = 2\nsecond += first\nfirst\n}\n",
         "pub fn mutable(left: I32, right: I32) -> I32 {\n    var result = 0\n    result += left\n    result\n}\n",
+        "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -9451,7 +9452,6 @@ fn primitive_comparison_local_uses_shadowed_binding_and_source_order() {
 #[test]
 fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
         "pub fn compare(left: Str, right: Str) -> Bool {\n    let result = left == right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left as I64 == right as I64\n    result\n}\n",
         "type IntegerAlias = I32\npub fn compare(left: IntegerAlias, right: IntegerAlias) -> Bool {\n    let result = left == right\n    result\n}\n",

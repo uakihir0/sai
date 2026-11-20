@@ -57513,7 +57513,6 @@ property "shared"() {}
             "computed_comparison_operand_unsupported",
             "call_comparison_operand_unsupported",
             "deep_comparison_call_unsupported",
-            "unresolved_comparison_local_unsupported",
         ] {
             assert!(
                 matches!(
@@ -77748,7 +77747,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
-        for index in [23, 24, 28, 32, 33] {
+        for index in [23, 24, 28, 32, 33, 35] {
             assert!(
                 matches!(
                     owners[index]

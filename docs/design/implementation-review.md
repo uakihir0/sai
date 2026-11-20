@@ -9478,3 +9478,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** With pinned Rust 1.99.1, `cargo test -p sai_driver --lib --locked --offline` (773 tests) and `cargo test -p sai_cli --test check_empty_source --locked --offline` (385 tests) each passed. `cargo fmt --all -- --check` and `git diff --check` passed.
 - **Hostile review:** Passed. `primitive_arithmetic_result` gates the (T, T) operator before resolving, so unsupported pairs error out before touching the variable; `resolve_literal_variable` range-checks every recorded site at resolution. No actionable P0-P3 findings remain.
 - **Remaining scope:** `%`/wrapping/bitwise path operands, literal-variable × literal-variable merges, Bool-operand diagnostics, the IR-1027/IR-1028/IR-1029 remaining lists, and CLI Stage 0.
+
+### IR-1031 (2026-11-20): Literal-variable operands against concrete paths in comparisons
+
+- **Decision:** Admit `x < path` (and `==`/`!=`/`<=`/`>`/`>=`) when `x` is an unresolved literal variable and the other operand checks to a concrete primitive `T`: the comparison must be defined for `(T, T)`, then the variable resolves to `T`.
+- **Reason:** §6.12.4 — same rule as IR-1030's arithmetic operands; a concretely typed side pins the literal variable through the operator's definition.
+- **Failure boundary and judgment:** `x < flag` (Bool/other families), two unresolved literal variables, and non-primitive operands stay gated rather than diagnosed. A resolved literal variable on the other side is admitted via its concrete type.
+- **Review required:** None beyond the shared IR-1026 flag — the operator gate runs before resolution.
+- **Planned verification matrix:** Driver owners `literal_var_cmp_param` (supported) and `literal_var_cmp_bool` (gated); the `unresolved_comparison_local_unsupported` gate fixture and one CLI row reclassified as supported.
+- **Verification:** Pinned Rust 1.99.1, `cargo test -p sai_driver --lib --locked --offline` (773) and `cargo test -p sai_cli --test check_empty_source --locked --offline` (385) pass; `cargo fmt --all -- --check` and `git diff --check` clean.
+- **Hostile review:** Passed. `primitive_comparison_result` rejects pairs without a Bool result before `resolve_literal_variable` runs; family mismatch errors out.
+- **Remaining scope:** lit-var × lit-var comparisons/arithmetic, family-mismatch diagnostics, and the earlier IR remaining lists.
