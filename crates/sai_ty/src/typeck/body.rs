@@ -3031,10 +3031,20 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// shapes (the function's return type is passed as an inert stand-in).
     fn check_break_value(&mut self, value: &'hir Expr<'hir>) -> Result<LocalType, ()> {
         match value.kind {
-            ExprKind::If { .. }
-            | ExprKind::Match { .. }
-            | ExprKind::Return(..)
-            | ExprKind::Loop { .. } => {
+            // `if`/`match` break values join `β`'s literal group through
+            // the same literal-join path unannotated `let` initializers
+            // use — branches must still be literal tails.
+            ExprKind::If { cond, then, els } => {
+                return self.check_literal_join_if(cond, then, els);
+            }
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => {
+                return self.check_literal_join_match(scrutinee, arms, source);
+            }
+            ExprKind::Return(..) | ExprKind::Loop { .. } => {
                 return Err(());
             }
             ExprKind::Unary(UnOp::BitNot, operand) if matches!(operand.kind, ExprKind::Lit(_)) => {
