@@ -2743,6 +2743,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             Some(tail) => match tail.kind {
                 ExprKind::Break { label, value } => self.check_break(tail.hir_id, label, value)?,
                 ExprKind::Continue { label } => self.check_continue(tail.hir_id, label)?,
+                // An `if`/`match` tail in statement position discards its
+                // result like an `if`/`match` statement — the `while`
+                // desugaring's then-block ends with the user's `if`.
+                ExprKind::If { .. } | ExprKind::Match { .. } => self.check_expr_stmt(tail)?,
                 _ => return Err(()),
             },
         }
