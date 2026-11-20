@@ -10278,7 +10278,6 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose() -> I32 { var a = 1\n    var b = 2.5\n    let sum = a + b\n    sum\n }\n",
         "pub fn choose() -> Bool { var a = true\n    var b = false\n    a + b\n }\n",
         "pub fn choose() -> F64 { var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n }\n",
-
         "pub fn choose() -> I32 { var x = 0.5\n    let rem = 1 % x\n    rem\n }\n",
         "pub fn choose(value: I32) -> I32 { var c = 0.5\n    let r = value << c\n    r\n }\n",
         "pub fn choose() -> I32 { var x = 0.5\n    var c = 1\n    let r = x << c\n    r\n }\n",
