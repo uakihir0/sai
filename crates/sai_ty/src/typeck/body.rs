@@ -2438,7 +2438,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let LocalType::Concrete(found) = check.local_type else {
                         return Err(());
                     };
-                    self.check_annotated_path(LocalType::LiteralVariable(id), found, rhs.hir_id)?;
+                    // A variable already resolved by an earlier assignment
+                    // coerces the right side to the resolved place type; an
+                    // unresolved one resolves to the right side's type.
+                    match self.literal_variables.get(id).and_then(|v| v.resolved) {
+                        Some(expected) => self.check_annotated_path(
+                            LocalType::Concrete(found),
+                            expected,
+                            rhs.hir_id,
+                        )?,
+                        None => self.check_annotated_path(
+                            LocalType::LiteralVariable(id),
+                            found,
+                            rhs.hir_id,
+                        )?,
+                    }
                 }
                 self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
                 Ok(())

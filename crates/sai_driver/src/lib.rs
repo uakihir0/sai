@@ -77123,6 +77123,7 @@ property "shared"() {}
             "pub fn literal_var_path_rhs(value: I32) -> I32 {\n    var x = 1\n    x = value\n    x\n}\n",
             "pub fn literal_var_float_rhs() -> I32 {\n    var x = 1\n    x = 2.5\n    x\n}\n",
             "pub fn literal_var_second_literal() -> I32 {\n    var x = 1\n    x = 2\n    x = 3\n    x\n}\n",
+            "pub fn literal_var_reassign_mismatch(value: I32, other: F32) -> I32 {\n    var x = 1\n    x = value\n    x = other\n    x\n}\n",
             "pub fn compound() -> I32 {\n    var x: I32 = 0\n    x += 5\n    x\n}\n",
             "pub fn unbound_target() -> I32 {\n    missing = 5\n    0\n}\n",
             "pub fn call_rhs() -> I32 {\n    var x: I32 = 0\n    let seed: I32 = 4\n    x = identity(seed)\n    x\n}\n",
@@ -77142,7 +77143,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 19);
+        assert_eq!(owners.len(), 20);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77182,7 +77183,18 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
-        for index in [11, 12, 15, 17, 18] {
+        // `literal_var_reassign_mismatch` resolves `x` to the first
+        // assignment's `I32`, so the `F32` right side mismatches the place
+        // type — `expected I32, found F32`, not the reverse.
+        assert!(matches!(
+            owners[15]
+                .body_type_check()
+                .expect("a resolved-variable reassignment mismatch is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        for index in [11, 12, 16, 18, 19] {
             let check = owners[index]
                 .body_type_check()
                 .expect("literal-var, compound and call assignments are checked");
@@ -77191,7 +77203,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed: {check:?}"
             );
         }
-        for index in [13, 14, 16] {
+        for index in [13, 14, 17] {
             assert!(
                 matches!(
                     owners[index]
