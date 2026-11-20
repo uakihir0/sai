@@ -10174,14 +10174,18 @@ fn public_if_tail_bodies_emit_check_results() {
 
 #[test]
 fn public_non_bool_if_condition_emits_type_mismatch() {
-    let source = "pub fn choose(value: I32) -> I32 { if value { 1 } else { 2 } }\n";
-    let output = run_check(source, "", &[], &[]);
-    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
-    assert!(
-        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
-            && stdout.contains("\"message\":\"expected `Bool`, found `I32`\""),
-        "the non-Bool condition emits its type mismatch diagnostic:\n{stdout}"
-    );
+    for source in [
+        "pub fn choose(value: I32) -> I32 { if value { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && stdout.contains("\"message\":\"expected `Bool`, found `I32`\""),
+            "the non-Bool condition emits its type mismatch diagnostic:\n{stdout}"
+        );
+    }
 }
 
 #[test]
@@ -10191,6 +10195,9 @@ fn public_bool_parameters_and_if_function_emits_check_result() {
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and right) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and left) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left and true { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and right and left) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left == right and left) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n        value\n    } else {\n        2\n    }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    left and right\n    if left and right {\n        1\n    } else {\n        2\n    }\n}\n",
     ] {
@@ -10201,12 +10208,9 @@ fn public_bool_parameters_and_if_function_emits_check_result() {
 #[test]
 fn unsupported_bool_parameter_and_shapes_remain_gated() {
     for source in [
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if left and true { 1 } else { 2 } }\n",
         "pub fn choose(var left: Bool, right: Bool) -> I32 { if left and right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left and right) { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and right and left) { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left == right and left) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n    } else {\n        value\n    }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        1\n    } else {\n        2\n    }\n    0\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    let value = 1\n    { value }\n    value\n}\n",
@@ -10221,6 +10225,11 @@ fn public_bool_parameters_or_if_function_emits_check_result() {
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not (right or left) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left or left { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left or true { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right or left { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right and left { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left or right or left) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left == right or left) { 1 } else { 2 } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10229,13 +10238,8 @@ fn public_bool_parameters_or_if_function_emits_check_result() {
 #[test]
 fn unsupported_bool_parameter_or_shapes_remain_gated() {
     for source in [
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if left or true { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right or left { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right and left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left or right) { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left or right or left) { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left == right or left) { 1 } else { 2 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -10257,6 +10261,10 @@ fn public_bool_parameter_and_primitive_comparison_if_functions_emit_check_result
 fn public_bool_parameter_or_primitive_comparison_if_functions_emit_check_results() {
     for source in [
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and (value > 0 and value < 10) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or (value > 0 or value < 10) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled or value >= 18 { 1 } else { 2 } }\n",
         "pub fn choose(value: I32, enabled: Bool) -> I32 { if value < 20 or enabled { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: U8) -> I32 { if enabled or 18 <= value { 1 } else { 2 } }\n",
     ] {
@@ -10274,6 +10282,8 @@ fn public_negated_mixed_bool_comparison_conditions_emit_check_results() {
         "pub fn choose(value: U8, enabled: Bool) -> I32 { if not (18 <= value) and enabled { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or not (value < 20) { 1 } else { 2 } }\n",
         "pub fn choose(value: I32, enabled: Bool) -> I32 { if not (value < 20) or enabled { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and (value > 0 and value < 10)) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled or (value > 0 or value < 10)) { 1 } else { 2 } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10282,13 +10292,8 @@ fn public_negated_mixed_bool_comparison_conditions_emit_check_results() {
 #[test]
 fn unsupported_mixed_bool_logical_comparison_conditions_remain_gated() {
     for source in [
-        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and (value > 0 and value < 10) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and enabled >= 18 { 1 } else { 2 } }\n",
-        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or (value > 0 or value < 10) { 1 } else { 2 } }\n",
-        "pub fn choose(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
-        "pub fn choose(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled or value >= 18 { 1 } else { 2 } }\n",
         "type BoolAlias = Bool\npub fn choose(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
-        "pub fn choose(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and not (not (value >= 18)) { 1 } else { 2 } }\n",
@@ -10297,8 +10302,6 @@ fn unsupported_mixed_bool_logical_comparison_conditions_remain_gated() {
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and not (value >= 18)) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (not enabled and value >= 18) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not enabled and value >= 18 { 1 } else { 2 } }\n",
-        "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and (value > 0 and value < 10)) { 1 } else { 2 } }\n",
-        "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled or (value > 0 or value < 10)) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and enabled >= 18) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled or enabled >= 18) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } }\n",
@@ -10328,6 +10331,8 @@ fn public_primitive_parameter_comparison_if_functions_emit_check_results() {
         "pub fn choose(left: USize, right: USize) -> I32 { if left >= right { 1 } else { 2 } }\n",
         "pub fn choose(left: Int, right: Int) -> I32 { if left == right { 1 } else { 2 } }\n",
         "pub fn choose(left: UInt, right: UInt) -> I32 { if left != right { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right and left { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left < right and left) { 1 } else { 2 } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -10338,10 +10343,8 @@ fn unsupported_primitive_parameter_comparison_shapes_remain_gated() {
     for source in [
         "type IntegerAlias = I32\npub fn choose(left: IntegerAlias, right: IntegerAlias) -> I32 { if left < right { 1 } else { 2 } }\n",
         "pub fn choose(left: (), right: ()) -> I32 { if left == right { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right and left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left < right) { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left < right and left) { 1 } else { 2 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -10355,6 +10358,8 @@ fn public_single_primitive_parameter_comparison_with_literal_emits_check_results
         "pub fn choose(value: I8) -> I32 { if value < -128 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < value { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if not (value < 10) { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 { if value < 1 and true { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 { if not (value < 1 and true) { 1 } else { 2 } }\n",
         "pub fn choose(value: F32) -> I32 { if not (1.5 < value) { 1 } else { 2 } }\n",
         "pub fn choose(value: U64) -> I32 { if value >= 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: F32) -> I32 { if value > 1.5 { 1 } else { 2 } }\n",
@@ -10385,10 +10390,8 @@ fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
         "const LIMIT: I8 = 10\npub fn choose(value: I8) -> I32 { if LIMIT < value { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < 11 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
-        "pub fn choose(value: I8) -> I32 { if value < 1 and true { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < other { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if not not (value < 10) { 1 } else { 2 } }\n",
-        "pub fn choose(value: I8) -> I32 { if not (value < 1 and true) { 1 } else { 2 } }\n",
         "type I8Alias = I8\npub fn choose(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
         "pub fn choose(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
