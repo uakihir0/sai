@@ -2728,23 +2728,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     fn check_if_condition(&mut self, condition: &'hir Expr<'hir>) -> Result<(), ()> {
         let local_type = match condition.kind {
             ExprKind::Path(_) => self.check_local_path(condition)?,
-            ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
-                ExprKind::Path(_) => self.check_logical_not(operand)?,
-                ExprKind::Binary(operator, left, right)
-                    if matches!(operator, BinOp::And | BinOp::Or) =>
-                {
-                    self.check_logical(operator, left, right)?
-                }
-                ExprKind::Binary(operator, left, right)
-                    if matches!(
-                        operator,
-                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-                    ) =>
-                {
-                    self.check_comparison(operator, left, right)?
-                }
-                _ => return Err(()),
-            },
+            // `not e` conditions admit the same operand-position logical
+            // shapes as `let x = not e` — `not not`, `not true`, and nested
+            // `and`/`or`/comparison operands recurse in source order.
+            ExprKind::Unary(UnOp::Not, operand) => {
+                let operand_type = self.check_logical_operand(operand)?;
+                self.check_logical_operand_type(operand, operand_type)?;
+                LocalType::Concrete(PrimTy::Bool)
+            }
             ExprKind::Binary(operator, left, right)
                 if matches!(operator, BinOp::And | BinOp::Or) =>
             {

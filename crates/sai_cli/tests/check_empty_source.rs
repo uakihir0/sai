@@ -10173,14 +10173,21 @@ fn unsupported_bool_parameter_if_shapes_remain_gated() {
 
 #[test]
 fn public_bool_parameter_not_if_function_emits_check_result() {
-    let source = "pub fn choose(flag: Bool) -> I32 { if not flag { 1 } else { 2 } }\n";
-    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    for source in [
+        "pub fn choose(flag: Bool) -> I32 { if not flag { 1 } else { 2 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { if not not flag { 1 } else { 2 } }\n",
+        "pub fn choose() -> I32 { if not true { 1 } else { 2 } }\n",
+        "pub fn choose(flag: Bool, value: I32) -> I32 { if not not (flag and value >= 18) { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 { if not not (value < 10) { 1 } else { 2 } }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
 }
 
 #[test]
 fn unsupported_bool_parameter_negation_shapes_remain_gated() {
     for source in [
-        "pub fn choose(flag: Bool) -> I32 { if not not flag { 1 } else { 2 } }\n",
+        "pub fn choose(flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not flag { 1 } else { 2 }\n}\n",
         "pub fn choose(flag: Bool) -> I32 { if not flag { 1 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10248,7 +10255,7 @@ fn unsupported_bool_parameter_and_shapes_remain_gated() {
     for source in [
         "pub fn choose(var left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if left and right { 1 } else { 2 }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left and right) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left and right) { 1 } else { 2 }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n    } else {\n        value\n    }\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        1\n    } else {\n        2\n    }\n    0\n}\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    let value = 1\n    { value }\n    value\n}\n",
@@ -10277,7 +10284,7 @@ fn public_bool_parameters_or_if_function_emits_check_result() {
 fn unsupported_bool_parameter_or_shapes_remain_gated() {
     for source in [
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left or right) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left or right) { 1 } else { 2 }\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -10337,8 +10344,8 @@ fn unsupported_mixed_bool_logical_comparison_conditions_remain_gated() {
         "type BoolAlias = Bool\npub fn choose(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } }\n",
-        "pub fn choose(enabled: Bool, value: I32) -> I32 { if not not (enabled and value >= 18) { 1 } else { 2 } }\n",
-        "pub fn choose(enabled: Bool, value: I32) -> I32 { if not not (enabled or value >= 18) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled and value >= 18) { 1 } else { 2 }\n}\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled or value >= 18) { 1 } else { 2 }\n}\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10516,7 +10523,7 @@ fn unsupported_primitive_parameter_comparison_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn choose(left: IntegerAlias, right: IntegerAlias) -> I32 { if left < right { 1 } else { 2 } }\n",
         "pub fn choose(left: (), right: ()) -> I32 { if left == right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left < right) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left < right) { 1 } else { 2 }\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -10563,7 +10570,7 @@ fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
         "pub fn choose(value: I8) -> I32 { if 10 < 11 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < other { 1 } else { 2 } }\n",
-        "pub fn choose(value: I8) -> I32 { if not not (value < 10) { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if not not (value < 10) { 1 } else { 2 }\n}\n",
         "type I8Alias = I8\npub fn choose(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
         "pub fn choose(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
