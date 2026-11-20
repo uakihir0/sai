@@ -3638,12 +3638,60 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             let LocalType::LiteralVariable(id) = place_type else {
                 return Err(());
             };
+            // `x <<= e`/`x >>= e` desugar to `x = x << e`: the shift keeps
+            // `x`'s unresolved integer literal variable as the result, so
+            // the right operand is checked as a `U32` shift count exactly
+            // like `x << e`.
+            if matches!(op, BinOp::Shl | BinOp::Shr) {
+                if !self.literal_variables.get(id).is_some_and(|variable| {
+                    variable.resolved.is_none() && variable.kind == PrimitiveLiteralKind::Integer
+                }) {
+                    return Err(());
+                }
+                if let ExprKind::Lit(literal) = rhs.kind {
+                    let Some(kind) = primitive_literal_kind(literal) else {
+                        return Err(());
+                    };
+                    if kind != PrimitiveLiteralKind::Integer {
+                        return Err(());
+                    }
+                    self.check_annotated_literal(PrimTy::U32, literal, kind, rhs.hir_id);
+                } else {
+                    let right_type = match self.check_local_path(rhs) {
+                        Ok(LocalType::LiteralVariable(other))
+                            if self.literal_variables.get(other).is_some_and(|v| {
+                                v.resolved.is_none() && v.kind == PrimitiveLiteralKind::Integer
+                            }) =>
+                        {
+                            self.resolve_literal_variable(other, PrimTy::U32)?;
+                            PrimTy::U32
+                        }
+                        _ => self
+                            .check_local_path(rhs)
+                            .ok()
+                            .and_then(|local_type| self.concrete_local_type(local_type))
+                            .filter(|primitive| supports_primitive_literal(*primitive))
+                            .ok_or(())?,
+                    };
+                    if right_type != PrimTy::U32 {
+                        self.errors.push(PrimitiveBodyError {
+                            node: rhs.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                expected: PrimTy::U32,
+                                found: right_type,
+                            },
+                        });
+                    }
+                    self.record_expression_type(rhs.hir_id, LocalType::Concrete(right_type));
+                }
+                self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+                self.record_expression_type(stmt_id, LocalType::LiteralVariable(id));
+                return Ok(());
+            }
             // `x op= literal` on an unresolved literal variable desugars
             // to `x = x op literal`: the result keeps the variable, so the
             // literal becomes another constraint site on it, exactly as
-            // `x = literal` does. Path right-hand sides and shifts —
-            // where the right operand's type is independent of the
-            // place's — stay gated.
+            // `x = literal` does.
             if !matches!(
                 op,
                 BinOp::Add
