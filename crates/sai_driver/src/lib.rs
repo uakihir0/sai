@@ -9759,7 +9759,7 @@ fn primitive_match_tail_shape_is_supported(
     }
     let mut catch_all = false;
     for arm in arms {
-        if catch_all || arm.guard.is_some() {
+        if catch_all {
             return false;
         }
         let mut arm_bindings = None;
@@ -9795,12 +9795,24 @@ fn primitive_match_tail_shape_is_supported(
                 sub: None,
                 ..
             } => {
-                catch_all = true;
+                // A guarded binding arm is not a catch-all — the guard may
+                // fail, so an unguarded catch-all arm is still required.
+                catch_all = arm.guard.is_none();
                 let mut extended = preceding_bindings.clone();
                 extended.insert(binding);
                 arm_bindings = Some(extended);
             }
             _ => return false,
+        }
+        // Guards admit the plain-`binding` catch-all arm only; the guard's
+        // condition sees the arm's binding, matching the checker's rule.
+        if let Some(guard) = arm.guard {
+            let Some(bindings) = arm_bindings.as_ref() else {
+                return false;
+            };
+            if !primitive_if_condition_shape_is_supported(guard, bindings, locals, inputs) {
+                return false;
+            }
         }
         if !primitive_if_branch_tail_shape_is_supported(
             arm.body,
@@ -77567,6 +77579,9 @@ property "shared"() {}
             "pub fn or_mismatch(value: I32) -> I32 {\n    match value { 0 | true => 1, _ => 0 }\n}\n",
             "pub fn open_range(value: I32) -> I32 {\n    match value { 1.. => 1, _ => 0 }\n}\n",
             "pub fn range_mismatch(value: I32) -> I32 {\n    match value { 1..='a' => 1, _ => 0 }\n}\n",
+            "pub fn guarded_no_catch_all(value: I32) -> I32 {\n    match value { n if n > 0 => 1 }\n}\n",
+            "pub fn guarded_literal(value: I32) -> I32 {\n    match value { 0 if value > 1 => 1, _ => 0 }\n}\n",
+            "pub fn empty_range(value: I32) -> I32 {\n    match value { 5..=1 => 1, _ => 0 }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77582,9 +77597,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 25);
+        assert_eq!(owners.len(), 28);
 
-        for index in [0, 1, 2, 3, 4, 5, 6, 12, 13, 17, 20] {
+        for index in [0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 17, 20] {
             let check = owners[index]
                 .body_type_check()
                 .expect("supported match-tail shapes are checked");
@@ -77593,7 +77608,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the match-tail slice: {check:?}"
             );
         }
-        for index in [7, 8, 22, 24] {
+        for index in [7, 8, 22, 24, 27] {
             let check = owners[index]
                 .body_type_check()
                 .expect("mismatched match patterns are diagnosed");
@@ -77606,6 +77621,7 @@ property "shared"() {}
                                 diagnostics[0].code,
                                 sai_diagnostics::Code::TypeMismatch
                                     | sai_diagnostics::Code::LiteralOutOfRange
+                                    | sai_diagnostics::Code::EmptyRangePattern
                             )
                 ),
                 "function owner {index} should report one pattern diagnostic: {check:?}"
@@ -77625,7 +77641,7 @@ property "shared"() {}
         ));
         // `stmt_match` stays gated: statement-position `match` discards its
         // arm values, so unifying them with the return type would be wrong.
-        for index in [10, 11, 14, 15, 16, 18, 19, 21, 23] {
+        for index in [10, 14, 15, 16, 18, 19, 21, 23, 25, 26] {
             let check = owners[index]
                 .body_type_check()
                 .expect("match shapes outside the slice are gated");

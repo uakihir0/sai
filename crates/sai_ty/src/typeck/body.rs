@@ -2872,8 +2872,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.check_match_arm_pattern(arm, scrutinee_type, &mut catch_all, &mut arm_binding)?;
             // Arm patterns bind only inside their arm body — restore the
             // previous binding (or its absence) so sibling arms and the
-            // enclosing scope never observe the arm-local name.
-            let body_result = self.check_expr_expected(arm.body, expected);
+            // enclosing scope never observe the arm-local name. A guard
+            // runs inside the same scope with the binding installed.
+            let body_result = arm
+                .guard
+                .map(|guard| self.check_if_condition(guard))
+                .unwrap_or(Ok(()))
+                .and_then(|_| self.check_expr_expected(arm.body, expected));
             self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
@@ -2894,7 +2899,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         catch_all: &mut bool,
         arm_binding: &mut Option<(BindingId, Option<LocalType>)>,
     ) -> Result<(), ()> {
-        if *catch_all || arm.guard.is_some() {
+        if *catch_all {
+            return Err(());
+        }
+        // Guards admit only the plain-`binding` catch-all arm — the guard
+        // runs with the binding installed. Guards on literal, or or range
+        // patterns stay gated.
+        if arm.guard.is_some()
+            && !matches!(
+                arm.pat.kind,
+                PatKind::Binding {
+                    mode: BindingMode::Value,
+                    sub: None,
+                    ..
+                }
+            )
+        {
             return Err(());
         }
         match arm.pat.kind {
@@ -2947,7 +2967,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 sub: None,
                 ..
             } => {
-                *catch_all = true;
+                // A guarded binding arm is not a catch-all — the guard may
+                // fail, so an unguarded catch-all arm is still required.
+                *catch_all = arm.guard.is_none();
                 *arm_binding = Some((
                     binding,
                     self.known_bindings
@@ -3079,7 +3101,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let mut joined = None;
         for arm in arms {
             self.check_match_arm_pattern(arm, scrutinee_type, &mut catch_all, &mut arm_binding)?;
-            let body_result = self.join_literal_site(arm.body, &mut joined);
+            let body_result = arm
+                .guard
+                .map(|guard| self.check_if_condition(guard))
+                .unwrap_or(Ok(()))
+                .and_then(|_| self.join_literal_site(arm.body, &mut joined));
             self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
