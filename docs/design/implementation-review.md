@@ -9489,3 +9489,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, `cargo test -p sai_driver --lib --locked --offline` (773) and `cargo test -p sai_cli --test check_empty_source --locked --offline` (385) pass; `cargo fmt --all -- --check` and `git diff --check` clean.
 - **Hostile review:** Passed. `primitive_comparison_result` rejects pairs without a Bool result before `resolve_literal_variable` runs; family mismatch errors out.
 - **Remaining scope:** lit-var × lit-var comparisons/arithmetic, family-mismatch diagnostics, and the earlier IR remaining lists.
+
+### IR-1032 (2026-11-20): Literal-variable operands in remainder, wrapping arithmetic, and their compound assignments
+
+- **Decision:** Admit `x % path`, `x % literal`, `x +%/-%/*% path`, `x +% literal` when `x` is an unresolved integer literal variable and the other operand is a literal (constraint site) or a concrete primitive the operator is defined for (variable resolves to it). `x %= p` and `x +%= p` follow the same rule in `check_assign_op_stmt`.
+- **Reason:** §6.12.3/§6.12.7 — remainder and wrapping operators only exist on integer primitives, so an unresolved float variable cannot satisfy them through a path operand and stays gated.
+- **Failure boundary and judgment:** Float literal variables (`x % p` on `var x = 0.5`) stay gated rather than reporting `OperatorNotSupported` — the unresolved variable gives no concrete operand for the diagnostic. Bitwise `x & path` and shift operands stay gated.
+- **Review required:** None beyond IR-1026's flag.
+- **Planned verification matrix:** Driver owners `literal_var_rem_path`/`literal_var_rem_literal`/`literal_var_wrap_path`/`literal_var_rem_assign`/`literal_var_wrap_assign` (supported) and `literal_var_rem_float` (gated); CLI `remainder_unresolved_local` and `wrapping_unresolved_local` reclassified, plus new positive `+%`/`%=`/`+%=` rows.
+- **Verification:** Pinned Rust 1.99.1, driver suite (773) and CLI suite (385) pass; `cargo fmt --all -- --check` and `git diff --check` clean.
+- **Hostile review:** Passed. Remainder requires `is_integer_primitive` on the operand before resolution; wrapping verifies via `primitive_wrapping_literal_left_result`; float variables return Err before any site is recorded.
+- **Remaining scope:** bitwise `x & path`, shift operands, lit-var × lit-var merges, and the earlier remaining lists.

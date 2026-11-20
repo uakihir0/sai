@@ -77654,6 +77654,12 @@ property "shared"() {}
             "pub fn literal_var_cmp_param(value: I32) -> Bool {\n    var x = 1\n    let y = x < value\n    y\n}\n",
             "pub fn literal_var_cmp_bool(value: Bool) -> I32 {\n    var x = 1\n    let y = x < value\n    0\n}\n",
             "pub fn literal_var_repeat_assign_op(value: I32) -> I32 {\n    var x = 0\n    x += value\n    x += value\n    x\n}\n",
+            "pub fn literal_var_rem_path(value: I32) -> I32 {\n    var x = 1\n    let y = x % value\n    y\n}\n",
+            "pub fn literal_var_rem_literal() -> I32 {\n    var x = 1\n    let y = x % 3\n    y\n}\n",
+            "pub fn literal_var_wrap_path(value: I32) -> I32 {\n    var x = 1\n    let y = x +% value\n    y\n}\n",
+            "pub fn literal_var_rem_assign(value: I32) -> I32 {\n    var x = 0\n    x %= value\n    x\n}\n",
+            "pub fn literal_var_wrap_assign(value: I32) -> I32 {\n    var x = 0\n    x +%= value\n    x\n}\n",
+            "pub fn literal_var_rem_float(value: F32) -> I32 {\n    var x = 0.5\n    let y = x % value\n    0\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77669,7 +77675,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 37);
+        assert_eq!(owners.len(), 43);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77738,7 +77744,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand merge: {check:?}"
             );
         }
-        for index in [25, 26, 27, 29, 30, 31, 34, 36] {
+        for index in [25, 26, 27, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a literal-variable comparison is checked");
@@ -77747,7 +77753,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
-        for index in [23, 24, 28, 32, 33, 35] {
+        for index in [23, 24, 28, 32, 33, 35, 42] {
             assert!(
                 matches!(
                     owners[index]

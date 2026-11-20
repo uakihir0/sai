@@ -5011,6 +5011,10 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn local_assign_op() -> I32 {\nlet first: I32 = 1\nvar second = 2\nsecond += first\nfirst\n}\n",
         "pub fn mutable(left: I32, right: I32) -> I32 {\n    var result = 0\n    result += left\n    result\n}\n",
         "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
+        "pub fn remainder_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one % left\n    result\n}\n",
+        "pub fn wrapping_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one +% left\n    result\n}\n",
+        "pub fn remainder_assign_local(left: I32) -> I32 {\n    var result = 0\n    result %= left\n    result\n}\n",
+        "pub fn wrapping_assign_local(left: I32) -> I32 {\n    var result = 0\n    result +%= left\n    result\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -9211,7 +9215,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn float_mul() -> F64 {\n    let result = 1.0 * 2.0\n    result\n}\n",
         "pub fn mixed_mul() -> I64 {\n    let result = 1 * 2.0\n    result\n}\n",
         "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
-        "pub fn remainder_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one % left\n    result\n}\n",
         "pub fn remainder_nested_right(left: I32, right: I32) -> I32 {\n    let result = left % (right % 1)\n    result\n}\n",
         "pub fn remainder_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left % right) % left\n    result\n}\n",
         "type IntegerAlias = I32\npub fn remainder_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left % right\n    result\n}\n",
@@ -9245,7 +9248,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn wrapping_float_left_literal(right: I32) -> I32 {\n    let result = 1.0 +% right\n    result\n}\n",
         "pub fn wrapping_float_literal_right(left: I32) -> I32 {\n    let result = left +% 1.0\n    result\n}\n",
         "pub fn wrapping_integer_literal_non_integer_path(left: F32) -> F32 {\n    let result = left +% 1\n    result\n}\n",
-        "pub fn wrapping_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one +% left\n    result\n}\n",
         "pub fn wrapping_left_unresolved_local(right: I32) -> I32 {\n    let one = 1\n    let result = 1 +% one\n    result\n}\n",
         "pub fn wrapping_left_nested(right: I32) -> I32 {\n    let result = (1 +% right) +% right\n    result\n}\n",
         "pub fn wrapping_nested(left: I32, right: I32) -> I32 {\n    let result = left +% (right +% left)\n    result\n}\n",
