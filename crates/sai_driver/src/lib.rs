@@ -8567,6 +8567,7 @@ fn check_function_body_primitive_local_block(
     let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)));
     let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
     let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(_));
+    let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8590,6 +8591,7 @@ fn check_function_body_primitive_local_block(
         ExprKind::Lit(_) if is_supported_literal_tail => None,
         ExprKind::Field { .. } if is_supported_field_tail => None,
         ExprKind::Call { .. } if is_supported_call_tail => None,
+        ExprKind::If { .. } if is_supported_if_tail => None,
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
@@ -8598,6 +8600,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_unary_tail
         && !is_supported_binary_tail
         && !is_supported_literal_tail
+        && !is_supported_if_tail
     {
         return Ok(None);
     }
@@ -8881,6 +8884,19 @@ fn check_function_body_primitive_local_block(
     if tail_binding.is_some_and(|binding| !preceding_bindings.contains(&binding)) {
         return Ok(None);
     }
+    if is_supported_if_tail
+        && !primitive_if_tail_shape_is_supported(
+            tail,
+            &preceding_bindings,
+            locals,
+            inputs,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+        )
+    {
+        return Ok(None);
+    }
     if let (
         true,
         ExprKind::Call {
@@ -9112,6 +9128,175 @@ fn is_supported_direct_call_argument_shape(
                     )
                 })
         }
+        _ => false,
+    }
+}
+
+// `if` tails admit empty-statement branches whose own tails stay inside the
+// same shapes the flat block tail admits, with `else if` chains recursing.
+fn primitive_if_tail_shape_is_supported(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> bool {
+    let ExprKind::If {
+        cond,
+        then,
+        els: Some(els),
+    } = expression.kind
+    else {
+        return false;
+    };
+    if !primitive_if_condition_shape_is_supported(cond, preceding_bindings, locals, inputs) {
+        return false;
+    }
+    if !primitive_if_branch_shape_is_supported(
+        then,
+        preceding_bindings,
+        locals,
+        inputs,
+        self_field_projections,
+        unknown_self_fields,
+        direct_call_signatures,
+    ) {
+        return false;
+    }
+    match els.kind {
+        ExprKind::Block(block) => primitive_if_branch_shape_is_supported(
+            block,
+            preceding_bindings,
+            locals,
+            inputs,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+        ),
+        ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
+            els,
+            preceding_bindings,
+            locals,
+            inputs,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+        ),
+        _ => false,
+    }
+}
+
+fn primitive_if_condition_shape_is_supported(
+    condition: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    match condition.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
+            ExprKind::Path(operand_path) => {
+                resolved_plain_local_path_binding(operand_path, locals, inputs)
+                    .is_some_and(|binding| preceding_bindings.contains(&binding))
+            }
+            _ => false,
+        },
+        ExprKind::Lit(Lit::Bool(_)) => true,
+        ExprKind::Binary(operator, ..) => matches!(
+            operator,
+            BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or
+        ),
+        _ => false,
+    }
+}
+
+fn primitive_if_branch_shape_is_supported(
+    block: &HirBlock<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> bool {
+    block.safety == sai_hir::Safety::Safe
+        && block.stmts.is_empty()
+        && block.tail.is_some_and(|tail| {
+            primitive_if_branch_tail_shape_is_supported(
+                tail,
+                preceding_bindings,
+                locals,
+                inputs,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+            )
+        })
+}
+
+fn primitive_if_branch_tail_shape_is_supported(
+    tail: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> bool {
+    match tail.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id))
+        }
+        ExprKind::Call {
+            args, base: None, ..
+        } => direct_call_signatures
+            .and_then(|signatures| signatures.get(&tail.hir_id))
+            .is_some_and(|signature| {
+                args.iter()
+                    .take(signature.parameters.len())
+                    .all(|argument| {
+                        is_supported_direct_call_argument_shape(
+                            argument.expr,
+                            preceding_bindings,
+                            locals,
+                            inputs,
+                            direct_call_signatures,
+                        )
+                    })
+            }),
+        ExprKind::Unary(operator, operand) => {
+            matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not)
+                && match operand.kind {
+                    ExprKind::Path(operand_path) => {
+                        resolved_plain_local_path_binding(operand_path, locals, inputs)
+                            .is_some_and(|binding| preceding_bindings.contains(&binding))
+                    }
+                    _ => false,
+                }
+        }
+        ExprKind::Binary(..) | ExprKind::Lit(_) => true,
+        ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
+            tail,
+            preceding_bindings,
+            locals,
+            inputs,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+        ),
         _ => false,
     }
 }
@@ -9705,8 +9890,30 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
                     .find_map(|argument| primitive_body_error_span(argument.expr, node))
             })
             .or_else(|| base.and_then(|base| primitive_body_error_span(base, node))),
+        ExprKind::If { cond, then, els } => primitive_body_error_span(cond, node)
+            .or_else(|| primitive_body_block_error_span(then, node))
+            .or_else(|| els.and_then(|els| primitive_body_error_span(els, node))),
+        ExprKind::Block(block) => primitive_body_block_error_span(block, node),
         _ => None,
     }
+}
+
+fn primitive_body_block_error_span(
+    block: &sai_hir::expressions::Block<'_>,
+    node: HirId,
+) -> Option<sai_hir::Span> {
+    block
+        .stmts
+        .iter()
+        .find_map(|stmt| match stmt.kind {
+            StmtKind::Let { init, .. } => primitive_body_error_span(init, node),
+            _ => None,
+        })
+        .or_else(|| {
+            block
+                .tail
+                .and_then(|tail| primitive_body_error_span(tail, node))
+        })
 }
 
 fn function_if_condition_uses_parameter_binding(
@@ -52747,6 +52954,186 @@ property "shared"() {}
     }
 
     #[test]
+    fn primitive_body_type_results_infer_if_tails() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub fn sign(value: I32) -> I32 { if value < 0 { -1 } else { 1 } }\n",
+            "pub fn negate_branch(value: I32) -> I32 { if value < 0 { -value } else { value } }\n",
+            "pub fn choose_flag(flag: Bool) -> I32 { if flag { 1 } else { 0 } }\n",
+            "pub fn choose_not(flag: Bool) -> I32 { if not flag { 0 } else { 1 } }\n",
+            "pub fn choose_and(first: Bool, second: Bool) -> I32 { if first and second { 1 } else { 0 } }\n",
+            "pub fn choose_paths() -> I32 {\n",
+            "    let low: I32 = 1\n",
+            "    let high: I32 = 2\n",
+            "    if low < high { low } else { high }\n",
+            "}\n",
+            "pub fn choose_literal() -> Bool { if true { true } else { false } }\n",
+            "pub fn else_if_chain(value: I32) -> I32 {\n",
+            "    if value < 0 { -1 } else if value == 0 { 0 } else { 1 }\n",
+            "}\n",
+            "pub fn mismatched_branch(value: I32) -> Bool { if value < 0 { false } else { 0 } }\n",
+            "pub fn non_bool_condition(value: I32) -> I32 { if value { 1 } else { 2 } }\n",
+            "pub fn no_else(value: I32) -> I32 { if value < 0 { -1 } }\n",
+            "pub fn branch_statement(value: I32) -> I32 {\n",
+            "    if value < 0 {\n",
+            "        let negated = -value\n",
+            "        negated\n",
+            "    } else {\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
+            "pub fn literal_condition() -> I32 { if 1 { 1 } else { 0 } }\n",
+            "pub fn nested_branch_tail(first: I32) -> I32 {\n",
+            "    if first < 0 { (first + 1) * 2 } else { 0 }\n",
+            "}\n",
+        )
+        .to_string();
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{name}` is present"))
+        }
+
+        for name in [
+            "sign",
+            "negate_branch",
+            "choose_flag",
+            "choose_not",
+            "choose_and",
+            "choose_paths",
+            "choose_literal",
+            "else_if_chain",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("if tail body check is available")
+            else {
+                panic!("a `{name}` if tail is supported");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "the `{name}` if tail checks without diagnostics"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("if tail results query succeeds")
+                .expect("if tail body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+        }
+
+        let chain_owner = owner_named(&database, &resolved, "else_if_chain");
+        let chain_results = chain_owner
+            .primitive_body_type_results()
+            .expect("chain results query succeeds")
+            .expect("chain body publishes primitive facts");
+        assert!(
+            chain_results
+                .expression_types()
+                .values()
+                .all(|ty| matches!(*ty, PrimTy::I32 | PrimTy::Bool)),
+            "the else-if chain publishes only I32 and Bool expression facts"
+        );
+
+        let mismatch_owner = owner_named(&database, &resolved, "mismatched_branch");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: mismatch_diagnostics,
+        } = mismatch_owner
+            .body_type_check()
+            .expect("mismatched branch body check is available")
+        else {
+            panic!("a literal branch mismatch remains a recoverable type error");
+        };
+        assert_eq!(mismatch_diagnostics.len(), 1);
+        assert!(
+            mismatch_diagnostics[0]
+                .message
+                .contains("expected `Bool`, found an integer literal"),
+            "the integer literal branch mismatches the Bool return type"
+        );
+
+        let cond_owner = owner_named(&database, &resolved, "non_bool_condition");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: cond_diagnostics,
+        } = cond_owner
+            .body_type_check()
+            .expect("non-Bool condition body check is available")
+        else {
+            panic!("a non-Bool condition remains a recoverable type error");
+        };
+        assert_eq!(cond_diagnostics.len(), 1);
+        assert!(
+            cond_diagnostics[0]
+                .message
+                .contains("expected `Bool`, found `I32`"),
+            "an I32 condition reports the expected `Bool` diagnostic"
+        );
+
+        for name in [
+            "no_else",
+            "branch_statement",
+            "literal_condition",
+            "nested_branch_tail",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("if tail boundary body query succeeds"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "the `{name}` if tail stays outside this slice"
+            );
+            assert!(
+                owner
+                    .primitive_body_type_results()
+                    .expect("if tail boundary projection query succeeds")
+                    .is_none(),
+                "the `{name}` shape publishes no primitive facts"
+            );
+        }
+    }
+
+    #[test]
     fn primitive_body_type_results_include_exact_direct_function_calls() {
         use sai_resolve::prelude::PrimTy;
 
@@ -75621,14 +76008,14 @@ property "shared"() {}
             (
                 2,
                 sai_diagnostics::Code::TypeMismatch,
-                "expected `I32`, found a Bool literal",
+                "expected `I32`, found `Bool`",
                 "unselected_else_mismatch",
                 "false",
             ),
             (
                 3,
                 sai_diagnostics::Code::TypeMismatch,
-                "expected `I32`, found a Bool literal",
+                "expected `I32`, found `Bool`",
                 "unselected_then_mismatch",
                 "false",
             ),
@@ -75720,9 +76107,17 @@ property "shared"() {}
             );
         }
 
-        for owner in &owners[5..] {
+        for index in [7, 10] {
             assert!(matches!(
-                owner
+                owners[index]
+                    .body_type_check()
+                    .expect("else-if and literal-operator branches are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for index in [5, 6, 8, 9, 11, 12, 13] {
+            assert!(matches!(
+                owners[index]
                     .body_type_check()
                     .expect("unsupported if form check succeeds"),
                 FunctionBodyTypeCheck::Unsupported
@@ -75768,14 +76163,29 @@ property "shared"() {}
                 .expect("the bool parameter path is type-checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for (index, owner) in owners.iter().enumerate().skip(1) {
-            let check = owner
+        assert!(matches!(
+            owners[1]
                 .body_type_check()
-                .expect("unsupported parameter condition is gated");
-            assert!(
-                matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
-            );
+                .expect("the non-Bool parameter condition is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        for index in [6, 8] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("multi-parameter and literal conditions are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for index in [2, 3, 4, 5, 7, 9] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("unsupported parameter condition is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
         }
     }
 
@@ -75904,14 +76314,19 @@ property "shared"() {}
                         sai_diagnostics::Code::LiteralOutOfRange,
                     ]
         ));
-        for (index, owner) in owners.iter().enumerate().skip(19) {
-            let check = owner
+        assert!(matches!(
+            owners[22]
                 .body_type_check()
-                .expect("unsupported parameter-literal comparison shape is gated");
-            assert!(
-                matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
-            );
+                .expect("a two-parameter literal comparison is checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for index in [19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("unsupported parameter-literal comparison shape is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
         }
     }
 
@@ -75950,14 +76365,21 @@ property "shared"() {}
                 .expect("one not operator over the bool parameter is supported"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for (index, owner) in owners.iter().enumerate().skip(1) {
-            let check = owner
+        assert!(matches!(
+            owners[3]
                 .body_type_check()
-                .expect("unsupported negated condition is gated");
-            assert!(
-                matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
-            );
+                .expect("the negated non-Bool parameter condition is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        for index in [1, 2, 4, 5, 6] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("unsupported negated condition is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
         }
     }
 
@@ -76004,14 +76426,29 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for (index, owner) in owners.iter().enumerate().skip(2) {
-            let check = owner
+        for index in [2, 10] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("repeated and three-parameter conditions are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        assert!(matches!(
+            owners[4]
                 .body_type_check()
-                .expect("unsupported two-parameter form is gated");
-            assert!(
-                matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
-            );
+                .expect("the non-Bool conjunction operand is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        for index in [3, 5, 6, 7, 8, 9, 11, 12] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("unsupported two-parameter form is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
         }
     }
 
@@ -76138,14 +76575,43 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the supported comparison slice: {check:?}"
             );
         }
-        for (index, owner) in owners.iter().enumerate().skip(26) {
-            let check = owner
-                .body_type_check()
-                .expect("unsupported comparison or operand form is gated");
-            assert!(
-                matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
-            );
+        for index in [38, 40] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("repeated and literal comparisons are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for index in [26, 43] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("mismatched comparison operands are diagnosed"),
+                FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.len() == 1
+                        && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+            ));
+        }
+        for index in [36, 37] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("non-Bool logical operands are diagnosed per operand"),
+                FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.len() == 2
+                        && diagnostics
+                            .iter()
+                            .all(|d| d.code == sai_diagnostics::Code::TypeMismatch)
+            ));
+        }
+        for index in [27, 28, 29, 30, 31, 32, 33, 34, 35, 39, 41, 42, 44, 45, 46] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("unsupported comparison or operand form is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
         }
     }
 
