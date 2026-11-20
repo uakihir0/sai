@@ -9302,16 +9302,19 @@ fn primitive_let_statement_shape_is_supported(
         ) {
             return false;
         }
+        // The right operand of `place op= e` is checked through the compound
+        // operator itself, so it follows operand admission (literals and
+        // preceding paths). Root-only shapes — calls, field projections,
+        // unary operators and nested expressions — stay gated until the
+        // desugared `let t = e` form is supported as a value here.
+        let rhs_is_supported = match rhs.kind {
+            ExprKind::Lit(_) => is_direct_function_scalar_literal(rhs),
+            ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding)),
+            _ => false,
+        };
         return primitive_assign_target_shape_is_supported(lhs, preceding_bindings, locals, inputs)
-            && primitive_value_expression_shape_is_supported(
-                rhs,
-                preceding_bindings,
-                locals,
-                inputs,
-                self_field_projections,
-                unknown_self_fields,
-                direct_call_signatures,
-            );
+            && rhs_is_supported;
     }
     let StmtKind::Let {
         pat,
@@ -9978,6 +9981,12 @@ fn primitive_body_errors_to_diagnostics(
                         primitive_body_error_span(lhs, error.node)
                             .or_else(|| primitive_body_error_span(rhs, error.node))
                     }
+                })
+                .or_else(|| {
+                    block
+                        .stmts
+                        .iter()
+                        .find_map(|stmt| (stmt.hir_id == error.node).then_some(stmt.span))
                 })
                 .or_else(|| primitive_body_error_span(tail, error.node)),
         };
@@ -77184,6 +77193,9 @@ property "shared"() {}
             "pub fn bool_operand() -> I32 {\n    var x: I32 = 0\n    var flag: Bool = false\n    x += flag\n    x\n}\n",
             "pub fn unannotated_literal_var() -> I32 {\n    var x = 1\n    x += 2\n    x\n}\n",
             "pub fn field_target() -> I32 {\n    var x: I32 = 0\n    x += 1\n    x.field += 1\n    x\n}\n",
+            "pub fn rem_float() -> F32 {\n    var x: F32 = 0.0\n    x %= 2.0\n    x\n}\n",
+            "pub fn nested_rhs(left: I32, right: I32) -> I32 {\n    var x: I32 = 0\n    x += left + right\n    x\n}\n",
+            "pub fn unary_rhs() -> I32 {\n    var x: I32 = 0\n    var y: I32 = 1\n    x += -y\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77199,7 +77211,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 9);
+        assert_eq!(owners.len(), 12);
 
         for index in 0..4 {
             let check = owners[index]
@@ -77226,10 +77238,20 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::InvalidAssignTarget
         ));
+        assert!(matches!(
+            owners[9]
+                .body_type_check()
+                .expect("the float-remainder compound assignment is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported
+        ));
         // `x += flag` gates exactly like `let t = x + flag`: a Bool operand
         // is outside the admitted arithmetic shapes, so the desugared
-        // assignment is equivalently unsupported rather than diagnosed.
-        for index in [6, 7, 8] {
+        // assignment is equivalently unsupported rather than diagnosed. The
+        // nested-expression and unary right operands follow operand
+        // admission and stay gated with the other unresolved shapes.
+        for index in [6, 7, 8, 10, 11] {
             assert!(
                 matches!(
                     owners[index]
