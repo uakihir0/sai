@@ -8566,6 +8566,7 @@ fn check_function_body_primitive_local_block(
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
     let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)));
     let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
+    let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(_));
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8586,6 +8587,7 @@ fn check_function_body_primitive_local_block(
             Some(operand_binding)
         }
         ExprKind::Binary(..) if is_supported_binary_tail => None,
+        ExprKind::Lit(_) if is_supported_literal_tail => None,
         ExprKind::Field { .. } if is_supported_field_tail => None,
         ExprKind::Call { .. } if is_supported_call_tail => None,
         _ => return Ok(None),
@@ -8595,6 +8597,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_call_tail
         && !is_supported_unary_tail
         && !is_supported_binary_tail
+        && !is_supported_literal_tail
     {
         return Ok(None);
     }
@@ -52600,6 +52603,146 @@ property "shared"() {}
                 .expect("nested projection query succeeds")
                 .is_none(),
             "a nested binary tail publishes no primitive facts"
+        );
+    }
+
+    #[test]
+    fn primitive_body_type_results_infer_literal_tails() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub fn int_tail() -> I32 { 7 }\n",
+            "pub fn bool_tail() -> Bool { true }\n",
+            "pub fn byte_tail() -> Byte { b'z' }\n",
+            "pub fn char_tail() -> Char { 'x' }\n",
+            "pub fn float_tail() -> F32 { 1.5 }\n",
+            "pub fn int_after_local() -> I64 {\n",
+            "    let source = 1\n",
+            "    7\n",
+            "}\n",
+            "pub fn int_mismatch() -> Bool { 7 }\n",
+            "pub fn int_range() -> I8 { 128 }\n",
+            "pub fn str_tail() -> I32 { \"text\" }\n",
+        )
+        .to_string();
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function owner `{name}` is present"))
+        }
+
+        for (name, expected_type) in [
+            ("int_tail", PrimTy::I32),
+            ("bool_tail", PrimTy::Bool),
+            ("byte_tail", PrimTy::Byte),
+            ("char_tail", PrimTy::Char),
+            ("float_tail", PrimTy::F32),
+            ("int_after_local", PrimTy::I64),
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("literal tail body check is available")
+            else {
+                panic!("a `{name}` literal tail is supported");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "the `{name}` literal tail checks without diagnostics"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("literal tail results query succeeds")
+                .expect("literal tail body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+            assert!(
+                results
+                    .expression_types()
+                    .values()
+                    .all(|ty| *ty == expected_type),
+                "every `{name}` fact is {expected_type:?}"
+            );
+        }
+
+        let mismatch_owner = owner_named(&database, &resolved, "int_mismatch");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: mismatch_diagnostics,
+        } = mismatch_owner
+            .body_type_check()
+            .expect("mismatch tail body check is available")
+        else {
+            panic!("an incompatible literal tail remains a recoverable type error");
+        };
+        assert_eq!(mismatch_diagnostics.len(), 1);
+        assert!(
+            mismatch_diagnostics[0].message.contains("integer literal"),
+            "the Bool return type mismatches the integer literal family"
+        );
+
+        let range_owner = owner_named(&database, &resolved, "int_range");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: range_diagnostics,
+        } = range_owner
+            .body_type_check()
+            .expect("range tail body check is available")
+        else {
+            panic!("an out-of-range literal tail remains a recoverable type error");
+        };
+        assert_eq!(
+            range_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["integer literal is out of range for `I8`"],
+            "the I8 tail literal keeps its range diagnostic"
+        );
+
+        let str_owner = owner_named(&database, &resolved, "str_tail");
+        assert!(
+            matches!(
+                str_owner
+                    .body_type_check()
+                    .expect("str tail body query succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ),
+            "a non-primitive literal tail stays outside this slice"
         );
     }
 

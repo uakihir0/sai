@@ -510,11 +510,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
         let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)));
         let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
+        let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some());
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
             && !is_supported_unary_tail
             && !is_supported_binary_tail
+            && !is_supported_literal_tail
         {
             return Err(());
         }
@@ -2417,6 +2419,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     } else {
                         self.check_comparison(operator, left, right)?
                     }
+                }
+                ExprKind::Lit(literal) => {
+                    let Some(kind) = primitive_literal_kind(literal) else {
+                        return Err(());
+                    };
+                    self.local_type_for_unannotated_literal(literal, kind, expression.hir_id)
                 }
                 _ => self.check_local_path(expression)?,
             }
