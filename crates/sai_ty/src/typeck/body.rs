@@ -2585,18 +2585,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         }
         if let LocalType::LiteralVariable(id) = source_type {
-            let is_direct_integer_literal_source = self
-                .direct_unannotated_integer_literals
-                .contains(&source_binding);
-            if is_direct_integer_literal_source
+            let is_eligible_literal_source = self.is_eligible_unannotated_literal_path(operand);
+            if is_eligible_literal_source
                 && self.literal_variables.get(id).is_some_and(|variable| {
                     variable.kind == PrimitiveLiteralKind::Integer && variable.resolved.is_none()
                 })
             {
-                // A direct integer literal local can share its inference
-                // variable with this BitNot result. The enclosing call's
-                // parameter expectation resolves both facts and performs the
-                // range check at the source literal.
+                // A direct integer literal local or its simple unannotated
+                // alias can share its inference variable with this BitNot
+                // result. The enclosing call's parameter expectation resolves
+                // both facts and performs the range check at the source
+                // literal.
                 return Ok(source_type);
             }
         }
