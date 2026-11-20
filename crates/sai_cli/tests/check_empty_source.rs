@@ -10410,6 +10410,28 @@ fn unsupported_assert_statement_shapes_remain_gated() {
 }
 
 #[test]
+fn public_var_declarations_emit_check_results() {
+    for source in [
+        "pub fn run() -> I32 { var total: I32 = 0\n    total\n }\n",
+        "pub fn run() -> I32 { var total = 0\n    total\n }\n",
+        "pub fn run(flag: Bool) -> I32 { var enabled: Bool = flag\n    if enabled { 1 } else { 2 }\n }\n",
+        "pub fn run(flag: Bool) -> Bool { var enabled: Bool = flag\n    let result = enabled and true\n    result\n }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn unsupported_var_forms_remain_gated() {
+    for source in [
+        "pub fn run(var value: I32) -> I32 { value\n }\n",
+        "pub fn run() -> I32 { var total: I32 = 0\n    total = 1\n    total\n }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_primitive_parameter_comparison_if_functions_emit_check_results() {
     for source in [
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",

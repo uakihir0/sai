@@ -9037,7 +9037,7 @@ fn primitive_let_statement_shape_is_supported(
         return false;
     };
     let PatKind::Binding {
-        mode: sai_hir::patterns::BindingMode::Value,
+        mode,
         name,
         binding,
         sub: None,
@@ -9048,11 +9048,14 @@ fn primitive_let_statement_shape_is_supported(
     };
     if !function_name_is_supported(name, symbols, inputs)
         || !matches!(
-            locals.bindings.get(&binding),
-            Some(sai_resolve::owner::LocalBinding {
-                kind: sai_resolve::owner::BindingKind::Let,
-                ..
-            })
+            (locals.bindings.get(&binding).map(|local| local.kind), mode),
+            (
+                Some(sai_resolve::owner::BindingKind::Let),
+                sai_hir::patterns::BindingMode::Value
+            ) | (
+                Some(sai_resolve::owner::BindingKind::Var),
+                sai_hir::patterns::BindingMode::Var
+            )
         )
     {
         return false;
@@ -76877,6 +76880,50 @@ property "shared"() {}
                 owners[index]
                     .body_type_check()
                     .expect("unsupported assert form is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_var_declarations() {
+        let root = concat!(
+            "pub fn annotated() -> I32 {\n    var total: I32 = 0\n    total\n}\n",
+            "pub fn unannotated() -> I32 {\n    var total = 0\n    total\n}\n",
+            "pub fn condition(flag: Bool) -> I32 {\n    var enabled: Bool = flag\n    if enabled { 1 } else { 2 }\n}\n",
+            "pub fn initializer(flag: Bool) -> Bool {\n    var enabled: Bool = flag\n    let result = enabled and true\n    result\n}\n",
+            "pub fn var_parameter(var value: I32) -> I32 {\n    value\n}\n",
+            "pub fn reassigned() -> I32 {\n    var total: I32 = 0\n    total = 1\n    total\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 6);
+
+        for index in 0..4 {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("var declarations with supported initializers are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for index in [4, 5] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("var parameters and assignment statements stay gated"),
                 FunctionBodyTypeCheck::Unsupported
             ));
         }

@@ -561,7 +561,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
 
         let PatKind::Binding {
-            mode: BindingMode::Value,
+            mode: BindingMode::Value | BindingMode::Var,
             binding,
             sub: None,
             ..
