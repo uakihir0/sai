@@ -1038,6 +1038,31 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Err(());
             };
             if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                && matches!(
+                    kind,
+                    PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                )
+            {
+                if let Some(LocalType::LiteralVariable(id)) = self.check_local_path(right).ok() {
+                    let Some(variable) = self.literal_variables.get(id) else {
+                        return Err(());
+                    };
+                    match (kind, variable.kind) {
+                        (PrimitiveLiteralKind::Integer, PrimitiveLiteralKind::Integer) => {
+                            self.add_integer_literal_constraint(id, literal, left.hir_id)?;
+                        }
+                        (
+                            PrimitiveLiteralKind::FloatingPoint,
+                            PrimitiveLiteralKind::FloatingPoint,
+                        ) => {
+                            self.add_float_literal_constraint(id, literal, left.hir_id)?;
+                        }
+                        _ => return Err(()),
+                    }
+                    return Ok(LocalType::LiteralVariable(id));
+                }
+            }
+            if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
                 && kind == PrimitiveLiteralKind::Integer
                 && matches!(right.kind, ExprKind::Lit(Lit::Int { .. }))
             {
@@ -1083,11 +1108,40 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             };
         }
 
-        let left_type = self
-            .check_local_path(left)
-            .ok()
-            .and_then(|local_type| self.concrete_local_type(local_type))
-            .ok_or(())?;
+        let left_local_type = self.check_local_path(left).ok().ok_or(())?;
+        let unresolved_literal_variable = matches!(left_local_type, LocalType::LiteralVariable(id)
+            if self
+                .literal_variables
+                .get(id)
+                .is_some_and(|variable| variable.resolved.is_none()));
+        if unresolved_literal_variable {
+            let LocalType::LiteralVariable(id) = left_local_type else {
+                return Err(());
+            };
+            if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                return Err(());
+            }
+            let ExprKind::Lit(literal) = right.kind else {
+                return Err(());
+            };
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            match (variable.kind, primitive_literal_kind(literal)) {
+                (PrimitiveLiteralKind::Integer, Some(PrimitiveLiteralKind::Integer)) => {
+                    self.add_integer_literal_constraint(id, literal, right.hir_id)?;
+                }
+                (
+                    PrimitiveLiteralKind::FloatingPoint,
+                    Some(PrimitiveLiteralKind::FloatingPoint),
+                ) => {
+                    self.add_float_literal_constraint(id, literal, right.hir_id)?;
+                }
+                _ => return Err(()),
+            }
+            return Ok(left_local_type);
+        }
+        let left_type = self.concrete_local_type(left_local_type).ok_or(())?;
 
         if let ExprKind::Lit(literal) = right.kind {
             let Some(found) = primitive_literal_kind(literal) else {

@@ -4986,7 +4986,6 @@ fn unannotated_literal_copy_reports_semantic_errors_at_the_source_and_tail() {
 fn unsupported_unannotated_literal_copy_forms_remain_gated() {
     for source in [
         "pub fn copy() -> I32 {\n    let source = 42\n    let copied = r#source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    let source = 42\n    let copied = source + 1\n    copied\n}\n",
         "const SOURCE: I32 = 42\npub fn copy() -> I32 {\n    let source = 7\n    let copied = SOURCE\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let var source = 42\n    let copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source = 42\n    let var copied = source\n    copied\n}\n",
@@ -5002,6 +5001,8 @@ fn public_flat_unannotated_primitive_local_sequences_emit_check_results() {
         "pub fn copy_chain() -> I8 {\n    let source = 127\n    let first = source\n    let second = first\n    let copied = second\n    copied\n}\n",
         "pub fn copy_source_tail() -> I32 {\n    let source = 42\n    let copied = source\n    source\n}\n",
         "pub fn earlier_tail() -> I8 {\n    let earlier = 42\n    let later = 7\n    earlier\n}\n",
+        "pub fn computed() -> I32 {\n    let source = 1\n    let copied = source + 1\n    copied\n}\n",
+        "pub fn var_computed() -> I32 {\n    var source = 1\n    let copied = source + 1\n    copied\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -5123,7 +5124,6 @@ fn unsupported_flat_unannotated_primitive_local_forms_remain_gated() {
     for source in [
         "pub fn self_reference() -> I32 {\n    let source = source\n    source\n}\n",
         "pub fn forward_reference() -> I32 {\n    let copied = later\n    let later = 1\n    copied\n}\n",
-        "pub fn computed() -> I32 {\n    let source = 1\n    let copied = source + 1\n    copied\n}\n",
         "pub fn destructured() -> I32 {\n    let (source, other) = (1, 2)\n    source\n}\n",
         "pub fn raw_path() -> I32 {\n    let source = 1\n    let copied = r#source\n    copied\n}\n",
         "pub fn qualified_path() -> I32 {\n    let source = 1\n    let copied = values.VALUE\n    copied\n}\n",

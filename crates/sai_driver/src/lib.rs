@@ -77641,6 +77641,11 @@ property "shared"() {}
             "pub fn unbound_target() -> I32 {\n    missing = 5\n    0\n}\n",
             "pub fn call_rhs() -> I32 {\n    var x: I32 = 0\n    let seed: I32 = 4\n    x = identity(seed)\n    x\n}\n",
             "pub fn identity(value: I32) -> I32 {\n    value\n}\n",
+            "pub fn literal_var_arith_rhs() -> I32 {\n    var x = 1\n    let y = x + 2\n    y\n}\n",
+            "pub fn literal_var_arith_left() -> I32 {\n    var x = 1\n    let y = 1 + x\n    y\n}\n",
+            "pub fn literal_var_float_arith() -> F64 {\n    var x = 1.5\n    let y = x * 2.0\n    y\n}\n",
+            "pub fn literal_var_pair() -> I32 {\n    var x = 1\n    var y = 2\n    let z = x + y\n    z\n}\n",
+            "pub fn literal_var_bool_literal() -> I32 {\n    var x = 1\n    let y = x + true\n    y\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77656,7 +77661,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 20);
+        assert_eq!(owners.len(), 25);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77714,6 +77719,26 @@ property "shared"() {}
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {index} unexpectedly failed: {check:?}"
+            );
+        }
+        for index in [20, 21, 22] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a literal-variable operand pair is checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the literal-operand merge: {check:?}"
+            );
+        }
+        for index in [23, 24] {
+            assert!(
+                matches!(
+                    owners[index]
+                        .body_type_check()
+                        .expect("a literal-variable operand boundary stays gated"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "function owner {index} unexpectedly passed the literal-operand merge boundary"
             );
         }
         for index in [13, 14, 17] {
