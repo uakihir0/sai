@@ -77582,6 +77582,7 @@ property "shared"() {}
             "pub fn guarded_no_catch_all(value: I32) -> I32 {\n    match value { n if n > 0 => 1 }\n}\n",
             "pub fn guarded_literal(value: I32) -> I32 {\n    match value { 0 if value > 1 => 1, _ => 0 }\n}\n",
             "pub fn empty_range(value: I32) -> I32 {\n    match value { 5..=1 => 1, _ => 0 }\n}\n",
+            "pub fn negated_range_bound(value: I32) -> I32 {\n    match value { -170141183460469231731687303715884105728..=1 => 1, _ => 0 }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77597,7 +77598,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 28);
+        assert_eq!(owners.len(), 29);
 
         for index in [0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 17, 20] {
             let check = owners[index]
@@ -77608,7 +77609,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the match-tail slice: {check:?}"
             );
         }
-        for index in [7, 8, 22, 24, 27] {
+        for index in [7, 8, 22, 24, 27, 28] {
             let check = owners[index]
                 .body_type_check()
                 .expect("mismatched match patterns are diagnosed");
