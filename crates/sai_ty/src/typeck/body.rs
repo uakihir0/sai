@@ -173,6 +173,8 @@ pub enum PrimitiveBodyErrorKind {
     NamedArgumentOnFunction {
         name_span: sai_hir::Span,
     },
+    AssignToImmutable,
+    InvalidAssignTarget,
 }
 
 /// An operand description for an unsupported primitive operator diagnostic.
@@ -301,6 +303,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
     let mut context = FnCtxt {
         input,
         known_bindings,
+        mutable_bindings: HashSet::new(),
         binding_type_candidates,
         binding_candidate_order: Vec::new(),
         binding_initializer_roots: HashMap::new(),
@@ -340,9 +343,18 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
     }
 }
 
+/// The checked result of an admissible value expression, with the
+/// deferred-operator flags the `let` path uses for provenance tracking.
+struct InitializerCheck {
+    local_type: LocalType,
+    deferred_neg_result: bool,
+    deferred_bitnot_result: bool,
+}
+
 struct FnCtxt<'a, 'hir> {
     input: PrimitiveBodyInput<'a, 'hir>,
     known_bindings: HashMap<BindingId, LocalType>,
+    mutable_bindings: HashSet<BindingId>,
     binding_type_candidates: HashMap<BindingId, LocalType>,
     binding_candidate_order: Vec<BindingId>,
     binding_initializer_roots: HashMap<BindingId, HirId>,
@@ -550,6 +562,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             return Ok(());
         }
+        if let StmtKind::Assign { lhs, rhs } = stmt.kind {
+            return self.check_assign_stmt(lhs, rhs);
+        }
         let StmtKind::Let {
             pat,
             ty,
@@ -561,7 +576,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
 
         let PatKind::Binding {
-            mode: BindingMode::Value | BindingMode::Var,
+            mode: mode @ (BindingMode::Value | BindingMode::Var),
             binding,
             sub: None,
             ..
@@ -570,6 +585,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         };
         self.binding_nodes.insert(binding, pat.hir_id);
+        if mode == BindingMode::Var {
+            self.mutable_bindings.insert(binding);
+        }
 
         let annotation = match ty {
             Some(ty) => {
@@ -585,221 +603,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
 
         let errors_before_initializer = self.errors.len();
-        let mut initializer_is_deferred_neg_result = false;
-        let mut initializer_is_deferred_bitnot_result = false;
-        let local_type = if self.expression_has_unknown_field_error(init) {
-            self.check_error_tainted_expression(init)?;
-            if let Some(id) = self.error_tainted_literal_variable(init) {
-                if let Some(expected) = annotation {
-                    self.check_annotated_path(
-                        LocalType::LiteralVariable(id),
-                        expected,
-                        init.hir_id,
-                    )?;
-                    LocalType::Error(Some(expected))
-                } else {
-                    LocalType::ErrorLiteralVariable(id)
-                }
-            } else {
-                let found = self.known_error_tainted_result_type(init);
-                if let (Some(expected), Some(found)) = (annotation, found) {
-                    if expected != found {
-                        self.errors.push(PrimitiveBodyError {
-                            node: init.hir_id,
-                            kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
-                        });
-                    }
-                }
-                LocalType::Error(annotation.or(found))
-            }
-        } else {
-            match init.kind {
-                ExprKind::Lit(literal) => {
-                    let Some(found) = primitive_literal_kind(literal) else {
-                        return Err(());
-                    };
-                    if let Some(expected) = annotation {
-                        self.check_annotated_literal(expected, literal, found, init.hir_id);
-                        LocalType::Concrete(expected)
-                    } else {
-                        self.local_type_for_unannotated_literal(literal, found, init.hir_id)
-                    }
-                }
-                ExprKind::Path(_) => {
-                    let source_type = self.check_local_path(init)?;
-                    if let Some(expected) = annotation {
-                        self.check_annotated_path(source_type, expected, init.hir_id)?;
-                        LocalType::Concrete(expected)
-                    } else {
-                        source_type
-                    }
-                }
-                ExprKind::Field { .. } => {
-                    let Some(field_type) = self
-                        .input
-                        .self_field_projections
-                        .and_then(|fields| fields.get(&init.hir_id))
-                        .copied()
-                    else {
-                        return Err(());
-                    };
-                    let source_type = LocalType::Concrete(field_type);
-                    if let Some(expected) = annotation {
-                        self.check_annotated_path(source_type, expected, init.hir_id)?;
-                        LocalType::Concrete(expected)
-                    } else {
-                        source_type
-                    }
-                }
-                ExprKind::Call { .. } => {
-                    let call_type = self.check_direct_call(init, false)?;
-                    if let Some(expected) = annotation {
-                        self.check_annotated_path(call_type, expected, init.hir_id)?;
-                        LocalType::Concrete(expected)
-                    } else {
-                        call_type
-                    }
-                }
-                ExprKind::Binary(operator, left, right) => {
-                    if matches!(
-                        operator,
-                        BinOp::Add
-                            | BinOp::Sub
-                            | BinOp::Mul
-                            | BinOp::Div
-                            | BinOp::Rem
-                            | BinOp::WrapAdd
-                            | BinOp::WrapSub
-                            | BinOp::WrapMul
-                    ) {
-                        let result = self.check_arithmetic(operator, left, right, init.hir_id)?;
-                        if let Some(expected) = annotation {
-                            self.check_annotated_path(result, expected, init.hir_id)?;
-                            // The annotation determines the local's recovered
-                            // type after the coercion-site mismatch, as it does
-                            // for the existing annotated path initializer.
-                            LocalType::Concrete(expected)
-                        } else {
-                            result
-                        }
-                    } else if matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
-                        let result = self.check_bitwise(operator, left, right, init.hir_id)?;
-                        if let Some(expected) = annotation {
-                            self.check_annotated_path(result, expected, init.hir_id)?;
-                            LocalType::Concrete(expected)
-                        } else {
-                            result
-                        }
-                    } else if matches!(operator, BinOp::Shl | BinOp::Shr) {
-                        let result = self.check_shift(operator, left, right, init.hir_id, false)?;
-                        if let Some(expected) = annotation {
-                            self.check_annotated_path(result, expected, init.hir_id)?;
-                            LocalType::Concrete(expected)
-                        } else {
-                            result
-                        }
-                    } else {
-                        let result = match operator {
-                            BinOp::And | BinOp::Or => self.check_logical(operator, left, right)?,
-                            _ => self.check_comparison(operator, left, right)?,
-                        };
-                        if let Some(expected) = annotation {
-                            if expected != PrimTy::Bool {
-                                self.errors.push(PrimitiveBodyError {
-                                    node: init.hir_id,
-                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                        expected,
-                                        found: PrimTy::Bool,
-                                    },
-                                });
-                            }
-                        }
-                        result
-                    }
-                }
-                ExprKind::Unary(UnOp::Not, operand) => {
-                    let result = self.check_logical_not(operand)?;
-                    if let Some(expected) = annotation {
-                        if expected != PrimTy::Bool {
-                            self.errors.push(PrimitiveBodyError {
-                                node: init.hir_id,
-                                kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                    expected,
-                                    found: PrimTy::Bool,
-                                },
-                            });
-                        }
-                    }
-                    result
-                }
-                ExprKind::Unary(UnOp::Neg, operand) => {
-                    let (result, is_deferred_neg_result) =
-                        self.check_local_initializer_neg_path(operand, init.hir_id)?;
-                    initializer_is_deferred_neg_result = is_deferred_neg_result;
-                    if let Some(expected) = annotation {
-                        self.check_annotated_path(result, expected, init.hir_id)?;
-                        LocalType::Concrete(expected)
-                    } else {
-                        result
-                    }
-                }
-                ExprKind::Unary(UnOp::BitNot, operand) => {
-                    if let ExprKind::Lit(literal) = operand.kind {
-                        match primitive_literal_kind(literal) {
-                            Some(PrimitiveLiteralKind::Integer) => {
-                                if let Some(expected) = annotation {
-                                    self.check_annotated_literal(
-                                        expected,
-                                        literal,
-                                        PrimitiveLiteralKind::Integer,
-                                        operand.hir_id,
-                                    );
-                                    LocalType::Concrete(expected)
-                                } else {
-                                    self.local_type_for_unannotated_literal(
-                                        literal,
-                                        PrimitiveLiteralKind::Integer,
-                                        operand.hir_id,
-                                    )
-                                }
-                            }
-                            Some(PrimitiveLiteralKind::Byte) => {
-                                self.record_expression_type(
-                                    operand.hir_id,
-                                    LocalType::Concrete(PrimTy::Byte),
-                                );
-                                if let Some(expected) = annotation {
-                                    if expected != PrimTy::Byte {
-                                        self.errors.push(PrimitiveBodyError {
-                                            node: init.hir_id,
-                                            kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                                expected,
-                                                found: PrimTy::Byte,
-                                            },
-                                        });
-                                    }
-                                    LocalType::Concrete(expected)
-                                } else {
-                                    LocalType::Concrete(PrimTy::Byte)
-                                }
-                            }
-                            _ => return Err(()),
-                        }
-                    } else {
-                        let (local_type, is_deferred_bitnot_result) =
-                            self.check_local_initializer_bitwise_not_path(operand, init.hir_id)?;
-                        initializer_is_deferred_bitnot_result = is_deferred_bitnot_result;
-                        if let Some(expected) = annotation {
-                            self.check_annotated_path(local_type, expected, init.hir_id)?;
-                            LocalType::Concrete(expected)
-                        } else {
-                            local_type
-                        }
-                    }
-                }
-                _ => return Err(()),
-            }
-        };
+        let InitializerCheck {
+            local_type,
+            deferred_neg_result: initializer_is_deferred_neg_result,
+            deferred_bitnot_result: initializer_is_deferred_bitnot_result,
+        } = self.check_initializer_value(init, annotation)?;
 
         if initializer_is_deferred_neg_result {
             self.deferred_neg_result_bindings.insert(binding);
@@ -2539,6 +2347,280 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         self.record_expression_type(expression.hir_id, local_type);
         Ok(())
+    }
+
+    /// `place = e` (§6.13.1): a plain path to a preceding local whose
+    /// right-hand side is an admissible value expression, coerced to the
+    /// place's type. Assigning to a `let` local or a parameter is
+    /// `ASSIGN_TO_IMMUTABLE` (§7.2.4); field, tuple-field, index, and
+    /// dereference places and paths outside the admitted local set stay
+    /// gated, and non-place targets are `INVALID_ASSIGN_TARGET` (§3.16).
+    fn check_assign_stmt(&mut self, lhs: &Expr<'hir>, rhs: &Expr<'hir>) -> Result<(), ()> {
+        let ExprKind::Path(_) = lhs.kind else {
+            return match lhs.kind {
+                ExprKind::Field { .. }
+                | ExprKind::TupleField { .. }
+                | ExprKind::Index(..)
+                | ExprKind::Unary(UnOp::Deref, _) => Err(()),
+                _ => {
+                    self.errors.push(PrimitiveBodyError {
+                        node: lhs.hir_id,
+                        kind: PrimitiveBodyErrorKind::InvalidAssignTarget,
+                    });
+                    Ok(())
+                }
+            };
+        };
+        let Some(binding) = self.plain_local_path_binding(lhs) else {
+            return Err(());
+        };
+        let Some(local_type) = self.known_bindings.get(&binding).copied() else {
+            return Err(());
+        };
+        let LocalType::Concrete(place_type) = local_type else {
+            return Err(());
+        };
+        if !self.mutable_bindings.contains(&binding) {
+            self.errors.push(PrimitiveBodyError {
+                node: lhs.hir_id,
+                kind: PrimitiveBodyErrorKind::AssignToImmutable,
+            });
+        }
+        self.check_initializer_value(rhs, Some(place_type))?;
+        self.record_expression_type(lhs.hir_id, local_type);
+        Ok(())
+    }
+
+    /// Checks an admissible value expression in a `let` initializer or the
+    /// right-hand side of an assignment — a coercion site when `annotation`
+    /// carries the expected type. The deferred-operator flags let the `let`
+    /// path keep its provenance tracking; an assignment ignores them because
+    /// its target already has a concrete type.
+    fn check_initializer_value(
+        &mut self,
+        init: &Expr<'hir>,
+        annotation: Option<PrimTy>,
+    ) -> Result<InitializerCheck, ()> {
+        let mut deferred_neg_result = false;
+        let mut deferred_bitnot_result = false;
+        let local_type = if self.expression_has_unknown_field_error(init) {
+            self.check_error_tainted_expression(init)?;
+            if let Some(id) = self.error_tainted_literal_variable(init) {
+                if let Some(expected) = annotation {
+                    self.check_annotated_path(
+                        LocalType::LiteralVariable(id),
+                        expected,
+                        init.hir_id,
+                    )?;
+                    LocalType::Error(Some(expected))
+                } else {
+                    LocalType::ErrorLiteralVariable(id)
+                }
+            } else {
+                let found = self.known_error_tainted_result_type(init);
+                if let (Some(expected), Some(found)) = (annotation, found) {
+                    if expected != found {
+                        self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                        });
+                    }
+                }
+                LocalType::Error(annotation.or(found))
+            }
+        } else {
+            match init.kind {
+                ExprKind::Lit(literal) => {
+                    let Some(found) = primitive_literal_kind(literal) else {
+                        return Err(());
+                    };
+                    if let Some(expected) = annotation {
+                        self.check_annotated_literal(expected, literal, found, init.hir_id);
+                        LocalType::Concrete(expected)
+                    } else {
+                        self.local_type_for_unannotated_literal(literal, found, init.hir_id)
+                    }
+                }
+                ExprKind::Path(_) => {
+                    let source_type = self.check_local_path(init)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(source_type, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        source_type
+                    }
+                }
+                ExprKind::Field { .. } => {
+                    let Some(field_type) = self
+                        .input
+                        .self_field_projections
+                        .and_then(|fields| fields.get(&init.hir_id))
+                        .copied()
+                    else {
+                        return Err(());
+                    };
+                    let source_type = LocalType::Concrete(field_type);
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(source_type, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        source_type
+                    }
+                }
+                ExprKind::Call { .. } => {
+                    let call_type = self.check_direct_call(init, false)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(call_type, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        call_type
+                    }
+                }
+                ExprKind::Binary(operator, left, right) => {
+                    if matches!(
+                        operator,
+                        BinOp::Add
+                            | BinOp::Sub
+                            | BinOp::Mul
+                            | BinOp::Div
+                            | BinOp::Rem
+                            | BinOp::WrapAdd
+                            | BinOp::WrapSub
+                            | BinOp::WrapMul
+                    ) {
+                        let result = self.check_arithmetic(operator, left, right, init.hir_id)?;
+                        if let Some(expected) = annotation {
+                            self.check_annotated_path(result, expected, init.hir_id)?;
+                            // The annotation determines the local's recovered
+                            // type after the coercion-site mismatch, as it does
+                            // for the existing annotated path initializer.
+                            LocalType::Concrete(expected)
+                        } else {
+                            result
+                        }
+                    } else if matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
+                        let result = self.check_bitwise(operator, left, right, init.hir_id)?;
+                        if let Some(expected) = annotation {
+                            self.check_annotated_path(result, expected, init.hir_id)?;
+                            LocalType::Concrete(expected)
+                        } else {
+                            result
+                        }
+                    } else if matches!(operator, BinOp::Shl | BinOp::Shr) {
+                        let result = self.check_shift(operator, left, right, init.hir_id, false)?;
+                        if let Some(expected) = annotation {
+                            self.check_annotated_path(result, expected, init.hir_id)?;
+                            LocalType::Concrete(expected)
+                        } else {
+                            result
+                        }
+                    } else {
+                        let result = match operator {
+                            BinOp::And | BinOp::Or => self.check_logical(operator, left, right)?,
+                            _ => self.check_comparison(operator, left, right)?,
+                        };
+                        if let Some(expected) = annotation {
+                            if expected != PrimTy::Bool {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: init.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                        expected,
+                                        found: PrimTy::Bool,
+                                    },
+                                });
+                            }
+                        }
+                        result
+                    }
+                }
+                ExprKind::Unary(UnOp::Not, operand) => {
+                    let result = self.check_logical_not(operand)?;
+                    if let Some(expected) = annotation {
+                        if expected != PrimTy::Bool {
+                            self.errors.push(PrimitiveBodyError {
+                                node: init.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                    expected,
+                                    found: PrimTy::Bool,
+                                },
+                            });
+                        }
+                    }
+                    result
+                }
+                ExprKind::Unary(UnOp::Neg, operand) => {
+                    let (result, is_deferred_neg_result) =
+                        self.check_local_initializer_neg_path(operand, init.hir_id)?;
+                    deferred_neg_result = is_deferred_neg_result;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(result, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        result
+                    }
+                }
+                ExprKind::Unary(UnOp::BitNot, operand) => {
+                    if let ExprKind::Lit(literal) = operand.kind {
+                        match primitive_literal_kind(literal) {
+                            Some(PrimitiveLiteralKind::Integer) => {
+                                if let Some(expected) = annotation {
+                                    self.check_annotated_literal(
+                                        expected,
+                                        literal,
+                                        PrimitiveLiteralKind::Integer,
+                                        operand.hir_id,
+                                    );
+                                    LocalType::Concrete(expected)
+                                } else {
+                                    self.local_type_for_unannotated_literal(
+                                        literal,
+                                        PrimitiveLiteralKind::Integer,
+                                        operand.hir_id,
+                                    )
+                                }
+                            }
+                            Some(PrimitiveLiteralKind::Byte) => {
+                                self.record_expression_type(
+                                    operand.hir_id,
+                                    LocalType::Concrete(PrimTy::Byte),
+                                );
+                                if let Some(expected) = annotation {
+                                    if expected != PrimTy::Byte {
+                                        self.errors.push(PrimitiveBodyError {
+                                            node: init.hir_id,
+                                            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                                expected,
+                                                found: PrimTy::Byte,
+                                            },
+                                        });
+                                    }
+                                    LocalType::Concrete(expected)
+                                } else {
+                                    LocalType::Concrete(PrimTy::Byte)
+                                }
+                            }
+                            _ => return Err(()),
+                        }
+                    } else {
+                        let (local_type, is_deferred_bitnot_result) =
+                            self.check_local_initializer_bitwise_not_path(operand, init.hir_id)?;
+                        deferred_bitnot_result = is_deferred_bitnot_result;
+                        if let Some(expected) = annotation {
+                            self.check_annotated_path(local_type, expected, init.hir_id)?;
+                            LocalType::Concrete(expected)
+                        } else {
+                            local_type
+                        }
+                    }
+                }
+                _ => return Err(()),
+            }
+        };
+        Ok(InitializerCheck {
+            local_type,
+            deferred_neg_result,
+            deferred_bitnot_result,
+        })
     }
 
     fn check_if_tail(
@@ -4287,7 +4369,10 @@ fn collect_primitive_block_nodes<'hir>(
                     collect_primitive_expression_nodes(msg, nodes);
                 }
             }
-            _ => continue,
+            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                collect_primitive_expression_nodes(lhs, nodes);
+                collect_primitive_expression_nodes(rhs, nodes);
+            }
         };
     }
     if let Some(tail) = block.tail {
