@@ -77650,6 +77650,7 @@ property "shared"() {}
             "pub fn literal_var_cmp_bool_pair() -> Bool {\n    var a = true\n    var b = false\n    a < b\n}\n",
             "pub fn literal_var_assign_float_rem() -> F64 {\n    var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n}\n",
             "pub fn literal_var_merge_cycle() -> I32 {\n    var a = 0\n    var b = 0\n    a += b\n    b += a\n    a\n}\n",
+            "pub fn literal_var_merge_block_scope(flag: Bool) -> I32 {\n    var a = 1\n    if flag {\n        var b = 2\n        a += b\n    }\n    a\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77665,7 +77666,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 58);
+        assert_eq!(owners.len(), 59);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77736,7 +77737,7 @@ property "shared"() {}
         }
         for index in [
             23, 25, 26, 27, 28, 29, 30, 31, 34, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49,
-            51, 52, 55,
+            51, 52, 55, 58,
         ] {
             let check = owners[index]
                 .body_type_check()

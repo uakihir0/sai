@@ -5361,41 +5361,62 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let pointer_width = self.input.pointer_width;
         let mut deferred_errors = Vec::new();
         let mut deferred_operator_errors = Vec::new();
-        for variable in &mut self.literal_variables[literal_floor..] {
-            if variable.resolved.is_none() {
-                let expected = match variable.kind {
-                    PrimitiveLiteralKind::Integer => PrimTy::I64,
-                    PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
-                    PrimitiveLiteralKind::Bool
-                    | PrimitiveLiteralKind::Byte
-                    | PrimitiveLiteralKind::Character => unreachable!(),
-                };
-                variable.resolved = Some(expected);
-                if check_primitive_literal(expected, variable.literal, symbols, pointer_width)
-                    == PrimitiveLiteralResult::OutOfRange
-                {
-                    deferred_errors.push(PrimitiveBodyError {
-                        node: variable.origin,
-                        kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                            expected,
-                            found: variable.kind,
-                        },
-                    });
+        let variable_count = self.literal_variables.len();
+        for index in literal_floor..variable_count {
+            // Merge children default with their group, not on their own —
+            // resolving a child while its parent stays unresolved would
+            // re-enter the already-resolved child when the parent
+            // resolves later and fail the whole body as unsupported.
+            if self.literal_variables[index].resolved.is_none()
+                && self.literal_variables[index].merged_with.is_none()
+            {
+                let mut group = vec![index];
+                let mut cursor = 0;
+                while cursor < group.len() {
+                    let parent = group[cursor];
+                    cursor += 1;
+                    group.extend(
+                        (0..variable_count)
+                            .filter(|i| self.literal_variables[*i].merged_with == Some(parent)),
+                    );
                 }
-                if let Some(site) = variable.additional_site {
-                    if check_primitive_literal(expected, site.literal, symbols, pointer_width)
+                for member in group {
+                    let variable = &mut self.literal_variables[member];
+                    let expected = match variable.kind {
+                        PrimitiveLiteralKind::Integer => PrimTy::I64,
+                        PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
+                        PrimitiveLiteralKind::Bool
+                        | PrimitiveLiteralKind::Byte
+                        | PrimitiveLiteralKind::Character => unreachable!(),
+                    };
+                    variable.resolved = Some(expected);
+                    if check_primitive_literal(expected, variable.literal, symbols, pointer_width)
                         == PrimitiveLiteralResult::OutOfRange
                     {
                         deferred_errors.push(PrimitiveBodyError {
-                            node: site.origin,
+                            node: variable.origin,
                             kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
                                 expected,
                                 found: variable.kind,
                             },
                         });
                     }
+                    if let Some(site) = variable.additional_site {
+                        if check_primitive_literal(expected, site.literal, symbols, pointer_width)
+                            == PrimitiveLiteralResult::OutOfRange
+                        {
+                            deferred_errors.push(PrimitiveBodyError {
+                                node: site.origin,
+                                kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                                    expected,
+                                    found: variable.kind,
+                                },
+                            });
+                        }
+                    }
                 }
             }
+            let variable = &mut self.literal_variables[index];
             if let Some(right) = variable.resolved {
                 deferred_operator_errors.extend(variable.pending_operator_traits.iter().map(
                     |site| {
