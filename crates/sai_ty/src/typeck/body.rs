@@ -571,6 +571,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 ..
             }
         );
+        let is_supported_return_tail = matches!(tail.kind, ExprKind::Return(..));
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
@@ -579,6 +580,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             && !is_supported_literal_tail
             && !is_supported_if_tail
             && !is_supported_match_tail
+            && !is_supported_return_tail
         {
             return Err(());
         }
@@ -3120,6 +3122,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     arms,
                     source,
                 } => self.check_match_tail(scrutinee, arms, source, expected)?,
+                // A `return` in tail position is the never-typed exit
+                // expression: the value is checked against the
+                // function's return type (not the surrounding expected
+                // type — an annotated `let x: Bool = if flag { return true }
+                // else { false }` in an I32 body still checks `true`
+                // against I32), and a bare `return` reports the same
+                // missing-value diagnostic as the statement form.
+                ExprKind::Return(value) => {
+                    self.check_return(expression.hir_id, value)?;
+                    LocalType::Concrete(expected)
+                }
                 _ => self.check_local_path(expression)?,
             }
         };

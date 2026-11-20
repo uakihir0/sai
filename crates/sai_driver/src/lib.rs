@@ -8581,6 +8581,7 @@ fn check_function_body_primitive_local_block(
             ..
         }
     );
+    let is_supported_return_tail = matches!(tail.kind, ExprKind::Return(..));
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8606,6 +8607,7 @@ fn check_function_body_primitive_local_block(
         ExprKind::Call { .. } if is_supported_call_tail => None,
         ExprKind::If { .. } if is_supported_if_tail => None,
         ExprKind::Match { .. } if is_supported_match_tail => None,
+        ExprKind::Return(..) if is_supported_return_tail => None,
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
@@ -8616,6 +8618,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_literal_tail
         && !is_supported_if_tail
         && !is_supported_match_tail
+        && !is_supported_return_tail
     {
         return Ok(None);
     }
@@ -8760,6 +8763,25 @@ fn check_function_body_primitive_local_block(
                 )
             })
         {
+            return Ok(None);
+        }
+    }
+
+    if let (true, ExprKind::Return(value)) = (is_supported_return_tail, tail.kind) {
+        if !value.is_none_or(|value| {
+            primitive_value_expression_shape_is_supported(
+                value,
+                &preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                &mut primitive_types,
+            )
+        }) {
             return Ok(None);
         }
     }
@@ -9805,6 +9827,20 @@ fn primitive_if_branch_tail_shape_is_supported(
             direct_call_signatures,
             primitive_types,
         ),
+        ExprKind::Return(value) => value.is_none_or(|value| {
+            primitive_value_expression_shape_is_supported(
+                value,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            )
+        }),
         _ => false,
     }
 }
@@ -78221,6 +78257,14 @@ property "shared"() {}
             "pub fn return_bitnot_literal() -> I32 {\n    return ~42\n    0\n}\n",
             "pub fn return_not_nested(flag: Bool) -> Bool {\n    return not not flag\n    true\n}\n",
             "fn helper(value: I32) -> I32 {\n    value\n}\n",
+            "pub fn return_tail() -> I32 {\n    return 5\n}\n",
+            "pub fn return_tail_path() -> I32 {\n    let x = 7\n    return x\n}\n",
+            "pub fn return_tail_bare() -> I32 {\n    return\n}\n",
+            "pub fn return_tail_in_if(flag: Bool) -> I32 {\n    if flag { return 1 } else { 2 }\n}\n",
+            "pub fn return_tail_in_match(value: I32) -> I32 {\n    match value { 1 => return 5, _ => 0 }\n}\n",
+            "pub fn return_tail_unbound() -> I32 {\n    return missing\n}\n",
+            "pub fn return_tail_let_mismatch(flag: Bool) -> I32 {\n    let x: Bool = if flag { return true } else { false }\n    0\n}\n",
+            "pub fn return_tail_let(flag: Bool) -> I32 {\n    let x: Bool = if flag { return 1 } else { false }\n    0\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78236,9 +78280,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 15);
+        assert_eq!(owners.len(), 23);
 
-        for index in [0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13] {
+        for index in [0, 1, 2, 3, 4, 5, 8, 10, 11, 12, 13, 15, 16, 18, 19, 22] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a return statement is checked");
@@ -78250,6 +78294,8 @@ property "shared"() {}
         for (index, code) in [
             (6, sai_diagnostics::Code::TypeMismatch),
             (7, sai_diagnostics::Code::TypeMismatch),
+            (17, sai_diagnostics::Code::TypeMismatch),
+            (21, sai_diagnostics::Code::TypeMismatch),
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -78260,13 +78306,15 @@ property "shared"() {}
                 "function owner {index} must report {code:?}: {check:?}"
             );
         }
-        let check = owners[9]
-            .body_type_check()
-            .expect("an unbound return value is gated");
-        assert!(
-            matches!(check, FunctionBodyTypeCheck::Unsupported),
-            "function owner 9 unexpectedly passed the return slice: {check:?}"
-        );
+        for index in [9, 20] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("an unbound return value is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the return slice: {check:?}"
+            );
+        }
     }
 
     #[test]
