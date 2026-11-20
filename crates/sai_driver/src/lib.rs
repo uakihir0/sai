@@ -47499,7 +47499,14 @@ property "shared"() {}
             ));
         }
 
-        for owner in &resolved.owners()[4..] {
+        assert!(matches!(
+            resolved.owners()[4]
+                .body_type_check()
+                .expect("computed body check succeeds"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+
+        for owner in &resolved.owners()[5..] {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -47657,9 +47664,17 @@ property "shared"() {}
             );
         }
 
+        assert!(matches!(
+            owners[17]
+                .body_type_check()
+                .expect("literal operand tail body check succeeds"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+
         for owner in owners[12..13]
             .iter()
-            .chain(owners[16..19].iter())
+            .chain(owners[16..17].iter())
+            .chain(owners[18..19].iter())
             .chain(owners[20..].iter())
         {
             assert!(matches!(
