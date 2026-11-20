@@ -9100,37 +9100,39 @@ fn primitive_break_value_shape_is_supported(
     primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     match value.kind {
-        ExprKind::If {
-            cond,
-            then,
-            els: Some(els),
-        } => {
-            primitive_if_condition_shape_is_supported(cond, preceding_bindings, locals, inputs)
-                && primitive_literal_join_branch_shape(then)
-                && matches!(els.kind, ExprKind::Block(else_block) if primitive_literal_join_branch_shape(else_block))
-        }
+        // `if`/`match` values admit the full tail shape — a concrete `β`
+        // (`let x: I32 = loop {..}`) checks them like any tail; a fresh `β`
+        // joins only literal branches, and the checker rejects the rest.
+        ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
+            value,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         ExprKind::Match {
             scrutinee,
             arms,
             source,
-        } => {
-            primitive_match_tail_shape_is_supported(
-                scrutinee,
-                arms,
-                source,
-                preceding_bindings,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                self_field_projections,
-                unknown_self_fields,
-                direct_call_signatures,
-                primitive_types,
-            ) && arms
-                .iter()
-                .all(|arm| matches!(arm.body.kind, ExprKind::Lit(_)))
-        }
+        } => primitive_match_tail_shape_is_supported(
+            scrutinee,
+            arms,
+            source,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         _ => primitive_value_expression_shape_is_supported(
             value,
             preceding_bindings,
@@ -9144,16 +9146,6 @@ fn primitive_break_value_shape_is_supported(
             primitive_types,
         ),
     }
-}
-
-/// A literal-join branch: a `safe` statement-free block whose tail is a
-/// literal — the shape `check_literal_join_if` joins as literal sites.
-fn primitive_literal_join_branch_shape(block: &HirBlock<'_>) -> bool {
-    block.safety == sai_hir::Safety::Safe
-        && block.stmts.is_empty()
-        && block
-            .tail
-            .is_some_and(|tail| matches!(tail.kind, ExprKind::Lit(_)))
 }
 
 fn primitive_value_expression_shape_is_supported(
@@ -78370,6 +78362,7 @@ property "shared"() {}
             "pub fn break_value_match(flag: Bool) -> I32 {\n    loop { break if flag { 1 } else { 2 } }\n}\n",
             "pub fn break_value_match_arm(value: I32) -> I32 {\n    loop { break match value { 1 => 7, _ => 0 } }\n}\n",
             "pub fn break_value_return(flag: Bool) -> I32 {\n    loop { break return 5 }\n}\n",
+            "pub fn break_value_if_nonliteral(flag: Bool, n: I32) -> I32 {\n    let x: I32 = loop { break if flag { n } else { 0 } }\n    x\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -78385,11 +78378,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 39);
+        assert_eq!(owners.len(), 40);
 
         for index in [
             0, 1, 2, 3, 4, 5, 11, 13, 14, 15, 17, 18, 19, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35,
-            36, 37,
+            36, 37, 39,
         ] {
             let check = owners[index]
                 .body_type_check()
