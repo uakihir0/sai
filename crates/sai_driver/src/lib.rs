@@ -9280,6 +9280,42 @@ fn primitive_let_statement_shape_is_supported(
                 direct_call_signatures,
             );
     }
+    if let StmtKind::AssignOp { op, lhs, rhs } = stmt.kind {
+        // `place op= e` desugars to `{ let t = e; place = place op t }`: the
+        // same place and value admission as `place = e`, restricted to the
+        // compound-assignment operators.
+        if !matches!(
+            op,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Rem
+                | BinOp::WrapAdd
+                | BinOp::WrapSub
+                | BinOp::WrapMul
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+        ) {
+            return false;
+        }
+        // The right operand of `place op= e` is checked through the compound
+        // operator itself, so it follows operand admission (literals and
+        // preceding paths). Root-only shapes — calls, field projections,
+        // unary operators and nested expressions — stay gated until the
+        // desugared `let t = e` form is supported as a value here.
+        let rhs_is_supported = match rhs.kind {
+            ExprKind::Lit(_) => is_direct_function_scalar_literal(rhs),
+            ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding)),
+            _ => false,
+        };
+        return primitive_assign_target_shape_is_supported(lhs, preceding_bindings, locals, inputs)
+            && rhs_is_supported;
+    }
     let StmtKind::Let {
         pat,
         ty,
@@ -9945,6 +9981,12 @@ fn primitive_body_errors_to_diagnostics(
                         primitive_body_error_span(lhs, error.node)
                             .or_else(|| primitive_body_error_span(rhs, error.node))
                     }
+                })
+                .or_else(|| {
+                    block
+                        .stmts
+                        .iter()
+                        .find_map(|stmt| (stmt.hir_id == error.node).then_some(stmt.span))
                 })
                 .or_else(|| primitive_body_error_span(tail, error.node)),
         };
@@ -70056,8 +70098,8 @@ property "shared"() {}
             "    result\n",
             "}\n",
             "pub fn excluded_mutable_source(value: I32) -> I32 {\n",
-            "    var source: I32 = value\n",
-            "    source += 0\n",
+            "    var source = 0\n",
+            "    source += value\n",
             "    let result = -source\n",
             "    result\n",
             "}\n",
@@ -76376,9 +76418,9 @@ property "shared"() {}
         let root = concat!(
             "const ONE: I32 = 1\n",
             "type Number = I32\n",
-            "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value += 1\n    value\n}\n",
+            "pub fn mutable() -> I32 {\n    var value = 42\n    value += 1\n    value\n}\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
-            "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second: I32 = 2\n    second += 3\n    first\n}\n",
+            "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second = 2\n    second += first\n    first\n}\n",
             "pub fn raw_copy() -> I32 {\n    let value: I32 = 42\n    let copy: I32 = r#value\n    copy\n}\n",
             "pub fn forward_copy() -> I32 {\n    let first: I32 = second\n    let second: I32 = 2\n    first\n}\n",
             "pub fn self_copy() -> I32 {\n    let value: I32 = value\n    value\n}\n",
@@ -76389,8 +76431,8 @@ property "shared"() {}
             "pub fn unannotated_copy_from_constant() -> I32 {\n    let copy = ONE\n    copy\n}\n",
             "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source % (1 + 0)\n    copy\n}\n",
             "pub fn unannotated_raw_copy() -> I32 {\n    let source: I32 = 42\n    let copy = r#source\n    copy\n}\n",
-            "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = source\n    copy += 0\n    copy\n}\n",
-            "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    let copy = source\n    copy += 0\n    copy\n}\n",
+            "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = 0\n    copy += source\n    copy\n}\n",
+            "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    var copy = 0\n    copy += source\n    copy\n}\n",
             "pub fn unannotated_string() -> Str {\n    let value = \"text\"\n    value\n}\n",
             "pub fn destructured() -> I32 {\n    let (first, second): (I32, I32) = (1, 2)\n    first\n}\n",
             "pub fn alias() -> I32 {\n    let value: Number = 42\n    value\n}\n",
@@ -77058,7 +77100,7 @@ property "shared"() {}
             "pub fn nonplace_target() -> I32 {\n    var x: I32 = 0\n    x + 1 = 5\n    x\n}\n",
             "pub fn rhs_mismatch() -> I32 {\n    var x: I32 = 0\n    x = true\n    x\n}\n",
             "pub fn unannotated_literal_var() -> I32 {\n    var x = 1\n    x = 2\n    x\n}\n",
-            "pub fn compound() -> I32 {\n    var x: I32 = 0\n    x += 1\n    x\n}\n",
+            "pub fn compound() -> I32 {\n    var x: I32 = 0\n    x += 5\n    x\n}\n",
             "pub fn unbound_target() -> I32 {\n    missing = 5\n    0\n}\n",
             "pub fn call_rhs() -> I32 {\n    var x: I32 = 0\n    let seed: I32 = 4\n    x = identity(seed)\n    x\n}\n",
             "pub fn identity(value: I32) -> I32 {\n    value\n}\n",
@@ -77117,7 +77159,16 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
-        for index in [11, 12, 13] {
+        for index in [12, 14, 15] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("compound and call assignments are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed: {check:?}"
+            );
+        }
+        for index in [11, 13] {
             assert!(
                 matches!(
                     owners[index]
@@ -77128,13 +77179,87 @@ property "shared"() {}
                 "function owner {index} should remain gated"
             );
         }
-        for index in [14, 15] {
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_assign_op_statements() {
+        let root = concat!(
+            "pub fn add() -> I32 {\n    var x: I32 = 0\n    x += 5\n    x\n}\n",
+            "pub fn sub_path(left: I32, right: I32) -> I32 {\n    var x: I32 = 10\n    x -= left\n    x -= right\n    x\n}\n",
+            "pub fn shift() -> I32 {\n    var x: I32 = 1\n    x <<= 4\n    x >>= 1\n    x\n}\n",
+            "pub fn bitwise(left: I32, right: I32) -> I32 {\n    var x: I32 = 0\n    x |= left\n    x &= right\n    x ^= left\n    x\n}\n",
+            "pub fn let_target() -> I32 {\n    let x: I32 = 0\n    x += 5\n    x\n}\n",
+            "pub fn nonplace_target() -> I32 {\n    var x: I32 = 0\n    x + 1 += 5\n    x\n}\n",
+            "pub fn bool_operand() -> I32 {\n    var x: I32 = 0\n    var flag: Bool = false\n    x += flag\n    x\n}\n",
+            "pub fn unannotated_literal_var() -> I32 {\n    var x = 1\n    x += 2\n    x\n}\n",
+            "pub fn field_target() -> I32 {\n    var x: I32 = 0\n    x += 1\n    x.field += 1\n    x\n}\n",
+            "pub fn rem_float() -> F32 {\n    var x: F32 = 0.0\n    x %= 2.0\n    x\n}\n",
+            "pub fn nested_rhs(left: I32, right: I32) -> I32 {\n    var x: I32 = 0\n    x += left + right\n    x\n}\n",
+            "pub fn unary_rhs() -> I32 {\n    var x: I32 = 0\n    var y: I32 = 1\n    x += -y\n    x\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 12);
+
+        for index in 0..4 {
             let check = owners[index]
                 .body_type_check()
-                .expect("an assignment whose right side is a direct call is checked");
+                .expect("supported compound-assignment shapes are checked");
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
-                "function owner {index} unexpectedly failed the call right-hand side slice: {check:?}"
+                "function owner {index} unexpectedly failed the compound-assignment slice: {check:?}"
+            );
+        }
+        assert!(matches!(
+            owners[4]
+                .body_type_check()
+                .expect("compound-assigning to a let binding is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::AssignToImmutable
+        ));
+        assert!(matches!(
+            owners[5]
+                .body_type_check()
+                .expect("a non-place compound target is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::InvalidAssignTarget
+        ));
+        assert!(matches!(
+            owners[9]
+                .body_type_check()
+                .expect("the float-remainder compound assignment is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported
+        ));
+        // `x += flag` gates exactly like `let t = x + flag`: a Bool operand
+        // is outside the admitted arithmetic shapes, so the desugared
+        // assignment is equivalently unsupported rather than diagnosed. The
+        // nested-expression and unary right operands follow operand
+        // admission and stay gated with the other unresolved shapes.
+        for index in [6, 7, 8, 10, 11] {
+            assert!(
+                matches!(
+                    owners[index]
+                        .body_type_check()
+                        .expect("unsupported compound-assignment form is gated"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "function owner {index} should remain gated"
             );
         }
     }
