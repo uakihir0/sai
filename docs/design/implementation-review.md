@@ -9580,3 +9580,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver suite (775) and CLI suite (387) pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Passed after one fixture correction — a `return` written as a function body's only expression is the tail, not a statement; fixtures place a trailing literal tail so `return` stays in statement position.
 - **Remaining scope:** `return` in tail position, `break` with a value on `loop`, `for`/`while let`, loop tails/initializers, tuple/index tails, match patterns beyond literal/wildcard, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1040 (2026-11-20): `return` in tail position
+
+- **Decision:** Admit `return` as a block tail — a body tail (`{ return 5 }`), an `if`/`else` branch tail, and a `match` arm body. The value operand checks against the expected type through the same `check_expr_value` arm IR-1039's statement path uses, so a bare `return` tail reports `TYPE_MISMATCH` (missing value for a non-`()` expected type) and an unbound operand stays gated.
+- **Reason:** §6.16 — `return` has type `!` and coerces to any expected type; in tail position it remains control flow out of the function, so the whole block's tail obligation is satisfied by any operand `return` accepts.
+- **Failure boundary and judgment:** `return` in initializer position (`let x = return 1`) stays gated — `!` never binds to a name in primitive bodies — and an unbound operand stays gated. The branch-tail admission shares `primitive_if_branch_tail_shape_is_supported` between `if` branches and `match` arms, so both accept `return` bodies with the same operand gate.
+- **Review required:** None — a tail `return` admits its operand through `primitive_value_expression_shape_is_supported` with the block's own `preceding_bindings`, so `let`-scoped values resolve exactly like any other tail.
+- **Planned verification matrix:** Driver owners `return_tail`/`return_tail_path`/`return_tail_in_if`/`return_tail_in_match` (supported), `return_tail_bare` (Supported+TYPE_MISMATCH), `return_tail_unbound` (gated); CLI `return_tail`/`return_tail_in_if`/`return_tail_in_match` rows while `return_unbound` stays gated.
+- **Verification:** Pinned Rust 1.99.1, driver suite and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Passed after one fix — the checker's own empty-block gate in `check_block_expected` kept rejecting `{ return 5 }` even after the driver admission was widened; the empty-statement chain now takes the `return`-tail flag like the other admitted tail kinds.
+- **Remaining scope:** `return` in initializer position, `break` with a value on `loop`, `for`/`while let`, loop tails/initializers, tuple/index tails, match patterns beyond literal/wildcard, move/borrow analysis, lowering/evaluation, CLI Stage 0.
