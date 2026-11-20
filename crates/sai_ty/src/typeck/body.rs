@@ -5581,6 +5581,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             group.sort_unstable();
             if self.literal_variables[index].resolved.is_none() {
+                // A group straddling the floor stays unresolved — the
+                // member below the floor may still be constrained by a
+                // later site (a loop-local `n += x` must not default
+                // the outer `x`).
+                if group.iter().any(|member| *member < literal_floor) {
+                    continue;
+                }
                 for member in &group {
                     let variable = &mut self.literal_variables[*member];
                     let expected = match variable.kind {
