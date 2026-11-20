@@ -9324,14 +9324,46 @@ fn primitive_let_statement_shape_is_supported(
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     if let StmtKind::Expr(expression) = stmt.kind {
-        // Statement-position `if`/`block`/`match` expressions unify their
-        // branch/arm tails with the return type, which does not apply to a
-        // discarded result, so they stay outside this slice.
-        if matches!(
-            expression.kind,
-            ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::Match { .. }
-        ) {
-            return false;
+        // Statement-position `if`/`match` expressions discard their result;
+        // branches and arms admit only statement blocks so the discarded
+        // value is `()` (§6.11.1). Bare `block` statements stay gated.
+        match expression.kind {
+            ExprKind::If { .. } => {
+                return primitive_if_stmt_shape_is_supported(
+                    expression,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                );
+            }
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => {
+                return primitive_match_stmt_shape_is_supported(
+                    scrutinee,
+                    arms,
+                    source,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                );
+            }
+            ExprKind::Block(_) => return false,
+            _ => {}
         }
         return primitive_if_branch_tail_shape_is_supported(
             expression,
@@ -9844,6 +9876,216 @@ fn primitive_match_tail_shape_is_supported(
         }
         if !primitive_if_branch_tail_shape_is_supported(
             arm.body,
+            arm_bindings.as_ref().unwrap_or(preceding_bindings),
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ) {
+            return false;
+        }
+    }
+    // Missing catch-alls and non-Bool coverage are diagnosed
+    // `NON_EXHAUSTIVE_MATCH` by the checker — the shape is admitted.
+    true
+}
+
+/// A statement-only block: every admitted statement, no tail expression —
+/// a value tail would be a discarded non-`()` value, out of this slice.
+/// Bindings stay scoped to the block.
+#[allow(clippy::too_many_arguments)]
+fn primitive_stmt_block_shape_is_supported(
+    block: &HirBlock<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    if block.safety != sai_hir::Safety::Safe || block.tail.is_some() {
+        return false;
+    }
+    let mut block_bindings = preceding_bindings.clone();
+    block.stmts.iter().all(|stmt| {
+        primitive_let_statement_shape_is_supported(
+            stmt,
+            &mut block_bindings,
+            primitive_types,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+        )
+    })
+}
+
+/// Statement-position `if`/`else if`/`else`: branches are statement-only
+/// blocks, so an `else` is optional.
+#[allow(clippy::too_many_arguments)]
+fn primitive_if_stmt_shape_is_supported(
+    expression: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    let ExprKind::If { cond, then, els } = expression.kind else {
+        return false;
+    };
+    if !primitive_if_condition_shape_is_supported(cond, preceding_bindings, locals, inputs) {
+        return false;
+    }
+    if !primitive_stmt_block_shape_is_supported(
+        then,
+        preceding_bindings,
+        locals,
+        inputs,
+        symbols,
+        type_paths,
+        self_field_projections,
+        unknown_self_fields,
+        direct_call_signatures,
+        primitive_types,
+    ) {
+        return false;
+    }
+    match els {
+        None => true,
+        Some(els) => match els.kind {
+            ExprKind::Block(block) => primitive_stmt_block_shape_is_supported(
+                block,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            ),
+            ExprKind::If { .. } => primitive_if_stmt_shape_is_supported(
+                els,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            ),
+            _ => false,
+        },
+    }
+}
+
+/// Statement-position `match`: the same scrutinee, pattern and guard
+/// admission as `primitive_match_tail_shape_is_supported`, but arm bodies
+/// must be statement-only blocks.
+#[allow(clippy::too_many_arguments)]
+fn primitive_match_stmt_shape_is_supported(
+    scrutinee: &HirExpr<'_>,
+    arms: &[HirArm<'_>],
+    source: MatchSource,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    if !matches!(source, MatchSource::Normal) {
+        return false;
+    }
+    let ExprKind::Path(path) = scrutinee.kind else {
+        return false;
+    };
+    if !resolved_plain_local_path_binding(path, locals, inputs)
+        .is_some_and(|binding| preceding_bindings.contains(&binding))
+    {
+        return false;
+    }
+    let mut catch_all = false;
+    for arm in arms {
+        let mut arm_bindings = None;
+        if let PatKind::Binding {
+            mode: sai_hir::patterns::BindingMode::Value,
+            binding,
+            sub: None,
+            ..
+        } = arm.pat.kind
+        {
+            let mut extended = preceding_bindings.clone();
+            extended.insert(binding);
+            arm_bindings = Some(extended);
+        }
+        if catch_all {
+            // `UNREACHABLE_PATTERN` — only the body still shape-checks.
+        } else {
+            match arm.pat.kind {
+                PatKind::Lit(_) => {}
+                PatKind::Or(alternatives) => {
+                    if alternatives.is_empty()
+                        || !alternatives
+                            .iter()
+                            .all(|alternative| matches!(alternative.kind, PatKind::Lit(_)))
+                    {
+                        return false;
+                    }
+                }
+                PatKind::Range { start, end, .. } => {
+                    if ![start, end]
+                        .iter()
+                        .all(|bound| matches!(bound, Some(sai_hir::patterns::PatRangeEnd::Lit(_))))
+                    {
+                        return false;
+                    }
+                }
+                PatKind::Wild => catch_all = true,
+                PatKind::Binding {
+                    mode: sai_hir::patterns::BindingMode::Value,
+                    sub: None,
+                    ..
+                } => {
+                    catch_all = arm.guard.is_none();
+                }
+                _ => return false,
+            }
+            if let Some(guard) = arm.guard {
+                let Some(bindings) = arm_bindings.as_ref() else {
+                    return false;
+                };
+                if !primitive_if_condition_shape_is_supported(guard, bindings, locals, inputs) {
+                    return false;
+                }
+            }
+        }
+        let ExprKind::Block(block) = arm.body.kind else {
+            return false;
+        };
+        if !primitive_stmt_block_shape_is_supported(
+            block,
             arm_bindings.as_ref().unwrap_or(preceding_bindings),
             locals,
             inputs,
@@ -77633,6 +77875,11 @@ property "shared"() {}
             "pub fn negated_range_bound(value: I32) -> I32 {\n    match value { -170141183460469231731687303715884105728..=1 => 1, _ => 0 }\n}\n",
             "pub fn negated_zero_bound(value: I32) -> I32 {\n    match value { 0..=-0 => 1, _ => 0 }\n}\n",
             "pub fn unreachable_binding(value: I32) -> I32 {\n    match value { _ => 0, n => n + 1 }\n}\n",
+            "pub fn stmt_if(flag: Bool) -> I32 {\n    var x: I32 = 0\n    if flag { x = 1 }\n    x\n}\n",
+            "pub fn stmt_if_else(flag: Bool) -> I32 {\n    var x: I32 = 0\n    if flag { x = 1 } else if flag { x = 2 } else { x = 3 }\n    x\n}\n",
+            "pub fn stmt_match(value: I32) -> I32 {\n    var x: I32 = 0\n    match value { 0 => { x = 1 }, _ => {} }\n    x\n}\n",
+            "pub fn stmt_if_value_tail(flag: Bool) -> I32 {\n    var x: I32 = 0\n    if flag { x = 1\n 5 }\n    x\n}\n",
+            "pub fn stmt_match_value_body(value: I32) -> I32 {\n    match value { _ => 1 }\n    0\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77648,9 +77895,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 31);
+        assert_eq!(owners.len(), 36);
 
-        for index in [0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 29] {
+        for index in [0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 29, 31, 32, 33] {
             let check = owners[index]
                 .body_type_check()
                 .expect("supported match-tail shapes are checked");
@@ -77694,7 +77941,7 @@ property "shared"() {}
         ));
         // `stmt_match` stays gated: statement-position `match` discards its
         // arm values, so unifying them with the return type would be wrong.
-        for index in [15, 18, 19, 21, 23, 26] {
+        for index in [15, 18, 19, 21, 23, 26, 34, 35] {
             let check = owners[index]
                 .body_type_check()
                 .expect("match shapes outside the slice are gated");

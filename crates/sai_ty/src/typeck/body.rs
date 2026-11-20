@@ -2248,17 +2248,130 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_expr_stmt(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
-        // Statement-position `if`/`block`/`match` expressions unify their
-        // branch/arm tails with the return type, which does not apply to a
-        // discarded result, so they stay outside this slice.
-        if matches!(
-            expression.kind,
-            ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::Match { .. }
-        ) {
-            return Err(());
+        // Statement-position `if`/`match` expressions discard their result;
+        // branches and arms admit only statement blocks so the discarded
+        // value is `()` (§6.11.1). Bare `block` statements stay gated.
+        match expression.kind {
+            ExprKind::If { cond, then, els } => return self.check_if_stmt(cond, then, els),
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => return self.check_match_stmt(scrutinee, arms, source),
+            ExprKind::Block(_) => return Err(()),
+            _ => {}
         }
         let local_type = self.check_expr_value(expression, self.input.return_type)?;
         self.record_expression_type(expression.hir_id, local_type);
+        Ok(())
+    }
+
+    /// A statement-only block: every admitted statement, no tail expression.
+    /// A value tail would be a discarded non-`()` value — out of scope.
+    fn check_stmt_block(&mut self, block: &'hir Block<'hir>) -> Result<(), ()> {
+        if block.safety != Safety::Safe || block.tail.is_some() {
+            return Err(());
+        }
+        let literal_floor = self.literal_variables.len();
+        for stmt in block.stmts {
+            self.check_stmt(stmt)?;
+        }
+        self.default_unresolved_literals(literal_floor);
+        Ok(())
+    }
+
+    /// Statement-position `if`/`else if`/`else`: branches are statement-only
+    /// blocks, so the expression is `()` and an `else` is optional.
+    fn check_if_stmt(
+        &mut self,
+        condition: &'hir Expr<'hir>,
+        then: &'hir Block<'hir>,
+        els: Option<&'hir Expr<'hir>>,
+    ) -> Result<(), ()> {
+        self.check_if_condition(condition)?;
+        self.check_stmt_block(then)?;
+        match els {
+            None => Ok(()),
+            Some(els) => match els.kind {
+                ExprKind::Block(block) => self.check_stmt_block(block),
+                ExprKind::If { cond, then, els } => self.check_if_stmt(cond, then, els),
+                _ => Err(()),
+            },
+        }
+    }
+
+    /// Statement-position `match`: the same scrutinee, pattern, guard and
+    /// exhaustiveness admission as `check_match_tail`, but arm bodies must
+    /// be statement-only blocks.
+    fn check_match_stmt(
+        &mut self,
+        scrutinee: &'hir Expr<'hir>,
+        arms: &'hir [Arm<'hir>],
+        source: MatchSource,
+    ) -> Result<(), ()> {
+        if !matches!(source, MatchSource::Normal) {
+            return Err(());
+        }
+        let ExprKind::Path(_) = scrutinee.kind else {
+            return Err(());
+        };
+        let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
+            return Err(());
+        };
+        let mut catch_all = false;
+        let mut bool_cover = (false, false);
+        let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
+        for arm in arms {
+            let check_body = |this: &mut Self| -> Result<(), ()> {
+                let ExprKind::Block(block) = arm.body.kind else {
+                    return Err(());
+                };
+                this.check_stmt_block(block)
+            };
+            if catch_all {
+                self.errors.push(PrimitiveBodyError {
+                    node: arm.pat.hir_id,
+                    kind: PrimitiveBodyErrorKind::UnreachablePattern,
+                });
+                if let PatKind::Binding {
+                    mode: BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } = arm.pat.kind
+                {
+                    arm_binding = Some((
+                        binding,
+                        self.known_bindings
+                            .insert(binding, LocalType::Concrete(scrutinee_type)),
+                    ));
+                }
+                let body_result = check_body(self);
+                self.restore_arm_binding(&mut arm_binding);
+                body_result?;
+                continue;
+            }
+            self.check_match_arm_pattern(
+                arm,
+                scrutinee_type,
+                &mut catch_all,
+                &mut bool_cover,
+                &mut arm_binding,
+            )?;
+            let body_result = arm
+                .guard
+                .map(|guard| self.check_if_condition(guard))
+                .unwrap_or(Ok(()))
+                .and_then(|_| check_body(self));
+            self.restore_arm_binding(&mut arm_binding);
+            body_result?;
+        }
+        if !catch_all && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true)) {
+            self.errors.push(PrimitiveBodyError {
+                node: scrutinee.hir_id,
+                kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
+            });
+        }
         Ok(())
     }
 
