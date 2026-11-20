@@ -77651,6 +77651,7 @@ property "shared"() {}
             "pub fn literal_var_assign_float_rem() -> F64 {\n    var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n}\n",
             "pub fn literal_var_merge_cycle() -> I32 {\n    var a = 0\n    var b = 0\n    a += b\n    b += a\n    a\n}\n",
             "pub fn literal_var_merge_block_scope(flag: Bool) -> I32 {\n    var a = 1\n    if flag {\n        var b = 2\n        a += b\n    }\n    a\n}\n",
+            "pub fn literal_var_merge_pending_neg() -> U8 {\n    var x = 1\n    var y = 2\n    let n = -x\n    let s = y + x\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -77666,7 +77667,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 59);
+        assert_eq!(owners.len(), 60);
 
         for index in 0..7 {
             let check = owners[index]
@@ -77758,6 +77759,23 @@ property "shared"() {}
                 "function owner {index} unexpectedly passed the literal-operand merge boundary"
             );
         }
+        // `x` merges under `y` at `y + x`, so the merge child precedes its
+        // parent in declaration order — a per-index deferred pass would
+        // skip the child's pending `-x` diagnostic.
+        assert!(
+            matches!(
+                owners[59]
+                    .body_type_check()
+                    .expect("a merged deferred-neg site is diagnosed"),
+                FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code
+                            == sai_diagnostics::Code::OperatorNotSupported)
+            ),
+            "a deferred `-x` on a merge child declared before its parent must still error: {:?}",
+            owners[59].body_type_check()
+        );
         for index in [13, 14, 17] {
             assert!(
                 matches!(

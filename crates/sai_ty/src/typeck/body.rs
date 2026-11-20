@@ -5363,25 +5363,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let mut deferred_operator_errors = Vec::new();
         let variable_count = self.literal_variables.len();
         for index in literal_floor..variable_count {
-            // Merge children default with their group, not on their own —
-            // resolving a child while its parent stays unresolved would
-            // re-enter the already-resolved child when the parent
-            // resolves later and fail the whole body as unsupported.
-            if self.literal_variables[index].resolved.is_none()
-                && self.literal_variables[index].merged_with.is_none()
-            {
-                let mut group = vec![index];
-                let mut cursor = 0;
-                while cursor < group.len() {
-                    let parent = group[cursor];
-                    cursor += 1;
-                    group.extend(
-                        (0..variable_count)
-                            .filter(|i| self.literal_variables[*i].merged_with == Some(parent)),
-                    );
-                }
-                for member in group {
-                    let variable = &mut self.literal_variables[member];
+            // Merge children are handled through their group's root — the
+            // root may come after a child (the right operand of `x + y`
+            // merges under the left), so a per-index visit would either
+            // default a child alone (leaving its parent unresolved) or
+            // skip its deferred diagnostics when the group resolves at a
+            // later index.
+            if self.literal_variables[index].merged_with.is_some() {
+                continue;
+            }
+            let mut group = vec![index];
+            let mut cursor = 0;
+            while cursor < group.len() {
+                let parent = group[cursor];
+                cursor += 1;
+                group.extend(
+                    (0..variable_count)
+                        .filter(|i| self.literal_variables[*i].merged_with == Some(parent)),
+                );
+            }
+            group.sort_unstable();
+            if self.literal_variables[index].resolved.is_none() {
+                for member in &group {
+                    let variable = &mut self.literal_variables[*member];
                     let expected = match variable.kind {
                         PrimitiveLiteralKind::Integer => PrimTy::I64,
                         PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
@@ -5416,41 +5420,50 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                 }
             }
-            let variable = &mut self.literal_variables[index];
-            if let Some(right) = variable.resolved {
-                deferred_operator_errors.extend(variable.pending_operator_traits.iter().map(
-                    |site| {
-                        (
-                            site.diagnostic_index,
-                            PrimitiveBodyError {
-                                node: site.expression,
-                                kind: PrimitiveBodyErrorKind::DeferredOperatorTraitNotSupported {
-                                    operator: site.operator,
-                                    left: PrimTy::Char,
-                                    right,
-                                },
-                            },
-                        )
-                    },
-                ));
-                deferred_operator_errors.extend(
-                    variable
-                        .pending_neg_traits
-                        .iter()
-                        .filter(|_| !is_neg_primitive(right))
-                        .map(|site| {
+            for member in group {
+                // Group members below this block's literal floor emit
+                // their deferred diagnostics in the enclosing block's
+                // pass, which visits the group again.
+                if member < literal_floor {
+                    continue;
+                }
+                let variable = &mut self.literal_variables[member];
+                if let Some(right) = variable.resolved {
+                    deferred_operator_errors.extend(variable.pending_operator_traits.iter().map(
+                        |site| {
                             (
                                 site.diagnostic_index,
                                 PrimitiveBodyError {
                                     node: site.expression,
-                                    kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
-                                        operator: UnOp::Neg,
-                                        operand: right,
-                                    },
+                                    kind:
+                                        PrimitiveBodyErrorKind::DeferredOperatorTraitNotSupported {
+                                            operator: site.operator,
+                                            left: PrimTy::Char,
+                                            right,
+                                        },
                                 },
                             )
-                        }),
-                );
+                        },
+                    ));
+                    deferred_operator_errors.extend(
+                        variable
+                            .pending_neg_traits
+                            .iter()
+                            .filter(|_| !is_neg_primitive(right))
+                            .map(|site| {
+                                (
+                                    site.diagnostic_index,
+                                    PrimitiveBodyError {
+                                        node: site.expression,
+                                        kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                                            operator: UnOp::Neg,
+                                            operand: right,
+                                        },
+                                    },
+                                )
+                            }),
+                    );
+                }
             }
         }
         self.errors.extend(deferred_errors);
