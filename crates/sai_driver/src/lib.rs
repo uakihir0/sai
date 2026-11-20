@@ -9461,6 +9461,10 @@ fn primitive_if_condition_shape_is_supported(
                 resolved_plain_local_path_binding(operand_path, locals, inputs)
                     .is_some_and(|binding| preceding_bindings.contains(&binding))
             }
+            // `not` operands recurse shallowly — the checker runs the shared
+            // logical-operand machinery, so `not not`, `not true`, and nested
+            // `and`/`or`/comparison operands are admitted here.
+            ExprKind::Unary(UnOp::Not, _) | ExprKind::Lit(Lit::Bool(_)) => true,
             ExprKind::Binary(operator, ..) => matches!(
                 operator,
                 BinOp::Eq
@@ -53443,7 +53447,7 @@ property "shared"() {}
             "        0\n",
             "    }\n",
             "}\n",
-            "pub fn double_negation(flag: Bool) -> I32 { if not not flag { 1 } else { 0 } }\n",
+            "pub fn double_negation(flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not flag { 1 } else { 0 }\n}\n",
             "pub fn literal_condition() -> I32 { if 1 { 1 } else { 0 } }\n",
             "pub fn nested_branch_tail(first: I32) -> I32 {\n",
             "    if first < 0 { (first + 1) * 2 } else { 0 }\n",
@@ -76729,7 +76733,7 @@ property "shared"() {}
             "pub fn nested_right_operand(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
             "pub fn mixed_condition(value: I8) -> I32 { if value < 1 and true { 1 } else { 2 } }\n",
             "pub fn two_parameters(value: I8, other: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
-            "pub fn double_negated_comparison(value: I8) -> I32 { if not not (value < 10) { 1 } else { 2 } }\n",
+            "pub fn double_negated_comparison(value: I8) -> I32 {\n    var t = 0\n    t += 1\n    if not not (value < 10) { 1 } else { 2 }\n}\n",
             "pub fn negated_mixed_condition(value: I8) -> I32 { if not (value < 1 and true) { 1 } else { 2 } }\n",
             "pub fn negated_two_parameters(value: I8, other: I8) -> I32 { if not (10 < value) { 1 } else { 2 } }\n",
             "pub fn aliased_parameter(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
@@ -76862,12 +76866,14 @@ property "shared"() {}
             "const OTHER: Bool = true\n",
             "type BoolAlias = Bool\n",
             "pub fn negated(flag: Bool) -> I32 { if not flag { 1 } else { 2 } }\n",
-            "pub fn nested_not(flag: Bool) -> I32 { if not not flag { 1 } else { 2 } }\n",
+            "pub fn nested_not(flag: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not flag { 1 } else { 2 }\n}\n",
             "pub fn other_binding(flag: Bool) -> I32 { if not OTHER { 1 } else { 2 } }\n",
             "pub fn wrong_parameter_type(flag: I32) -> I32 { if not flag { 1 } else { 2 } }\n",
             "pub fn aliased_parameter_type(flag: BoolAlias) -> I32 { if not flag { 1 } else { 2 } }\n",
             "pub fn logical_and(flag: Bool) -> I32 { if flag and true { 1 } else { 2 } }\n",
-            "pub fn negated_literal_without_parameter() -> I32 { if not true { 1 } else { 2 } }\n",
+            "pub fn negated_literal_without_parameter() -> I32 {\n    var t = 0\n    t += 1\n    if not true { 1 } else { 2 }\n}\n",
+            "pub fn double_not(flag: Bool) -> I32 { if not not flag { 1 } else { 2 } }\n",
+            "pub fn not_literal() -> I32 { if not true { 1 } else { 2 } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -76883,14 +76889,17 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 7);
+        assert_eq!(owners.len(), 9);
 
-        assert!(matches!(
-            owners[0]
+        for index in [0, 7, 8] {
+            let check = owners[index]
                 .body_type_check()
-                .expect("one not operator over the bool parameter is supported"),
-            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
-        ));
+                .expect("not conditions over admitted operand shapes are supported");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the not-condition slice: {check:?}"
+            );
+        }
         assert!(matches!(
             owners[3]
                 .body_type_check()
@@ -77457,10 +77466,10 @@ property "shared"() {}
             "pub fn other_primitive_type(left: I32, right: U32) -> I32 { if left < right { 1 } else { 2 } }\n",
             "pub fn aliased_primitive_type(left: IntegerAlias, right: IntegerAlias) -> I32 { if left < right { 1 } else { 2 } }\n",
             "pub fn string_type(left: Str, right: Str) -> I32 { if left == right { 1 } else { 2 } }\n",
-            "pub fn double_negated_comparison(left: Bool, right: Bool) -> I32 { if not not (left < right) { 1 } else { 2 } }\n",
+            "pub fn double_negated_comparison(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left < right) { 1 } else { 2 }\n}\n",
             "pub fn negated_mixed_comparison(left: Bool, right: Bool) -> I32 { if not (left < right and left) { 1 } else { 2 } }\n",
-            "pub fn double_negated_and(left: Bool, right: Bool) -> I32 { if not not (left and right) { 1 } else { 2 } }\n",
-            "pub fn double_negated_or(left: Bool, right: Bool) -> I32 { if not not (left or right) { 1 } else { 2 } }\n",
+            "pub fn double_negated_and(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left and right) { 1 } else { 2 }\n}\n",
+            "pub fn double_negated_or(left: Bool, right: Bool) -> I32 {\n    var t = 0\n    t += 1\n    if not not (left or right) { 1 } else { 2 }\n}\n",
             "pub fn chained_negated_and(left: Bool, right: Bool) -> I32 { if not (left and right and left) { 1 } else { 2 } }\n",
             "pub fn chained_negated_or(left: Bool, right: Bool) -> I32 { if not (left or right or left) { 1 } else { 2 } }\n",
             "pub fn negated_repeated_operand(left: Bool, right: Bool) -> I32 { if not (left and left) { 1 } else { 2 } }\n",
@@ -77581,8 +77590,8 @@ property "shared"() {}
             "pub fn disjunction_repeated_parameter(enabled: Bool, value: I32) -> I32 { if enabled or enabled >= 18 { 1 } else { 2 } }\n",
             "pub fn negated_repeated_parameter(enabled: Bool, value: I32) -> I32 { if not (enabled and enabled >= 18) { 1 } else { 2 } }\n",
             "pub fn negated_repeated_disjunction(enabled: Bool, value: I32) -> I32 { if not (enabled or enabled >= 18) { 1 } else { 2 } }\n",
-            "pub fn double_negated_condition(enabled: Bool, value: I32) -> I32 { if not not (enabled and value >= 18) { 1 } else { 2 } }\n",
-            "pub fn double_negated_disjunction(enabled: Bool, value: I32) -> I32 { if not not (enabled or value >= 18) { 1 } else { 2 } }\n",
+            "pub fn double_negated_condition(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled and value >= 18) { 1 } else { 2 }\n}\n",
+            "pub fn double_negated_disjunction(enabled: Bool, value: I32) -> I32 {\n    var t = 0\n    t += 1\n    if not not (enabled or value >= 18) { 1 } else { 2 }\n}\n",
             "pub fn aliased_bool(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn wrong_bool_type(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn extra_parameter(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
