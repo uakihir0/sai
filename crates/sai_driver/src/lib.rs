@@ -9185,6 +9185,43 @@ fn primitive_logical_init_operand_shape_is_supported(
             }
             _ => false,
         },
+        // A block operand under `and`/`or` contributes its tail —
+        // `flag and { let t = other\n  t }` behaves as `flag and other and
+        // t` — statements admit like the inner-block predicate, and the
+        // tail itself must be a logical operand.
+        ExprKind::Block(inner) => {
+            if inner.safety != sai_hir::Safety::Safe {
+                return false;
+            }
+            let mut inner_bindings = preceding_bindings.clone();
+            inner.stmts.iter().all(|stmt| {
+                primitive_let_statement_shape_is_supported(
+                    stmt,
+                    &mut inner_bindings,
+                    primitive_types,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                )
+            }) && inner.tail.is_some_and(|tail| {
+                primitive_logical_init_operand_shape_is_supported(
+                    tail,
+                    &inner_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            })
+        }
         _ => false,
     }
 }
@@ -91032,6 +91069,16 @@ property "shared"() {}
             "    let x = 1 + { let y = 2\n        y }\n",
             "    x\n",
             "}\n",
+            "pub fn let_logical_block_operand() -> Bool {\n",
+            "    let flag = true\n",
+            "    let x = flag and { flag }\n",
+            "    x\n",
+            "}\n",
+            "pub fn let_logical_stmt_block_operand() -> Bool {\n",
+            "    let flag = true\n",
+            "    let x = flag and { let t = flag\n        t }\n",
+            "    x\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -91053,7 +91100,7 @@ property "shared"() {}
         // tails, and inner `let` statements all check cleanly. Branch
         // tails admit the same nesting.
         for index in [
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24,
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26,
         ] {
             let check = resolved.owners()[index]
                 .body_type_check()

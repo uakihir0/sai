@@ -9943,3 +9943,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, focused driver test passes; full driver suite green; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Two closures that call the nested/logical predicates became `mut` (they now borrow `primitive_types` mutably) — mechanical fallout, no semantic change. The tainted-operand predicate passes `None` for call signatures as before.
 - **Remaining scope:** `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1073 (2026-11-21): Block operands under `and`/`or`
+
+- **Decision:** A block is a logical operand — `flag and { flag }`, `flag and { let t = flag\n  t }` — closing the operand-position gap IR-1072 left.
+- **Reason:** `primitive_logical_init_operand_shape_is_supported` gains an `ExprKind::Block` arm that admits inner statements through `primitive_let_statement_shape_is_supported` (into a cloned binding scope) and the tail through itself — `{ let t = flag\n  t }` resolves `t` from the inner scope. The checker needed no change: `check_logical_operand`'s fallback reaches `check_operand_local_type` → `check_initializer_value`'s `Block` arm.
+- **Failure boundary and judgment:** Empty and unsafe blocks keep their gates; unsupported inner statements and non-logical tails gate through the composed predicates. Unary tails with folded-literal operands (`{ ~1 }`) keep the long-standing path/field-only unary-tail boundary — consistent with IR-998/999, not a regression (a review finding claiming otherwise was rejected).
+- **Review required:** None — composes reviewed predicates; checker semantics unchanged.
+- **Planned verification matrix:** Driver `function_body_type_check_nested_block_tails` — `let_logical_block_operand`, `let_logical_stmt_block_operand` supported-clean.
+- **Verification:** Pinned Rust 1.99.1, focused driver test passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** The tail checks against `inner_bindings` (not the outer set) so an inner `let`'s binding is usable; the outer `preceding_bindings` is cloned, so inner declarations cannot leak into sibling operands.
+- **Remaining scope:** `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
