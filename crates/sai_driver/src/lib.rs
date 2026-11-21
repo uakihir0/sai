@@ -89895,6 +89895,23 @@ property "shared"() {}
             "    let total = self.missing + self.count * 2\n",
             "    total\n",
             "  }\n",
+            "  pub fn tainted_and_evaluated_comparison(self: borrow Self) -> Bool {\n",
+            "    let n = 1\n",
+            "    let result = self.missing and (n < 2)\n",
+            "    result\n",
+            "  }\n",
+            "  pub fn tainted_shift_literal_count(self: borrow Self) -> I32 {\n",
+            "    let total = self.missing << (1 + 2)\n",
+            "    total\n",
+            "  }\n",
+            "  pub fn annotated_tainted_literal_range(self: borrow Self) -> U8 {\n",
+            "    let total: U8 = (256 + 1) << self.missing\n",
+            "    total\n",
+            "  }\n",
+            "  pub fn annotated_tainted_literal_mismatch(self: borrow Self) -> Byte {\n",
+            "    let total: Byte = (1 + 2) << self.missing\n",
+            "    total\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -89911,7 +89928,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 11);
+        assert_eq!(members.len(), 15);
 
         // Known self fields in operand position desugar to `let t = self.f`
         // bindings, so pairs, nested operands, tails, and logical
@@ -89935,7 +89952,7 @@ property "shared"() {}
         // inside a nested binary, comparison, logical leaf, or unary
         // operand — keep the unknown-field diagnostic and the Error-type
         // recovery instead of gating.
-        for index in [4, 5, 6, 7, 8] {
+        for index in [4, 5, 6, 7, 8, 10, 11, 12] {
             let check = members[index]
                 .body_type_check()
                 .expect("tainted-operand body check has an independent result");
@@ -89957,11 +89974,49 @@ property "shared"() {}
             assert_primitive_type_result_parity(&database, type_results);
         }
 
-        // Call arguments keep the direct-call argument boundary —
-        // `ident(self.count)` is not a supported argument shape. A clean
-        // nested operand tree next to the tainted one also stays gated:
-        // recovery does not evaluate clean nested operand types.
-        for index in [9, 10] {
+        // Member 13 propagates the `U8` annotation into the evaluated
+        // literal-variable operand: `256` is out of range and reports on
+        // top of the unknown-field diagnostic.
+        let check = members[13]
+            .body_type_check()
+            .expect("annotated tainted literal body check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("an annotated tainted literal operand should be checked: {check:#?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField)
+                && diagnostics.len() > 1,
+            "the annotation reaches the literal operand and reports its range: {diagnostics:#?}"
+        );
+
+        // Member 14's `Byte` annotation does not fit the integer literal
+        // family: the member keeps its supported result and reports the
+        // mismatch next to the unknown-field diagnostic instead of
+        // gating the body.
+        let check = members[14]
+            .body_type_check()
+            .expect("annotated tainted literal body check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("an annotated tainted literal operand should be checked: {check:#?}");
+        };
+        let codes: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert!(
+            codes.contains(&sai_diagnostics::Code::UnknownField)
+                && codes.contains(&sai_diagnostics::Code::TypeMismatch),
+            "the annotation mismatch reports beside the field error: {diagnostics:#?}"
+        );
+
+        // Member 10's clean nested operand `self.count * 2` is typed
+        // through the desugared `let t = e` evaluation inside recovery,
+        // so it joins the supported group; call arguments keep the
+        // direct-call argument boundary — `ident(self.count)` is not a
+        // supported argument shape.
+        for index in [9] {
             let check = members[index]
                 .body_type_check()
                 .expect("boundary member body check has an independent result");
