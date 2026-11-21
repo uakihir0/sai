@@ -4901,6 +4901,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     fn check_if_condition(&mut self, condition: &'hir Expr<'hir>) -> Result<(), ()> {
         let local_type = match condition.kind {
             ExprKind::Path(_) => self.check_local_path(condition)?,
+            // A known self field in condition position — `if self.flag` —
+            // reads its declared type like a local path; the shared tail
+            // applies the `Bool` requirement below.
+            ExprKind::Field { .. } => LocalType::Concrete(
+                self.input
+                    .self_field_projections
+                    .and_then(|fields| fields.get(&condition.hir_id))
+                    .copied()
+                    .ok_or(())?,
+            ),
             // `not e` conditions admit the same operand-position logical
             // shapes as `let x = not e` — `not not`, `not true`, and nested
             // `and`/`or`/comparison operands recurse in source order.
@@ -5231,6 +5241,28 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         operand: &'hir Expr<'hir>,
         expression: HirId,
     ) -> Result<(LocalType, bool), ()> {
+        // `-self.f` reads the field's declared type — a concrete type, so
+        // the literal-variable deferral and binding cycle guard below do
+        // not apply.
+        if let ExprKind::Field { .. } = operand.kind {
+            let operand_type = self
+                .input
+                .self_field_projections
+                .and_then(|fields| fields.get(&operand.hir_id))
+                .copied()
+                .ok_or(())?;
+            self.record_expression_type(operand.hir_id, LocalType::Concrete(operand_type));
+            if !is_neg_primitive(operand_type) {
+                self.errors.push(PrimitiveBodyError {
+                    node: expression,
+                    kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                        operator: UnOp::Neg,
+                        operand: operand_type,
+                    },
+                });
+            }
+            return Ok((LocalType::Concrete(operand_type), false));
+        }
         let source_type = self.check_local_path(operand)?;
         let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
         if self.deferred_neg_result_bindings.contains(&source_binding) {
@@ -5281,6 +5313,26 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         operand: &'hir Expr<'hir>,
         expression: HirId,
     ) -> Result<(LocalType, bool), ()> {
+        // `~self.f` reads the field's declared type — see the `Neg` arm.
+        if let ExprKind::Field { .. } = operand.kind {
+            let operand_type = self
+                .input
+                .self_field_projections
+                .and_then(|fields| fields.get(&operand.hir_id))
+                .copied()
+                .ok_or(())?;
+            self.record_expression_type(operand.hir_id, LocalType::Concrete(operand_type));
+            if !is_bitwise_primitive(operand_type) {
+                self.errors.push(PrimitiveBodyError {
+                    node: expression,
+                    kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                        operator: UnOp::BitNot,
+                        operand: operand_type,
+                    },
+                });
+            }
+            return Ok((LocalType::Concrete(operand_type), false));
+        }
         let source_type = self.check_local_path(operand)?;
         let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
         if self
@@ -6153,10 +6205,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 },
             ),
             // Mirrors the driver's unary-operand admission exactly:
-            // `-` over a local path, `~` over a local path or an
-            // integer/byte literal. Field receivers stay gated there.
+            // `-` over a local path or a known self field, `~` over the
+            // same or an integer/byte literal. Unknown fields stay gated —
+            // unary over a field error is outside the tainted slice.
             ExprKind::Unary(UnOp::Neg, operand) => {
-                matches!(operand.kind, ExprKind::Path(_)) && self.check_local_path(operand).is_ok()
+                (matches!(operand.kind, ExprKind::Path(_))
+                    && self.check_local_path(operand).is_ok())
+                    || (matches!(operand.kind, ExprKind::Field { .. })
+                        && self
+                            .input
+                            .self_field_projections
+                            .is_some_and(|fields| fields.contains_key(&operand.hir_id)))
             }
             ExprKind::Unary(UnOp::BitNot, operand) => match operand.kind {
                 ExprKind::Lit(literal) => matches!(
@@ -6164,6 +6223,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     Some(PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::Byte)
                 ),
                 ExprKind::Path(_) => self.check_local_path(operand).is_ok(),
+                ExprKind::Field { .. } => self
+                    .input
+                    .self_field_projections
+                    .is_some_and(|fields| fields.contains_key(&operand.hir_id)),
                 _ => false,
             },
             ExprKind::Binary(_, left, right) => {

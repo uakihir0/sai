@@ -4275,6 +4275,60 @@ fn unknown_direct_self_field_does_not_hide_unsupported_arithmetic_siblings() {
 }
 
 #[test]
+fn unary_operators_over_known_self_fields_emit_check_results() {
+    let prefix = "type Counter { count: I32, flag: Bool }\nimpl Counter {\n";
+    let suffix = "}\n";
+    for body in [
+        "    pub fn negate(self: borrow Self) -> I32 {\n        let x = -self.count\n        x\n    }\n",
+        "    pub fn invert(self: borrow Self) -> I32 {\n        let x = ~self.count\n        x\n    }\n",
+        "    pub fn toggle(self: borrow Self) -> Bool {\n        let x = not self.flag\n        x\n    }\n",
+        "    pub fn operand(self: borrow Self) -> I32 {\n        let x = 1 + -self.count\n        x\n    }\n",
+        "    pub fn ready(self: borrow Self) -> Bool {\n        if not self.flag {\n            true\n        } else {\n            false\n        }\n    }\n",
+        "    pub fn bare(self: borrow Self) -> Bool {\n        if self.flag {\n            true\n        } else {\n            false\n        }\n    }\n",
+    ] {
+        let source = format!("{prefix}{body}{suffix}");
+        assert_success_result(
+            run_check(source.as_str(), "", &[], &[]),
+            "wasm32-core",
+            "dev",
+        );
+    }
+}
+
+#[test]
+fn unary_operators_over_unknown_self_fields_remain_gated() {
+    for source in [
+        concat!(
+            "type Counter { count: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn negate(self: borrow Self) -> I32 {\n",
+            "        let x = -self.missing\n",
+            "        x\n",
+            "    }\n",
+            "}\n",
+        ),
+        concat!(
+            "type Counter { count: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn invert(self: borrow Self) -> I32 {\n",
+            "        let x = ~self.missing\n",
+            "        x\n",
+            "        let x = 1 + ~self.missing\n",
+            "        x\n",
+            "    }\n",
+            "}\n",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "unary operators over unknown self fields stay gated: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn unsupported_inherent_method_shapes_remain_gated() {
     let cases = [
         (

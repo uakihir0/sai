@@ -9240,24 +9240,30 @@ fn primitive_nested_operand_shape_is_supported(
             unknown_self_fields,
             direct_call_signatures,
         ),
-        ExprKind::Unary(UnOp::Neg, inner) => {
-            let ExprKind::Path(path) = inner.kind else {
-                return false;
-            };
-            resolved_plain_local_path_binding(path, locals, inputs)
-                .is_some_and(|binding| preceding_bindings.contains(&binding))
-        }
+        ExprKind::Unary(UnOp::Neg, inner) => match inner.kind {
+            ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding)),
+            // A known self field desugars to `let t = self.f` — its
+            // declared type feeds the operator check directly. Unknown
+            // fields keep the tainted boundary.
+            ExprKind::Field { .. } => {
+                self_field_projections.is_some_and(|fields| fields.contains_key(&inner.hir_id))
+            }
+            _ => false,
+        },
         ExprKind::Unary(UnOp::BitNot, inner) => {
             if is_direct_function_integer_literal(inner)
                 || matches!(inner.kind, ExprKind::Lit(Lit::Byte(_)))
             {
                 true
             } else {
-                let ExprKind::Path(path) = inner.kind else {
-                    return false;
-                };
-                resolved_plain_local_path_binding(path, locals, inputs)
-                    .is_some_and(|binding| preceding_bindings.contains(&binding))
+                match inner.kind {
+                    ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                        .is_some_and(|binding| preceding_bindings.contains(&binding)),
+                    ExprKind::Field { .. } => self_field_projections
+                        .is_some_and(|fields| fields.contains_key(&inner.hir_id)),
+                    _ => false,
+                }
             }
         }
         ExprKind::Binary(operator, left, right)
@@ -9403,31 +9409,48 @@ fn primitive_value_expression_shape_is_supported(
                 return false;
             }
         }
-        ExprKind::Unary(UnOp::Neg, operand) => {
-            let ExprKind::Path(path) = operand.kind else {
-                return false;
-            };
-            let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
-            else {
-                return false;
-            };
-            if !preceding_bindings.contains(&source_binding) {
-                return false;
-            }
-        }
-        ExprKind::Unary(UnOp::BitNot, operand) => {
-            if !is_direct_function_integer_literal(operand)
-                && !matches!(operand.kind, ExprKind::Lit(Lit::Byte(_)))
-            {
-                let ExprKind::Path(path) = operand.kind else {
-                    return false;
-                };
+        ExprKind::Unary(UnOp::Neg, operand) => match operand.kind {
+            ExprKind::Path(path) => {
                 let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
                 else {
                     return false;
                 };
                 if !preceding_bindings.contains(&source_binding) {
                     return false;
+                }
+            }
+            ExprKind::Field { .. } => {
+                if !self_field_projections
+                    .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        },
+        ExprKind::Unary(UnOp::BitNot, operand) => {
+            if !is_direct_function_integer_literal(operand)
+                && !matches!(operand.kind, ExprKind::Lit(Lit::Byte(_)))
+            {
+                match operand.kind {
+                    ExprKind::Path(path) => {
+                        let Some(source_binding) =
+                            resolved_plain_local_path_binding(path, locals, inputs)
+                        else {
+                            return false;
+                        };
+                        if !preceding_bindings.contains(&source_binding) {
+                            return false;
+                        }
+                    }
+                    ExprKind::Field { .. } => {
+                        if !self_field_projections
+                            .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                        {
+                            return false;
+                        }
+                    }
+                    _ => return false,
                 }
             }
         }
@@ -9719,8 +9742,13 @@ fn primitive_let_statement_shape_is_supported(
     if let StmtKind::Assert { cond, msg, .. } = stmt.kind {
         // `assert` takes the same condition gate as `if`; the optional
         // message is a `Str` literal (N-C-20).
-        return primitive_if_condition_shape_is_supported(cond, preceding_bindings, locals, inputs)
-            && msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))));
+        return primitive_if_condition_shape_is_supported(
+            cond,
+            preceding_bindings,
+            locals,
+            inputs,
+            self_field_projections,
+        ) && msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))));
     }
     if let StmtKind::Assign { lhs, rhs } = stmt.kind {
         // `place = e` (§6.13.1): a plain path to a preceding local; field,
@@ -9868,7 +9896,13 @@ fn primitive_if_tail_shape_is_supported(
     else {
         return false;
     };
-    if !primitive_if_condition_shape_is_supported(cond, preceding_bindings, locals, inputs) {
+    if !primitive_if_condition_shape_is_supported(
+        cond,
+        preceding_bindings,
+        locals,
+        inputs,
+        self_field_projections,
+    ) {
         return false;
     }
     if !primitive_if_branch_shape_is_supported(
@@ -9919,14 +9953,23 @@ fn primitive_if_condition_shape_is_supported(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     match condition.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        // A known self field reads its declared type in condition
+        // position — `if self.flag` — like the operand-position leaf.
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&condition.hir_id))
+        }
         ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
             ExprKind::Path(operand_path) => {
                 resolved_plain_local_path_binding(operand_path, locals, inputs)
                     .is_some_and(|binding| preceding_bindings.contains(&binding))
+            }
+            ExprKind::Field { .. } => {
+                self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
             }
             // `not` operands recurse shallowly — the checker runs the shared
             // logical-operand machinery, so `not not`, `not true`, and nested
@@ -10247,7 +10290,13 @@ fn primitive_match_tail_shape_is_supported(
         // binds one, and the enclosing bindings otherwise.
         if let Some(guard) = arm.guard {
             let bindings = arm_bindings.as_ref().unwrap_or(preceding_bindings);
-            if !primitive_if_condition_shape_is_supported(guard, bindings, locals, inputs) {
+            if !primitive_if_condition_shape_is_supported(
+                guard,
+                bindings,
+                locals,
+                inputs,
+                self_field_projections,
+            ) {
                 return false;
             }
         }
@@ -10527,7 +10576,13 @@ fn primitive_if_stmt_shape_is_supported(
     let ExprKind::If { cond, then, els } = expression.kind else {
         return false;
     };
-    if !primitive_if_condition_shape_is_supported(cond, preceding_bindings, locals, inputs) {
+    if !primitive_if_condition_shape_is_supported(
+        cond,
+        preceding_bindings,
+        locals,
+        inputs,
+        self_field_projections,
+    ) {
         return false;
     }
     if !primitive_stmt_block_shape_is_supported(
@@ -10653,7 +10708,13 @@ fn primitive_match_stmt_shape_is_supported(
             }
             if let Some(guard) = arm.guard {
                 let bindings = arm_bindings.as_ref().unwrap_or(preceding_bindings);
-                if !primitive_if_condition_shape_is_supported(guard, bindings, locals, inputs) {
+                if !primitive_if_condition_shape_is_supported(
+                    guard,
+                    bindings,
+                    locals,
+                    inputs,
+                    self_field_projections,
+                ) {
                     return false;
                 }
             }
@@ -90023,6 +90084,138 @@ property "shared"() {}
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
                 "member {index} exceeds the operand slice and stays gated: {check:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_unary_over_self_fields() {
+        let root = concat!(
+            "type Counter { count: I32, limit: I32, flag: Bool }\n",
+            "impl Counter {\n",
+            "  pub fn neg_field_init(self: borrow Self) -> I32 {\n",
+            "    let x = -self.count\n",
+            "    x\n",
+            "  }\n",
+            "  pub fn bitnot_field_init(self: borrow Self) -> I32 {\n",
+            "    let x = ~self.count\n",
+            "    x\n",
+            "  }\n",
+            "  pub fn not_field_init(self: borrow Self) -> Bool {\n",
+            "    let x = not self.flag\n",
+            "    x\n",
+            "  }\n",
+            "  pub fn neg_field_operand(self: borrow Self) -> I32 {\n",
+            "    let x = 1 + -self.count\n",
+            "    x\n",
+            "  }\n",
+            "  pub fn not_field_condition(self: borrow Self) -> Bool {\n",
+            "    if not self.flag {\n",
+            "      true\n",
+            "    } else {\n",
+            "      false\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn bare_field_condition(self: borrow Self) -> Bool {\n",
+            "    if self.flag {\n",
+            "      true\n",
+            "    } else {\n",
+            "      false\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn non_bool_field_condition(self: borrow Self) -> Bool {\n",
+            "    if self.count {\n",
+            "      true\n",
+            "    } else {\n",
+            "      false\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn neg_bool_field(self: borrow Self) -> Bool {\n",
+            "    let x = -self.flag\n",
+            "    x\n",
+            "  }\n",
+            "  pub fn neg_unknown_field_init(self: borrow Self) -> I32 {\n",
+            "    let x = -self.missing\n",
+            "    x\n",
+            "  }\n",
+            "  pub fn bitnot_unknown_field_operand(self: borrow Self) -> I32 {\n",
+            "    let x = 1 + ~self.missing\n",
+            "    x\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("unary-over-field methods collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let members = results.owners()[0].members();
+        assert_eq!(members.len(), 10);
+
+        // `-self.f`/`~self.f`/`not self.f` desugar to a `let t = self.f`
+        // binding, so initializers, nested operands, and field conditions
+        // check cleanly like their path counterparts.
+        for index in [0, 1, 2, 3, 4, 5] {
+            let check = members[index]
+                .body_type_check()
+                .expect("unary-over-field body check has an independent result");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "member {index} should be checked cleanly: {check:#?}"
+            );
+            let type_results = members[index]
+                .primitive_body_type_results()
+                .expect("unary-over-field projection succeeds")
+                .expect("unary-over-field body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, type_results);
+        }
+
+        // `if self.count` reports the `Bool` requirement like `if count`.
+        let check = members[6]
+            .body_type_check()
+            .expect("non-Bool field condition check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a non-Bool field condition should be checked: {check:#?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch),
+            "a non-Bool field condition reports the Bool requirement: {diagnostics:#?}"
+        );
+
+        // `-self.flag` reports the missing `Neg` implementation like
+        // `-flag` does — diagnostic, not a gate.
+        let check = members[7]
+            .body_type_check()
+            .expect("negated Bool field check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a negated Bool field should be checked: {check:#?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::OperatorNotSupported),
+            "a negated Bool field reports the operator error: {diagnostics:#?}"
+        );
+
+        // Unary operators over UNKNOWN self fields stay outside the
+        // tainted slice — `-self.missing`/`~self.missing` keep the gate.
+        for index in [8, 9] {
+            let check = members[index]
+                .body_type_check()
+                .expect("unary-over-unknown-field check has an independent result");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "member {index} exceeds the unary slice and stays gated: {check:#?}"
             );
         }
     }
