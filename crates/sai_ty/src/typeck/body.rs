@@ -598,10 +598,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // A nested `{ e }` block tail checks its own tail against the same
         // expected type — bindings stay scoped to the inner block. An
         // inner plain path tail (`{ { value } }`) resolves like a tail in
-        // statement position.
+        // statement position. Inner `let` statements are admitted too:
+        // they bind inside the block only (the resolver scopes them by
+        // HirId), so `{ { let x = 1 x } }` checks like a flat body.
         let is_supported_block_tail = matches!(
             tail.kind,
-            ExprKind::Block(inner) if inner.safety == Safety::Safe && inner.stmts.is_empty()
+            ExprKind::Block(inner)
+                if inner.safety == Safety::Safe
+                    && inner
+                        .stmts
+                        .iter()
+                        .all(|stmt| matches!(stmt.kind, StmtKind::Let { .. }))
         );
         let is_supported_path_tail = matches!(tail.kind, ExprKind::Path(_));
         if block.stmts.is_empty()
@@ -620,10 +627,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         }
         for stmt in block.stmts {
-            self.check_stmt(stmt)?;
+            if self.check_stmt(stmt).is_err() {
+                return Err(());
+            }
         }
 
-        self.check_expr_expected(tail, expected)?;
+        if self.check_expr_expected(tail, expected).is_err() {
+            return Err(());
+        }
         self.default_unresolved_literals(literal_floor);
         Ok(())
     }
