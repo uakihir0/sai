@@ -5026,18 +5026,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
                 // A known self field passes its declared type like a path
-                // argument; unknown fields take the tainted path before
-                // the call check.
+                // argument; an unknown field recovers through the tainted
+                // leaf path so the `UnknownField` diagnostic survives.
                 ExprKind::Field { .. } => {
-                    let Some(field_type) = self
+                    let local_type = if let Some(field_type) = self
                         .input
                         .self_field_projections
                         .and_then(|fields| fields.get(&argument.expr.hir_id))
                         .copied()
-                    else {
+                    {
+                        LocalType::Concrete(field_type)
+                    } else if self.expression_has_unknown_field_error(argument.expr) {
+                        self.check_error_tainted_expression(argument.expr)?;
+                        LocalType::Error(self.known_error_tainted_result_type(argument.expr))
+                    } else {
                         return Err(());
                     };
-                    let local_type = LocalType::Concrete(field_type);
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }

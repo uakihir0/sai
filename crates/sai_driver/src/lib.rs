@@ -8748,6 +8748,7 @@ fn check_function_body_primitive_local_block(
                     locals,
                     inputs,
                     self_field_projections,
+                    unknown_self_fields,
                     direct_call_signatures,
                 )
             })
@@ -8893,6 +8894,7 @@ fn is_supported_direct_call_argument_shape(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     match expression.kind {
@@ -8900,9 +8902,11 @@ fn is_supported_direct_call_argument_shape(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         // A known self field passes its declared type like a path
-        // argument; unknown fields keep the tainted boundary.
+        // argument; an unknown field recovers through the tainted leaf
+        // path so the `UnknownField` diagnostic survives.
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&expression.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&expression.hir_id))
         }
         ExprKind::Unary(UnOp::Not, _) => is_supported_direct_call_not_argument_shape(
             expression,
@@ -9048,6 +9052,7 @@ fn primitive_logical_init_operand_shape_is_supported(
             locals,
             inputs,
             self_field_projections,
+            unknown_self_fields,
             direct_call_signatures,
         ),
         ExprKind::Unary(UnOp::Not, inner) => primitive_logical_init_operand_shape_is_supported(
@@ -9207,6 +9212,7 @@ fn primitive_direct_call_operand_shape_is_supported(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     let ExprKind::Call {
@@ -9227,6 +9233,7 @@ fn primitive_direct_call_operand_shape_is_supported(
                         locals,
                         inputs,
                         self_field_projections,
+                        unknown_self_fields,
                         direct_call_signatures,
                     )
                 })
@@ -9260,6 +9267,7 @@ fn primitive_nested_operand_shape_is_supported(
             locals,
             inputs,
             self_field_projections,
+            unknown_self_fields,
             direct_call_signatures,
         ),
         // Unary operands desugar to the same `let t = <unary>` binding the
@@ -9422,6 +9430,7 @@ fn primitive_value_expression_shape_is_supported(
                             locals,
                             inputs,
                             self_field_projections,
+                            unknown_self_fields,
                             direct_call_signatures,
                         )
                     })
@@ -10147,6 +10156,7 @@ fn primitive_if_branch_tail_shape_is_supported(
                             locals,
                             inputs,
                             self_field_projections,
+                            unknown_self_fields,
                             direct_call_signatures,
                         )
                     })
@@ -90577,11 +90587,27 @@ property "shared"() {}
             "a byte shift count reports the count type mismatch: {diagnostics:#?}"
         );
 
-        // `bump(self.missing)` and `bump(self.missing + 1)` keep the tainted
-        // boundary — unknown fields in arguments cannot be typed for the
-        // parameter match. `bump(bump(bump(self.count)))` stays gated with
-        // the nested-call depth boundary.
-        for index in [10, 11, 13] {
+        // `bump(self.missing)` recovers through the tainted leaf path —
+        // the argument checks like a call argument but keeps the
+        // `UnknownField` diagnostic instead of gating the method.
+        let check = members[10]
+            .body_type_check()
+            .expect("unknown-field call argument check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("an unknown-field call argument recovers: {check:#?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
+            "an unknown-field call argument keeps the field error: {diagnostics:#?}"
+        );
+
+        // `bump(self.missing + 1)` keeps the tainted boundary — unknown
+        // fields inside argument trees stay gated.
+        // `bump(bump(bump(self.count)))` stays gated with the nested-call
+        // depth boundary.
+        for index in [11, 13] {
             let check = members[index]
                 .body_type_check()
                 .expect("out-of-slice call check has an independent result");
