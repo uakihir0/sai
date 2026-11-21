@@ -5628,8 +5628,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     // A clean operand already evaluated through
                     // `check_operand_local_type` produced its own
                     // diagnostics — walking it again would duplicate
-                    // each leaf error.
+                    // each leaf error. The operand-position `Bool`
+                    // requirement is not part of that evaluation, so it
+                    // is enforced here from the recorded result type.
                     if evaluated_clean_operands.contains(&operand.hir_id) {
+                        if let Some(operand_type) = self.known_recovery_operand_type(operand) {
+                            match primitive_bool_operand_result(operand_type) {
+                                PrimitiveBoolOperandResult::Bool => {}
+                                PrimitiveBoolOperandResult::TypeMismatch { found } => {
+                                    self.errors.push(PrimitiveBodyError {
+                                        node: operand.hir_id,
+                                        kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                            expected: PrimTy::Bool,
+                                            found,
+                                        },
+                                    });
+                                }
+                                PrimitiveBoolOperandResult::Unsupported => return Err(()),
+                            }
+                        }
                         continue;
                     }
                     self.check_error_tainted_logical_operand(operand)?;
@@ -5656,6 +5673,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             PrimitiveLiteralKind::Integer,
                             right.hir_id,
                         );
+                    } else if let Some(id) = self.unresolved_integer_literal_variable(right) {
+                        // An evaluated literal-variable count — `1 + 2`
+                        // — resolves to `U32` exactly like the primary
+                        // shift checker's count position.
+                        self.resolve_literal_variable(id, PrimTy::U32)?;
                     }
                 }
                 if let Some(right_type) = self.known_recovery_operand_type(right) {
@@ -5934,10 +5956,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     literal_kind(expression),
                     Some(PrimitiveLiteralKind::Byte | PrimitiveLiteralKind::Integer)
                 )
+                || self
+                    .unresolved_integer_literal_variable(expression)
+                    .is_some()
         };
         let clean_operand_is_shift_count = |expression: &Expr<'hir>| {
             primitive_path(expression).is_some()
                 || literal_kind(expression) == Some(PrimitiveLiteralKind::Integer)
+                || self
+                    .unresolved_integer_literal_variable(expression)
+                    .is_some()
         };
         let clean_operand_is_bitwise = |expression: &Expr<'hir>| {
             primitive_path(expression).is_some() || literal_kind(expression).is_some()
@@ -6146,6 +6174,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     // still produces `Bool` during recovery checking, mirroring the nested
     // operand forms the primary checker admits.
     fn error_tainted_clean_logical_operand(&self, operand: &Expr<'hir>) -> bool {
+        // A clean operand already evaluated through
+        // `check_operand_local_type` answers from its recorded result
+        // type — a comparison is `Bool` even when its leaves keep
+        // unresolved literal variables.
+        if let Some(operand_type) = self.known_recovery_operand_type(operand) {
+            return !matches!(
+                primitive_bool_operand_result(operand_type),
+                PrimitiveBoolOperandResult::Unsupported
+            );
+        }
         match operand.kind {
             ExprKind::Lit(Lit::Bool(_)) => true,
             ExprKind::Unary(UnOp::Not, inner) => self.error_tainted_clean_logical_operand(inner),
@@ -6237,6 +6275,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// The id of an unresolved integer literal variable recorded for an
+    /// evaluated operand — e.g. `1 + 2` in shift-count position.
+    fn unresolved_integer_literal_variable(&self, expression: &Expr<'hir>) -> Option<usize> {
+        let LocalType::LiteralVariable(id) = self
+            .expression_type_candidates
+            .borrow()
+            .get(&expression.hir_id)
+            .copied()?
+        else {
+            return None;
+        };
+        let variable = self.literal_variables.get(id)?;
+        if variable.kind == PrimitiveLiteralKind::Integer && variable.resolved.is_none() {
+            Some(id)
+        } else {
+            None
         }
     }
 
