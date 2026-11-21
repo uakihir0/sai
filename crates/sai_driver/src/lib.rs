@@ -9482,6 +9482,25 @@ fn primitive_nested_operand_shape_is_supported(
                 direct_call_signatures,
             )
         }
+        // A statement-free block operand contributes its tail — `1 + { 2 }`
+        // behaves as `1 + 2`. Statement-bearing block operands keep the
+        // statement-admission boundary of `primitive_let_statement_…`,
+        // which the operand predicate does not thread.
+        ExprKind::Block(inner) => {
+            inner.safety == sai_hir::Safety::Safe
+                && inner.stmts.is_empty()
+                && inner.tail.is_some_and(|tail| {
+                    primitive_nested_operand_shape_is_supported(
+                        tail,
+                        preceding_bindings,
+                        locals,
+                        inputs,
+                        self_field_projections,
+                        unknown_self_fields,
+                        direct_call_signatures,
+                    )
+                })
+        }
         _ => false,
     }
 }
@@ -90953,7 +90972,7 @@ property "shared"() {}
         // tails, and inner `let` statements all check cleanly. Branch
         // tails admit the same nesting.
         for index in [
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 22, 23,
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23,
         ] {
             let check = resolved.owners()[index]
                 .body_type_check()
@@ -90973,7 +90992,7 @@ property "shared"() {}
         // the unresolved-binding boundary and an `if` tail without
         // `else` stays gated with the if-tail boundary; supported inner
         // statements (let, expr, assert, assign) admit like flat bodies.
-        for index in [11, 15, 20, 21] {
+        for index in [11, 15, 21] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("gated nested-block-tail check has an independent result");

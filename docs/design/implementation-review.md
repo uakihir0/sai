@@ -9921,3 +9921,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, focused driver test passes; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** The recursive tail check propagates `deferred_neg_result`/`deferred_bitnot_result` so `let x = { -y }` keeps flat-initializer deferral provenance. Inner-block literals join the outer literal scope (transparent-initializer semantics, matching `if`/`match` joins) — `let x = { 1 }; take_u8(x)` resolves `x` to `U8`, deliberately mirroring `let x = if c { 1 } else { 2 }`.
 - **Remaining scope:** `{ e }` as a binary operand, `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1071 (2026-11-21): Statement-free block operands
+
+- **Decision:** A statement-free block is an operand — `1 + { 2 }`, `first * { second + third }` — with the tail admitted through the same nested-operand predicate.
+- **Reason:** `check_operand_local_type` already falls back to `check_initializer_value`, whose IR-1070 `Block` arm evaluates `{ ...; tail }` faithfully; the only gate was the driver's nested-operand mirror, which now admits `ExprKind::Block` when `stmts.is_empty()` and the tail itself admits.
+- **Failure boundary and judgment:** Statement-bearing block operands (`1 + { let y = 2\n  y }`) stay gated — admitting them means threading the statement predicate's extra inputs through the operand predicate, deferred to a later slice. Empty/unsafe blocks keep their gates.
+- **Review required:** None — checker semantics unchanged; the mirror composes reviewed predicates.
+- **Planned verification matrix:** Driver `function_body_type_check_nested_block_tails` — `let_block_operand` flips to supported-clean; `let_empty_block_init` stays gated.
+- **Verification:** Pinned Rust 1.99.1, focused driver test passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Verified the checker needed no parallel change — `check_operand_local_type`'s `check_initializer_value` fallback evaluates the inner statements (none here) and tail identically to a flat operand, including literal-variable joining for `1 + { 2 }`.
+- **Remaining scope:** Statement-bearing block operands, `Str` literal locals, tuple/index tails, `for`/`while let`/`if let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
