@@ -5014,6 +5014,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             let Some(expected) = signature.parameters.get(index) else {
                 continue;
             };
+            // Tainted argument trees (`bump(self.missing + 1)`) recover like
+            // the statement-position tainted path: the argument type is
+            // `Error`, the parameter unify no-ops, and the field error is
+            // kept instead of gating the method.
+            if self.expression_has_unknown_field_error(argument.expr) {
+                self.check_error_tainted_expression(argument.expr)?;
+                let local_type =
+                    LocalType::Error(self.known_error_tainted_result_type(argument.expr));
+                self.record_expression_type(argument.expr.hir_id, local_type);
+                self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                continue;
+            }
             match argument.expr.kind {
                 ExprKind::Lit(literal) => {
                     let Some(found) = primitive_literal_kind(literal) else {

@@ -8897,6 +8897,22 @@ fn is_supported_direct_call_argument_shape(
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
+    // A tainted argument tree (`bump(self.missing + 1)`,
+    // `bump(-self.missing)`) recovers like the statement-position tainted
+    // path: the checker keeps the field error and unifies `Error` against
+    // the parameter instead of gating the method.
+    if direct_call_argument_is_unknown_field_tainted(expression, unknown_self_fields)
+        && primitive_tainted_operand_shape_is_supported(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+            self_field_projections,
+            unknown_self_fields,
+        )
+    {
+        return true;
+    }
     match expression.kind {
         ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
@@ -9242,6 +9258,106 @@ fn primitive_direct_call_operand_shape_is_supported(
 
 // A nested binary operand — `(a + b) * c` — desugars to a `let t`
 // binding whose initializer the checker evaluates, so operand admission
+/// Mirrors `expression_has_unknown_field_error` for self-field taint:
+/// unary and binary roots carry the taint of their operands.
+fn direct_call_argument_is_unknown_field_tainted(
+    expression: &HirExpr<'_>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+) -> bool {
+    match expression.kind {
+        ExprKind::Field { .. } => {
+            unknown_self_fields.is_some_and(|fields| fields.contains(&expression.hir_id))
+        }
+        ExprKind::Unary(_, operand) => {
+            direct_call_argument_is_unknown_field_tainted(operand, unknown_self_fields)
+        }
+        ExprKind::Binary(_, left, right) => {
+            direct_call_argument_is_unknown_field_tainted(left, unknown_self_fields)
+                || direct_call_argument_is_unknown_field_tainted(right, unknown_self_fields)
+        }
+        _ => false,
+    }
+}
+
+/// The tainted-operand admission inside a call argument — the checker's
+/// `is_supported_error_tainted_operand` without the `Call` arm: calls
+/// inside tainted trees stay gated.
+fn primitive_tainted_operand_shape_is_supported(
+    operand: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+) -> bool {
+    match operand.kind {
+        ExprKind::Lit(_) => is_direct_function_scalar_literal(operand),
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+        }
+        ExprKind::Unary(UnOp::Not, inner) => primitive_logical_init_operand_shape_is_supported(
+            inner,
+            preceding_bindings,
+            locals,
+            inputs,
+            self_field_projections,
+            unknown_self_fields,
+            None,
+        ),
+        ExprKind::Unary(UnOp::Neg, inner) => match inner.kind {
+            ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding)),
+            ExprKind::Field { .. } => {
+                self_field_projections.is_some_and(|fields| fields.contains_key(&inner.hir_id))
+                    || unknown_self_fields.is_some_and(|fields| fields.contains(&inner.hir_id))
+            }
+            _ => false,
+        },
+        ExprKind::Unary(UnOp::BitNot, inner) => {
+            if is_direct_function_integer_literal(inner)
+                || matches!(inner.kind, ExprKind::Lit(Lit::Byte(_)))
+            {
+                true
+            } else {
+                match inner.kind {
+                    ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                        .is_some_and(|binding| preceding_bindings.contains(&binding)),
+                    ExprKind::Field { .. } => {
+                        self_field_projections
+                            .is_some_and(|fields| fields.contains_key(&inner.hir_id))
+                            || unknown_self_fields
+                                .is_some_and(|fields| fields.contains(&inner.hir_id))
+                    }
+                    _ => false,
+                }
+            }
+        }
+        ExprKind::Binary(operator, left, right)
+            if is_function_primitive_local_binary_operator(operator) =>
+        {
+            primitive_tainted_operand_shape_is_supported(
+                left,
+                preceding_bindings,
+                locals,
+                inputs,
+                self_field_projections,
+                unknown_self_fields,
+            ) && primitive_tainted_operand_shape_is_supported(
+                right,
+                preceding_bindings,
+                locals,
+                inputs,
+                self_field_projections,
+                unknown_self_fields,
+            )
+        }
+        _ => false,
+    }
+}
+
 // accepts any operand-shaped tree of supported primitive binary
 // operators, literal leaves, preceding paths, and unknown self fields.
 fn primitive_nested_operand_shape_is_supported(
@@ -90518,6 +90634,12 @@ property "shared"() {}
             "  pub fn call_shift_field_byte(self: borrow Self) -> I32 {\n",
             "    bump(self.count << b'0')\n",
             "  }\n",
+            "  pub fn call_neg_unknown_field(self: borrow Self) -> I32 {\n",
+            "    bump(-self.missing)\n",
+            "  }\n",
+            "  pub fn call_not_unknown_field(self: borrow Self) -> Bool {\n",
+            "    gate(not self.missing)\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -90534,7 +90656,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 18);
+        assert_eq!(members.len(), 20);
 
         // Field arguments desugar to `let t = self.f` bindings, so they
         // check like path arguments — bare fields in initializers, tails,
@@ -90603,11 +90725,28 @@ property "shared"() {}
             "an unknown-field call argument keeps the field error: {diagnostics:#?}"
         );
 
-        // `bump(self.missing + 1)` keeps the tainted boundary — unknown
-        // fields inside argument trees stay gated.
+        // Unknown fields inside argument trees recover the same way —
+        // `bump(self.missing + 1)`, `bump(-self.missing)`, and
+        // `gate(not self.missing)` keep the `UnknownField` diagnostic
+        // instead of gating.
+        for index in [11, 18, 19] {
+            let check = members[index]
+                .body_type_check()
+                .expect("tainted call argument check has an independent result");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("a tainted call argument recovers: {check:#?}");
+            };
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
+                "a tainted call argument keeps the field error: {diagnostics:#?}"
+            );
+        }
+
         // `bump(bump(bump(self.count)))` stays gated with the nested-call
         // depth boundary.
-        for index in [11, 13] {
+        for index in [13] {
             let check = members[index]
                 .body_type_check()
                 .expect("out-of-slice call check has an independent result");

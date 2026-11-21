@@ -9833,3 +9833,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver suite (779) passes; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Admitting `bump(self.missing)` widens the check result to a diagnostic — no soundness risk because `Error` locals never constrain the parameter. The mirror's `unknown_self_fields` admission is required for the checker to run at all; without it the member is `Unsupported` even though the diagnostic machinery is in place.
 - **Remaining scope:** Unknown-field leaves inside argument trees, unary over unknown-field tails, `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1063 (2026-11-21): Unknown self fields inside call-argument trees
+
+- **Decision:** Tainted argument trees — `bump(self.missing + 1)`, `bump(-self.missing)`, `gate(not self.missing)` — recover through the statement-position tainted path and report `UnknownField` instead of gating the method.
+- **Reason:** `check_error_tainted_expression` already recovers tainted binary/unary roots in statement position (IR-1055/1056/1058); the argument check now applies the same `expression_has_unknown_field_error` gate before dispatching on the argument kind, unifies `LocalType::Error` against the parameter (a no-op), and keeps the field diagnostic.
+- **Failure boundary and judgment:** Calls inside tainted trees stay gated (`bump(self.missing + f())`) — the tainted operand admission excludes `Call` just like `is_supported_error_tainted_operand`. Taint does not cross `Call` roots (`expression_has_unknown_field_error` recurses only through `Unary`/`Binary`), so a tainted inner argument of a nested call recovers through that call's own argument loop.
+- **Review required:** None — this is the argument-position application of the existing tainted recovery.
+- **Planned verification matrix:** Driver `inherent_method_body_type_check_call_over_self_fields` — `call_unknown_in_tree`, `call_neg_unknown_field`, `call_not_unknown_field` supported with `UnknownField`; `call_deep_nested_call` stays gated.
+- **Verification:** Pinned Rust 1.99.1, driver suite (779) passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** The driver mirror's tainted operand predicate excludes `Call` (like the checker) so over-admission is bounded; under-admission degrades to `Unsupported`, not a wrong type. `check_annotated_path` on `Error` is a no-op, so no spurious mismatch diagnostics.
+- **Remaining scope:** Unknown-field unary tails, `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
