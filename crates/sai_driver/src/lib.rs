@@ -8586,9 +8586,12 @@ fn check_function_body_primitive_local_block(
                     &block_bindings,
                     locals,
                     inputs,
+                    symbols,
+                    type_paths,
                     self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
+                    &mut primitive_types,
                 )
             })
         }
@@ -10282,9 +10285,12 @@ fn primitive_nested_block_tail_shape_is_supported(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     match tail.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
@@ -10338,12 +10344,78 @@ fn primitive_nested_block_tail_shape_is_supported(
                     preceding_bindings,
                     locals,
                     inputs,
+                    symbols,
+                    type_paths,
                     self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
+                    primitive_types,
                 )
             })
         }
+        // Composite tails inside a nested block reuse the same admission
+        // predicates the top-level tail gate applies — the inner block is
+        // statement-free, so the surrounding bindings are unchanged.
+        ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
+            tail,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source,
+        } => primitive_match_tail_shape_is_supported(
+            scrutinee,
+            arms,
+            source,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+        ExprKind::Loop {
+            body,
+            source: LoopSource::Loop,
+            ..
+        } => primitive_loop_body_shape_is_supported(
+            body,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+        ExprKind::Return(value) => value.is_none_or(|value| {
+            primitive_value_expression_shape_is_supported(
+                value,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            )
+        }),
         _ => false,
     }
 }
@@ -10413,9 +10485,12 @@ fn primitive_if_branch_tail_shape_is_supported(
                     preceding_bindings,
                     locals,
                     inputs,
+                    symbols,
+                    type_paths,
                     self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
+                    primitive_types,
                 )
             })
         }
@@ -90761,6 +90836,10 @@ property "shared"() {}
             "pub fn nested_if_tail(value: I32) -> Bool { { if value < 1 { true } else { false } } }\n",
             "pub fn stmt_inner_block_tail() -> I32 { { let x = 1 x } }\n",
             "pub fn nested_unknown_path_tail() -> I32 { { missing } }\n",
+            "pub fn nested_match_tail(value: I32) -> I32 { { match value { 0 => 0, _ => 1 } } }\n",
+            "pub fn nested_loop_tail() -> I32 { { loop { break 1 } } }\n",
+            "pub fn nested_return_tail() -> I32 { { return 1 } }\n",
+            "pub fn nested_missing_else(value: I32) -> I32 { { if value < 1 { 1 } } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -90777,10 +90856,10 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         // A nested `{ e }` tail rechecks `e` against the expected type —
-        // literals, operator tails over outer bindings, unary tails and
-        // deeper nesting all check cleanly. Branch tails admit the same
-        // nesting.
-        for index in [0, 1, 2, 3, 4, 5, 6] {
+        // literals, paths, operator tails over outer bindings, unary
+        // tails, deeper nesting, and composite `if`/`match`/`loop`/`return`
+        // tails all check cleanly. Branch tails admit the same nesting.
+        for index in [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("nested-block-tail body check has an independent result");
@@ -90795,12 +90874,11 @@ property "shared"() {}
             assert_primitive_type_result_parity(&database, type_results);
         }
 
-        // Boundaries: `if`/`match`/`loop`/`return` tails inside nested
-        // blocks stay gated with their own admission boundary, an inner
-        // block carrying statements stays gated with the
-        // statement-admission boundary, and an unresolvable inner path
-        // tail stays gated with the unresolved-binding boundary.
-        for index in [7, 8, 9] {
+        // Boundaries: an inner block carrying statements stays gated with
+        // the statement-admission boundary, an unresolvable inner path
+        // tail stays gated with the unresolved-binding boundary, and an
+        // `if` tail without `else` stays gated with the if-tail boundary.
+        for index in [8, 9, 13] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("gated nested-block-tail check has an independent result");
