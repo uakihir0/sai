@@ -595,20 +595,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 ..
             }
         );
-        // A nested `{ e }` block tail checks its own tail against the same
-        // expected type — bindings stay scoped to the inner block. An
-        // inner plain path tail (`{ { value } }`) resolves like a tail in
-        // statement position. Inner `let` statements are admitted too:
-        // they bind inside the block only (the resolver scopes them by
-        // HirId), so `{ { let x = 1 x } }` checks like a flat body.
+        // A nested `{ ...; e }` block tail checks its own statements and
+        // tail against the same expected type — bindings stay scoped to
+        // the inner block. Statement admission is enforced by check_stmt
+        // itself, so the flag only excludes non-safe inner blocks.
         let is_supported_block_tail = matches!(
             tail.kind,
-            ExprKind::Block(inner)
-                if inner.safety == Safety::Safe
-                    && inner
-                        .stmts
-                        .iter()
-                        .all(|stmt| matches!(stmt.kind, StmtKind::Let { .. }))
+            ExprKind::Block(inner) if inner.safety == Safety::Safe
         );
         let is_supported_path_tail = matches!(tail.kind, ExprKind::Path(_));
         if block.stmts.is_empty()
@@ -7399,6 +7392,21 @@ fn block_has_primitive_result_taint(
                     tainted_bindings,
                 )
             })
+        }
+        StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+            expression_has_primitive_result_taint(
+                lhs,
+                error_nodes,
+                unknown_self_fields,
+                local_paths,
+                tainted_bindings,
+            ) || expression_has_primitive_result_taint(
+                rhs,
+                error_nodes,
+                unknown_self_fields,
+                local_paths,
+                tainted_bindings,
+            )
         }
         _ => false,
     }) || block.tail.is_some_and(|tail| {

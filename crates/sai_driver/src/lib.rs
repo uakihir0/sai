@@ -10274,9 +10274,10 @@ fn primitive_if_branch_shape_is_supported(
 /// deferred to the outer function-tail handling and the checker's empty-block
 /// gate rejects them) and composite `if`/`match`/`loop`/`return` tails, which
 /// stay gated with their own admission boundaries.
-// A nested `{ e }` / `{ let s = .. e }` block admits statements only as
-// `let`s for now: their bindings join the set the inner tail may name but
-// are scoped — they never escape into the caller's preceding_bindings.
+// A nested `{ ...; e }` block admits statements through the same
+// per-statement predicate as the outer body: `let` bindings join the set
+// the inner tail may name but are scoped — they never escape into the
+// caller's preceding_bindings.
 fn primitive_inner_block_shape_is_supported(
     inner: &sai_hir::expressions::Block<'_>,
     base_bindings: &HashSet<sai_hir::BindingId>,
@@ -10294,9 +10295,6 @@ fn primitive_inner_block_shape_is_supported(
     }
     let mut inner_bindings = base_bindings.clone();
     for stmt in inner.stmts {
-        if !matches!(stmt.kind, StmtKind::Let { .. }) {
-            return false;
-        }
         if !primitive_let_statement_shape_is_supported(
             stmt,
             &mut inner_bindings,
@@ -90888,6 +90886,9 @@ property "shared"() {}
             "pub fn inner_expr_stmt_tail() -> I32 {\n",
             "    { let x = 1\n        x + 1\n        x }\n",
             "}\n",
+            "pub fn inner_assert_stmt_tail() -> I32 {\n",
+            "    { let x = 1\n        assert x > 0\n        x }\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -90908,7 +90909,7 @@ property "shared"() {}
         // tails, deeper nesting, composite `if`/`match`/`loop`/`return`
         // tails, and inner `let` statements all check cleanly. Branch
         // tails admit the same nesting.
-        for index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14] {
+        for index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("nested-block-tail body check has an independent result");
@@ -90924,11 +90925,10 @@ property "shared"() {}
         }
 
         // Boundaries: an unresolvable inner path tail stays gated with
-        // the unresolved-binding boundary, an `if` tail without `else`
-        // stays gated with the if-tail boundary, and an inner block
-        // carrying a non-`let` statement stays gated with the
-        // statement-admission boundary.
-        for index in [11, 15, 16] {
+        // the unresolved-binding boundary and an `if` tail without
+        // `else` stays gated with the if-tail boundary; supported inner
+        // statements (let, expr, assert, assign) admit like flat bodies.
+        for index in [11, 15] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("gated nested-block-tail check has an independent result");
