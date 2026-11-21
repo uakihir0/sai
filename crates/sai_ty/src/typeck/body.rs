@@ -5586,6 +5586,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         {
             return Err(());
         }
+        // Evaluate clean non-leaf operands through the desugared `let t =
+        // e` path so the shape and diagnostic phases can type them — the
+        // result lands in `expression_type_candidates`, which
+        // `known_recovery_operand_type` consults. A clean operand the
+        // primary checker cannot type gates the whole expression just as
+        // it would untainted. Evaluated operands are remembered so the
+        // diagnostic walkers below skip them: their leaf errors were
+        // already emitted by the real checkers.
+        let mut evaluated_clean_operands = HashSet::new();
+        for operand in [left, right] {
+            if !self.expression_has_unknown_field_error(operand)
+                && !matches!(
+                    operand.kind,
+                    ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Field { .. }
+                )
+                && self.is_supported_error_tainted_operand(operand)
+            {
+                if self.check_operand_local_type(operand).is_err() {
+                    return Err(());
+                }
+                evaluated_clean_operands.insert(operand.hir_id);
+            }
+        }
         if !self.is_supported_error_tainted_binary_shape(
             operator,
             left,
@@ -5602,6 +5625,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match operator {
             BinOp::And | BinOp::Or => {
                 for operand in [left, right] {
+                    // A clean operand already evaluated through
+                    // `check_operand_local_type` produced its own
+                    // diagnostics — walking it again would duplicate
+                    // each leaf error.
+                    if evaluated_clean_operands.contains(&operand.hir_id) {
+                        continue;
+                    }
                     self.check_error_tainted_logical_operand(operand)?;
                 }
             }
@@ -6225,7 +6255,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .self_field_projections
                 .and_then(|fields| fields.get(&expression.hir_id))
                 .copied(),
-            _ => None,
+            _ => self
+                .expression_type_candidates
+                .borrow()
+                .get(&expression.hir_id)
+                .copied()
+                .and_then(|local_type| self.concrete_local_type(local_type)),
         }
     }
 

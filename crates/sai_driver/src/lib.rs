@@ -89935,7 +89935,7 @@ property "shared"() {}
         // inside a nested binary, comparison, logical leaf, or unary
         // operand — keep the unknown-field diagnostic and the Error-type
         // recovery instead of gating.
-        for index in [4, 5, 6, 7, 8] {
+        for index in [4, 5, 6, 7, 8, 10] {
             let check = members[index]
                 .body_type_check()
                 .expect("tainted-operand body check has an independent result");
@@ -89957,11 +89957,12 @@ property "shared"() {}
             assert_primitive_type_result_parity(&database, type_results);
         }
 
-        // Call arguments keep the direct-call argument boundary —
-        // `ident(self.count)` is not a supported argument shape. A clean
-        // nested operand tree next to the tainted one also stays gated:
-        // recovery does not evaluate clean nested operand types.
-        for index in [9, 10] {
+        // Member 10's clean nested operand `self.count * 2` is typed
+        // through the desugared `let t = e` evaluation inside recovery,
+        // so it joins the supported group; call arguments keep the
+        // direct-call argument boundary — `ident(self.count)` is not a
+        // supported argument shape.
+        for index in [9] {
             let check = members[index]
                 .body_type_check()
                 .expect("boundary member body check has an independent result");
