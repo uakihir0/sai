@@ -5012,6 +5012,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let local_type = self.check_local_path(argument.expr)?;
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
+                // A known self field passes its declared type like a path
+                // argument; unknown fields take the tainted path before
+                // the call check.
+                ExprKind::Field { .. } => {
+                    let Some(field_type) = self
+                        .input
+                        .self_field_projections
+                        .and_then(|fields| fields.get(&argument.expr.hir_id))
+                        .copied()
+                    else {
+                        return Err(());
+                    };
+                    let local_type = LocalType::Concrete(field_type);
+                    self.record_expression_type(argument.expr.hir_id, local_type);
+                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
                 ExprKind::Call { .. } if !nested => {
                     let local_type = self.check_direct_call(argument.expr, true)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
