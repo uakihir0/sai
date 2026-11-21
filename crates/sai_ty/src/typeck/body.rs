@@ -5874,15 +5874,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             matches!(expression.kind, ExprKind::Path(_))
                 && self.check_local_path(expression).is_ok()
         };
-        let is_unknown_self_field = |expression: &Expr<'hir>| {
+        let is_self_field = |expression: &Expr<'hir>| {
             matches!(expression.kind, ExprKind::Field { .. })
-                && self
+                && (self
                     .input
-                    .unknown_self_fields
-                    .is_some_and(|fields| fields.contains(&expression.hir_id))
+                    .self_field_projections
+                    .is_some_and(|fields| fields.contains_key(&expression.hir_id))
+                    || self
+                        .input
+                        .unknown_self_fields
+                        .is_some_and(|fields| fields.contains(&expression.hir_id)))
         };
         let is_path_or_unknown_field =
-            |expression: &Expr<'hir>| is_path(expression) || is_unknown_self_field(expression);
+            |expression: &Expr<'hir>| is_path(expression) || is_self_field(expression);
         let is_literal = |expression: &Expr<'hir>| {
             matches!(
                 expression.kind,
@@ -5891,9 +5895,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
         let is_path_or_literal =
             |expression: &Expr<'hir>| is_path(expression) || is_literal(expression);
-        let is_path_literal_or_unknown_field = |expression: &Expr<'hir>| {
-            is_path_or_literal(expression) || is_unknown_self_field(expression)
-        };
+        let is_path_literal_or_unknown_field =
+            |expression: &Expr<'hir>| is_path_or_literal(expression) || is_self_field(expression);
         let primitive_path = |expression: &Expr<'hir>| self.known_recovery_operand_type(expression);
         let literal_kind = |expression: &Expr<'hir>| match expression.kind {
             ExprKind::Lit(literal) => primitive_literal_kind(literal),
