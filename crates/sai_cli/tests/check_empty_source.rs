@@ -4296,34 +4296,45 @@ fn unary_operators_over_known_self_fields_emit_check_results() {
 }
 
 #[test]
-fn unary_operators_over_unknown_self_fields_remain_gated() {
-    for source in [
-        concat!(
-            "type Counter { count: I32 }\n",
-            "impl Counter {\n",
-            "    pub fn negate(self: borrow Self) -> I32 {\n",
-            "        let x = -self.missing\n",
-            "        x\n",
-            "    }\n",
-            "}\n",
+fn unary_operators_over_unknown_self_fields_recover_through_field_errors() {
+    for (source, expected_unknown_fields) in [
+        (
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn negate(self: borrow Self) -> I32 {\n",
+                "        let x = -self.missing\n",
+                "        x\n",
+                "    }\n",
+                "}\n",
+            ),
+            1,
         ),
-        concat!(
-            "type Counter { count: I32 }\n",
-            "impl Counter {\n",
-            "    pub fn invert(self: borrow Self) -> I32 {\n",
-            "        let x = ~self.missing\n",
-            "        x\n",
-            "        let x = 1 + ~self.missing\n",
-            "        x\n",
-            "    }\n",
-            "}\n",
+        (
+            concat!(
+                "type Counter { count: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn invert(self: borrow Self) -> I32 {\n",
+                "        let x = ~self.missing\n",
+                "        let y = 1 + ~self.missing\n",
+                "        y\n",
+                "    }\n",
+                "}\n",
+            ),
+            2,
         ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            expected_unknown_fields,
+            "unary operators over unknown self fields keep the field diagnostic: {stdout}"
+        );
         assert!(
-            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
-            "unary operators over unknown self fields stay gated: {stdout}"
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "unary operators over unknown self fields leave the gate: {stdout}"
         );
     }
 }

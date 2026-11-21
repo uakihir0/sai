@@ -9243,11 +9243,12 @@ fn primitive_nested_operand_shape_is_supported(
         ExprKind::Unary(UnOp::Neg, inner) => match inner.kind {
             ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
                 .is_some_and(|binding| preceding_bindings.contains(&binding)),
-            // A known self field desugars to `let t = self.f` — its
-            // declared type feeds the operator check directly. Unknown
-            // fields keep the tainted boundary.
+            // A self field desugars to `let t = self.f` — a known field's
+            // declared type feeds the operator check, while an unknown
+            // field recovers through the field-error diagnostic.
             ExprKind::Field { .. } => {
                 self_field_projections.is_some_and(|fields| fields.contains_key(&inner.hir_id))
+                    || unknown_self_fields.is_some_and(|fields| fields.contains(&inner.hir_id))
             }
             _ => false,
         },
@@ -9260,8 +9261,12 @@ fn primitive_nested_operand_shape_is_supported(
                 match inner.kind {
                     ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
                         .is_some_and(|binding| preceding_bindings.contains(&binding)),
-                    ExprKind::Field { .. } => self_field_projections
-                        .is_some_and(|fields| fields.contains_key(&inner.hir_id)),
+                    ExprKind::Field { .. } => {
+                        self_field_projections
+                            .is_some_and(|fields| fields.contains_key(&inner.hir_id))
+                            || unknown_self_fields
+                                .is_some_and(|fields| fields.contains(&inner.hir_id))
+                    }
                     _ => false,
                 }
             }
@@ -9422,6 +9427,7 @@ fn primitive_value_expression_shape_is_supported(
             ExprKind::Field { .. } => {
                 if !self_field_projections
                     .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                    && !unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
                 {
                     return false;
                 }
@@ -9446,6 +9452,8 @@ fn primitive_value_expression_shape_is_supported(
                     ExprKind::Field { .. } => {
                         if !self_field_projections
                             .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                            && !unknown_self_fields
+                                .is_some_and(|fields| fields.contains(&operand.hir_id))
                         {
                             return false;
                         }
@@ -90142,6 +90150,11 @@ property "shared"() {}
             "    let x = 1 + ~self.missing\n",
             "    x\n",
             "  }\n",
+            "  pub fn neg_bound_unknown_field_init(self: borrow Self) -> Bool {\n",
+            "    let n: I32 = self.missing\n",
+            "    let x: Bool = -n\n",
+            "    x\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -90158,7 +90171,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 10);
+        assert_eq!(members.len(), 11);
 
         // `-self.f`/`~self.f`/`not self.f` desugar to a `let t = self.f`
         // binding, so initializers, nested operands, and field conditions
@@ -90207,15 +90220,40 @@ property "shared"() {}
             "a negated Bool field reports the operator error: {diagnostics:#?}"
         );
 
-        // Unary operators over UNKNOWN self fields stay outside the
-        // tainted slice — `-self.missing`/`~self.missing` keep the gate.
+        // Unary operators over UNKNOWN self fields recover through the
+        // field-error diagnostic — `let x = -self.missing` and `1 +
+        // ~self.missing` keep the member checkable with `UnknownField`.
         for index in [8, 9] {
             let check = members[index]
                 .body_type_check()
                 .expect("unary-over-unknown-field check has an independent result");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("member {index} recovers through the field error: {check:#?}");
+            };
             assert!(
-                matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "member {index} exceeds the unary slice and stays gated: {check:#?}"
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
+                "member {index} keeps the unknown-field diagnostic: {diagnostics:#?}"
+            );
+        }
+
+        // `let n: I32 = self.missing` binds `n` as `Error(I32)`, so
+        // `let x: Bool = -n` recovers the operand type and still reports
+        // the `Bool`/`I32` annotation mismatch alongside the field error.
+        let check = members[10]
+            .body_type_check()
+            .expect("negated error-bound local check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a negated error-bound local recovers: {check:#?}");
+        };
+        for code in [
+            sai_diagnostics::Code::UnknownField,
+            sai_diagnostics::Code::TypeMismatch,
+        ] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+                "member 10 keeps {code:?} alongside the field error: {diagnostics:#?}"
             );
         }
     }
