@@ -9932,3 +9932,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, focused driver test passes; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Verified the checker needed no parallel change — `check_operand_local_type`'s `check_initializer_value` fallback evaluates the inner statements (none here) and tail identically to a flat operand, including literal-variable joining for `1 + { 2 }`.
 - **Remaining scope:** Statement-bearing block operands, `Str` literal locals, tuple/index tails, `for`/`while let`/`if let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1072 (2026-11-21): Statement-bearing block operands
+
+- **Decision:** Widens IR-1071: a block operand may carry statements — `1 + { let y = 2\n  y }` — admitted through `primitive_inner_block_shape_is_supported` instead of the statement-free tail check.
+- **Reason:** The operand predicate now threads `symbols`, `type_paths`, and `primitive_types` through the nested-operand, logical-init-operand, tainted-operand, and direct-call-argument predicates, matching the parameter list the statement predicate already needs. The checker needed no change: `check_operand_local_type` reaches `check_initializer_value`, whose `Block` arm checks inner statements and the tail.
+- **Failure boundary and judgment:** `{ cond }` under `and`/`or` (`a and { cond }`) stays gated — logical-init operands route comparisons through the nested predicate but `and`/`or` leaves themselves keep the leaf boundary. Empty and unsafe block operands keep their gates.
+- **Review required:** None — signature threading plus delegation to the reviewed inner-block predicate.
+- **Planned verification matrix:** Driver `function_body_type_check_nested_block_tails` — new `let_stmt_block_operand` (`1 + { let y = 2\n  y }`) supported-clean; `let_empty_block_init` stays gated.
+- **Verification:** Pinned Rust 1.99.1, focused driver test passes; full driver suite green; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Two closures that call the nested/logical predicates became `mut` (they now borrow `primitive_types` mutably) — mechanical fallout, no semantic change. The tainted-operand predicate passes `None` for call signatures as before.
+- **Remaining scope:** `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
