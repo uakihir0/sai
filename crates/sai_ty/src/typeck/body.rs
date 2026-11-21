@@ -596,11 +596,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         );
         // A nested `{ e }` block tail checks its own tail against the same
-        // expected type — bindings stay scoped to the inner block.
+        // expected type — bindings stay scoped to the inner block. An
+        // inner plain path tail (`{ { value } }`) resolves like a tail in
+        // statement position.
         let is_supported_block_tail = matches!(
             tail.kind,
             ExprKind::Block(inner) if inner.safety == Safety::Safe && inner.stmts.is_empty()
         );
+        let is_supported_path_tail = matches!(tail.kind, ExprKind::Path(_));
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
@@ -612,6 +615,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             && !is_supported_return_tail
             && !is_supported_loop_tail
             && !is_supported_block_tail
+            && !is_supported_path_tail
         {
             return Err(());
         }

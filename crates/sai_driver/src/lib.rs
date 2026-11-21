@@ -10287,6 +10287,8 @@ fn primitive_nested_block_tail_shape_is_supported(
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     match tail.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(_) | ExprKind::Binary(..) => true,
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id))
@@ -78564,6 +78566,17 @@ property "shared"() {}
 
         assert_eq!(resolved.owners().len(), 14);
         for (index, owner) in resolved.owners().iter().enumerate() {
+            if index == 5 {
+                // `{ value }` is a statement-free nested block tail whose
+                // inner path tail resolves the annotated `value` binding.
+                assert!(matches!(
+                    owner
+                        .body_type_check()
+                        .expect("nested-block tail is checked"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ));
+                continue;
+            }
             if index == 9 {
                 // `source % (1 + 0)` resolves the literal-literal nested
                 // operand through the operand probe and gives `copy` I32.
@@ -90741,8 +90754,13 @@ property "shared"() {}
             "    }\n",
             "}\n",
             "pub fn nested_path_tail(value: I32) -> I32 { { value } }\n",
+            "pub fn nested_let_path_tail() -> I32 {\n",
+            "    let x = 1\n",
+            "    { { x } }\n",
+            "}\n",
             "pub fn nested_if_tail(value: I32) -> Bool { { if value < 1 { true } else { false } } }\n",
             "pub fn stmt_inner_block_tail() -> I32 { { let x = 1 x } }\n",
+            "pub fn nested_unknown_path_tail() -> I32 { { missing } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -90762,7 +90780,7 @@ property "shared"() {}
         // literals, operator tails over outer bindings, unary tails and
         // deeper nesting all check cleanly. Branch tails admit the same
         // nesting.
-        for index in [0, 1, 2, 3, 4] {
+        for index in [0, 1, 2, 3, 4, 5, 6] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("nested-block-tail body check has an independent result");
@@ -90777,13 +90795,12 @@ property "shared"() {}
             assert_primitive_type_result_parity(&database, type_results);
         }
 
-        // Boundaries: an inner `{ value }` path tail is outside the
-        // primitive checker's tail set (plain path tails live in the
-        // function-tail slice), `if`/`match`/`loop`/`return` tails inside
-        // nested blocks stay gated with their own admission boundary, and
-        // an inner block carrying statements stays gated with the
-        // statement-admission boundary.
-        for index in [5, 6, 7] {
+        // Boundaries: `if`/`match`/`loop`/`return` tails inside nested
+        // blocks stay gated with their own admission boundary, an inner
+        // block carrying statements stays gated with the
+        // statement-admission boundary, and an unresolvable inner path
+        // tail stays gated with the unresolved-binding boundary.
+        for index in [7, 8, 9] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("gated nested-block-tail check has an independent result");
