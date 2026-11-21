@@ -89904,6 +89904,10 @@ property "shared"() {}
             "    let total = self.missing << (1 + 2)\n",
             "    total\n",
             "  }\n",
+            "  pub fn annotated_tainted_literal_range(self: borrow Self) -> U8 {\n",
+            "    let total: U8 = (256 + 1) << self.missing\n",
+            "    total\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -89920,7 +89924,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 13);
+        assert_eq!(members.len(), 14);
 
         // Known self fields in operand position desugar to `let t = self.f`
         // bindings, so pairs, nested operands, tails, and logical
@@ -89965,6 +89969,23 @@ property "shared"() {}
                 .expect("tainted-operand body publishes primitive facts");
             assert_primitive_type_result_parity(&database, type_results);
         }
+
+        // Member 13 propagates the `U8` annotation into the evaluated
+        // literal-variable operand: `256` is out of range and reports on
+        // top of the unknown-field diagnostic.
+        let check = members[13]
+            .body_type_check()
+            .expect("annotated tainted literal body check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("an annotated tainted literal operand should be checked: {check:#?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField)
+                && diagnostics.len() > 1,
+            "the annotation reaches the literal operand and reports its range: {diagnostics:#?}"
+        );
 
         // Member 10's clean nested operand `self.count * 2` is typed
         // through the desugared `let t = e` evaluation inside recovery,

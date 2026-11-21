@@ -4144,6 +4144,38 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     LocalType::ErrorLiteralVariable(id)
                 }
             } else {
+                // A literal variable produced for a clean operand tree —
+                // `(256 + 1) << self.missing` — resolves through the
+                // annotation exactly like the primary checker resolves
+                // the desugared operand's variable, so out-of-range
+                // literals still report instead of hiding behind the
+                // field error.
+                if let (Some(expected), ExprKind::Binary(operator, left, _)) =
+                    (annotation, init.kind)
+                {
+                    if matches!(
+                        operator,
+                        BinOp::Add
+                            | BinOp::Sub
+                            | BinOp::Mul
+                            | BinOp::Div
+                            | BinOp::Rem
+                            | BinOp::WrapAdd
+                            | BinOp::WrapSub
+                            | BinOp::WrapMul
+                            | BinOp::BitAnd
+                            | BinOp::BitOr
+                            | BinOp::BitXor
+                            | BinOp::Shl
+                            | BinOp::Shr
+                    ) && (is_integer_primitive(expected) || expected == PrimTy::Byte)
+                        && !self.expression_has_unknown_field_error(left)
+                    {
+                        if let Some(id) = self.unresolved_integer_literal_variable(left) {
+                            self.resolve_literal_variable(id, expected)?;
+                        }
+                    }
+                }
                 let found = self.known_error_tainted_result_type(init);
                 if let (Some(expected), Some(found)) = (annotation, found) {
                     if expected != found {
