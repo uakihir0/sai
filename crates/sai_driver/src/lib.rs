@@ -90605,6 +90605,7 @@ property "shared"() {}
             "type Counter { count: I32, flag: Bool, limit: I32, shift: U32 }\n",
             "pub fn bump(value: I32) -> I32 { value + 1 }\n",
             "pub fn gate(flag: Bool) -> Bool { flag }\n",
+            "pub fn take_u8(value: U8) -> U8 { value }\n",
             "impl Counter {\n",
             "  pub fn call_field_init(self: borrow Self) -> I32 {\n",
             "    let x = bump(self.count)\n",
@@ -90668,6 +90669,10 @@ property "shared"() {}
             "  pub fn call_not_unknown_field(self: borrow Self) -> Bool {\n",
             "    gate(not self.missing)\n",
             "  }\n",
+            "  pub fn call_error_literal_arg(self: borrow Self) -> U8 {\n",
+            "    let n = 300 + self.missing\n",
+            "    take_u8(n)\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -90684,7 +90689,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 20);
+        assert_eq!(members.len(), 21);
 
         // Field arguments desugar to `let t = self.f` bindings, so they
         // check like path arguments — bare fields in initializers, tails,
@@ -90769,6 +90774,25 @@ property "shared"() {}
                     .iter()
                     .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
                 "a tainted call argument keeps the field error: {diagnostics:#?}"
+            );
+        }
+
+        // `let n = 300 + self.missing; take_u8(n)` keeps both the field
+        // error and the `U8` range diagnostic — the argument preserves the
+        // error literal variable so the parameter still constrains it.
+        let check = members[20]
+            .body_type_check()
+            .expect("error-literal call argument check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("an error-literal call argument recovers: {check:#?}");
+        };
+        for code in [
+            sai_diagnostics::Code::UnknownField,
+            sai_diagnostics::Code::LiteralOutOfRange,
+        ] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+                "member 20 keeps {code:?} alongside the field error: {diagnostics:#?}"
             );
         }
 
