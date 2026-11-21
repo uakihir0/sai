@@ -8543,7 +8543,7 @@ fn check_function_body_primitive_local_block(
             || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
     let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-    let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)));
+    let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && (matches!(operand.kind, ExprKind::Path(_)) || (matches!(operand.kind, ExprKind::Field { .. }) && self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)))));
     let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
     let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(_));
     let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
@@ -8571,15 +8571,21 @@ fn check_function_body_primitive_local_block(
             Some(tail_binding)
         }
         ExprKind::Unary(_, operand) if is_supported_unary_tail => {
-            let ExprKind::Path(operand_path) = operand.kind else {
-                return Ok(None);
-            };
-            let Some(operand_binding) =
-                resolved_plain_local_path_binding(operand_path, locals, inputs)
-            else {
-                return Ok(None);
-            };
-            Some(operand_binding)
+            // A `self.f` operand desugars to `let t = self.f` like a field
+            // tail — no binding to defer through.
+            if matches!(operand.kind, ExprKind::Field { .. }) {
+                None
+            } else {
+                let ExprKind::Path(operand_path) = operand.kind else {
+                    return Ok(None);
+                };
+                let Some(operand_binding) =
+                    resolved_plain_local_path_binding(operand_path, locals, inputs)
+                else {
+                    return Ok(None);
+                };
+                Some(operand_binding)
+            }
         }
         ExprKind::Binary(..) if is_supported_binary_tail => None,
         ExprKind::Lit(_) if is_supported_literal_tail => None,
@@ -10152,6 +10158,8 @@ fn primitive_if_branch_tail_shape_is_supported(
                         resolved_plain_local_path_binding(operand_path, locals, inputs)
                             .is_some_and(|binding| preceding_bindings.contains(&binding))
                     }
+                    ExprKind::Field { .. } => self_field_projections
+                        .is_some_and(|fields| fields.contains_key(&operand.hir_id)),
                     _ => false,
                 }
         }
@@ -90304,6 +90312,25 @@ property "shared"() {}
             "    let x: Bool = -n\n",
             "    x\n",
             "  }\n",
+            "  pub fn neg_field_tail(self: borrow Self) -> I32 {\n",
+            "    -self.count\n",
+            "  }\n",
+            "  pub fn bitnot_field_tail(self: borrow Self) -> I32 {\n",
+            "    ~self.count\n",
+            "  }\n",
+            "  pub fn not_field_tail(self: borrow Self) -> Bool {\n",
+            "    not self.flag\n",
+            "  }\n",
+            "  pub fn neg_unknown_field_tail(self: borrow Self) -> I32 {\n",
+            "    -self.missing\n",
+            "  }\n",
+            "  pub fn branch_neg_field_tail(self: borrow Self) -> I32 {\n",
+            "    if self.flag {\n",
+            "      -self.count\n",
+            "    } else {\n",
+            "      0\n",
+            "    }\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -90320,12 +90347,12 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 11);
+        assert_eq!(members.len(), 16);
 
         // `-self.f`/`~self.f`/`not self.f` desugar to a `let t = self.f`
         // binding, so initializers, nested operands, and field conditions
         // check cleanly like their path counterparts.
-        for index in [0, 1, 2, 3, 4, 5] {
+        for index in [0, 1, 2, 3, 4, 5, 11, 12, 13, 15] {
             let check = members[index]
                 .body_type_check()
                 .expect("unary-over-field body check has an independent result");
@@ -90405,6 +90432,17 @@ property "shared"() {}
                 "member 10 keeps {code:?} alongside the field error: {diagnostics:#?}"
             );
         }
+
+        // `-self.missing` in tail position stays gated: the tainted
+        // expression path only recovers leaf roots (Path/Field), not a
+        // unary expression whose operand carries the field error.
+        let check = members[14]
+            .body_type_check()
+            .expect("unknown-field unary tail check has an independent result");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "member 14 exceeds the unary-field-tail slice and stays gated: {check:#?}"
+        );
     }
 
     #[test]
