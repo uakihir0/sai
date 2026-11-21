@@ -90673,6 +90673,9 @@ property "shared"() {}
             "    let n = 300 + self.missing\n",
             "    take_u8(n)\n",
             "  }\n",
+            "  pub fn call_tainted_shift_literal_arg(self: borrow Self) -> U8 {\n",
+            "    take_u8((256 + 1) << self.missing)\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -90689,7 +90692,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 21);
+        assert_eq!(members.len(), 22);
 
         // Field arguments desugar to `let t = self.f` bindings, so they
         // check like path arguments — bare fields in initializers, tails,
@@ -90793,6 +90796,25 @@ property "shared"() {}
             assert!(
                 diagnostics.iter().any(|diagnostic| diagnostic.code == code),
                 "member 20 keeps {code:?} alongside the field error: {diagnostics:#?}"
+            );
+        }
+
+        // `take_u8((256 + 1) << self.missing)` keeps both the field error
+        // and the `U8` range diagnostic — the clean literal left subtree's
+        // variable is preserved so the parameter still constrains it.
+        let check = members[21]
+            .body_type_check()
+            .expect("tainted shift-literal argument check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a tainted shift-literal argument recovers: {check:#?}");
+        };
+        for code in [
+            sai_diagnostics::Code::UnknownField,
+            sai_diagnostics::Code::LiteralOutOfRange,
+        ] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+                "member 21 keeps {code:?} alongside the field error: {diagnostics:#?}"
             );
         }
 
