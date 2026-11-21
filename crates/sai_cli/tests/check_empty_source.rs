@@ -4392,17 +4392,6 @@ fn unsupported_inherent_method_shapes_remain_gated() {
             ),
         ),
         (
-            "operator as the method tail",
-            concat!(
-                "type Counter { marker: I32 }\n",
-                "impl Counter {\n",
-                "    pub fn current_count(self: borrow Self) -> I32 {\n",
-                "        self.missing + 1\n",
-                "    }\n",
-                "}\n",
-            ),
-        ),
-        (
             "nested receiver field",
             concat!(
                 "type Counter { marker: I32 }\n",
@@ -4553,7 +4542,7 @@ fn unsupported_inherent_method_shapes_remain_gated() {
 }
 
 #[test]
-fn unknown_direct_self_field_operator_method_tail_stays_gated() {
+fn unknown_direct_self_field_operator_method_tail_reports_field_error() {
     let source = concat!(
         "type Counter { marker: I32 }\n",
         "impl Counter {\n",
@@ -4564,11 +4553,16 @@ fn unknown_direct_self_field_operator_method_tail_stays_gated() {
     );
     let output = run_check(source, "", &[], &[]);
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
     assert!(
-        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
-            && !stdout.contains("\"code\":\"UNKNOWN_FIELD\"")
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
             && !stdout.contains("\"type\":\"result\""),
-        "a binary method tail must remain outside the direct field-tail checker:\n{stdout}"
+        "a tainted binary method tail reports only its field error:\n{stdout}"
     );
 }
 
