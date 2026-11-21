@@ -9954,3 +9954,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, focused driver test passes; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** The tail checks against `inner_bindings` (not the outer set) so an inner `let`'s binding is usable; the outer `preceding_bindings` is cloned, so inner declarations cannot leak into sibling operands.
 - **Remaining scope:** `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1074 (2026-11-21): Block expressions as call arguments
+
+- **Decision:** A `{ ...; e }` block is a call argument — `take_i32({ 1 })`, `take_i32({ let y = 2\n  y })` — completing operand-position block coverage.
+- **Reason:** `check_direct_call`'s per-argument dispatch gains a `Block` arm: the inner block checks via `check_block_expected(block, *expected)` (statements through `check_stmt`, tail against the parameter type), and the argument expression records `Concrete(expected)`. The driver mirror's `is_supported_direct_call_argument_shape` delegates `ExprKind::Block` to `primitive_inner_block_shape_is_supported`.
+- **Failure boundary and judgment:** Empty and unsafe blocks keep their gates; unsupported inner statements and tails gate through the composed predicates.
+- **Review required:** None — delegates to reviewed paths.
+- **Planned verification matrix:** Driver `function_body_type_check_nested_block_tails` — `call_block_arg`, `call_stmt_block_arg` supported-clean.
+- **Verification:** Pinned Rust 1.99.1, focused driver test passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Unlike the `Path`/operand arms, the `Block` arm skips `check_annotated_path` — the block already unified its tail against the parameter inside `check_block_expected`, so no second constraint site is needed.
+- **Remaining scope:** `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.

@@ -8956,6 +8956,20 @@ fn is_supported_direct_call_argument_shape(
         ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        // A `{ ...; e }` argument admits like an inner block: `bump({ 1 })`
+        // behaves as `bump(1)`, statements included.
+        ExprKind::Block(inner) => primitive_inner_block_shape_is_supported(
+            inner,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         // A known self field passes its declared type like a path
         // argument; an unknown field recovers through the tainted leaf
         // path so the `UnknownField` diagnostic survives.
@@ -91079,6 +91093,13 @@ property "shared"() {}
             "    let x = flag and { let t = flag\n        t }\n",
             "    x\n",
             "}\n",
+            "pub fn call_block_arg() -> I32 {\n",
+            "    take_i32({ 1 })\n",
+            "}\n",
+            "pub fn call_stmt_block_arg() -> I32 {\n",
+            "    take_i32({ let y = 2\n        y })\n",
+            "}\n",
+            "pub fn take_i32(v: I32) -> I32 { v }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -91101,6 +91122,7 @@ property "shared"() {}
         // tails admit the same nesting.
         for index in [
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26,
+            27, 28,
         ] {
             let check = resolved.owners()[index]
                 .body_type_check()
