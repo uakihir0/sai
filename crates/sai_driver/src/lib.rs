@@ -8903,18 +8903,21 @@ fn is_supported_direct_call_argument_shape(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         ExprKind::Unary(UnOp::BitNot, _) => is_supported_direct_call_bitwise_not_argument_shape(
             expression,
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         ExprKind::Unary(UnOp::Neg, _) => is_supported_direct_call_neg_argument_shape(
             expression,
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         ExprKind::Binary(BinOp::Rem, left, right) => {
             is_supported_direct_call_remainder_argument_shape(
@@ -8923,6 +8926,7 @@ fn is_supported_direct_call_argument_shape(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
             )
         }
         ExprKind::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, left, right) => {
@@ -8932,6 +8936,7 @@ fn is_supported_direct_call_argument_shape(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
             )
         }
         ExprKind::Binary(
@@ -8944,6 +8949,7 @@ fn is_supported_direct_call_argument_shape(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         ExprKind::Binary(BinOp::And | BinOp::Or, left, right) => {
             is_supported_direct_call_logical_operands_shape(
@@ -8952,6 +8958,7 @@ fn is_supported_direct_call_argument_shape(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
             )
         }
         ExprKind::Binary(BinOp::Shl | BinOp::Shr, left, right) => {
@@ -8961,6 +8968,7 @@ fn is_supported_direct_call_argument_shape(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
             )
         }
         ExprKind::Binary(BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, left, right) => {
@@ -8970,6 +8978,7 @@ fn is_supported_direct_call_argument_shape(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
             )
         }
         ExprKind::Call {
@@ -8991,6 +9000,7 @@ fn is_supported_direct_call_argument_shape(
                         preceding_bindings,
                         locals,
                         inputs,
+                        self_field_projections,
                     )
                 })
         }
@@ -10777,6 +10787,7 @@ fn is_supported_direct_call_arithmetic_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     match expression.kind {
         ExprKind::Binary(BinOp::Rem, left, right) => {
@@ -10786,6 +10797,7 @@ fn is_supported_direct_call_arithmetic_argument_shape(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
             )
         }
         ExprKind::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, left, right) => {
@@ -10795,6 +10807,7 @@ fn is_supported_direct_call_arithmetic_argument_shape(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
             )
         }
         ExprKind::Binary(
@@ -10807,6 +10820,7 @@ fn is_supported_direct_call_arithmetic_argument_shape(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         ExprKind::Binary(BinOp::And | BinOp::Or, left, right) => {
             is_supported_direct_call_logical_operands_shape(
@@ -10815,6 +10829,7 @@ fn is_supported_direct_call_arithmetic_argument_shape(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
             )
         }
         ExprKind::Binary(BinOp::Shl | BinOp::Shr, left, right) => {
@@ -10824,6 +10839,7 @@ fn is_supported_direct_call_arithmetic_argument_shape(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
             )
         }
         ExprKind::Binary(BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, left, right) => {
@@ -10833,6 +10849,7 @@ fn is_supported_direct_call_arithmetic_argument_shape(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
             )
         }
         ExprKind::Unary(UnOp::Not, _) => is_supported_direct_call_not_argument_shape(
@@ -10840,24 +10857,28 @@ fn is_supported_direct_call_arithmetic_argument_shape(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         ExprKind::Unary(UnOp::BitNot, _) => is_supported_direct_call_bitwise_not_argument_shape(
             expression,
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         ExprKind::Unary(UnOp::Neg, _) => is_supported_direct_call_neg_argument_shape(
             expression,
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
         _ => is_supported_direct_call_leaf_argument_shape(
             expression,
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
         ),
     }
 }
@@ -10867,6 +10888,7 @@ fn is_supported_direct_call_not_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     let ExprKind::Unary(UnOp::Not, operand) = expression.kind else {
         return false;
@@ -10875,6 +10897,9 @@ fn is_supported_direct_call_not_argument_shape(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Bool(_)) => true,
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+        }
         _ => false,
     }
 }
@@ -10884,6 +10909,7 @@ fn is_supported_direct_call_bitwise_not_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     let ExprKind::Unary(UnOp::BitNot, operand) = expression.kind else {
         return false;
@@ -10892,6 +10918,9 @@ fn is_supported_direct_call_bitwise_not_argument_shape(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)) => true,
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+        }
         _ => false,
     }
 }
@@ -10901,10 +10930,14 @@ fn is_supported_direct_call_neg_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     let ExprKind::Unary(UnOp::Neg, operand) = expression.kind else {
         return false;
     };
+    if matches!(operand.kind, ExprKind::Field { .. }) {
+        return self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id));
+    }
     let ExprKind::Path(path) = operand.kind else {
         return false;
     };
@@ -10918,6 +10951,7 @@ fn is_supported_direct_call_remainder_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     match (left.kind, right.kind) {
         (ExprKind::Path(left_path), ExprKind::Lit(Lit::Int { .. })) => {
@@ -10936,7 +10970,25 @@ fn is_supported_direct_call_remainder_argument_shape(
                 .is_some_and(|binding| preceding_bindings.contains(&binding))
         }
         (ExprKind::Lit(Lit::Int { .. }), ExprKind::Lit(Lit::Int { .. })) => true,
-        _ => false,
+        _ => {
+            // A `self.f` leaf desugars to `let t = self.f`, so a known
+            // field counts wherever a path leaf does; the other operand
+            // must stay a path leaf or an integer literal.
+            let is_known_field = |expression: &HirExpr<'_>| {
+                matches!(expression.kind, ExprKind::Field { .. })
+                    && self_field_projections
+                        .is_some_and(|fields| fields.contains_key(&expression.hir_id))
+            };
+            let is_int_literal = |expression: &HirExpr<'_>| {
+                matches!(expression.kind, ExprKind::Lit(Lit::Int { .. }))
+            };
+            let is_path_leaf =
+                |expression: &HirExpr<'_>| matches!(expression.kind, ExprKind::Path(_));
+            (is_known_field(left)
+                && (is_int_literal(right) || is_path_leaf(right) || is_known_field(right)))
+                || (is_known_field(right) && is_int_literal(left))
+                || (is_known_field(right) && is_path_leaf(left))
+        }
     }
 }
 
@@ -10946,11 +10998,15 @@ fn is_supported_direct_call_arithmetic_operands_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     let is_arithmetic_leaf = |expression: &HirExpr<'_>| match expression.kind {
         ExprKind::Lit(Lit::Int { .. } | Lit::Float { .. }) => true,
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&expression.hir_id))
+        }
         _ => false,
     };
     if !is_arithmetic_leaf(left) || !is_arithmetic_leaf(right) {
@@ -10980,13 +11036,21 @@ fn is_supported_direct_call_comparison_operands_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     let is_comparison_leaf = |expression: &HirExpr<'_>| {
-        is_supported_direct_call_leaf_argument_shape(expression, preceding_bindings, locals, inputs)
+        is_supported_direct_call_leaf_argument_shape(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+            self_field_projections,
+        )
     };
     is_comparison_leaf(left)
         && is_comparison_leaf(right)
-        && (matches!(left.kind, ExprKind::Path(_)) || matches!(right.kind, ExprKind::Path(_)))
+        && (matches!(left.kind, ExprKind::Path(_) | ExprKind::Field { .. })
+            || matches!(right.kind, ExprKind::Path(_) | ExprKind::Field { .. }))
 }
 
 fn is_supported_direct_call_logical_operands_shape(
@@ -10995,11 +11059,15 @@ fn is_supported_direct_call_logical_operands_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     [left, right].into_iter().all(|operand| match operand.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Bool(_)) => true,
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+        }
         _ => false,
     })
 }
@@ -11010,12 +11078,16 @@ fn is_supported_direct_call_shift_operands_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     let left_shape_is_supported = match left.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Byte(_)) => true,
         ExprKind::Lit(Lit::Int { .. }) => true,
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&left.hir_id))
+        }
         _ => false,
     };
     if !left_shape_is_supported {
@@ -11026,11 +11098,17 @@ fn is_supported_direct_call_shift_operands_shape(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Int { .. }) => true,
-        ExprKind::Lit(Lit::Byte(_)) => matches!(
-            left.kind,
-            ExprKind::Path(_) | ExprKind::Lit(Lit::Byte(_) | Lit::Int { .. })
-        ),
+        ExprKind::Lit(Lit::Byte(_)) => {
+            matches!(
+                left.kind,
+                ExprKind::Path(_) | ExprKind::Lit(Lit::Byte(_) | Lit::Int { .. })
+            ) || (matches!(left.kind, ExprKind::Field { .. })
+                && self_field_projections.is_some_and(|fields| fields.contains_key(&left.hir_id)))
+        }
         ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. }) => true,
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&right.hir_id))
+        }
         _ => false,
     }
 }
@@ -11041,16 +11119,25 @@ fn is_supported_direct_call_bitwise_operands_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
+    let is_path_like_leaf = |expression: &HirExpr<'_>| {
+        matches!(expression.kind, ExprKind::Path(_))
+            || (matches!(expression.kind, ExprKind::Field { .. })
+                && self_field_projections
+                    .is_some_and(|fields| fields.contains_key(&expression.hir_id)))
+    };
     if matches!(left.kind, ExprKind::Lit(Lit::Int { .. })) {
         if matches!(right.kind, ExprKind::Lit(Lit::Int { .. })) {
             return true;
         }
-        let ExprKind::Path(path) = right.kind else {
-            return false;
-        };
-        return resolved_plain_local_path_binding(path, locals, inputs)
-            .is_some_and(|binding| preceding_bindings.contains(&binding));
+        match right.kind {
+            ExprKind::Path(path) => {
+                return resolved_plain_local_path_binding(path, locals, inputs)
+                    .is_some_and(|binding| preceding_bindings.contains(&binding));
+            }
+            _ => return is_path_like_leaf(right),
+        }
     }
 
     if matches!(left.kind, ExprKind::Lit(Lit::Byte(_))) {
@@ -11062,11 +11149,25 @@ fn is_supported_direct_call_bitwise_operands_shape(
         ) {
             return true;
         }
-        let ExprKind::Path(path) = right.kind else {
+        match right.kind {
+            ExprKind::Path(path) => {
+                return resolved_plain_local_path_binding(path, locals, inputs)
+                    .is_some_and(|binding| preceding_bindings.contains(&binding));
+            }
+            _ => return is_path_like_leaf(right),
+        }
+    }
+
+    if matches!(left.kind, ExprKind::Field { .. }) {
+        if !is_path_like_leaf(left) {
             return false;
+        }
+        return match right.kind {
+            ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding)),
+            ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)) => true,
+            _ => is_path_like_leaf(right),
         };
-        return resolved_plain_local_path_binding(path, locals, inputs)
-            .is_some_and(|binding| preceding_bindings.contains(&binding));
     }
 
     let ExprKind::Path(path) = left.kind else {
@@ -11082,11 +11183,13 @@ fn is_supported_direct_call_bitwise_operands_shape(
         return true;
     }
 
-    let ExprKind::Path(path) = right.kind else {
-        return false;
-    };
-    resolved_plain_local_path_binding(path, locals, inputs)
-        .is_some_and(|binding| preceding_bindings.contains(&binding))
+    match right.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        // A known self field is a path-like right operand for a bound path
+        // left operand (`value & self.count`).
+        _ => is_path_like_leaf(right),
+    }
 }
 
 fn is_supported_direct_call_leaf_argument_shape(
@@ -11094,11 +11197,15 @@ fn is_supported_direct_call_leaf_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     match expression.kind {
         ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&expression.hir_id))
+        }
         _ => false,
     }
 }
@@ -90303,7 +90410,7 @@ property "shared"() {}
     #[test]
     fn inherent_method_body_type_check_call_over_self_fields() {
         let root = concat!(
-            "type Counter { count: I32, flag: Bool }\n",
+            "type Counter { count: I32, flag: Bool, limit: I32, shift: U32 }\n",
             "pub fn bump(value: I32) -> I32 { value + 1 }\n",
             "pub fn gate(flag: Bool) -> Bool { flag }\n",
             "impl Counter {\n",
@@ -90324,11 +90431,44 @@ property "shared"() {}
             "  pub fn call_field_mismatch(self: borrow Self) -> Bool {\n",
             "    gate(self.count)\n",
             "  }\n",
+            "  pub fn call_field_inside_arg(self: borrow Self) -> I32 {\n",
+            "    bump(self.count + 1)\n",
+            "  }\n",
+            "  pub fn call_neg_field_arg(self: borrow Self) -> I32 {\n",
+            "    bump(-self.count)\n",
+            "  }\n",
+            "  pub fn call_not_field_arg(self: borrow Self) -> Bool {\n",
+            "    gate(not self.flag)\n",
+            "  }\n",
+            "  pub fn call_shift_field_arg(self: borrow Self) -> I32 {\n",
+            "    bump(self.count << 1)\n",
+            "  }\n",
+            "  pub fn call_comparison_field_arg(self: borrow Self) -> Bool {\n",
+            "    gate(self.count < self.limit)\n",
+            "  }\n",
             "  pub fn call_unknown_field(self: borrow Self) -> I32 {\n",
             "    bump(self.missing)\n",
             "  }\n",
-            "  pub fn call_field_inside_arg(self: borrow Self) -> I32 {\n",
-            "    bump(self.count + 1)\n",
+            "  pub fn call_unknown_in_tree(self: borrow Self) -> I32 {\n",
+            "    bump(self.missing + 1)\n",
+            "  }\n",
+            "  pub fn call_nested_call(self: borrow Self) -> I32 {\n",
+            "    bump(bump(self.count))\n",
+            "  }\n",
+            "  pub fn call_deep_nested_call(self: borrow Self) -> I32 {\n",
+            "    bump(bump(bump(self.count)))\n",
+            "  }\n",
+            "  pub fn call_logical_field_arg(self: borrow Self) -> Bool {\n",
+            "    gate(self.flag and true)\n",
+            "  }\n",
+            "  pub fn call_bitwise_field_right(self: borrow Self, value: I32) -> I32 {\n",
+            "    bump(value & self.count)\n",
+            "  }\n",
+            "  pub fn call_shift_lit_field(self: borrow Self) -> I32 {\n",
+            "    bump(1 << self.shift)\n",
+            "  }\n",
+            "  pub fn call_shift_field_byte(self: borrow Self) -> I32 {\n",
+            "    bump(self.count << b'0')\n",
             "  }\n",
             "}\n",
         );
@@ -90346,12 +90486,14 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 7);
+        assert_eq!(members.len(), 18);
 
-        // `bump(self.count)` desugars the argument to a `let t = self.count`
-        // binding, so field arguments check like path arguments in
-        // initializers, tails, and operand-position calls.
-        for index in [0, 1, 2, 3] {
+        // Field arguments desugar to `let t = self.f` bindings, so they
+        // check like path arguments — bare fields in initializers, tails,
+        // and operand-position calls, and field leaves inside flat
+        // argument trees (`self.count + 1`, `-self.count`, `not self.flag`,
+        // `self.count << 1`, `self.count < self.limit`).
+        for index in [0, 1, 2, 3, 5, 6, 7, 8, 9, 12, 14, 15, 16] {
             let check = members[index]
                 .body_type_check()
                 .expect("call-over-field body check has an independent result");
@@ -90381,10 +90523,27 @@ property "shared"() {}
             "a mismatched field argument reports the parameter type: {diagnostics:#?}"
         );
 
-        // `bump(self.missing)` and `bump(self.count + 1)` stay outside the
-        // slice — unknown fields in arguments keep the tainted boundary,
-        // and field expressions inside argument trees remain gated.
-        for index in [5, 6] {
+        // `bump(self.count << b'0')` checks but reports the shift-count
+        // mismatch — the field-left/Byte-right pair must not be gated away
+        // before the diagnostic is produced.
+        let check = members[17]
+            .body_type_check()
+            .expect("byte-shift field check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a byte shift count should be checked: {check:#?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch),
+            "a byte shift count reports the count type mismatch: {diagnostics:#?}"
+        );
+
+        // `bump(self.missing)` and `bump(self.missing + 1)` keep the tainted
+        // boundary — unknown fields in arguments cannot be typed for the
+        // parameter match. `bump(bump(bump(self.count)))` stays gated with
+        // the nested-call depth boundary.
+        for index in [10, 11, 13] {
             let check = members[index]
                 .body_type_check()
                 .expect("out-of-slice call check has an independent result");
