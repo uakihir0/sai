@@ -8052,69 +8052,33 @@ fn check_inherent_method_body_type(
     let mut self_field_projections = HashMap::new();
     let mut unknown_self_fields = HashSet::new();
     let mut diagnostics = Vec::new();
-    for stmt in method_block.stmts {
-        let init = match stmt.kind {
-            StmtKind::Let { init, .. } => init,
-            StmtKind::Assign { rhs, .. } | StmtKind::AssignOp { rhs, .. } => rhs,
-            _ => continue,
-        };
-        match init.kind {
-            ExprKind::Field { .. } => {
-                if !collect_inherent_method_self_field(
-                    method_owner.id,
-                    init,
-                    true,
-                    &field_types,
-                    &mut self_field_projections,
-                    &mut unknown_self_fields,
-                    &mut diagnostics,
-                    symbols,
-                    inputs,
-                    snapshot,
-                )? {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                }
-            }
-            ExprKind::Binary(_, left, right) => {
-                for operand in [left, right] {
-                    if matches!(operand.kind, ExprKind::Field { .. })
-                        && !collect_inherent_method_self_field(
-                            method_owner.id,
-                            operand,
-                            false,
-                            &field_types,
-                            &mut self_field_projections,
-                            &mut unknown_self_fields,
-                            &mut diagnostics,
-                            symbols,
-                            inputs,
-                            snapshot,
-                        )?
-                    {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    }
-                }
-            }
-            _ => {}
+    // Self-field operands desugar to `let t = self.f`, so every `self.f`
+    // node in the body contributes its projection (or unknown-field
+    // diagnostic); nodes that are not self fields stay unrecorded and
+    // gate through the admission mirrors.
+    let mut collect_error = None;
+    visit_block_expressions(method_block, &mut |expression| {
+        if collect_error.is_some() || !matches!(expression.kind, ExprKind::Field { .. }) {
+            return;
         }
-    }
-    if let Some(tail) = method_block.tail {
-        if matches!(tail.kind, ExprKind::Field { .. }) {
-            if !collect_inherent_method_self_field(
-                method_owner.id,
-                tail,
-                true,
-                &field_types,
-                &mut self_field_projections,
-                &mut unknown_self_fields,
-                &mut diagnostics,
-                symbols,
-                inputs,
-                snapshot,
-            )? {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            }
+        match collect_inherent_method_self_field(
+            method_owner.id,
+            expression,
+            true,
+            &field_types,
+            &mut self_field_projections,
+            &mut unknown_self_fields,
+            &mut diagnostics,
+            symbols,
+            inputs,
+            snapshot,
+        ) {
+            Ok(_) => {}
+            Err(error) => collect_error = Some(error),
         }
+    });
+    if let Some(error) = collect_error {
+        return Err(error);
     }
 
     let explicit_sig = sai_hir::body::FnSig {
@@ -9030,6 +8994,7 @@ fn primitive_logical_init_operand_shape_is_supported(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
@@ -9037,7 +9002,8 @@ fn primitive_logical_init_operand_shape_is_supported(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Field { .. } => {
-            unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
         }
         _ => false,
     };
@@ -9056,6 +9022,7 @@ fn primitive_logical_init_operand_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
         ),
@@ -9066,6 +9033,7 @@ fn primitive_logical_init_operand_shape_is_supported(
                     preceding_bindings,
                     locals,
                     inputs,
+                    self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
                 ) && primitive_logical_init_operand_shape_is_supported(
@@ -9073,6 +9041,7 @@ fn primitive_logical_init_operand_shape_is_supported(
                     preceding_bindings,
                     locals,
                     inputs,
+                    self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
                 )
@@ -9087,6 +9056,7 @@ fn primitive_logical_init_operand_shape_is_supported(
                     preceding_bindings,
                     locals,
                     inputs,
+                    self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
                 ) && primitive_nested_operand_shape_is_supported(
@@ -9094,6 +9064,7 @@ fn primitive_logical_init_operand_shape_is_supported(
                     preceding_bindings,
                     locals,
                     inputs,
+                    self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
                 )
@@ -9236,6 +9207,7 @@ fn primitive_nested_operand_shape_is_supported(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
@@ -9244,7 +9216,8 @@ fn primitive_nested_operand_shape_is_supported(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Field { .. } => {
-            unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
         }
         ExprKind::Call { .. } => primitive_direct_call_operand_shape_is_supported(
             operand,
@@ -9263,6 +9236,7 @@ fn primitive_nested_operand_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
         ),
@@ -9294,6 +9268,7 @@ fn primitive_nested_operand_shape_is_supported(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
                 unknown_self_fields,
                 direct_call_signatures,
             ) && primitive_nested_operand_shape_is_supported(
@@ -9301,6 +9276,7 @@ fn primitive_nested_operand_shape_is_supported(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
                 unknown_self_fields,
                 direct_call_signatures,
             )
@@ -9420,6 +9396,7 @@ fn primitive_value_expression_shape_is_supported(
                 preceding_bindings,
                 locals,
                 inputs,
+                self_field_projections,
                 unknown_self_fields,
                 direct_call_signatures,
             ) {
@@ -9464,18 +9441,22 @@ fn primitive_value_expression_shape_is_supported(
                 resolved_plain_local_path_binding(path, locals, inputs)
                     .is_some_and(|binding| preceding_bindings.contains(&binding))
             };
-            let is_unknown_self_field = |operand: &HirExpr<'_>| {
+            let is_known_or_unknown_self_field = |operand: &HirExpr<'_>| {
                 matches!(operand.kind, ExprKind::Field { .. })
-                    && unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+                    && (self_field_projections
+                        .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                        || unknown_self_fields
+                            .is_some_and(|fields| fields.contains(&operand.hir_id)))
             };
             let is_preceding_path_or_unknown_field = |operand: &HirExpr<'_>| {
                 is_preceding_path(operand)
-                    || is_unknown_self_field(operand)
+                    || is_known_or_unknown_self_field(operand)
                     || primitive_nested_operand_shape_is_supported(
                         operand,
                         preceding_bindings,
                         locals,
                         inputs,
+                        self_field_projections,
                         unknown_self_fields,
                         direct_call_signatures,
                     )
@@ -9488,6 +9469,7 @@ fn primitive_value_expression_shape_is_supported(
                             preceding_bindings,
                             locals,
                             inputs,
+                            self_field_projections,
                             unknown_self_fields,
                             direct_call_signatures,
                         )
@@ -11890,6 +11872,126 @@ fn direct_primitive_call_sites(
     calls
 }
 
+// Visit every expression node in a body, pre-order, including nested
+// blocks, `if`/`match`/`loop` bodies, call arguments, format-string
+// arguments, closures, and break/return values.
+fn visit_expression_tree(expression: &HirExpr<'_>, visit: &mut impl FnMut(&HirExpr<'_>)) {
+    visit(expression);
+    match expression.kind {
+        ExprKind::Field { base, .. }
+        | ExprKind::TupleField { base, .. }
+        | ExprKind::Unary(_, base)
+        | ExprKind::Borrow(_, base)
+        | ExprKind::Try(base)
+        | ExprKind::Await(base)
+        | ExprKind::AsCast { operand: base, .. } => visit_expression_tree(base, visit),
+        ExprKind::Index(base, index) => {
+            visit_expression_tree(base, visit);
+            visit_expression_tree(index, visit);
+        }
+        ExprKind::Binary(_, left, right) => {
+            visit_expression_tree(left, visit);
+            visit_expression_tree(right, visit);
+        }
+        ExprKind::Range { start, end, .. } => {
+            for operand in [start, end].into_iter().flatten() {
+                visit_expression_tree(operand, visit);
+            }
+        }
+        ExprKind::Call {
+            callee, args, base, ..
+        } => {
+            visit_expression_tree(callee, visit);
+            for argument in args {
+                visit_expression_tree(argument.expr, visit);
+            }
+            if let Some(base) = base {
+                visit_expression_tree(base, visit);
+            }
+        }
+        ExprKind::ContractOld { args, base } => {
+            for argument in args {
+                visit_expression_tree(argument.expr, visit);
+            }
+            if let Some(base) = base {
+                visit_expression_tree(base, visit);
+            }
+        }
+        ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
+            for element in elements {
+                visit_expression_tree(element, visit);
+            }
+        }
+        ExprKind::Block(block)
+        | ExprKind::AsyncBlock { block, .. }
+        | ExprKind::Region { block, .. } => visit_block_expressions(block, visit),
+        ExprKind::If { cond, then, els } => {
+            visit_expression_tree(cond, visit);
+            visit_block_expressions(then, visit);
+            if let Some(els) = els {
+                visit_expression_tree(els, visit);
+            }
+        }
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => {
+            visit_expression_tree(scrutinee, visit);
+            for arm in arms.iter() {
+                if let Some(guard) = arm.guard {
+                    visit_expression_tree(guard, visit);
+                }
+                visit_expression_tree(arm.body, visit);
+            }
+        }
+        ExprKind::Loop { body, .. } => visit_block_expressions(body, visit),
+        ExprKind::Closure(closure) => visit_block_expressions(closure.body, visit),
+        ExprKind::Break { value, .. } | ExprKind::Return(value) => {
+            if let Some(value) = value {
+                visit_expression_tree(value, visit);
+            }
+        }
+        ExprKind::FormatString(pieces) => {
+            for piece in pieces.iter() {
+                if let FmtPiece::Arg { expr, .. } = piece {
+                    visit_expression_tree(expr, visit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn visit_block_expressions(block: &HirBlock<'_>, visit: &mut impl FnMut(&HirExpr<'_>)) {
+    for statement in block.stmts {
+        match statement.kind {
+            StmtKind::Let { init, els, .. } => {
+                visit_expression_tree(init, visit);
+                if let Some(els) = els {
+                    visit_block_expressions(els, visit);
+                }
+            }
+            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                visit_expression_tree(lhs, visit);
+                visit_expression_tree(rhs, visit);
+            }
+            StmtKind::Assert { cond, msg, .. } => {
+                visit_expression_tree(cond, visit);
+                if let Some(msg) = msg {
+                    visit_expression_tree(msg, visit);
+                }
+            }
+            StmtKind::Expr(expression) => visit_expression_tree(expression, visit),
+        }
+    }
+    if let Some(tail) = block.tail {
+        visit_expression_tree(tail, visit);
+    }
+}
+
+// A call in operand position desugars to a `let t = f(..)` binding, so
+// every expression subtree contributes its resolvable direct-call sites.
+// Sites the checker never reaches stay inert: admission still gates the
+// positions that consult the map.
 fn index_direct_call_sites_in_block(
     block: &HirBlock<'_>,
     module_paths: &ModuleResolution,
@@ -11898,352 +12000,17 @@ fn index_direct_call_sites_in_block(
     inputs: &CurrentOwnerInputs,
     calls: &mut HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>,
 ) {
-    for statement in block.stmts {
-        match statement.kind {
-            StmtKind::Let { init, els, .. } => {
-                index_direct_call_sites_in_expression(
-                    init,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-                if let Some(els) = els {
-                    index_direct_call_sites_in_block(
-                        els,
-                        module_paths,
-                        signatures,
-                        requesting_package,
-                        inputs,
-                        calls,
-                    );
-                }
-            }
-            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
-                index_direct_call_sites_in_expression(
-                    lhs,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-                index_direct_call_sites_in_expression(
-                    rhs,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-            }
-            StmtKind::Assert { cond, msg, .. } => {
-                index_direct_call_sites_in_expression(
-                    cond,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-                if let Some(msg) = msg {
-                    index_direct_call_sites_in_expression(
-                        msg,
-                        module_paths,
-                        signatures,
-                        requesting_package,
-                        inputs,
-                        calls,
-                    );
-                }
-            }
-            StmtKind::Expr(expression) => index_direct_call_sites_in_expression(
-                expression,
-                module_paths,
-                signatures,
-                requesting_package,
-                inputs,
-                calls,
-            ),
-        }
-    }
-    if let Some(tail) = block.tail {
-        index_direct_call_sites_in_expression(
-            tail,
+    visit_block_expressions(block, &mut |expression| {
+        if let Some(signature) = direct_primitive_call_site(
+            expression,
             module_paths,
             signatures,
             requesting_package,
             inputs,
-            calls,
-        );
-    }
-}
-
-// A call in operand position desugars to a `let t = f(..)` binding, so
-// every expression subtree contributes its resolvable direct-call sites.
-// Sites the checker never reaches stay inert: admission still gates the
-// positions that consult the map.
-fn index_direct_call_sites_in_expression(
-    expression: &HirExpr<'_>,
-    module_paths: &ModuleResolution,
-    signatures: &HashMap<DefId, PrimitiveFunctionCallSignature>,
-    requesting_package: PackageId,
-    inputs: &CurrentOwnerInputs,
-    calls: &mut HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>,
-) {
-    if let Some(signature) = direct_primitive_call_site(
-        expression,
-        module_paths,
-        signatures,
-        requesting_package,
-        inputs,
-    ) {
-        calls.insert(expression.hir_id, signature);
-    }
-    match expression.kind {
-        ExprKind::Field { base, .. }
-        | ExprKind::TupleField { base, .. }
-        | ExprKind::Unary(_, base)
-        | ExprKind::Borrow(_, base)
-        | ExprKind::Try(base)
-        | ExprKind::Await(base)
-        | ExprKind::AsCast { operand: base, .. } => index_direct_call_sites_in_expression(
-            base,
-            module_paths,
-            signatures,
-            requesting_package,
-            inputs,
-            calls,
-        ),
-        ExprKind::Index(base, index) => {
-            index_direct_call_sites_in_expression(
-                base,
-                module_paths,
-                signatures,
-                requesting_package,
-                inputs,
-                calls,
-            );
-            index_direct_call_sites_in_expression(
-                index,
-                module_paths,
-                signatures,
-                requesting_package,
-                inputs,
-                calls,
-            );
+        ) {
+            calls.insert(expression.hir_id, signature);
         }
-        ExprKind::Binary(_, left, right) => {
-            index_direct_call_sites_in_expression(
-                left,
-                module_paths,
-                signatures,
-                requesting_package,
-                inputs,
-                calls,
-            );
-            index_direct_call_sites_in_expression(
-                right,
-                module_paths,
-                signatures,
-                requesting_package,
-                inputs,
-                calls,
-            );
-        }
-        ExprKind::Range { start, end, .. } => {
-            for operand in [start, end].into_iter().flatten() {
-                index_direct_call_sites_in_expression(
-                    operand,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-            }
-        }
-        ExprKind::Call {
-            callee, args, base, ..
-        } => {
-            index_direct_call_sites_in_expression(
-                callee,
-                module_paths,
-                signatures,
-                requesting_package,
-                inputs,
-                calls,
-            );
-            for argument in args {
-                index_direct_call_sites_in_expression(
-                    argument.expr,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-            }
-            if let Some(base) = base {
-                index_direct_call_sites_in_expression(
-                    base,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-            }
-        }
-        ExprKind::ContractOld { args, base } => {
-            for argument in args {
-                index_direct_call_sites_in_expression(
-                    argument.expr,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-            }
-            if let Some(base) = base {
-                index_direct_call_sites_in_expression(
-                    base,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-            }
-        }
-        ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
-            for element in elements {
-                index_direct_call_sites_in_expression(
-                    element,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-            }
-        }
-        ExprKind::Block(block)
-        | ExprKind::AsyncBlock { block, .. }
-        | ExprKind::Region { block, .. } => index_direct_call_sites_in_block(
-            block,
-            module_paths,
-            signatures,
-            requesting_package,
-            inputs,
-            calls,
-        ),
-        ExprKind::If { cond, then, els } => {
-            index_direct_call_sites_in_expression(
-                cond,
-                module_paths,
-                signatures,
-                requesting_package,
-                inputs,
-                calls,
-            );
-            index_direct_call_sites_in_block(
-                then,
-                module_paths,
-                signatures,
-                requesting_package,
-                inputs,
-                calls,
-            );
-            if let Some(els) = els {
-                index_direct_call_sites_in_expression(
-                    els,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-            }
-        }
-        ExprKind::Match {
-            scrutinee, arms, ..
-        } => {
-            index_direct_call_sites_in_expression(
-                scrutinee,
-                module_paths,
-                signatures,
-                requesting_package,
-                inputs,
-                calls,
-            );
-            for arm in arms.iter() {
-                if let Some(guard) = arm.guard {
-                    index_direct_call_sites_in_expression(
-                        guard,
-                        module_paths,
-                        signatures,
-                        requesting_package,
-                        inputs,
-                        calls,
-                    );
-                }
-                index_direct_call_sites_in_expression(
-                    arm.body,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-            }
-        }
-        ExprKind::Loop { body, .. } => index_direct_call_sites_in_block(
-            body,
-            module_paths,
-            signatures,
-            requesting_package,
-            inputs,
-            calls,
-        ),
-        ExprKind::Closure(closure) => index_direct_call_sites_in_block(
-            closure.body,
-            module_paths,
-            signatures,
-            requesting_package,
-            inputs,
-            calls,
-        ),
-        ExprKind::Break { value, .. } | ExprKind::Return(value) => {
-            if let Some(value) = value {
-                index_direct_call_sites_in_expression(
-                    value,
-                    module_paths,
-                    signatures,
-                    requesting_package,
-                    inputs,
-                    calls,
-                );
-            }
-        }
-        ExprKind::FormatString(pieces) => {
-            for piece in pieces.iter() {
-                if let FmtPiece::Arg { expr, .. } = piece {
-                    index_direct_call_sites_in_expression(
-                        expr,
-                        module_paths,
-                        signatures,
-                        requesting_package,
-                        inputs,
-                        calls,
-                    );
-                }
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
 fn direct_primitive_call_site(
@@ -90078,6 +89845,110 @@ property "shared"() {}
                 .is_some(),
             "a valid sibling keeps its canonical type beside field errors"
         );
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_admits_self_fields_as_operands() {
+        let root = concat!(
+            "type Counter { count: I32, limit: I32, flag: Bool }\n",
+            "impl Counter {\n",
+            "  pub fn field_pair_operand(self: borrow Self) -> I32 {\n",
+            "    let total = self.count + self.limit\n",
+            "    total\n",
+            "  }\n",
+            "  pub fn nested_field_operand(self: borrow Self) -> I32 {\n",
+            "    let total = (self.count + 1) * self.limit\n",
+            "    total\n",
+            "  }\n",
+            "  pub fn field_tail_operand(self: borrow Self) -> I32 {\n",
+            "    self.count + self.limit\n",
+            "  }\n",
+            "  pub fn logical_field_leaf(self: borrow Self) -> Bool {\n",
+            "    let result = self.flag and self.count < self.limit\n",
+            "    result\n",
+            "  }\n",
+            "  pub fn unknown_field_operand(self: borrow Self) -> I32 {\n",
+            "    let total = (1 + self.missing) * self.limit\n",
+            "    total\n",
+            "  }\n",
+            "  pub fn mixed_field_operand(self: borrow Self) -> I32 {\n",
+            "    let total = self.count + self.missing\n",
+            "    total\n",
+            "  }\n",
+            "  pub fn call_arg_field_operand(self: borrow Self) -> I32 {\n",
+            "    let total = ident(self.count) + self.limit\n",
+            "    total\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single inherent method collects");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let members = results.owners()[0].members();
+        assert_eq!(members.len(), 7);
+
+        // Known self fields in operand position desugar to `let t = self.f`
+        // bindings, so pairs, nested operands, tails, and logical
+        // comparison leaves all check cleanly.
+        for index in [0, 1, 2, 3] {
+            let check = members[index]
+                .body_type_check()
+                .expect("self-field operand body check has an independent result");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "member {index} with self-field operands should be checked: {check:#?}"
+            );
+            let type_results = members[index]
+                .primitive_body_type_results()
+                .expect("self-field operand projection succeeds")
+                .expect("self-field operand body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, type_results);
+        }
+
+        // A known field next to an unknown one keeps the unknown-field
+        // diagnostic and the Error-type recovery instead of gating.
+        let check = members[5]
+            .body_type_check()
+            .expect("mixed-field operand body check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a known+unknown field operand pair should be checked: {check:#?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
+            "the unknown field keeps its diagnostic: {diagnostics:#?}"
+        );
+        let type_results = members[5]
+            .primitive_body_type_results()
+            .expect("mixed-field operand projection succeeds")
+            .expect("mixed-field operand body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, type_results);
+
+        // Nested tainted subtrees stay gated: the error-recovery slice
+        // covers tainted operand roots (`let x = 1 + self.missing`), not an
+        // unknown field inside a nested operand tree.
+        // Call arguments also keep the direct-call argument boundary —
+        // `ident(self.count)` is not a supported argument shape.
+        for index in [4, 6] {
+            let check = members[index]
+                .body_type_check()
+                .expect("boundary member body check has an independent result");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "member {index} exceeds the operand slice and stays gated: {check:#?}"
+            );
+        }
     }
 
     #[test]

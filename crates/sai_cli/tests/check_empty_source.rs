@@ -3320,6 +3320,20 @@ fn public_inherent_method_returns_primitive_field_as_tail() {
 }
 
 #[test]
+fn public_inherent_method_reads_field_as_operator_operand() {
+    let source = concat!(
+        "type Counter { marker: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn add_one(self: borrow Self) -> I32 {\n",
+        "        let result = self.marker + 1\n",
+        "        result\n",
+        "    }\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
 fn public_inherent_method_tail_field_mismatch_reports_the_field_span() {
     let source = concat!(
         "type Counter { count: I32 }\n",
@@ -4298,18 +4312,6 @@ fn unsupported_inherent_method_shapes_remain_gated() {
                 "    pub fn add_one(self: borrow Self, value: I32) -> I32 {\n",
                 "        let receiver_copy = self\n",
                 "        let result = value + 1\n",
-                "        result\n",
-                "    }\n",
-                "}\n",
-            ),
-        ),
-        (
-            "known receiver field in an operator",
-            concat!(
-                "type Counter { marker: I32 }\n",
-                "impl Counter {\n",
-                "    pub fn add_one(self: borrow Self) -> I32 {\n",
-                "        let result = self.marker + 1\n",
                 "        result\n",
                 "    }\n",
                 "}\n",
