@@ -3631,6 +3631,20 @@ fn unknown_direct_self_fields_in_binary_initializer_operands_are_diagnosed() {
             ),
             "missing",
         ),
+        (
+            "nested tainted operand",
+            concat!(
+                "type User { count: I32 }\n",
+                "impl User {\n",
+                "    pub fn add_one(self: borrow Self) -> I32 {\n",
+                "        let count: I32 = 1\n",
+                "        let result = (self.missing + count) + 1\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            "missing",
+        ),
     ];
 
     for (label, source, expected_field) in cases {
@@ -3771,33 +3785,18 @@ fn unknown_direct_self_field_keeps_known_bitwise_operator_errors() {
 
 #[test]
 fn unknown_direct_self_fields_in_unsupported_binary_shapes_stay_gated() {
-    let cases = [
-        (
-            "nested binary operand",
-            concat!(
-                "type User { count: I32 }\n",
-                "impl User {\n",
-                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
-                "        let count: I32 = 1\n",
-                "        let result = (self.missing + count) + 1\n",
-                "        result\n",
-                "    }\n",
-                "}\n",
-            ),
+    let cases = [(
+        "unsupported arithmetic sibling",
+        concat!(
+            "type User { count: I32 }\n",
+            "impl User {\n",
+            "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+            "        let result = self.missing + true\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
         ),
-        (
-            "unsupported arithmetic sibling",
-            concat!(
-                "type User { count: I32 }\n",
-                "impl User {\n",
-                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
-                "        let result = self.missing + true\n",
-                "        result\n",
-                "    }\n",
-                "}\n",
-            ),
-        ),
-    ];
+    )];
 
     for (shape, source) in cases {
         let output = run_check(source, "", &[], &[]);
@@ -3812,7 +3811,7 @@ fn unknown_direct_self_fields_in_unsupported_binary_shapes_stay_gated() {
 }
 
 #[test]
-fn unknown_direct_self_field_does_not_enable_nested_operator_shapes() {
+fn unknown_direct_self_field_diagnoses_nested_tainted_operands() {
     let source = concat!(
         "type User { name: I32 }\n",
         "impl User {\n",
@@ -3827,10 +3826,15 @@ fn unknown_direct_self_field_does_not_enable_nested_operator_shapes() {
     let output = run_check(source, "", &[], &[]);
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "an error-typed local inside a nested operand tree keeps its field diagnostic:\n{stdout}"
+    );
     assert!(
-        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
             && !stdout.contains("\"type\":\"result\""),
-        "an unknown local must not make a nested unsupported body shape appear checked:\n{stdout}"
+        "a nested tainted operand is recovered instead of gated:\n{stdout}"
     );
 }
 
@@ -3863,7 +3867,7 @@ fn unknown_direct_self_fields_in_both_operands_do_not_add_a_feature_gate() {
 }
 
 #[test]
-fn unknown_direct_self_field_does_not_enable_compound_unary_shapes() {
+fn unknown_direct_self_field_recovers_compound_unary_shapes() {
     let source = concat!(
         "type User { name: I32 }\n",
         "impl User {\n",
@@ -3878,10 +3882,15 @@ fn unknown_direct_self_field_does_not_enable_compound_unary_shapes() {
     let output = run_check(source, "", &[], &[]);
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "an error inside a compound unary operand keeps its field diagnostic:\n{stdout}"
+    );
     assert!(
-        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
             && !stdout.contains("\"type\":\"result\""),
-        "an error inside a compound unary operand must preserve the unsupported-shape gate:\n{stdout}"
+        "a tainted subtree under `not` is recovered instead of gated:\n{stdout}"
     );
 }
 

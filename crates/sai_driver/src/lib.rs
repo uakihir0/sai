@@ -89875,8 +89875,24 @@ property "shared"() {}
             "    let total = self.count + self.missing\n",
             "    total\n",
             "  }\n",
+            "  pub fn tainted_comparison_leaf(self: borrow Self) -> Bool {\n",
+            "    let result = self.count < (1 + self.missing)\n",
+            "    result\n",
+            "  }\n",
+            "  pub fn tainted_logical_leaf(self: borrow Self) -> Bool {\n",
+            "    let result = self.flag and self.limit < (1 + self.missing)\n",
+            "    result\n",
+            "  }\n",
+            "  pub fn tainted_right_subtree(self: borrow Self) -> I32 {\n",
+            "    let total = self.count * (self.missing + self.limit)\n",
+            "    total\n",
+            "  }\n",
             "  pub fn call_arg_field_operand(self: borrow Self) -> I32 {\n",
             "    let total = ident(self.count) + self.limit\n",
+            "    total\n",
+            "  }\n",
+            "  pub fn clean_nested_in_tainted(self: borrow Self) -> I32 {\n",
+            "    let total = self.missing + self.count * 2\n",
             "    total\n",
             "  }\n",
             "}\n",
@@ -89895,7 +89911,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 7);
+        assert_eq!(members.len(), 11);
 
         // Known self fields in operand position desugar to `let t = self.f`
         // bindings, so pairs, nested operands, tails, and logical
@@ -89915,32 +89931,37 @@ property "shared"() {}
             assert_primitive_type_result_parity(&database, type_results);
         }
 
-        // A known field next to an unknown one keeps the unknown-field
-        // diagnostic and the Error-type recovery instead of gating.
-        let check = members[5]
-            .body_type_check()
-            .expect("mixed-field operand body check has an independent result");
-        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
-            panic!("a known+unknown field operand pair should be checked: {check:#?}");
-        };
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
-            "the unknown field keeps its diagnostic: {diagnostics:#?}"
-        );
-        let type_results = members[5]
-            .primitive_body_type_results()
-            .expect("mixed-field operand projection succeeds")
-            .expect("mixed-field operand body publishes primitive facts");
-        assert_primitive_type_result_parity(&database, type_results);
+        // Tainted subtrees nested inside operand trees — an unknown field
+        // inside a nested binary, comparison, logical leaf, or unary
+        // operand — keep the unknown-field diagnostic and the Error-type
+        // recovery instead of gating.
+        for index in [4, 5, 6, 7, 8] {
+            let check = members[index]
+                .body_type_check()
+                .expect("tainted-operand body check has an independent result");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!(
+                    "member {index} with a nested tainted operand should be checked: {check:#?}"
+                );
+            };
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
+                "member {index} keeps the unknown-field diagnostic: {diagnostics:#?}"
+            );
+            let type_results = members[index]
+                .primitive_body_type_results()
+                .expect("tainted-operand projection succeeds")
+                .expect("tainted-operand body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, type_results);
+        }
 
-        // Nested tainted subtrees stay gated: the error-recovery slice
-        // covers tainted operand roots (`let x = 1 + self.missing`), not an
-        // unknown field inside a nested operand tree.
-        // Call arguments also keep the direct-call argument boundary —
-        // `ident(self.count)` is not a supported argument shape.
-        for index in [4, 6] {
+        // Call arguments keep the direct-call argument boundary —
+        // `ident(self.count)` is not a supported argument shape. A clean
+        // nested operand tree next to the tainted one also stays gated:
+        // recovery does not evaluate clean nested operand types.
+        for index in [9, 10] {
             let check = members[index]
                 .body_type_check()
                 .expect("boundary member body check has an independent result");

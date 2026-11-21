@@ -5570,6 +5570,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                     Ok(())
                 }
+                ExprKind::Unary(UnOp::Not, operand)
+                    if self.expression_has_unknown_field_error(operand)
+                        && self.is_supported_error_tainted_operand(operand) =>
+                {
+                    Ok(())
+                }
                 _ => Err(()),
             };
         };
@@ -5870,33 +5876,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         left_has_error: bool,
         right_has_error: bool,
     ) -> bool {
-        let is_path = |expression: &Expr<'hir>| {
-            matches!(expression.kind, ExprKind::Path(_))
-                && self.check_local_path(expression).is_ok()
-        };
-        let is_self_field = |expression: &Expr<'hir>| {
-            matches!(expression.kind, ExprKind::Field { .. })
-                && (self
-                    .input
-                    .self_field_projections
-                    .is_some_and(|fields| fields.contains_key(&expression.hir_id))
-                    || self
-                        .input
-                        .unknown_self_fields
-                        .is_some_and(|fields| fields.contains(&expression.hir_id)))
-        };
-        let is_path_or_unknown_field =
-            |expression: &Expr<'hir>| is_path(expression) || is_self_field(expression);
         let is_literal = |expression: &Expr<'hir>| {
             matches!(
                 expression.kind,
                 ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some()
             )
         };
-        let is_path_or_literal =
-            |expression: &Expr<'hir>| is_path(expression) || is_literal(expression);
-        let is_path_literal_or_unknown_field =
-            |expression: &Expr<'hir>| is_path_or_literal(expression) || is_self_field(expression);
         let primitive_path = |expression: &Expr<'hir>| self.known_recovery_operand_type(expression);
         let literal_kind = |expression: &Expr<'hir>| match expression.kind {
             ExprKind::Lit(literal) => primitive_literal_kind(literal),
@@ -5931,17 +5916,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             primitive_path(expression).is_some() || literal_kind(expression).is_some()
         };
 
+        let is_supported_operand =
+            |expression: &Expr<'hir>| self.is_supported_error_tainted_operand(expression);
         let shape_is_supported = match operator {
             BinOp::And | BinOp::Or => {
-                self.error_tainted_logical_operand_shape(
-                    left,
-                    &is_path_or_unknown_field,
-                    &is_literal,
-                ) && self.error_tainted_logical_operand_shape(
-                    right,
-                    &is_path_or_unknown_field,
-                    &is_literal,
-                )
+                self.error_tainted_logical_operand_shape(left, &is_supported_operand, &is_literal)
+                    && self.error_tainted_logical_operand_shape(
+                        right,
+                        &is_supported_operand,
+                        &is_literal,
+                    )
             }
             BinOp::Shl | BinOp::Shr => {
                 let supported_left_literal = matches!(
@@ -5958,13 +5942,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         if primitive_literal_kind(literal)
                             == Some(PrimitiveLiteralKind::Integer)
                 );
-                (is_path_or_unknown_field(left) || supported_left_literal)
-                    && (is_path_or_unknown_field(right) || supported_right_literal)
+                (is_supported_operand(left) || supported_left_literal)
+                    && (is_supported_operand(right) || supported_right_literal)
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                (is_path_or_unknown_field(left) && is_path_or_unknown_field(right))
-                    || (is_path_or_unknown_field(left) && is_literal(right))
-                    || (is_literal(left) && is_path_or_unknown_field(right))
+                is_supported_operand(left) && is_supported_operand(right)
             }
             BinOp::Add
             | BinOp::Sub
@@ -5976,9 +5958,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             | BinOp::WrapMul
             | BinOp::BitAnd
             | BinOp::BitOr
-            | BinOp::BitXor => {
-                is_path_literal_or_unknown_field(left) && is_path_literal_or_unknown_field(right)
-            }
+            | BinOp::BitXor => is_supported_operand(left) && is_supported_operand(right),
         };
         if !shape_is_supported {
             return false;
@@ -6036,6 +6016,58 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     && (left_has_error || clean_operand_is_comparable(left))
                     && (right_has_error || clean_operand_is_comparable(right))
             }
+        }
+    }
+
+    /// Operand admission inside an error-tainted expression: the
+    /// checker-side mirror of the driver's
+    /// `primitive_nested_operand_shape_is_supported` — literals, local
+    /// paths, `self` fields (known or unknown), `not`/`~`/`-` over leaf
+    /// operands, and nested binary trees over any primitive-local binary
+    /// operator. Calls stay gated: recovery has no call operand types to
+    /// evaluate them with.
+    fn is_supported_error_tainted_operand(&self, expression: &Expr<'hir>) -> bool {
+        match expression.kind {
+            ExprKind::Lit(literal) => primitive_literal_kind(literal).is_some(),
+            ExprKind::Path(_) => self.check_local_path(expression).is_ok(),
+            ExprKind::Field { .. } => {
+                self.input
+                    .self_field_projections
+                    .is_some_and(|fields| fields.contains_key(&expression.hir_id))
+                    || self
+                        .input
+                        .unknown_self_fields
+                        .is_some_and(|fields| fields.contains(&expression.hir_id))
+            }
+            ExprKind::Unary(UnOp::Not, operand) => self.error_tainted_logical_operand_shape(
+                operand,
+                &|expression| self.is_supported_error_tainted_operand(expression),
+                &|expression| {
+                    matches!(
+                        expression.kind,
+                        ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some()
+                    )
+                },
+            ),
+            // Mirrors the driver's unary-operand admission exactly:
+            // `-` over a local path, `~` over a local path or an
+            // integer/byte literal. Field receivers stay gated there.
+            ExprKind::Unary(UnOp::Neg, operand) => {
+                matches!(operand.kind, ExprKind::Path(_)) && self.check_local_path(operand).is_ok()
+            }
+            ExprKind::Unary(UnOp::BitNot, operand) => match operand.kind {
+                ExprKind::Lit(literal) => matches!(
+                    primitive_literal_kind(literal),
+                    Some(PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::Byte)
+                ),
+                ExprKind::Path(_) => self.check_local_path(operand).is_ok(),
+                _ => false,
+            },
+            ExprKind::Binary(_, left, right) => {
+                self.is_supported_error_tainted_operand(left)
+                    && self.is_supported_error_tainted_operand(right)
+            }
+            _ => false,
         }
     }
 
