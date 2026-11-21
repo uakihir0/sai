@@ -9176,6 +9176,7 @@ fn primitive_nested_operand_shape_is_supported(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
     unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     match operand.kind {
         ExprKind::Lit(_) => is_direct_function_scalar_literal(operand),
@@ -9184,6 +9185,26 @@ fn primitive_nested_operand_shape_is_supported(
         ExprKind::Field { .. } => {
             unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
         }
+        // A call operand desugars to `let t = f(..)`, so it mirrors the
+        // initializer-position call admission: a resolved signature plus
+        // direct-call argument shapes.
+        ExprKind::Call {
+            args, base: None, ..
+        } => direct_call_signatures
+            .and_then(|signatures| signatures.get(&operand.hir_id))
+            .is_some_and(|signature| {
+                args.iter()
+                    .take(signature.parameters.len())
+                    .all(|argument| {
+                        is_supported_direct_call_argument_shape(
+                            argument.expr,
+                            preceding_bindings,
+                            locals,
+                            inputs,
+                            direct_call_signatures,
+                        )
+                    })
+            }),
         ExprKind::Binary(operator, left, right)
             if is_function_primitive_local_binary_operator(operator) =>
         {
@@ -9193,12 +9214,14 @@ fn primitive_nested_operand_shape_is_supported(
                 locals,
                 inputs,
                 unknown_self_fields,
+                direct_call_signatures,
             ) && primitive_nested_operand_shape_is_supported(
                 right,
                 preceding_bindings,
                 locals,
                 inputs,
                 unknown_self_fields,
+                direct_call_signatures,
             )
         }
         _ => false,
@@ -9372,6 +9395,7 @@ fn primitive_value_expression_shape_is_supported(
                         locals,
                         inputs,
                         unknown_self_fields,
+                        direct_call_signatures,
                     )
             };
             let supported_shape = match operator {
@@ -11772,65 +11796,370 @@ fn direct_primitive_call_sites(
     let ExprKind::Block(block) = body.value.kind else {
         return calls;
     };
-    let mut index_root_and_one_level_arguments = |expression: &HirExpr<'_>| {
-        let Some(signature) = direct_primitive_call_site(
-            expression,
+    index_direct_call_sites_in_block(
+        block,
+        module_paths,
+        signatures,
+        requesting_package,
+        inputs,
+        &mut calls,
+    );
+    calls
+}
+
+fn index_direct_call_sites_in_block(
+    block: &HirBlock<'_>,
+    module_paths: &ModuleResolution,
+    signatures: &HashMap<DefId, PrimitiveFunctionCallSignature>,
+    requesting_package: PackageId,
+    inputs: &CurrentOwnerInputs,
+    calls: &mut HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>,
+) {
+    for statement in block.stmts {
+        match statement.kind {
+            StmtKind::Let { init, els, .. } => {
+                index_direct_call_sites_in_expression(
+                    init,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+                if let Some(els) = els {
+                    index_direct_call_sites_in_block(
+                        els,
+                        module_paths,
+                        signatures,
+                        requesting_package,
+                        inputs,
+                        calls,
+                    );
+                }
+            }
+            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                index_direct_call_sites_in_expression(
+                    lhs,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+                index_direct_call_sites_in_expression(
+                    rhs,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+            }
+            StmtKind::Assert { cond, msg, .. } => {
+                index_direct_call_sites_in_expression(
+                    cond,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+                if let Some(msg) = msg {
+                    index_direct_call_sites_in_expression(
+                        msg,
+                        module_paths,
+                        signatures,
+                        requesting_package,
+                        inputs,
+                        calls,
+                    );
+                }
+            }
+            StmtKind::Expr(expression) => index_direct_call_sites_in_expression(
+                expression,
+                module_paths,
+                signatures,
+                requesting_package,
+                inputs,
+                calls,
+            ),
+        }
+    }
+    if let Some(tail) = block.tail {
+        index_direct_call_sites_in_expression(
+            tail,
             module_paths,
             signatures,
             requesting_package,
             inputs,
-        ) else {
-            return;
-        };
-        let argument_count = signature.parameters.len();
+            calls,
+        );
+    }
+}
+
+// A call in operand position desugars to a `let t = f(..)` binding, so
+// every expression subtree contributes its resolvable direct-call sites.
+// Sites the checker never reaches stay inert: admission still gates the
+// positions that consult the map.
+fn index_direct_call_sites_in_expression(
+    expression: &HirExpr<'_>,
+    module_paths: &ModuleResolution,
+    signatures: &HashMap<DefId, PrimitiveFunctionCallSignature>,
+    requesting_package: PackageId,
+    inputs: &CurrentOwnerInputs,
+    calls: &mut HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>,
+) {
+    if let Some(signature) = direct_primitive_call_site(
+        expression,
+        module_paths,
+        signatures,
+        requesting_package,
+        inputs,
+    ) {
         calls.insert(expression.hir_id, signature);
-        let ExprKind::Call {
-            args, base: None, ..
-        } = expression.kind
-        else {
-            return;
-        };
-        for argument in args.iter().take(argument_count) {
-            if matches!(argument.expr.kind, ExprKind::Call { .. })
-                && let Some(nested_signature) = direct_primitive_call_site(
+    }
+    match expression.kind {
+        ExprKind::Field { base, .. }
+        | ExprKind::TupleField { base, .. }
+        | ExprKind::Unary(_, base)
+        | ExprKind::Borrow(_, base)
+        | ExprKind::Try(base)
+        | ExprKind::Await(base)
+        | ExprKind::AsCast { operand: base, .. } => index_direct_call_sites_in_expression(
+            base,
+            module_paths,
+            signatures,
+            requesting_package,
+            inputs,
+            calls,
+        ),
+        ExprKind::Index(base, index) => {
+            index_direct_call_sites_in_expression(
+                base,
+                module_paths,
+                signatures,
+                requesting_package,
+                inputs,
+                calls,
+            );
+            index_direct_call_sites_in_expression(
+                index,
+                module_paths,
+                signatures,
+                requesting_package,
+                inputs,
+                calls,
+            );
+        }
+        ExprKind::Binary(_, left, right) => {
+            index_direct_call_sites_in_expression(
+                left,
+                module_paths,
+                signatures,
+                requesting_package,
+                inputs,
+                calls,
+            );
+            index_direct_call_sites_in_expression(
+                right,
+                module_paths,
+                signatures,
+                requesting_package,
+                inputs,
+                calls,
+            );
+        }
+        ExprKind::Range { start, end, .. } => {
+            for operand in [start, end].into_iter().flatten() {
+                index_direct_call_sites_in_expression(
+                    operand,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+            }
+        }
+        ExprKind::Call {
+            callee, args, base, ..
+        } => {
+            index_direct_call_sites_in_expression(
+                callee,
+                module_paths,
+                signatures,
+                requesting_package,
+                inputs,
+                calls,
+            );
+            for argument in args {
+                index_direct_call_sites_in_expression(
                     argument.expr,
                     module_paths,
                     signatures,
                     requesting_package,
                     inputs,
-                )
-            {
-                calls.insert(argument.expr.hir_id, nested_signature);
+                    calls,
+                );
+            }
+            if let Some(base) = base {
+                index_direct_call_sites_in_expression(
+                    base,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
             }
         }
-    };
-    for statement in block.stmts {
-        let expression = match statement.kind {
-            StmtKind::Let { init, .. } | StmtKind::Expr(init) => init,
-            StmtKind::Assign { rhs, .. } | StmtKind::AssignOp { rhs, .. } => rhs,
-            _ => continue,
-        };
-        let expression = primitive_call_site_root(expression);
-        if matches!(expression.kind, ExprKind::Call { .. }) {
-            index_root_and_one_level_arguments(expression);
+        ExprKind::ContractOld { args, base } => {
+            for argument in args {
+                index_direct_call_sites_in_expression(
+                    argument.expr,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+            }
+            if let Some(base) = base {
+                index_direct_call_sites_in_expression(
+                    base,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+            }
         }
-    }
-    if let Some(tail) = block.tail {
-        let tail = primitive_call_site_root(tail);
-        if matches!(tail.kind, ExprKind::Call { .. }) {
-            index_root_and_one_level_arguments(tail);
+        ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
+            for element in elements {
+                index_direct_call_sites_in_expression(
+                    element,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+            }
         }
-    }
-    calls
-}
-
-fn primitive_call_site_root<'hir>(expression: &'hir HirExpr<'hir>) -> &'hir HirExpr<'hir> {
-    match expression.kind {
-        ExprKind::Return(Some(value))
-        | ExprKind::Break {
-            value: Some(value), ..
-        } => value,
-        _ => expression,
+        ExprKind::Block(block)
+        | ExprKind::AsyncBlock { block, .. }
+        | ExprKind::Region { block, .. } => index_direct_call_sites_in_block(
+            block,
+            module_paths,
+            signatures,
+            requesting_package,
+            inputs,
+            calls,
+        ),
+        ExprKind::If { cond, then, els } => {
+            index_direct_call_sites_in_expression(
+                cond,
+                module_paths,
+                signatures,
+                requesting_package,
+                inputs,
+                calls,
+            );
+            index_direct_call_sites_in_block(
+                then,
+                module_paths,
+                signatures,
+                requesting_package,
+                inputs,
+                calls,
+            );
+            if let Some(els) = els {
+                index_direct_call_sites_in_expression(
+                    els,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+            }
+        }
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => {
+            index_direct_call_sites_in_expression(
+                scrutinee,
+                module_paths,
+                signatures,
+                requesting_package,
+                inputs,
+                calls,
+            );
+            for arm in arms.iter() {
+                if let Some(guard) = arm.guard {
+                    index_direct_call_sites_in_expression(
+                        guard,
+                        module_paths,
+                        signatures,
+                        requesting_package,
+                        inputs,
+                        calls,
+                    );
+                }
+                index_direct_call_sites_in_expression(
+                    arm.body,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+            }
+        }
+        ExprKind::Loop { body, .. } => index_direct_call_sites_in_block(
+            body,
+            module_paths,
+            signatures,
+            requesting_package,
+            inputs,
+            calls,
+        ),
+        ExprKind::Closure(closure) => index_direct_call_sites_in_block(
+            closure.body,
+            module_paths,
+            signatures,
+            requesting_package,
+            inputs,
+            calls,
+        ),
+        ExprKind::Break { value, .. } | ExprKind::Return(value) => {
+            if let Some(value) = value {
+                index_direct_call_sites_in_expression(
+                    value,
+                    module_paths,
+                    signatures,
+                    requesting_package,
+                    inputs,
+                    calls,
+                );
+            }
+        }
+        ExprKind::FormatString(pieces) => {
+            for piece in pieces.iter() {
+                if let FmtPiece::Arg { expr, .. } = piece {
+                    index_direct_call_sites_in_expression(
+                        expr,
+                        module_paths,
+                        signatures,
+                        requesting_package,
+                        inputs,
+                        calls,
+                    );
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -54243,6 +54572,220 @@ property "shared"() {}
     }
 
     #[test]
+    fn primitive_body_type_results_admit_call_expressions_as_binary_operands() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub fn one() -> I32 { 1 }\n",
+            "pub fn two(value: I32) -> I32 { value + 1 }\n",
+            "pub fn call_left(left: I32) -> I32 {\n",
+            "    let total = one() + left\n",
+            "    total\n",
+            "}\n",
+            "pub fn call_right(left: I32) -> Bool {\n",
+            "    let result = left < one()\n",
+            "    result\n",
+            "}\n",
+            "pub fn call_both() -> I32 {\n",
+            "    let total = one() + two(1)\n",
+            "    total\n",
+            "}\n",
+            "pub fn call_with_arg_operand(left: I32) -> I32 {\n",
+            "    let total = two(left) + one()\n",
+            "    total\n",
+            "}\n",
+            "pub fn call_tail_operand(left: I32) -> I32 {\n",
+            "    one() * left\n",
+            "}\n",
+            "pub fn call_nested_call_operand() -> I32 {\n",
+            "    let total = (one() + one()) * two(2)\n",
+            "    total\n",
+            "}\n",
+            "pub fn call_logical_leaf(flag: Bool, left: I32) -> Bool {\n",
+            "    flag and left < one()\n",
+            "}\n",
+            "pub fn call_logical_init_leaf(flag: Bool, left: I32) -> Bool {\n",
+            "    let result = flag and left < one()\n",
+            "    result\n",
+            "}\n",
+            "pub fn call_unsupported_arg(left: I32) -> I32 {\n",
+            "    let total = two(~left) + one()\n",
+            "    total\n",
+            "}\n",
+            "pub fn unresolved_callee(left: I32) -> I32 {\n",
+            "    let total = missing() + left\n",
+            "    total\n",
+            "}\n",
+            "pub fn id(value: I32) -> I32 { value }\n",
+            "pub fn literal_var_call_arg() -> I32 {\n",
+            "    let x = 1\n",
+            "    let total = x + id(x)\n",
+            "    total\n",
+            "}\n",
+            "pub fn literal_var_call_compare() -> Bool {\n",
+            "    let x = 1\n",
+            "    let result = x == id(x)\n",
+            "    result\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            resolved: &'a FunctionOwnerResolutions,
+            name: &str,
+        ) -> &'a FunctionOwnerResolution {
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            let Some(component) = path.data().last() else {
+                                return false;
+                            };
+                            let DefPathData::ValueNs(symbol) = &component.data else {
+                                return false;
+                            };
+                            database
+                                .symbols
+                                .resolve(*symbol)
+                                .is_ok_and(|resolved| resolved.as_ref() == name)
+                        })
+                })
+                .unwrap_or_else(|| panic!("function `{name}` is resolved"))
+        }
+
+        for (name, expected_type) in [
+            ("call_left", PrimTy::I32),
+            ("call_both", PrimTy::I32),
+            ("call_with_arg_operand", PrimTy::I32),
+            ("call_tail_operand", PrimTy::I32),
+            ("call_nested_call_operand", PrimTy::I32),
+            ("call_unsupported_arg", PrimTy::I32),
+            ("literal_var_call_arg", PrimTy::I32),
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("call operand body check is available")
+            else {
+                panic!("a call expression binary operand in `{name}` is supported");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "the `{name}` call operand checks without diagnostics: {diagnostics:?}"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("call operand results query succeeds")
+                .expect("call operand body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+            assert!(
+                results
+                    .expression_types()
+                    .values()
+                    .all(|ty| *ty == expected_type),
+                "every `{name}` expression fact is {expected_type:?}"
+            );
+        }
+
+        let call_right = owner_named(&database, &resolved, "call_right");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: call_right_diagnostics,
+        } = call_right
+            .body_type_check()
+            .expect("comparison call operand body check is available")
+        else {
+            panic!("a call comparison operand is supported");
+        };
+        assert!(
+            call_right_diagnostics.is_empty(),
+            "the `call_right` call operand checks without diagnostics: {call_right_diagnostics:?}"
+        );
+        let call_right_results = call_right
+            .primitive_body_type_results()
+            .expect("comparison call operand results query succeeds")
+            .expect("comparison call operand body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, call_right_results);
+        assert!(
+            call_right_results
+                .expression_types()
+                .values()
+                .any(|ty| *ty == PrimTy::I32)
+                && call_right_results
+                    .expression_types()
+                    .values()
+                    .any(|ty| *ty == PrimTy::Bool),
+            "the `call_right` facts cover both the call's I32 and the comparison's Bool"
+        );
+
+        let literal_var_compare = owner_named(&database, &resolved, "literal_var_call_compare");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: compare_diagnostics,
+        } = literal_var_compare
+            .body_type_check()
+            .expect("literal-variable call comparison body check is available")
+        else {
+            panic!("a literal-variable call operand comparison is supported");
+        };
+        assert!(
+            compare_diagnostics.is_empty(),
+            "the `literal_var_call_compare` operand checks without diagnostics: {compare_diagnostics:?}"
+        );
+        let compare_results = literal_var_compare
+            .primitive_body_type_results()
+            .expect("literal-variable call comparison results query succeeds")
+            .expect("literal-variable call comparison body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, compare_results);
+
+        let logical_owner = owner_named(&database, &resolved, "call_logical_leaf");
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: logical_diagnostics,
+        } = logical_owner
+            .body_type_check()
+            .expect("logical call operand body check is available")
+        else {
+            panic!("a call comparison operand under `and` in tail position is supported");
+        };
+        assert!(
+            logical_diagnostics.is_empty(),
+            "the `call_logical_leaf` tail checks without diagnostics: {logical_diagnostics:?}"
+        );
+        let logical_results = logical_owner
+            .primitive_body_type_results()
+            .expect("logical call operand results query succeeds")
+            .expect("logical call operand body publishes primitive facts");
+        assert_primitive_type_result_parity(&database, logical_results);
+
+        for name in ["call_logical_init_leaf", "unresolved_callee"] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner.body_type_check().expect("body check is available"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "excluded shape `{name}` remains behind the body checker gate"
+            );
+        }
+    }
+
+    #[test]
     fn primitive_body_type_results_infer_literal_tails() {
         use sai_resolve::prelude::PrimTy;
 
@@ -57756,6 +58299,18 @@ property "shared"() {}
             assert_supported(&database, "arithmetic_call_argument_literal_left", &[]);
         let arithmetic_call_argument_integer_literals =
             assert_supported(&database, "arithmetic_call_argument_integer_literals", &[]);
+        let call_in_operator = assert_supported(&database, "call_in_operator", &[]);
+        let call_in_operator_results = call_in_operator
+            .primitive_body_type_results()
+            .expect("call operand results query succeeds")
+            .expect("call operand body publishes primitive facts");
+        assert!(
+            call_in_operator_results
+                .expression_types()
+                .values()
+                .all(|ty| *ty == PrimTy::I32),
+            "the `apply(input) + 1` call operand facts are I32"
+        );
         let arithmetic_call_argument_float =
             assert_supported(&database, "arithmetic_call_argument_float", &[]);
         let float_literal_pair_call_argument =
@@ -57849,7 +58404,6 @@ property "shared"() {}
             "str_call",
             "shadowed_call",
             "deep_nested_call",
-            "call_in_operator",
             "nested_shadowed_call",
             "nested_generic_unsupported",
             "nested_arithmetic_argument",
