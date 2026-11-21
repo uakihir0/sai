@@ -7940,6 +7940,7 @@ fn check_inherent_method_body_type(
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -8095,7 +8096,7 @@ fn check_inherent_method_body_type(
         &explicit_body,
         locals,
         type_paths,
-        None,
+        direct_call_signatures,
         semantic_types,
         symbols,
         Some(&self_field_projections),
@@ -8177,11 +8178,20 @@ fn inherent_method_primitive_field_types(
     {
         return None;
     }
-    let mut items = source_file.items();
-    let Some(ast::Item::Type(type_decl)) = items.next() else {
-        return None;
-    };
-    let Some(ast::Item::Impl(impl_decl)) = items.next() else {
+    // A method package holds the self type, its inherent `impl`, and any
+    // free helper functions the body calls; other item shapes keep the
+    // unsupported boundary.
+    let mut type_decl = None;
+    let mut impl_decl = None;
+    for item in source_file.items() {
+        match item {
+            ast::Item::Type(decl) if type_decl.is_none() => type_decl = Some(decl),
+            ast::Item::Impl(decl) if impl_decl.is_none() => impl_decl = Some(decl),
+            ast::Item::Function(_) => {}
+            _ => return None,
+        }
+    }
+    let (Some(type_decl), Some(impl_decl)) = (type_decl, impl_decl) else {
         return None;
     };
     let type_name_node = type_decl.name()?;
@@ -8190,8 +8200,7 @@ fn inherent_method_primitive_field_types(
         sai_diagnostics::Span::new(inputs.source.id(), type_name_node.syntax().text_range());
     let struct_def = type_decl.struct_def()?;
     let fields = struct_def.fields()?;
-    if items.next().is_some()
-        || type_decl.attrs().next().is_some()
+    if type_decl.attrs().next().is_some()
         || type_decl
             .syntax()
             .children()
@@ -8732,6 +8741,7 @@ fn check_function_body_primitive_local_block(
                     &preceding_bindings,
                     locals,
                     inputs,
+                    self_field_projections,
                     direct_call_signatures,
                 )
             })
@@ -8876,12 +8886,18 @@ fn is_supported_direct_call_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     match expression.kind {
         ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        // A known self field passes its declared type like a path
+        // argument; unknown fields keep the tainted boundary.
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&expression.hir_id))
+        }
         ExprKind::Unary(UnOp::Not, _) => is_supported_direct_call_not_argument_shape(
             expression,
             preceding_bindings,
@@ -9015,6 +9031,7 @@ fn primitive_logical_init_operand_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
             direct_call_signatures,
         ),
         ExprKind::Unary(UnOp::Not, inner) => primitive_logical_init_operand_shape_is_supported(
@@ -9173,6 +9190,7 @@ fn primitive_direct_call_operand_shape_is_supported(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     let ExprKind::Call {
@@ -9192,6 +9210,7 @@ fn primitive_direct_call_operand_shape_is_supported(
                         preceding_bindings,
                         locals,
                         inputs,
+                        self_field_projections,
                         direct_call_signatures,
                     )
                 })
@@ -9224,6 +9243,7 @@ fn primitive_nested_operand_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            self_field_projections,
             direct_call_signatures,
         ),
         // Unary operands desugar to the same `let t = <unary>` binding the
@@ -9385,6 +9405,7 @@ fn primitive_value_expression_shape_is_supported(
                             &preceding_bindings,
                             locals,
                             inputs,
+                            self_field_projections,
                             direct_call_signatures,
                         )
                     })
@@ -10109,6 +10130,7 @@ fn primitive_if_branch_tail_shape_is_supported(
                             preceding_bindings,
                             locals,
                             inputs,
+                            self_field_projections,
                             direct_call_signatures,
                         )
                     })
@@ -31947,6 +31969,13 @@ impl RootDatabase {
             })
             .collect::<Vec<_>>();
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let primitive_function_call_signatures = self.index_direct_primitive_function_signatures(
+            collection,
+            snapshot,
+            &top_level_owner_index,
+            &module_members,
+            source_graph_packages,
+        );
         let mut owners = Vec::with_capacity(descriptors.len());
 
         for descriptor in descriptors {
@@ -32210,6 +32239,23 @@ impl RootDatabase {
                                     let resolved_type_paths = type_path_resolution
                                         .as_ref()
                                         .and_then(|result| result.as_ref().ok());
+                                    let mut module = resolve_owner_module_paths(
+                                        &locals,
+                                        module_scope,
+                                        &generic_parameters,
+                                    );
+                                    // Method bodies index direct-call sites
+                                    // through the same module-path map
+                                    // function bodies use, so field
+                                    // arguments pass their declared type
+                                    // into a callee.
+                                    let direct_call_signatures = direct_primitive_call_sites(
+                                        body,
+                                        &module,
+                                        &primitive_function_call_signatures,
+                                        collection.module_tree.package,
+                                        &inputs,
+                                    );
                                     body_type_check = if descriptor.kind == TopLevelOwnerKind::Impl
                                     {
                                         check_inherent_method_body_type(
@@ -32218,6 +32264,7 @@ impl RootDatabase {
                                             body,
                                             &locals,
                                             resolved_type_paths,
+                                            Some(&direct_call_signatures),
                                             &self.semantic_types,
                                             &self.symbols,
                                             &inputs,
@@ -32228,11 +32275,6 @@ impl RootDatabase {
                                     } else {
                                         Ok(FunctionBodyTypeCheck::Unsupported)
                                     };
-                                    let mut module = resolve_owner_module_paths(
-                                        &locals,
-                                        module_scope,
-                                        &generic_parameters,
-                                    );
                                     match collect_test_only_reference_diagnostics(
                                         member_owner,
                                         &locals.deferred_paths,
@@ -90254,6 +90296,101 @@ property "shared"() {}
             assert!(
                 diagnostics.iter().any(|diagnostic| diagnostic.code == code),
                 "member 10 keeps {code:?} alongside the field error: {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_call_over_self_fields() {
+        let root = concat!(
+            "type Counter { count: I32, flag: Bool }\n",
+            "pub fn bump(value: I32) -> I32 { value + 1 }\n",
+            "pub fn gate(flag: Bool) -> Bool { flag }\n",
+            "impl Counter {\n",
+            "  pub fn call_field_init(self: borrow Self) -> I32 {\n",
+            "    let x = bump(self.count)\n",
+            "    x\n",
+            "  }\n",
+            "  pub fn call_field_tail(self: borrow Self) -> I32 {\n",
+            "    bump(self.count)\n",
+            "  }\n",
+            "  pub fn call_field_operand(self: borrow Self) -> I32 {\n",
+            "    let x = 1 + bump(self.count)\n",
+            "    x\n",
+            "  }\n",
+            "  pub fn call_bool_field(self: borrow Self) -> Bool {\n",
+            "    gate(self.flag)\n",
+            "  }\n",
+            "  pub fn call_field_mismatch(self: borrow Self) -> Bool {\n",
+            "    gate(self.count)\n",
+            "  }\n",
+            "  pub fn call_unknown_field(self: borrow Self) -> I32 {\n",
+            "    bump(self.missing)\n",
+            "  }\n",
+            "  pub fn call_field_inside_arg(self: borrow Self) -> I32 {\n",
+            "    bump(self.count + 1)\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("call-over-field methods collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let members = results.owners()[0].members();
+        assert_eq!(members.len(), 7);
+
+        // `bump(self.count)` desugars the argument to a `let t = self.count`
+        // binding, so field arguments check like path arguments in
+        // initializers, tails, and operand-position calls.
+        for index in [0, 1, 2, 3] {
+            let check = members[index]
+                .body_type_check()
+                .expect("call-over-field body check has an independent result");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "member {index} should be checked cleanly: {check:#?}"
+            );
+            let type_results = members[index]
+                .primitive_body_type_results()
+                .expect("call-over-field projection succeeds")
+                .expect("call-over-field body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, type_results);
+        }
+
+        // `gate(self.count)` reports the parameter mismatch like
+        // `gate(count)` does.
+        let check = members[4]
+            .body_type_check()
+            .expect("mismatched field argument check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a mismatched field argument should be checked: {check:#?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch),
+            "a mismatched field argument reports the parameter type: {diagnostics:#?}"
+        );
+
+        // `bump(self.missing)` and `bump(self.count + 1)` stay outside the
+        // slice — unknown fields in arguments keep the tainted boundary,
+        // and field expressions inside argument trees remain gated.
+        for index in [5, 6] {
+            let check = members[index]
+                .body_type_check()
+                .expect("out-of-slice call check has an independent result");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "member {index} exceeds the field-argument slice and stays gated: {check:#?}"
             );
         }
     }
