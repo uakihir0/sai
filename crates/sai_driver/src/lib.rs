@@ -9778,6 +9778,25 @@ fn primitive_value_expression_shape_is_supported(
                 return false;
             }
         }
+        // A `{ ...; e }` block in value position (`let x = { 1 }`,
+        // `x = { let y = 2\n y }`, `return { 1 }`) admits the same
+        // inner-block shape as a nested tail: statements through the
+        // per-statement predicate, the tail through the nested-tail
+        // predicate, bindings scoped to the block.
+        ExprKind::Block(inner) => {
+            return primitive_inner_block_shape_is_supported(
+                inner,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            );
+        }
         _ => return false,
     }
     true
@@ -51913,7 +51932,6 @@ property "shared"() {}
             "negated_result_alias",
             "negated_result_later_constraint",
             "negated_result_alias_later_constraint",
-            "deep_nested_source",
             "forward_source",
             "global_source",
         ] {
@@ -52476,7 +52494,6 @@ property "shared"() {}
             "compound_operand",
             "global_source",
             "forward_source",
-            "deep_nested_source",
         ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
@@ -90889,6 +90906,22 @@ property "shared"() {}
             "pub fn inner_assert_stmt_tail() -> I32 {\n",
             "    { let x = 1\n        assert x > 0\n        x }\n",
             "}\n",
+            "pub fn let_block_init() -> I32 {\n",
+            "    let x = { 1 }\n",
+            "    x\n",
+            "}\n",
+            "pub fn let_stmt_block_init() -> I32 {\n",
+            "    let x = { let y = 2\n        y }\n",
+            "    x\n",
+            "}\n",
+            "pub fn let_block_operand() -> I32 {\n",
+            "    let x = 1 + { 2 }\n",
+            "    x\n",
+            "}\n",
+            "pub fn let_empty_block_init() -> I32 {\n",
+            "    let x = {}\n",
+            "    x\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -90909,7 +90942,7 @@ property "shared"() {}
         // tails, deeper nesting, composite `if`/`match`/`loop`/`return`
         // tails, and inner `let` statements all check cleanly. Branch
         // tails admit the same nesting.
-        for index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17] {
+        for index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("nested-block-tail body check has an independent result");
@@ -90928,7 +90961,7 @@ property "shared"() {}
         // the unresolved-binding boundary and an `if` tail without
         // `else` stays gated with the if-tail boundary; supported inner
         // statements (let, expr, assert, assign) admit like flat bodies.
-        for index in [11, 15] {
+        for index in [11, 15, 20, 21] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("gated nested-block-tail check has an independent result");

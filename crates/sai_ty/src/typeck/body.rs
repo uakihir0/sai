@@ -4490,6 +4490,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         }
                     }
                 }
+                // A `{ ...; e }` block in initializer position checks its
+                // statements in scope and its tail like the initializer
+                // itself: the annotation (or the unannotated literal
+                // machinery) applies to the tail expression directly.
+                ExprKind::Block(block) => {
+                    if block.safety != Safety::Safe {
+                        return Err(());
+                    }
+                    let Some(inner_tail) = block.tail else {
+                        return Err(());
+                    };
+                    for stmt in block.stmts {
+                        self.check_stmt(stmt)?;
+                    }
+                    let inner = self.check_initializer_value(inner_tail, annotation)?;
+                    deferred_neg_result = inner.deferred_neg_result;
+                    deferred_bitnot_result = inner.deferred_bitnot_result;
+                    inner.local_type
+                }
                 _ => return Err(()),
             }
         };
@@ -7408,7 +7427,6 @@ fn block_has_primitive_result_taint(
                 tainted_bindings,
             )
         }
-        _ => false,
     }) || block.tail.is_some_and(|tail| {
         expression_has_primitive_result_taint(
             tail,
