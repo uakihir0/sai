@@ -8577,24 +8577,18 @@ fn check_function_body_primitive_local_block(
         }
     }
     let is_supported_block_tail = match tail.kind {
-        ExprKind::Block(inner)
-            if inner.safety == sai_hir::Safety::Safe && inner.stmts.is_empty() =>
-        {
-            inner.tail.is_some_and(|inner_tail| {
-                primitive_nested_block_tail_shape_is_supported(
-                    inner_tail,
-                    &block_bindings,
-                    locals,
-                    inputs,
-                    symbols,
-                    type_paths,
-                    self_field_projections,
-                    unknown_self_fields,
-                    direct_call_signatures,
-                    &mut primitive_types,
-                )
-            })
-        }
+        ExprKind::Block(inner) => primitive_inner_block_shape_is_supported(
+            inner,
+            &block_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            &mut primitive_types,
+        ),
         _ => false,
     };
     let tail_binding = match tail.kind {
@@ -10280,6 +10274,60 @@ fn primitive_if_branch_shape_is_supported(
 /// deferred to the outer function-tail handling and the checker's empty-block
 /// gate rejects them) and composite `if`/`match`/`loop`/`return` tails, which
 /// stay gated with their own admission boundaries.
+// A nested `{ e }` / `{ let s = .. e }` block admits statements only as
+// `let`s for now: their bindings join the set the inner tail may name but
+// are scoped — they never escape into the caller's preceding_bindings.
+fn primitive_inner_block_shape_is_supported(
+    inner: &sai_hir::expressions::Block<'_>,
+    base_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    if inner.safety != sai_hir::Safety::Safe {
+        return false;
+    }
+    let mut inner_bindings = base_bindings.clone();
+    for stmt in inner.stmts {
+        if !matches!(stmt.kind, StmtKind::Let { .. }) {
+            return false;
+        }
+        if !primitive_let_statement_shape_is_supported(
+            stmt,
+            &mut inner_bindings,
+            primitive_types,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+        ) {
+            return false;
+        }
+    }
+    inner.tail.is_some_and(|inner_tail| {
+        primitive_nested_block_tail_shape_is_supported(
+            inner_tail,
+            &inner_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        )
+    })
+}
+
 fn primitive_nested_block_tail_shape_is_supported(
     tail: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
@@ -10335,24 +10383,18 @@ fn primitive_nested_block_tail_shape_is_supported(
                     _ => false,
                 }
         }
-        ExprKind::Block(inner)
-            if inner.safety == sai_hir::Safety::Safe && inner.stmts.is_empty() =>
-        {
-            inner.tail.is_some_and(|inner_tail| {
-                primitive_nested_block_tail_shape_is_supported(
-                    inner_tail,
-                    preceding_bindings,
-                    locals,
-                    inputs,
-                    symbols,
-                    type_paths,
-                    self_field_projections,
-                    unknown_self_fields,
-                    direct_call_signatures,
-                    primitive_types,
-                )
-            })
-        }
+        ExprKind::Block(inner) => primitive_inner_block_shape_is_supported(
+            inner,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         // Composite tails inside a nested block reuse the same admission
         // predicates the top-level tail gate applies — the inner block is
         // statement-free, so the surrounding bindings are unchanged.
@@ -10474,26 +10516,20 @@ fn primitive_if_branch_tail_shape_is_supported(
                     _ => false,
                 }
         }
-        // A nested `{ e }` branch tail admits the nested-tail shapes —
-        // stmt-bearing inner blocks stay gated.
-        ExprKind::Block(inner)
-            if inner.safety == sai_hir::Safety::Safe && inner.stmts.is_empty() =>
-        {
-            inner.tail.is_some_and(|inner_tail| {
-                primitive_nested_block_tail_shape_is_supported(
-                    inner_tail,
-                    preceding_bindings,
-                    locals,
-                    inputs,
-                    symbols,
-                    type_paths,
-                    self_field_projections,
-                    unknown_self_fields,
-                    direct_call_signatures,
-                    primitive_types,
-                )
-            })
-        }
+        // A nested `{ e }` / `{ let s = .. e }` branch tail admits the
+        // nested-tail shapes; non-`let` inner statements stay gated.
+        ExprKind::Block(inner) => primitive_inner_block_shape_is_supported(
+            inner,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         ExprKind::Binary(..) | ExprKind::Lit(_) => true,
         ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
             tail,
@@ -90834,12 +90870,24 @@ property "shared"() {}
             "    { { x } }\n",
             "}\n",
             "pub fn nested_if_tail(value: I32) -> Bool { { if value < 1 { true } else { false } } }\n",
-            "pub fn stmt_inner_block_tail() -> I32 { { let x = 1 x } }\n",
+            "pub fn stmt_inner_block_tail() -> I32 {\n",
+            "    { let x = 1\n        x }\n",
+            "}\n",
+            "pub fn stmt_inner_annotated_tail() -> I32 {\n",
+            "    let flag: Bool = true\n",
+            "    { let x: I32 = if flag { 2 } else { 3 }\n        x + 1 }\n",
+            "}\n",
+            "pub fn stmt_inner_let_chain_tail() -> I32 {\n",
+            "    { let x = 1\n        let y = x + 1\n        y }\n",
+            "}\n",
             "pub fn nested_unknown_path_tail() -> I32 { { missing } }\n",
             "pub fn nested_match_tail(value: I32) -> I32 { { match value { 0 => 0, _ => 1 } } }\n",
             "pub fn nested_loop_tail() -> I32 { { loop { break 1 } } }\n",
             "pub fn nested_return_tail() -> I32 { { return 1 } }\n",
             "pub fn nested_missing_else(value: I32) -> I32 { { if value < 1 { 1 } } }\n",
+            "pub fn inner_expr_stmt_tail() -> I32 {\n",
+            "    { let x = 1\n        x + 1\n        x }\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -90857,9 +90905,10 @@ property "shared"() {}
 
         // A nested `{ e }` tail rechecks `e` against the expected type —
         // literals, paths, operator tails over outer bindings, unary
-        // tails, deeper nesting, and composite `if`/`match`/`loop`/`return`
-        // tails all check cleanly. Branch tails admit the same nesting.
-        for index in [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12] {
+        // tails, deeper nesting, composite `if`/`match`/`loop`/`return`
+        // tails, and inner `let` statements all check cleanly. Branch
+        // tails admit the same nesting.
+        for index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("nested-block-tail body check has an independent result");
@@ -90874,11 +90923,12 @@ property "shared"() {}
             assert_primitive_type_result_parity(&database, type_results);
         }
 
-        // Boundaries: an inner block carrying statements stays gated with
-        // the statement-admission boundary, an unresolvable inner path
-        // tail stays gated with the unresolved-binding boundary, and an
-        // `if` tail without `else` stays gated with the if-tail boundary.
-        for index in [8, 9, 13] {
+        // Boundaries: an unresolvable inner path tail stays gated with
+        // the unresolved-binding boundary, an `if` tail without `else`
+        // stays gated with the if-tail boundary, and an inner block
+        // carrying a non-`let` statement stays gated with the
+        // statement-admission boundary.
+        for index in [11, 15, 16] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("gated nested-block-tail check has an independent result");

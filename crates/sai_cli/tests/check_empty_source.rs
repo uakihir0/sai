@@ -11381,7 +11381,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     for source in [
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
-        "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = value\nvalue\n}\n",
@@ -11466,6 +11465,16 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     assert_success_result(
         run_check(
             "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % (1 + 0)\nfirst\n}\n",
+            "",
+            &[],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
+    assert_success_result(
+        run_check(
+            "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
             "",
             &[],
             &[],
