@@ -9844,3 +9844,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver suite (779) passes; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** The driver mirror's tainted operand predicate excludes `Call` (like the checker) so over-admission is bounded; under-admission degrades to `Unsupported`, not a wrong type. `check_annotated_path` on `Error` is a no-op, so no spurious mismatch diagnostics.
 - **Remaining scope:** Unknown-field unary tails, `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1064 (2026-11-21): Tainted expression tails
+
+- **Decision:** Tainted tails — `-self.missing`, `~self.missing`, `not self.missing`, `self.missing + 1`, and `if`-branch tails like `{ -self.missing }` — recover through the shared tainted path and report `UnknownField` instead of gating the member.
+- **Reason:** `check_expr_value`'s tainted gate admitted only leaf roots (`Path`/`Field`) since IR-1061, because `check_error_tainted_expression` then recovered only leaves. IR-1058 added unary-over-unknown-field recovery and IR-1055/1056 tainted binary trees, so the leaf restriction is obsolete: dropping it lets the shared recovery decide each root shape, and tails now follow statement-position behavior exactly.
+- **Failure boundary and judgment:** Shapes `check_error_tainted_expression` rejects still gate (e.g. calls inside tainted trees). Mirrors admit unknown-field operands only where the checker recovers them (`Unary` tail operand, `if` branch-tail unary operand); binary tails were already admitted.
+- **Review required:** None — applies the existing recovery to the remaining gated position.
+- **Planned verification matrix:** Driver `inherent_method_body_type_check_unary_over_self_fields` — `neg_unknown_field_tail`, `not_unknown_field_tail`, `missing_binary_tail`, `bitnot_unknown_field_tail`, `branch_neg_unknown_tail` supported with `UnknownField`.
+- **Verification:** Pinned Rust 1.99.1, driver suite (779) passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Widening the tainted gate also recovers tainted return values and conditions that route through `check_expr_value` — consistent, since the Error type never produces spurious constraint diagnostics. A tainted tail that recovers reports only the field error; e.g. `if -self.missing` reports `UnknownField` without a `Bool` mismatch, matching `let x: Bool = -self.missing`.
+- **Remaining scope:** `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.

@@ -576,7 +576,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .call_signatures
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
         let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)))
-            || matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Field { .. }) && self.input.self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)));
+            || matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Field { .. }) && (self.input.self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)) || self.input.unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))));
         let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
         let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some());
         let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
@@ -3340,9 +3340,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         expected: PrimTy,
     ) -> Result<LocalType, ()> {
         let local_type = if self.expression_has_unknown_field_error(expression) {
-            if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. }) {
-                return Err(());
-            }
+            // The shared tainted path recovers every root shape
+            // `check_error_tainted_expression` supports — leaf roots
+            // (`self.missing`), unary roots (`-self.missing`), and binary
+            // trees (`self.missing + 1`) — so tails follow the
+            // statement-position recovery.
             self.check_error_tainted_expression(expression)?;
             if let Some(id) = self.error_tainted_literal_variable(expression) {
                 LocalType::ErrorLiteralVariable(id)
