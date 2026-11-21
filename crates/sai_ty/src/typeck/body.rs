@@ -5020,8 +5020,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // kept instead of gating the method.
             if self.expression_has_unknown_field_error(argument.expr) {
                 self.check_error_tainted_expression(argument.expr)?;
+                // Preserve the error literal variable so the parameter
+                // expectation still constrains the tainted literal —
+                // `let n = 300 + self.missing; take_u8(n)` must keep the
+                // out-of-range diagnostic (mirrors `check_expr_value`).
                 let local_type =
-                    LocalType::Error(self.known_error_tainted_result_type(argument.expr));
+                    if let Some(id) = self.error_tainted_literal_variable(argument.expr) {
+                        LocalType::ErrorLiteralVariable(id)
+                    } else {
+                        LocalType::Error(self.known_error_tainted_result_type(argument.expr))
+                    };
                 self.record_expression_type(argument.expr.hir_id, local_type);
                 self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 continue;
