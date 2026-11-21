@@ -704,9 +704,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.deferred_bitnot_result_bindings.insert(binding);
         }
 
+        let provenance = initializer_provenance(init);
+
         if annotation.is_none()
             && matches!(
-                init.kind,
+                provenance.kind,
                 ExprKind::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, _, _)
             )
         {
@@ -724,7 +726,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let has_direct_integer_bitwise_literal_pair = matches!(
-            init.kind,
+            provenance.kind,
             ExprKind::Binary(
                 BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor,
                 left,
@@ -754,7 +756,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let has_direct_integer_addition_literal_pair = matches!(
-            init.kind,
+            provenance.kind,
             ExprKind::Binary(
                 BinOp::Add,
                 left,
@@ -780,7 +782,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let has_direct_integer_subtraction_literal_pair = matches!(
-            init.kind,
+            provenance.kind,
             ExprKind::Binary(
                 BinOp::Sub,
                 left,
@@ -807,7 +809,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let has_direct_integer_multiplication_literal_pair = matches!(
-            init.kind,
+            provenance.kind,
             ExprKind::Binary(
                 BinOp::Mul,
                 left,
@@ -834,7 +836,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let has_direct_integer_division_literal_pair = matches!(
-            init.kind,
+            provenance.kind,
             ExprKind::Binary(
                 BinOp::Div,
                 left,
@@ -860,7 +862,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let has_direct_integer_remainder_literal_pair = matches!(
-            init.kind,
+            provenance.kind,
             ExprKind::Binary(
                 BinOp::Rem,
                 left,
@@ -887,7 +889,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let has_direct_integer_wrapping_literal_pair = matches!(
-            init.kind,
+            provenance.kind,
             ExprKind::Binary(
                 BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul,
                 left,
@@ -913,7 +915,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         if annotation.is_none() {
-            if let ExprKind::Lit(literal) = init.kind {
+            if let ExprKind::Lit(literal) = provenance.kind {
                 match primitive_literal_kind(literal) {
                     Some(PrimitiveLiteralKind::Integer) => {
                         self.direct_unannotated_integer_literals.insert(binding);
@@ -949,7 +951,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.binding_initializer_roots.insert(binding, init.hir_id);
             self.trusted_bindings.insert(binding);
         }
-        if let Some(source_binding) = self.plain_local_path_binding(init) {
+        if let Some(source_binding) = self.plain_local_path_binding(provenance) {
             if self.deferred_neg_result_bindings.contains(&source_binding) {
                 self.deferred_neg_result_bindings.insert(binding);
             }
@@ -965,7 +967,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .contains(&source_binding);
             if can_track_resolved_computed_literal_alias(
                 source_has_resolved_computed_literal_provenance,
-                matches!(init.kind, ExprKind::Path(_)),
+                matches!(provenance.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
                 self.resolved_computed_literal_paths.insert(binding);
@@ -976,7 +978,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .contains(&source_binding);
             if can_track_unannotated_integer_bitwise_pair_alias(
                 source_has_integer_bitwise_pair_provenance,
-                matches!(init.kind, ExprKind::Path(_)),
+                matches!(provenance.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
                 self.unannotated_integer_bitwise_pair_paths.insert(binding);
@@ -987,7 +989,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .contains(&source_binding);
             if can_track_unannotated_integer_addition_pair_alias(
                 source_has_integer_addition_pair_provenance,
-                matches!(init.kind, ExprKind::Path(_)),
+                matches!(provenance.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
                 self.unannotated_integer_addition_pair_paths.insert(binding);
@@ -998,7 +1000,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .contains(&source_binding);
             if can_track_unannotated_integer_subtraction_pair_alias(
                 source_has_integer_subtraction_pair_provenance,
-                matches!(init.kind, ExprKind::Path(_)),
+                matches!(provenance.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
                 self.unannotated_integer_subtraction_pair_paths
@@ -1010,7 +1012,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .contains(&source_binding);
             if can_track_unannotated_integer_multiplication_pair_alias(
                 source_has_integer_multiplication_pair_provenance,
-                matches!(init.kind, ExprKind::Path(_)),
+                matches!(provenance.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
                 self.unannotated_integer_multiplication_pair_paths
@@ -1022,7 +1024,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .contains(&source_binding);
             if can_track_unannotated_integer_division_pair_alias(
                 source_has_integer_division_pair_provenance,
-                matches!(init.kind, ExprKind::Path(_)),
+                matches!(provenance.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
                 self.unannotated_integer_division_pair_paths.insert(binding);
@@ -1033,7 +1035,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .contains(&source_binding);
             if can_track_unannotated_integer_remainder_pair_alias(
                 source_has_integer_remainder_pair_provenance,
-                matches!(init.kind, ExprKind::Path(_)),
+                matches!(provenance.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
                 self.unannotated_integer_remainder_pair_paths
@@ -1045,7 +1047,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .contains(&source_binding);
             if can_track_unannotated_integer_wrapping_pair_alias(
                 source_has_integer_wrapping_pair_provenance,
-                matches!(init.kind, ExprKind::Path(_)),
+                matches!(provenance.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
                 self.unannotated_integer_wrapping_pair_paths.insert(binding);
@@ -1059,7 +1061,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     .contains(&source_binding);
             if can_track_unannotated_integer_literal_alias(
                 source_has_integer_literal_provenance,
-                matches!(init.kind, ExprKind::Path(_)),
+                matches!(provenance.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
                 self.unannotated_integer_literal_aliases.insert(binding);
@@ -1072,7 +1074,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     .contains(&source_binding);
             if can_track_unannotated_float_literal_alias(
                 source_has_float_literal_provenance,
-                matches!(init.kind, ExprKind::Path(_)),
+                matches!(provenance.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
                 self.unannotated_float_literal_aliases.insert(binding);
@@ -7436,6 +7438,21 @@ fn block_has_primitive_result_taint(
             tainted_bindings,
         )
     })
+}
+
+/// The expression a block initializer contributes for provenance: a value
+/// block `{ ...; tail }` behaves as its tail for literal-local, pair, and
+/// alias tracking, so `let x = { 1 }` and `let x = { let y = 1\n  y }`
+/// register the same way `let x = 1` and `let x = y` do.
+fn initializer_provenance<'hir>(init: &'hir Expr<'hir>) -> &'hir Expr<'hir> {
+    let mut expr = init;
+    while let ExprKind::Block(block) = expr.kind {
+        let Some(tail) = block.tail else {
+            break;
+        };
+        expr = tail;
+    }
+    expr
 }
 
 fn can_track_unannotated_float_literal_alias(

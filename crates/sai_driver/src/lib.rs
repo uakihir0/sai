@@ -90922,6 +90922,16 @@ property "shared"() {}
             "    let x = {}\n",
             "    x\n",
             "}\n",
+            "pub fn let_block_init_unary_source() -> I32 {\n",
+            "    let source = { 1 }\n",
+            "    let result = -source\n",
+            "    result\n",
+            "}\n",
+            "pub fn let_stmt_block_init_alias_source() -> I32 {\n",
+            "    let x = { let y = 1\n        y }\n",
+            "    let result = ~x\n",
+            "    result\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -90942,7 +90952,9 @@ property "shared"() {}
         // tails, deeper nesting, composite `if`/`match`/`loop`/`return`
         // tails, and inner `let` statements all check cleanly. Branch
         // tails admit the same nesting.
-        for index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19] {
+        for index in [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 22, 23,
+        ] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("nested-block-tail body check has an independent result");
