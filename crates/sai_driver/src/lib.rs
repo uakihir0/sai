@@ -8562,6 +8562,38 @@ fn check_function_body_primitive_local_block(
             ..
         }
     );
+
+    // A nested `{ e }` block tail admits the same tail shapes as a branch
+    // tail — the inner block must hold only a tail (stmt-bearing inner
+    // blocks stay gated with the statement-admission boundary). Every let
+    // binding in the body precedes the tail.
+    let mut primitive_types = HashMap::new();
+    let mut block_bindings = initial_bindings.keys().copied().collect::<HashSet<_>>();
+    for stmt in block.stmts {
+        if let StmtKind::Let { pat, .. } = stmt.kind {
+            if let PatKind::Binding { binding, .. } = pat.kind {
+                block_bindings.insert(binding);
+            }
+        }
+    }
+    let is_supported_block_tail = match tail.kind {
+        ExprKind::Block(inner)
+            if inner.safety == sai_hir::Safety::Safe && inner.stmts.is_empty() =>
+        {
+            inner.tail.is_some_and(|inner_tail| {
+                primitive_nested_block_tail_shape_is_supported(
+                    inner_tail,
+                    &block_bindings,
+                    locals,
+                    inputs,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                )
+            })
+        }
+        _ => false,
+    };
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -8595,6 +8627,7 @@ fn check_function_body_primitive_local_block(
         ExprKind::Match { .. } if is_supported_match_tail => None,
         ExprKind::Return(..) if is_supported_return_tail => None,
         ExprKind::Loop { .. } if is_supported_loop_tail => None,
+        ExprKind::Block(_) if is_supported_block_tail => None,
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
@@ -8607,6 +8640,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_match_tail
         && !is_supported_return_tail
         && !is_supported_loop_tail
+        && !is_supported_block_tail
     {
         return Ok(None);
     }
@@ -8663,7 +8697,6 @@ fn check_function_body_primitive_local_block(
         }
     }
 
-    let mut primitive_types = HashMap::new();
     let mut preceding_bindings = initial_bindings.keys().copied().collect::<HashSet<_>>();
     for stmt in block.stmts {
         if !primitive_let_statement_shape_is_supported(
@@ -10239,6 +10272,80 @@ fn primitive_if_branch_shape_is_supported(
     })
 }
 
+/// The tail shapes a nested `{ e }` block tail admits inside the primitive
+/// slice: every checker-supported tail except bare paths (path tails are
+/// deferred to the outer function-tail handling and the checker's empty-block
+/// gate rejects them) and composite `if`/`match`/`loop`/`return` tails, which
+/// stay gated with their own admission boundaries.
+fn primitive_nested_block_tail_shape_is_supported(
+    tail: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> bool {
+    match tail.kind {
+        ExprKind::Lit(_) | ExprKind::Binary(..) => true,
+        ExprKind::Field { .. } => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id))
+        }
+        ExprKind::Call {
+            args, base: None, ..
+        } => direct_call_signatures
+            .and_then(|signatures| signatures.get(&tail.hir_id))
+            .is_some_and(|signature| {
+                args.iter()
+                    .take(signature.parameters.len())
+                    .all(|argument| {
+                        is_supported_direct_call_argument_shape(
+                            argument.expr,
+                            preceding_bindings,
+                            locals,
+                            inputs,
+                            self_field_projections,
+                            unknown_self_fields,
+                            direct_call_signatures,
+                        )
+                    })
+            }),
+        ExprKind::Unary(operator, operand) => {
+            matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not)
+                && match operand.kind {
+                    ExprKind::Path(operand_path) => {
+                        resolved_plain_local_path_binding(operand_path, locals, inputs)
+                            .is_some_and(|binding| preceding_bindings.contains(&binding))
+                    }
+                    ExprKind::Field { .. } => {
+                        self_field_projections
+                            .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                            || unknown_self_fields
+                                .is_some_and(|fields| fields.contains(&operand.hir_id))
+                    }
+                    _ => false,
+                }
+        }
+        ExprKind::Block(inner)
+            if inner.safety == sai_hir::Safety::Safe && inner.stmts.is_empty() =>
+        {
+            inner.tail.is_some_and(|inner_tail| {
+                primitive_nested_block_tail_shape_is_supported(
+                    inner_tail,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
 fn primitive_if_branch_tail_shape_is_supported(
     tail: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
@@ -10292,6 +10399,23 @@ fn primitive_if_branch_tail_shape_is_supported(
                     }
                     _ => false,
                 }
+        }
+        // A nested `{ e }` branch tail admits the nested-tail shapes —
+        // stmt-bearing inner blocks stay gated.
+        ExprKind::Block(inner)
+            if inner.safety == sai_hir::Safety::Safe && inner.stmts.is_empty() =>
+        {
+            inner.tail.is_some_and(|inner_tail| {
+                primitive_nested_block_tail_shape_is_supported(
+                    inner_tail,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                )
+            })
         }
         ExprKind::Binary(..) | ExprKind::Lit(_) => true,
         ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
@@ -90600,6 +90724,77 @@ property "shared"() {}
     }
 
     #[test]
+    fn function_body_type_check_nested_block_tails() {
+        let root = concat!(
+            "pub fn nested_literal_tail() -> I32 { { 42 } }\n",
+            "pub fn nested_stmt_tail() -> I32 {\n",
+            "    let x = 1\n",
+            "    { x + 1 }\n",
+            "}\n",
+            "pub fn nested_unary_tail(value: I32) -> I32 { { -value } }\n",
+            "pub fn double_nested_tail() -> I32 { { { 42 } } }\n",
+            "pub fn branch_nested_tail(flag: Bool) -> I32 {\n",
+            "    if flag {\n",
+            "        { 1 }\n",
+            "    } else {\n",
+            "        0\n",
+            "    }\n",
+            "}\n",
+            "pub fn nested_path_tail(value: I32) -> I32 { { value } }\n",
+            "pub fn nested_if_tail(value: I32) -> Bool { { if value < 1 { true } else { false } } }\n",
+            "pub fn stmt_inner_block_tail() -> I32 { { let x = 1 x } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("nested-block-tail functions collect");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        // A nested `{ e }` tail rechecks `e` against the expected type —
+        // literals, operator tails over outer bindings, unary tails and
+        // deeper nesting all check cleanly. Branch tails admit the same
+        // nesting.
+        for index in [0, 1, 2, 3, 4] {
+            let check = resolved.owners()[index]
+                .body_type_check()
+                .expect("nested-block-tail body check has an independent result");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "owner {index} should be checked cleanly: {check:#?}"
+            );
+            let type_results = resolved.owners()[index]
+                .primitive_body_type_results()
+                .expect("nested-block-tail projection succeeds")
+                .expect("nested-block-tail body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, type_results);
+        }
+
+        // Boundaries: an inner `{ value }` path tail is outside the
+        // primitive checker's tail set (plain path tails live in the
+        // function-tail slice), `if`/`match`/`loop`/`return` tails inside
+        // nested blocks stay gated with their own admission boundary, and
+        // an inner block carrying statements stays gated with the
+        // statement-admission boundary.
+        for index in [5, 6, 7] {
+            let check = resolved.owners()[index]
+                .body_type_check()
+                .expect("gated nested-block-tail check has an independent result");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "owner {index} exceeds the nested-tail slice: {check:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn inherent_method_body_type_check_call_over_self_fields() {
         let root = concat!(
             "type Counter { count: I32, flag: Bool, limit: I32, shift: U32 }\n",
@@ -90673,6 +90868,9 @@ property "shared"() {}
             "    let n = 300 + self.missing\n",
             "    take_u8(n)\n",
             "  }\n",
+            "  pub fn call_tainted_shift_literal_arg(self: borrow Self) -> U8 {\n",
+            "    take_u8((256 + 1) << self.missing)\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -90689,7 +90887,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 21);
+        assert_eq!(members.len(), 22);
 
         // Field arguments desugar to `let t = self.f` bindings, so they
         // check like path arguments — bare fields in initializers, tails,
@@ -90793,6 +90991,25 @@ property "shared"() {}
             assert!(
                 diagnostics.iter().any(|diagnostic| diagnostic.code == code),
                 "member 20 keeps {code:?} alongside the field error: {diagnostics:#?}"
+            );
+        }
+
+        // `take_u8((256 + 1) << self.missing)` keeps both the field error
+        // and the `U8` range diagnostic — the clean literal left subtree's
+        // variable is preserved so the parameter still constrains it.
+        let check = members[21]
+            .body_type_check()
+            .expect("tainted shift-literal argument check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a tainted shift-literal argument recovers: {check:#?}");
+        };
+        for code in [
+            sai_diagnostics::Code::UnknownField,
+            sai_diagnostics::Code::LiteralOutOfRange,
+        ] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+                "member 21 keeps {code:?} alongside the field error: {diagnostics:#?}"
             );
         }
 

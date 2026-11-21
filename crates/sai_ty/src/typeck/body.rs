@@ -595,6 +595,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 ..
             }
         );
+        // A nested `{ e }` block tail checks its own tail against the same
+        // expected type — bindings stay scoped to the inner block.
+        let is_supported_block_tail = matches!(
+            tail.kind,
+            ExprKind::Block(inner) if inner.safety == Safety::Safe && inner.stmts.is_empty()
+        );
         if block.stmts.is_empty()
             && !is_supported_field_tail
             && !is_supported_call_tail
@@ -605,6 +611,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             && !is_supported_match_tail
             && !is_supported_return_tail
             && !is_supported_loop_tail
+            && !is_supported_block_tail
         {
             return Err(());
         }
@@ -3361,6 +3368,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         .copied()
                         .ok_or(())?,
                 ),
+                ExprKind::Block(block) => {
+                    self.check_block_expected(block, expected)?;
+                    LocalType::Concrete(expected)
+                }
                 ExprKind::Unary(UnOp::Not, operand) => {
                     // `not e` admits the same operand-position logical
                     // shapes as `let x = not e` (path, `Bool` literal,
@@ -5637,19 +5648,33 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             };
         }
 
-        let ExprKind::Binary(
-            operator @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div),
-            left,
-            right,
-        ) = expression.kind
-        else {
+        let ExprKind::Binary(operator, left, right) = expression.kind else {
             return None;
         };
         if !self.expression_has_unknown_field_error(right) {
             return None;
         }
-        let ExprKind::Lit(literal) = left.kind else {
+        if matches!(operator, BinOp::Shl | BinOp::Shr) {
+            // `lit << self.missing` — the clean left subtree was already
+            // evaluated as an operand by the recovery walker; reuse its
+            // literal variable so the expected type still constrains the
+            // literals (a `256` left of a `U8` shift reports
+            // `LiteralOutOfRange` instead of defaulting to `I64`).
+            return match self.check_operand_local_type(left) {
+                Ok(LocalType::LiteralVariable(id)) => Some(id),
+                _ => None,
+            };
+        }
+        if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
             return None;
+        }
+        let ExprKind::Lit(literal) = left.kind else {
+            // A nested literal-only subtree (`(256 + 1) + self.missing`)
+            // keeps its literal variable the same way.
+            return match self.check_operand_local_type(left) {
+                Ok(LocalType::LiteralVariable(id)) => Some(id),
+                _ => None,
+            };
         };
         let kind = primitive_literal_kind(literal)?;
         if !matches!(
