@@ -5642,24 +5642,41 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                     Ok(())
                 }
-                ExprKind::Unary(UnOp::BitNot, operand)
-                    if matches!(operand.kind, ExprKind::Path(_))
-                        && self.check_local_path(operand).is_ok_and(|local_type| {
-                            matches!(
-                                local_type,
-                                LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
-                            )
+                ExprKind::Unary(operator, operand)
+                    if matches!(operator, UnOp::Neg | UnOp::BitNot)
+                        && (match operand.kind {
+                            ExprKind::Path(_) => {
+                                self.check_local_path(operand).is_ok_and(|local_type| {
+                                    matches!(
+                                        local_type,
+                                        LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
+                                    )
+                                })
+                            }
+                            // `~self.missing` recovers like the path form:
+                            // the driver reports the unknown field; the
+                            // operand type is unrecoverable here, so no
+                            // operator check runs.
+                            ExprKind::Field { .. } => self
+                                .input
+                                .unknown_self_fields
+                                .is_some_and(|fields| fields.contains(&operand.hir_id)),
+                            _ => false,
                         }) =>
                 {
                     if self.has_unresolved_error_literal_path(operand) {
                         return Err(());
                     }
                     if let Some(operand_type) = self.known_recovery_operand_type(operand) {
-                        if !is_bitwise_primitive(operand_type) {
+                        let supported = match operator {
+                            UnOp::Neg => is_neg_primitive(operand_type),
+                            _ => is_bitwise_primitive(operand_type),
+                        };
+                        if !supported {
                             self.errors.push(PrimitiveBodyError {
                                 node: expression.hir_id,
                                 kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
-                                    operator: UnOp::BitNot,
+                                    operator,
                                     operand: operand_type,
                                 },
                             });
@@ -6205,17 +6222,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 },
             ),
             // Mirrors the driver's unary-operand admission exactly:
-            // `-` over a local path or a known self field, `~` over the
-            // same or an integer/byte literal. Unknown fields stay gated —
-            // unary over a field error is outside the tainted slice.
+            // `-` over a local path or a self field, `~` over the same or
+            // an integer/byte literal — known fields check directly,
+            // unknown fields recover through the field-error diagnostic.
             ExprKind::Unary(UnOp::Neg, operand) => {
                 (matches!(operand.kind, ExprKind::Path(_))
                     && self.check_local_path(operand).is_ok())
                     || (matches!(operand.kind, ExprKind::Field { .. })
-                        && self
+                        && (self
                             .input
                             .self_field_projections
-                            .is_some_and(|fields| fields.contains_key(&operand.hir_id)))
+                            .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                            || self
+                                .input
+                                .unknown_self_fields
+                                .is_some_and(|fields| fields.contains(&operand.hir_id))))
             }
             ExprKind::Unary(UnOp::BitNot, operand) => match operand.kind {
                 ExprKind::Lit(literal) => matches!(
@@ -6223,10 +6244,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     Some(PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::Byte)
                 ),
                 ExprKind::Path(_) => self.check_local_path(operand).is_ok(),
-                ExprKind::Field { .. } => self
-                    .input
-                    .self_field_projections
-                    .is_some_and(|fields| fields.contains_key(&operand.hir_id)),
+                ExprKind::Field { .. } => {
+                    self.input
+                        .self_field_projections
+                        .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                        || self
+                            .input
+                            .unknown_self_fields
+                            .is_some_and(|fields| fields.contains(&operand.hir_id))
+                }
                 _ => false,
             },
             ExprKind::Binary(_, left, right) => {

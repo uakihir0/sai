@@ -9243,11 +9243,12 @@ fn primitive_nested_operand_shape_is_supported(
         ExprKind::Unary(UnOp::Neg, inner) => match inner.kind {
             ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
                 .is_some_and(|binding| preceding_bindings.contains(&binding)),
-            // A known self field desugars to `let t = self.f` — its
-            // declared type feeds the operator check directly. Unknown
-            // fields keep the tainted boundary.
+            // A self field desugars to `let t = self.f` — a known field's
+            // declared type feeds the operator check, while an unknown
+            // field recovers through the field-error diagnostic.
             ExprKind::Field { .. } => {
                 self_field_projections.is_some_and(|fields| fields.contains_key(&inner.hir_id))
+                    || unknown_self_fields.is_some_and(|fields| fields.contains(&inner.hir_id))
             }
             _ => false,
         },
@@ -9260,8 +9261,12 @@ fn primitive_nested_operand_shape_is_supported(
                 match inner.kind {
                     ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
                         .is_some_and(|binding| preceding_bindings.contains(&binding)),
-                    ExprKind::Field { .. } => self_field_projections
-                        .is_some_and(|fields| fields.contains_key(&inner.hir_id)),
+                    ExprKind::Field { .. } => {
+                        self_field_projections
+                            .is_some_and(|fields| fields.contains_key(&inner.hir_id))
+                            || unknown_self_fields
+                                .is_some_and(|fields| fields.contains(&inner.hir_id))
+                    }
                     _ => false,
                 }
             }
@@ -9422,6 +9427,7 @@ fn primitive_value_expression_shape_is_supported(
             ExprKind::Field { .. } => {
                 if !self_field_projections
                     .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                    && !unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
                 {
                     return false;
                 }
@@ -9446,6 +9452,8 @@ fn primitive_value_expression_shape_is_supported(
                     ExprKind::Field { .. } => {
                         if !self_field_projections
                             .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                            && !unknown_self_fields
+                                .is_some_and(|fields| fields.contains(&operand.hir_id))
                         {
                             return false;
                         }
@@ -90207,15 +90215,21 @@ property "shared"() {}
             "a negated Bool field reports the operator error: {diagnostics:#?}"
         );
 
-        // Unary operators over UNKNOWN self fields stay outside the
-        // tainted slice — `-self.missing`/`~self.missing` keep the gate.
+        // Unary operators over UNKNOWN self fields recover through the
+        // field-error diagnostic — `let x = -self.missing` and `1 +
+        // ~self.missing` keep the member checkable with `UnknownField`.
         for index in [8, 9] {
             let check = members[index]
                 .body_type_check()
                 .expect("unary-over-unknown-field check has an independent result");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("member {index} recovers through the field error: {check:#?}");
+            };
             assert!(
-                matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "member {index} exceeds the unary slice and stays gated: {check:#?}"
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
+                "member {index} keeps the unknown-field diagnostic: {diagnostics:#?}"
             );
         }
     }
