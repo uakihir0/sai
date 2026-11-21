@@ -7393,6 +7393,21 @@ fn block_has_primitive_result_taint(
                 )
             })
         }
+        StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+            expression_has_primitive_result_taint(
+                lhs,
+                error_nodes,
+                unknown_self_fields,
+                local_paths,
+                tainted_bindings,
+            ) || expression_has_primitive_result_taint(
+                rhs,
+                error_nodes,
+                unknown_self_fields,
+                local_paths,
+                tainted_bindings,
+            )
+        }
         _ => false,
     }) || block.tail.is_some_and(|tail| {
         expression_has_primitive_result_taint(
