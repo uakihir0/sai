@@ -2600,7 +2600,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Bool));
                     PrimTy::Bool
                 }
-                ExprKind::Path(_) => self
+                ExprKind::Path(_) | ExprKind::Field { .. } => self
                     .check_operand_local_type(operand)
                     .ok()
                     .and_then(|local_type| self.concrete_local_type(local_type))
@@ -8799,6 +8799,13 @@ fn is_supported_direct_call_shift_operands(
                 Lit::Int { .. } | Lit::Byte(_) | Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. },
             ),
         ) => true,
+        // A literal left operand also admits a known-field right operand —
+        // the field desugars to a path leaf for the shift-count slot.
+        _ if matches!(left.kind, ExprKind::Lit(Lit::Byte(_) | Lit::Int { .. }))
+            && is_direct_call_known_self_field(right, fields) =>
+        {
+            true
+        }
         _ => false,
     }
 }

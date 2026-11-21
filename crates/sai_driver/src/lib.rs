@@ -11098,10 +11098,13 @@ fn is_supported_direct_call_shift_operands_shape(
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Lit(Lit::Int { .. }) => true,
-        ExprKind::Lit(Lit::Byte(_)) => matches!(
-            left.kind,
-            ExprKind::Path(_) | ExprKind::Lit(Lit::Byte(_) | Lit::Int { .. })
-        ),
+        ExprKind::Lit(Lit::Byte(_)) => {
+            matches!(
+                left.kind,
+                ExprKind::Path(_) | ExprKind::Lit(Lit::Byte(_) | Lit::Int { .. })
+            ) || (matches!(left.kind, ExprKind::Field { .. })
+                && self_field_projections.is_some_and(|fields| fields.contains_key(&left.hir_id)))
+        }
         ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. }) => true,
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&right.hir_id))
@@ -11180,11 +11183,13 @@ fn is_supported_direct_call_bitwise_operands_shape(
         return true;
     }
 
-    let ExprKind::Path(path) = right.kind else {
-        return false;
-    };
-    resolved_plain_local_path_binding(path, locals, inputs)
-        .is_some_and(|binding| preceding_bindings.contains(&binding))
+    match right.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        // A known self field is a path-like right operand for a bound path
+        // left operand (`value & self.count`).
+        _ => is_path_like_leaf(right),
+    }
 }
 
 fn is_supported_direct_call_leaf_argument_shape(
@@ -90405,7 +90410,7 @@ property "shared"() {}
     #[test]
     fn inherent_method_body_type_check_call_over_self_fields() {
         let root = concat!(
-            "type Counter { count: I32, flag: Bool, limit: I32 }\n",
+            "type Counter { count: I32, flag: Bool, limit: I32, shift: U32 }\n",
             "pub fn bump(value: I32) -> I32 { value + 1 }\n",
             "pub fn gate(flag: Bool) -> Bool { flag }\n",
             "impl Counter {\n",
@@ -90453,6 +90458,18 @@ property "shared"() {}
             "  pub fn call_deep_nested_call(self: borrow Self) -> I32 {\n",
             "    bump(bump(bump(self.count)))\n",
             "  }\n",
+            "  pub fn call_logical_field_arg(self: borrow Self) -> Bool {\n",
+            "    gate(self.flag and true)\n",
+            "  }\n",
+            "  pub fn call_bitwise_field_right(self: borrow Self, value: I32) -> I32 {\n",
+            "    bump(value & self.count)\n",
+            "  }\n",
+            "  pub fn call_shift_lit_field(self: borrow Self) -> I32 {\n",
+            "    bump(1 << self.shift)\n",
+            "  }\n",
+            "  pub fn call_shift_field_byte(self: borrow Self) -> I32 {\n",
+            "    bump(self.count << b'0')\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -90469,14 +90486,14 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 14);
+        assert_eq!(members.len(), 18);
 
         // Field arguments desugar to `let t = self.f` bindings, so they
         // check like path arguments — bare fields in initializers, tails,
         // and operand-position calls, and field leaves inside flat
         // argument trees (`self.count + 1`, `-self.count`, `not self.flag`,
         // `self.count << 1`, `self.count < self.limit`).
-        for index in [0, 1, 2, 3, 5, 6, 7, 8, 9, 12] {
+        for index in [0, 1, 2, 3, 5, 6, 7, 8, 9, 12, 14, 15, 16] {
             let check = members[index]
                 .body_type_check()
                 .expect("call-over-field body check has an independent result");
@@ -90504,6 +90521,22 @@ property "shared"() {}
                 .iter()
                 .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch),
             "a mismatched field argument reports the parameter type: {diagnostics:#?}"
+        );
+
+        // `bump(self.count << b'0')` checks but reports the shift-count
+        // mismatch — the field-left/Byte-right pair must not be gated away
+        // before the diagnostic is produced.
+        let check = members[17]
+            .body_type_check()
+            .expect("byte-shift field check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a byte shift count should be checked: {check:#?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch),
+            "a byte shift count reports the count type mismatch: {diagnostics:#?}"
         );
 
         // `bump(self.missing)` and `bump(self.missing + 1)` keep the tainted
