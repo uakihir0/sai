@@ -8543,7 +8543,7 @@ fn check_function_body_primitive_local_block(
             || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
     let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-    let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && (matches!(operand.kind, ExprKind::Path(_)) || (matches!(operand.kind, ExprKind::Field { .. }) && self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)))));
+    let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && (matches!(operand.kind, ExprKind::Path(_)) || (matches!(operand.kind, ExprKind::Field { .. }) && (self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)) || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))))));
     let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
     let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(_));
     let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
@@ -10284,8 +10284,12 @@ fn primitive_if_branch_tail_shape_is_supported(
                         resolved_plain_local_path_binding(operand_path, locals, inputs)
                             .is_some_and(|binding| preceding_bindings.contains(&binding))
                     }
-                    ExprKind::Field { .. } => self_field_projections
-                        .is_some_and(|fields| fields.contains_key(&operand.hir_id)),
+                    ExprKind::Field { .. } => {
+                        self_field_projections
+                            .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                            || unknown_self_fields
+                                .is_some_and(|fields| fields.contains(&operand.hir_id))
+                    }
                     _ => false,
                 }
         }
@@ -90457,6 +90461,22 @@ property "shared"() {}
             "      0\n",
             "    }\n",
             "  }\n",
+            "  pub fn not_unknown_field_tail(self: borrow Self) -> Bool {\n",
+            "    not self.missing\n",
+            "  }\n",
+            "  pub fn missing_binary_tail(self: borrow Self) -> I32 {\n",
+            "    self.missing + 1\n",
+            "  }\n",
+            "  pub fn bitnot_unknown_field_tail(self: borrow Self) -> I32 {\n",
+            "    ~self.missing\n",
+            "  }\n",
+            "  pub fn branch_neg_unknown_tail(self: borrow Self) -> I32 {\n",
+            "    if self.flag {\n",
+            "      -self.missing\n",
+            "    } else {\n",
+            "      0\n",
+            "    }\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -90473,7 +90493,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 16);
+        assert_eq!(members.len(), 20);
 
         // `-self.f`/`~self.f`/`not self.f` desugar to a `let t = self.f`
         // binding, so initializers, nested operands, and field conditions
@@ -90559,16 +90579,24 @@ property "shared"() {}
             );
         }
 
-        // `-self.missing` in tail position stays gated: the tainted
-        // expression path only recovers leaf roots (Path/Field), not a
-        // unary expression whose operand carries the field error.
-        let check = members[14]
-            .body_type_check()
-            .expect("unknown-field unary tail check has an independent result");
-        assert!(
-            matches!(check, FunctionBodyTypeCheck::Unsupported),
-            "member 14 exceeds the unary-field-tail slice and stays gated: {check:#?}"
-        );
+        // Tainted tails recover like statement positions: `-self.missing`,
+        // `~self.missing`, `not self.missing`, `self.missing + 1`, and the
+        // `if`-branch `-self.missing` tail all keep the `UnknownField`
+        // diagnostic instead of gating the member.
+        for index in [14, 16, 17, 18, 19] {
+            let check = members[index]
+                .body_type_check()
+                .expect("tainted tail check has an independent result");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("a tainted tail recovers: {check:#?}");
+            };
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
+                "member {index} keeps the field error: {diagnostics:#?}"
+            );
+        }
     }
 
     #[test]
