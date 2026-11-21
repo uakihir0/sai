@@ -5534,7 +5534,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match expression.kind {
             ExprKind::Path(_) => self.known_recovery_operand_type(expression),
             ExprKind::Unary(UnOp::Not, _) => Some(PrimTy::Bool),
-            ExprKind::Unary(UnOp::BitNot, operand) => self.known_recovery_operand_type(operand),
+            // `Neg`/`BitNot` both return their operand's type, so a
+            // recoverable operand type is the tainted result type.
+            ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand) => {
+                self.known_recovery_operand_type(operand)
+            }
             ExprKind::Binary(
                 BinOp::And
                 | BinOp::Or

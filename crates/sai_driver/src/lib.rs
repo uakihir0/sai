@@ -90150,6 +90150,11 @@ property "shared"() {}
             "    let x = 1 + ~self.missing\n",
             "    x\n",
             "  }\n",
+            "  pub fn neg_bound_unknown_field_init(self: borrow Self) -> Bool {\n",
+            "    let n: I32 = self.missing\n",
+            "    let x: Bool = -n\n",
+            "    x\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -90166,7 +90171,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 10);
+        assert_eq!(members.len(), 11);
 
         // `-self.f`/`~self.f`/`not self.f` desugar to a `let t = self.f`
         // binding, so initializers, nested operands, and field conditions
@@ -90230,6 +90235,25 @@ property "shared"() {}
                     .iter()
                     .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField),
                 "member {index} keeps the unknown-field diagnostic: {diagnostics:#?}"
+            );
+        }
+
+        // `let n: I32 = self.missing` binds `n` as `Error(I32)`, so
+        // `let x: Bool = -n` recovers the operand type and still reports
+        // the `Bool`/`I32` annotation mismatch alongside the field error.
+        let check = members[10]
+            .body_type_check()
+            .expect("negated error-bound local check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a negated error-bound local recovers: {check:#?}");
+        };
+        for code in [
+            sai_diagnostics::Code::UnknownField,
+            sai_diagnostics::Code::TypeMismatch,
+        ] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+                "member 10 keeps {code:?} alongside the field error: {diagnostics:#?}"
             );
         }
     }
