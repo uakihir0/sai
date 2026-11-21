@@ -4168,11 +4168,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             | BinOp::BitXor
                             | BinOp::Shl
                             | BinOp::Shr
-                    ) && (is_integer_primitive(expected) || expected == PrimTy::Byte)
-                        && !self.expression_has_unknown_field_error(left)
+                    ) && !self.expression_has_unknown_field_error(left)
                     {
                         if let Some(id) = self.unresolved_integer_literal_variable(left) {
-                            self.resolve_literal_variable(id, expected)?;
+                            if literal_family_accepts(PrimitiveLiteralKind::Integer, expected) {
+                                self.resolve_literal_variable(id, expected)?;
+                            } else {
+                                // `let x: Byte = (1 + 2) << self.missing`
+                                // reports the annotation mismatch like the
+                                // primary checker instead of gating the
+                                // whole body behind the field error.
+                                self.errors.push(PrimitiveBodyError {
+                                    node: init.hir_id,
+                                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                        expected,
+                                        found: PrimitiveLiteralKind::Integer,
+                                    },
+                                });
+                            }
                         }
                     }
                 }

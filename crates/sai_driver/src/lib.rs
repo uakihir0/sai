@@ -89908,6 +89908,10 @@ property "shared"() {}
             "    let total: U8 = (256 + 1) << self.missing\n",
             "    total\n",
             "  }\n",
+            "  pub fn annotated_tainted_literal_mismatch(self: borrow Self) -> Byte {\n",
+            "    let total: Byte = (1 + 2) << self.missing\n",
+            "    total\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -89924,7 +89928,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let members = results.owners()[0].members();
-        assert_eq!(members.len(), 14);
+        assert_eq!(members.len(), 15);
 
         // Known self fields in operand position desugar to `let t = self.f`
         // bindings, so pairs, nested operands, tails, and logical
@@ -89985,6 +89989,26 @@ property "shared"() {}
                 .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownField)
                 && diagnostics.len() > 1,
             "the annotation reaches the literal operand and reports its range: {diagnostics:#?}"
+        );
+
+        // Member 14's `Byte` annotation does not fit the integer literal
+        // family: the member keeps its supported result and reports the
+        // mismatch next to the unknown-field diagnostic instead of
+        // gating the body.
+        let check = members[14]
+            .body_type_check()
+            .expect("annotated tainted literal body check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("an annotated tainted literal operand should be checked: {check:#?}");
+        };
+        let codes: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert!(
+            codes.contains(&sai_diagnostics::Code::UnknownField)
+                && codes.contains(&sai_diagnostics::Code::TypeMismatch),
+            "the annotation mismatch reports beside the field error: {diagnostics:#?}"
         );
 
         // Member 10's clean nested operand `self.count * 2` is typed
