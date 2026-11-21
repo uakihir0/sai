@@ -9031,6 +9031,7 @@ fn primitive_logical_init_operand_shape_is_supported(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
     unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     let is_preceding_or_field = |operand: &HirExpr<'_>| match operand.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
@@ -9043,12 +9044,20 @@ fn primitive_logical_init_operand_shape_is_supported(
     match operand.kind {
         ExprKind::Path(_) | ExprKind::Field { .. } => is_preceding_or_field(operand),
         ExprKind::Lit(Lit::Bool(_)) => true,
+        ExprKind::Call { .. } => primitive_direct_call_operand_shape_is_supported(
+            operand,
+            preceding_bindings,
+            locals,
+            inputs,
+            direct_call_signatures,
+        ),
         ExprKind::Unary(UnOp::Not, inner) => primitive_logical_init_operand_shape_is_supported(
             inner,
             preceding_bindings,
             locals,
             inputs,
             unknown_self_fields,
+            direct_call_signatures,
         ),
         ExprKind::Binary(operator, left, right) => match operator {
             BinOp::And | BinOp::Or => {
@@ -9058,18 +9067,36 @@ fn primitive_logical_init_operand_shape_is_supported(
                     locals,
                     inputs,
                     unknown_self_fields,
+                    direct_call_signatures,
                 ) && primitive_logical_init_operand_shape_is_supported(
                     right,
                     preceding_bindings,
                     locals,
                     inputs,
                     unknown_self_fields,
+                    direct_call_signatures,
                 )
             }
+            // Comparison leaves under `and`/`or` route through
+            // `check_comparison`, so their operands admit the same shapes
+            // nested binary operands do — paths, fields, literals, nested
+            // binaries, and direct calls.
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                (is_preceding_or_field(left) && is_preceding_or_field(right))
-                    || (is_preceding_or_field(left) && is_direct_function_scalar_literal(right))
-                    || (is_direct_function_scalar_literal(left) && is_preceding_or_field(right))
+                primitive_nested_operand_shape_is_supported(
+                    left,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                ) && primitive_nested_operand_shape_is_supported(
+                    right,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                )
             }
             _ => false,
         },
@@ -9166,6 +9193,40 @@ fn primitive_break_value_shape_is_supported(
     }
 }
 
+// A direct call in operand position — `f(..)` used as a binary or logical
+// operand — desugars to `let t = f(..)`, so it mirrors the
+// initializer-position call admission: a resolved signature plus
+// direct-call argument shapes.
+fn primitive_direct_call_operand_shape_is_supported(
+    operand: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> bool {
+    let ExprKind::Call {
+        args, base: None, ..
+    } = operand.kind
+    else {
+        return false;
+    };
+    direct_call_signatures
+        .and_then(|signatures| signatures.get(&operand.hir_id))
+        .is_some_and(|signature| {
+            args.iter()
+                .take(signature.parameters.len())
+                .all(|argument| {
+                    is_supported_direct_call_argument_shape(
+                        argument.expr,
+                        preceding_bindings,
+                        locals,
+                        inputs,
+                        direct_call_signatures,
+                    )
+                })
+        })
+}
+
 // A nested binary operand — `(a + b) * c` — desugars to a `let t`
 // binding whose initializer the checker evaluates, so operand admission
 // accepts any operand-shaped tree of supported primitive binary
@@ -9185,26 +9246,13 @@ fn primitive_nested_operand_shape_is_supported(
         ExprKind::Field { .. } => {
             unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
         }
-        // A call operand desugars to `let t = f(..)`, so it mirrors the
-        // initializer-position call admission: a resolved signature plus
-        // direct-call argument shapes.
-        ExprKind::Call {
-            args, base: None, ..
-        } => direct_call_signatures
-            .and_then(|signatures| signatures.get(&operand.hir_id))
-            .is_some_and(|signature| {
-                args.iter()
-                    .take(signature.parameters.len())
-                    .all(|argument| {
-                        is_supported_direct_call_argument_shape(
-                            argument.expr,
-                            preceding_bindings,
-                            locals,
-                            inputs,
-                            direct_call_signatures,
-                        )
-                    })
-            }),
+        ExprKind::Call { .. } => primitive_direct_call_operand_shape_is_supported(
+            operand,
+            preceding_bindings,
+            locals,
+            inputs,
+            direct_call_signatures,
+        ),
         ExprKind::Binary(operator, left, right)
             if is_function_primitive_local_binary_operator(operator) =>
         {
@@ -9340,6 +9388,7 @@ fn primitive_value_expression_shape_is_supported(
                 locals,
                 inputs,
                 unknown_self_fields,
+                direct_call_signatures,
             ) {
                 return false;
             }
@@ -9407,6 +9456,7 @@ fn primitive_value_expression_shape_is_supported(
                             locals,
                             inputs,
                             unknown_self_fields,
+                            direct_call_signatures,
                         )
                     };
                     operand_is_supported(left) && operand_is_supported(right)
@@ -54608,6 +54658,19 @@ property "shared"() {}
             "    let result = flag and left < one()\n",
             "    result\n",
             "}\n",
+            "pub fn truthy() -> Bool { true }\n",
+            "pub fn call_bool_logical_operand(flag: Bool) -> Bool {\n",
+            "    let result = flag and truthy()\n",
+            "    result\n",
+            "}\n",
+            "pub fn nested_logical_init_leaf(flag: Bool, left: I32) -> Bool {\n",
+            "    let result = flag and (left + 1) < 2\n",
+            "    result\n",
+            "}\n",
+            "pub fn unresolved_logical_leaf_call(flag: Bool, left: I32) -> Bool {\n",
+            "    let result = flag and left < missing()\n",
+            "    result\n",
+            "}\n",
             "pub fn call_unsupported_arg(left: I32) -> I32 {\n",
             "    let total = two(~left) + one()\n",
             "    total\n",
@@ -54773,7 +54836,30 @@ property "shared"() {}
             .expect("logical call operand body publishes primitive facts");
         assert_primitive_type_result_parity(&database, logical_results);
 
-        for name in ["call_logical_init_leaf", "unresolved_callee"] {
+        for name in [
+            "call_logical_init_leaf",
+            "call_bool_logical_operand",
+            "nested_logical_init_leaf",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("logical-init call operand body check is available")
+            else {
+                panic!("a widened logical `let` operand in `{name}` is supported");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "the `{name}` logical initializer checks without diagnostics: {diagnostics:?}"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("logical-init operand results query succeeds")
+                .expect("logical-init operand body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+        }
+
+        for name in ["unresolved_callee", "unresolved_logical_leaf_call"] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
                 matches!(
