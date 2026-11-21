@@ -575,7 +575,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .input
                 .call_signatures
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-        let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)));
+        let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)))
+            || matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Field { .. }) && self.input.self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)));
         let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
         let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some());
         let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
@@ -3406,11 +3407,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 ExprKind::Unary(operator, operand)
                     if matches!(operator, UnOp::Neg | UnOp::BitNot)
-                        && matches!(operand.kind, ExprKind::Path(_)) =>
+                        && matches!(operand.kind, ExprKind::Path(_) | ExprKind::Field { .. }) =>
                 {
-                    match operator {
-                        UnOp::Neg => self.check_direct_call_neg_path(operand, expression.hir_id)?,
-                        _ => self.check_bitwise_not_path(operand, expression.hir_id)?,
+                    match (operator, operand.kind) {
+                        (UnOp::Neg, ExprKind::Path(_)) => {
+                            self.check_direct_call_neg_path(operand, expression.hir_id)?
+                        }
+                        (_, ExprKind::Path(_)) => {
+                            self.check_bitwise_not_path(operand, expression.hir_id)?
+                        }
+                        // `-self.f`/`~self.f` in tail position evaluate the
+                        // field operand's declared type — same desugar as
+                        // the unary field operands elsewhere.
+                        _ => self.check_direct_call_unary_field(
+                            operand,
+                            operator,
+                            expression.hir_id,
+                        )?,
                     }
                 }
                 // Binary tails share the local-initializer family checkers:
