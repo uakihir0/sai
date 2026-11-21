@@ -9253,6 +9253,39 @@ fn primitive_nested_operand_shape_is_supported(
             inputs,
             direct_call_signatures,
         ),
+        // Unary operands desugar to the same `let t = <unary>` binding the
+        // initializer checker handles, so they mirror the initializer-position
+        // admission: `-path`/`~path` from a preceding binding, `~` over an
+        // integer or byte literal, and `not` over operand-position logical
+        // shapes.
+        ExprKind::Unary(UnOp::Not, inner) => primitive_logical_init_operand_shape_is_supported(
+            inner,
+            preceding_bindings,
+            locals,
+            inputs,
+            unknown_self_fields,
+            direct_call_signatures,
+        ),
+        ExprKind::Unary(UnOp::Neg, inner) => {
+            let ExprKind::Path(path) = inner.kind else {
+                return false;
+            };
+            resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| preceding_bindings.contains(&binding))
+        }
+        ExprKind::Unary(UnOp::BitNot, inner) => {
+            if is_direct_function_integer_literal(inner)
+                || matches!(inner.kind, ExprKind::Lit(Lit::Byte(_)))
+            {
+                true
+            } else {
+                let ExprKind::Path(path) = inner.kind else {
+                    return false;
+                };
+                resolved_plain_local_path_binding(path, locals, inputs)
+                    .is_some_and(|binding| preceding_bindings.contains(&binding))
+            }
+        }
         ExprKind::Binary(operator, left, right)
             if is_function_primitive_local_binary_operator(operator) =>
         {
@@ -54446,6 +54479,18 @@ property "shared"() {}
             "pub fn and_parameters(first: Bool, second: Bool) -> Bool { first and second }\n",
             "pub fn arithmetic_mismatch(first: I32, second: I32) -> Bool { first + second }\n",
             "pub fn nested_tail(first: I32) -> I32 { (first + 1) * 2 }\n",
+            "pub fn unary_neg_operand(first: I32, second: I32) -> I32 { first + -second }\n",
+            "pub fn unary_bitnot_operand(first: I32, second: I32) -> I32 { first + ~second }\n",
+            "pub fn unary_bitnot_literal_operand(first: I32) -> I32 { first + ~1 }\n",
+            "pub fn unary_neg_literal_var() -> I32 {\n",
+            "    let x = 1\n",
+            "    x + -x\n",
+            "}\n",
+            "pub fn unary_not_comparison(flag: Bool, other: Bool) -> Bool {\n",
+            "    flag and (not other) == false\n",
+            "}\n",
+            "pub fn unary_neg_nested_operand(first: I32, second: I32) -> I32 { first + -(first + second) }\n",
+            "pub fn unary_neg_missing_operand(first: I32) -> I32 { first + -missing }\n",
         )
         .to_string();
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -54619,6 +54664,47 @@ property "shared"() {}
             .expect("nested projection query succeeds")
             .expect("a nested binary tail publishes primitive facts");
         assert_primitive_type_result_parity(&database, nested_results);
+
+        // Unary operators in nested operand position evaluate through the
+        // same initializer-position arms the `let t = <unary>` desugar uses:
+        // `-path`/`~path` on preceding bindings, `~` over integer literals,
+        // deferred `-`/`~` on unannotated literal locals, and `not` over
+        // operand-position logical shapes.
+        for name in [
+            "unary_neg_operand",
+            "unary_bitnot_operand",
+            "unary_bitnot_literal_operand",
+            "unary_neg_literal_var",
+            "unary_not_comparison",
+        ] {
+            let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("unary operand body check is available")
+            else {
+                panic!("a unary nested operand in `{name}` is supported");
+            };
+            assert!(
+                diagnostics.is_empty(),
+                "the `{name}` unary operand checks without diagnostics: {diagnostics:?}"
+            );
+            let results = owner
+                .primitive_body_type_results()
+                .expect("unary operand results query succeeds")
+                .expect("unary operand body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
+        }
+
+        for name in ["unary_neg_nested_operand", "unary_neg_missing_operand"] {
+            let owner = owner_named(&database, &resolved, name);
+            assert!(
+                matches!(
+                    owner.body_type_check().expect("body check is available"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "excluded unary operand shape `{name}` remains behind the body checker gate"
+            );
+        }
     }
 
     #[test]
@@ -78156,7 +78242,7 @@ property "shared"() {}
                 .expect("unsupported bitwise body check is gated");
             if matches!(
                 index,
-                12 | 13 | 17 | 29 | 33 | 34 | 35 | 65 | 66 | 72 | 73 | 76
+                12 | 13 | 15 | 17 | 29 | 33 | 34 | 35 | 65 | 66 | 72 | 73 | 76
             ) {
                 continue;
             }
@@ -78168,7 +78254,7 @@ property "shared"() {}
         // `(left ^ right)`, `('b' | 'c')` and the path-plus-scalar nested
         // operands evaluate through the operand probes, surfacing the
         // operator-trait diagnostics inside them.
-        for index in [12, 13, 17, 29, 33, 34, 35, 65, 66] {
+        for index in [12, 13, 15, 17, 29, 33, 34, 35, 65, 66] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
                 .expect("nested-operand bitwise body check is available")

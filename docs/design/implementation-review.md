@@ -9723,3 +9723,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver suite and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** Pending — see PR.
 - **Remaining scope:** Unary/field operands in nested positions, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1053 (2026-11-21): Unary operators in nested operand position
+
+- **Decision:** Nested binary operands may be unary expressions — `first + -second`, `first + ~second`, `first + ~1`, `x + -x` (unannotated literal local), `flag and (not other) == false` — evaluated through `check_operand_local_type` → `check_initializer_value`, whose `Unary` arms already handle `Neg`/`BitNot`/`Not` in the desugared `let t = <unary>` position.
+- **Reason:** Same `let t = e` desugar as IR-1050's nested binaries and IR-1051's calls — `check_local_initializer_neg_path`/`check_local_initializer_bitwise_not_path`/`check_logical_operand` are the initializer-position handlers the operand position reuses verbatim.
+- **Failure boundary and judgment:** `Neg` requires a plain path from a preceding binding (`-(a + b)` gates); `BitNot` admits integer/byte literals and preceding paths (`~missing`, `~(expr)` gate); `Not` admits operand-position logical shapes. Unsupported concrete operands (e.g. `-` on `U*`) report `UnaryOperatorNotSupported` as a diagnostic rather than gating — the flipped CLI fixture `'a' & -rhs` now emits `OPERATOR_NOT_SUPPORTED{BitAnd<F64>, Char}`.
+- **Review required:** None — checker reuses the reviewed initializer-position unary arms; the driver mirror gains a `Unary` arm mirroring the same admission (path from preceding bindings, `~` over integer/byte literals, `not` over logical-operand shapes).
+- **Planned verification matrix:** Driver `unary_neg_operand`/`unary_bitnot_operand`/`unary_bitnot_literal_operand`/`unary_neg_literal_var`/`unary_not_comparison` (supported), `unary_neg_nested_operand`/`unary_neg_missing_operand` (gated). CLI `char_unary_float_path_rhs` flipped to a diagnostic assertion, `byte_computed_left` flipped to a result assertion.
+- **Verification:** Pinned Rust 1.99.1, driver suite and CLI suite (388) pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Pending — see PR.
+- **Remaining scope:** Field operands in nested positions, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.

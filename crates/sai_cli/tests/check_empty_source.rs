@@ -15732,10 +15732,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         )
         .to_owned(),
         fixture(
-            "pub fn char_unary_float_path_rhs(rhs: F64) -> Char",
-            "let result = 'a' & -rhs",
-        ),
-        fixture(
             "pub fn char_computed_float_literal_rhs() -> Char",
             "let result = 'a' & (1.0 + 1.0)",
         ),
@@ -16096,10 +16092,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         fixture(
             "pub fn byte_forward_reference() -> Byte",
             "let result = b'a' & later\n    let later: Byte = b'b'",
-        ),
-        fixture(
-            "pub fn byte_computed_left(right: Byte) -> Byte",
-            "let result = (~b'a') & right",
         ),
         fixture(
             "pub fn byte_computed_rhs() -> Byte",
@@ -16708,6 +16700,51 @@ fn primitive_bitwise_byte_right_integer_literal_reports_mismatch_without_unsuppo
         "expected `Byte`, found an integer literal",
         literal_start,
         literal_start + "1".len(),
+    );
+}
+
+#[test]
+fn primitive_bitwise_unary_path_operand_reports_operator_diagnostic() {
+    let source = concat!(
+        "pub fn char_unary_float_path_rhs(rhs: F64) -> Char {\n",
+        "    let result = 'a' & -rhs\n",
+        "    result\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the unary path operand should evaluate to `F64` and report one unsupported operator:\n{stdout}"
+    );
+    let expression = "'a' & -rhs";
+    let start = source.find(expression).expect("expression exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<F64>` implementation for `Char`",
+        start,
+        start + expression.len(),
+    );
+
+    // `(~b'a') & right` resolves cleanly to `Byte & Byte` and emits a
+    // successful check result.
+    let byte_source = concat!(
+        "pub fn byte_computed_left(right: Byte) -> Byte {\n",
+        "    let result = (~b'a') & right\n",
+        "    result\n",
+        "}\n",
+    );
+    let output = run_check(byte_source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains("\"type\":\"result\""),
+        "the `~b'a'` literal operand checks cleanly and emits a result:\n{stdout}"
     );
 }
 
