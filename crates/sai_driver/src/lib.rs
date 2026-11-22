@@ -13184,6 +13184,102 @@ fn str_binding_path(
     )
 }
 
+// The group family a local path carries — `"`Str`"` or a scalar literal
+// family — when the expression is a single-segment local path.
+fn str_binding_family(
+    expression: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+) -> Option<&'static str> {
+    let ExprKind::Path(path) = expression.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return None;
+    }
+    match locals.paths.get(&path.hir_id) {
+        Some(PathRes {
+            base: Res::Local(binding),
+            resolved_segments: 1,
+            segment_count: 1,
+        }) => str_bindings.get(binding).copied(),
+        _ => None,
+    }
+}
+
+// The group family a scalar literal binds under — its default literal
+// type like the checker's unresolved literal (`I64`/`F64`/`Bool`/
+// `Byte`/`Char`).
+fn str_scalar_family_name(literal: Lit<'_>) -> Option<&'static str> {
+    match literal {
+        Lit::Int { .. } => Some("`I64`"),
+        Lit::Float { .. } => Some("`F64`"),
+        Lit::Bool(_) => Some("`Bool`"),
+        Lit::Byte(_) => Some("`Byte`"),
+        Lit::Char(_) => Some("`Char`"),
+        _ => None,
+    }
+}
+
+// The family a literal or local-path `let` initializer binds under:
+// `Str` literals `"`Str`"`, scalar literals their default family (with
+// the literal's own range check), and bindings their recorded family.
+// Returns `None` for initializers the caller still handles — `if`/
+// `loop`/`match` inits or gated shapes.
+#[allow(clippy::too_many_arguments)]
+fn str_literal_family_init(
+    owner: &HirOwner<'_>,
+    init: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<(&'static str, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
+    match init.kind {
+        ExprKind::Lit(Lit::Str(_)) => return Ok(Some(("`Str`", Vec::new()))),
+        ExprKind::Lit(literal) => {
+            let Some(literal_type) = str_scalar_literal_default(literal) else {
+                return Ok(None);
+            };
+            let Some(diagnostics) = check_const_literal_against_type(
+                owner.id,
+                literal_type,
+                init,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some((
+                str_scalar_family_name(literal).unwrap_or("`I64`"),
+                diagnostics,
+            )));
+        }
+        _ => {}
+    }
+    Ok(str_binding_family(init, locals, str_bindings).map(|family| (family, Vec::new())))
+}
+
+// The family a comparison-condition operand carries: `"`Str`"` for `Str`
+// literals and bindings, the scalar family for scalar literals and
+// scalar bindings, `None` for other shapes.
+fn str_condition_operand_family(
+    expr: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+) -> Option<&'static str> {
+    match expr.kind {
+        ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
+        ExprKind::Lit(literal) => str_scalar_family_name(literal),
+        _ => str_binding_family(expr, locals, str_bindings),
+    }
+}
+
 // `Str` locals bind only string literals and earlier `Str` bindings:
 // `let s = "a"`, `let t: Str = s`. `str_bindings` may be pre-seeded with a
 // `Str` parameter binding.
@@ -13227,9 +13323,22 @@ fn str_assert_msg(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    if matches!(msg.kind, ExprKind::Lit(Lit::Str(_))) || str_binding_path(msg, locals, str_bindings)
-    {
+    if matches!(msg.kind, ExprKind::Lit(Lit::Str(_))) {
         return Ok(Some(Vec::new()));
+    }
+    if let Some(family) = str_binding_family(msg, locals, str_bindings) {
+        if family == "`Str`" {
+            return Ok(Some(Vec::new()));
+        }
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            msg.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `Str`, found {family}"),
+            "type mismatch",
+        )?]));
     }
     if let ExprKind::Lit(literal) = msg.kind
         && let Some(found) = str_pattern_literal_name(literal)
@@ -13272,73 +13381,51 @@ fn str_condition(
         rhs,
     ) = cond.kind
     {
-        // A comparison over two scalar literals of the same literal
-        // family (`1 == 1`) folds to `Bool` — clean without a `Str`
-        // operand; any other no-`Str` shape stays gated rather than
-        // drawing `expected Str` diagnostics.
-        if !str_condition_operand(lhs, locals, str_bindings)
-            && !str_condition_operand(rhs, locals, str_bindings)
-        {
-            let (ExprKind::Lit(left_literal), ExprKind::Lit(right_literal)) = (lhs.kind, rhs.kind)
-            else {
-                return Ok(None);
-            };
-            let (Some(left_name), Some(right_name)) = (
-                str_pattern_literal_name(left_literal),
-                str_pattern_literal_name(right_literal),
-            ) else {
-                return Ok(None);
-            };
-            return if left_name == right_name {
-                // Scalar literals in a comparison default like the
-                // checker's unresolved literal (`I64`/`F64`) — an
-                // out-of-range literal still reports its range error.
-                let mut diagnostics = Vec::new();
-                for (operand, literal) in [(lhs, left_literal), (rhs, right_literal)] {
-                    let Some(literal_type) = str_scalar_literal_default(literal) else {
-                        return Ok(None);
-                    };
-                    let Some(mut operand_diagnostics) = check_const_literal_against_type(
-                        owner.id,
-                        literal_type,
-                        operand,
-                        symbols,
-                        inputs,
-                        snapshot,
-                        target_cfg,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    diagnostics.append(&mut operand_diagnostics);
-                }
-                Ok(Some(diagnostics))
-            } else {
-                Ok(None)
-            };
-        }
-        let mut diagnostics = Vec::new();
-        for operand in [lhs, rhs] {
-            if str_condition_operand(operand, locals, str_bindings) {
-                continue;
+        // Operands carry literal families — `Str` for `Str` literals and
+        // bindings, the default scalar family otherwise. Equal families
+        // fold to `Bool` (literal operands still carry their default
+        // range check); differing families report the checker's
+        // `expected <left>, found <right>` on the right operand.
+        let (Some(left_family), Some(right_family)) = (
+            str_condition_operand_family(lhs, locals, str_bindings),
+            str_condition_operand_family(rhs, locals, str_bindings),
+        ) else {
+            return Ok(None);
+        };
+        if left_family == right_family {
+            let mut diagnostics = Vec::new();
+            for operand in [lhs, rhs] {
+                let ExprKind::Lit(literal) = operand.kind else {
+                    continue;
+                };
+                let Some(literal_type) = str_scalar_literal_default(literal) else {
+                    continue;
+                };
+                let Some(mut operand_diagnostics) = check_const_literal_against_type(
+                    owner.id,
+                    literal_type,
+                    operand,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut operand_diagnostics);
             }
-            let ExprKind::Lit(literal) = operand.kind else {
-                return Ok(None);
-            };
-            let Some(found) = str_pattern_literal_name(literal) else {
-                return Ok(None);
-            };
-            diagnostics.push(const_literal_diagnostic(
-                owner.id,
-                inputs,
-                snapshot,
-                operand.span,
-                sai_diagnostics::Code::TypeMismatch,
-                format!("expected `Str`, found {found}"),
-                "type mismatch",
-            )?);
+            return Ok(Some(diagnostics));
         }
-        return Ok(Some(diagnostics));
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            rhs.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected {left_family}, found {right_family}"),
+            "type mismatch",
+        )?]));
     }
     // A literal or `Str`-leaf condition in a `Bool` slot is the checker's
     // `expected Bool` mismatch — recoverable like the comparison-operand
@@ -13358,6 +13445,20 @@ fn str_condition(
             cond.span,
             sai_diagnostics::Code::TypeMismatch,
             format!("expected `Bool`, found {found}"),
+            "type mismatch",
+        )?]));
+    }
+    if let Some(family) = str_binding_family(cond, locals, str_bindings) {
+        if family == "`Bool`" {
+            return Ok(Some(Vec::new()));
+        }
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            cond.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `Bool`, found {family}"),
             "type mismatch",
         )?]));
     }
@@ -13519,6 +13620,44 @@ fn check_function_str_local_block(
                 != Some(FunctionDirectType::Str)
         {
             return Ok(None);
+        }
+        // Literal and copy initializers bind their own family — a scalar
+        // literal still carries its default-type range check, and an
+        // annotation pins the binding to `Str` (a scalar init then
+        // reports `expected `Str`` while the binding stays `Str`).
+        if let Some((family, mut init_diagnostics)) = str_literal_family_init(
+            owner,
+            init,
+            locals,
+            str_bindings,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )? {
+            let PatKind::Binding {
+                mode: sai_hir::patterns::BindingMode::Value,
+                binding,
+                sub: None,
+                ..
+            } = pat.kind
+            else {
+                return Ok(None);
+            };
+            if ty.is_some() && family != "`Str`" {
+                init_diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    init.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!("expected `Str`, found {family}"),
+                    "type mismatch",
+                )?);
+            }
+            diagnostics.append(&mut init_diagnostics);
+            str_bindings.insert(binding, if ty.is_some() { "`Str`" } else { family });
+            continue;
         }
         // `let s = if <lit bool> { <Str block> } else { <Str block> }` runs
         // the shared block walk on each branch with a cloned binding set.
@@ -13706,7 +13845,6 @@ fn check_function_str_local_block(
                 };
                 diagnostics.append(&mut match_diagnostics);
             }
-            _ if str_binding_path(init, locals, str_bindings) => {}
             _ => return Ok(None),
         }
         let PatKind::Binding {
@@ -14115,8 +14253,7 @@ fn str_stmt_break_family(
         ExprKind::Lit(literal) => {
             str_pattern_literal_name(literal).or(Some("a byte-string literal"))
         }
-        _ if str_binding_path(value, locals, str_bindings) => Some("`Str`"),
-        _ => None,
+        _ => str_binding_family(value, locals, str_bindings),
     }
 }
 
@@ -14308,13 +14445,19 @@ fn str_stmt_block_unit(
                 {
                     return Ok(None);
                 }
-                let init_is_str = match init.kind {
-                    ExprKind::Lit(Lit::Str(_)) => true,
-                    _ => str_binding_path(init, locals, &inner_bindings),
-                };
-                if !init_is_str {
+                let Some((family, mut init_diagnostics)) = str_literal_family_init(
+                    owner,
+                    init,
+                    locals,
+                    &inner_bindings,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
                     return Ok(None);
-                }
+                };
                 let PatKind::Binding {
                     mode: sai_hir::patterns::BindingMode::Value,
                     binding,
@@ -14324,7 +14467,19 @@ fn str_stmt_block_unit(
                 else {
                     return Ok(None);
                 };
-                inner_bindings.insert(binding, "`Str`");
+                if ty.is_some() && family != "`Str`" {
+                    init_diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        init.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected `Str`, found {family}"),
+                        "type mismatch",
+                    )?);
+                }
+                diagnostics.append(&mut init_diagnostics);
+                inner_bindings.insert(binding, if ty.is_some() { "`Str`" } else { family });
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
                 let Some(mut expr_diagnostics) = str_stmt_expr_unit(
@@ -14435,13 +14590,19 @@ fn str_loop_level_block(
                 {
                     return Ok(None);
                 }
-                let init_is_str = match init.kind {
-                    ExprKind::Lit(Lit::Str(_)) => true,
-                    _ => str_binding_path(init, locals, str_bindings),
-                };
-                if !init_is_str {
+                let Some((family, mut init_diagnostics)) = str_literal_family_init(
+                    owner,
+                    init,
+                    locals,
+                    str_bindings,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
                     return Ok(None);
-                }
+                };
                 let PatKind::Binding {
                     mode: sai_hir::patterns::BindingMode::Value,
                     binding,
@@ -14451,7 +14612,19 @@ fn str_loop_level_block(
                 else {
                     return Ok(None);
                 };
-                str_bindings.insert(binding, "`Str`");
+                if ty.is_some() && family != "`Str`" {
+                    init_diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        init.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected `Str`, found {family}"),
+                        "type mismatch",
+                    )?);
+                }
+                diagnostics.append(&mut init_diagnostics);
+                str_bindings.insert(binding, if ty.is_some() { "`Str`" } else { family });
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
                 let Some((clean, broken, mut expr_diagnostics)) = str_loop_level_expr(
@@ -14815,10 +14988,25 @@ fn str_break_value(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<(bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
-    if matches!(value.kind, ExprKind::Lit(Lit::Str(_)))
-        || str_binding_path(value, locals, str_bindings)
-    {
+    if matches!(value.kind, ExprKind::Lit(Lit::Str(_))) {
         return Ok(Some((true, Vec::new())));
+    }
+    if let Some(family) = str_binding_family(value, locals, str_bindings) {
+        if family == "`Str`" {
+            return Ok(Some((true, Vec::new())));
+        }
+        return Ok(Some((
+            false,
+            vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `Str`, found {family}"),
+                "type mismatch",
+            )?],
+        )));
     }
     // Scalar literals count as a break contribution but not a clean `Str`
     // yield: the recoverable mismatch still surfaces, while a `let`
@@ -15088,8 +15276,19 @@ fn check_function_str_tail(
     break_ctx: bool,
     frame: StrStmtLoopFrame,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    if str_binding_path(tail, locals, str_bindings) {
-        return Ok(Some(Vec::new()));
+    if let Some(family) = str_binding_family(tail, locals, str_bindings) {
+        if family == "`Str`" {
+            return Ok(Some(Vec::new()));
+        }
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            tail.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `Str`, found {family}"),
+            "type mismatch",
+        )?]));
     }
     if let ExprKind::If {
         cond,
@@ -15330,7 +15529,9 @@ fn check_function_str_tail(
                     }
                     (StrStmtLoopFrame::Loop, Some(value)) => match value.kind {
                         ExprKind::Lit(_) => Ok(Some(Vec::new())),
-                        _ if str_binding_path(value, locals, str_bindings) => Ok(Some(Vec::new())),
+                        _ if str_binding_family(value, locals, str_bindings).is_some() => {
+                            Ok(Some(Vec::new()))
+                        }
                         _ => Ok(None),
                     },
                     (StrStmtLoopFrame::While, Some(value)) => {
@@ -52791,6 +52992,16 @@ property "shared"() {}
             "pub fn str_loop_break_value_then_unit() -> Str {\n    loop { break \"a\"\n    break }\n    \"a\"\n}\n",
             "pub fn str_while_body_no_tail() -> Str {\n    while true {}\n}\n",
             "pub fn str_return_break_block() -> Str {\n    loop { return { break } }\n    let s = \"b\"\n}\n",
+            "pub fn str_scalar_local_tail() -> Str {\n    let n = 1\n    \"a\"\n}\n",
+            "pub fn str_scalar_binding_tail() -> Str {\n    let n = 1\n    n\n}\n",
+            "pub fn str_scalar_copy_tail() -> Str {\n    let n = 1\n    let m = n\n    m\n}\n",
+            "pub fn str_scalar_local_out_of_range() -> Str {\n    let n = 99999999999999999999\n    \"a\"\n}\n",
+            "pub fn str_scalar_bool_cond() -> Str {\n    let f = true\n    if f {\n        \"a\"\n    } else {\n        \"b\"\n    }\n}\n",
+            "pub fn str_scalar_int_cond() -> Str {\n    let n = 1\n    if n {\n        \"a\"\n    } else {\n        \"b\"\n    }\n}\n",
+            "pub fn str_scalar_cmp_binding() -> Str {\n    let s = \"a\"\n    let n = 1\n    if s == n {\n        \"a\"\n    } else {\n        \"b\"\n    }\n}\n",
+            "pub fn str_scalar_cmp_fold() -> Str {\n    let n = 1\n    let m = 2\n    if n == m {\n        \"a\"\n    } else {\n        \"b\"\n    }\n}\n",
+            "pub fn str_scalar_assert_msg() -> Str {\n    let n = 1\n    assert true, n\n    \"a\"\n}\n",
+            "pub fn str_scalar_break_binding() -> Str {\n    loop {\n        let n = 1\n        break n\n    }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -52806,9 +53017,10 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 112);
+        assert_eq!(resolved.owners().len(), 122);
         for (index, owner) in resolved.owners()[..4]
             .iter()
+            .chain(&resolved.owners()[5..6])
             .chain(&resolved.owners()[8..17])
             .chain(&resolved.owners()[19..21])
             .chain(&resolved.owners()[24..28])
@@ -52829,6 +53041,9 @@ property "shared"() {}
             .chain(&resolved.owners()[98..100])
             .chain(&resolved.owners()[104..105])
             .chain(&resolved.owners()[108..109])
+            .chain(&resolved.owners()[112..113])
+            .chain(&resolved.owners()[116..117])
+            .chain(&resolved.owners()[119..120])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -52844,7 +53059,8 @@ property "shared"() {}
             );
         }
         for index in [
-            4, 17, 21, 28, 32, 33, 37, 38, 46, 51, 61, 68, 76, 86, 90, 97, 102, 105, 110,
+            4, 17, 21, 28, 32, 33, 37, 38, 46, 51, 61, 68, 76, 86, 90, 97, 102, 105, 110, 113, 114,
+            117, 118, 120, 121,
         ] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
@@ -52869,6 +53085,7 @@ property "shared"() {}
             (107, sai_diagnostics::Code::BreakOutsideLoop),
             (109, sai_diagnostics::Code::InvalidBreakValue),
             (111, sai_diagnostics::Code::TypeMismatch),
+            (115, sai_diagnostics::Code::LiteralOutOfRange),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -52897,7 +53114,7 @@ property "shared"() {}
         // A `Str` parameter seeds the group, so copies and a param tail are
         // supported; non-`Str` statements, `var` bindings, and generic-arg
         // paths stay gated.
-        for owner in resolved.owners()[5..8]
+        for owner in resolved.owners()[6..8]
             .iter()
             .chain(&resolved.owners()[18..19])
             .chain(&resolved.owners()[22..24])
