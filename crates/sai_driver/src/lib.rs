@@ -15690,12 +15690,10 @@ fn str_pure_init_family(
                 .iter()
                 .filter_map(|contribution| contribution.0)
                 .filter(|family| *family != "`!`");
-            let first = families.next()?;
-            if families.any(|family| family != first) {
-                None
-            } else {
-                Some(first)
-            }
+            // Any classed contribution admits the loop — a family
+            // disagreement is the diagnostic walk's fold mismatch, not
+            // a gate.
+            families.next()
         }
         ExprKind::Match {
             scrutinee,
