@@ -7618,20 +7618,25 @@ fn check_function_body_type(
         _ => return Ok(FunctionBodyTypeCheck::Unsupported),
     };
     let diagnostics = if let Some((parameter, body_parameter)) = parameter {
-        if matches!(
-            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
-            Some(FunctionDirectType::Str)
-        ) && matches!(
-            sig.ret
-                .and_then(|ty| { resolve_function_direct_type(*ty, type_paths, symbols, inputs) }),
-            Some(FunctionDirectType::Str)
-        ) {
-            // A `Str` parameter seeds the `Str` local group: `let copy = param`
-            // and a param-path tail both resolve through it.
+        let parameter_family =
+            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+                .and_then(str_parameter_family);
+        if let Some(parameter_family) = parameter_family
+            && matches!(
+                sig.ret.and_then(|ty| {
+                    resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+                }),
+                Some(FunctionDirectType::Str)
+            )
+        {
+            // A `Str`/scalar parameter seeds the local group: `let copy =
+            // param` and a param-path tail or scrutinee resolve through
+            // it. Scalar parameters are concrete-typed like the checker's
+            // parameter local — they carry no literal seed.
             let mut str_bindings = StrLocalBindings::from([(
                 body_parameter.binding,
                 StrLocalEntry {
-                    family: "`Str`",
+                    family: parameter_family,
                     literal: None,
                 },
             )]);
@@ -7776,30 +7781,31 @@ fn check_function_body_type(
             }
         }
     } else if let Some((first, first_body, second, second_body)) = parameter_pair {
-        if matches!(
-            (
-                resolve_function_direct_type(*first.ty, type_paths, symbols, inputs),
-                resolve_function_direct_type(*second.ty, type_paths, symbols, inputs),
-            ),
-            (Some(FunctionDirectType::Str), Some(FunctionDirectType::Str))
-        ) && matches!(
-            sig.ret
-                .and_then(|ty| { resolve_function_direct_type(*ty, type_paths, symbols, inputs) }),
-            Some(FunctionDirectType::Str)
-        ) {
-            // Two `Str` parameters seed the `Str` local group together.
+        let first_family = resolve_function_direct_type(*first.ty, type_paths, symbols, inputs)
+            .and_then(str_parameter_family);
+        let second_family = resolve_function_direct_type(*second.ty, type_paths, symbols, inputs)
+            .and_then(str_parameter_family);
+        if let (Some(first_family), Some(second_family)) = (first_family, second_family)
+            && matches!(
+                sig.ret.and_then(|ty| {
+                    resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+                }),
+                Some(FunctionDirectType::Str)
+            )
+        {
+            // Two `Str`/scalar parameters seed the local group together.
             let mut str_bindings = StrLocalBindings::from([
                 (
                     first_body.binding,
                     StrLocalEntry {
-                        family: "`Str`",
+                        family: first_family,
                         literal: None,
                     },
                 ),
                 (
                     second_body.binding,
                     StrLocalEntry {
-                        family: "`Str`",
+                        family: second_family,
                         literal: None,
                     },
                 ),
@@ -13392,6 +13398,14 @@ fn str_default_unresolved_literals(
 // type like the checker's unresolved literal (`I64`/`F64`/`Bool`/
 // `Byte`/`Char`).
 // The family name an annotated scalar primitive pins (`let n: I8`).
+fn str_parameter_family(direct: FunctionDirectType) -> Option<&'static str> {
+    match direct {
+        FunctionDirectType::Str => Some("`Str`"),
+        FunctionDirectType::Primitive(primitive) => str_prim_family_name(primitive),
+        _ => None,
+    }
+}
+
 fn str_prim_family_name(primitive: sai_resolve::prelude::PrimTy) -> Option<&'static str> {
     use sai_resolve::prelude::PrimTy;
     Some(match primitive {
@@ -56113,7 +56127,7 @@ property "shared"() {}
             "pub fn str_bin_pin_mixed_tm() -> Str {\n    let s = \"a\"\n    let wide: I64 = 5\n    let m: I8 = wide + 200\n    s\n}\n",
             "pub fn str_match_guard_op_tm() -> Str {\n    let s = \"a\"\n    let m = match s {\n        \"x\" if s + 1 => \"y\"\n        _ => \"w\"\n    }\n    m\n}\n",
             "pub fn str_litvar_conflicting_pins_tm() -> Str {\n    let s = \"a\"\n    let n = 1\n    let a: I64 = n\n    let b: U32 = n\n    s\n}\n",
-            "pub fn str_bin_fold_wide_literal() -> Str {\n    let s = \"a\"\n    let w: U64 = 5\n    let m = w + 18446744073709551615\n    s\n}\npub fn str_litvar_bytestring_gate() -> Str {\n    let b = b\"abc\"\n    \"a\"\n}\npub fn str_litvar_loop_pin_oob() -> Str {\n    let n = 300\n    let m: U8 = loop { break n + 1 }\n    \"a\"\n}\n",
+            "pub fn str_bin_fold_wide_literal() -> Str {\n    let s = \"a\"\n    let w: U64 = 5\n    let m = w + 18446744073709551615\n    s\n}\npub fn str_litvar_bytestring_gate() -> Str {\n    let b = b\"abc\"\n    \"a\"\n}\npub fn str_litvar_loop_pin_oob() -> Str {\n    let n = 300\n    let m: U8 = loop { break n + 1 }\n    \"a\"\n}\npub fn str_scalar_param_cond(n: I64) -> Str {\n    if n == 1 { \"a\" } else { \"b\" }\n}\npub fn str_scalar_param_let(n: I64) -> Str {\n    let m = n\n    \"a\"\n}\npub fn str_scalar_param_tail(n: I64) -> Str {\n    n\n}\npub fn str_pair_mixed(s: Str, n: I64) -> Str {\n    match n { _ => s }\n}\npub fn str_pair_scalars(a: I64, b: I8) -> Str {\n    match b { _ => \"y\" }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -56129,7 +56143,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 223);
+        assert_eq!(resolved.owners().len(), 228);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -56187,7 +56201,10 @@ property "shared"() {}
             .chain(&resolved.owners()[208..209])
             .chain(&resolved.owners()[214..215])
             .chain(&resolved.owners()[216..217])
+            .chain(&resolved.owners()[64..65])
             .chain(&resolved.owners()[220..221])
+            .chain(&resolved.owners()[223..225])
+            .chain(&resolved.owners()[226..228])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -56275,6 +56292,7 @@ property "shared"() {}
             (218, sai_diagnostics::Code::TypeMismatch),
             (219, sai_diagnostics::Code::TypeMismatch),
             (222, sai_diagnostics::Code::LiteralOutOfRange),
+            (225, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -56348,7 +56366,7 @@ property "shared"() {}
         // A `Str` parameter seeds the group, so copies and a param tail are
         // supported; non-`Str` statements, `var` bindings, and generic-arg
         // paths stay gated.
-        for index in [7, 18, 22, 23, 29, 34, 39, 64, 168, 173, 211, 221] {
+        for index in [7, 18, 22, 23, 29, 34, 39, 168, 173, 211, 221] {
             let owner = &resolved.owners()[index];
             assert!(
                 matches!(

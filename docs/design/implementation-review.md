@@ -10353,3 +10353,13 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** driver fixture test green on the pinned toolchain.
 - **Hostile review:** the pure scan admits any classed operand family (mismatch reporting is the diagnostic walk's job); per-operand operand diagnostics keep the checker's `expected Bool` wording for `and`/`or`/`not` rather than a synthetic literal pin; operand walks pass `expected: None` so an outer annotation cannot leak into operand families.
 - **Remaining scope:** scalar scrutinee parameters / `Str` in `LocalType`, `for`/`if let`/`while let`, call/field operands and conditions, multi-owner lowering.
+
+### IR-1112 (2026-11-23): scalar parameters seed the `-> Str` local group
+
+- **Decision:** single- and two-parameter functions returning `Str` seed every parameter whose type resolves through `str_parameter_family` (`Str` or a scalar primitive) into the local bindings map — `match n { _ => "a" }`, `if n == 1`, `let m = n` and param-path tails over `I64`/`U8`/... parameters all work. Scalar parameters carry no literal seed (they are concrete-typed like the checker's parameter local). A param-path tail keeps the group mismatch (`n` reports `expected `Str`, found `I64``), and mixed pairs (`s: Str, n: I64`) seed independently.
+- **Reason:** the checker binds every supported parameter as a concrete local; restricting the group walk to `Str` parameters gated scalar-scrutinee `match` bodies (the former `str_match_int_scrutinee` gate).
+- **Failure boundary:** parameters without a scalar/`Str` direct type (tuples, records, units) still gate, and the scalar-parameter path requires a `Str` return like the `Str`-parameter path.
+- **Planned verification matrix:** `str_match_int_scrutinee` (reclassified clean), `str_scalar_param_cond`/`str_scalar_param_let`/`str_pair_mixed`/`str_pair_scalars` (clean), `str_scalar_param_tail` (TypeMismatch).
+- **Verification:** driver fixture test green on the pinned toolchain.
+- **Hostile review:** the seed entry carries `literal: None`, so a scalar parameter never merges as a literal variable (the checker's parameter is concrete, not a literal var); `let m = n` copies the concrete family with a fresh-cell-less entry and keeps the parameter itself untouched.
+- **Remaining scope:** `Str` in `LocalType`, `for`/`if let`/`while let` (non-`Normal` `MatchSource`), call/field operands and conditions, multi-owner lowering.
