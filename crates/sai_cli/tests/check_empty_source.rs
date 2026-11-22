@@ -11468,9 +11468,7 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet r#value = 42\nr#value\n}\n",
         "pub fn local() -> I32 {\nlet value = 42\nr#value\n}\n",
         "const ONE: I32 = 1\npub fn local() -> I32 {\nlet value = 42\nONE\n}\n",
-        "pub fn parameter_str_return(value: I32) -> Str { \"text\" }\n",
         "pub fn str_param_to_integer(value: Str) -> I32 { value }\n",
-        "pub fn integer_param_to_str(value: I32) -> Str { value }\n",
         "pub fn str_param_to_unit(value: Str) -> () { value }\n",
         "pub fn str_param_without_return(value: Str) { value }\n",
         "pub fn mutable_str_identity(var value: Str) -> Str { value }\n",
@@ -11533,6 +11531,35 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         );
     }
 
+    // A scalar-parameter `Str` body is checked: a param-path tail reports the
+    // group mismatch instead of gating.
+    let source = "pub fn integer_param_to_str(value: I32) -> Str { value }\n";
+    let output = run_check(source, "", &[], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "checked body with a mismatching tail must fail"
+    );
+    let stdout = std::str::from_utf8(&output.stdout).expect("CLI stdout is UTF-8");
+    let tail_start = source.find("value }\n").expect("tail exists");
+    assert_json_diagnostic_primary_span(
+        stdout,
+        "TYPE_MISMATCH",
+        "expected `Str`, found `I32`",
+        tail_start,
+        tail_start + "value".len(),
+    );
+
+    assert_success_result(
+        run_check(
+            "pub fn parameter_str_return(value: I32) -> Str { \"text\" }\n",
+            "",
+            &[],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
     assert_success_result(
         run_check(
             "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % (1 + 0)\nfirst\n}\n",
