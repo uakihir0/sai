@@ -16345,16 +16345,18 @@ fn str_loop_level_expr(
     target_cfg: &TargetCfg,
 ) -> Result<Option<(bool, bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     match expr.kind {
-        ExprKind::If {
-            cond,
-            then,
-            els: Some(els),
-        } => {
-            let else_block = match els.kind {
-                ExprKind::Block(block) => Some(block),
-                // `else if` nests the next `if` — recurse at loop level.
-                ExprKind::If { .. } => None,
-                _ => return Ok(None),
+        ExprKind::If { cond, then, els } => {
+            // `check_if_stmt` admits `els: None` — the missing else just
+            // continues the loop with no contribution.
+            let else_block = match els {
+                None => None,
+                Some(els) => match els.kind {
+                    ExprKind::Block(block) => Some(block),
+                    // `else if` nests the next `if` — recurse at loop
+                    // level through the synthetic `if` expression below.
+                    ExprKind::If { .. } => None,
+                    _ => return Ok(None),
+                },
             };
             let Some(mut cond_diagnostics) = str_condition(
                 owner,
@@ -16392,12 +16394,14 @@ fn str_loop_level_expr(
             };
             diagnostics.append(&mut cond_diagnostics);
             let mut else_bindings = str_bindings.clone();
-            let (else_clean, else_broken, mut else_diagnostics) =
-                if let Some(else_block) = else_block {
+            let (else_clean, else_broken, mut else_diagnostics) = match els {
+                // No `else` — the loop continues with no contribution.
+                None => (false, false, Vec::new()),
+                Some(_) if else_block.is_some() => {
                     let Some(t) = str_loop_level_block(
                         owner,
                         return_ty,
-                        else_block,
+                        else_block.unwrap(),
                         &mut else_bindings,
                         locals,
                         type_paths,
@@ -16410,7 +16414,9 @@ fn str_loop_level_expr(
                         return Ok(None);
                     };
                     t
-                } else {
+                }
+                // `else if` — recurse at loop level.
+                Some(els) => {
                     let Some(t) = str_loop_level_expr(
                         owner,
                         return_ty,
@@ -16427,7 +16433,8 @@ fn str_loop_level_expr(
                         return Ok(None);
                     };
                     t
-                };
+                }
+            };
             diagnostics.append(&mut else_diagnostics);
             Ok(Some((
                 then_clean || else_clean,
@@ -54710,6 +54717,7 @@ property "shared"() {}
             "pub fn str_scalar_cond_and_lit() -> Str {\n    let a = true\n    if a and 1 {\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_cond_not_str() -> Str {\n    let a = true\n    if not \"s\" {\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_cond_and_gate() -> Str {\n    let a = true\n    if a and 1 + 2 {\n    }\n    \"a\"\n}\n",
+            "pub fn str_loop_if_no_else() -> Str {\n    let flag = true\n    loop {\n        if not flag {\n        }\n        break \"ok\"\n    }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54725,7 +54733,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 192);
+        assert_eq!(resolved.owners().len(), 193);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54772,6 +54780,7 @@ property "shared"() {}
             .chain(&resolved.owners()[179..181])
             .chain(&resolved.owners()[183..184])
             .chain(&resolved.owners()[185..189])
+            .chain(&resolved.owners()[192..193])
             .enumerate()
         {
             let (index, owner) = (index, owner);
