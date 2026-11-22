@@ -13461,10 +13461,14 @@ fn str_literal_family_init(
                     // the caller's compare — checking its default type
                     // here would report `I64` range errors for
                     // literals a `U64` sibling accepts (`w + 2^64-1`).
-                    return Ok(Some((
-                        str_scalar_family_name(literal).unwrap_or("`I64`"),
-                        Vec::new(),
-                    )));
+                    // An unforced literal resolves through the fold or
+                    // the caller's compare — checking its default type
+                    // here would report `I64` range errors for
+                    // literals a `U64` sibling accepts (`w + 2^64-1`).
+                    // Non-scalar literals (`b"..."`) bind no family the
+                    // walk can model — the caller gates them.
+                    return Ok(str_scalar_family_name(literal)
+                        .map(|family| (family, Vec::new())));
                 }
             };
             let Some(diagnostics) = check_const_literal_against_type(
