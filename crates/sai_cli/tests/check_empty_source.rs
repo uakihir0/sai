@@ -10039,16 +10039,24 @@ fn primitive_local_not_reports_operand_mismatch_and_recovers_as_bool() {
 
 #[test]
 fn primitive_literal_variable_not_and_logical_operands_report_type_mismatch() {
-    for (source, operand, target) in [
+    for (source, operand, target, message) in [
         (
             "pub fn logical() -> Bool {\n    let inferred = 1\n    let result = not inferred\n    result\n}\n",
             "not inferred",
             "inferred",
+            "expected `Bool`, found `I64`",
         ),
         (
             "pub fn logical(flag: Bool) -> Bool {\n    let inferred = 1\n    let result = inferred and flag\n    result\n}\n",
             "inferred and",
             "inferred",
+            "expected `Bool`, found `I64`",
+        ),
+        (
+            "pub fn logical(left: I32, right: I32) -> Bool {\n    let result = not (left + right)\n    result\n}\n",
+            "not (left + right)",
+            "left + right",
+            "expected `Bool`, found `I32`",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);
@@ -10072,7 +10080,7 @@ fn primitive_literal_variable_not_and_logical_operands_report_type_mismatch() {
         assert_json_diagnostic_primary_span(
             &stdout,
             "TYPE_MISMATCH",
-            "expected `Bool`, found `I64`",
+            message,
             operand_start,
             operand_start + target.len(),
         );
@@ -10138,7 +10146,6 @@ fn primitive_local_not_diagnostics_follow_initializer_source_order() {
 #[test]
 fn unsupported_primitive_local_not_shapes_remain_gated() {
     for source in [
-        "pub fn logical(left: I32, right: I32) -> Bool {\n    let result = not (left + right)\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let result = not missing\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let result = not later\n    let later: Bool = flag\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let result = not result\n    result\n}\n",
