@@ -10278,3 +10278,8 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** driver 781 / CLI 392 green on the pinned toolchain.
 - **Hostile review:** expression-walk evaluation of a contribution runs after `str_stmt_block_unit` emits the body's diagnostics, so a contribution that classes as `Str` still surfaces its inner mismatches through the statement walk — no diagnostic can be swallowed by the family pass.
 - **Remaining scope:** `break match` contribution typing, annotated `loop` init, scalar `match` initializers, `Str` in `LocalType`, `for`/`if let`/`while let`, non-`Str` scrutinee match, multi-owner lowering.
+
+### IR-1104
+
+- 类型化 Str 循环的 `break match` 贡献以及标量 `match` 初始化器（`let n = match s { "a" => 1, _ => 2 }` 绑定 `I64`）。`str_expr_family` 新增无期望的 `Match` 分支：审视 scrutinee（须为 `Str` 字面量或 `Str` 绑定），按 `check_function_str_match` 镜像逐 arm 检查 — 仅 `Lit::Str` 字面量、`Or` 全 `Str` 元素、`Wild`/无 guard 绑定 catch-all；guard 仅 `Lit::Bool`；catch-all 后的 arm 报告 UNREACHABLE_PATTERN，缺 catch-all 报告 NON_EXHAUSTIVE_MATCH；非 `Str` 字面量模式报告 `expected `Str`, found <lit>`；arm 体经 `str_expr_family(expected=None)` 分类，join 跳过 `!`，分歧报告 TypeMismatch，diverging 返回 `!`。带标注的 `match` 初始化器仍 gate（期望为非 `Str` pin），`Str` pin 走语句级 join。driver 782 / CLI 392。
+
