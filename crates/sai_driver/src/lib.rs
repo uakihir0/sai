@@ -13585,7 +13585,7 @@ fn str_loop_family(
     let mut resolved = Vec::with_capacity(contributions.len());
     for (contribution, value, span) in contributions {
         if let Some(family) = contribution {
-            resolved.push((family, span));
+            resolved.push((Some(family), value, span));
             continue;
         }
         let evaluated = match value {
@@ -13605,12 +13605,22 @@ fn str_loop_family(
             None => None,
         };
         match evaluated {
-            Some((family, _diagnostics)) => resolved.push((family, span)),
+            Some((family, _diagnostics)) => resolved.push((Some(family), value, span)),
             None => return Ok(None),
         }
     }
+    str_fold_literal_contributions(
+        owner,
+        &mut resolved,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+        &mut diagnostics,
+    )?;
     let mut family: Option<&'static str> = None;
-    for (contribution, span) in resolved {
+    for (contribution, _value, span) in resolved {
+        let contribution = contribution.expect("every contribution resolved above");
         if contribution == "`!`" {
             continue;
         }
@@ -13638,6 +13648,56 @@ fn str_loop_family(
     // unifies with every join, so the family stays `!` rather than a
     // concrete `Str`.
     Ok(Some((family.unwrap_or("`!`"), diagnostics)))
+}
+
+// Fold default-integer literal break values into a single pinned/
+// primitive contribution family, like the checker's β unification:
+// `break x` (x: I8) and `break 2` join at `I8`. The literal is checked
+// against the pin, so an out-of-range value reports
+// LITERAL_OUT_OF_RANGE rather than a spurious join mismatch.
+fn str_fold_literal_contributions(
+    owner: &HirOwner<'_>,
+    contributions: &mut [(Option<&'static str>, Option<&HirExpr<'_>>, sai_hir::Span)],
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), OwnerControlFlowResolutionError> {
+    let mut prims = contributions
+        .iter()
+        .filter(|(_, value, _)| !matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_))))
+        .filter_map(|(family, _, _)| *family)
+        .filter(|family| {
+            *family != "`!`"
+                && *family != "`()`"
+                && primitive_method_field_type(family.trim_matches('`')).is_some()
+        });
+    let (Some(prim), None) = (prims.next(), prims.next()) else {
+        return Ok(());
+    };
+    let Some(primitive) = primitive_method_field_type(prim.trim_matches('`')) else {
+        return Ok(());
+    };
+    for (family, value, _) in contributions.iter_mut() {
+        let Some(expr) = *value else { continue };
+        if *family != Some("`I64`") || !matches!(expr.kind, ExprKind::Lit(_)) {
+            continue;
+        }
+        if let Some(mut literal_diagnostics) = check_const_literal_against_type(
+            owner.id,
+            ConstLiteralType::Primitive(primitive),
+            expr,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )? {
+            diagnostics.append(&mut literal_diagnostics);
+        }
+        *family = Some(prim);
+    }
+    Ok(())
 }
 
 // `Str` locals bind only string literals and earlier `Str` bindings:
@@ -14546,6 +14606,15 @@ fn str_stmt_expr_unit(
                     inputs,
                     &mut contributions,
                 );
+                str_fold_literal_contributions(
+                    owner,
+                    &mut contributions,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    &mut diagnostics,
+                )?;
                 let mut classed = contributions
                     .iter()
                     .filter_map(|contribution| contribution.0.map(|f| (f, contribution.2)))
@@ -14853,6 +14922,29 @@ fn str_pure_init_family(
                 inputs,
                 &mut contributions,
             );
+            // The same literal-vs-pin fold as the diagnostic walk, minus
+            // diagnostics — the statement walk emits those itself.
+            let mut prims: Vec<_> = contributions
+                .iter()
+                .filter(|(_, value, _)| !matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_))))
+                .filter_map(|contribution| contribution.0)
+                .filter(|family| {
+                    *family != "`!`"
+                        && *family != "`()`"
+                        && primitive_method_field_type(family.trim_matches('`')).is_some()
+                })
+                .collect();
+            prims.sort_unstable();
+            prims.dedup();
+            if let [prim] = prims.as_slice() {
+                for (family, value, _) in contributions.iter_mut() {
+                    if *family == Some("`I64`")
+                        && matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_)))
+                    {
+                        *family = Some(*prim);
+                    }
+                }
+            }
             let mut families = contributions
                 .iter()
                 .filter_map(|contribution| contribution.0)
