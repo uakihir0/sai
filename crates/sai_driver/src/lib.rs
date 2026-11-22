@@ -15135,8 +15135,133 @@ fn str_pure_init_family(
                 Some(first)
             }
         }
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source: MatchSource::Normal,
+        } => str_pure_match_family(
+            scrutinee,
+            arms,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+        ),
         _ => str_binding_family(init, locals, str_bindings),
     }
+}
+
+// The pure counterpart of `str_match_family`: the same scrutinee and
+// pattern admission minus diagnostics — arms after the catch-all still
+// join (the diagnostic walk reports their UNREACHABLE_PATTERN itself),
+// and a missing catch-all still joins since exhaustiveness is a
+// diagnostic, not a gate, in the family walk.
+fn str_pure_match_family(
+    scrutinee: &HirExpr<'_>,
+    arms: &[sai_hir::expressions::Arm<'_>],
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<&'static str> {
+    if !(matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_)))
+        || str_binding_family(scrutinee, locals, str_bindings) == Some("`Str`"))
+        || arms.is_empty()
+    {
+        return None;
+    }
+    let mut catch_all = false;
+    let mut arm_families: Vec<(Option<&'static str>, Option<&HirExpr<'_>>, sai_hir::Span)> =
+        Vec::with_capacity(arms.len());
+    for arm in arms {
+        if let Some(guard) = arm.guard
+            && !matches!(guard.kind, ExprKind::Lit(Lit::Bool(_)))
+        {
+            return None;
+        }
+        let mut arm_bindings = str_bindings.clone();
+        if catch_all {
+            if let PatKind::Binding {
+                mode: sai_hir::patterns::BindingMode::Value,
+                binding,
+                sub: None,
+                ..
+            } = arm.pat.kind
+            {
+                arm_bindings.insert(binding, "`Str`");
+            }
+        } else {
+            match arm.pat.kind {
+                PatKind::Lit(Lit::Str(_)) => {}
+                PatKind::Lit(literal) if str_pattern_literal_name(literal).is_some() => {}
+                PatKind::Lit(_) => return None,
+                PatKind::Or(alternatives) => {
+                    if alternatives.is_empty() {
+                        return None;
+                    }
+                    for alternative in alternatives {
+                        match alternative.kind {
+                            PatKind::Lit(Lit::Str(_)) => {}
+                            PatKind::Lit(literal)
+                                if str_pattern_literal_name(literal).is_some() => {}
+                            _ => return None,
+                        }
+                    }
+                }
+                PatKind::Wild => catch_all = arm.guard.is_none(),
+                PatKind::Binding {
+                    mode: sai_hir::patterns::BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } => {
+                    catch_all = arm.guard.is_none();
+                    arm_bindings.insert(binding, "`Str`");
+                }
+                _ => return None,
+            }
+        }
+        let arm_family =
+            str_pure_init_family(arm.body, locals, &arm_bindings, type_paths, symbols, inputs)?;
+        arm_families.push((Some(arm_family), Some(arm.body), arm.body.span));
+    }
+    // The literal-vs-pin fold, minus diagnostics.
+    let mut prims: Vec<_> = arm_families
+        .iter()
+        .filter(|(_, value, _)| !matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_))))
+        .filter_map(|contribution| contribution.0)
+        .filter(|family| {
+            *family != "`!`"
+                && *family != "`()`"
+                && primitive_method_field_type(family.trim_matches('`')).is_some()
+        })
+        .collect();
+    prims.sort_unstable();
+    prims.dedup();
+    if let [prim] = prims.as_slice() {
+        for (family, value, _) in arm_families.iter_mut() {
+            if *family == Some("`I64`") && matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_))) {
+                *family = Some(*prim);
+            }
+        }
+    }
+    let mut family: Option<&'static str> = None;
+    for (arm_family, _, _) in arm_families {
+        let Some(arm_family) = arm_family else {
+            continue;
+        };
+        if arm_family == "`!`" {
+            continue;
+        }
+        match family {
+            Some(first) if first != arm_family => return None,
+            None => family = Some(arm_family),
+            _ => {}
+        }
+    }
+    Some(family.unwrap_or("`!`"))
 }
 
 // A block's pure family: `let` statements seed the inner map, the tail
@@ -15404,7 +15529,7 @@ fn str_stmt_block_unit(
                     }
                     None => (None, None),
                 };
-                let Some((family, mut init_diagnostics)) = str_literal_family_init(
+                let (family, mut init_diagnostics) = match str_literal_family_init(
                     owner,
                     init,
                     locals,
@@ -15414,9 +15539,38 @@ fn str_stmt_block_unit(
                     inputs,
                     snapshot,
                     target_cfg,
-                )?
-                else {
-                    return Ok(None);
+                )? {
+                    Some(found) => found,
+                    // `let n = if`/`loop`/`block`/`match` inside a
+                    // statement block binds the joined family like the
+                    // group-level initializer dispatch.
+                    None if matches!(
+                        init.kind,
+                        ExprKind::If { .. }
+                            | ExprKind::Block(_)
+                            | ExprKind::Loop { .. }
+                            | ExprKind::Match { .. }
+                    ) =>
+                    {
+                        let Some(found) = str_expr_family(
+                            owner,
+                            return_ty,
+                            init,
+                            locals,
+                            &inner_bindings,
+                            expected,
+                            type_paths,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        found
+                    }
+                    None => return Ok(None),
                 };
                 let PatKind::Binding {
                     mode: sai_hir::patterns::BindingMode::Value,
@@ -54007,6 +54161,7 @@ property "shared"() {}
             "pub fn str_diverging_local_str_copy() -> Str {\n    let n = loop {}\n    let s: Str = n\n    s\n}\n",
             "pub fn str_loop_ann_break_lit_fold() -> Str {\n    loop {\n        return if true {\n            let x: I8 = 1\n            break x\n        } else {\n            break 2\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_loop_ann_break_lit_oob() -> Str {\n    loop {\n        return if true {\n            let x: I8 = 1\n            break x\n        } else {\n            break 200\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_loop_match_seed_break_mismatch() -> Str {\n    let s = \"a\"\n    loop {\n        let n = match s {\n            \"x\" => 1,\n            _ => 2,\n        }\n        return if true {\n            break n\n        } else {\n            break \"a\"\n        }\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54022,7 +54177,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 148);
+        assert_eq!(resolved.owners().len(), 149);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54107,6 +54262,7 @@ property "shared"() {}
             (141, sai_diagnostics::Code::LiteralOutOfRange),
             (144, sai_diagnostics::Code::TypeMismatch),
             (147, sai_diagnostics::Code::LiteralOutOfRange),
+            (148, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
