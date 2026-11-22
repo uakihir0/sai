@@ -13186,6 +13186,7 @@ fn check_function_str_local_block(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let mut diagnostics = Vec::new();
     for stmt in block.stmts {
         // `assert` statements admit a literal `Bool` condition and an
         // optional `Str` literal message — other shapes stay gated.
@@ -13212,12 +13213,73 @@ fn check_function_str_local_block(
         {
             return Ok(None);
         }
-        let init_is_str = match init.kind {
-            ExprKind::Lit(Lit::Str(_)) => true,
-            _ => str_binding_path(init, locals, str_bindings),
-        };
-        if !init_is_str {
-            return Ok(None);
+        // `let s = if <lit bool> { <Str block> } else { <Str block> }` runs
+        // the shared block walk on each branch with a cloned binding set.
+        match init.kind {
+            ExprKind::Lit(Lit::Str(_)) => {}
+            ExprKind::If {
+                cond,
+                then,
+                els: Some(els),
+            } => {
+                let ExprKind::Block(else_block) = els.kind else {
+                    return Ok(None);
+                };
+                if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+                    || then.safety != sai_hir::Safety::Safe
+                    || else_block.safety != sai_hir::Safety::Safe
+                {
+                    return Ok(None);
+                }
+                // At least one branch must yield a `Str` value — an `if`
+                // producing only non-`Str` arms is a non-`Str` initializer
+                // and stays gated rather than borrowing the return type.
+                let branch_yields_str = |branch: &sai_hir::expressions::Block<'_>| {
+                    branch.tail.is_some_and(|tail| {
+                        matches!(tail.kind, ExprKind::Lit(Lit::Str(_)))
+                            || str_binding_path(tail, locals, str_bindings)
+                    })
+                };
+                if !branch_yields_str(then) && !branch_yields_str(else_block) {
+                    return Ok(None);
+                }
+                let mut then_bindings = str_bindings.clone();
+                let Some(mut then_diagnostics) = check_function_str_local_block(
+                    owner,
+                    return_ty,
+                    then,
+                    &mut then_bindings,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut then_diagnostics);
+                let mut else_bindings = str_bindings.clone();
+                let Some(mut else_diagnostics) = check_function_str_local_block(
+                    owner,
+                    return_ty,
+                    else_block,
+                    &mut else_bindings,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut else_diagnostics);
+            }
+            _ if str_binding_path(init, locals, str_bindings) => {}
+            _ => return Ok(None),
         }
         let PatKind::Binding {
             mode: sai_hir::patterns::BindingMode::Value,
@@ -13233,7 +13295,7 @@ fn check_function_str_local_block(
     let Some(tail) = block.tail else {
         return Ok(None);
     };
-    check_function_str_tail(
+    let Some(mut tail_diagnostics) = check_function_str_tail(
         owner,
         return_ty,
         tail,
@@ -13244,7 +13306,12 @@ fn check_function_str_local_block(
         inputs,
         snapshot,
         target_cfg,
-    )
+    )?
+    else {
+        return Ok(None);
+    };
+    diagnostics.append(&mut tail_diagnostics);
+    Ok(Some(diagnostics))
 }
 
 // One `Str` tail position: a `Str` literal, a path into the `Str` local group,
@@ -50656,6 +50723,12 @@ property "shared"() {}
             "pub fn str_assert_int_cond() -> Str {\n    assert 1\n    \"a\"\n}\n",
             "pub fn str_assert_int_msg() -> Str {\n    assert true, 1\n    \"a\"\n}\n",
             "pub fn str_unsafe_block_tail() -> Str {\n    unsafe { \"a\" }\n}\n",
+            "pub fn str_if_init() -> Str {\n    let s = if true { \"a\" } else { \"b\" }\n    s\n}\n",
+            "pub fn str_if_init_local() -> Str {\n    let s = if true { let v = \"a\"\n    v } else { \"b\" }\n    s\n}\n",
+            "pub fn str_if_init_mismatch() -> Str {\n    let s = if true { 1 } else { \"b\" }\n    s\n}\n",
+            "pub fn str_if_init_int_cond() -> Str {\n    let s = if 1 { \"a\" } else { \"b\" }\n    s\n}\n",
+            "pub fn str_if_init_no_else() -> Str {\n    let s = if true { \"a\" }\n    s\n}\n",
+            "pub fn str_if_init_all_int() -> Str {\n    let s = if true { 1 } else { 2 }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -50671,13 +50744,14 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 35);
+        assert_eq!(resolved.owners().len(), 41);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
             .chain(&resolved.owners()[20..21])
             .chain(&resolved.owners()[24..28])
             .chain(&resolved.owners()[30..32])
+            .chain(&resolved.owners()[35..37])
         {
             assert!(matches!(
                 owner
@@ -50686,7 +50760,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [4, 21] {
+        for index in [4, 21, 37] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
                 .expect("Str mismatch body check succeeds");
@@ -50704,7 +50778,8 @@ property "shared"() {}
             .chain(&resolved.owners()[17..20])
             .chain(&resolved.owners()[22..24])
             .chain(&resolved.owners()[28..30])
-            .chain(&resolved.owners()[32..])
+            .chain(&resolved.owners()[32..35])
+            .chain(&resolved.owners()[38..])
         {
             assert!(matches!(
                 owner
