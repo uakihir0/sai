@@ -10064,3 +10064,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver 781 and `check_empty_source` 392 pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** `value<I32>` param tails still gate — the param seed goes through `str_binding_path`, which now requires a plain single-segment arg-free path; the review fix for IR-1082 therefore covers the seed too.
 - **Remaining scope:** two-`Str`-param bodies, `Str` locals from non-literal/non-group initializers (needs `Str` in `LocalType`), tuple/index tails, `for`/`while let`/`if let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).
+
+### IR-1084 (2026-11-22): two `Str` parameters as `Str` local-group seeds
+
+- **Decision:** The two-parameter arm seeds both bindings into the `Str` local group when both parameters and the return type resolve to `Str` — `fn f(value: Str, other: Str) -> Str { other }`, `let copied = value`, and literal tails are supported.
+- **Reason:** The pair arm is the dispatch slot for two-parameter bodies; seeding `{first_body.binding, second_body.binding}` through `check_function_str_local_block` reuses the same walk instead of duplicating the param-tail path check that gated `multi_str_identity`.
+- **Failure boundary and judgment:** Mixed `Str`/non-`Str` pairs and non-`Str` returns stay on the old `if`-tail path (gated); mutable params never reach the pair arm; three or more params have no arm.
+- **Review required:** None — reuses the IR-1083 seeded walk verbatim; the only new rule is which bindings seed.
+- **Planned verification matrix:** Driver `function_body_type_check_accepts_str_literal_locals` gains `multi_str_identity`, `multi_str_local`, `multi_str_lit_tail` (supported-clean); CLI moves `multi_str_identity` into `public_zero_parameter_direct_scalar_function_emits_check_result`.
+- **Verification:** Pinned Rust 1.99.1, driver 781 and `check_empty_source` 392 pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** The seeds go through `str_binding_path`, so generic-arg or multi-segment param paths still gate; a tail naming a non-seeded binding (a third param cannot exist — the arm only fires on exactly two) is impossible by construction.
+- **Remaining scope:** `Str` locals from non-literal/non-group initializers (needs `Str` in `LocalType`), tuple/index tails, `for`/`while let`/`if let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).
