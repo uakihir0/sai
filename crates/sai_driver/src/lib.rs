@@ -15468,7 +15468,10 @@ fn str_pure_condition(
         return str_condition_operand_family(lhs, locals, str_bindings).is_some()
             && str_condition_operand_family(rhs, locals, str_bindings).is_some();
     }
-    false
+    // A bound path is admitted like the diagnostic twin — `Bool`/`!` is
+    // clean, any other family is the recoverable `expected Bool`.
+    str_condition_operand(cond, locals, str_bindings)
+        || str_binding_family(cond, locals, str_bindings).is_some()
 }
 
 // The family a `let` initializer binds without running the diagnostic
@@ -15668,11 +15671,11 @@ fn str_pure_match_family(
                 }
                 _ => return None,
             }
-        }
-        if let Some(guard) = arm.guard
-            && !str_pure_condition(guard, locals, &arm_bindings)
-        {
-            return None;
+            if let Some(guard) = arm.guard
+                && !str_pure_condition(guard, locals, &arm_bindings)
+            {
+                return None;
+            }
         }
         let arm_family =
             str_pure_init_family(arm.body, locals, &arm_bindings, type_paths, symbols, inputs)?;
