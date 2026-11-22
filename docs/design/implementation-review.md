@@ -10108,3 +10108,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** The clone-on-entry rule means an inner `let` cannot satisfy an outer tail — `str_block_scope_leak` gates on the unresolved path; `return` inside a branch is a diverging tail checked leaf-by-leaf, so no binding state leaks through it either.
 - **Remaining scope:** `match` tails for `Str` (needs a matchable scrutinee), `Str` locals from non-literal/non-group initializers (needs `Str` in `LocalType`), `loop`/`while`/`for` in `Str` bodies, tuple/index tails, `if let`/`while let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).
+
+### IR-1088 (2026-11-22): `assert` statements and the unsafe-block gate in `-> Str` bodies
+
+- **Decision:** `check_function_str_local_block` admits `StmtKind::Assert` with a literal `Bool` condition and an optional `Str` literal message — `assert true` / `assert true, "bad"` in `-> Str` bodies pass. Additionally, hostile review on IR-1087 found the nested-`Block` tail arm missing a safety check; `unsafe { "a" }` now gates.
+- **Reason:** `check_stmt` already checks asserts in the general path (`Bool` cond, `Str` msg); the literal forms mirror that admission inside the bounded `Str` walk. The unsafe gap was a real divergence from the primitive slice, which gates non-safe blocks.
+- **Failure boundary and judgment:** Non-literal conditions (`assert flag`), non-`Str` messages (`assert true, 1`), `var`/`let`-else/other statement kinds still gate; unsafe and unchecked blocks everywhere in the walk gate.
+- **Review required:** The safety gate is load-bearing — verified by `str_unsafe_block_tail` staying `Unsupported`.
+- **Planned verification matrix:** Driver gains `str_assert`, `str_assert_msg` (supported-clean), `str_assert_int_cond`, `str_assert_int_msg`, `str_unsafe_block_tail` (gated); CLI adds `str_assert` success case.
+- **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** The assert arm runs before the `Let` destructure, so no statement can masquerade as both; message `None` and `Lit::Str` are the only admitted forms.
+- **Remaining scope:** `match` tails for `Str` (needs a matchable scrutinee), `Str` locals from non-literal/non-group initializers (needs `Str` in `LocalType`), `loop`/`while`/`for` in `Str` bodies, tuple/index tails, `if let`/`while let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).

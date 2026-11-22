@@ -13187,6 +13187,16 @@ fn check_function_str_local_block(
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     for stmt in block.stmts {
+        // `assert` statements admit a literal `Bool` condition and an
+        // optional `Str` literal message — other shapes stay gated.
+        if let sai_hir::expressions::StmtKind::Assert { cond, msg, .. } = stmt.kind {
+            let cond_ok = matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)));
+            let msg_ok = msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))));
+            if !cond_ok || !msg_ok {
+                return Ok(None);
+            }
+            continue;
+        }
         let sai_hir::expressions::StmtKind::Let {
             pat,
             ty,
@@ -13312,6 +13322,9 @@ fn check_function_str_tail(
     // Nested blocks re-run the shared `Str` walk on a cloned binding set —
     // bindings declared inside stay scoped to the inner block.
     if let ExprKind::Block(inner) = tail.kind {
+        if inner.safety != sai_hir::Safety::Safe {
+            return Ok(None);
+        }
         let mut inner_bindings = str_bindings.clone();
         return check_function_str_local_block(
             owner,
@@ -50638,6 +50651,11 @@ property "shared"() {}
             "pub fn str_nested_block_local() -> Str {\n    { let v = \"a\"\n    v }\n}\n",
             "pub fn str_bare_return() -> Str {\n    return\n}\n",
             "pub fn str_block_scope_leak() -> Str {\n    { let v = \"a\"\n    v }\n    v\n}\n",
+            "pub fn str_assert() -> Str {\n    assert true\n    \"a\"\n}\n",
+            "pub fn str_assert_msg() -> Str {\n    assert true, \"bad\"\n    \"a\"\n}\n",
+            "pub fn str_assert_int_cond() -> Str {\n    assert 1\n    \"a\"\n}\n",
+            "pub fn str_assert_int_msg() -> Str {\n    assert true, 1\n    \"a\"\n}\n",
+            "pub fn str_unsafe_block_tail() -> Str {\n    unsafe { \"a\" }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -50653,12 +50671,13 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 30);
+        assert_eq!(resolved.owners().len(), 35);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
             .chain(&resolved.owners()[20..21])
             .chain(&resolved.owners()[24..28])
+            .chain(&resolved.owners()[30..32])
         {
             assert!(matches!(
                 owner
@@ -50684,7 +50703,8 @@ property "shared"() {}
             .iter()
             .chain(&resolved.owners()[17..20])
             .chain(&resolved.owners()[22..24])
-            .chain(&resolved.owners()[28..])
+            .chain(&resolved.owners()[28..30])
+            .chain(&resolved.owners()[32..])
         {
             assert!(matches!(
                 owner
