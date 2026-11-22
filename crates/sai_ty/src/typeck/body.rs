@@ -2607,11 +2607,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 let local_type = self.check_expr_value(operand, PrimTy::Bool)?;
                 self.concrete_local_type(local_type).ok_or(())
             }
-            _ => self
-                .check_operand_local_type(operand)
-                .ok()
-                .and_then(|local_type| self.concrete_local_type(local_type))
-                .ok_or(()),
+            _ => {
+                let local_type = self.check_operand_local_type(operand)?;
+                if let LocalType::LiteralVariable(id) = local_type {
+                    // An integer or floating-point literal variable can
+                    // never resolve to `Bool`, so `not x` reports the
+                    // operand's family default rather than gating.
+                    let Some(variable) = self.literal_variables.get(id) else {
+                        return Err(());
+                    };
+                    if variable.resolved.is_none() {
+                        return Ok(literal_variable_default_type(variable.kind));
+                    }
+                }
+                self.concrete_local_type(local_type).ok_or(())
+            }
         }
     }
 

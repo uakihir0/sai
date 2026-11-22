@@ -55119,14 +55119,18 @@ property "shared"() {}
         }
 
         let int_literal_owner = owner_named(&database, &resolved, "not_int_literal_tail");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = int_literal_owner
+            .body_type_check()
+            .expect("int literal local not tail body query succeeds")
+        else {
+            panic!("`not` over an unannotated integer literal variable diagnoses")
+        };
+        assert_eq!(diagnostics.len(), 1);
         assert!(
-            matches!(
-                int_literal_owner
-                    .body_type_check()
-                    .expect("int literal local not tail body query succeeds"),
-                FunctionBodyTypeCheck::Unsupported
-            ),
-            "`not` over an unannotated integer literal variable stays outside this slice"
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                == sai_diagnostics::Code::TypeMismatch
+                && diagnostic.message.contains("expected `Bool`, found `I64`")),
+            "`not` over an integer literal variable reports the family default: {diagnostics:?}"
         );
     }
 
