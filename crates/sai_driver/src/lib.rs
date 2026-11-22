@@ -13206,6 +13206,37 @@ fn str_comparison_condition(
     )
 }
 
+// An `assert` message in a `-> Str` body: a `Str` literal or binding is
+// clean, a scalar literal is the checker's `expected Str` mismatch, and
+// any other shape stays gated.
+fn str_assert_msg(
+    owner: &HirOwner<'_>,
+    msg: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if matches!(msg.kind, ExprKind::Lit(Lit::Str(_))) || str_binding_path(msg, locals, str_bindings)
+    {
+        return Ok(Some(Vec::new()));
+    }
+    if let ExprKind::Lit(literal) = msg.kind
+        && let Some(found) = str_pattern_literal_name(literal)
+    {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            msg.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `Str`, found {found}"),
+            "type mismatch",
+        )?]));
+    }
+    Ok(None)
+}
+
 // A condition in a `-> Str` body: a `Bool` literal or a `Str` comparison.
 // A scalar literal operand inside a comparison is a recoverable
 // `expected Str, found <lit>` mismatch; any other shape (calls, nested
@@ -13318,12 +13349,13 @@ fn check_function_str_local_block(
             else {
                 return Ok(None);
             };
-            let msg_ok = msg.is_none_or(|msg| {
-                matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))
-                    || str_binding_path(msg, locals, str_bindings)
-            });
-            if !msg_ok {
-                return Ok(None);
+            if let Some(msg) = msg {
+                let Some(mut msg_diagnostics) =
+                    str_assert_msg(owner, msg, locals, str_bindings, inputs, snapshot)?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut msg_diagnostics);
             }
             diagnostics.append(&mut cond_diagnostics);
             continue;
@@ -13784,8 +13816,13 @@ fn str_loop_level_block(
                 else {
                     return Ok(None);
                 };
-                if !msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))) {
-                    return Ok(None);
+                if let Some(msg) = msg {
+                    let Some(mut msg_diagnostics) =
+                        str_assert_msg(owner, msg, locals, str_bindings, inputs, snapshot)?
+                    else {
+                        return Ok(None);
+                    };
+                    diagnostics.append(&mut msg_diagnostics);
                 }
                 diagnostics.append(&mut cond_diagnostics);
             }
@@ -51957,6 +51994,7 @@ property "shared"() {}
             "pub fn str_if_scalar_eq() -> Str {\n    if 1 == 1 { \"a\" } else { \"b\" }\n}\n",
             "pub fn str_if_str_cond() -> Str {\n    let s = \"a\"\n    if s { \"x\" } else { \"b\" }\n}\n",
             "pub fn str_if_init_else_if() -> Str {\n    let s = if true { \"a\" } else if false { \"b\" } else { \"c\" }\n    s\n}\n",
+            "pub fn str_loop_assert_binding_msg() -> Str {\n    loop { let t = \"b\"\n    assert true, t\n    break \"a\" }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51972,7 +52010,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 99);
+        assert_eq!(resolved.owners().len(), 100);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -51992,7 +52030,7 @@ property "shared"() {}
             .chain(&resolved.owners()[83..86])
             .chain(&resolved.owners()[87..90])
             .chain(&resolved.owners()[91..96])
-            .chain(&resolved.owners()[98..99])
+            .chain(&resolved.owners()[98..100])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -52006,7 +52044,7 @@ property "shared"() {}
                 "clean owner #{index} produced diagnostics"
             );
         }
-        for index in [4, 17, 21, 32, 37, 38, 51, 61, 68, 76, 86, 90, 97] {
+        for index in [4, 17, 21, 32, 33, 37, 38, 51, 61, 68, 76, 86, 90, 97] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
                 .expect("Str mismatch body check succeeds");
@@ -52038,7 +52076,7 @@ property "shared"() {}
             .chain(&resolved.owners()[18..19])
             .chain(&resolved.owners()[22..24])
             .chain(&resolved.owners()[28..30])
-            .chain(&resolved.owners()[33..35])
+            .chain(&resolved.owners()[34..35])
             .chain(&resolved.owners()[39..41])
             .chain(&resolved.owners()[45..48])
             .chain(&resolved.owners()[52..53])
