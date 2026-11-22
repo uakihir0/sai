@@ -13269,25 +13269,18 @@ fn check_function_str_tail(
         let ExprKind::Block(else_block) = else_expr.kind else {
             return Ok(None);
         };
-        if then.safety != sai_hir::Safety::Safe
-            || else_block.safety != sai_hir::Safety::Safe
-            || !then.stmts.is_empty()
-            || !else_block.stmts.is_empty()
-        {
+        if then.safety != sai_hir::Safety::Safe || else_block.safety != sai_hir::Safety::Safe {
             return Ok(None);
         }
-        let Some(then_tail) = then.tail else {
-            return Ok(None);
-        };
-        let Some(else_tail) = else_block.tail else {
-            return Ok(None);
-        };
-        let Some(mut diagnostics) = check_function_str_tail(
+        // Each branch walks its own copy of the `Str` group so bindings made
+        // inside one branch cannot leak into the sibling or the outer tail.
+        let mut then_bindings = str_bindings.clone();
+        let Some(mut diagnostics) = check_function_str_local_block(
             owner,
             return_ty,
-            then_tail,
+            then,
+            &mut then_bindings,
             locals,
-            str_bindings,
             type_paths,
             symbols,
             inputs,
@@ -13297,12 +13290,13 @@ fn check_function_str_tail(
         else {
             return Ok(None);
         };
-        let Some(mut else_diagnostics) = check_function_str_tail(
+        let mut else_bindings = str_bindings.clone();
+        let Some(mut else_diagnostics) = check_function_str_local_block(
             owner,
             return_ty,
-            else_tail,
+            else_block,
+            &mut else_bindings,
             locals,
-            str_bindings,
             type_paths,
             symbols,
             inputs,
@@ -50624,6 +50618,7 @@ property "shared"() {}
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
+            .chain(&resolved.owners()[20..21])
         {
             assert!(matches!(
                 owner
@@ -50647,7 +50642,7 @@ property "shared"() {}
         // paths stay gated.
         for owner in resolved.owners()[5..8]
             .iter()
-            .chain(&resolved.owners()[17..21])
+            .chain(&resolved.owners()[17..20])
             .chain(&resolved.owners()[22..])
         {
             assert!(matches!(
