@@ -13295,7 +13295,13 @@ fn str_binding_family(
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
 ) -> Option<&'static str> {
-    str_binding_entry(expression, locals, str_bindings).map(|entry| entry.family)
+    str_binding_entry(expression, locals, str_bindings).map(|entry| {
+        entry
+            .literal
+            .as_ref()
+            .and_then(|seed| seed.resolved.get())
+            .unwrap_or(entry.family)
+    })
 }
 
 fn str_binding_entry(
@@ -13317,6 +13323,71 @@ fn str_binding_entry(
         }) => str_bindings.get(binding).cloned(),
         _ => None,
     }
+}
+
+// The resolution cells bound before a block walk: seeds created inside
+// the block carry fresh cells, so the defaulting pass can tell
+// block-local literals from ones an outer site may still constrain.
+fn str_seed_cells(
+    str_bindings: &StrLocalBindings,
+) -> std::collections::HashSet<*const std::cell::Cell<Option<&'static str>>> {
+    str_bindings
+        .values()
+        .filter_map(|entry| entry.literal.as_ref())
+        .map(|seed| std::rc::Rc::as_ptr(&seed.resolved))
+        .collect()
+}
+
+// `default_unresolved_literals`: an integer/float literal variable still
+// unresolved at its block's end defaults to `I64`/`F64` and reports the
+// deferred range error at the literal's origin. `carried` holds the
+// cells bound before the block — outer literals stay unresolved (a
+// later site may still constrain them).
+fn str_default_unresolved_literals(
+    owner: &HirOwner<'_>,
+    carried: &std::collections::HashSet<*const std::cell::Cell<Option<&'static str>>>,
+    str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    symbols: &Interner,
+    target_cfg: &TargetCfg,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for entry in str_bindings.values() {
+        let Some(seed) = entry.literal.as_ref() else {
+            continue;
+        };
+        if carried.contains(&std::rc::Rc::as_ptr(&seed.resolved))
+            || seed.resolved.get().is_some()
+        {
+            continue;
+        }
+        let (default_name, primitive, kind_word) = match seed.literal {
+            Lit::Int { .. } => ("`I64`", sai_resolve::prelude::PrimTy::I64, "integer"),
+            Lit::Float { .. } => ("`F64`", sai_resolve::prelude::PrimTy::F64, "floating-point"),
+            _ => continue,
+        };
+        seed.resolved.set(Some(default_name));
+        if sai_ty::typeck::literal::check_primitive_literal(
+            primitive,
+            seed.literal,
+            symbols,
+            target_cfg.pointer_width(),
+        ) == sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange
+            && let Ok(diagnostic) = const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                seed.origin,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                format!("{kind_word} literal is out of range for {default_name}"),
+                "literal out of range",
+            )
+        {
+            diagnostics.push(diagnostic);
+        }
+    }
+    diagnostics
 }
 
 // The group family a scalar literal binds under — its default literal
@@ -15212,6 +15283,7 @@ fn check_function_str_local_block(
     break_ctx: bool,
     frame: StrStmtLoopFrame,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let carried = str_seed_cells(str_bindings);
     let mut diagnostics = Vec::new();
     for stmt in block.stmts {
         // `assert` statements admit a literal `Bool` condition and an
@@ -15765,6 +15837,16 @@ fn check_function_str_local_block(
         return Ok(None);
     };
     diagnostics.append(&mut tail_diagnostics);
+    let mut defaulted = str_default_unresolved_literals(
+        owner,
+        &carried,
+        str_bindings,
+        inputs,
+        snapshot,
+        symbols,
+        target_cfg,
+    );
+    diagnostics.append(&mut defaulted);
     Ok(Some(diagnostics))
 }
 
@@ -17176,6 +17258,7 @@ fn str_stmt_block_unit(
     if block.safety != sai_hir::Safety::Safe {
         return Ok(None);
     }
+    let carried = str_seed_cells(str_bindings);
     let mut inner_bindings = str_bindings.clone();
     let mut diagnostics = Vec::new();
     for stmt in block.stmts {
@@ -17347,6 +17430,16 @@ fn str_stmt_block_unit(
         };
         diagnostics.append(&mut tail_diagnostics);
     }
+    let mut defaulted = str_default_unresolved_literals(
+        owner,
+        &carried,
+        &inner_bindings,
+        inputs,
+        snapshot,
+        symbols,
+        target_cfg,
+    );
+    diagnostics.append(&mut defaulted);
     Ok(Some(diagnostics))
 }
 
@@ -17372,6 +17465,7 @@ fn str_loop_level_block(
     if block.safety != sai_hir::Safety::Safe {
         return Ok(None);
     }
+    let carried = str_seed_cells(str_bindings);
     let mut diagnostics = Vec::new();
     let mut clean_yield = false;
     let mut any_break = false;
@@ -17513,6 +17607,16 @@ fn str_loop_level_block(
         any_break |= broken;
         diagnostics.append(&mut tail_diagnostics);
     }
+    let mut defaulted = str_default_unresolved_literals(
+        owner,
+        &carried,
+        str_bindings,
+        inputs,
+        snapshot,
+        symbols,
+        target_cfg,
+    );
+    diagnostics.append(&mut defaulted);
     Ok(Some((clean_yield, any_break, diagnostics)))
 }
 
