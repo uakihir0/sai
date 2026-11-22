@@ -10020,3 +10020,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver 780 and `check_empty_source` 392 pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** The probe resolves the operand's own type first, so `flag and a & b` reports the operand's real type (`I64`/`I32`) rather than asserting `Bool` on the tree root — the same guarantee as `not (a + b)`, which now reports `I32` where IR-1078 reported `I64` for bare literal vars.
 - **Remaining scope:** literal-var operands inside call-argument logical trees, `not` tails over literal vars in nested positions, `Str` literal locals (needs a non-`PrimTy` local type), tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1080 (2026-11-22): literal variables in call-argument logical operands
+
+- **Decision:** `apply_bool(inferred and flag)` where `inferred` is an unresolved integer or float literal variable now diagnoses `expected Bool, found I64`/`F64` instead of gating — the direct-call logical operand check uses `check_logical_operand_probe` for `Path`/`Field` leaves, matching the initializer-position fallback.
+- **Reason:** The admission mirror `is_supported_direct_call_logical_operands` already admits `Path` operands by shape; the failure was inside `check_direct_call_logical`, which required `concrete_local_type` — `None` for an unresolved literal variable. Routing through the probe returns the family default so `check_logical_operand_type` emits the mismatch.
+- **Failure boundary and judgment:** Unbound paths and unknown fields still gate via the probe; `ErrorLiteralVariable` operands stay with the tainted recovery path.
+- **Review required:** None — reuses the IR-1079 probe verbatim inside the reviewed direct-call operand loop.
+- **Planned verification matrix:** Driver `function_body_type_check_checks_multiple_annotated_locals_and_copies_in_source_order` gains `logical_literal_var_call_argument` asserting supported-with-`TypeMismatch`.
+- **Verification:** Pinned Rust 1.99.1, driver 780 and `check_empty_source` 392 pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** The probe is shared with the initializer path, so `not`/comparison call-argument leaves keep their existing checks — only the `Path`/`Field` arm of `check_direct_call_logical` changes, and `Bool` literals still short-circuit to `Concrete(Bool)`.
+- **Remaining scope:** `not` tails over literal vars in nested positions, `Str` literal locals (needs a non-`PrimTy` local type), tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.

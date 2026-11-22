@@ -2652,11 +2652,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Bool));
                     PrimTy::Bool
                 }
-                ExprKind::Path(_) | ExprKind::Field { .. } => self
-                    .check_operand_local_type(operand)
-                    .ok()
-                    .and_then(|local_type| self.concrete_local_type(local_type))
-                    .ok_or(())?,
+                // Unresolved literal variables fall back to their family
+                // default like the initializer-position operands — the
+                // operand-type check then reports the `Bool` mismatch.
+                ExprKind::Path(_) | ExprKind::Field { .. } => {
+                    self.check_logical_operand_probe(operand)?
+                }
                 _ => return Err(()),
             };
             self.check_logical_operand_type(operand, operand_type)?;

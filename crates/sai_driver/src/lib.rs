@@ -56478,6 +56478,10 @@ property "shared"() {}
             "    apply_bool(left_copy and right_copy)\n",
             "}\n",
             "pub fn logical_path_literal_and(left: Bool) -> Bool { apply_bool(left and true) }\n",
+            "pub fn logical_literal_var_call_argument(left: Bool) -> Bool {\n",
+            "    let inferred = 1\n",
+            "    apply_bool(inferred and left)\n",
+            "}\n",
             "pub fn logical_literal_path_and(right: Bool) -> Bool { apply_bool(false and right) }\n",
             "pub fn logical_path_literal_or(left: Bool) -> Bool { apply_bool(left or false) }\n",
             "pub fn logical_literal_path_or(right: Bool) -> Bool { apply_bool(true or right) }\n",
@@ -58707,6 +58711,13 @@ property "shared"() {}
         let logical_local_paths_call_argument =
             assert_supported(&database, "logical_local_paths_call_argument", &[]);
         let logical_path_literal_and = assert_supported(&database, "logical_path_literal_and", &[]);
+        // An unresolved literal-variable operand defaults to its family type
+        // and reports the `Bool` mismatch like the initializer positions.
+        let _logical_literal_var_call_argument = assert_supported(
+            &database,
+            "logical_literal_var_call_argument",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         let logical_literal_path_and = assert_supported(&database, "logical_literal_path_and", &[]);
         let logical_path_literal_or = assert_supported(&database, "logical_path_literal_or", &[]);
         let logical_literal_path_or = assert_supported(&database, "logical_literal_path_or", &[]);
