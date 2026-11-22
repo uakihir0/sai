@@ -13364,6 +13364,8 @@ fn str_expr_family(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -13760,6 +13762,8 @@ fn str_match_family(
                     snapshot,
                     symbols,
                     target_cfg,
+                    return_ty,
+                    type_paths,
                 )?
                 else {
                     return Ok(None);
@@ -14176,6 +14180,8 @@ fn str_condition(
     snapshot: &WorkspaceSnapshot,
     symbols: &Interner,
     target_cfg: &TargetCfg,
+    return_ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
         || str_comparison_condition(cond, locals, str_bindings)
@@ -14327,6 +14333,8 @@ fn str_condition(
             snapshot,
             symbols,
             target_cfg,
+            return_ty,
+            type_paths,
         );
     }
     if let ExprKind::Binary(BinOp::And | BinOp::Or, lhs, rhs) = cond.kind {
@@ -14341,6 +14349,8 @@ fn str_condition(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -14348,6 +14358,36 @@ fn str_condition(
             diagnostics.append(&mut operand_diagnostics);
         }
         return Ok(Some(diagnostics));
+    }
+    // Any other supported value shape is the checker's operand probe —
+    // `check_expr_value(operand, Bool)`: the family resolves against the
+    // `Bool` the condition demands (literal operands check against the
+    // pin) and a non-`Bool` result reports the operand mismatch.
+    if let Some((family, mut value_diagnostics)) = str_expr_family(
+        owner,
+        return_ty,
+        cond,
+        locals,
+        str_bindings,
+        Some(sai_resolve::prelude::PrimTy::Bool),
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )? {
+        if family != "`Bool`" && family != "`!`" {
+            value_diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                cond.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `Bool`, found {family}"),
+                "type mismatch",
+            )?);
+        }
+        return Ok(Some(value_diagnostics));
     }
     Ok(None)
 }
@@ -14380,6 +14420,8 @@ fn check_function_str_local_block(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -14636,6 +14678,8 @@ fn check_function_str_local_block(
                     snapshot,
                     symbols,
                     target_cfg,
+                    return_ty,
+                    type_paths,
                 )?
                 else {
                     return Ok(None);
@@ -14919,6 +14963,8 @@ fn str_stmt_expr_unit(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -15320,6 +15366,8 @@ fn str_stmt_expr_unit(
                             snapshot,
                             symbols,
                             target_cfg,
+                            return_ty,
+                            type_paths,
                         )?
                         else {
                             return Ok(None);
@@ -15490,6 +15538,9 @@ fn str_pure_condition(
     cond: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
 ) -> bool {
     if matches!(cond.kind, ExprKind::Lit(_)) {
         return true;
@@ -15507,15 +15558,15 @@ fn str_pure_condition(
             && str_condition_operand_family(rhs, locals, str_bindings).is_some();
     }
     if let ExprKind::Unary(UnOp::Not, operand) = cond.kind {
-        return str_pure_condition(operand, locals, str_bindings);
+        return str_pure_condition(operand, locals, str_bindings, type_paths, symbols, inputs);
     }
     if let ExprKind::Binary(BinOp::And | BinOp::Or, lhs, rhs) = cond.kind {
-        return str_pure_condition(lhs, locals, str_bindings)
-            && str_pure_condition(rhs, locals, str_bindings);
+        return str_pure_condition(lhs, locals, str_bindings, type_paths, symbols, inputs)
+            && str_pure_condition(rhs, locals, str_bindings, type_paths, symbols, inputs);
     }
-    // A bound path is admitted like the diagnostic twin — `Bool`/`!` is
-    // clean, any other family is the recoverable `expected Bool`.
-    str_binding_family(cond, locals, str_bindings).is_some()
+    // The diagnostic twin evaluates any supported value shape through
+    // the operand probe — only the admission matters here.
+    str_pure_init_family(cond, locals, str_bindings, type_paths, symbols, inputs).is_some()
 }
 
 // The family a `let` initializer binds without running the diagnostic
@@ -15716,7 +15767,7 @@ fn str_pure_match_family(
                 _ => return None,
             }
             if let Some(guard) = arm.guard
-                && !str_pure_condition(guard, locals, &arm_bindings)
+                && !str_pure_condition(guard, locals, &arm_bindings, type_paths, symbols, inputs)
             {
                 return None;
             }
@@ -16011,6 +16062,8 @@ fn str_stmt_block_unit(
                     snapshot,
                     symbols,
                     target_cfg,
+                    return_ty,
+                    type_paths,
                 )?
                 else {
                     return Ok(None);
@@ -16203,6 +16256,8 @@ fn str_loop_level_block(
                     snapshot,
                     symbols,
                     target_cfg,
+                    return_ty,
+                    type_paths,
                 )?
                 else {
                     return Ok(None);
@@ -16367,6 +16422,8 @@ fn str_loop_level_expr(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -16820,6 +16877,8 @@ fn check_function_str_match(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -16951,6 +17010,8 @@ fn check_function_str_tail(
             snapshot,
             symbols,
             target_cfg,
+            return_ty,
+            type_paths,
         )?
         else {
             return Ok(None);
@@ -54718,6 +54779,9 @@ property "shared"() {}
             "pub fn str_scalar_cond_not_str() -> Str {\n    let a = true\n    if not \"s\" {\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_cond_and_gate() -> Str {\n    let a = true\n    if a and 1 + 2 {\n    }\n    \"a\"\n}\n",
             "pub fn str_loop_if_no_else() -> Str {\n    let flag = true\n    loop {\n        if not flag {\n        }\n        break \"ok\"\n    }\n}\n",
+            "pub fn str_scalar_cond_and_if() -> Str {\n    let a = true\n    if a and if a { true } else { a } {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_if_tm() -> Str {\n    let a = true\n    if a and if a { 1 } else { true } {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_guard_if() -> Str {\n    let n = 1\n    let a = true\n    match n {\n        1 if if a { true } else { a } => \"a\",\n        _ => \"b\",\n    }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54733,7 +54797,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 193);
+        assert_eq!(resolved.owners().len(), 196);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54781,6 +54845,8 @@ property "shared"() {}
             .chain(&resolved.owners()[183..184])
             .chain(&resolved.owners()[185..189])
             .chain(&resolved.owners()[192..193])
+            .chain(&resolved.owners()[193..194])
+            .chain(&resolved.owners()[195..196])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54849,6 +54915,7 @@ property "shared"() {}
             (182, sai_diagnostics::Code::TypeMismatch),
             (189, sai_diagnostics::Code::TypeMismatch),
             (190, sai_diagnostics::Code::TypeMismatch),
+            (194, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()

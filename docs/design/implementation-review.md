@@ -10333,3 +10333,13 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** driver fixture test green on the pinned toolchain.
 - **Hostile review:** the diagnostic walk's `str_condition_operand` (Str-leaf) admission keeps its `expected Bool` mismatch diagnostic; the pure twin mirrors admission only, including bound paths of any family and skipping post-catch-all arm guards like `check_match_stmt`.
 - **Remaining scope:** scalar scrutinee parameters, `Str` in `LocalType`, `for`/`if let`/`while let`, field/call conditions, multi-owner lowering.
+
+### IR-1110 (2026-11-23): value-shape condition operands and else-less loop-level `if` (`-> Str` bodies)
+
+- **Decision:** `str_condition` falls back to the `str_expr_family` value walk at `Bool` expectation for condition/operand shapes the structured leaves do not admit — `if`/`match`/block/loop expressions work as conditions and logical operands (`if a and if a { 1 } else { true }`, match-guard `if`-expressions). A non-`Bool` result reports `expected Bool, found <family>` on the operand, mirroring `check_logical_operand_probe`/`check_expr_value(operand, Bool)`. `str_pure_condition` mirrors admission through `str_pure_init_family`. `str_loop_level_expr` also admits `els: None` like `check_if_stmt` (`loop { if c {} break "a" }`).
+- **Reason:** the checker's `check_if_condition`/`check_logical_operand` check any operand expression's type against `Bool`; restricting conditions to literal/comparison/logical leaves made valid programs gate.
+- **Failure boundary:** shapes `str_expr_family` does not lower (arithmetic binaries `a + 1`, calls, fields) still gate.
+- **Planned verification matrix:** `str_scalar_cond_and_if`/`str_scalar_match_guard_if`/`str_loop_if_no_else` (clean), `str_scalar_cond_if_tm` (`expected Bool` per literal branch).
+- **Verification:** driver fixture test green on the pinned toolchain.
+- **Hostile review:** the fallback runs after every structured leaf so `Lit`/`Path`/comparison shapes keep their exact diagnostics; literal operands check against the `Bool` pin through `str_literal_family_init`, matching the checker's operand diagnostics rather than a synthetic `expected Bool`.
+- **Remaining scope:** arithmetic/call/field conditions, scalar scrutinee parameters, `Str` in `LocalType`, `for`/`if let`/`while let`, multi-owner lowering.
