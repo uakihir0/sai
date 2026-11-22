@@ -13180,7 +13180,7 @@ fn is_direct_const_literal_or_unit(value: &HirExpr<'_>) -> bool {
 /// unforced use sees plus the literal seed when the binding is an
 /// unannotated literal variable — those resolve per use like the
 /// checker's `LiteralVariable`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct StrLocalEntry {
     family: &'static str,
     literal: Option<StrLiteralSeed>,
@@ -13188,11 +13188,17 @@ struct StrLocalEntry {
 
 /// An unannotated literal binding's seed: the literal itself plus its
 /// origin span (range diagnostics anchor to the literal like the
-/// checker's `variable.origin`).
-#[derive(Clone, Copy)]
+/// checker's `variable.origin`) and the primitive it first resolved
+/// to — like the checker's `LiteralVariable`, resolving the variable
+/// fixes it for every later use, so `let a: I64 = n` then `let b: U32
+/// = n` reports `expected `U32`, found `I64``. Cloned binding scopes
+/// share the cell; `let m = n` copies seed a fresh one (an
+/// independent literal variable).
+#[derive(Clone)]
 struct StrLiteralSeed {
     literal: Lit<'static>,
     origin: sai_hir::Span,
+    resolved: std::rc::Rc<std::cell::Cell<Option<&'static str>>>,
 }
 
 type StrLocalBindings = std::collections::BTreeMap<sai_hir::BindingId, StrLocalEntry>;
@@ -13233,13 +13239,26 @@ fn str_let_entry(
             literal: str_static_literal(literal).map(|literal| StrLiteralSeed {
                 literal,
                 origin: init.span,
+                resolved: std::rc::Rc::new(std::cell::Cell::new(None)),
             }),
         },
         ExprKind::Path(_) => {
-            str_binding_entry(init, locals, str_bindings).unwrap_or(StrLocalEntry {
-                family,
-                literal: None,
-            })
+            str_binding_entry(init, locals, str_bindings)
+                .map(|entry| StrLocalEntry {
+                    family: entry.family,
+                    // `let m = n` binds an independent literal
+                    // variable: the seed travels but the resolution
+                    // cell does not.
+                    literal: entry.literal.map(|seed| StrLiteralSeed {
+                        literal: seed.literal,
+                        origin: seed.origin,
+                        resolved: std::rc::Rc::new(std::cell::Cell::new(None)),
+                    }),
+                })
+                .unwrap_or(StrLocalEntry {
+                    family,
+                    literal: None,
+                })
         }
         _ => StrLocalEntry {
             family,
@@ -13295,7 +13314,7 @@ fn str_binding_entry(
             base: Res::Local(binding),
             resolved_segments: 1,
             segment_count: 1,
-        }) => str_bindings.get(binding).copied(),
+        }) => str_bindings.get(binding).cloned(),
         _ => None,
     }
 }
@@ -13367,10 +13386,14 @@ fn str_literal_family_init(
                     (name, ConstLiteralType::Primitive(primitive))
                 }
                 None => {
-                    let Some(default) = str_scalar_literal_default(literal) else {
-                        return Ok(None);
-                    };
-                    (str_scalar_family_name(literal).unwrap_or("`I64`"), default)
+                    // An unforced literal resolves through the fold or
+                    // the caller's compare — checking its default type
+                    // here would report `I64` range errors for
+                    // literals a `U64` sibling accepts (`w + 2^64-1`).
+                    return Ok(Some((
+                        str_scalar_family_name(literal).unwrap_or("`I64`"),
+                        Vec::new(),
+                    )));
                 }
             };
             let Some(diagnostics) = check_const_literal_against_type(
@@ -13396,7 +13419,11 @@ fn str_literal_family_init(
     // `resolve_literal_variable`: the seed literal range-checks against
     // it (anchored at the seed's origin); a literal kind the pin cannot
     // accept keeps its default family and the caller's pin/fold compare
-    // reports `expected <pin>, found <family>`.
+    // reports `expected <pin>, found <family>`. Resolving the variable
+    // fixes it — a later conflicting pin sees the resolved family.
+    if let Some(resolved) = entry.literal.as_ref().and_then(|seed| seed.resolved.get()) {
+        return Ok(Some((resolved, Vec::new())));
+    }
     if let (Some(primitive), Some(seed)) = (expected, entry.literal) {
         let Some(name) = str_prim_family_name(primitive) else {
             return Ok(None);
@@ -13409,26 +13436,32 @@ fn str_literal_family_init(
                 symbols,
                 target_cfg.pointer_width(),
             ) {
-                sai_ty::typeck::literal::PrimitiveLiteralResult::Match => (name, Vec::new()),
-                sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => (
-                    name,
-                    vec![const_literal_diagnostic(
-                        owner.id,
-                        inputs,
-                        snapshot,
-                        seed.origin,
-                        sai_diagnostics::Code::LiteralOutOfRange,
-                        format!(
-                            "{} literal is out of range for {name}",
-                            if matches!(literal, Lit::Int { .. }) {
-                                "integer"
-                            } else {
-                                "floating-point"
-                            }
-                        ),
-                        "literal out of range",
-                    )?],
-                ),
+                sai_ty::typeck::literal::PrimitiveLiteralResult::Match => {
+                    seed.resolved.set(Some(name));
+                    (name, Vec::new())
+                }
+                sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
+                    seed.resolved.set(Some(name));
+                    (
+                        name,
+                        vec![const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            seed.origin,
+                            sai_diagnostics::Code::LiteralOutOfRange,
+                            format!(
+                                "{} literal is out of range for {name}",
+                                if matches!(literal, Lit::Int { .. }) {
+                                    "integer"
+                                } else {
+                                    "floating-point"
+                                }
+                            ),
+                            "literal out of range",
+                        )?],
+                    )
+                }
                 sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => {
                     (entry.family, Vec::new())
                 }
@@ -13576,8 +13609,12 @@ fn str_expr_family(
                 });
             let operand_is_literalish = |operand: &HirExpr<'_>| {
                 matches!(operand.kind, ExprKind::Lit(_))
-                    || str_binding_entry(operand, locals, str_bindings)
-                        .is_some_and(|entry| entry.literal.is_some())
+                    || str_binding_entry(operand, locals, str_bindings).is_some_and(|entry| {
+                        entry
+                            .literal
+                            .as_ref()
+                            .is_some_and(|seed| seed.resolved.get().is_none())
+                    })
             };
             let operands_share_literal_kind =
                 operand_is_literalish(lhs) && operand_is_literalish(rhs);
@@ -13671,29 +13708,32 @@ fn str_expr_family(
                         Lit::Int { .. } => Some(StrLiteralSeed {
                             literal: str_static_literal(literal).unwrap(),
                             origin: lhs.span,
+                            resolved: std::rc::Rc::new(std::cell::Cell::new(None)),
                         }),
                         Lit::Byte(_) => None,
                         _ => return Ok(None),
                     },
                     ExprKind::Path(_) => {
                         match str_binding_entry(lhs, locals, str_bindings) {
-                            Some(entry) => match entry.literal {
-                                // A non-integer literal variable
-                                // resolves to its default family, then
-                                // the bitwise check applies below.
-                                Some(
-                                    seed @ StrLiteralSeed {
-                                        literal: Lit::Int { .. },
-                                        ..
-                                    },
-                                ) => Some(seed),
-                                Some(_) | None => {
-                                    if matches!(left_family, "`Str`" | "`ByteStr`" | "`()`") {
-                                        return Ok(None);
+                            Some(entry) => {
+                                match entry.literal.filter(|seed| seed.resolved.get().is_none()) {
+                                    // A non-integer literal variable
+                                    // resolves to its default family, then
+                                    // the bitwise check applies below.
+                                    Some(
+                                        seed @ StrLiteralSeed {
+                                            literal: Lit::Int { .. },
+                                            ..
+                                        },
+                                    ) => Some(seed),
+                                    Some(_) | None => {
+                                        if matches!(left_family, "`Str`" | "`ByteStr`" | "`()`") {
+                                            return Ok(None);
+                                        }
+                                        None
                                     }
-                                    None
                                 }
-                            },
+                            }
                             None => None,
                         }
                     }
@@ -13754,12 +13794,15 @@ fn str_expr_family(
                         diagnostics.append(&mut count_diagnostics);
                     }
                     _ => {
-                        let count_seed = str_binding_entry(rhs, locals, str_bindings)
-                            .and_then(|entry| entry.literal);
+                        let count_seed =
+                            str_binding_entry(rhs, locals, str_bindings).and_then(|entry| {
+                                entry.literal.filter(|seed| seed.resolved.get().is_none())
+                            });
                         match count_seed {
                             Some(StrLiteralSeed {
                                 literal: Lit::Int { .. },
                                 origin,
+                                ..
                             }) => {
                                 // An unresolved integer literal
                                 // variable resolves to `U32` like
@@ -13810,6 +13853,7 @@ fn str_expr_family(
                     Some(StrLiteralSeed {
                         literal: Lit::Int { .. },
                         origin,
+                        ..
                     }) => match expected.and_then(str_prim_family_name) {
                         Some(name)
                             if matches!(
@@ -55925,6 +55969,8 @@ property "shared"() {}
             "pub fn str_bin_shift_ann_pin() -> Str {\n    let s = \"a\"\n    let c = 1\n    let m: U8 = 1 << c\n    s\n}\n",
             "pub fn str_bin_pin_mixed_tm() -> Str {\n    let s = \"a\"\n    let wide: I64 = 5\n    let m: I8 = wide + 200\n    s\n}\n",
             "pub fn str_match_guard_op_tm() -> Str {\n    let s = \"a\"\n    let m = match s {\n        \"x\" if s + 1 => \"y\"\n        _ => \"w\"\n    }\n    m\n}\n",
+            "pub fn str_litvar_conflicting_pins_tm() -> Str {\n    let s = \"a\"\n    let n = 1\n    let a: I64 = n\n    let b: U32 = n\n    s\n}\n",
+            "pub fn str_bin_fold_wide_literal() -> Str {\n    let s = \"a\"\n    let w: U64 = 5\n    let m = w + 18446744073709551615\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -55940,7 +55986,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 219);
+        assert_eq!(resolved.owners().len(), 221);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -55968,7 +56014,7 @@ property "shared"() {}
             .chain(&resolved.owners()[104..105])
             .chain(&resolved.owners()[108..109])
             .chain(&resolved.owners()[112..113])
-            .chain(&resolved.owners()[116..117])
+            .chain(&resolved.owners()[115..117])
             .chain(&resolved.owners()[119..120])
             .chain(&resolved.owners()[122..123])
             .chain(&resolved.owners()[125..126])
@@ -55998,6 +56044,7 @@ property "shared"() {}
             .chain(&resolved.owners()[208..209])
             .chain(&resolved.owners()[214..215])
             .chain(&resolved.owners()[216..217])
+            .chain(&resolved.owners()[220..221])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -56039,7 +56086,6 @@ property "shared"() {}
             (107, sai_diagnostics::Code::BreakOutsideLoop),
             (109, sai_diagnostics::Code::InvalidBreakValue),
             (111, sai_diagnostics::Code::TypeMismatch),
-            (115, sai_diagnostics::Code::LiteralOutOfRange),
             (128, sai_diagnostics::Code::LiteralOutOfRange),
             (135, sai_diagnostics::Code::LiteralOutOfRange),
             (136, sai_diagnostics::Code::TypeMismatch),
@@ -56083,6 +56129,7 @@ property "shared"() {}
             (215, sai_diagnostics::Code::LiteralOutOfRange),
             (217, sai_diagnostics::Code::TypeMismatch),
             (218, sai_diagnostics::Code::TypeMismatch),
+            (219, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
