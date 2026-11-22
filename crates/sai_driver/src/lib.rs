@@ -7628,7 +7628,13 @@ fn check_function_body_type(
         ) {
             // A `Str` parameter seeds the `Str` local group: `let copy = param`
             // and a param-path tail both resolve through it.
-            let mut str_bindings = StrLocalBindings::from([(body_parameter.binding, "`Str`")]);
+            let mut str_bindings = StrLocalBindings::from([(
+                body_parameter.binding,
+                StrLocalEntry {
+                    family: "`Str`",
+                    literal: None,
+                },
+            )]);
             let Some(diagnostics) = check_function_str_local_block(
                 owner,
                 *sig.ret.expect("Str return is present"),
@@ -7783,8 +7789,20 @@ fn check_function_body_type(
         ) {
             // Two `Str` parameters seed the `Str` local group together.
             let mut str_bindings = StrLocalBindings::from([
-                (first_body.binding, "`Str`"),
-                (second_body.binding, "`Str`"),
+                (
+                    first_body.binding,
+                    StrLocalEntry {
+                        family: "`Str`",
+                        literal: None,
+                    },
+                ),
+                (
+                    second_body.binding,
+                    StrLocalEntry {
+                        family: "`Str`",
+                        literal: None,
+                    },
+                ),
             ]);
             let Some(diagnostics) = check_function_str_local_block(
                 owner,
@@ -13158,10 +13176,77 @@ fn is_direct_const_literal_or_unit(value: &HirExpr<'_>) -> bool {
     }
 }
 
-// `Str` body locals: a binding id maps to its group family — `"`Str`"`
-// for `Str` literals/copies and the literal family (`"`I64`"`, `"`F64`"`,
-// `"`Bool`"`, `"`Byte`"`, `"`Char`"`) for scalar literal locals.
-type StrLocalBindings = std::collections::BTreeMap<sai_hir::BindingId, &'static str>;
+/// A binding's contribution in the `Str` local group: the family an
+/// unforced use sees plus the literal seed when the binding is an
+/// unannotated literal variable — those resolve per use like the
+/// checker's `LiteralVariable`.
+#[derive(Clone, Copy)]
+struct StrLocalEntry {
+    family: &'static str,
+    literal: Option<StrLiteralSeed>,
+}
+
+/// An unannotated literal binding's seed: the literal itself plus its
+/// origin span (range diagnostics anchor to the literal like the
+/// checker's `variable.origin`).
+#[derive(Clone, Copy)]
+struct StrLiteralSeed {
+    literal: Lit<'static>,
+    origin: sai_hir::Span,
+}
+
+type StrLocalBindings = std::collections::BTreeMap<sai_hir::BindingId, StrLocalEntry>;
+
+// A `Lit` from an owner body as a `'static` value — every scalar kind
+// carries owned data; `ByteStr` borrows and never becomes a seed.
+fn str_static_literal(literal: Lit<'_>) -> Option<Lit<'static>> {
+    Some(match literal {
+        Lit::Int { value, negated } => Lit::Int { value, negated },
+        Lit::Float { text, negated } => Lit::Float { text, negated },
+        Lit::Str(symbol) => Lit::Str(symbol),
+        Lit::ByteStr(_) => return None,
+        Lit::Char(character) => Lit::Char(character),
+        Lit::Byte(byte) => Lit::Byte(byte),
+        Lit::Bool(boolean) => Lit::Bool(boolean),
+    })
+}
+
+// The binding entry a `let` initializer records: the pin when
+/// annotated, a literal-variable seed for an unannotated literal init,
+/// a copy of the source entry for `let m = n`, otherwise concrete.
+fn str_let_entry(
+    init: &HirExpr<'_>,
+    family: &'static str,
+    pinned: Option<&'static str>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+) -> StrLocalEntry {
+    if let Some(pinned) = pinned {
+        return StrLocalEntry {
+            family: pinned,
+            literal: None,
+        };
+    }
+    match init.kind {
+        ExprKind::Lit(literal) if str_scalar_family_name(literal).is_some() => StrLocalEntry {
+            family,
+            literal: str_static_literal(literal).map(|literal| StrLiteralSeed {
+                literal,
+                origin: init.span,
+            }),
+        },
+        ExprKind::Path(_) => {
+            str_binding_entry(init, locals, str_bindings).unwrap_or(StrLocalEntry {
+                family,
+                literal: None,
+            })
+        }
+        _ => StrLocalEntry {
+            family,
+            literal: None,
+        },
+    }
+}
 
 fn str_binding_path(
     expression: &HirExpr<'_>,
@@ -13180,7 +13265,7 @@ fn str_binding_path(
             base: Res::Local(binding),
             resolved_segments: 1,
             segment_count: 1,
-        }) if matches!(str_bindings.get(binding), Some(&"`Str`"))
+        }) if matches!(str_bindings.get(binding), Some(entry) if entry.family == "`Str`")
     )
 }
 
@@ -13191,6 +13276,27 @@ fn str_binding_family(
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
 ) -> Option<&'static str> {
+    let ExprKind::Path(path) = expression.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return None;
+    }
+    match locals.paths.get(&path.hir_id) {
+        Some(PathRes {
+            base: Res::Local(binding),
+            resolved_segments: 1,
+            segment_count: 1,
+        }) => str_bindings.get(binding).copied().map(|entry| entry.family),
+        _ => None,
+    }
+}
+
+fn str_binding_entry(
+    expression: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+) -> Option<StrLocalEntry> {
     let ExprKind::Path(path) = expression.kind else {
         return None;
     };
@@ -13296,7 +13402,53 @@ fn str_literal_family_init(
         }
         _ => {}
     }
-    Ok(str_binding_family(init, locals, str_bindings).map(|family| (family, Vec::new())))
+    let Some(entry) = str_binding_entry(init, locals, str_bindings) else {
+        return Ok(None);
+    };
+    // A literal-variable path resolves to the demanded primitive like
+    // `resolve_literal_variable`: the seed literal range-checks against
+    // it (anchored at the seed's origin); a literal kind the pin cannot
+    // accept keeps its default family and the caller's pin/fold compare
+    // reports `expected <pin>, found <family>`.
+    if let (Some(primitive), Some(seed)) = (expected, entry.literal) {
+        let Some(name) = str_prim_family_name(primitive) else {
+            return Ok(None);
+        };
+        let literal = seed.literal;
+        return Ok(Some(
+            match sai_ty::typeck::literal::check_primitive_literal(
+                primitive,
+                literal,
+                symbols,
+                target_cfg.pointer_width(),
+            ) {
+                sai_ty::typeck::literal::PrimitiveLiteralResult::Match => (name, Vec::new()),
+                sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => (
+                    name,
+                    vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        seed.origin,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        format!(
+                            "{} literal is out of range for {name}",
+                            if matches!(literal, Lit::Int { .. }) {
+                                "integer"
+                            } else {
+                                "floating-point"
+                            }
+                        ),
+                        "literal out of range",
+                    )?],
+                ),
+                sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => {
+                    (entry.family, Vec::new())
+                }
+            },
+        ));
+    }
+    Ok(Some((entry.family, Vec::new())))
 }
 
 // The family a comparison-condition operand carries: `"`Str`"` for `Str`
@@ -13510,41 +13662,200 @@ fn str_expr_family(
             } else {
                 (left_family, right_family)
             };
-            // `x << c`: the result is the left family and the count is
-            // `U32` — `check_shift` requires an integer-literal count
-            // checked against `U32` or a `U32` operand.
+            // `x << c` mirrors `check_shift`: the left side is an
+            // integer/byte literal (an unresolved integer literal
+            // variable), a bound integer literal variable, or a
+            // bitwise-primitive operand — `F64`/`Bool`/`Char` report
+            // `shift operator is not supported`, `Str`/`ByteStr`/`()`
+            // gate. The count is `U32`: an integer literal or integer
+            // literal variable resolves to it (range-checked at the
+            // seed's origin), anything else reports
+            // `expected `U32`, found <family>`.
             if matches!(operator, BinOp::Shl | BinOp::Shr) {
-                if matches!(left_family, "`Str`" | "`ByteStr`" | "`()`") {
-                    return Ok(None);
-                }
-                if let ExprKind::Lit(literal) = rhs.kind {
-                    if str_scalar_family_name(literal) != Some("`I64`") {
-                        return Ok(None);
+                let left_seed = match lhs.kind {
+                    ExprKind::Lit(literal) => match literal {
+                        Lit::Int { .. } => Some(StrLiteralSeed {
+                            literal: str_static_literal(literal).unwrap(),
+                            origin: lhs.span,
+                        }),
+                        Lit::Byte(_) => None,
+                        _ => return Ok(None),
+                    },
+                    ExprKind::Path(_) => {
+                        match str_binding_entry(lhs, locals, str_bindings) {
+                            Some(entry) => match entry.literal {
+                                // A non-integer literal variable
+                                // resolves to its default family, then
+                                // the bitwise check applies below.
+                                Some(
+                                    seed @ StrLiteralSeed {
+                                        literal: Lit::Int { .. },
+                                        ..
+                                    },
+                                ) => Some(seed),
+                                Some(_) | None => {
+                                    if matches!(left_family, "`Str`" | "`ByteStr`" | "`()`") {
+                                        return Ok(None);
+                                    }
+                                    None
+                                }
+                            },
+                            None => None,
+                        }
                     }
-                    let Some(mut count_diagnostics) = check_const_literal_against_type(
-                        owner.id,
-                        ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::U32),
-                        rhs,
-                        symbols,
-                        inputs,
-                        snapshot,
-                        target_cfg,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    diagnostics.append(&mut count_diagnostics);
-                } else if right_family != "`U32`" && right_family != "`!`" {
+                    _ => {
+                        if matches!(left_family, "`Str`" | "`ByteStr`" | "`()`") {
+                            return Ok(None);
+                        }
+                        None
+                    }
+                };
+                // A concrete non-bitwise left reports the operator
+                // diagnostic like `is_bitwise_primitive` in the
+                // checker; `!` skips it.
+                if left_seed.is_none()
+                    && !matches!(
+                        left_family,
+                        "`!`"
+                            | "`I8`"
+                            | "`I16`"
+                            | "`I32`"
+                            | "`I64`"
+                            | "`U8`"
+                            | "`U16`"
+                            | "`U32`"
+                            | "`U64`"
+                            | "`ISize`"
+                            | "`USize`"
+                            | "`Byte`"
+                    )
+                {
                     diagnostics.push(const_literal_diagnostic(
                         owner.id,
                         inputs,
                         snapshot,
-                        rhs.span,
-                        sai_diagnostics::Code::TypeMismatch,
-                        format!("expected `U32`, found {right_family}"),
-                        "type mismatch",
+                        expr.span,
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        "shift operator is not supported for this primitive".to_string(),
+                        "operator not supported",
                     )?);
                 }
+                match rhs.kind {
+                    ExprKind::Lit(literal) => {
+                        if str_scalar_family_name(literal) != Some("`I64`") {
+                            return Ok(None);
+                        }
+                        let Some(mut count_diagnostics) = check_const_literal_against_type(
+                            owner.id,
+                            ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::U32),
+                            rhs,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        diagnostics.append(&mut count_diagnostics);
+                    }
+                    _ => {
+                        let count_seed = str_binding_entry(rhs, locals, str_bindings)
+                            .and_then(|entry| entry.literal);
+                        match count_seed {
+                            Some(StrLiteralSeed {
+                                literal: Lit::Int { .. },
+                                origin,
+                            }) => {
+                                // An unresolved integer literal
+                                // variable resolves to `U32` like
+                                // `resolve_literal_variable`; a seed
+                                // that cannot fit reports the range
+                                // error at its origin.
+                                if sai_ty::typeck::literal::check_primitive_literal(
+                                    sai_resolve::prelude::PrimTy::U32,
+                                    count_seed.unwrap().literal,
+                                    symbols,
+                                    target_cfg.pointer_width(),
+                                ) == sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange
+                                {
+                                    diagnostics.push(const_literal_diagnostic(
+                                        owner.id,
+                                        inputs,
+                                        snapshot,
+                                        origin,
+                                        sai_diagnostics::Code::LiteralOutOfRange,
+                                        "integer literal is out of range for `U32`".to_string(),
+                                        "literal out of range",
+                                    )?);
+                                }
+                            }
+                            // A non-integer literal variable resolves
+                            // to its default family — same `expected
+                            // `U32`` diagnostic as a concrete operand.
+                            Some(_) | None => {
+                                if right_family != "`U32`" && right_family != "`!`" {
+                                    diagnostics.push(const_literal_diagnostic(
+                                        owner.id,
+                                        inputs,
+                                        snapshot,
+                                        rhs.span,
+                                        sai_diagnostics::Code::TypeMismatch,
+                                        format!("expected `U32`, found {right_family}"),
+                                        "type mismatch",
+                                    )?);
+                                }
+                            }
+                        }
+                    }
+                }
+                // The result is the left family; an unresolved integer
+                // literal variable resolves through the pin like the
+                // checker (range-checked against the pin's primitive).
+                let left_family = match left_seed {
+                    Some(StrLiteralSeed {
+                        literal: Lit::Int { .. },
+                        origin,
+                    }) => match expected.and_then(str_prim_family_name) {
+                        Some(name)
+                            if matches!(
+                                name,
+                                "`I8`"
+                                    | "`I16`"
+                                    | "`I32`"
+                                    | "`I64`"
+                                    | "`U8`"
+                                    | "`U16`"
+                                    | "`U32`"
+                                    | "`U64`"
+                                    | "`ISize`"
+                                    | "`USize`"
+                            ) =>
+                        {
+                            let primitive = expected.unwrap();
+                            if sai_ty::typeck::literal::check_primitive_literal(
+                                primitive,
+                                left_seed.unwrap().literal,
+                                symbols,
+                                target_cfg.pointer_width(),
+                            ) == sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange
+                            {
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    origin,
+                                    sai_diagnostics::Code::LiteralOutOfRange,
+                                    format!("integer literal is out of range for {name}"),
+                                    "literal out of range",
+                                )?);
+                            }
+                            name
+                        }
+                        _ => "`I64`",
+                    },
+                    _ => left_family,
+                };
                 return Ok(Some((left_family, diagnostics)));
             }
             // A literal operand against a scalar-primitive operand folds
@@ -14156,7 +14467,13 @@ fn str_match_family(
                 ..
             } = arm.pat.kind
             {
-                arm_bindings.insert(binding, scrutinee_family);
+                arm_bindings.insert(
+                    binding,
+                    StrLocalEntry {
+                        family: scrutinee_family,
+                        literal: None,
+                    },
+                );
             }
         } else {
             let Some(binding) = str_match_arm_pattern(
@@ -14177,7 +14494,13 @@ fn str_match_family(
             catch_all = arm.guard.is_none()
                 && matches!(arm.pat.kind, PatKind::Wild | PatKind::Binding { .. });
             if let Some(binding) = binding {
-                arm_bindings.insert(binding, scrutinee_family);
+                arm_bindings.insert(
+                    binding,
+                    StrLocalEntry {
+                        family: scrutinee_family,
+                        literal: None,
+                    },
+                );
             }
             // Guards evaluate like `check_if_condition` — the pattern
             // binding is already seeded (`n if n > 0`).
@@ -14317,7 +14640,13 @@ fn str_block_family(
         else {
             return Ok(None);
         };
-        inner.insert(binding, family);
+        inner.insert(
+            binding,
+            StrLocalEntry {
+                family,
+                literal: None,
+            },
+        );
     }
     let Some(tail) = block.tail else {
         return Ok(None);
@@ -15029,7 +15358,10 @@ fn check_function_str_local_block(
                 )?);
             }
             diagnostics.append(&mut init_diagnostics);
-            str_bindings.insert(binding, pinned.unwrap_or(family));
+            str_bindings.insert(
+                binding,
+                str_let_entry(init, family, pinned, locals, str_bindings),
+            );
             continue;
         }
         // Non-literal initializers — `if`/`loop`/`match`/block — that join
@@ -15080,7 +15412,10 @@ fn check_function_str_local_block(
                 )?);
             }
             diagnostics.append(&mut init_diagnostics);
-            str_bindings.insert(binding, pinned.unwrap_or(family));
+            str_bindings.insert(
+                binding,
+                str_let_entry(init, family, pinned, locals, str_bindings),
+            );
             continue;
         }
         if matches!(
@@ -15130,7 +15465,10 @@ fn check_function_str_local_block(
                 )?);
             }
             diagnostics.append(&mut init_diagnostics);
-            str_bindings.insert(binding, pinned.unwrap_or(family));
+            str_bindings.insert(
+                binding,
+                str_let_entry(init, family, pinned, locals, str_bindings),
+            );
             continue;
         }
         // `let s = if <lit bool> { <Str block> } else { <Str block> }` runs
@@ -15299,7 +15637,13 @@ fn check_function_str_local_block(
                         ..
                     } = arm.pat.kind
                     {
-                        bindings.insert(binding, "`Str`");
+                        bindings.insert(
+                            binding,
+                            StrLocalEntry {
+                                family: "`Str`",
+                                literal: None,
+                            },
+                        );
                     }
                     matches!(arm.body.kind, ExprKind::Lit(Lit::Str(_)))
                         || str_binding_path(arm.body, locals, &bindings)
@@ -15338,7 +15682,13 @@ fn check_function_str_local_block(
         else {
             return Ok(None);
         };
-        str_bindings.insert(binding, "`Str`");
+        str_bindings.insert(
+            binding,
+            StrLocalEntry {
+                family: "`Str`",
+                literal: None,
+            },
+        );
     }
     let Some(tail) = block.tail else {
         // A block without a tail yields `!` when a statement diverges
@@ -15819,7 +16169,13 @@ fn str_stmt_expr_unit(
                         ..
                     } = arm.pat.kind
                     {
-                        arm_bindings.insert(binding, scrutinee_family);
+                        arm_bindings.insert(
+                            binding,
+                            StrLocalEntry {
+                                family: scrutinee_family,
+                                literal: None,
+                            },
+                        );
                     }
                 } else {
                     let Some(binding) = str_match_arm_pattern(
@@ -15838,7 +16194,13 @@ fn str_stmt_expr_unit(
                         return Ok(None);
                     };
                     if let Some(binding) = binding {
-                        arm_bindings.insert(binding, scrutinee_family);
+                        arm_bindings.insert(
+                            binding,
+                            StrLocalEntry {
+                                family: scrutinee_family,
+                                literal: None,
+                            },
+                        );
                     }
                     catch_all =
                         !guarded && matches!(arm.pat.kind, PatKind::Wild | PatKind::Binding { .. });
@@ -16016,7 +16378,13 @@ fn str_stmt_loop_break_families<'h>(
                     },
                 ) = (seeded, pat.kind)
                 {
-                    local.insert(binding, family);
+                    local.insert(
+                        binding,
+                        StrLocalEntry {
+                            family,
+                            literal: None,
+                        },
+                    );
                 }
             }
             sai_hir::expressions::StmtKind::Expr(expr) => str_stmt_break_families_expr(
@@ -16121,9 +16489,16 @@ fn str_pure_init_family(
             } else {
                 (left, right)
             };
-            // `x << c` yields the left family; a non-scalar left or a
-            // non-integer literal count gates like the diagnostic walk.
+            // `x << c` yields the left family. Literal lefts admit
+            // integer/byte kinds only (non-integer lefts carry the
+            // operator diagnostic); `Str`/`ByteStr`/`()` lefts and
+            // non-integer literal counts gate like the diagnostic walk.
             if matches!(operator, BinOp::Shl | BinOp::Shr) {
+                if let ExprKind::Lit(literal) = lhs.kind
+                    && !matches!(literal, Lit::Int { .. } | Lit::Byte(_))
+                {
+                    return None;
+                }
                 if matches!(left, "`Str`" | "`ByteStr`" | "`()`") {
                     return None;
                 }
@@ -16376,7 +16751,13 @@ fn str_pure_match_family(
                 ..
             } = arm.pat.kind
             {
-                arm_bindings.insert(binding, scrutinee_family);
+                arm_bindings.insert(
+                    binding,
+                    StrLocalEntry {
+                        family: scrutinee_family,
+                        literal: None,
+                    },
+                );
             }
         } else {
             let admit_literal = |literal: Lit<'_>| -> bool {
@@ -16417,7 +16798,13 @@ fn str_pure_match_family(
                     ..
                 } => {
                     catch_all = arm.guard.is_none();
-                    arm_bindings.insert(binding, scrutinee_family);
+                    arm_bindings.insert(
+                        binding,
+                        StrLocalEntry {
+                            family: scrutinee_family,
+                            literal: None,
+                        },
+                    );
                 }
                 _ => return None,
             }
@@ -16502,7 +16889,13 @@ fn str_pure_block_family(
         else {
             return None;
         };
-        inner.insert(binding, family);
+        inner.insert(
+            binding,
+            StrLocalEntry {
+                family,
+                literal: None,
+            },
+        );
     }
     str_pure_init_family(block.tail?, locals, &inner, type_paths, symbols, inputs)
 }
@@ -16613,7 +17006,13 @@ fn str_stmt_break_families_expr<'h>(
                         ..
                     } = arm.pat.kind
                 {
-                    arm_bindings.insert(binding, family);
+                    arm_bindings.insert(
+                        binding,
+                        StrLocalEntry {
+                            family: family,
+                            literal: None,
+                        },
+                    );
                 }
                 str_stmt_break_families_expr(
                     arm.body,
@@ -16841,7 +17240,13 @@ fn str_stmt_block_unit(
                     )?);
                 }
                 diagnostics.append(&mut init_diagnostics);
-                inner_bindings.insert(binding, pinned.unwrap_or(family));
+                inner_bindings.insert(
+                    binding,
+                    StrLocalEntry {
+                        family: pinned.unwrap_or(family),
+                        literal: None,
+                    },
+                );
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
                 let Some(mut expr_diagnostics) = str_stmt_expr_unit(
@@ -17006,7 +17411,10 @@ fn str_loop_level_block(
                     )?);
                 }
                 diagnostics.append(&mut init_diagnostics);
-                str_bindings.insert(binding, pinned.unwrap_or(family));
+                str_bindings.insert(
+                    binding,
+                    str_let_entry(init, family, pinned, locals, str_bindings),
+                );
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
                 let Some((clean, broken, mut expr_diagnostics)) = str_loop_level_expr(
@@ -17305,7 +17713,13 @@ fn str_clean_block(
                 } = pat.kind
                 {
                     if str_clean_expr(init, locals, &bindings, loop_level) {
-                        bindings.insert(binding, "`Str`");
+                        bindings.insert(
+                            binding,
+                            StrLocalEntry {
+                                family: "`Str`",
+                                literal: None,
+                            },
+                        );
                     }
                 }
             }
@@ -17348,7 +17762,13 @@ fn str_clean_expr(
                 ..
             } = arm.pat.kind
             {
-                bindings.insert(binding, "`Str`");
+                bindings.insert(
+                    binding,
+                    StrLocalEntry {
+                        family: "`Str`",
+                        literal: None,
+                    },
+                );
             }
             str_clean_expr(arm.body, locals, &bindings, loop_level)
         }),
@@ -17537,7 +17957,13 @@ fn check_function_str_match(
             ..
         } = arm.pat.kind
         {
-            arm_bindings.insert(binding, scrutinee_family);
+            arm_bindings.insert(
+                binding,
+                StrLocalEntry {
+                    family: scrutinee_family,
+                    literal: None,
+                },
+            );
         }
         if let Some(guard) = arm.guard {
             let Some(mut guard_diagnostics) = str_condition(
@@ -17575,7 +18001,13 @@ fn check_function_str_match(
                 ..
             } = arm.pat.kind
             {
-                arm_bindings.insert(binding, scrutinee_family);
+                arm_bindings.insert(
+                    binding,
+                    StrLocalEntry {
+                        family: scrutinee_family,
+                        literal: None,
+                    },
+                );
             }
         } else {
             let Some(binding) = str_match_arm_pattern(
@@ -17595,7 +18027,13 @@ fn check_function_str_match(
             };
             catch_all = !guarded && matches!(arm.pat.kind, PatKind::Wild | PatKind::Binding { .. });
             if let Some(binding) = binding {
-                arm_bindings.insert(binding, scrutinee_family);
+                arm_bindings.insert(
+                    binding,
+                    StrLocalEntry {
+                        family: scrutinee_family,
+                        literal: None,
+                    },
+                );
             }
         }
         let Some(mut arm_diagnostics) = check_function_str_tail(
@@ -55470,6 +55908,11 @@ property "shared"() {}
             "pub fn str_bin_rem_float() -> Str {\n    let s = \"a\"\n    let f = 1.5\n    let m = f % f\n    s\n}\n",
             "pub fn str_bin_bitand_bool() -> Str {\n    let s = \"a\"\n    let a = true\n    let m = a & a\n    s\n}\n",
             "pub fn str_bin_byte_add() -> Str {\n    let s = \"a\"\n    let b = b'x'\n    let m = b + b\n    s\n}\n",
+            "pub fn str_bin_shift_left_f64_opns() -> Str {\n    let s = \"a\"\n    let f = 1.5\n    let m = f << 1\n    s\n}\n",
+            "pub fn str_bin_shift_left_bool_opns() -> Str {\n    let s = \"a\"\n    let a = true\n    let m = a << 1\n    s\n}\n",
+            "pub fn str_bin_shift_litvar_count() -> Str {\n    let s = \"a\"\n    let n = 1\n    let c = 1\n    let m = n << c\n    s\n}\n",
+            "pub fn str_bin_shift_count_oob() -> Str {\n    let s = \"a\"\n    let n = 1\n    let c = 4294967296\n    let m = n << c\n    s\n}\n",
+            "pub fn str_bin_shift_ann_pin() -> Str {\n    let s = \"a\"\n    let c = 1\n    let m: U8 = 1 << c\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -55485,7 +55928,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 212);
+        assert_eq!(resolved.owners().len(), 217);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -55541,6 +55984,8 @@ property "shared"() {}
             .chain(&resolved.owners()[205..206])
             .chain(&resolved.owners()[206..207])
             .chain(&resolved.owners()[208..209])
+            .chain(&resolved.owners()[214..215])
+            .chain(&resolved.owners()[216..217])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -55621,6 +56066,9 @@ property "shared"() {}
             (207, sai_diagnostics::Code::TypeMismatch),
             (209, sai_diagnostics::Code::OperatorNotSupported),
             (210, sai_diagnostics::Code::OperatorNotSupported),
+            (212, sai_diagnostics::Code::OperatorNotSupported),
+            (213, sai_diagnostics::Code::OperatorNotSupported),
+            (215, sai_diagnostics::Code::LiteralOutOfRange),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
