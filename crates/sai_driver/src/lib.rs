@@ -13411,13 +13411,50 @@ fn str_expr_family(
             }
         }
         ExprKind::Binary(operator, lhs, rhs) => {
+            // A numeric annotation pin reaches a literal operand (`let
+            // n: I8 = 1 + 2`); a `Bool` pin never does — `1 + 2` stays
+            // `I64` so the caller can report `expected Bool, found I64`
+            // on the binary like `check_logical_operand_probe`. A shift
+            // count ignores pins entirely — it is always `U32`.
+            let numeric_pin = expected
+                .and_then(str_prim_family_name)
+                .is_some_and(|family| {
+                    matches!(
+                        family,
+                        "`I8`"
+                            | "`I16`"
+                            | "`I32`"
+                            | "`I64`"
+                            | "`U8`"
+                            | "`U16`"
+                            | "`U32`"
+                            | "`U64`"
+                            | "`ISize`"
+                            | "`USize`"
+                            | "`F32`"
+                            | "`F64`"
+                    )
+                });
+            let operand_expected = |operand: &HirExpr<'_>| {
+                if numeric_pin && matches!(operand.kind, ExprKind::Lit(_)) {
+                    expected
+                } else {
+                    None
+                }
+            };
+            let lhs_expected = operand_expected(lhs);
+            let rhs_expected = if matches!(operator, BinOp::Shl | BinOp::Shr) {
+                None
+            } else {
+                operand_expected(rhs)
+            };
             let Some((left_family, mut left_diagnostics)) = str_expr_family(
                 owner,
                 return_ty,
                 lhs,
                 locals,
                 str_bindings,
-                None,
+                lhs_expected,
                 type_paths,
                 symbols,
                 inputs,
@@ -13433,7 +13470,7 @@ fn str_expr_family(
                 rhs,
                 locals,
                 str_bindings,
-                None,
+                rhs_expected,
                 type_paths,
                 symbols,
                 inputs,
@@ -13473,16 +13510,78 @@ fn str_expr_family(
             } else {
                 (left_family, right_family)
             };
-            // A literal operand against a scalar-primitive operand
-            // folds to the other's primitive like the checker coercing
-            // the literal; two literal operands keep their defaults.
+            // `x << c`: the result is the left family and the count is
+            // `U32` — `check_shift` requires an integer-literal count
+            // checked against `U32` or a `U32` operand.
+            if matches!(operator, BinOp::Shl | BinOp::Shr) {
+                if matches!(left_family, "`Str`" | "`ByteStr`" | "`()`") {
+                    return Ok(None);
+                }
+                if let ExprKind::Lit(literal) = rhs.kind {
+                    if str_scalar_family_name(literal) != Some("`I64`") {
+                        return Ok(None);
+                    }
+                    let Some(mut count_diagnostics) = check_const_literal_against_type(
+                        owner.id,
+                        ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::U32),
+                        rhs,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    diagnostics.append(&mut count_diagnostics);
+                } else if right_family != "`U32`" && right_family != "`!`" {
+                    diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        rhs.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected `U32`, found {right_family}"),
+                        "type mismatch",
+                    )?);
+                }
+                return Ok(Some((left_family, diagnostics)));
+            }
+            // A literal operand against a scalar-primitive operand folds
+            // to the other's primitive when the literal's own family
+            // accepts it — `1 + f: F64` reports `expected `I64`, found
+            // `F64`` on the path like `primitive_arithmetic_literal_-
+            // left_result` instead of pretending the literal was `F64`.
+            let literal_family_accepts = |expr: &HirExpr<'_>, target: &'static str| {
+                let ExprKind::Lit(literal) = expr.kind else {
+                    return false;
+                };
+                match str_scalar_family_name(literal) {
+                    Some("`I64`") => matches!(
+                        target,
+                        "`I8`"
+                            | "`I16`"
+                            | "`I32`"
+                            | "`I64`"
+                            | "`U8`"
+                            | "`U16`"
+                            | "`U32`"
+                            | "`U64`"
+                            | "`ISize`"
+                            | "`USize`"
+                    ),
+                    Some("`F64`") => matches!(target, "`F32`" | "`F64`"),
+                    Some(default) => default == target,
+                    None => false,
+                }
+            };
             let fold = |expr: &HirExpr<'_>,
                         own: &'static str,
                         other_expr: &HirExpr<'_>,
                         other: &'static str| {
                 if own != other
-                    && matches!(expr.kind, ExprKind::Lit(_))
                     && !matches!(other_expr.kind, ExprKind::Lit(_))
+                    && literal_family_accepts(expr, other)
                     && primitive_method_field_type(other.trim_matches('`')).is_some()
                 {
                     other
@@ -13525,18 +13624,125 @@ fn str_expr_family(
                 if comparison {
                     return Ok(Some(("`Bool`", diagnostics)));
                 }
-                // `Str`/`Bool`/`()` have no arithmetic operators — the
-                // same-family non-comparison case reports the operand.
-                if matches!(left_family, "`Str`" | "`ByteStr`" | "`Bool`" | "`()`") {
-                    diagnostics.push(const_literal_diagnostic(
-                        owner.id,
-                        inputs,
-                        snapshot,
-                        lhs.span,
-                        sai_diagnostics::Code::TypeMismatch,
-                        format!("expected `I64`, found {left_family}"),
-                        "type mismatch",
-                    )?);
+                let operator_text = match operator {
+                    BinOp::Rem => "%",
+                    BinOp::WrapAdd => "+%",
+                    BinOp::WrapSub => "-%",
+                    BinOp::WrapMul => "*%",
+                    BinOp::BitAnd => "&",
+                    BinOp::BitOr => "|",
+                    BinOp::BitXor => "^",
+                    _ => "",
+                };
+                let family_name = left_family.trim_matches('`');
+                // `x % y` on floats reports the float-remainder
+                // unsupported diagnostic like `check_remainder`; `&`/`|`/
+                // `^` on `Bool` reports the missing operator and recovers
+                // `Bool`, on `Char` the missing trait impl and recovers
+                // `Char`. `+`/`-`/`*`/`/` on non-arithmetic primitives and
+                // bitwise/`%` on `Byte`/`Bool`/`Str` pairs gate like the
+                // checker's `Unsupported` result.
+                match operator {
+                    BinOp::Rem if matches!(family_name, "F32" | "F64") => {
+                        let mut diagnostic = const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            expr.span,
+                            sai_diagnostics::Code::OperatorNotSupported,
+                            format!(
+                                "operator `{operator_text}` is not defined for `{family_name}`"
+                            ),
+                            "floating-point remainder is not supported",
+                        )?;
+                        diagnostic
+                            .push_child(Child {
+                                kind: ChildKind::Help,
+                                message:
+                                    "use the floating-point `rem` method (for example, `left.rem(right)`)"
+                                        .to_owned(),
+                                location: None,
+                            })
+                            .map_err(|_| {
+                                OwnerControlFlowResolutionError::InvalidSourceLocation(owner.id)
+                            })?;
+                        diagnostics.push(diagnostic);
+                        return Ok(Some((left_family, diagnostics)));
+                    }
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor if left_family == "`Bool`" => {
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            expr.span,
+                            sai_diagnostics::Code::OperatorNotSupported,
+                            format!("operator `{operator_text}` is not defined for `Bool`"),
+                            "bitwise operator is not supported for this primitive",
+                        )?);
+                        return Ok(Some((left_family, diagnostics)));
+                    }
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor if left_family == "`Char`" => {
+                        let trait_name = match operator {
+                            BinOp::BitAnd => "BitAnd",
+                            BinOp::BitOr => "BitOr",
+                            _ => "BitXor",
+                        };
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            expr.span,
+                            sai_diagnostics::Code::OperatorNotSupported,
+                            format!(
+                                "operator `{operator_text}` has no `{trait_name}<Char>` implementation for `Char`"
+                            ),
+                            "operator trait implementation is not available",
+                        )?);
+                        return Ok(Some((left_family, diagnostics)));
+                    }
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+                        if matches!(
+                            family_name,
+                            "I8" | "I16"
+                                | "I32"
+                                | "I64"
+                                | "U8"
+                                | "U16"
+                                | "U32"
+                                | "U64"
+                                | "ISize"
+                                | "USize"
+                                | "F32"
+                                | "F64"
+                        ) => {}
+                    BinOp::Rem | BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul
+                        if matches!(
+                            family_name,
+                            "I8" | "I16"
+                                | "I32"
+                                | "I64"
+                                | "U8"
+                                | "U16"
+                                | "U32"
+                                | "U64"
+                                | "ISize"
+                                | "USize"
+                        ) => {}
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
+                        if matches!(
+                            family_name,
+                            "I8" | "I16"
+                                | "I32"
+                                | "I64"
+                                | "U8"
+                                | "U16"
+                                | "U32"
+                                | "U64"
+                                | "ISize"
+                                | "USize"
+                                | "Byte"
+                        ) => {}
+                    _ => return Ok(None),
                 }
                 return Ok(Some((left_family, diagnostics)));
             }
@@ -15915,28 +16121,123 @@ fn str_pure_init_family(
             } else {
                 (left, right)
             };
+            // `x << c` yields the left family; a non-scalar left or a
+            // non-integer literal count gates like the diagnostic walk.
+            if matches!(operator, BinOp::Shl | BinOp::Shr) {
+                if matches!(left, "`Str`" | "`ByteStr`" | "`()`") {
+                    return None;
+                }
+                if let ExprKind::Lit(literal) = rhs.kind
+                    && str_scalar_family_name(literal) != Some("`I64`")
+                {
+                    return None;
+                }
+                return Some(left);
+            }
+            let literal_family_accepts = |expr: &HirExpr<'_>, target: &'static str| {
+                let ExprKind::Lit(literal) = expr.kind else {
+                    return false;
+                };
+                match str_scalar_family_name(literal) {
+                    Some("`I64`") => matches!(
+                        target,
+                        "`I8`"
+                            | "`I16`"
+                            | "`I32`"
+                            | "`I64`"
+                            | "`U8`"
+                            | "`U16`"
+                            | "`U32`"
+                            | "`U64`"
+                            | "`ISize`"
+                            | "`USize`"
+                    ),
+                    Some("`F64`") => matches!(target, "`F32`" | "`F64`"),
+                    Some(default) => default == target,
+                    None => false,
+                }
+            };
             let left = if left != right
-                && matches!(lhs.kind, ExprKind::Lit(_))
                 && !matches!(rhs.kind, ExprKind::Lit(_))
+                && literal_family_accepts(lhs, right)
                 && primitive_method_field_type(right.trim_matches('`')).is_some()
             {
                 right
             } else {
                 left
             };
-            let right = if left != right
-                && matches!(rhs.kind, ExprKind::Lit(_))
+            let _ = if left != right
                 && !matches!(lhs.kind, ExprKind::Lit(_))
+                && literal_family_accepts(rhs, left)
                 && primitive_method_field_type(left.trim_matches('`')).is_some()
             {
                 left
             } else {
                 right
             };
-            let _ = right;
-            // A family disagreement is the diagnostic walk's report —
-            // the pure scan admits with the left family.
-            Some(left)
+            let family_name = left.trim_matches('`');
+            match operator {
+                // `%` on floats and `&`/`|`/`^` on `Bool`/`Char` carry
+                // operator diagnostics, not gates.
+                BinOp::Rem if matches!(family_name, "F32" | "F64") => Some(left),
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
+                    if left == "`Bool`" || left == "`Char`" =>
+                {
+                    Some(left)
+                }
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+                    if matches!(
+                        family_name,
+                        "I8" | "I16"
+                            | "I32"
+                            | "I64"
+                            | "U8"
+                            | "U16"
+                            | "U32"
+                            | "U64"
+                            | "ISize"
+                            | "USize"
+                            | "F32"
+                            | "F64"
+                    ) =>
+                {
+                    Some(left)
+                }
+                BinOp::Rem | BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul
+                    if matches!(
+                        family_name,
+                        "I8" | "I16"
+                            | "I32"
+                            | "I64"
+                            | "U8"
+                            | "U16"
+                            | "U32"
+                            | "U64"
+                            | "ISize"
+                            | "USize"
+                    ) =>
+                {
+                    Some(left)
+                }
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
+                    if matches!(
+                        family_name,
+                        "I8" | "I16"
+                            | "I32"
+                            | "I64"
+                            | "U8"
+                            | "U16"
+                            | "U32"
+                            | "U64"
+                            | "ISize"
+                            | "USize"
+                            | "Byte"
+                    ) =>
+                {
+                    Some(left)
+                }
+                _ => None,
+            }
         }
         ExprKind::If {
             then,
@@ -55163,6 +55464,12 @@ property "shared"() {}
             "pub fn str_bin_and_tm() -> Str {\n    let s = \"a\"\n    let a = true\n    let m = a and 1\n    s\n}\n",
             "pub fn str_bin_str_arith_tm() -> Str {\n    let s = \"a\"\n    let m = s + 1\n    s\n}\n",
             "pub fn str_bin_cmp_bool() -> Str {\n    let s = \"a\"\n    let n = 1\n    let m = n < 2\n    s\n}\n",
+            "pub fn str_bin_shift_u32() -> Str {\n    let s = \"a\"\n    let n = 1\n    let c: U32 = 1\n    let m = n << c\n    s\n}\n",
+            "pub fn str_bin_shift_count_tm() -> Str {\n    let s = \"a\"\n    let n: I8 = 1\n    let c: I8 = 1\n    let m = n << c\n    s\n}\n",
+            "pub fn str_bin_ann_lit_pin() -> Str {\n    let s = \"a\"\n    let n: I8 = 1 + 2\n    s\n}\n",
+            "pub fn str_bin_rem_float() -> Str {\n    let s = \"a\"\n    let f = 1.5\n    let m = f % f\n    s\n}\n",
+            "pub fn str_bin_bitand_bool() -> Str {\n    let s = \"a\"\n    let a = true\n    let m = a & a\n    s\n}\n",
+            "pub fn str_bin_byte_add() -> Str {\n    let s = \"a\"\n    let b = b'x'\n    let m = b + b\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -55178,7 +55485,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 206);
+        assert_eq!(resolved.owners().len(), 212);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -55232,6 +55539,8 @@ property "shared"() {}
             .chain(&resolved.owners()[198..199])
             .chain(&resolved.owners()[201..202])
             .chain(&resolved.owners()[205..206])
+            .chain(&resolved.owners()[206..207])
+            .chain(&resolved.owners()[208..209])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -55309,6 +55618,9 @@ property "shared"() {}
             (202, sai_diagnostics::Code::TypeMismatch),
             (203, sai_diagnostics::Code::TypeMismatch),
             (204, sai_diagnostics::Code::TypeMismatch),
+            (207, sai_diagnostics::Code::TypeMismatch),
+            (209, sai_diagnostics::Code::OperatorNotSupported),
+            (210, sai_diagnostics::Code::OperatorNotSupported),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -55382,7 +55694,7 @@ property "shared"() {}
         // A `Str` parameter seeds the group, so copies and a param tail are
         // supported; non-`Str` statements, `var` bindings, and generic-arg
         // paths stay gated.
-        for index in [7, 18, 22, 23, 29, 34, 39, 64, 168, 173] {
+        for index in [7, 18, 22, 23, 29, 34, 39, 64, 168, 173, 211] {
             let owner = &resolved.owners()[index];
             assert!(
                 matches!(
