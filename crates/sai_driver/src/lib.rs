@@ -13210,6 +13210,29 @@ fn str_binding_family(
 // The group family a scalar literal binds under — its default literal
 // type like the checker's unresolved literal (`I64`/`F64`/`Bool`/
 // `Byte`/`Char`).
+// The family name an annotated scalar primitive pins (`let n: I8`).
+fn str_prim_family_name(primitive: sai_resolve::prelude::PrimTy) -> Option<&'static str> {
+    use sai_resolve::prelude::PrimTy;
+    Some(match primitive {
+        PrimTy::I8 => "`I8`",
+        PrimTy::I16 => "`I16`",
+        PrimTy::I32 => "`I32`",
+        PrimTy::I64 => "`I64`",
+        PrimTy::ISize => "`ISize`",
+        PrimTy::U8 => "`U8`",
+        PrimTy::U16 => "`U16`",
+        PrimTy::U32 => "`U32`",
+        PrimTy::U64 => "`U64`",
+        PrimTy::USize => "`USize`",
+        PrimTy::F32 => "`F32`",
+        PrimTy::F64 => "`F64`",
+        PrimTy::Bool => "`Bool`",
+        PrimTy::Byte => "`Byte`",
+        PrimTy::Char => "`Char`",
+        _ => return None,
+    })
+}
+
 fn str_scalar_family_name(literal: Lit<'_>) -> Option<&'static str> {
     match literal {
         Lit::Int { .. } => Some("`I64`"),
@@ -13232,6 +13255,7 @@ fn str_literal_family_init(
     init: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    expected: Option<sai_resolve::prelude::PrimTy>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -13240,8 +13264,21 @@ fn str_literal_family_init(
     match init.kind {
         ExprKind::Lit(Lit::Str(_)) => return Ok(Some(("`Str`", Vec::new()))),
         ExprKind::Lit(literal) => {
-            let Some(literal_type) = str_scalar_literal_default(literal) else {
-                return Ok(None);
+            // An annotated primitive pins the literal's family and its
+            // check (`let n: I8 = 200` checks `200` against `I8`).
+            let (family, literal_type) = match expected {
+                Some(primitive) => {
+                    let Some(name) = str_prim_family_name(primitive) else {
+                        return Ok(None);
+                    };
+                    (name, ConstLiteralType::Primitive(primitive))
+                }
+                None => {
+                    let Some(default) = str_scalar_literal_default(literal) else {
+                        return Ok(None);
+                    };
+                    (str_scalar_family_name(literal).unwrap_or("`I64`"), default)
+                }
             };
             let Some(diagnostics) = check_const_literal_against_type(
                 owner.id,
@@ -13255,10 +13292,7 @@ fn str_literal_family_init(
             else {
                 return Ok(None);
             };
-            return Ok(Some((
-                str_scalar_family_name(literal).unwrap_or("`I64`"),
-                diagnostics,
-            )));
+            return Ok(Some((family, diagnostics)));
         }
         _ => {}
     }
@@ -13295,6 +13329,7 @@ fn str_expr_family(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    expected: Option<sai_resolve::prelude::PrimTy>,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -13306,6 +13341,7 @@ fn str_expr_family(
         expr,
         locals,
         str_bindings,
+        expected,
         symbols,
         inputs,
         snapshot,
@@ -13343,6 +13379,7 @@ fn str_expr_family(
                 then,
                 locals,
                 str_bindings,
+                expected,
                 type_paths,
                 symbols,
                 inputs,
@@ -13354,25 +13391,30 @@ fn str_expr_family(
             };
             diagnostics.append(&mut then_diagnostics);
             let Some((else_family, mut else_diagnostics)) = (match els.kind {
-                ExprKind::Block(_) | ExprKind::If { .. } => str_expr_family(
-                    owner,
-                    return_ty,
-                    els,
-                    locals,
-                    str_bindings,
-                    type_paths,
-                    symbols,
-                    inputs,
-                    snapshot,
-                    target_cfg,
-                ),
+                ExprKind::Block(_) | ExprKind::If { .. } | ExprKind::Loop { .. } => {
+                    str_expr_family(
+                        owner,
+                        return_ty,
+                        els,
+                        locals,
+                        str_bindings,
+                        expected,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )
+                }
                 _ => Ok(None),
             })?
             else {
                 return Ok(None);
             };
             diagnostics.append(&mut else_diagnostics);
-            if then_family != else_family {
+            // A diverging branch yields `!`, which unifies with the other
+            // branch's family — only a concrete disagreement reports.
+            if then_family != else_family && then_family != "`!`" && else_family != "`!`" {
                 diagnostics.push(const_literal_diagnostic(
                     owner.id,
                     inputs,
@@ -13383,7 +13425,14 @@ fn str_expr_family(
                     "type mismatch",
                 )?);
             }
-            Ok(Some((then_family, diagnostics)))
+            Ok(Some((
+                if then_family == "`!`" {
+                    else_family
+                } else {
+                    then_family
+                },
+                diagnostics,
+            )))
         }
         ExprKind::Block(block) => str_block_family(
             owner,
@@ -13391,6 +13440,7 @@ fn str_expr_family(
             block,
             locals,
             str_bindings,
+            expected,
             type_paths,
             symbols,
             inputs,
@@ -13401,7 +13451,7 @@ fn str_expr_family(
             body,
             source: LoopSource::Loop,
             ..
-        } => str_loop_family(
+        } if expected.is_none() => str_loop_family(
             owner,
             return_ty,
             body,
@@ -13426,6 +13476,7 @@ fn str_block_family(
     block: &sai_hir::expressions::Block<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    expected: Option<sai_resolve::prelude::PrimTy>,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -13448,7 +13499,7 @@ fn str_block_family(
             return Ok(None);
         };
         let Some((family, mut stmt_diagnostics)) = str_expr_family(
-            owner, return_ty, init, locals, &inner, type_paths, symbols, inputs, snapshot,
+            owner, return_ty, init, locals, &inner, None, type_paths, symbols, inputs, snapshot,
             target_cfg,
         )?
         else {
@@ -13470,7 +13521,8 @@ fn str_block_family(
         return Ok(None);
     };
     let Some((family, mut tail_diagnostics)) = str_expr_family(
-        owner, return_ty, tail, locals, &inner, type_paths, symbols, inputs, snapshot, target_cfg,
+        owner, return_ty, tail, locals, &inner, expected, type_paths, symbols, inputs, snapshot,
+        target_cfg,
     )?
     else {
         return Ok(None);
@@ -13528,6 +13580,9 @@ fn str_loop_family(
     let mut family: Option<&'static str> = None;
     for (contribution, _value, span) in contributions {
         let contribution = contribution.expect("unclassed contributions gate above");
+        if contribution == "`!`" {
+            continue;
+        }
         match family {
             None => family = Some(contribution),
             Some(first) if first != contribution => {
@@ -13548,7 +13603,10 @@ fn str_loop_family(
             _ => {}
         }
     }
-    Ok(Some((family.unwrap_or("`Str`"), diagnostics)))
+    // A `loop` with no reachable `break` diverges — its `!` type
+    // unifies with every join, so the family stays `!` rather than a
+    // concrete `Str`.
+    Ok(Some((family.unwrap_or("`!`"), diagnostics)))
 }
 
 // `Str` locals bind only string literals and earlier `Str` bindings:
@@ -13598,7 +13656,8 @@ fn str_assert_msg(
         return Ok(Some(Vec::new()));
     }
     if let Some(family) = str_binding_family(msg, locals, str_bindings) {
-        if family == "`Str`" {
+        // `!` (a `let n = loop {}` binding) unifies with every type.
+        if family == "`Str`" || family == "`!`" {
             return Ok(Some(Vec::new()));
         }
         return Ok(Some(vec![const_literal_diagnostic(
@@ -13663,18 +13722,51 @@ fn str_condition(
         ) else {
             return Ok(None);
         };
+        // `!` unifies with the other operand's family (a `let n =
+        // loop {}` binding compared against anything).
+        let (left_family, right_family) = if left_family == "`!`" {
+            (right_family, right_family)
+        } else if right_family == "`!`" {
+            (left_family, left_family)
+        } else {
+            (left_family, right_family)
+        };
+        // A literal operand against a scalar-primitive binding folds to
+        // the binding's primitive (`n: I8 == 2` checks `2` against `I8`),
+        // like the checker coercing the literal. Two literal operands
+        // keep their default families so `1 == 2.5` still mismatches
+        // left-to-right.
+        let fold = |expr: &HirExpr<'_>,
+                    own: &'static str,
+                    other_expr: &HirExpr<'_>,
+                    other: &'static str| {
+            if own != other
+                && matches!(expr.kind, ExprKind::Lit(_))
+                && !matches!(other_expr.kind, ExprKind::Lit(_))
+                && primitive_method_field_type(other.trim_matches('`')).is_some()
+            {
+                other
+            } else {
+                own
+            }
+        };
+        let (left_family, right_family) = (
+            fold(lhs, left_family, rhs, right_family),
+            fold(rhs, right_family, lhs, left_family),
+        );
         if left_family == right_family {
             let mut diagnostics = Vec::new();
             for operand in [lhs, rhs] {
-                let ExprKind::Lit(literal) = operand.kind else {
+                let ExprKind::Lit(_) = operand.kind else {
                     continue;
                 };
-                let Some(literal_type) = str_scalar_literal_default(literal) else {
+                let Some(primitive) = primitive_method_field_type(left_family.trim_matches('`'))
+                else {
                     continue;
                 };
                 let Some(mut operand_diagnostics) = check_const_literal_against_type(
                     owner.id,
-                    literal_type,
+                    ConstLiteralType::Primitive(primitive),
                     operand,
                     symbols,
                     inputs,
@@ -13720,7 +13812,7 @@ fn str_condition(
         )?]));
     }
     if let Some(family) = str_binding_family(cond, locals, str_bindings) {
-        if family == "`Bool`" {
+        if family == "`Bool`" || family == "`!`" {
             return Ok(Some(Vec::new()));
         }
         return Ok(Some(vec![const_literal_diagnostic(
@@ -13886,12 +13978,22 @@ fn check_function_str_local_block(
         else {
             return Ok(None);
         };
-        if let Some(ty) = ty
-            && resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-                != Some(FunctionDirectType::Str)
-        {
-            return Ok(None);
-        }
+        // `Str` and scalar-primitive annotations pin the binding's
+        // family; a primitive also becomes the initializer's expected
+        // type (`let n: I8 = 200` checks `200` against `I8`).
+        let (pinned, expected) = match ty {
+            Some(ty) => match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
+                Some(FunctionDirectType::Str) => (Some("`Str`"), None),
+                Some(FunctionDirectType::Primitive(primitive)) => {
+                    let Some(name) = str_prim_family_name(primitive) else {
+                        return Ok(None);
+                    };
+                    (Some(name), Some(primitive))
+                }
+                _ => return Ok(None),
+            },
+            None => (None, None),
+        };
         // Literal and copy initializers bind their own family — a scalar
         // literal still carries its default-type range check, and an
         // annotation pins the binding to `Str` (a scalar init then
@@ -13901,6 +14003,7 @@ fn check_function_str_local_block(
             init,
             locals,
             str_bindings,
+            expected,
             symbols,
             inputs,
             snapshot,
@@ -13915,19 +14018,21 @@ fn check_function_str_local_block(
             else {
                 return Ok(None);
             };
-            if ty.is_some() && family != "`Str`" {
+            if let Some(pinned) = pinned
+                && family != pinned
+            {
                 init_diagnostics.push(const_literal_diagnostic(
                     owner.id,
                     inputs,
                     snapshot,
                     init.span,
                     sai_diagnostics::Code::TypeMismatch,
-                    format!("expected `Str`, found {family}"),
+                    format!("expected {pinned}, found {family}"),
                     "type mismatch",
                 )?);
             }
             diagnostics.append(&mut init_diagnostics);
-            str_bindings.insert(binding, if ty.is_some() { "`Str`" } else { family });
+            str_bindings.insert(binding, pinned.unwrap_or(family));
             continue;
         }
         // Non-literal initializers — `if`/`loop`/block — that join a
@@ -13944,12 +14049,16 @@ fn check_function_str_local_block(
             init,
             locals,
             str_bindings,
+            expected,
             type_paths,
             symbols,
             inputs,
             snapshot,
             target_cfg,
-        )? && family != "`Str`"
+            // A scalar pin must bind through this path too — a matching
+            // family (`I8` init on `x: I8`) or a `Str` mismatch (`x: I8 =
+            // "a"`) both bind the pin rather than the Str-initializer walk.
+        )? && (family != "`Str`" || pinned.is_some_and(|p| p != "`Str`"))
         {
             let PatKind::Binding {
                 mode: sai_hir::patterns::BindingMode::Value,
@@ -13960,19 +14069,22 @@ fn check_function_str_local_block(
             else {
                 return Ok(None);
             };
-            if ty.is_some() && family != "`Str`" {
+            if let Some(pinned) = pinned
+                && family != pinned
+                && family != "`!`"
+            {
                 init_diagnostics.push(const_literal_diagnostic(
                     owner.id,
                     inputs,
                     snapshot,
                     init.span,
                     sai_diagnostics::Code::TypeMismatch,
-                    format!("expected `Str`, found {family}"),
+                    format!("expected {pinned}, found {family}"),
                     "type mismatch",
                 )?);
             }
             diagnostics.append(&mut init_diagnostics);
-            str_bindings.insert(binding, if ty.is_some() { "`Str`" } else { family });
+            str_bindings.insert(binding, pinned.unwrap_or(family));
             continue;
         }
         // `let s = if <lit bool> { <Str block> } else { <Str block> }` runs
@@ -14390,7 +14502,8 @@ fn str_stmt_expr_unit(
                 str_stmt_loop_break_families(body, locals, str_bindings, &mut contributions);
                 let mut classed = contributions
                     .iter()
-                    .filter_map(|contribution| contribution.0.map(|f| (f, contribution.2)));
+                    .filter_map(|contribution| contribution.0.map(|f| (f, contribution.2)))
+                    .filter(|(family, _)| *family != "`!`");
                 if let Some((first_family, _)) = classed.next() {
                     for (family, span) in classed {
                         if family == first_family {
@@ -14621,8 +14734,8 @@ fn str_stmt_loop_break_families<'h>(
 }
 
 // The family a `let` initializer binds without running the diagnostic
-// walk — literals and local paths only; other shapes yield no family
-// and the binding is left unrecorded (the body walk already gated them).
+// walk — literals, local paths, `if`/`block`/`loop` joins. An unclassed
+// shape leaves the binding unrecorded (the body walk already gated it).
 fn str_pure_init_family(
     init: &HirExpr<'_>,
     locals: &LocalResolution,
@@ -14631,8 +14744,81 @@ fn str_pure_init_family(
     match init.kind {
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal),
+        ExprKind::If {
+            then,
+            els: Some(els),
+            ..
+        } => {
+            let then_family = str_pure_block_family(then, locals, str_bindings)?;
+            let else_family = match els.kind {
+                ExprKind::Block(block) => str_pure_block_family(block, locals, str_bindings),
+                ExprKind::If { .. } | ExprKind::Loop { .. } => {
+                    str_pure_init_family(els, locals, str_bindings)
+                }
+                _ => None,
+            }?;
+            // `!` unifies with the other branch's family.
+            Some(if then_family == "`!`" {
+                else_family
+            } else {
+                then_family
+            })
+        }
+        ExprKind::Block(block) => str_pure_block_family(block, locals, str_bindings),
+        ExprKind::Loop {
+            body,
+            source: LoopSource::Loop,
+            ..
+        } => {
+            let mut contributions = Vec::new();
+            str_stmt_loop_break_families(body, locals, str_bindings, &mut contributions);
+            let mut families = contributions
+                .iter()
+                .filter_map(|contribution| contribution.0)
+                .filter(|family| *family != "`!`");
+            let first = families.next()?;
+            if families.any(|family| family != first) {
+                None
+            } else {
+                Some(first)
+            }
+        }
         _ => str_binding_family(init, locals, str_bindings),
     }
+}
+
+// A block's pure family: `let` statements seed the inner map, the tail
+// gives the family — `()` contributions of a bare `break` disqualify
+// the block like in the diagnostic walk.
+fn str_pure_block_family(
+    block: &sai_hir::expressions::Block<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+) -> Option<&'static str> {
+    let mut inner = str_bindings.clone();
+    for stmt in block.stmts {
+        let sai_hir::expressions::StmtKind::Let {
+            pat,
+            ty: None,
+            init,
+            els: None,
+        } = stmt.kind
+        else {
+            return None;
+        };
+        let family = str_pure_init_family(init, locals, &inner)?;
+        let PatKind::Binding {
+            mode: sai_hir::patterns::BindingMode::Value,
+            binding,
+            sub: None,
+            ..
+        } = pat.kind
+        else {
+            return None;
+        };
+        inner.insert(binding, family);
+    }
+    str_pure_init_family(block.tail?, locals, &inner)
 }
 
 fn str_stmt_break_families_expr<'h>(
@@ -14798,17 +14984,30 @@ fn str_stmt_block_unit(
                 init,
                 els: None,
             } => {
-                if let Some(ty) = ty
-                    && resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-                        != Some(FunctionDirectType::Str)
-                {
-                    return Ok(None);
-                }
+                // `Str` and scalar-primitive annotations pin the binding's
+                // family; a primitive also becomes the initializer's
+                // expected type.
+                let (pinned, expected) = match ty {
+                    Some(ty) => {
+                        match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
+                            Some(FunctionDirectType::Str) => (Some("`Str`"), None),
+                            Some(FunctionDirectType::Primitive(primitive)) => {
+                                let Some(name) = str_prim_family_name(primitive) else {
+                                    return Ok(None);
+                                };
+                                (Some(name), Some(primitive))
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                    None => (None, None),
+                };
                 let Some((family, mut init_diagnostics)) = str_literal_family_init(
                     owner,
                     init,
                     locals,
                     &inner_bindings,
+                    expected,
                     symbols,
                     inputs,
                     snapshot,
@@ -14826,19 +15025,21 @@ fn str_stmt_block_unit(
                 else {
                     return Ok(None);
                 };
-                if ty.is_some() && family != "`Str`" {
+                if let Some(pinned) = pinned
+                    && family != pinned
+                {
                     init_diagnostics.push(const_literal_diagnostic(
                         owner.id,
                         inputs,
                         snapshot,
                         init.span,
                         sai_diagnostics::Code::TypeMismatch,
-                        format!("expected `Str`, found {family}"),
+                        format!("expected {pinned}, found {family}"),
                         "type mismatch",
                     )?);
                 }
                 diagnostics.append(&mut init_diagnostics);
-                inner_bindings.insert(binding, if ty.is_some() { "`Str`" } else { family });
+                inner_bindings.insert(binding, pinned.unwrap_or(family));
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
                 let Some(mut expr_diagnostics) = str_stmt_expr_unit(
@@ -14943,17 +15144,30 @@ fn str_loop_level_block(
                 init,
                 els: None,
             } => {
-                if let Some(ty) = ty
-                    && resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-                        != Some(FunctionDirectType::Str)
-                {
-                    return Ok(None);
-                }
+                // `Str` and scalar-primitive annotations pin the binding's
+                // family; a primitive also becomes the initializer's
+                // expected type.
+                let (pinned, expected) = match ty {
+                    Some(ty) => {
+                        match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
+                            Some(FunctionDirectType::Str) => (Some("`Str`"), None),
+                            Some(FunctionDirectType::Primitive(primitive)) => {
+                                let Some(name) = str_prim_family_name(primitive) else {
+                                    return Ok(None);
+                                };
+                                (Some(name), Some(primitive))
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                    None => (None, None),
+                };
                 let Some((family, mut init_diagnostics)) = str_literal_family_init(
                     owner,
                     init,
                     locals,
                     str_bindings,
+                    expected,
                     symbols,
                     inputs,
                     snapshot,
@@ -14971,19 +15185,21 @@ fn str_loop_level_block(
                 else {
                     return Ok(None);
                 };
-                if ty.is_some() && family != "`Str`" {
+                if let Some(pinned) = pinned
+                    && family != pinned
+                {
                     init_diagnostics.push(const_literal_diagnostic(
                         owner.id,
                         inputs,
                         snapshot,
                         init.span,
                         sai_diagnostics::Code::TypeMismatch,
-                        format!("expected `Str`, found {family}"),
+                        format!("expected {pinned}, found {family}"),
                         "type mismatch",
                     )?);
                 }
                 diagnostics.append(&mut init_diagnostics);
-                str_bindings.insert(binding, if ty.is_some() { "`Str`" } else { family });
+                str_bindings.insert(binding, pinned.unwrap_or(family));
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
                 let Some((clean, broken, mut expr_diagnostics)) = str_loop_level_expr(
@@ -15351,7 +15567,7 @@ fn str_break_value(
         return Ok(Some((true, Vec::new())));
     }
     if let Some(family) = str_binding_family(value, locals, str_bindings) {
-        if family == "`Str`" {
+        if family == "`Str`" || family == "`!`" {
             return Ok(Some((true, Vec::new())));
         }
         return Ok(Some((
@@ -15636,7 +15852,7 @@ fn check_function_str_tail(
     frame: StrStmtLoopFrame,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if let Some(family) = str_binding_family(tail, locals, str_bindings) {
-        if family == "`Str`" {
+        if family == "`Str`" || family == "`!`" {
             return Ok(Some(Vec::new()));
         }
         return Ok(Some(vec![const_literal_diagnostic(
@@ -53370,6 +53586,18 @@ property "shared"() {}
             "pub fn str_scalar_loop_init_range() -> Str {\n    let n = loop { break 99999999999999999999 }\n    \"a\"\n}\n",
             "pub fn str_scalar_if_init_let_branch() -> Str {\n    let n = if true { let t = 1\n    t } else { 2 }\n    \"a\"\n}\n",
             "pub fn str_scalar_if_init_ann() -> Str {\n    let n: Str = if true { 1 } else { 2 }\n    \"a\"\n}\n",
+            "pub fn str_scalar_if_init_never() -> Str {\n    let n = if true { 1 } else { loop {} }\n    \"a\"\n}\n",
+            "pub fn str_scalar_loop_init_never() -> Str {\n    let n = loop {}\n    \"a\"\n}\n",
+            "pub fn str_scalar_loop_init_never_tail() -> Str {\n    let n = loop {}\n    n\n}\n",
+            "pub fn str_ann_i8_local() -> Str {\n    let x: I8 = 42\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_local_oob() -> Str {\n    let x: I8 = 200\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_local_str_init() -> Str {\n    let x: I8 = \"text\"\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_use_in_if_tail() -> Str {\n    let x: I8 = 1\n    if true { \"a\" } else { \"b\" }\n}\n",
+            "pub fn str_ann_i8_local_float_init() -> Str {\n    let x: I8 = 1.5\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_cmp_local() -> Str {\n    let x: I8 = 1\n    if x == 200 { \"a\" } else { \"b\" }\n}\n",
+            "pub fn str_ann_i8_if_init() -> Str {\n    let x: I8 = if true { 1 } else { 2 }\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_if_init_oob() -> Str {\n    let x: I8 = if true { 200 } else { 2 }\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_loop_init() -> Str {\n    let x: I8 = loop { break }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -53385,7 +53613,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 131);
+        assert_eq!(resolved.owners().len(), 143);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -53416,6 +53644,9 @@ property "shared"() {}
             .chain(&resolved.owners()[122..123])
             .chain(&resolved.owners()[125..126])
             .chain(&resolved.owners()[129..130])
+            .chain(&resolved.owners()[131..135])
+            .chain(&resolved.owners()[137..138])
+            .chain(&resolved.owners()[140..141])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -53459,6 +53690,11 @@ property "shared"() {}
             (111, sai_diagnostics::Code::TypeMismatch),
             (115, sai_diagnostics::Code::LiteralOutOfRange),
             (128, sai_diagnostics::Code::LiteralOutOfRange),
+            (135, sai_diagnostics::Code::LiteralOutOfRange),
+            (136, sai_diagnostics::Code::TypeMismatch),
+            (138, sai_diagnostics::Code::TypeMismatch),
+            (139, sai_diagnostics::Code::LiteralOutOfRange),
+            (141, sai_diagnostics::Code::LiteralOutOfRange),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -53476,6 +53712,20 @@ property "shared"() {}
             .expect("scalar/Str if-init body check succeeds")
         else {
             panic!("a scalar/Str if-init stays a supported check result");
+        };
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+        );
+        // A scalar-annotated `Str` literal init reports the init
+        // mismatch, and the pinned binding then mismatches the tail.
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[6]
+            .body_type_check()
+            .expect("annotated Str literal init body check succeeds")
+        else {
+            panic!("a scalar-annotated `Str` init stays a supported check result");
         };
         assert_eq!(diagnostics.len(), 2);
         assert!(
@@ -53501,7 +53751,7 @@ property "shared"() {}
         // A `Str` parameter seeds the group, so copies and a param tail are
         // supported; non-`Str` statements, `var` bindings, and generic-arg
         // paths stay gated.
-        for owner in resolved.owners()[6..8]
+        for owner in resolved.owners()[7..8]
             .iter()
             .chain(&resolved.owners()[18..19])
             .chain(&resolved.owners()[22..24])
@@ -53511,6 +53761,7 @@ property "shared"() {}
             .chain(&resolved.owners()[64..66])
             .chain(&resolved.owners()[69..70])
             .chain(&resolved.owners()[81..83])
+            .chain(&resolved.owners()[142..143])
         {
             assert!(matches!(
                 owner
