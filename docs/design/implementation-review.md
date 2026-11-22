@@ -10198,3 +10198,13 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** The message is evaluated only on failure per N-C-20 — no eager-evaluation concern.
 - **Remaining scope:** `Str` in `LocalType` (carries `Str` call signatures, Str-typed `assert` messages in primitive bodies, and Str scrutinees through the checker), `if let`/`while let`/`for`, range patterns and full guards, tuple/index tails, move/borrow, lowering/evaluation, multi-owner CLI coverage (Stage 0).
+
+### IR-1096 (2026-11-22): `Str` comparison conditions in `-> Str` bodies
+
+- **Decision:** conditions in `if` tails/inits/statements, `while` desugars, `assert` conditions, and match-arm guards admit `==`/`!=`/`<`/`<=`/`>`/`>=` over two `Str` leaves (literal or binding), in addition to `Bool` literals — byte equality and lexicographic byte order per spec/06. A scalar literal operand inside a comparison emits a recoverable `expected Str, found <lit>` `TypeMismatch` (same diagnostic family as pattern-literal mismatches); any other operand shape — calls, nested expressions, `ByteStr` — stays gated.
+- **Reason:** condition leaves in the checker's `Str` domain are comparisons over the group's operands; sharing `str_condition` across the tail, let-init, assert, loop-level, and guard sites keeps admission uniform.
+- **Failure boundary:** gates before producing a `Supported` result whenever a condition operand is not a `Str` leaf or nameable scalar literal; statement-position comparisons whose operand is a non-`Str` scalar gate rather than diagnose because `str_stmt_block_is_unit`/`str_stmt_expr_is_unit` cannot emit diagnostics — recorded boundary, the tail-level `str_condition` still diagnoses.
+- **Planned verification matrix:** clean comparison `if`/`while`/`assert`/guard fixtures, a mismatched-operand `if` (`s == 1` → one `TypeMismatch`), and the reclassified `str_match_expr_guard` (`"x" if s == "x"` → supported-clean rather than gated).
+- **Verification:** six new fixtures; `str_match_expr_guard` moved from the gated slice to supported-clean; driver 781 tests green locally.
+- **Hostile review:** `Str`-only operands — an `Int`-typed path comparison stays gated since `LocalType` cannot hold `Str` yet (see IR-1094), and mixing a `Str` leaf with an `Int` path gates rather than risking a wrong `expected Str` diagnostic direction.
+- **Remaining scope:** statement-position comparison mismatches gate instead of diagnosing; guards referencing the arm's own value `Binding` pattern are seeded into the guard's scope; sub-patterns and other pattern kinds still gate.

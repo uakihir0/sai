@@ -13177,6 +13177,84 @@ fn str_binding_path(
 // `Str` locals bind only string literals and earlier `Str` bindings:
 // `let s = "a"`, `let t: Str = s`. `str_bindings` may be pre-seeded with a
 // `Str` parameter binding.
+// Whether a condition operand is a `Str` leaf — a `Str` literal or a `Str`
+// binding path — for the comparison conditions the group admits.
+fn str_condition_operand(
+    expr: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+) -> bool {
+    matches!(expr.kind, ExprKind::Lit(Lit::Str(_))) || str_binding_path(expr, locals, str_bindings)
+}
+
+// A `Str` comparison condition leaf: `==`/`!=`/`<`/`<=`/`>`/`>=` over two
+// `Str` operands — byte equality and lexicographic byte order per
+// spec/06 — with no diagnostics to emit.
+fn str_comparison_condition(
+    cond: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+) -> bool {
+    matches!(
+        cond.kind,
+        ExprKind::Binary(
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+            lhs,
+            rhs,
+        ) if str_condition_operand(lhs, locals, str_bindings)
+            && str_condition_operand(rhs, locals, str_bindings)
+    )
+}
+
+// A condition in a `-> Str` body: a `Bool` literal or a `Str` comparison.
+// A scalar literal operand inside a comparison is a recoverable
+// `expected Str, found <lit>` mismatch; any other shape (calls, nested
+// expressions, non-comparison operators, `ByteStr`) stays gated.
+fn str_condition(
+    owner: &HirOwner<'_>,
+    cond: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+        || str_comparison_condition(cond, locals, str_bindings)
+    {
+        return Ok(Some(Vec::new()));
+    }
+    if let ExprKind::Binary(
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+        lhs,
+        rhs,
+    ) = cond.kind
+    {
+        let mut diagnostics = Vec::new();
+        for operand in [lhs, rhs] {
+            if str_condition_operand(operand, locals, str_bindings) {
+                continue;
+            }
+            let ExprKind::Lit(literal) = operand.kind else {
+                return Ok(None);
+            };
+            let Some(found) = str_pattern_literal_name(literal) else {
+                return Ok(None);
+            };
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                operand.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `Str`, found {found}"),
+                "type mismatch",
+            )?);
+        }
+        return Ok(Some(diagnostics));
+    }
+    Ok(None)
+}
+
 fn check_function_str_local_block(
     owner: &HirOwner<'_>,
     return_ty: Ty<'_>,
@@ -13195,14 +13273,19 @@ fn check_function_str_local_block(
         // `assert` statements admit a literal `Bool` condition and an
         // optional `Str` literal message — other shapes stay gated.
         if let sai_hir::expressions::StmtKind::Assert { cond, msg, .. } = stmt.kind {
-            let cond_ok = matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)));
+            let Some(mut cond_diagnostics) =
+                str_condition(owner, cond, locals, str_bindings, inputs, snapshot)?
+            else {
+                return Ok(None);
+            };
             let msg_ok = msg.is_none_or(|msg| {
                 matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))
                     || str_binding_path(msg, locals, str_bindings)
             });
-            if !cond_ok || !msg_ok {
+            if !msg_ok {
                 return Ok(None);
             }
+            diagnostics.append(&mut cond_diagnostics);
             continue;
         }
         // Statement-position expressions admit only unit shapes: `if` with
@@ -13291,12 +13374,17 @@ fn check_function_str_local_block(
                 let ExprKind::Block(else_block) = els.kind else {
                     return Ok(None);
                 };
-                if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
-                    || then.safety != sai_hir::Safety::Safe
+                let Some(mut cond_diagnostics) =
+                    str_condition(owner, cond, locals, str_bindings, inputs, snapshot)?
+                else {
+                    return Ok(None);
+                };
+                if then.safety != sai_hir::Safety::Safe
                     || else_block.safety != sai_hir::Safety::Safe
                 {
                     return Ok(None);
                 }
+                diagnostics.append(&mut cond_diagnostics);
                 // At least one branch must yield a `Str` value — an `if`
                 // producing only non-`Str` arms is a non-`Str` initializer
                 // and stays gated rather than borrowing the return type.
@@ -13477,7 +13565,8 @@ fn str_stmt_expr_is_unit(
             let ExprKind::Block(else_block) = els.kind else {
                 return false;
             };
-            matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+            (matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+                || str_comparison_condition(cond, locals, str_bindings))
                 && str_stmt_block_is_unit(then, locals, str_bindings, type_paths, symbols, inputs)
                 && str_stmt_block_is_unit(
                     else_block,
@@ -13525,8 +13614,11 @@ fn str_stmt_block_is_unit(
         match stmt.kind {
             sai_hir::expressions::StmtKind::Assert { cond, msg, .. } => {
                 if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
-                    || !msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))))
+                    && !str_comparison_condition(cond, locals, str_bindings)
                 {
+                    return false;
+                }
+                if !msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))) {
                     return false;
                 }
             }
@@ -13608,11 +13700,15 @@ fn str_loop_level_block(
     for stmt in block.stmts {
         match stmt.kind {
             sai_hir::expressions::StmtKind::Assert { cond, msg, .. } => {
-                if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
-                    || !msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))))
-                {
+                let Some(mut cond_diagnostics) =
+                    str_condition(owner, cond, locals, str_bindings, inputs, snapshot)?
+                else {
+                    return Ok(None);
+                };
+                if !msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))) {
                     return Ok(None);
                 }
+                diagnostics.append(&mut cond_diagnostics);
             }
             sai_hir::expressions::StmtKind::Let {
                 pat,
@@ -13716,10 +13812,12 @@ fn str_loop_level_expr(
             let ExprKind::Block(else_block) = els.kind else {
                 return Ok(None);
             };
-            if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
-                || then.safety != sai_hir::Safety::Safe
-                || else_block.safety != sai_hir::Safety::Safe
-            {
+            let Some(mut cond_diagnostics) =
+                str_condition(owner, cond, locals, str_bindings, inputs, snapshot)?
+            else {
+                return Ok(None);
+            };
+            if then.safety != sai_hir::Safety::Safe || else_block.safety != sai_hir::Safety::Safe {
                 return Ok(None);
             }
             let mut then_bindings = str_bindings.clone();
@@ -13738,6 +13836,7 @@ fn str_loop_level_expr(
             else {
                 return Ok(None);
             };
+            diagnostics.append(&mut cond_diagnostics);
             let mut else_bindings = str_bindings.clone();
             let Some((else_clean, else_broken, mut else_diagnostics)) = str_loop_level_block(
                 owner,
@@ -14042,13 +14141,26 @@ fn check_function_str_match(
         // Mirrors `check_match_arm_pattern`: a guarded arm may fail its
         // guard, so it never counts as the catch-all. The leaf subset
         // admits only `Lit::Bool` guards.
+        let mut arm_bindings = str_bindings.clone();
+        // The arm's pattern binding is in scope for its guard.
+        if let PatKind::Binding {
+            mode: sai_hir::patterns::BindingMode::Value,
+            binding,
+            sub: None,
+            ..
+        } = arm.pat.kind
+        {
+            arm_bindings.insert(binding);
+        }
         if let Some(guard) = arm.guard {
-            if !matches!(guard.kind, ExprKind::Lit(Lit::Bool(_))) {
+            let Some(mut guard_diagnostics) =
+                str_condition(owner, guard, locals, &arm_bindings, inputs, snapshot)?
+            else {
                 return Ok(None);
-            }
+            };
+            diagnostics.append(&mut guard_diagnostics);
         }
         let guarded = arm.guard.is_some();
-        let mut arm_bindings = str_bindings.clone();
         if catch_all {
             diagnostics.push(const_literal_diagnostic(
                 owner.id,
@@ -14184,11 +14296,13 @@ fn check_function_str_tail(
         els: Some(else_expr),
     } = tail.kind
     {
-        // Only literal `Bool` conditions: parameter/logical conditions are the
-        // parameter arms' domain, and `Str` comparisons are out of scope.
-        if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_))) {
+        // `Bool` literal or `Str` comparison conditions: parameter/logical
+        // conditions stay gated.
+        let Some(mut cond_diagnostics) =
+            str_condition(owner, cond, locals, str_bindings, inputs, snapshot)?
+        else {
             return Ok(None);
-        }
+        };
         let ExprKind::Block(else_block) = else_expr.kind else {
             return Ok(None);
         };
@@ -14214,6 +14328,7 @@ fn check_function_str_tail(
         else {
             return Ok(None);
         };
+        diagnostics.append(&mut cond_diagnostics);
         let mut else_bindings = str_bindings.clone();
         let Some(mut else_diagnostics) = check_function_str_local_block(
             owner,
@@ -51700,6 +51815,13 @@ property "shared"() {}
             "pub fn str_loop_break_inner_loop() -> Str {\n    let m = loop { break if true { loop { break \"x\" } } else { \"b\" } }\n    m\n}\n",
             "pub fn str_loop_break_int_inner_loop() -> Str {\n    let n = loop { break if true { loop { break 1 } } else { \"b\" } }\n    \"a\"\n}\n",
             "pub fn str_assert_local_msg() -> Str {\n    let s = \"a\"\n    assert true, s\n    s\n}\n",
+            "pub fn str_if_eq_cond() -> Str {\n    let s = \"a\"\n    if s == \"a\" { \"x\" } else { \"b\" }\n}\n",
+            "pub fn str_if_lt_cond() -> Str {\n    let s = \"a\"\n    let t = \"b\"\n    if s < t { \"x\" } else { \"b\" }\n}\n",
+            "pub fn str_if_mismatch_cond() -> Str {\n    let s = \"a\"\n    if s == 1 { \"x\" } else { \"b\" }\n}\n",
+            "pub fn str_match_guard_eq() -> Str {\n    let s = \"a\"\n    match s { \"x\" if s == \"a\" => \"y\", _ => \"z\" }\n}\n",
+            "pub fn str_assert_cmp() -> Str {\n    let s = \"a\"\n    let t = \"b\"\n    assert s < t, \"m\"\n    s\n}\n",
+            "pub fn str_while_eq() -> Str {\n    let s = \"a\"\n    while s == \"a\" { break }\n    s\n}\n",
+            "pub fn str_match_binding_guard() -> Str {\n    let s = \"a\"\n    match s { v if v == \"x\" => v, _ => \"z\" }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51715,7 +51837,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 88);
+        assert_eq!(resolved.owners().len(), 95);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -51730,10 +51852,11 @@ property "shared"() {}
             .chain(&resolved.owners()[63..64])
             .chain(&resolved.owners()[66..68])
             .chain(&resolved.owners()[70..71])
-            .chain(&resolved.owners()[73..76])
+            .chain(&resolved.owners()[72..76])
             .chain(&resolved.owners()[77..80])
             .chain(&resolved.owners()[83..86])
-            .chain(&resolved.owners()[87..])
+            .chain(&resolved.owners()[87..90])
+            .chain(&resolved.owners()[91..])
         {
             assert!(matches!(
                 owner
@@ -51742,7 +51865,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [4, 21, 37, 51, 61, 68, 76, 86] {
+        for index in [4, 21, 37, 51, 61, 68, 76, 86, 90] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
                 .expect("Str mismatch body check succeeds");
@@ -51781,7 +51904,6 @@ property "shared"() {}
             .chain(&resolved.owners()[54..57])
             .chain(&resolved.owners()[64..66])
             .chain(&resolved.owners()[69..70])
-            .chain(&resolved.owners()[72..73])
             .chain(&resolved.owners()[80..83])
         {
             assert!(matches!(

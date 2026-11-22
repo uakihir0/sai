@@ -4648,6 +4648,8 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
         "pub fn str_match_or() -> Str {\n    let s = \"a\"\n    match s { \"x\" | \"w\" => \"y\", _ => \"z\" }\n}\n",
         "pub fn str_loop_break_match() -> Str {\n    let s = \"a\"\n    loop { break match s { \"x\" => \"y\", _ => \"z\" } }\n}\n",
         "pub fn str_assert_local_msg() -> Str {\n    let s = \"a\"\n    assert true, s\n    s\n}\n",
+        "pub fn str_if_eq_cond() -> Str {\n    let s = \"a\"\n    if s == \"a\" { \"x\" } else { \"b\" }\n}\n",
+        "pub fn str_match_guard_eq() -> Str {\n    let s = \"a\"\n    match s { \"x\" if s == \"a\" => \"y\", _ => \"z\" }\n}\n",
         "pub fn answer() -> I32 { 42 }\n",
         "pub fn ready() -> Bool { true }\n",
         "pub fn letter() -> Char { 'z' }\n",
