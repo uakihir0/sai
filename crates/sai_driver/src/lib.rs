@@ -15463,7 +15463,7 @@ fn str_pure_match_family(
                 ..
             } = arm.pat.kind
             {
-                arm_bindings.insert(binding, "`Str`");
+                arm_bindings.insert(binding, scrutinee_family);
             }
         } else {
             let admit_literal = |literal: Lit<'_>| -> bool {
@@ -15661,13 +15661,17 @@ fn str_stmt_break_families_expr<'h>(
         ExprKind::Match {
             scrutinee, arms, ..
         } => {
-            // A binding arm types the pattern variable as `Str` — break
-            // values inside the arm (`break other`) classify through it.
-            let scrutinee_str = matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_)))
-                || str_binding_family(scrutinee, locals, str_bindings) == Some("`Str`");
+            // A binding arm types the pattern variable as the scrutinee
+            // family — break values inside the arm (`break other`)
+            // classify through it.
+            let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
+                Some("`Str`")
+            } else {
+                str_binding_family(scrutinee, locals, str_bindings)
+            };
             for arm in arms {
                 let mut arm_bindings = str_bindings.clone();
-                if scrutinee_str
+                if let Some(family) = scrutinee_family
                     && let PatKind::Binding {
                         mode: sai_hir::patterns::BindingMode::Value,
                         binding,
@@ -15675,7 +15679,7 @@ fn str_stmt_break_families_expr<'h>(
                         ..
                     } = arm.pat.kind
                 {
-                    arm_bindings.insert(binding, "`Str`");
+                    arm_bindings.insert(binding, family);
                 }
                 str_stmt_break_families_expr(
                     arm.body,
@@ -54471,6 +54475,8 @@ property "shared"() {}
             "pub fn str_scalar_match_empty_range() -> Str {\n    let n = 1\n    match n {\n        3..=1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
             "pub fn str_scalar_match_no_catch() -> Str {\n    let n = 1\n    match n {\n        1 => \"a\"\n    }\n}\n",
             "pub fn str_scalar_match_str_pat() -> Str {\n    let n = 1\n    match n {\n        \"a\" => \"x\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_arm_break_seed() -> Str {\n    let n = 1\n    let m = loop {\n        let t = match n {\n            _ => 1,\n            k => k,\n        }\n        break t\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_break_in_arm() -> Str {\n    let n = 1\n    let m = loop {\n        return match n {\n            k => break k,\n        }\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54486,7 +54492,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 169);
+        assert_eq!(resolved.owners().len(), 171);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54527,6 +54533,7 @@ property "shared"() {}
             .chain(&resolved.owners()[153..154])
             .chain(&resolved.owners()[156..159])
             .chain(&resolved.owners()[159..164])
+            .chain(&resolved.owners()[170..171])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54587,6 +54594,7 @@ property "shared"() {}
             (165, sai_diagnostics::Code::TypeMismatch),
             (166, sai_diagnostics::Code::EmptyRangePattern),
             (167, sai_diagnostics::Code::NonExhaustiveMatch),
+            (169, sai_diagnostics::Code::UnreachablePattern),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
