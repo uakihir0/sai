@@ -575,8 +575,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .input
                 .call_signatures
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-        let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Path(_)))
-            || matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && matches!(operand.kind, ExprKind::Field { .. }) && (self.input.self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)) || self.input.unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))));
+        let is_supported_unary_tail = match tail.kind {
+            ExprKind::Unary(operator, operand)
+                if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) =>
+            {
+                self.unary_tail_operand_is_admissible(operator, operand)
+            }
+            _ => false,
+        };
         let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
         let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some());
         let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
@@ -3351,6 +3357,98 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// `expected` is the type the expression's value unifies with: the
     /// return type at tail positions, or the annotation at annotated
     /// initializer/assign positions.
+    // Tail-position unary operand admission mirrors the driver:
+    // `-`/`~` over paths or self fields (`-lit` never reaches here — the
+    // parser folds it into a literal), `~` over integer/byte literals,
+    // and `not` over the logical-operand shapes `check_logical_operand`
+    // handles. The runtime checkers gate anything this admission covers
+    // that stays unsupported, so the predicate only needs to be a
+    // superset of the driver mirror.
+    fn unary_tail_operand_is_admissible(&self, operator: UnOp, operand: &Expr<'hir>) -> bool {
+        match (operator, operand.kind) {
+            (_, ExprKind::Path(_)) => true,
+            (_, ExprKind::Field { .. }) => self.self_field_leaf_is_admissible(operand),
+            (UnOp::BitNot, ExprKind::Lit(literal)) => matches!(
+                primitive_literal_kind(literal),
+                Some(PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::Byte)
+            ),
+            (UnOp::Not, _) => self.logical_operand_shape_is_admissible(operand),
+            _ => false,
+        }
+    }
+
+    fn self_field_leaf_is_admissible(&self, operand: &Expr<'hir>) -> bool {
+        self.input
+            .self_field_projections
+            .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+            || self
+                .input
+                .unknown_self_fields
+                .is_some_and(|fields| fields.contains(&operand.hir_id))
+    }
+
+    // Every leaf and tree shape `check_logical_operand` can type or
+    // diagnose — the driver's `primitive_logical_init_operand_shape`
+    // mirror refuses anything narrower, and refusal is what publishes
+    // Unsupported, so admitting a superset here is consistent.
+    fn logical_operand_shape_is_admissible(&self, operand: &Expr<'hir>) -> bool {
+        match operand.kind {
+            ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Block(_) => true,
+            ExprKind::Field { .. } => self.self_field_leaf_is_admissible(operand),
+            ExprKind::Call { base: None, .. } => self
+                .input
+                .call_signatures
+                .is_some_and(|signatures| signatures.contains_key(&operand.hir_id)),
+            ExprKind::Unary(UnOp::Not, inner) => self.logical_operand_shape_is_admissible(inner),
+            ExprKind::Binary(operator, left, right) => match operator {
+                BinOp::And | BinOp::Or => {
+                    self.logical_operand_shape_is_admissible(left)
+                        && self.logical_operand_shape_is_admissible(right)
+                }
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    self.operand_shape_is_admissible(left)
+                        && self.operand_shape_is_admissible(right)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    // The comparison-leaf counterpart of
+    // `logical_operand_shape_is_admissible`: the driver mirror's nested
+    // operand shapes — literals, paths, fields, direct calls, the
+    // initializer unary shapes, nested binary trees, and blocks.
+    fn operand_shape_is_admissible(&self, operand: &Expr<'hir>) -> bool {
+        match operand.kind {
+            ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Block(_) => true,
+            ExprKind::Field { .. } => self.self_field_leaf_is_admissible(operand),
+            ExprKind::Call { base: None, .. } => self
+                .input
+                .call_signatures
+                .is_some_and(|signatures| signatures.contains_key(&operand.hir_id)),
+            ExprKind::Unary(UnOp::Not, inner) => self.logical_operand_shape_is_admissible(inner),
+            ExprKind::Unary(UnOp::Neg, inner) => {
+                matches!(inner.kind, ExprKind::Path(_))
+                    || (matches!(inner.kind, ExprKind::Field { .. })
+                        && self.self_field_leaf_is_admissible(inner))
+            }
+            ExprKind::Unary(UnOp::BitNot, inner) => match inner.kind {
+                ExprKind::Path(_) => true,
+                ExprKind::Field { .. } => self.self_field_leaf_is_admissible(inner),
+                ExprKind::Lit(literal) => matches!(
+                    primitive_literal_kind(literal),
+                    Some(PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::Byte)
+                ),
+                _ => false,
+            },
+            ExprKind::Binary(_, left, right) => {
+                self.operand_shape_is_admissible(left) && self.operand_shape_is_admissible(right)
+            }
+            _ => false,
+        }
+    }
+
     fn check_expr_value(
         &mut self,
         expression: &Expr<'hir>,
