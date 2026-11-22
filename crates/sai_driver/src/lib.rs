@@ -13223,8 +13223,97 @@ fn check_function_str_local_block(
     let Some(tail) = block.tail else {
         return Ok(None);
     };
+    check_function_str_tail(
+        owner,
+        return_ty,
+        tail,
+        locals,
+        str_bindings,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )
+}
+
+// One `Str` tail position: a `Str` literal, a path into the `Str` local group,
+// an `if` over a literal `Bool` condition with `Str` branch tails, or a scalar
+// literal checked against `Str` for the recoverable mismatch diagnostic.
+fn check_function_str_tail(
+    owner: &HirOwner<'_>,
+    return_ty: Ty<'_>,
+    tail: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if str_binding_path(tail, locals, str_bindings) {
         return Ok(Some(Vec::new()));
+    }
+    if let ExprKind::If {
+        cond,
+        then,
+        els: Some(else_expr),
+    } = tail.kind
+    {
+        // Only literal `Bool` conditions: parameter/logical conditions are the
+        // parameter arms' domain, and `Str` comparisons are out of scope.
+        if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_))) {
+            return Ok(None);
+        }
+        let ExprKind::Block(else_block) = else_expr.kind else {
+            return Ok(None);
+        };
+        if then.safety != sai_hir::Safety::Safe
+            || else_block.safety != sai_hir::Safety::Safe
+            || !then.stmts.is_empty()
+            || !else_block.stmts.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(then_tail) = then.tail else {
+            return Ok(None);
+        };
+        let Some(else_tail) = else_block.tail else {
+            return Ok(None);
+        };
+        let Some(mut diagnostics) = check_function_str_tail(
+            owner,
+            return_ty,
+            then_tail,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(mut else_diagnostics) = check_function_str_tail(
+            owner,
+            return_ty,
+            else_tail,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut else_diagnostics);
+        return Ok(Some(diagnostics));
     }
     if !matches!(tail.kind, ExprKind::Lit(Lit::Str(_))) && !is_direct_function_scalar_literal(tail)
     {
@@ -50506,6 +50595,14 @@ property "shared"() {}
             "pub fn multi_str_identity(value: Str, other: Str) -> Str { other }\n",
             "pub fn multi_str_local(value: Str, other: Str) -> Str {\n    let copied = value\n    copied\n}\n",
             "pub fn multi_str_lit_tail(value: Str, other: Str) -> Str {\n    let copied = other\n    \"text\"\n}\n",
+            "pub fn str_if_tail() -> Str {\n    if true { \"a\" } else { \"b\" }\n}\n",
+            "pub fn str_if_local_branch() -> Str {\n    let v = \"x\"\n    if true { v } else { \"y\" }\n}\n",
+            "pub fn str_if_nested() -> Str {\n    if true { if false { \"a\" } else { \"b\" } } else { \"c\" }\n}\n",
+            "pub fn str_if_nonliteral_cond() -> Str {\n    if 1 { \"a\" } else { \"b\" }\n}\n",
+            "pub fn str_if_no_else() -> Str {\n    if true { \"a\" }\n}\n",
+            "pub fn str_if_else_if() -> Str {\n    if true { \"a\" } else if false { \"b\" } else { \"c\" }\n}\n",
+            "pub fn str_if_stmt_branch() -> Str {\n    if true { let v = \"a\"\n v } else { \"b\" }\n}\n",
+            "pub fn str_if_mismatch_branch() -> Str {\n    if true { 1 } else { \"b\" }\n}\n",
             "pub fn str_local_generic_tail() -> Str {\n    let value = \"text\"\n    value<I32>\n}\n",
             "pub fn str_local_generic_init() -> Str {\n    let value = \"text\"\n    let copy = value<I32>\n    copy\n}\n",
         );
@@ -50523,10 +50620,10 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 16);
+        assert_eq!(resolved.owners().len(), 24);
         for owner in resolved.owners()[..4]
             .iter()
-            .chain(&resolved.owners()[8..14])
+            .chain(&resolved.owners()[8..17])
         {
             assert!(matches!(
                 owner
@@ -50535,20 +50632,23 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        let mismatch = resolved.owners()[4]
-            .body_type_check()
-            .expect("Str local mismatch tail body check succeeds");
-        let FunctionBodyTypeCheck::Supported { diagnostics } = mismatch else {
-            panic!("a non-Str literal tail stays a recoverable type error");
-        };
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        for index in [4, 21] {
+            let mismatch = resolved.owners()[index]
+                .body_type_check()
+                .expect("Str mismatch body check succeeds");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = mismatch else {
+                panic!("a non-Str literal tail stays a recoverable type error");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        }
         // A `Str` parameter seeds the group, so copies and a param tail are
         // supported; non-`Str` statements, `var` bindings, and generic-arg
         // paths stay gated.
         for owner in resolved.owners()[5..8]
             .iter()
-            .chain(&resolved.owners()[14..16])
+            .chain(&resolved.owners()[17..21])
+            .chain(&resolved.owners()[22..])
         {
             assert!(matches!(
                 owner

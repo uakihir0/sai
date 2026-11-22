@@ -4632,6 +4632,8 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
         "pub fn string_parameter_return(value: Str) -> Str { \"text\" }\n",
         "pub fn local_str_copy(value: Str) -> Str {\n    let copied = value\n    copied\n}\n",
         "pub fn multi_str_identity(value: Str, other: Str) -> Str { other }\n",
+        "pub fn str_if_tail() -> Str {\n    if true { \"a\" } else { \"b\" }\n}\n",
+        "pub fn str_if_param_tail(value: Str) -> Str {\n    if true { \"a\" } else { value }\n}\n",
         "pub fn answer() -> I32 { 42 }\n",
         "pub fn ready() -> Bool { true }\n",
         "pub fn letter() -> Char { 'z' }\n",
