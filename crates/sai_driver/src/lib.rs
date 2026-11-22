@@ -13414,9 +13414,28 @@ fn str_expr_family(
                 return Ok(None);
             };
             diagnostics.append(&mut else_diagnostics);
+            if let Some(pin_family) = expected.and_then(str_prim_family_name) {
+                // Under a pin (`let x: I8 = if`, a `Bool` condition
+                // operand) each branch checks against it like the
+                // checker — `if flag { n } else { false }` reports the
+                // `n` branch as `expected Bool, found I64`, not a
+                // branch-vs-branch join mismatch.
+                for (branch_family, span) in [(then_family, then.span), (else_family, els.span)] {
+                    if branch_family != pin_family && branch_family != "`!`" {
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            span,
+                            sai_diagnostics::Code::TypeMismatch,
+                            format!("expected {pin_family}, found {branch_family}"),
+                            "type mismatch",
+                        )?);
+                    }
+                }
             // A diverging branch yields `!`, which unifies with the other
             // branch's family — only a concrete disagreement reports.
-            if then_family != else_family && then_family != "`!`" && else_family != "`!`" {
+            } else if then_family != else_family && then_family != "`!`" && else_family != "`!`" {
                 diagnostics.push(const_literal_diagnostic(
                     owner.id,
                     inputs,
@@ -14377,7 +14396,10 @@ fn str_condition(
         snapshot,
         target_cfg,
     )? {
-        if family != "`Bool`" && family != "`!`" {
+        // Compound value shapes (`if`/`match`) already reported the
+        // offending branch against the `Bool` expectation — only a bare
+        // family mismatch on a quiet walk adds the operand diagnostic.
+        if family != "`Bool`" && family != "`!`" && value_diagnostics.is_empty() {
             value_diagnostics.push(const_literal_diagnostic(
                 owner.id,
                 inputs,
@@ -54814,6 +54836,8 @@ property "shared"() {}
             "pub fn str_scalar_cond_and_if() -> Str {\n    let a = true\n    if a and if a { true } else { a } {\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_cond_if_tm() -> Str {\n    let a = true\n    if a and if a { 1 } else { true } {\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_match_guard_if() -> Str {\n    let n = 1\n    let a = true\n    match n {\n        1 if if a { true } else { a } => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_loop_match_guard_loop() -> Str {\n    let n = 1\n    let flag = true\n    loop {\n        let t = match n {\n            1 if loop {\n                break if flag {\n                    true\n                } else {\n                    false\n                }\n            } => 1,\n            _ => 2,\n        }\n        break t\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_if_branch_tm() -> Str {\n    let a = true\n    let n = 1\n    if a and if a { n } else { true } {\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54829,7 +54853,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 196);
+        assert_eq!(resolved.owners().len(), 198);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54879,6 +54903,7 @@ property "shared"() {}
             .chain(&resolved.owners()[192..193])
             .chain(&resolved.owners()[193..194])
             .chain(&resolved.owners()[195..196])
+            .chain(&resolved.owners()[196..197])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54948,6 +54973,7 @@ property "shared"() {}
             (189, sai_diagnostics::Code::TypeMismatch),
             (190, sai_diagnostics::Code::TypeMismatch),
             (194, sai_diagnostics::Code::TypeMismatch),
+            (197, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
