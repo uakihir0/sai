@@ -15685,7 +15685,7 @@ fn str_pure_init_family(
             prims.dedup();
             if let [prim] = prims.as_slice() {
                 for (family, value, _) in contributions.iter_mut() {
-                    if *family == Some("`I64`")
+                    if matches!(*family, Some("`I64`") | Some("`F64`"))
                         && matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_)))
                     {
                         *family = Some(*prim);
@@ -15834,7 +15834,9 @@ fn str_pure_match_family(
     prims.dedup();
     if let [prim] = prims.as_slice() {
         for (family, value, _) in arm_families.iter_mut() {
-            if *family == Some("`I64`") && matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_))) {
+            if matches!(*family, Some("`I64`") | Some("`F64`"))
+                && matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_)))
+            {
                 *family = Some(*prim);
             }
         }
