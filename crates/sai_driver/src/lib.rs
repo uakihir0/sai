@@ -15190,6 +15190,131 @@ fn str_stmt_expr_unit(
                 Ok(Some(Vec::new()))
             }
         }
+        // `match n { .. }` in statement position mirrors
+        // `check_match_stmt`: the scrutinee must be a scalar-family
+        // path (`Str` scrutinees gate — the checker requires a
+        // `Concrete` local), patterns go through `str_match_arm_pattern`,
+        // arm bodies must be blocks checked as statement blocks at this
+        // frame, and binding arms seed the scrutinee family for the
+        // arm's guard and body.
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source: MatchSource::Normal,
+        } => {
+            let Some(scrutinee_family) = str_binding_family(scrutinee, locals, str_bindings) else {
+                return Ok(None);
+            };
+            if scrutinee_family == "`Str`" {
+                return Ok(None);
+            }
+            let Some(scrutinee_prim) =
+                primitive_method_field_type(scrutinee_family.trim_matches('`'))
+            else {
+                return Ok(None);
+            };
+            let mut diagnostics = Vec::new();
+            let mut catch_all = false;
+            let mut bool_cover = (false, false);
+            for arm in arms {
+                let mut arm_bindings = str_bindings.clone();
+                let guarded = arm.guard.is_some();
+                if catch_all {
+                    diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        arm.pat.span,
+                        sai_diagnostics::Code::UnreachablePattern,
+                        "arm can never match".to_owned(),
+                        "unreachable pattern",
+                    )?);
+                    if let PatKind::Binding {
+                        mode: sai_hir::patterns::BindingMode::Value,
+                        binding,
+                        sub: None,
+                        ..
+                    } = arm.pat.kind
+                    {
+                        arm_bindings.insert(binding, scrutinee_family);
+                    }
+                } else {
+                    let Some(binding) = str_match_arm_pattern(
+                        owner,
+                        &arm.pat,
+                        !guarded,
+                        Some(scrutinee_prim),
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                        &mut diagnostics,
+                        &mut bool_cover,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    if let Some(binding) = binding {
+                        arm_bindings.insert(binding, scrutinee_family);
+                    }
+                    catch_all =
+                        !guarded && matches!(arm.pat.kind, PatKind::Wild | PatKind::Binding { .. });
+                    if let Some(guard) = arm.guard {
+                        let Some(mut guard_diagnostics) = str_condition(
+                            owner,
+                            guard,
+                            locals,
+                            &arm_bindings,
+                            inputs,
+                            snapshot,
+                            symbols,
+                            target_cfg,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        diagnostics.append(&mut guard_diagnostics);
+                    }
+                }
+                let ExprKind::Block(block) = arm.body.kind else {
+                    return Ok(None);
+                };
+                let Some(mut body_diagnostics) = str_stmt_block_unit(
+                    owner,
+                    return_ty,
+                    block,
+                    locals,
+                    &arm_bindings,
+                    expected,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    break_ctx,
+                    frame,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut body_diagnostics);
+            }
+            if !catch_all
+                && !(scrutinee_prim == sai_resolve::prelude::PrimTy::Bool
+                    && bool_cover == (true, true))
+            {
+                diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    scrutinee.span,
+                    sai_diagnostics::Code::NonExhaustiveMatch,
+                    "match does not cover every value".to_owned(),
+                    "non-exhaustive match",
+                )?);
+            }
+            Ok(Some(diagnostics))
+        }
         // `return e` checks `e` like a tail; a bare `return` in a
         // `-> Str` body reports `expected `Str`, found `()` — the
         // checker's MISSING_RETURN_VALUE.
@@ -54477,6 +54602,14 @@ property "shared"() {}
             "pub fn str_scalar_match_str_pat() -> Str {\n    let n = 1\n    match n {\n        \"a\" => \"x\",\n        _ => \"b\",\n    }\n}\n",
             "pub fn str_scalar_match_arm_break_seed() -> Str {\n    let n = 1\n    let m = loop {\n        let t = match n {\n            _ => 1,\n            k => k,\n        }\n        break t\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_match_break_in_arm() -> Str {\n    let n = 1\n    let m = loop {\n        return match n {\n            k => break k,\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_stmt() -> Str {\n    let n = 1\n    match n {\n        1 => {\n            assert(true)\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_stmt_break() -> Str {\n    let n = 1\n    loop {\n        match n {\n            _ => {\n                break\n            }\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_stmt_str_scrut() -> Str {\n    let s = \"a\"\n    match s {\n        \"x\" => {\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_stmt_no_catch() -> Str {\n    let n = 1\n    match n {\n        1 => {\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_stmt_pat_tm() -> Str {\n    let n = 1\n    match n {\n        'a' => {\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_stmt_unreachable() -> Str {\n    let n = 1\n    match n {\n        _ => {\n        }\n        2 => {\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_stmt_let() -> Str {\n    let n = 1\n    match n {\n        1 => {\n            let m = n\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_stmt_guard() -> Str {\n    let n = 1\n    match n {\n        1 if true => {\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54492,7 +54625,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 171);
+        assert_eq!(resolved.owners().len(), 179);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54534,6 +54667,8 @@ property "shared"() {}
             .chain(&resolved.owners()[156..159])
             .chain(&resolved.owners()[159..164])
             .chain(&resolved.owners()[170..171])
+            .chain(&resolved.owners()[171..173])
+            .chain(&resolved.owners()[177..179])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54595,6 +54730,9 @@ property "shared"() {}
             (166, sai_diagnostics::Code::EmptyRangePattern),
             (167, sai_diagnostics::Code::NonExhaustiveMatch),
             (169, sai_diagnostics::Code::UnreachablePattern),
+            (174, sai_diagnostics::Code::NonExhaustiveMatch),
+            (175, sai_diagnostics::Code::TypeMismatch),
+            (176, sai_diagnostics::Code::UnreachablePattern),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -54678,6 +54816,7 @@ property "shared"() {}
             .chain(&resolved.owners()[64..65])
             .chain(&resolved.owners()[69..70])
             .chain(&resolved.owners()[168..169])
+            .chain(&resolved.owners()[173..174])
         {
             assert!(matches!(
                 owner
