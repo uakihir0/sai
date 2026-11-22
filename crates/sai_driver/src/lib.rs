@@ -13260,6 +13260,38 @@ fn str_condition(
         }
         return Ok(Some(diagnostics));
     }
+    // A literal or `Str`-leaf condition in a `Bool` slot is the checker's
+    // `expected Bool` mismatch — recoverable like the comparison-operand
+    // case; every other shape stays gated.
+    if let ExprKind::Lit(literal) = cond.kind {
+        let found = match literal {
+            Lit::Str(_) => "a string literal",
+            _ => match str_pattern_literal_name(literal) {
+                Some(name) => name,
+                None => return Ok(None),
+            },
+        };
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            cond.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `Bool`, found {found}"),
+            "type mismatch",
+        )?]));
+    }
+    if str_condition_operand(cond, locals, str_bindings) {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            cond.span,
+            sai_diagnostics::Code::TypeMismatch,
+            "expected `Bool`, found `Str`".to_string(),
+            "type mismatch",
+        )?]));
+    }
     Ok(None)
 }
 
@@ -13379,8 +13411,11 @@ fn check_function_str_local_block(
                 then,
                 els: Some(els),
             } => {
-                let ExprKind::Block(else_block) = els.kind else {
-                    return Ok(None);
+                let else_block = match els.kind {
+                    ExprKind::Block(block) => Some(block),
+                    // `else if` nests the next `if` — the chain is one tail.
+                    ExprKind::If { .. } => None,
+                    _ => return Ok(None),
                 };
                 let Some(mut cond_diagnostics) =
                     str_condition(owner, cond, locals, str_bindings, inputs, snapshot)?
@@ -13388,7 +13423,7 @@ fn check_function_str_local_block(
                     return Ok(None);
                 };
                 if then.safety != sai_hir::Safety::Safe
-                    || else_block.safety != sai_hir::Safety::Safe
+                    || else_block.is_some_and(|b| b.safety != sai_hir::Safety::Safe)
                 {
                     return Ok(None);
                 }
@@ -13402,7 +13437,12 @@ fn check_function_str_local_block(
                             || str_binding_path(tail, locals, str_bindings)
                     })
                 };
-                if !branch_yields_str(then) && !branch_yields_str(else_block) {
+                let else_yields = match else_block {
+                    Some(b) => branch_yields_str(b),
+                    // `else if` — the nested chain's own clean-yield scan.
+                    None => str_clean_expr(els, locals, str_bindings, false),
+                };
+                if !branch_yields_str(then) && !else_yields {
                     return Ok(None);
                 }
                 let mut then_bindings = str_bindings.clone();
@@ -13424,21 +13464,43 @@ fn check_function_str_local_block(
                 };
                 diagnostics.append(&mut then_diagnostics);
                 let mut else_bindings = str_bindings.clone();
-                let Some(mut else_diagnostics) = check_function_str_local_block(
-                    owner,
-                    return_ty,
-                    else_block,
-                    &mut else_bindings,
-                    locals,
-                    type_paths,
-                    symbols,
-                    inputs,
-                    snapshot,
-                    target_cfg,
-                    break_ctx,
-                )?
-                else {
-                    return Ok(None);
+                let mut else_diagnostics = if let Some(else_block) = else_block {
+                    let Some(d) = check_function_str_local_block(
+                        owner,
+                        return_ty,
+                        else_block,
+                        &mut else_bindings,
+                        locals,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                        break_ctx,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    d
+                } else {
+                    // `else if` — the nested `if` is a tail expression.
+                    let Some(d) = check_function_str_tail(
+                        owner,
+                        return_ty,
+                        els,
+                        locals,
+                        &else_bindings,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                        break_ctx,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    d
                 };
                 diagnostics.append(&mut else_diagnostics);
             }
@@ -13570,20 +13632,26 @@ fn str_stmt_expr_is_unit(
             then,
             els: Some(els),
         } => {
-            let ExprKind::Block(else_block) = els.kind else {
-                return false;
-            };
-            (matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
-                || str_comparison_condition(cond, locals, str_bindings))
-                && str_stmt_block_is_unit(then, locals, str_bindings, type_paths, symbols, inputs)
-                && str_stmt_block_is_unit(
+            // `else { ... }` is a unit block; `else if` is itself a unit
+            // statement expression — the recursion checks its own cond.
+            let else_unit = match els.kind {
+                ExprKind::Block(else_block) => str_stmt_block_is_unit(
                     else_block,
                     locals,
                     str_bindings,
                     type_paths,
                     symbols,
                     inputs,
-                )
+                ),
+                ExprKind::If { .. } => {
+                    str_stmt_expr_is_unit(els, locals, str_bindings, type_paths, symbols, inputs)
+                }
+                _ => false,
+            };
+            (matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+                || str_comparison_condition(cond, locals, str_bindings))
+                && str_stmt_block_is_unit(then, locals, str_bindings, type_paths, symbols, inputs)
+                && else_unit
         }
         ExprKind::Loop {
             body,
@@ -13820,15 +13888,20 @@ fn str_loop_level_expr(
             then,
             els: Some(els),
         } => {
-            let ExprKind::Block(else_block) = els.kind else {
-                return Ok(None);
+            let else_block = match els.kind {
+                ExprKind::Block(block) => Some(block),
+                // `else if` nests the next `if` — recurse at loop level.
+                ExprKind::If { .. } => None,
+                _ => return Ok(None),
             };
             let Some(mut cond_diagnostics) =
                 str_condition(owner, cond, locals, str_bindings, inputs, snapshot)?
             else {
                 return Ok(None);
             };
-            if then.safety != sai_hir::Safety::Safe || else_block.safety != sai_hir::Safety::Safe {
+            if then.safety != sai_hir::Safety::Safe
+                || else_block.is_some_and(|b| b.safety != sai_hir::Safety::Safe)
+            {
                 return Ok(None);
             }
             let mut then_bindings = str_bindings.clone();
@@ -13849,21 +13922,42 @@ fn str_loop_level_expr(
             };
             diagnostics.append(&mut cond_diagnostics);
             let mut else_bindings = str_bindings.clone();
-            let Some((else_clean, else_broken, mut else_diagnostics)) = str_loop_level_block(
-                owner,
-                return_ty,
-                else_block,
-                &mut else_bindings,
-                locals,
-                type_paths,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
-            )?
-            else {
-                return Ok(None);
-            };
+            let (else_clean, else_broken, mut else_diagnostics) =
+                if let Some(else_block) = else_block {
+                    let Some(t) = str_loop_level_block(
+                        owner,
+                        return_ty,
+                        else_block,
+                        &mut else_bindings,
+                        locals,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    t
+                } else {
+                    let Some(t) = str_loop_level_expr(
+                        owner,
+                        return_ty,
+                        els,
+                        &mut else_bindings,
+                        locals,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    t
+                };
             diagnostics.append(&mut else_diagnostics);
             Ok(Some((
                 then_clean || else_clean,
@@ -14013,7 +14107,7 @@ fn str_clean_expr(
             ..
         } => {
             str_clean_block(then, locals, str_bindings, loop_level)
-                || matches!(els.kind, ExprKind::Block(else_block) if str_clean_block(else_block, locals, str_bindings, loop_level))
+                || str_clean_expr(els, locals, str_bindings, loop_level)
         }
         ExprKind::Block(inner) => str_clean_block(inner, locals, str_bindings, loop_level),
         ExprKind::Match {
@@ -14314,10 +14408,15 @@ fn check_function_str_tail(
         else {
             return Ok(None);
         };
-        let ExprKind::Block(else_block) = else_expr.kind else {
-            return Ok(None);
+        let else_block = match else_expr.kind {
+            ExprKind::Block(block) => Some(block),
+            // `else if` nests the next `if` directly — it is itself a tail.
+            ExprKind::If { .. } => None,
+            _ => return Ok(None),
         };
-        if then.safety != sai_hir::Safety::Safe || else_block.safety != sai_hir::Safety::Safe {
+        if then.safety != sai_hir::Safety::Safe
+            || else_block.is_some_and(|b| b.safety != sai_hir::Safety::Safe)
+        {
             return Ok(None);
         }
         // Each branch walks its own copy of the `Str` group so bindings made
@@ -14340,22 +14439,43 @@ fn check_function_str_tail(
             return Ok(None);
         };
         diagnostics.append(&mut cond_diagnostics);
-        let mut else_bindings = str_bindings.clone();
-        let Some(mut else_diagnostics) = check_function_str_local_block(
-            owner,
-            return_ty,
-            else_block,
-            &mut else_bindings,
-            locals,
-            type_paths,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-            break_ctx,
-        )?
-        else {
-            return Ok(None);
+        let mut else_diagnostics = if let Some(else_block) = else_block {
+            let mut else_bindings = str_bindings.clone();
+            let Some(d) = check_function_str_local_block(
+                owner,
+                return_ty,
+                else_block,
+                &mut else_bindings,
+                locals,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                break_ctx,
+            )?
+            else {
+                return Ok(None);
+            };
+            d
+        } else {
+            let Some(d) = check_function_str_tail(
+                owner,
+                return_ty,
+                else_expr,
+                locals,
+                str_bindings,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                break_ctx,
+            )?
+            else {
+                return Ok(None);
+            };
+            d
         };
         diagnostics.append(&mut else_diagnostics);
         return Ok(Some(diagnostics));
@@ -51835,6 +51955,8 @@ property "shared"() {}
             "pub fn str_match_binding_guard() -> Str {\n    let s = \"a\"\n    match s { v if v == \"x\" => v, _ => \"z\" }\n}\n",
             "pub fn str_while_local_assert_eq() -> Str {\n    let s = \"a\"\n    while s == \"a\" { let t = \"b\"\n    assert t == \"b\", t\n    break }\n    s\n}\n",
             "pub fn str_if_scalar_eq() -> Str {\n    if 1 == 1 { \"a\" } else { \"b\" }\n}\n",
+            "pub fn str_if_str_cond() -> Str {\n    let s = \"a\"\n    if s { \"x\" } else { \"b\" }\n}\n",
+            "pub fn str_if_init_else_if() -> Str {\n    let s = if true { \"a\" } else if false { \"b\" } else { \"c\" }\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51850,11 +51972,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 97);
+        assert_eq!(resolved.owners().len(), 99);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
-            .chain(&resolved.owners()[20..21])
+            .chain(&resolved.owners()[19..21])
             .chain(&resolved.owners()[24..28])
             .chain(&resolved.owners()[30..32])
             .chain(&resolved.owners()[35..37])
@@ -51870,6 +51992,7 @@ property "shared"() {}
             .chain(&resolved.owners()[83..86])
             .chain(&resolved.owners()[87..90])
             .chain(&resolved.owners()[91..96])
+            .chain(&resolved.owners()[98..99])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -51883,7 +52006,7 @@ property "shared"() {}
                 "clean owner #{index} produced diagnostics"
             );
         }
-        for index in [4, 21, 37, 51, 61, 68, 76, 86, 90] {
+        for index in [4, 17, 21, 32, 37, 38, 51, 61, 68, 76, 86, 90, 97] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
                 .expect("Str mismatch body check succeeds");
@@ -51912,11 +52035,11 @@ property "shared"() {}
         // paths stay gated.
         for owner in resolved.owners()[5..8]
             .iter()
-            .chain(&resolved.owners()[17..20])
+            .chain(&resolved.owners()[18..19])
             .chain(&resolved.owners()[22..24])
             .chain(&resolved.owners()[28..30])
-            .chain(&resolved.owners()[32..35])
-            .chain(&resolved.owners()[38..41])
+            .chain(&resolved.owners()[33..35])
+            .chain(&resolved.owners()[39..41])
             .chain(&resolved.owners()[45..48])
             .chain(&resolved.owners()[52..53])
             .chain(&resolved.owners()[54..57])
