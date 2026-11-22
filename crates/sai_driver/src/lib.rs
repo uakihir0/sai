@@ -7640,6 +7640,7 @@ fn check_function_body_type(
                 inputs,
                 snapshot,
                 target_cfg,
+                false,
             )?
             else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -7793,6 +7794,7 @@ fn check_function_body_type(
                 inputs,
                 snapshot,
                 target_cfg,
+                false,
             )?
             else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -7997,6 +7999,7 @@ fn check_function_body_type(
                     inputs,
                     snapshot,
                     target_cfg,
+                    false,
                 )?
                 else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -13185,6 +13188,7 @@ fn check_function_str_local_block(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    break_ctx: bool,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let mut diagnostics = Vec::new();
     for stmt in block.stmts {
@@ -13201,7 +13205,58 @@ fn check_function_str_local_block(
         // Statement-position expressions admit only unit shapes: `if` with
         // unit branches, `loop`/`while` bodies, `break`/`continue`.
         if let sai_hir::expressions::StmtKind::Expr(expr) = stmt.kind {
-            if !str_stmt_expr_is_unit(expr, locals, str_bindings, type_paths, symbols, inputs) {
+            if break_ctx {
+                // Inside a `break` value the same statements reach the
+                // enclosing loop: `break v` contributes like loop level,
+                // valueless/labeled breaks dilute β with `()` and gate, and
+                // `continue` is neutral.
+                match expr.kind {
+                    ExprKind::Break {
+                        label: None,
+                        value: Some(value),
+                    } => {
+                        let Some((_, mut break_diagnostics)) = str_break_value(
+                            owner,
+                            return_ty,
+                            value,
+                            str_bindings,
+                            locals,
+                            type_paths,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        diagnostics.append(&mut break_diagnostics);
+                    }
+                    ExprKind::Break { .. } | ExprKind::Continue { label: Some(_) } => {
+                        return Ok(None);
+                    }
+                    ExprKind::Continue { label: None } => {}
+                    _ => {
+                        if !str_stmt_expr_is_unit(
+                            expr,
+                            locals,
+                            str_bindings,
+                            type_paths,
+                            symbols,
+                            inputs,
+                        ) {
+                            return Ok(None);
+                        }
+                    }
+                }
+            } else if !str_stmt_expr_is_unit(
+                expr,
+                locals,
+                str_bindings,
+                type_paths,
+                symbols,
+                inputs,
+            ) {
                 return Ok(None);
             }
             continue;
@@ -13263,6 +13318,7 @@ fn check_function_str_local_block(
                     inputs,
                     snapshot,
                     target_cfg,
+                    break_ctx,
                 )?
                 else {
                     return Ok(None);
@@ -13280,6 +13336,7 @@ fn check_function_str_local_block(
                     inputs,
                     snapshot,
                     target_cfg,
+                    break_ctx,
                 )?
                 else {
                     return Ok(None);
@@ -13351,6 +13408,7 @@ fn check_function_str_local_block(
                     inputs,
                     snapshot,
                     target_cfg,
+                    break_ctx,
                 )?
                 else {
                     return Ok(None);
@@ -13385,6 +13443,7 @@ fn check_function_str_local_block(
         inputs,
         snapshot,
         target_cfg,
+        break_ctx,
     )?
     else {
         return Ok(None);
@@ -13780,6 +13839,103 @@ fn str_loop_str_body(
 // `expected Str, found <lit>` diagnostic (the checker's β mismatch). Other
 // value shapes stay gated — `break` into nested `if`/`loop` bodies is out
 // of scope here.
+// Whether a `break` value expression yields a clean `Str`: a `Str` leaf at
+// a value position (branch tail, arm body, nested block tail) or a clean
+// `Str` break contribution at any depth inside it. `let` bindings declared
+// inside the value seed the scanned group the same way the real walk does.
+fn str_break_ctx_clean(
+    expr: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+) -> bool {
+    str_clean_expr(expr, locals, str_bindings, false)
+}
+
+fn str_clean_block(
+    block: &sai_hir::expressions::Block<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    loop_level: bool,
+) -> bool {
+    let mut bindings = str_bindings.clone();
+    let mut clean = false;
+    for stmt in block.stmts {
+        match stmt.kind {
+            sai_hir::expressions::StmtKind::Expr(expr) => {
+                clean |= str_clean_expr(expr, locals, &bindings, loop_level);
+            }
+            sai_hir::expressions::StmtKind::Let { pat, init, .. } => {
+                if let PatKind::Binding {
+                    mode: sai_hir::patterns::BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } = pat.kind
+                {
+                    if str_clean_expr(init, locals, &bindings, loop_level) {
+                        bindings.insert(binding);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    clean
+        || block
+            .tail
+            .is_some_and(|tail| str_clean_expr(tail, locals, &bindings, loop_level))
+}
+
+fn str_clean_expr(
+    expr: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    loop_level: bool,
+) -> bool {
+    match expr.kind {
+        ExprKind::Lit(Lit::Str(_)) => true,
+        ExprKind::If {
+            then,
+            els: Some(els),
+            ..
+        } => {
+            str_clean_block(then, locals, str_bindings, loop_level)
+                || matches!(els.kind, ExprKind::Block(else_block) if str_clean_block(else_block, locals, str_bindings, loop_level))
+        }
+        ExprKind::Block(inner) => str_clean_block(inner, locals, str_bindings, loop_level),
+        ExprKind::Match {
+            arms,
+            source: MatchSource::Normal,
+            ..
+        } => arms.iter().any(|arm| {
+            let mut bindings = str_bindings.clone();
+            if let PatKind::Binding {
+                mode: sai_hir::patterns::BindingMode::Value,
+                binding,
+                sub: None,
+                ..
+            } = arm.pat.kind
+            {
+                bindings.insert(binding);
+            }
+            str_clean_expr(arm.body, locals, &bindings, loop_level)
+        }),
+        ExprKind::Break {
+            label: None,
+            value: Some(value),
+        } => str_clean_expr(value, locals, str_bindings, loop_level),
+        // A `loop` in value position yields its own break contributions;
+        // at loop level the same loop is a statement whose breaks stay
+        // inside it, so it is not scanned.
+        ExprKind::Loop {
+            body,
+            label: None,
+            source: LoopSource::Loop,
+        } => !loop_level && str_clean_block(body, locals, str_bindings, true),
+        _ => str_binding_path(expr, locals, str_bindings),
+    }
+}
+
 fn str_break_value(
     owner: &HirOwner<'_>,
     return_ty: Ty<'_>,
@@ -13808,6 +13964,33 @@ fn str_break_value(
             return Ok(None);
         };
         return Ok(Some((false, value_diagnostics)));
+    }
+    // `break if`/`break match` values reuse the tail walker: a supported
+    // tail is a clean `Str` yield only when it produced no diagnostics.
+    if matches!(value.kind, ExprKind::If { .. } | ExprKind::Match { .. }) {
+        let Some(value_diagnostics) = check_function_str_tail(
+            owner,
+            return_ty,
+            value,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            true,
+        )?
+        else {
+            return Ok(None);
+        };
+        // The value is a clean `Str` yield only when a `Str` leaf or a
+        // clean `Str` break contribution exists inside it — an all-integer
+        // `if`/`match` produces no `Str` for a `let` initializer to seed.
+        return Ok(Some((
+            str_break_ctx_clean(value, locals, str_bindings),
+            value_diagnostics,
+        )));
     }
     Ok(None)
 }
@@ -13845,6 +14028,7 @@ fn check_function_str_match(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    break_ctx: bool,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if !str_binding_path(scrutinee, locals, str_bindings) {
         return Ok(None);
@@ -13951,6 +14135,7 @@ fn check_function_str_match(
             inputs,
             snapshot,
             target_cfg,
+            break_ctx,
         )?
         else {
             return Ok(None);
@@ -13985,6 +14170,7 @@ fn check_function_str_tail(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    break_ctx: bool,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if str_binding_path(tail, locals, str_bindings) {
         return Ok(Some(Vec::new()));
@@ -14020,6 +14206,7 @@ fn check_function_str_tail(
             inputs,
             snapshot,
             target_cfg,
+            break_ctx,
         )?
         else {
             return Ok(None);
@@ -14036,6 +14223,7 @@ fn check_function_str_tail(
             inputs,
             snapshot,
             target_cfg,
+            break_ctx,
         )?
         else {
             return Ok(None);
@@ -14061,6 +14249,7 @@ fn check_function_str_tail(
             inputs,
             snapshot,
             target_cfg,
+            break_ctx,
         );
     }
     // `loop { break <Str> }` tails yield `Str` from their break values;
@@ -14085,6 +14274,35 @@ fn check_function_str_tail(
             false,
         );
     }
+    if break_ctx {
+        // A `break`/`continue` tail inside a `break` value reaches the
+        // enclosing loop: `break v` contributes, the rest gate.
+        match tail.kind {
+            ExprKind::Break {
+                label: None,
+                value: Some(value),
+            } => {
+                let Some((_, break_diagnostics)) = str_break_value(
+                    owner,
+                    return_ty,
+                    value,
+                    str_bindings,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some(break_diagnostics));
+            }
+            ExprKind::Break { .. } | ExprKind::Continue { .. } => return Ok(None),
+            _ => {}
+        }
+    }
     // `match s { <Str literal or catch-all> => <Str expr> }` mirrors
     // `check_match_tail` via `check_function_str_match`.
     if let ExprKind::Match {
@@ -14105,6 +14323,7 @@ fn check_function_str_tail(
             inputs,
             snapshot,
             target_cfg,
+            break_ctx,
         );
     }
     // `return e` tails check `e` against the `Str` group — bare `return`
@@ -14121,6 +14340,7 @@ fn check_function_str_tail(
             inputs,
             snapshot,
             target_cfg,
+            break_ctx,
         );
     }
     if !matches!(tail.kind, ExprKind::Lit(Lit::Str(_))) && !is_direct_function_scalar_literal(tail)
@@ -51462,6 +51682,20 @@ property "shared"() {}
             "pub fn str_match_bool_guard() -> Str {\n    let s = \"a\"\n    match s { \"x\" if true => \"y\", _ => \"z\" }\n}\n",
             "pub fn str_match_guarded_catch() -> Str {\n    let s = \"a\"\n    match s { \"x\" => \"y\", _ if true => \"z\" }\n}\n",
             "pub fn str_match_expr_guard() -> Str {\n    let s = \"a\"\n    match s { \"x\" if s == \"x\" => \"y\", _ => \"z\" }\n}\n",
+            "pub fn str_loop_break_if() -> Str {\n    loop { break if true { \"a\" } else { \"b\" } }\n}\n",
+            "pub fn str_loop_break_match() -> Str {\n    let s = \"a\"\n    loop { break match s { \"x\" => \"y\", _ => \"z\" } }\n}\n",
+            "pub fn str_loop_break_match_init() -> Str {\n    let s = \"a\"\n    let m = loop { break match s { \"x\" => \"y\", _ => \"z\" } }\n    m\n}\n",
+            "pub fn str_loop_break_match_mixed() -> Str {\n    let s = \"a\"\n    let m = loop { break match s { \"x\" => 1, _ => \"z\" } }\n    m\n}\n",
+            "pub fn str_loop_break_if_init() -> Str {\n    let m = loop { break if true { \"a\" } else { \"b\" } }\n    m\n}\n",
+            "pub fn str_loop_break_if_stmts() -> Str {\n    loop { break if true { let t = \"x\"\n    t } else { \"b\" } }\n}\n",
+            "pub fn str_loop_break_if_break() -> Str {\n    loop { break if true { break \"a\" } else { \"b\" } }\n}\n",
+            "pub fn str_loop_break_if_diluted() -> Str {\n    loop { break if true { break\n    \"a\" } else { \"b\" } }\n}\n",
+            "pub fn str_loop_break_int_init_if() -> Str {\n    let n = loop { break if true { 1 } else { 2 } }\n    \"a\"\n}\n",
+            "pub fn str_loop_break_int_init_match() -> Str {\n    let s = \"a\"\n    let n = loop { break match s { \"x\" => 1, _ => 2 } }\n    \"a\"\n}\n",
+            "pub fn str_loop_break_contrib_init() -> Str {\n    let m = loop { break if true { break \"x\" } else { \"b\" } }\n    m\n}\n",
+            "pub fn str_loop_break_if_local_break() -> Str {\n    loop { break if true { let t = \"x\"\n    break t } else { \"b\" } }\n}\n",
+            "pub fn str_loop_break_inner_loop() -> Str {\n    let m = loop { break if true { loop { break \"x\" } } else { \"b\" } }\n    m\n}\n",
+            "pub fn str_loop_break_int_inner_loop() -> Str {\n    let n = loop { break if true { loop { break 1 } } else { \"b\" } }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51477,7 +51711,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 73);
+        assert_eq!(resolved.owners().len(), 87);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -51492,6 +51726,9 @@ property "shared"() {}
             .chain(&resolved.owners()[63..64])
             .chain(&resolved.owners()[66..68])
             .chain(&resolved.owners()[70..71])
+            .chain(&resolved.owners()[73..76])
+            .chain(&resolved.owners()[77..80])
+            .chain(&resolved.owners()[83..86])
         {
             assert!(matches!(
                 owner
@@ -51500,7 +51737,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [4, 21, 37, 51, 61, 68] {
+        for index in [4, 21, 37, 51, 61, 68, 76, 86] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
                 .expect("Str mismatch body check succeeds");
@@ -51539,7 +51776,8 @@ property "shared"() {}
             .chain(&resolved.owners()[54..57])
             .chain(&resolved.owners()[64..66])
             .chain(&resolved.owners()[69..70])
-            .chain(&resolved.owners()[72..])
+            .chain(&resolved.owners()[72..73])
+            .chain(&resolved.owners()[80..83])
         {
             assert!(matches!(
                 owner
