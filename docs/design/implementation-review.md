@@ -10031,3 +10031,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver 780 and `check_empty_source` 392 pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** The probe is shared with the initializer path, so `not`/comparison call-argument leaves keep their existing checks — only the `Path`/`Field` arm of `check_direct_call_logical` changes, and `Bool` literals still short-circuit to `Concrete(Bool)`.
 - **Remaining scope:** `not` tails over literal vars in nested positions, `Str` literal locals (needs a non-`PrimTy` local type), tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1081 (2026-11-22): literal variables in `not` call arguments and nested `not` tails
+
+- **Decision:** `apply_bool(not inferred)` and `if flag { not inferred } else { false }` diagnose `expected Bool, found I64` — verified supported through existing machinery; no checker or mirror change. `check_direct_call_logical_not`'s `Path` arm delegates to `check_logical_not`, which reaches the IR-1079 operand probe; the if-branch tail mirror admits `not` tails over preceding bindings, and the branch checker shares `check_logical_operand`.
+- **Reason:** Coverage record — the IR-1078/IR-1079 probes compose across positions without extra wiring, so the remaining-scope item closes as verification-only.
+- **Failure boundary and judgment:** None new — the same boundaries as IR-1079/IR-1080 apply.
+- **Review required:** None — test coverage only.
+- **Planned verification matrix:** Driver `primitive_body_type_results_infer_if_tails` gains `not_literal_var_branch_tail` (supported-with-`TypeMismatch`); `checks_multiple_annotated_locals_and_copies_in_source_order` gains `not_literal_var_call_argument` (supported-with-`TypeMismatch`).
+- **Verification:** Pinned Rust 1.99.1, driver 780 and `check_empty_source` 392 pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Confirmed `apply_bool(not inferred)` reports exactly one `TypeMismatch` — the nested `not` does not double-count because `check_logical_not` records once at the operand node.
+- **Remaining scope:** `Str` literal locals (needs a non-`PrimTy` local type), tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or (Tuple/Slice/Ctor/ImplicitMember need non-`PrimTy` types), move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).
