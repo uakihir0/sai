@@ -55965,6 +55965,10 @@ property "shared"() {}
             "pub fn nested_branch_tail(first: I32) -> I32 {\n",
             "    if first < 0 { (first + 1) * 2 } else { 0 }\n",
             "}\n",
+            "pub fn not_literal_var_branch_tail(flag: Bool) -> Bool {\n",
+            "    let inferred = 1\n",
+            "    if flag { not inferred } else { false }\n",
+            "}\n",
         )
         .to_string();
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -56120,6 +56124,7 @@ property "shared"() {}
             "negated_mismatch",
             "flat_negated_expression",
             "discarded_expression_mismatch",
+            "not_literal_var_branch_tail",
         ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
@@ -56481,6 +56486,10 @@ property "shared"() {}
             "pub fn logical_literal_var_call_argument(left: Bool) -> Bool {\n",
             "    let inferred = 1\n",
             "    apply_bool(inferred and left)\n",
+            "}\n",
+            "pub fn not_literal_var_call_argument() -> Bool {\n",
+            "    let inferred = 1\n",
+            "    apply_bool(not inferred)\n",
             "}\n",
             "pub fn logical_literal_path_and(right: Bool) -> Bool { apply_bool(false and right) }\n",
             "pub fn logical_path_literal_or(left: Bool) -> Bool { apply_bool(left or false) }\n",
@@ -58716,6 +58725,12 @@ property "shared"() {}
         let _logical_literal_var_call_argument = assert_supported(
             &database,
             "logical_literal_var_call_argument",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
+        // `not <litvar>` routes through the shared operand probe as well.
+        let _not_literal_var_call_argument = assert_supported(
+            &database,
+            "not_literal_var_call_argument",
             &[sai_diagnostics::Code::TypeMismatch],
         );
         let logical_literal_path_and = assert_supported(&database, "logical_literal_path_and", &[]);
