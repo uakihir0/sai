@@ -13196,7 +13196,10 @@ fn check_function_str_local_block(
         // optional `Str` literal message — other shapes stay gated.
         if let sai_hir::expressions::StmtKind::Assert { cond, msg, .. } = stmt.kind {
             let cond_ok = matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)));
-            let msg_ok = msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))));
+            let msg_ok = msg.is_none_or(|msg| {
+                matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))
+                    || str_binding_path(msg, locals, str_bindings)
+            });
             if !cond_ok || !msg_ok {
                 return Ok(None);
             }
@@ -51696,6 +51699,7 @@ property "shared"() {}
             "pub fn str_loop_break_if_local_break() -> Str {\n    loop { break if true { let t = \"x\"\n    break t } else { \"b\" } }\n}\n",
             "pub fn str_loop_break_inner_loop() -> Str {\n    let m = loop { break if true { loop { break \"x\" } } else { \"b\" } }\n    m\n}\n",
             "pub fn str_loop_break_int_inner_loop() -> Str {\n    let n = loop { break if true { loop { break 1 } } else { \"b\" } }\n    \"a\"\n}\n",
+            "pub fn str_assert_local_msg() -> Str {\n    let s = \"a\"\n    assert true, s\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51711,7 +51715,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 87);
+        assert_eq!(resolved.owners().len(), 88);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -51729,6 +51733,7 @@ property "shared"() {}
             .chain(&resolved.owners()[73..76])
             .chain(&resolved.owners()[77..80])
             .chain(&resolved.owners()[83..86])
+            .chain(&resolved.owners()[87..])
         {
             assert!(matches!(
                 owner
