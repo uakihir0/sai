@@ -10119,3 +10119,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** The assert arm runs before the `Let` destructure, so no statement can masquerade as both; message `None` and `Lit::Str` are the only admitted forms.
 - **Remaining scope:** `match` tails for `Str` (needs a matchable scrutinee), `Str` locals from non-literal/non-group initializers (needs `Str` in `LocalType`), `loop`/`while`/`for` in `Str` bodies, tuple/index tails, `if let`/`while let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).
+
+### IR-1089 (2026-11-22): `if` expressions as `Str` local initializers
+
+- **Decision:** `let s = if <literal Bool> { <Str block> } else { <Str block> }` in `-> Str` bodies runs the shared `check_function_str_local_block` on each branch with a cloned binding set; branch diagnostics (e.g. a non-`Str` literal arm) accumulate and the binding still joins the `Str` group.
+- **Reason:** `let x = if` is the natural initializer counterpart of the `if` tail admitted in IR-1085/1086; the only new machinery is accumulating statement-position diagnostics instead of treating every statement as diag-free.
+- **Failure boundary and judgment:** Non-literal conditions, missing `else`, `else if` chains, unsafe branch blocks, and non-`Str` initializer forms (`let s = call()`, `let s = self.f`) still gate.
+- **Review required:** The clone-per-branch scoping is load-bearing — a branch-local binding must not satisfy the outer `s` or the tail.
+- **Planned verification matrix:** Driver gains `str_if_init`, `str_if_init_local` (supported-clean), `str_if_init_mismatch` (supported with one `TypeMismatch`), `str_if_init_int_cond`, `str_if_init_no_else` (gated); CLI adds `str_if_init` success case.
+- **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** The binding `s` joins the group even when a branch produced a `TypeMismatch` — mirrors the general checker, which still records the binding's declared type.
+- **Remaining scope:** `match` tails/initializers for `Str` (needs a matchable scrutinee), `Str` locals from non-literal/non-group/non-if initializers (needs `Str` in `LocalType`), `loop`/`while`/`for` in `Str` bodies, tuple/index tails, `if let`/`while let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).
