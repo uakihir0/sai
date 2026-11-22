@@ -13134,6 +13134,9 @@ fn str_binding_path(
     let ExprKind::Path(path) = expression.kind else {
         return false;
     };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return false;
+    }
     matches!(
         locals.paths.get(&path.hir_id),
         Some(PathRes {
@@ -50410,6 +50413,8 @@ property "shared"() {}
             "pub fn non_str_annotated_local() -> Str {\n    let value: I32 = \"text\"\n    value\n}\n",
             "pub fn str_local_var_binding() -> Str {\n    var value = \"text\"\n    value\n}\n",
             "pub fn str_local_param_tail(value: Str) -> Str {\n    let copy = \"text\"\n    value\n}\n",
+            "pub fn str_local_generic_tail() -> Str {\n    let value = \"text\"\n    value<I32>\n}\n",
+            "pub fn str_local_generic_init() -> Str {\n    let value = \"text\"\n    let copy = value<I32>\n    copy\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -50425,7 +50430,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 9);
+        assert_eq!(resolved.owners().len(), 11);
         for owner in &resolved.owners()[..4] {
             assert!(matches!(
                 owner
