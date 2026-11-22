@@ -13568,7 +13568,15 @@ fn str_loop_family(
         return Ok(None);
     };
     let mut contributions = Vec::new();
-    str_stmt_loop_break_families(body, locals, str_bindings, &mut contributions);
+    str_stmt_loop_break_families(
+        body,
+        locals,
+        str_bindings,
+        type_paths,
+        symbols,
+        inputs,
+        &mut contributions,
+    );
     // A `break` whose value classifies carries its family; an unclassed
     // value gates — it could produce a family the bounded walk missed.
     if contributions
@@ -14090,6 +14098,12 @@ fn check_function_str_local_block(
         }
         // `let s = if <lit bool> { <Str block> } else { <Str block> }` runs
         // the shared block walk on each branch with a cloned binding set.
+        // These arms seed `Str` — a non-`Str` pin the family walk refused
+        // (`let x: I8 = loop { .. }`, `let x: I8 = match ..`) stays gated
+        // rather than mis-binding as `Str`.
+        if pinned.is_some_and(|pin| pin != "`Str`") {
+            return Ok(None);
+        }
         match init.kind {
             ExprKind::Lit(Lit::Str(_)) => {}
             ExprKind::If {
@@ -14500,7 +14514,15 @@ fn str_stmt_expr_unit(
                 // differing contribution is a mismatch, even in a
                 // discarded statement-position loop.
                 let mut contributions = Vec::new();
-                str_stmt_loop_break_families(body, locals, str_bindings, &mut contributions);
+                str_stmt_loop_break_families(
+                    body,
+                    locals,
+                    str_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    &mut contributions,
+                );
                 let mut classed = contributions
                     .iter()
                     .filter_map(|contribution| contribution.0.map(|f| (f, contribution.2)))
@@ -14696,6 +14718,9 @@ fn str_stmt_loop_break_families<'h>(
     block: &sai_hir::expressions::Block<'h>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
     out: &mut Vec<(Option<&'static str>, Option<&'h HirExpr<'h>>, sai_hir::Span)>,
 ) {
     // `let` bindings declared in this block scope the following
@@ -14706,10 +14731,26 @@ fn str_stmt_loop_break_families<'h>(
         match stmt.kind {
             sai_hir::expressions::StmtKind::Let {
                 pat,
-                ty: None,
+                ty,
                 init,
                 els: None,
             } => {
+                // An annotation pins the seeded family — `let x: I8 = 1`
+                // seeds `I8`, so `break x` carries `I8` even though the
+                // literal would default to `I64`. An annotation the
+                // bounded walk cannot resolve seeds nothing.
+                let seeded = match ty {
+                    Some(ty) => {
+                        match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
+                            Some(FunctionDirectType::Str) => Some("`Str`"),
+                            Some(FunctionDirectType::Primitive(primitive)) => {
+                                str_prim_family_name(primitive)
+                            }
+                            _ => None,
+                        }
+                    }
+                    None => str_pure_init_family(init, locals, &local, type_paths, symbols, inputs),
+                };
                 if let (
                     Some(family),
                     PatKind::Binding {
@@ -14718,19 +14759,19 @@ fn str_stmt_loop_break_families<'h>(
                         sub: None,
                         ..
                     },
-                ) = (str_pure_init_family(init, locals, &local), pat.kind)
+                ) = (seeded, pat.kind)
                 {
                     local.insert(binding, family);
                 }
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
-                str_stmt_break_families_expr(expr, locals, &local, out)
+                str_stmt_break_families_expr(expr, locals, &local, type_paths, symbols, inputs, out)
             }
             _ => {}
         }
     }
     if let Some(tail) = block.tail {
-        str_stmt_break_families_expr(tail, locals, &local, out);
+        str_stmt_break_families_expr(tail, locals, &local, type_paths, symbols, inputs, out);
     }
 }
 
@@ -14741,6 +14782,9 @@ fn str_pure_init_family(
     init: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
 ) -> Option<&'static str> {
     match init.kind {
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
@@ -14750,11 +14794,14 @@ fn str_pure_init_family(
             els: Some(els),
             ..
         } => {
-            let then_family = str_pure_block_family(then, locals, str_bindings)?;
+            let then_family =
+                str_pure_block_family(then, locals, str_bindings, type_paths, symbols, inputs)?;
             let else_family = match els.kind {
-                ExprKind::Block(block) => str_pure_block_family(block, locals, str_bindings),
+                ExprKind::Block(block) => {
+                    str_pure_block_family(block, locals, str_bindings, type_paths, symbols, inputs)
+                }
                 ExprKind::If { .. } | ExprKind::Loop { .. } => {
-                    str_pure_init_family(els, locals, str_bindings)
+                    str_pure_init_family(els, locals, str_bindings, type_paths, symbols, inputs)
                 }
                 _ => None,
             }?;
@@ -14765,14 +14812,24 @@ fn str_pure_init_family(
                 then_family
             })
         }
-        ExprKind::Block(block) => str_pure_block_family(block, locals, str_bindings),
+        ExprKind::Block(block) => {
+            str_pure_block_family(block, locals, str_bindings, type_paths, symbols, inputs)
+        }
         ExprKind::Loop {
             body,
             source: LoopSource::Loop,
             ..
         } => {
             let mut contributions = Vec::new();
-            str_stmt_loop_break_families(body, locals, str_bindings, &mut contributions);
+            str_stmt_loop_break_families(
+                body,
+                locals,
+                str_bindings,
+                type_paths,
+                symbols,
+                inputs,
+                &mut contributions,
+            );
             let mut families = contributions
                 .iter()
                 .filter_map(|contribution| contribution.0)
@@ -14795,6 +14852,9 @@ fn str_pure_block_family(
     block: &sai_hir::expressions::Block<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
 ) -> Option<&'static str> {
     let mut inner = str_bindings.clone();
     for stmt in block.stmts {
@@ -14807,7 +14867,7 @@ fn str_pure_block_family(
         else {
             return None;
         };
-        let family = str_pure_init_family(init, locals, &inner)?;
+        let family = str_pure_init_family(init, locals, &inner, type_paths, symbols, inputs)?;
         let PatKind::Binding {
             mode: sai_hir::patterns::BindingMode::Value,
             binding,
@@ -14819,13 +14879,16 @@ fn str_pure_block_family(
         };
         inner.insert(binding, family);
     }
-    str_pure_init_family(block.tail?, locals, &inner)
+    str_pure_init_family(block.tail?, locals, &inner, type_paths, symbols, inputs)
 }
 
 fn str_stmt_break_families_expr<'h>(
     expr: &'h HirExpr<'h>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
     out: &mut Vec<(Option<&'static str>, Option<&'h HirExpr<'h>>, sai_hir::Span)>,
 ) {
     match expr.kind {
@@ -14837,26 +14900,70 @@ fn str_stmt_break_families_expr<'h>(
             ));
         }
         ExprKind::If { then, els, .. } => {
-            str_stmt_loop_break_families(then, locals, str_bindings, out);
+            str_stmt_loop_break_families(
+                then,
+                locals,
+                str_bindings,
+                type_paths,
+                symbols,
+                inputs,
+                out,
+            );
             if let Some(els) = els {
                 match els.kind {
-                    ExprKind::Block(else_block) => {
-                        str_stmt_loop_break_families(else_block, locals, str_bindings, out)
-                    }
-                    ExprKind::If { .. } => {
-                        str_stmt_break_families_expr(els, locals, str_bindings, out)
-                    }
+                    ExprKind::Block(else_block) => str_stmt_loop_break_families(
+                        else_block,
+                        locals,
+                        str_bindings,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        out,
+                    ),
+                    ExprKind::If { .. } => str_stmt_break_families_expr(
+                        els,
+                        locals,
+                        str_bindings,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        out,
+                    ),
                     _ => {}
                 }
             }
         }
         ExprKind::Return(Some(value)) => {
-            str_stmt_break_families_expr(value, locals, str_bindings, out);
+            str_stmt_break_families_expr(
+                value,
+                locals,
+                str_bindings,
+                type_paths,
+                symbols,
+                inputs,
+                out,
+            );
         }
-        ExprKind::Block(inner) => str_stmt_loop_break_families(inner, locals, str_bindings, out),
+        ExprKind::Block(inner) => str_stmt_loop_break_families(
+            inner,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            out,
+        ),
         ExprKind::Match { arms, .. } => {
             for arm in arms {
-                str_stmt_break_families_expr(arm.body, locals, str_bindings, out);
+                str_stmt_break_families_expr(
+                    arm.body,
+                    locals,
+                    str_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    out,
+                );
             }
         }
         _ => {}
