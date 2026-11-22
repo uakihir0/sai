@@ -13841,13 +13841,56 @@ fn str_loop_str_body(
 // of scope here.
 // Whether a `break` value expression yields a clean `Str`: a `Str` leaf at
 // a value position (branch tail, arm body, nested block tail) or a clean
-// `Str` break contribution at any depth inside it. Nested `loop`/`while`
-// bodies are not scanned — their breaks yield the nested loop, not the
-// enclosing one.
+// `Str` break contribution at any depth inside it. `let` bindings declared
+// inside the value seed the scanned group the same way the real walk does.
 fn str_break_ctx_clean(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+) -> bool {
+    str_clean_expr(expr, locals, str_bindings, false)
+}
+
+fn str_clean_block(
+    block: &sai_hir::expressions::Block<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    loop_level: bool,
+) -> bool {
+    let mut bindings = str_bindings.clone();
+    let mut clean = false;
+    for stmt in block.stmts {
+        match stmt.kind {
+            sai_hir::expressions::StmtKind::Expr(expr) => {
+                clean |= str_clean_expr(expr, locals, &bindings, loop_level);
+            }
+            sai_hir::expressions::StmtKind::Let { pat, init, .. } => {
+                if let PatKind::Binding {
+                    mode: sai_hir::patterns::BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } = pat.kind
+                {
+                    if str_clean_expr(init, locals, &bindings, loop_level) {
+                        bindings.insert(binding);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    clean
+        || block
+            .tail
+            .is_some_and(|tail| str_clean_expr(tail, locals, &bindings, loop_level))
+}
+
+fn str_clean_expr(
+    expr: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    loop_level: bool,
 ) -> bool {
     match expr.kind {
         ExprKind::Lit(Lit::Str(_)) => true,
@@ -13856,10 +13899,10 @@ fn str_break_ctx_clean(
             els: Some(els),
             ..
         } => {
-            str_break_ctx_clean_block(then, locals, str_bindings)
-                || matches!(els.kind, ExprKind::Block(else_block) if str_break_ctx_clean_block(else_block, locals, str_bindings))
+            str_clean_block(then, locals, str_bindings, loop_level)
+                || matches!(els.kind, ExprKind::Block(else_block) if str_clean_block(else_block, locals, str_bindings, loop_level))
         }
-        ExprKind::Block(inner) => str_break_ctx_clean_block(inner, locals, str_bindings),
+        ExprKind::Block(inner) => str_clean_block(inner, locals, str_bindings, loop_level),
         ExprKind::Match {
             arms,
             source: MatchSource::Normal,
@@ -13875,29 +13918,22 @@ fn str_break_ctx_clean(
             {
                 bindings.insert(binding);
             }
-            str_break_ctx_clean(arm.body, locals, &bindings)
+            str_clean_expr(arm.body, locals, &bindings, loop_level)
         }),
         ExprKind::Break {
             label: None,
             value: Some(value),
-        } => str_break_ctx_clean(value, locals, str_bindings),
+        } => str_clean_expr(value, locals, str_bindings, loop_level),
+        // A `loop` in value position yields its own break contributions;
+        // at loop level the same loop is a statement whose breaks stay
+        // inside it, so it is not scanned.
+        ExprKind::Loop {
+            body,
+            label: None,
+            source: LoopSource::Loop,
+        } => !loop_level && str_clean_block(body, locals, str_bindings, true),
         _ => str_binding_path(expr, locals, str_bindings),
     }
-}
-
-fn str_break_ctx_clean_block(
-    block: &sai_hir::expressions::Block<'_>,
-    locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
-) -> bool {
-    block.stmts.iter().any(|stmt| match stmt.kind {
-        sai_hir::expressions::StmtKind::Expr(expr) => {
-            str_break_ctx_clean(expr, locals, str_bindings)
-        }
-        _ => false,
-    }) || block
-        .tail
-        .is_some_and(|tail| str_break_ctx_clean(tail, locals, str_bindings))
 }
 
 fn str_break_value(
@@ -51657,6 +51693,9 @@ property "shared"() {}
             "pub fn str_loop_break_int_init_if() -> Str {\n    let n = loop { break if true { 1 } else { 2 } }\n    \"a\"\n}\n",
             "pub fn str_loop_break_int_init_match() -> Str {\n    let s = \"a\"\n    let n = loop { break match s { \"x\" => 1, _ => 2 } }\n    \"a\"\n}\n",
             "pub fn str_loop_break_contrib_init() -> Str {\n    let m = loop { break if true { break \"x\" } else { \"b\" } }\n    m\n}\n",
+            "pub fn str_loop_break_if_local_break() -> Str {\n    loop { break if true { let t = \"x\"\n    break t } else { \"b\" } }\n}\n",
+            "pub fn str_loop_break_inner_loop() -> Str {\n    let m = loop { break if true { loop { break \"x\" } } else { \"b\" } }\n    m\n}\n",
+            "pub fn str_loop_break_int_inner_loop() -> Str {\n    let n = loop { break if true { loop { break 1 } } else { \"b\" } }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51672,7 +51711,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 84);
+        assert_eq!(resolved.owners().len(), 87);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -51689,7 +51728,7 @@ property "shared"() {}
             .chain(&resolved.owners()[70..71])
             .chain(&resolved.owners()[73..76])
             .chain(&resolved.owners()[77..80])
-            .chain(&resolved.owners()[83..])
+            .chain(&resolved.owners()[83..86])
         {
             assert!(matches!(
                 owner
@@ -51698,7 +51737,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [4, 21, 37, 51, 61, 68, 76] {
+        for index in [4, 21, 37, 51, 61, 68, 76, 86] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
                 .expect("Str mismatch body check succeeds");
