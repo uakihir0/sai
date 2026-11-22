@@ -13578,16 +13578,39 @@ fn str_loop_family(
         &mut contributions,
     );
     // A `break` whose value classifies carries its family; an unclassed
-    // value gates — it could produce a family the bounded walk missed.
-    if contributions
-        .iter()
-        .any(|contribution| contribution.0.is_none())
-    {
-        return Ok(None);
+    // value gets one pass through the expression walk (`break if`/nested
+    // block values). Its diagnostics stay with the statement walk —
+    // re-emitting them here would double-report. A value that still
+    // cannot classify gates — it could produce a family the walk missed.
+    let mut resolved = Vec::with_capacity(contributions.len());
+    for (contribution, value, span) in contributions {
+        if let Some(family) = contribution {
+            resolved.push((family, span));
+            continue;
+        }
+        let evaluated = match value {
+            Some(value) => str_expr_family(
+                owner,
+                return_ty,
+                value,
+                locals,
+                str_bindings,
+                None,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?,
+            None => None,
+        };
+        match evaluated {
+            Some((family, _diagnostics)) => resolved.push((family, span)),
+            None => return Ok(None),
+        }
     }
     let mut family: Option<&'static str> = None;
-    for (contribution, _value, span) in contributions {
-        let contribution = contribution.expect("unclassed contributions gate above");
+    for (contribution, span) in resolved {
         if contribution == "`!`" {
             continue;
         }
@@ -53708,6 +53731,9 @@ property "shared"() {}
             "pub fn str_ann_i8_if_init() -> Str {\n    let x: I8 = if true { 1 } else { 2 }\n    \"a\"\n}\n",
             "pub fn str_ann_i8_if_init_oob() -> Str {\n    let x: I8 = if true { 200 } else { 2 }\n    \"a\"\n}\n",
             "pub fn str_ann_i8_loop_init() -> Str {\n    let x: I8 = loop { break }\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_loop_break_str() -> Str {\n    let x: I8 = loop { break \"a\" }\n    \"a\"\n}\n",
+            "pub fn str_loop_return_if_ann_break() -> Str {\n    loop {\n        return if true {\n            let x: I8 = 1\n            break x\n        } else {\n            break \"a\"\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_diverging_local_str_copy() -> Str {\n    let n = loop {}\n    let s: Str = n\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -53723,7 +53749,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 143);
+        assert_eq!(resolved.owners().len(), 146);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -53757,6 +53783,7 @@ property "shared"() {}
             .chain(&resolved.owners()[131..135])
             .chain(&resolved.owners()[137..138])
             .chain(&resolved.owners()[140..141])
+            .chain(&resolved.owners()[145..146])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -53805,6 +53832,7 @@ property "shared"() {}
             (138, sai_diagnostics::Code::TypeMismatch),
             (139, sai_diagnostics::Code::LiteralOutOfRange),
             (141, sai_diagnostics::Code::LiteralOutOfRange),
+            (144, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -53871,7 +53899,7 @@ property "shared"() {}
             .chain(&resolved.owners()[64..66])
             .chain(&resolved.owners()[69..70])
             .chain(&resolved.owners()[81..83])
-            .chain(&resolved.owners()[142..143])
+            .chain(&resolved.owners()[142..144])
         {
             assert!(matches!(
                 owner
