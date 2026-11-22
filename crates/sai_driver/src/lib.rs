@@ -13812,6 +13812,20 @@ fn str_break_value(
     Ok(None)
 }
 
+// The `<lit>` name for a `expected Str, found <lit>` pattern diagnostic —
+// `ByteStr` and `Str` have no `Str`-scrutinee name (Str matches; ByteStr
+// gates).
+fn str_pattern_literal_name(literal: Lit<'_>) -> Option<&'static str> {
+    match literal {
+        Lit::Int { .. } => Some("an integer literal"),
+        Lit::Float { .. } => Some("a floating-point literal"),
+        Lit::Bool(_) => Some("a Bool literal"),
+        Lit::Byte(_) => Some("a byte literal"),
+        Lit::Char(_) => Some("a character literal"),
+        _ => None,
+    }
+}
+
 // A `match` over a `Str` group path mirrors `check_match_tail`: `Str`
 // literal patterns match, wild/binding patterns are the catch-all (a
 // binding seeds the arm's group), arms after a catch-all diagnose
@@ -13838,9 +13852,15 @@ fn check_function_str_match(
     let mut diagnostics = Vec::new();
     let mut catch_all = false;
     for arm in arms {
-        if arm.guard.is_some() {
-            return Ok(None);
+        // Mirrors `check_match_arm_pattern`: a guarded arm may fail its
+        // guard, so it never counts as the catch-all. The leaf subset
+        // admits only `Lit::Bool` guards.
+        if let Some(guard) = arm.guard {
+            if !matches!(guard.kind, ExprKind::Lit(Lit::Bool(_))) {
+                return Ok(None);
+            }
         }
+        let guarded = arm.guard.is_some();
         let mut arm_bindings = str_bindings.clone();
         if catch_all {
             diagnostics.push(const_literal_diagnostic(
@@ -13865,13 +13885,8 @@ fn check_function_str_match(
             match arm.pat.kind {
                 PatKind::Lit(Lit::Str(_)) => {}
                 PatKind::Lit(literal) => {
-                    let found = match literal {
-                        Lit::Int { .. } => "an integer literal",
-                        Lit::Float { .. } => "a floating-point literal",
-                        Lit::Bool(_) => "a Bool literal",
-                        Lit::Byte(_) => "a byte literal",
-                        Lit::Char(_) => "a character literal",
-                        _ => return Ok(None),
+                    let Some(found) = str_pattern_literal_name(literal) else {
+                        return Ok(None);
                     };
                     diagnostics.push(const_literal_diagnostic(
                         owner.id,
@@ -13883,8 +13898,35 @@ fn check_function_str_match(
                         "type mismatch",
                     )?);
                 }
+                // `l1 | l2 | …` alternatives must all be literals —
+                // mirrors `check_match_arm_pattern`.
+                PatKind::Or(alternatives) => {
+                    if alternatives.is_empty() {
+                        return Ok(None);
+                    }
+                    for alternative in alternatives {
+                        match alternative.kind {
+                            PatKind::Lit(Lit::Str(_)) => {}
+                            PatKind::Lit(literal) => {
+                                let Some(found) = str_pattern_literal_name(literal) else {
+                                    return Ok(None);
+                                };
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    arm.pat.span,
+                                    sai_diagnostics::Code::TypeMismatch,
+                                    format!("expected `Str`, found {found}"),
+                                    "type mismatch",
+                                )?);
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                }
                 PatKind::Wild => {
-                    catch_all = true;
+                    catch_all = !guarded;
                 }
                 PatKind::Binding {
                     mode: sai_hir::patterns::BindingMode::Value,
@@ -13892,7 +13934,7 @@ fn check_function_str_match(
                     sub: None,
                     ..
                 } => {
-                    catch_all = true;
+                    catch_all = !guarded;
                     arm_bindings.insert(binding);
                 }
                 _ => return Ok(None),
@@ -51414,6 +51456,12 @@ property "shared"() {}
             "pub fn str_match_int_scrutinee(n: I32) -> Str {\n    match n { _ => \"a\" }\n}\n",
             "pub fn str_match_int_init() -> Str {\n    let s = \"a\"\n    let m = match s { \"x\" => 1, _ => 2 }\n    \"a\"\n}\n",
             "pub fn str_match_binding_init() -> Str {\n    let s = \"a\"\n    let m = match s { other => other }\n    m\n}\n",
+            "pub fn str_match_or() -> Str {\n    let s = \"a\"\n    match s { \"x\" | \"w\" => \"y\", _ => \"z\" }\n}\n",
+            "pub fn str_match_or_mixed() -> Str {\n    let s = \"a\"\n    match s { \"x\" | 1 => \"y\", _ => \"z\" }\n}\n",
+            "pub fn str_match_or_binding() -> Str {\n    let s = \"a\"\n    match s { \"x\" | other => \"y\", _ => \"z\" }\n}\n",
+            "pub fn str_match_bool_guard() -> Str {\n    let s = \"a\"\n    match s { \"x\" if true => \"y\", _ => \"z\" }\n}\n",
+            "pub fn str_match_guarded_catch() -> Str {\n    let s = \"a\"\n    match s { \"x\" => \"y\", _ if true => \"z\" }\n}\n",
+            "pub fn str_match_expr_guard() -> Str {\n    let s = \"a\"\n    match s { \"x\" if s == \"x\" => \"y\", _ => \"z\" }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51429,7 +51477,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 67);
+        assert_eq!(resolved.owners().len(), 73);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -51441,7 +51489,9 @@ property "shared"() {}
             .chain(&resolved.owners()[48..51])
             .chain(&resolved.owners()[53..54])
             .chain(&resolved.owners()[57..60])
-            .chain(&resolved.owners()[66..])
+            .chain(&resolved.owners()[63..64])
+            .chain(&resolved.owners()[66..68])
+            .chain(&resolved.owners()[70..71])
         {
             assert!(matches!(
                 owner
@@ -51450,7 +51500,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [4, 21, 37, 51, 61] {
+        for index in [4, 21, 37, 51, 61, 68] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
                 .expect("Str mismatch body check succeeds");
@@ -51463,6 +51513,7 @@ property "shared"() {}
         for (index, code) in [
             (60, sai_diagnostics::Code::NonExhaustiveMatch),
             (62, sai_diagnostics::Code::UnreachablePattern),
+            (71, sai_diagnostics::Code::NonExhaustiveMatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -51486,7 +51537,9 @@ property "shared"() {}
             .chain(&resolved.owners()[45..48])
             .chain(&resolved.owners()[52..53])
             .chain(&resolved.owners()[54..57])
-            .chain(&resolved.owners()[63..66])
+            .chain(&resolved.owners()[64..66])
+            .chain(&resolved.owners()[69..70])
+            .chain(&resolved.owners()[72..])
         {
             assert!(matches!(
                 owner

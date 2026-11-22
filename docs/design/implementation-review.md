@@ -10163,3 +10163,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** `match` over an `I32` parameter gates even where the checker would admit it — the mirror cannot model a non-`Str` scrutinee binding; recorded divergence. `str_match_int_init` (all-integer arm bodies) gates via the clean-yield rule rather than binding a non-`Str` local.
 - **Remaining scope:** `Str` locals from non-literal/non-group initializers (needs `Str` in `LocalType`), `if let`/`while let`/`for`, match guards and range/or patterns for `Str`, tuple/index tails, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).
+
+### IR-1093 (2026-11-22): `Str` match or-patterns and `Lit::Bool` guards
+
+- **Decision:** `check_function_str_match` admits `PatKind::Or` arms whose alternatives are all literals (each checked like a literal pattern — `Str` literals match, other literal kinds diagnose `expected Str, found <lit>`, non-literal alternatives gate) and `Lit::Bool` arm guards. A guarded arm never counts as the catch-all, mirroring `check_match_arm_pattern`'s `*catch_all = arm.guard.is_none()` for wild/binding patterns.
+- **Reason:** Both forms are admitted by `check_match_arm_pattern` for primitive scrutinees; the leaf subset only narrows guards to `Lit::Bool` (the Str mirror cannot check condition expressions) and or-patterns to literal alternatives.
+- **Failure boundary and judgment:** Non-`Lit::Bool` guards and non-literal or-pattern alternatives gate; a guarded wildcard/binding arm leaves the match non-exhaustive (`str_match_guarded_catch` diagnoses `NonExhaustiveMatch`). Range patterns stay gated — `Str` has no range semantics.
+- **Review required:** The `catch_all` flag now depends on `guarded`; verified by `str_match_bool_guard` (unguarded `_` still covers) and `str_match_guarded_catch`.
+- **Planned verification matrix:** Driver gains `str_match_or`, `str_match_guard`, `str_match_bool_guard` (supported-clean), `str_match_or_mixed` (one `TypeMismatch`), `str_match_guarded_catch` (one `NonExhaustiveMatch`), `str_match_or_binding`, `str_match_expr_guard` (gated); CLI adds `str_match_or`.
+- **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** `str_match_guard` (`"x" if true`) flipped from gated to supported-clean when `Lit::Bool` guards were admitted — the fixture was reclassified rather than the rule narrowed, matching `check_match_arm_pattern` semantics.
+- **Remaining scope:** `Str` in `LocalType`, `if let`/`while let`/`for`, range patterns and full guard expressions for `Str` matches, tuple/index tails, other match patterns, move/borrow, lowering/evaluation, multi-owner CLI coverage (Stage 0).
