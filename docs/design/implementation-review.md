@@ -10086,3 +10086,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, driver 781 and `check_empty_source` 392 pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** `str_if_local_branch`'s `let v = "x"; if true { v } else { "y" }` resolves `v` inside the branch because `str_binding_path` consults the same function-level set — a binding declared after the `if` would still fail resolution at HIR level, so no forward-reference leak exists.
 - **Remaining scope:** `match` tails for `Str`, `Str` locals from non-literal/non-group initializers (needs `Str` in `LocalType`), tuple/index tails, `for`/`while let`/`if let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).
+
+### IR-1086 (2026-11-22): `Str` locals inside `if` branch blocks
+
+- **Decision:** `if` branch blocks of `-> Str` bodies run the full `check_function_str_local_block` walk instead of the stmt-free tail check — `if true { let v = "a"\n v } else { "b" }` is supported. Each branch walks its own clone of the `Str` set, so bindings made inside a branch cannot leak into the sibling branch or the outer tail.
+- **Reason:** Branches are just blocks; delegating them to the same walk as the outer block keeps one admission rule and removes the `stmts.is_empty()` gate that only existed because there was no per-branch scoping.
+- **Failure boundary and judgment:** Non-`Str` statements inside branches (`let v = 1`, `var`, calls), non-literal conditions, missing `else`, and `else if` chains still gate — the branch walk inherits every boundary of the outer walk.
+- **Review required:** None — the new code calls the already-reviewed helper with a cloned set; no new checking rules.
+- **Planned verification matrix:** Driver `function_body_type_check_accepts_str_literal_locals` — `str_if_stmt_branch` moves to supported-clean; CLI adds `str_if_stmt_branch` to `public_zero_parameter_direct_scalar_function_emits_check_result`.
+- **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Cloning the set per branch means `let v` declared in the `then` arm is invisible to the `else` arm and to code after the `if` — matches block scoping; a `Str` tail after the `if` still sees only outer bindings.
+- **Remaining scope:** `match` tails for `Str` (needs a matchable scrutinee — out of the `Str`-only local lattice), `Str` locals from non-literal/non-group initializers (needs `Str` in `LocalType`), tuple/index tails, `for`/`while let`/`if let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).
