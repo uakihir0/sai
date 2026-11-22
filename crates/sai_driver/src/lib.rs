@@ -13198,6 +13198,14 @@ fn check_function_str_local_block(
             }
             continue;
         }
+        // Statement-position expressions admit only unit shapes: `if` with
+        // unit branches, `loop`/`while` bodies, `break`/`continue`.
+        if let sai_hir::expressions::StmtKind::Expr(expr) = stmt.kind {
+            if !str_stmt_expr_is_unit(expr, locals, str_bindings, type_paths, symbols, inputs) {
+                return Ok(None);
+            }
+            continue;
+        }
         let sai_hir::expressions::StmtKind::Let {
             pat,
             ty,
@@ -13312,6 +13320,131 @@ fn check_function_str_local_block(
     };
     diagnostics.append(&mut tail_diagnostics);
     Ok(Some(diagnostics))
+}
+
+// Statement-position expressions inside a `Str` body admit only unit-shaped
+// control flow: literal-`Bool` `if` with unit branches, `loop`/`while`
+// bodies, and `break`/`continue` exits. Value-position expressions
+// (assignments, calls, returns) stay gated — they discard or produce values
+// the bounded `Str` walk does not model.
+fn str_stmt_expr_is_unit(
+    expr: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    match expr.kind {
+        ExprKind::If {
+            cond,
+            then,
+            els: Some(els),
+        } => {
+            let ExprKind::Block(else_block) = els.kind else {
+                return false;
+            };
+            matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+                && str_stmt_block_is_unit(then, locals, str_bindings, type_paths, symbols, inputs)
+                && str_stmt_block_is_unit(
+                    else_block,
+                    locals,
+                    str_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                )
+        }
+        ExprKind::Loop {
+            body,
+            label: None,
+            source,
+        } => {
+            matches!(source, LoopSource::Loop | LoopSource::While)
+                && str_stmt_block_is_unit(body, locals, str_bindings, type_paths, symbols, inputs)
+        }
+        ExprKind::Break {
+            label: None,
+            value: None,
+        }
+        | ExprKind::Continue { label: None } => true,
+        _ => false,
+    }
+}
+
+// A statement-only block: every statement must be an admitted `Str` `let`
+// (literal or group-path initializer only — `if` initializers stay gated
+// here), an assert, or a unit statement expression; the tail must be absent
+// or itself a unit expression (the `while` desugaring's `else { break }`).
+fn str_stmt_block_is_unit(
+    block: &sai_hir::expressions::Block<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    if block.safety != sai_hir::Safety::Safe {
+        return false;
+    }
+    let mut inner_bindings = str_bindings.clone();
+    for stmt in block.stmts {
+        match stmt.kind {
+            sai_hir::expressions::StmtKind::Assert { cond, msg, .. } => {
+                if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+                    || !msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))))
+                {
+                    return false;
+                }
+            }
+            sai_hir::expressions::StmtKind::Let {
+                pat,
+                ty,
+                init,
+                els: None,
+            } => {
+                if let Some(ty) = ty
+                    && resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+                        != Some(FunctionDirectType::Str)
+                {
+                    return false;
+                }
+                let init_is_str = match init.kind {
+                    ExprKind::Lit(Lit::Str(_)) => true,
+                    _ => str_binding_path(init, locals, &inner_bindings),
+                };
+                if !init_is_str {
+                    return false;
+                }
+                let PatKind::Binding {
+                    mode: sai_hir::patterns::BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } = pat.kind
+                else {
+                    return false;
+                };
+                inner_bindings.insert(binding);
+            }
+            sai_hir::expressions::StmtKind::Expr(expr) => {
+                if !str_stmt_expr_is_unit(
+                    expr,
+                    locals,
+                    &inner_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                ) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    block.tail.is_none_or(|tail| {
+        str_stmt_expr_is_unit(tail, locals, &inner_bindings, type_paths, symbols, inputs)
+    })
 }
 
 // One `Str` tail position: a `Str` literal, a path into the `Str` local group,
@@ -50729,6 +50862,13 @@ property "shared"() {}
             "pub fn str_if_init_int_cond() -> Str {\n    let s = if 1 { \"a\" } else { \"b\" }\n    s\n}\n",
             "pub fn str_if_init_no_else() -> Str {\n    let s = if true { \"a\" }\n    s\n}\n",
             "pub fn str_if_init_all_int() -> Str {\n    let s = if true { 1 } else { 2 }\n    \"a\"\n}\n",
+            "pub fn str_while_stmt() -> Str {\n    while true { }\n    \"a\"\n}\n",
+            "pub fn str_loop_break() -> Str {\n    loop { break }\n    \"a\"\n}\n",
+            "pub fn str_if_stmt() -> Str {\n    if true { } else { }\n    \"a\"\n}\n",
+            "pub fn str_while_local_break() -> Str {\n    while true { let v = \"a\"\n    break }\n    \"a\"\n}\n",
+            "pub fn str_loop_break_value() -> Str {\n    loop { break \"a\" }\n    \"b\"\n}\n",
+            "pub fn str_while_int_cond() -> Str {\n    while 1 { }\n    \"a\"\n}\n",
+            "pub fn str_labeled_loop() -> Str {\n    'l: loop { break }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -50744,7 +50884,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 41);
+        assert_eq!(resolved.owners().len(), 48);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -50752,6 +50892,7 @@ property "shared"() {}
             .chain(&resolved.owners()[24..28])
             .chain(&resolved.owners()[30..32])
             .chain(&resolved.owners()[35..37])
+            .chain(&resolved.owners()[41..45])
         {
             assert!(matches!(
                 owner
@@ -50779,7 +50920,8 @@ property "shared"() {}
             .chain(&resolved.owners()[22..24])
             .chain(&resolved.owners()[28..30])
             .chain(&resolved.owners()[32..35])
-            .chain(&resolved.owners()[38..])
+            .chain(&resolved.owners()[38..41])
+            .chain(&resolved.owners()[45..])
         {
             assert!(matches!(
                 owner
