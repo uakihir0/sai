@@ -10187,3 +10187,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Review fix:** `break`/`continue` statements inside a `break` value's `if`/`match` branches now reach the enclosing loop via a `break_ctx` walk — a valueless/labeled break gates instead of diluting β with `()`, and `break v` contributes like loop level (`loop { break if true { break "a" } else { "b" } }` seeds; `loop { break if true { break\n "a" } else { "b" } }` gates). The `if`/`match` clean flag now requires a `Str` leaf or a clean `Str` break contribution — `let n = loop { break if true { 1 } else { 2 } }` gates. Breaks nested inside `if`/`match` statements deeper in a branch are still not tracked — remaining scope.
 - **Review fix:** the clean scan now tracks `let` bindings declared inside the value and scans nested `loop` bodies at loop level — a branch yielding `Str` only via `let t = "x"` + `break t` or via an inner `loop { break "x" }` tail stays a clean yield instead of gating. A nested loop that breaks only non-`Str` values contributes its recoverable diagnostic like any mixed break value.
 - **Remaining scope:** `Str` in `LocalType` (the type is not a `PrimTy` — needs a `LocalType` carrier beyond `Concrete(PrimTy)`), `if let`/`while let`/`for`, range patterns and full guard expressions for `Str` matches, `Str` call signatures and arguments, tuple/index tails, move/borrow, lowering/evaluation, multi-owner CLI coverage (Stage 0).
+
+### IR-1095 (2026-11-22): `Str` local `assert` messages
+
+- **Decision:** The `assert` arm of `check_function_str_local_block` admits a `Str` group path as the message (`assert c, s`), alongside `Lit::Str` and absent messages.
+- **Reason:** N-C-20 types the message as `Str`/`String`; a bound `Str` local is a `Str` expression.
+- **Failure boundary and judgment:** Non-`Str` messages and non-`Lit::Bool` conditions stay gated, as before.
+- **Review required:** None beyond the binding-set membership check; `str_binding_path` rejects non-`Str` locals.
+- **Planned verification matrix:** Driver gains `str_assert_local_msg` (supported-clean); CLI adds the same source.
+- **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** The message is evaluated only on failure per N-C-20 — no eager-evaluation concern.
+- **Remaining scope:** `Str` in `LocalType` (carries `Str` call signatures, Str-typed `assert` messages in primitive bodies, and Str scrutinees through the checker), `if let`/`while let`/`for`, range patterns and full guards, tuple/index tails, move/borrow, lowering/evaluation, multi-owner CLI coverage (Stage 0).
