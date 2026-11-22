@@ -15439,12 +15439,29 @@ fn str_stmt_break_families_expr<'h>(
             inputs,
             out,
         ),
-        ExprKind::Match { arms, .. } => {
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => {
+            // A binding arm types the pattern variable as `Str` — break
+            // values inside the arm (`break other`) classify through it.
+            let scrutinee_str = matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_)))
+                || str_binding_family(scrutinee, locals, str_bindings) == Some("`Str`");
             for arm in arms {
+                let mut arm_bindings = str_bindings.clone();
+                if scrutinee_str
+                    && let PatKind::Binding {
+                        mode: sai_hir::patterns::BindingMode::Value,
+                        binding,
+                        sub: None,
+                        ..
+                    } = arm.pat.kind
+                {
+                    arm_bindings.insert(binding, "`Str`");
+                }
                 str_stmt_break_families_expr(
                     arm.body,
                     locals,
-                    str_bindings,
+                    &arm_bindings,
                     type_paths,
                     symbols,
                     inputs,
@@ -54230,6 +54247,7 @@ property "shared"() {}
             "pub fn str_loop_ann_break_lit_oob() -> Str {\n    loop {\n        return if true {\n            let x: I8 = 1\n            break x\n        } else {\n            break 200\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_loop_match_seed_break_mismatch() -> Str {\n    let s = \"a\"\n    loop {\n        let n = match s {\n            \"x\" => 1,\n            _ => 2,\n        }\n        return if true {\n            break n\n        } else {\n            break \"a\"\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_loop_break_match_ann_arm_fold() -> Str {\n    let x: I8 = 1\n    let n = loop {\n        break match \"s\" {\n            \"b\" => x,\n            _ => 1,\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_loop_break_match_arm_binding() -> Str {\n    let s = \"a\"\n    loop {\n        return match s {\n            other => {\n                break other\n            }\n        }\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54245,7 +54263,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 150);
+        assert_eq!(resolved.owners().len(), 151);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54281,7 +54299,7 @@ property "shared"() {}
             .chain(&resolved.owners()[137..138])
             .chain(&resolved.owners()[140..141])
             .chain(&resolved.owners()[145..147])
-            .chain(&resolved.owners()[149..150])
+            .chain(&resolved.owners()[149..151])
             .enumerate()
         {
             let (index, owner) = (index, owner);
