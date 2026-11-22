@@ -13276,20 +13276,7 @@ fn str_binding_family(
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
 ) -> Option<&'static str> {
-    let ExprKind::Path(path) = expression.kind else {
-        return None;
-    };
-    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
-        return None;
-    }
-    match locals.paths.get(&path.hir_id) {
-        Some(PathRes {
-            base: Res::Local(binding),
-            resolved_segments: 1,
-            segment_count: 1,
-        }) => str_bindings.get(binding).copied().map(|entry| entry.family),
-        _ => None,
-    }
+    str_binding_entry(expression, locals, str_bindings).map(|entry| entry.family)
 }
 
 fn str_binding_entry(
@@ -15425,60 +15412,6 @@ fn check_function_str_local_block(
             );
             continue;
         }
-        // Non-literal initializers — `if`/`loop`/`match`/block — that join
-        // a non-`Str` family bind it directly: `let n = if c { 1 } else
-        // { 2 }` gives `n: I64`. `Str`-joining shapes fall through to the
-        // shared `Str` walk (it emits the recoverable branch
-        // diagnostics), and unclassed shapes gate.
-        // Operand trees (`let m = n + 1`, `let m = -n`, `let m = n < 2`)
-        // bind whatever family the fold reports — a `Str` result only
-        // arises from arithmetic on `Str` operands, which already
-        // carries the operand diagnostic.
-        if matches!(init.kind, ExprKind::Unary(_, _) | ExprKind::Binary(_, _, _))
-            && let Some((family, mut init_diagnostics)) = str_expr_family(
-                owner,
-                return_ty,
-                init,
-                locals,
-                str_bindings,
-                expected,
-                type_paths,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
-            )?
-        {
-            let PatKind::Binding {
-                mode: sai_hir::patterns::BindingMode::Value,
-                binding,
-                sub: None,
-                ..
-            } = pat.kind
-            else {
-                return Ok(None);
-            };
-            if let Some(pinned) = pinned
-                && family != pinned
-                && family != "`!`"
-            {
-                init_diagnostics.push(const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    init.span,
-                    sai_diagnostics::Code::TypeMismatch,
-                    format!("expected {pinned}, found {family}"),
-                    "type mismatch",
-                )?);
-            }
-            diagnostics.append(&mut init_diagnostics);
-            str_bindings.insert(
-                binding,
-                str_let_entry(init, family, pinned, locals, str_bindings),
-            );
-            continue;
-        }
         if matches!(
             init.kind,
             ExprKind::If { .. }
@@ -16483,8 +16416,12 @@ fn str_pure_condition(
         rhs,
     ) = cond.kind
     {
-        return str_condition_operand_family(lhs, locals, str_bindings).is_some()
-            && str_condition_operand_family(rhs, locals, str_bindings).is_some();
+        // Comparison operands are value positions — any supported
+        // operand tree admits like the diagnostic walk's probe.
+        return str_pure_init_family(lhs, locals, str_bindings, type_paths, symbols, inputs)
+            .is_some()
+            && str_pure_init_family(rhs, locals, str_bindings, type_paths, symbols, inputs)
+                .is_some();
     }
     if let ExprKind::Unary(UnOp::Not, operand) = cond.kind {
         return str_pure_condition(operand, locals, str_bindings, type_paths, symbols, inputs);
@@ -16611,6 +16548,21 @@ fn str_pure_init_family(
             } else {
                 right
             };
+            // A family mismatch reports `expected left, found right` in
+            // the diagnostic walk and yields the left family (`Bool`
+            // for comparisons) — the pure scan admits the same.
+            if left != right {
+                return Some(
+                    if matches!(
+                        operator,
+                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                    ) {
+                        "`Bool`"
+                    } else {
+                        left
+                    },
+                );
+            }
             let family_name = left.trim_matches('`');
             match operator {
                 // `%` on floats and `&`/`|`/`^` on `Bool`/`Char` carry
@@ -55972,6 +55924,7 @@ property "shared"() {}
             "pub fn str_bin_shift_count_oob() -> Str {\n    let s = \"a\"\n    let n = 1\n    let c = 4294967296\n    let m = n << c\n    s\n}\n",
             "pub fn str_bin_shift_ann_pin() -> Str {\n    let s = \"a\"\n    let c = 1\n    let m: U8 = 1 << c\n    s\n}\n",
             "pub fn str_bin_pin_mixed_tm() -> Str {\n    let s = \"a\"\n    let wide: I64 = 5\n    let m: I8 = wide + 200\n    s\n}\n",
+            "pub fn str_match_guard_op_tm() -> Str {\n    let s = \"a\"\n    let m = match s {\n        \"x\" if s + 1 => \"y\"\n        _ => \"w\"\n    }\n    m\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -55987,7 +55940,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 218);
+        assert_eq!(resolved.owners().len(), 219);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -56129,6 +56082,7 @@ property "shared"() {}
             (213, sai_diagnostics::Code::OperatorNotSupported),
             (215, sai_diagnostics::Code::LiteralOutOfRange),
             (217, sai_diagnostics::Code::TypeMismatch),
+            (218, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
