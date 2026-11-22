@@ -13286,6 +13286,30 @@ fn check_function_str_local_block(
                 };
                 diagnostics.append(&mut else_diagnostics);
             }
+            // `let s = loop { break <Str> }` seeds β from break values.
+            ExprKind::Loop {
+                body,
+                label: None,
+                source: LoopSource::Loop,
+            } => {
+                let mut inner_bindings = str_bindings.clone();
+                let Some(mut loop_diagnostics) = str_loop_str_body(
+                    owner,
+                    return_ty,
+                    body,
+                    &mut inner_bindings,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut loop_diagnostics);
+            }
             _ if str_binding_path(init, locals, str_bindings) => {}
             _ => return Ok(None),
         }
@@ -13447,6 +13471,173 @@ fn str_stmt_block_is_unit(
     })
 }
 
+// A `loop` body that yields `Str`: statements follow the unit-block rules
+// (`Str` `let`s with literal or group-path initializers, asserts, unit
+// expressions) plus `break <Str>` — a `Str` literal, a group path, or a
+// scalar literal producing the recoverable mismatch diagnostic. At least
+// one `Str`-typed break must exist for the loop to yield `Str`; the cloned
+// binding set keeps `let`s scoped to the loop body.
+fn str_loop_str_body(
+    owner: &HirOwner<'_>,
+    return_ty: Ty<'_>,
+    block: &sai_hir::expressions::Block<'_>,
+    str_bindings: &mut std::collections::HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if block.safety != sai_hir::Safety::Safe {
+        return Ok(None);
+    }
+    let mut diagnostics = Vec::new();
+    let mut yields_str = false;
+    for stmt in block.stmts {
+        match stmt.kind {
+            sai_hir::expressions::StmtKind::Assert { cond, msg, .. } => {
+                if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+                    || !msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))))
+                {
+                    return Ok(None);
+                }
+            }
+            sai_hir::expressions::StmtKind::Let {
+                pat,
+                ty,
+                init,
+                els: None,
+            } => {
+                if let Some(ty) = ty
+                    && resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+                        != Some(FunctionDirectType::Str)
+                {
+                    return Ok(None);
+                }
+                let init_is_str = match init.kind {
+                    ExprKind::Lit(Lit::Str(_)) => true,
+                    _ => str_binding_path(init, locals, str_bindings),
+                };
+                if !init_is_str {
+                    return Ok(None);
+                }
+                let PatKind::Binding {
+                    mode: sai_hir::patterns::BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } = pat.kind
+                else {
+                    return Ok(None);
+                };
+                str_bindings.insert(binding);
+            }
+            sai_hir::expressions::StmtKind::Expr(expr) => match expr.kind {
+                ExprKind::Break {
+                    label: None,
+                    value: Some(value),
+                } => {
+                    let Some((yields, mut value_diagnostics)) = str_break_value(
+                        owner,
+                        return_ty,
+                        value,
+                        str_bindings,
+                        locals,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    yields_str |= yields;
+                    diagnostics.append(&mut value_diagnostics);
+                }
+                _ if str_stmt_expr_is_unit(
+                    expr,
+                    locals,
+                    str_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                ) => {}
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        }
+    }
+    if let Some(tail) = block.tail {
+        match tail.kind {
+            ExprKind::Break {
+                label: None,
+                value: Some(value),
+            } => {
+                let Some((yields, mut value_diagnostics)) = str_break_value(
+                    owner,
+                    return_ty,
+                    value,
+                    str_bindings,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                yields_str |= yields;
+                diagnostics.append(&mut value_diagnostics);
+            }
+            _ if str_stmt_expr_is_unit(tail, locals, str_bindings, type_paths, symbols, inputs) => {
+            }
+            _ => return Ok(None),
+        }
+    }
+    if !yields_str {
+        return Ok(None);
+    }
+    Ok(Some(diagnostics))
+}
+
+// `break <value>` inside a `Str`-yielding `loop` body: `Str` literals and
+// group paths yield `Str` cleanly; scalar literals produce the recoverable
+// `expected Str, found <lit>` diagnostic (the checker's β mismatch). Other
+// value shapes stay gated — `break` into nested `if`/`loop` bodies is out
+// of scope here.
+fn str_break_value(
+    owner: &HirOwner<'_>,
+    return_ty: Ty<'_>,
+    value: &HirExpr<'_>,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<(bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
+    if matches!(value.kind, ExprKind::Lit(Lit::Str(_)))
+        || str_binding_path(value, locals, str_bindings)
+    {
+        return Ok(Some((true, Vec::new())));
+    }
+    if is_direct_function_scalar_literal(value) {
+        let Some(value_diagnostics) = check_const_literal_leaf(
+            owner, return_ty, value, type_paths, symbols, inputs, snapshot, target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some((true, value_diagnostics)));
+    }
+    Ok(None)
+}
+
 // One `Str` tail position: a `Str` literal, a path into the `Str` local group,
 // an `if` over a literal `Bool` condition with `Str` branch tails, or a scalar
 // literal checked against `Str` for the recoverable mismatch diagnostic.
@@ -13530,6 +13721,28 @@ fn check_function_str_tail(
             owner,
             return_ty,
             inner,
+            &mut inner_bindings,
+            locals,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        );
+    }
+    // `loop { break <Str> }` tails yield `Str` from their break values;
+    // `while` loops and valueless-only breaks stay gated (they yield `()`).
+    if let ExprKind::Loop {
+        body,
+        label: None,
+        source: LoopSource::Loop,
+    } = tail.kind
+    {
+        let mut inner_bindings = str_bindings.clone();
+        return str_loop_str_body(
+            owner,
+            return_ty,
+            body,
             &mut inner_bindings,
             locals,
             type_paths,
@@ -50869,6 +51082,13 @@ property "shared"() {}
             "pub fn str_loop_break_value() -> Str {\n    loop { break \"a\" }\n    \"b\"\n}\n",
             "pub fn str_while_int_cond() -> Str {\n    while 1 { }\n    \"a\"\n}\n",
             "pub fn str_labeled_loop() -> Str {\n    'l: loop { break }\n    \"a\"\n}\n",
+            "pub fn str_loop_tail() -> Str {\n    loop { break \"a\" }\n}\n",
+            "pub fn str_loop_tail_binding() -> Str {\n    let s = \"a\"\n    loop { break s }\n}\n",
+            "pub fn str_loop_init() -> Str {\n    let s = loop { break \"a\" }\n    s\n}\n",
+            "pub fn str_loop_int_break() -> Str {\n    loop { break 1 }\n}\n",
+            "pub fn str_while_break() -> Str {\n    while true { break \"a\" }\n}\n",
+            "pub fn str_loop_nested_break() -> Str {\n    loop { if true { break \"a\" } else { break \"b\" } }\n}\n",
+            "pub fn str_loop_no_yield() -> Str {\n    loop { break }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -50884,7 +51104,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 48);
+        assert_eq!(resolved.owners().len(), 55);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -50893,6 +51113,7 @@ property "shared"() {}
             .chain(&resolved.owners()[30..32])
             .chain(&resolved.owners()[35..37])
             .chain(&resolved.owners()[41..45])
+            .chain(&resolved.owners()[48..51])
         {
             assert!(matches!(
                 owner
@@ -50901,7 +51122,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [4, 21, 37] {
+        for index in [4, 21, 37, 51] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
                 .expect("Str mismatch body check succeeds");
@@ -50921,7 +51142,8 @@ property "shared"() {}
             .chain(&resolved.owners()[28..30])
             .chain(&resolved.owners()[32..35])
             .chain(&resolved.owners()[38..41])
-            .chain(&resolved.owners()[45..])
+            .chain(&resolved.owners()[45..48])
+            .chain(&resolved.owners()[52..])
         {
             assert!(matches!(
                 owner
