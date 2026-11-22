@@ -8543,7 +8543,6 @@ fn check_function_body_primitive_local_block(
             || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
     let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-    let is_supported_unary_tail = matches!(tail.kind, ExprKind::Unary(operator, operand) if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) && (matches!(operand.kind, ExprKind::Path(_)) || (matches!(operand.kind, ExprKind::Field { .. }) && (self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id)) || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))))));
     let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
     let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(_));
     let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
@@ -8576,6 +8575,26 @@ fn check_function_body_primitive_local_block(
             }
         }
     }
+    let is_supported_unary_tail = match tail.kind {
+        ExprKind::Unary(operator, operand)
+            if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) =>
+        {
+            unary_tail_operand_shape_is_supported(
+                operator,
+                operand,
+                &block_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                &mut primitive_types,
+            )
+        }
+        _ => false,
+    };
     let is_supported_block_tail = match tail.kind {
         ExprKind::Block(inner) => primitive_inner_block_shape_is_supported(
             inner,
@@ -8601,8 +8620,9 @@ fn check_function_body_primitive_local_block(
         }
         ExprKind::Unary(_, operand) if is_supported_unary_tail => {
             // A `self.f` operand desugars to `let t = self.f` like a field
-            // tail — no binding to defer through.
-            if matches!(operand.kind, ExprKind::Field { .. }) {
+            // tail, and a literal or logical operand carries no binding —
+            // none defer through a binding.
+            if !matches!(operand.kind, ExprKind::Path(_)) {
                 None
             } else {
                 let ExprKind::Path(operand_path) = operand.kind else {
@@ -9094,6 +9114,51 @@ fn is_supported_direct_call_argument_shape(
 // `check_logical_operand` does: preceding paths (or unknown self-fields),
 // `Bool` literals, nested `and`/`or`, `not` operands, and comparisons whose
 // operands are preceding paths/fields or scalar literals.
+// Unary tail operands mirror the initializer-position admission for each
+// operator: `-` over a preceding path or a self field (`-lit` never reaches
+// here — the parser folds it into a literal), `~` over the same or an
+// integer/byte literal, and `not` over every logical-operand shape
+// (`not flag`, `not true`, `not (a < b)`, `not (a and b)`).
+fn unary_tail_operand_shape_is_supported(
+    operator: UnOp,
+    operand: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+) -> bool {
+    match (operator, operand.kind) {
+        (_, ExprKind::Path(path)) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        (_, ExprKind::Field { .. }) => {
+            self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
+        }
+        (UnOp::BitNot, _) => {
+            is_direct_function_integer_literal(operand)
+                || matches!(operand.kind, ExprKind::Lit(Lit::Byte(_)))
+        }
+        (UnOp::Not, _) => primitive_logical_init_operand_shape_is_supported(
+            operand,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+        _ => false,
+    }
+}
+
 fn primitive_logical_init_operand_shape_is_supported(
     operand: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
@@ -10528,21 +10593,22 @@ fn primitive_nested_block_tail_shape_is_supported(
                         )
                     })
             }),
-        ExprKind::Unary(operator, operand) => {
-            matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not)
-                && match operand.kind {
-                    ExprKind::Path(operand_path) => {
-                        resolved_plain_local_path_binding(operand_path, locals, inputs)
-                            .is_some_and(|binding| preceding_bindings.contains(&binding))
-                    }
-                    ExprKind::Field { .. } => {
-                        self_field_projections
-                            .is_some_and(|fields| fields.contains_key(&operand.hir_id))
-                            || unknown_self_fields
-                                .is_some_and(|fields| fields.contains(&operand.hir_id))
-                    }
-                    _ => false,
-                }
+        ExprKind::Unary(operator, operand)
+            if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) =>
+        {
+            unary_tail_operand_shape_is_supported(
+                operator,
+                operand,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            )
         }
         ExprKind::Block(inner) => primitive_inner_block_shape_is_supported(
             inner,
@@ -10664,21 +10730,22 @@ fn primitive_if_branch_tail_shape_is_supported(
                         )
                     })
             }),
-        ExprKind::Unary(operator, operand) => {
-            matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not)
-                && match operand.kind {
-                    ExprKind::Path(operand_path) => {
-                        resolved_plain_local_path_binding(operand_path, locals, inputs)
-                            .is_some_and(|binding| preceding_bindings.contains(&binding))
-                    }
-                    ExprKind::Field { .. } => {
-                        self_field_projections
-                            .is_some_and(|fields| fields.contains_key(&operand.hir_id))
-                            || unknown_self_fields
-                                .is_some_and(|fields| fields.contains(&operand.hir_id))
-                    }
-                    _ => false,
-                }
+        ExprKind::Unary(operator, operand)
+            if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) =>
+        {
+            unary_tail_operand_shape_is_supported(
+                operator,
+                operand,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            )
         }
         // A nested `{ e }` / `{ let s = .. e }` branch tail admits the
         // nested-tail shapes; non-`let` inner statements stay gated.
@@ -54929,29 +54996,39 @@ property "shared"() {}
             "the Bool result mismatches the I32 return type"
         );
 
-        for name in [
-            "not_int_literal_tail",
-            "not_computed_tail",
-            "not_double_tail",
-        ] {
+        for name in ["not_computed_tail", "not_double_tail"] {
             let owner = owner_named(&database, &resolved, name);
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("widened not tail body check is available")
+            else {
+                panic!("`not` over a comparison or another `not` is supported for `{name}`");
+            };
+            assert!(diagnostics.is_empty(), "the `{name}` tail checks cleanly");
+            let results = owner
+                .primitive_body_type_results()
+                .expect("widened not tail results query succeeds")
+                .expect("widened not tail body publishes primitive facts");
+            assert_primitive_type_result_parity(&database, results);
             assert!(
-                matches!(
-                    owner
-                        .body_type_check()
-                        .expect("excluded tail body query succeeds"),
-                    FunctionBodyTypeCheck::Unsupported
-                ),
-                "the `{name}` tail shape remains outside this slice"
-            );
-            assert!(
-                owner
-                    .primitive_body_type_results()
-                    .expect("excluded projection query succeeds")
-                    .is_none(),
-                "the `{name}` tail shape publishes no primitive facts"
+                results
+                    .expression_types()
+                    .values()
+                    .all(|ty| *ty == PrimTy::Bool),
+                "the `{name}` tail resolves to Bool"
             );
         }
+
+        let int_literal_owner = owner_named(&database, &resolved, "not_int_literal_tail");
+        assert!(
+            matches!(
+                int_literal_owner
+                    .body_type_check()
+                    .expect("int literal local not tail body query succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ),
+            "`not` over an unannotated integer literal variable stays outside this slice"
+        );
     }
 
     #[test]
@@ -91100,6 +91177,19 @@ property "shared"() {}
             "    take_i32({ let y = 2\n        y })\n",
             "}\n",
             "pub fn take_i32(v: I32) -> I32 { v }\n",
+            "pub fn bitnot_lit_top_tail() -> I32 { ~1 }\n",
+            "pub fn nested_bitnot_lit_tail() -> I32 { { ~1 } }\n",
+            "pub fn nested_not_lit_tail() -> Bool { { not true } }\n",
+            "pub fn not_comparison_tail(left: I32, right: I32) -> Bool {\n",
+            "    not (left < right)\n",
+            "}\n",
+            "pub fn bitnot_lit_if_branch(flag: Bool) -> I32 {\n",
+            "    if flag { ~1 } else { 0 }\n",
+            "}\n",
+            "pub fn bitnot_lit_block_operand() -> I32 {\n",
+            "    let x = 1 + { ~1 }\n",
+            "    x\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -91122,7 +91212,7 @@ property "shared"() {}
         // tails admit the same nesting.
         for index in [
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26,
-            27, 28,
+            27, 28, 30, 31, 32, 33, 34, 35,
         ] {
             let check = resolved.owners()[index]
                 .body_type_check()
