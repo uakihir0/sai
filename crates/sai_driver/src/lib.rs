@@ -13515,6 +13515,7 @@ fn str_match_family(
     let mut diagnostics = Vec::new();
     let mut family: Option<&'static str> = None;
     let mut catch_all = false;
+    let mut arm_families = Vec::with_capacity(arms.len());
     for arm in arms {
         if let Some(guard) = arm.guard
             && !matches!(guard.kind, ExprKind::Lit(Lit::Bool(_)))
@@ -13615,6 +13616,24 @@ fn str_match_family(
             return Ok(None);
         };
         diagnostics.append(&mut arm_diagnostics);
+        arm_families.push((Some(arm_family), Some(arm.body), arm.body.span));
+    }
+    // Literal arm bodies fold into a single pinned/primitive arm family
+    // like the checker's β unification: `x => x` (x: I8) then
+    // `"a" => 1` joins at `I8`.
+    str_fold_literal_contributions(
+        owner,
+        &mut arm_families,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+        &mut diagnostics,
+    )?;
+    for (arm_family, _, span) in arm_families {
+        let Some(arm_family) = arm_family else {
+            continue;
+        };
         if arm_family == "`!`" {
             continue;
         }
@@ -13623,7 +13642,7 @@ fn str_match_family(
                 owner.id,
                 inputs,
                 snapshot,
-                arm.body.span,
+                span,
                 sai_diagnostics::Code::TypeMismatch,
                 format!("expected {first}, found {arm_family}"),
                 "type mismatch",
@@ -14785,16 +14804,47 @@ fn str_stmt_expr_unit(
                     inputs,
                     &mut contributions,
                 );
+                // Unclassed contributions get the same silent expression-
+                // walk pass as `str_loop_family` — the statement walk
+                // already emitted their diagnostics; still-unclassed
+                // values gate.
+                let mut resolved = Vec::with_capacity(contributions.len());
+                for (contribution, value, span) in contributions {
+                    if let Some(family) = contribution {
+                        resolved.push((Some(family), value, span));
+                        continue;
+                    }
+                    let evaluated = match value {
+                        Some(value) => str_expr_family(
+                            owner,
+                            return_ty,
+                            value,
+                            locals,
+                            str_bindings,
+                            None,
+                            type_paths,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                        )?,
+                        None => None,
+                    };
+                    match evaluated {
+                        Some((family, _)) => resolved.push((Some(family), value, span)),
+                        None => return Ok(None),
+                    }
+                }
                 str_fold_literal_contributions(
                     owner,
-                    &mut contributions,
+                    &mut resolved,
                     symbols,
                     inputs,
                     snapshot,
                     target_cfg,
                     &mut diagnostics,
                 )?;
-                let mut classed = contributions
+                let mut classed = resolved
                     .iter()
                     .filter_map(|contribution| contribution.0.map(|f| (f, contribution.2)))
                     .filter(|(family, _)| *family != "`!`");
@@ -14881,8 +14931,10 @@ fn str_stmt_expr_unit(
                     )?])),
                     (StrStmtLoopFrame::Loop, None) => Ok(Some(Vec::new())),
                     // A `break <literal or path>` in a statement-position
-                    // `loop` contributes a discarded β — clean; complex
-                    // break values would need the seeded walk — gate.
+                    // `loop` contributes a discarded β — clean; other
+                    // values run the expression family walk once for
+                    // their diagnostics (`break if`/`break match`), and
+                    // the contribution join re-evaluates them silently.
                     (StrStmtLoopFrame::Loop, Some(value)) => match value.kind {
                         ExprKind::Lit(Lit::Str(_)) => Ok(Some(Vec::new())),
                         ExprKind::Lit(literal) => {
@@ -14904,7 +14956,22 @@ fn str_stmt_expr_unit(
                             )
                         }
                         _ if str_binding_path(value, locals, str_bindings) => Ok(Some(Vec::new())),
-                        _ => Ok(None),
+                        _ => match str_expr_family(
+                            owner,
+                            return_ty,
+                            value,
+                            locals,
+                            str_bindings,
+                            None,
+                            type_paths,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                        )? {
+                            Some((_, value_diagnostics)) => Ok(Some(value_diagnostics)),
+                            None => Ok(None),
+                        },
                     },
                     (StrStmtLoopFrame::While, Some(value)) => {
                         Ok(Some(vec![str_invalid_break_value(
@@ -54162,6 +54229,7 @@ property "shared"() {}
             "pub fn str_loop_ann_break_lit_fold() -> Str {\n    loop {\n        return if true {\n            let x: I8 = 1\n            break x\n        } else {\n            break 2\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_loop_ann_break_lit_oob() -> Str {\n    loop {\n        return if true {\n            let x: I8 = 1\n            break x\n        } else {\n            break 200\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_loop_match_seed_break_mismatch() -> Str {\n    let s = \"a\"\n    loop {\n        let n = match s {\n            \"x\" => 1,\n            _ => 2,\n        }\n        return if true {\n            break n\n        } else {\n            break \"a\"\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_loop_break_match_ann_arm_fold() -> Str {\n    let x: I8 = 1\n    let n = loop {\n        break match \"s\" {\n            \"b\" => x,\n            _ => 1,\n        }\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54177,7 +54245,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 149);
+        assert_eq!(resolved.owners().len(), 150);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54196,6 +54264,7 @@ property "shared"() {}
             .chain(&resolved.owners()[70..71])
             .chain(&resolved.owners()[72..76])
             .chain(&resolved.owners()[77..80])
+            .chain(&resolved.owners()[81..83])
             .chain(&resolved.owners()[83..86])
             .chain(&resolved.owners()[87..90])
             .chain(&resolved.owners()[91..97])
@@ -54212,6 +54281,7 @@ property "shared"() {}
             .chain(&resolved.owners()[137..138])
             .chain(&resolved.owners()[140..141])
             .chain(&resolved.owners()[145..147])
+            .chain(&resolved.owners()[149..150])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54227,8 +54297,8 @@ property "shared"() {}
             );
         }
         for index in [
-            4, 17, 21, 28, 32, 33, 38, 46, 51, 61, 68, 76, 86, 90, 97, 102, 105, 110, 113, 114,
-            117, 118, 120, 121, 123, 124, 126, 127, 130,
+            4, 17, 21, 28, 32, 33, 38, 46, 51, 61, 68, 86, 90, 97, 102, 105, 110, 113, 114, 117,
+            118, 120, 121, 123, 124, 126, 127, 130,
         ] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
@@ -54268,7 +54338,10 @@ property "shared"() {}
                 .body_type_check()
                 .expect("Str match body check succeeds")
             else {
-                panic!("a match diagnostic stays a supported check result");
+                panic!(
+                    "owner #{index}: got {:?}",
+                    resolved.owners()[index].body_type_check()
+                );
             };
             assert_eq!(diagnostics.len(), 1, "owner #{index}: {diagnostics:?}");
             assert_eq!(diagnostics[0].code, code);
@@ -54280,6 +54353,20 @@ property "shared"() {}
             .expect("scalar/Str if-init body check succeeds")
         else {
             panic!("a scalar/Str if-init stays a supported check result");
+        };
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+        );
+        // A mixed-arm `break match` reports the arm join mismatch and
+        // the bound family then mismatches the tail.
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[76]
+            .body_type_check()
+            .expect("mixed break-match body check succeeds")
+        else {
+            panic!("a mixed break match stays a supported check result");
         };
         assert_eq!(diagnostics.len(), 2);
         assert!(
@@ -54328,7 +54415,6 @@ property "shared"() {}
             .chain(&resolved.owners()[39..40])
             .chain(&resolved.owners()[64..66])
             .chain(&resolved.owners()[69..70])
-            .chain(&resolved.owners()[81..83])
             .chain(&resolved.owners()[142..144])
         {
             assert!(matches!(
