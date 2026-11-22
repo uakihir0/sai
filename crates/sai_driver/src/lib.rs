@@ -13231,6 +13231,18 @@ fn check_function_str_local_block(
                 {
                     return Ok(None);
                 }
+                // At least one branch must yield a `Str` value — an `if`
+                // producing only non-`Str` arms is a non-`Str` initializer
+                // and stays gated rather than borrowing the return type.
+                let branch_yields_str = |branch: &sai_hir::expressions::Block<'_>| {
+                    branch.tail.is_some_and(|tail| {
+                        matches!(tail.kind, ExprKind::Lit(Lit::Str(_)))
+                            || str_binding_path(tail, locals, str_bindings)
+                    })
+                };
+                if !branch_yields_str(then) && !branch_yields_str(else_block) {
+                    return Ok(None);
+                }
                 let mut then_bindings = str_bindings.clone();
                 let Some(mut then_diagnostics) = check_function_str_local_block(
                     owner,
@@ -50716,6 +50728,7 @@ property "shared"() {}
             "pub fn str_if_init_mismatch() -> Str {\n    let s = if true { 1 } else { \"b\" }\n    s\n}\n",
             "pub fn str_if_init_int_cond() -> Str {\n    let s = if 1 { \"a\" } else { \"b\" }\n    s\n}\n",
             "pub fn str_if_init_no_else() -> Str {\n    let s = if true { \"a\" }\n    s\n}\n",
+            "pub fn str_if_init_all_int() -> Str {\n    let s = if true { 1 } else { 2 }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -50731,7 +50744,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 40);
+        assert_eq!(resolved.owners().len(), 41);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
