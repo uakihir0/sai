@@ -2583,10 +2583,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.check_logical(operator, left, right)?;
                 Ok(PrimTy::Bool)
             }
-            ExprKind::Binary(operator, left, right) => {
+            ExprKind::Binary(operator, left, right)
+                if matches!(
+                    operator,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                ) =>
+            {
                 self.check_comparison(operator, left, right)?;
                 Ok(PrimTy::Bool)
             }
+            // Non-comparison binaries (`not (a + b)`, `flag and a & b`)
+            // evaluate through the operand probe — their result is never
+            // `Bool`, so the operand-type check reports the mismatch.
+            ExprKind::Binary(..) => self.check_logical_operand_probe(operand),
             ExprKind::Lit(Lit::Bool(_)) => {
                 self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Bool));
                 Ok(PrimTy::Bool)
@@ -2607,22 +2616,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 let local_type = self.check_expr_value(operand, PrimTy::Bool)?;
                 self.concrete_local_type(local_type).ok_or(())
             }
-            _ => {
-                let local_type = self.check_operand_local_type(operand)?;
-                if let LocalType::LiteralVariable(id) = local_type {
-                    // An integer or floating-point literal variable can
-                    // never resolve to `Bool`, so `not x` reports the
-                    // operand's family default rather than gating.
-                    let Some(variable) = self.literal_variables.get(id) else {
-                        return Err(());
-                    };
-                    if variable.resolved.is_none() {
-                        return Ok(literal_variable_default_type(variable.kind));
-                    }
-                }
-                self.concrete_local_type(local_type).ok_or(())
+            _ => self.check_logical_operand_probe(operand),
+        }
+    }
+
+    fn check_logical_operand_probe(&mut self, operand: &'hir Expr<'hir>) -> Result<PrimTy, ()> {
+        let local_type = self.check_operand_local_type(operand)?;
+        if let LocalType::LiteralVariable(id) = local_type {
+            // An integer or floating-point literal variable can
+            // never resolve to `Bool`, so `not x` reports the
+            // operand's family default rather than gating.
+            let Some(variable) = self.literal_variables.get(id) else {
+                return Err(());
+            };
+            if variable.resolved.is_none() {
+                return Ok(literal_variable_default_type(variable.kind));
             }
         }
+        self.concrete_local_type(local_type).ok_or(())
     }
 
     fn check_direct_call_logical(
@@ -2641,11 +2652,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Bool));
                     PrimTy::Bool
                 }
-                ExprKind::Path(_) | ExprKind::Field { .. } => self
-                    .check_operand_local_type(operand)
-                    .ok()
-                    .and_then(|local_type| self.concrete_local_type(local_type))
-                    .ok_or(())?,
+                // Unresolved literal variables fall back to their family
+                // default like the initializer-position operands — the
+                // operand-type check then reports the `Bool` mismatch.
+                ExprKind::Path(_) | ExprKind::Field { .. } => {
+                    self.check_logical_operand_probe(operand)?
+                }
                 _ => return Err(()),
             };
             self.check_logical_operand_type(operand, operand_type)?;

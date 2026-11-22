@@ -9295,7 +9295,36 @@ fn primitive_logical_init_operand_shape_is_supported(
                     primitive_types,
                 )
             }
-            _ => false,
+            // Non-comparison binaries (`not (a + b)`, `flag and a & b`)
+            // evaluate through the operand probe — the operand-type
+            // check reports the `Bool` mismatch for whatever type the
+            // expression produces, so their leaves admit like nested
+            // operands.
+            _ => {
+                primitive_nested_operand_shape_is_supported(
+                    left,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                ) && primitive_nested_operand_shape_is_supported(
+                    right,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            }
         },
         // A block operand under `and`/`or` contributes its tail —
         // `flag and { let t = other\n  t }` behaves as `flag and other and
@@ -56449,6 +56478,10 @@ property "shared"() {}
             "    apply_bool(left_copy and right_copy)\n",
             "}\n",
             "pub fn logical_path_literal_and(left: Bool) -> Bool { apply_bool(left and true) }\n",
+            "pub fn logical_literal_var_call_argument(left: Bool) -> Bool {\n",
+            "    let inferred = 1\n",
+            "    apply_bool(inferred and left)\n",
+            "}\n",
             "pub fn logical_literal_path_and(right: Bool) -> Bool { apply_bool(false and right) }\n",
             "pub fn logical_path_literal_or(left: Bool) -> Bool { apply_bool(left or false) }\n",
             "pub fn logical_literal_path_or(right: Bool) -> Bool { apply_bool(true or right) }\n",
@@ -58678,6 +58711,13 @@ property "shared"() {}
         let logical_local_paths_call_argument =
             assert_supported(&database, "logical_local_paths_call_argument", &[]);
         let logical_path_literal_and = assert_supported(&database, "logical_path_literal_and", &[]);
+        // An unresolved literal-variable operand defaults to its family type
+        // and reports the `Bool` mismatch like the initializer positions.
+        let _logical_literal_var_call_argument = assert_supported(
+            &database,
+            "logical_literal_var_call_argument",
+            &[sai_diagnostics::Code::TypeMismatch],
+        );
         let logical_literal_path_and = assert_supported(&database, "logical_literal_path_and", &[]);
         let logical_path_literal_or = assert_supported(&database, "logical_path_literal_or", &[]);
         let logical_literal_path_or = assert_supported(&database, "logical_literal_path_or", &[]);
@@ -79873,10 +79913,20 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the literal-operand comparison: {check:?}"
             );
         }
+        // `(x + 2) and true` evaluates the arithmetic operand through the
+        // probe — the `I64` result mismatches `Bool` like `flag and i32`.
+        assert!(matches!(
+            owners[33]
+                .body_type_check()
+                .expect("a non-comparison and operand is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
         // Owner 57 (`a += b; b += a`) used to gate on the merge-cycle
         // check: root normalization makes the second merge a same-group
         // no-op, so it is genuinely supported now.
-        for index in [24, 32, 33, 35, 42, 50, 53, 54, 56, 63, 67, 68, 72] {
+        for index in [24, 32, 35, 42, 50, 53, 54, 56, 63, 67, 68, 72] {
             assert!(
                 matches!(
                     owners[index]
@@ -80516,7 +80566,11 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the not-initializer slice: {check:?}"
             );
         }
-        for (index, function) in [(5, "annotated_mismatch"), (6, "operand_mismatch")] {
+        for (index, function) in [
+            (5, "annotated_mismatch"),
+            (6, "operand_mismatch"),
+            (7, "arithmetic_operand"),
+        ] {
             let check = owners[index]
                 .body_type_check()
                 .unwrap_or_else(|_| panic!("{function} produces a supported diagnostic"));
@@ -80527,17 +80581,15 @@ property "shared"() {}
                 "function owner {index} should report one TYPE_MISMATCH: {check:?}"
             );
         }
-        for index in [7, 8] {
-            assert!(
-                matches!(
-                    owners[index]
-                        .body_type_check()
-                        .expect("unsupported not-initializer form is gated"),
-                    FunctionBodyTypeCheck::Unsupported
-                ),
-                "function owner {index} should remain gated"
-            );
-        }
+        assert!(
+            matches!(
+                owners[8]
+                    .body_type_check()
+                    .expect("unsupported not-initializer form is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ),
+            "function owner 8 should remain gated"
+        );
     }
 
     #[test]
