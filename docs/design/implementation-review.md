@@ -10218,3 +10218,13 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** `str_if_else_if`, `str_if_init_else_if`, `str_while_int_cond` reclassified or confirmed; driver fixture test green.
 - **Hostile review:** the else-yield probe for initializer `else if` uses the shared `str_clean_expr` so an `else if` whose chain never yields `Str` still fails `branch_yields_str` and gates — a non-`Str` chain cannot borrow the return type.
 - **Remaining scope:** `while 1`/stmt-position literal-condition mismatches gate rather than diagnose; `let s = if` without `else` and all-non-`Str` `if` initializers stay gated; `for`/`if let`/`while let`, `Str` in `LocalType`, and multi-owner lowering remain the open frontier.
+
+### IR-1098 (2026-11-22): `assert` message diagnostics in `-> Str` bodies
+
+- **Decision:** a shared `str_assert_msg` helper mirrors `str_condition` for the optional `assert` message: a `Str` literal or `Str` binding is clean, a scalar literal emits a recoverable `expected \`Str\`, found <lit>` `TypeMismatch`, other shapes gate. Loop-level blocks now resolve binding messages too — `loop { let t = "b"\n  assert true, t\n  break "a" }` is admitted where only `Lit::Str` passed before.
+- **Reason:** the assert message slot expects `Str`, so a non-`Str` scalar literal there is the same recoverable mismatch the checker reports for pattern literals — gating silently dropped a diagnosable error; loop-level blocks inconsistently rejected binding messages the block-level walk already admitted.
+- **Failure boundary:** non-literal, non-binding messages (calls, `ByteStr` — `str_pattern_literal_name` returns `None`) stay gated; statement-position asserts keep the no-diagnostic bool-walker boundary — `assert true, 1` inside a `while`/stmt block still gates rather than diagnosing.
+- **Planned verification matrix:** `str_assert_int_msg` (`assert true, 1` → one `TypeMismatch`), `str_loop_assert_binding_msg` (loop-level binding message → clean).
+- **Verification:** both fixtures reclassified; driver fixture test green.
+- **Hostile review:** `str_assert_msg` runs before the condition diagnostics append, so a bad message and a bad condition each surface their own diagnostic — no first-error masking.
+- **Remaining scope:** statement-position assert-message mismatches gate instead of diagnosing; `Str` in `LocalType`, `for`/`if let`/`while let`, and multi-owner lowering remain.
