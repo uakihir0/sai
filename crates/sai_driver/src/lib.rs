@@ -14313,6 +14313,42 @@ fn str_condition(
             "type mismatch",
         )?]));
     }
+    // `not`/`and`/`or` recurse like `check_logical_operand`: each operand
+    // evaluates as a Bool condition, so `if a and a`, `if not flag`, and
+    // match guards `k if a or b` are supported; a scalar literal or
+    // non-Bool binding operand still reports `expected Bool`.
+    if let ExprKind::Unary(UnOp::Not, operand) = cond.kind {
+        return str_condition(
+            owner,
+            operand,
+            locals,
+            str_bindings,
+            inputs,
+            snapshot,
+            symbols,
+            target_cfg,
+        );
+    }
+    if let ExprKind::Binary(BinOp::And | BinOp::Or, lhs, rhs) = cond.kind {
+        let mut diagnostics = Vec::new();
+        for operand in [lhs, rhs] {
+            let Some(mut operand_diagnostics) = str_condition(
+                owner,
+                operand,
+                locals,
+                str_bindings,
+                inputs,
+                snapshot,
+                symbols,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            diagnostics.append(&mut operand_diagnostics);
+        }
+        return Ok(Some(diagnostics));
+    }
     Ok(None)
 }
 
@@ -14873,11 +14909,7 @@ fn str_stmt_expr_unit(
     frame: StrStmtLoopFrame,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     match expr.kind {
-        ExprKind::If {
-            cond,
-            then,
-            els: Some(els),
-        } => {
+        ExprKind::If { cond, then, els } => {
             let Some(mut diagnostics) = str_condition(
                 owner,
                 cond,
@@ -14910,54 +14942,60 @@ fn str_stmt_expr_unit(
                 return Ok(None);
             };
             diagnostics.append(&mut then_diagnostics);
-            // `else { ... }` is a unit block; `else if` is itself a unit
-            // statement expression — the recursion checks its own cond.
-            let mut else_diagnostics = match els.kind {
-                ExprKind::Block(else_block) => {
-                    let Some(d) = str_stmt_block_unit(
-                        owner,
-                        return_ty,
-                        else_block,
-                        locals,
-                        str_bindings,
-                        expected,
-                        type_paths,
-                        symbols,
-                        inputs,
-                        snapshot,
-                        target_cfg,
-                        break_ctx,
-                        frame,
-                    )?
-                    else {
-                        return Ok(None);
+            // `check_if_stmt`: no `else` is complete; `else { ... }` is a
+            // unit block; `else if` is itself a unit statement
+            // expression — the recursion checks its own cond.
+            match els {
+                None => {}
+                Some(els) => {
+                    let mut else_diagnostics = match els.kind {
+                        ExprKind::Block(else_block) => {
+                            let Some(d) = str_stmt_block_unit(
+                                owner,
+                                return_ty,
+                                else_block,
+                                locals,
+                                str_bindings,
+                                expected,
+                                type_paths,
+                                symbols,
+                                inputs,
+                                snapshot,
+                                target_cfg,
+                                break_ctx,
+                                frame,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            d
+                        }
+                        ExprKind::If { .. } => {
+                            let Some(d) = str_stmt_expr_unit(
+                                owner,
+                                return_ty,
+                                els,
+                                locals,
+                                str_bindings,
+                                expected,
+                                type_paths,
+                                symbols,
+                                inputs,
+                                snapshot,
+                                target_cfg,
+                                break_ctx,
+                                frame,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            d
+                        }
+                        _ => return Ok(None),
                     };
-                    d
+                    diagnostics.append(&mut else_diagnostics);
                 }
-                ExprKind::If { .. } => {
-                    let Some(d) = str_stmt_expr_unit(
-                        owner,
-                        return_ty,
-                        els,
-                        locals,
-                        str_bindings,
-                        expected,
-                        type_paths,
-                        symbols,
-                        inputs,
-                        snapshot,
-                        target_cfg,
-                        break_ctx,
-                        frame,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    d
-                }
-                _ => return Ok(None),
-            };
-            diagnostics.append(&mut else_diagnostics);
+            }
             Ok(Some(diagnostics))
         }
         // A `loop` body walks at `Loop` frame; the `while` desugaring's
@@ -15468,10 +15506,16 @@ fn str_pure_condition(
         return str_condition_operand_family(lhs, locals, str_bindings).is_some()
             && str_condition_operand_family(rhs, locals, str_bindings).is_some();
     }
+    if let ExprKind::Unary(UnOp::Not, operand) = cond.kind {
+        return str_pure_condition(operand, locals, str_bindings);
+    }
+    if let ExprKind::Binary(BinOp::And | BinOp::Or, lhs, rhs) = cond.kind {
+        return str_pure_condition(lhs, locals, str_bindings)
+            && str_pure_condition(rhs, locals, str_bindings);
+    }
     // A bound path is admitted like the diagnostic twin — `Bool`/`!` is
     // clean, any other family is the recoverable `expected Bool`.
-    str_condition_operand(cond, locals, str_bindings)
-        || str_binding_family(cond, locals, str_bindings).is_some()
+    str_binding_family(cond, locals, str_bindings).is_some()
 }
 
 // The family a `let` initializer binds without running the diagnostic
@@ -54659,6 +54703,13 @@ property "shared"() {}
             "pub fn str_scalar_match_guard_lit() -> Str {\n    let n = 1\n    match n {\n        1 if 1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
             "pub fn str_scalar_match_guard_loop_seed() -> Str {\n    let n = 1\n    let m = loop {\n        let t = match n {\n            1 if n == 1 => 1,\n            _ => 2,\n        }\n        break t\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_match_guard_add() -> Str {\n    let n = 1\n    match n {\n        1 if n + 1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_cond_and() -> Str {\n    let a = true\n    if a and a {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_not() -> Str {\n    let a = true\n    if not a {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_or() -> Str {\n    let a = true\n    while a or a {\n        break\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_guard_and() -> Str {\n    let n = 1\n    let a = true\n    match n {\n        1 if a and true => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_cond_and_lit() -> Str {\n    let a = true\n    if a and 1 {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_not_str() -> Str {\n    let a = true\n    if not \"s\" {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_and_gate() -> Str {\n    let a = true\n    if a and 1 + 2 {\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54674,7 +54725,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 185);
+        assert_eq!(resolved.owners().len(), 192);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54720,6 +54771,7 @@ property "shared"() {}
             .chain(&resolved.owners()[177..179])
             .chain(&resolved.owners()[179..181])
             .chain(&resolved.owners()[183..184])
+            .chain(&resolved.owners()[185..189])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54786,6 +54838,8 @@ property "shared"() {}
             (176, sai_diagnostics::Code::UnreachablePattern),
             (181, sai_diagnostics::Code::TypeMismatch),
             (182, sai_diagnostics::Code::TypeMismatch),
+            (189, sai_diagnostics::Code::TypeMismatch),
+            (190, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -54871,6 +54925,7 @@ property "shared"() {}
             .chain(&resolved.owners()[168..169])
             .chain(&resolved.owners()[173..174])
             .chain(&resolved.owners()[184..185])
+            .chain(&resolved.owners()[191..192])
         {
             assert!(matches!(
                 owner

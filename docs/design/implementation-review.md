@@ -10323,3 +10323,13 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** driver fixture test green on the pinned toolchain.
 - **Hostile review:** the pattern binding is seeded into the arm-local binding map before the guard is evaluated, mirroring the checker's `check_match_arm_pattern` → `check_if_condition` order; post-catch-all arms still skip the guard like the checker.
 - **Remaining scope:** scalar scrutinee parameters, `Str` in `LocalType`, `for`/`if let`/`while let`, wider guard/condition expressions, multi-owner lowering.
+
+### IR-1109 (2026-11-23): logical condition shapes and else-less `if` statements (`-> Str` bodies)
+
+- **Decision:** `str_condition`/`str_pure_condition` now admit `not`/`and`/`or` recursively like `check_logical_operand` — `if a and a`, `if not flag`, `while a or a`, assert conditions and match guards (`k if a and true`) are supported; each operand evaluates as a Bool condition so a scalar literal or non-Bool binding operand still reports `expected Bool` on the operand. Statement-position `if` without `else` is admitted like `check_if_stmt` (`els: None`).
+- **Reason:** the checker's `check_if_condition` admits the logical forms and `check_if_stmt` requires no `else`; restricting to literals and comparisons made valid programs gate.
+- **Failure boundary:** operand shapes neither `str_condition` leaf admits (arithmetic, calls, field expressions) still gate — `if a and 1 + 2` stays Unsupported.
+- **Planned verification matrix:** `str_scalar_cond_and`/`str_scalar_cond_not`/`str_scalar_cond_or`/`str_scalar_match_guard_and` (clean, else-less `if`), `str_scalar_cond_and_lit`/`str_scalar_cond_not_str` (TypeMismatch), `str_scalar_cond_and_gate` (stays gated).
+- **Verification:** driver fixture test green on the pinned toolchain.
+- **Hostile review:** the diagnostic walk's `str_condition_operand` (Str-leaf) admission keeps its `expected Bool` mismatch diagnostic; the pure twin mirrors admission only, including bound paths of any family and skipping post-catch-all arm guards like `check_match_stmt`.
+- **Remaining scope:** scalar scrutinee parameters, `Str` in `LocalType`, `for`/`if let`/`while let`, field/call conditions, multi-owner lowering.
