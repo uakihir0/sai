@@ -10130,3 +10130,14 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** The binding `s` joins the group even when a branch produced a `TypeMismatch` — mirrors the general checker, which still records the binding's declared type.
 - **Remaining scope:** `match` tails/initializers for `Str` (needs a matchable scrutinee), `Str` locals from non-literal/non-group/non-if initializers (needs `Str` in `LocalType`), `loop`/`while`/`for` in `Str` bodies, tuple/index tails, `if let`/`while let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).
+
+### IR-1090 (2026-11-22): `while`/`loop`/`if` statements in `-> Str` bodies
+
+- **Decision:** `check_function_str_local_block` admits `StmtKind::Expr` whose expression is unit-shaped, via recursive `str_stmt_expr_is_unit`/`str_stmt_block_is_unit`: literal-`Bool` `if` with unit branches, unlabeled `loop`/`while` bodies (the `while` desugaring's `if cond { body } else { break }` walks as an `if` unit block), and `break`/`continue` exits. `Str` `let`s and asserts recurse into statement blocks on a cloned binding set.
+- **Reason:** Statement-position control flow produces `()` — admitting it lets `-> Str { while true { } "a" }`, `loop { break }`, and `if c { } else { }` check without modeling value-position statements.
+- **Failure boundary and judgment:** `break <value>`, labeled loops/breaks, `while let`/`for`/`for await`, non-literal conditions, `if` initializers inside unit blocks, and any value-position statement (`x = e`, `f()`, `return e` mid-block) still gate.
+- **Review required:** The unit-only rule is load-bearing — a `break "a"` must not reach the `Str` group; verified by `str_loop_break_value` staying `Unsupported`.
+- **Planned verification matrix:** Driver gains `str_while_stmt`, `str_loop_break`, `str_if_stmt`, `str_while_local_break` (supported-clean) plus `str_loop_break_value`, `str_while_int_cond`, `str_labeled_loop` (gated); CLI adds `str_while_stmt` and `str_loop_break` success cases.
+- **Verification:** Pinned Rust 1.99.1, focused driver test and CLI suite pass; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** `break 'outer`/`continue 'outer` gate on the label — the bounded walk cannot correlate exits to their loop targets; statement `if` without `else` gates.
+- **Remaining scope:** `Str` locals from non-literal/non-group/non-if initializers (needs `Str` in `LocalType`), `break <Str>`/`loop` expression values, `match` tails/initializers for `Str` (needs a matchable scrutinee), tuple/index tails, `if let`/`while let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, multi-owner CLI coverage (Stage 0).

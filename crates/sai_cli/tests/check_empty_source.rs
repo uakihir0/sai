@@ -4639,6 +4639,8 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
         "pub fn str_nested_block_local() -> Str {\n    { let v = \"a\"\n    v }\n}\n",
         "pub fn str_assert() -> Str {\n    assert true\n    \"a\"\n}\n",
         "pub fn str_if_init() -> Str {\n    let s = if true { \"a\" } else { \"b\" }\n    s\n}\n",
+        "pub fn str_while_stmt() -> Str {\n    while true { }\n    \"a\"\n}\n",
+        "pub fn str_loop_break() -> Str {\n    loop { break }\n    \"a\"\n}\n",
         "pub fn answer() -> I32 { 42 }\n",
         "pub fn ready() -> Bool { true }\n",
         "pub fn letter() -> Char { 'z' }\n",
