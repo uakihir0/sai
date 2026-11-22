@@ -13809,6 +13809,29 @@ fn str_break_value(
         };
         return Ok(Some((false, value_diagnostics)));
     }
+    // `break if`/`break match` values reuse the tail walker: a supported
+    // tail is a clean `Str` yield only when it produced no diagnostics.
+    if matches!(value.kind, ExprKind::If { .. } | ExprKind::Match { .. }) {
+        let Some(value_diagnostics) = check_function_str_tail(
+            owner,
+            return_ty,
+            value,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        // A supported `if`/`match` tail contributes a `Str` value even when
+        // it carries recoverable diagnostics — the same `expected Str`
+        // mismatches the checker reports under expected-type propagation.
+        return Ok(Some((true, value_diagnostics)));
+    }
     Ok(None)
 }
 
@@ -51462,6 +51485,12 @@ property "shared"() {}
             "pub fn str_match_bool_guard() -> Str {\n    let s = \"a\"\n    match s { \"x\" if true => \"y\", _ => \"z\" }\n}\n",
             "pub fn str_match_guarded_catch() -> Str {\n    let s = \"a\"\n    match s { \"x\" => \"y\", _ if true => \"z\" }\n}\n",
             "pub fn str_match_expr_guard() -> Str {\n    let s = \"a\"\n    match s { \"x\" if s == \"x\" => \"y\", _ => \"z\" }\n}\n",
+            "pub fn str_loop_break_if() -> Str {\n    loop { break if true { \"a\" } else { \"b\" } }\n}\n",
+            "pub fn str_loop_break_match() -> Str {\n    let s = \"a\"\n    loop { break match s { \"x\" => \"y\", _ => \"z\" } }\n}\n",
+            "pub fn str_loop_break_match_init() -> Str {\n    let s = \"a\"\n    let m = loop { break match s { \"x\" => \"y\", _ => \"z\" } }\n    m\n}\n",
+            "pub fn str_loop_break_match_mixed() -> Str {\n    let s = \"a\"\n    let m = loop { break match s { \"x\" => 1, _ => \"z\" } }\n    m\n}\n",
+            "pub fn str_loop_break_if_init() -> Str {\n    let m = loop { break if true { \"a\" } else { \"b\" } }\n    m\n}\n",
+            "pub fn str_loop_break_if_stmts() -> Str {\n    loop { break if true { let t = \"x\"\n    t } else { \"b\" } }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51477,7 +51506,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 73);
+        assert_eq!(resolved.owners().len(), 79);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -51492,6 +51521,8 @@ property "shared"() {}
             .chain(&resolved.owners()[63..64])
             .chain(&resolved.owners()[66..68])
             .chain(&resolved.owners()[70..71])
+            .chain(&resolved.owners()[73..76])
+            .chain(&resolved.owners()[77..])
         {
             assert!(matches!(
                 owner
@@ -51500,7 +51531,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [4, 21, 37, 51, 61, 68] {
+        for index in [4, 21, 37, 51, 61, 68, 76] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
                 .expect("Str mismatch body check succeeds");
@@ -51539,7 +51570,7 @@ property "shared"() {}
             .chain(&resolved.owners()[54..57])
             .chain(&resolved.owners()[64..66])
             .chain(&resolved.owners()[69..70])
-            .chain(&resolved.owners()[72..])
+            .chain(&resolved.owners()[72..73])
         {
             assert!(matches!(
                 owner
