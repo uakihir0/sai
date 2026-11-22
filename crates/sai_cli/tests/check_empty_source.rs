@@ -4645,6 +4645,7 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
         "pub fn str_loop_init() -> Str {\n    let s = loop { break \"a\" }\n    s\n}\n",
         "pub fn str_match_tail() -> Str {\n    let s = \"a\"\n    match s { \"x\" => \"y\", _ => \"z\" }\n}\n",
         "pub fn str_match_init() -> Str {\n    let s = \"a\"\n    let m = match s { \"x\" => \"y\", _ => \"z\" }\n    m\n}\n",
+        "pub fn str_match_or() -> Str {\n    let s = \"a\"\n    match s { \"x\" | \"w\" => \"y\", _ => \"z\" }\n}\n",
         "pub fn answer() -> I32 { 42 }\n",
         "pub fn ready() -> Bool { true }\n",
         "pub fn letter() -> Char { 'z' }\n",
