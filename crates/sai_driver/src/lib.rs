@@ -13762,6 +13762,7 @@ fn str_loop_family(
         body,
         locals,
         str_bindings,
+        expected,
         type_paths,
         symbols,
         inputs,
@@ -13817,26 +13818,15 @@ fn str_loop_family(
     }
     // An annotated `let n: I8 = loop { .. }` pins every literal
     // contribution to the annotation like the checker's β seeding — the
-    // scan's default `I64` folds into the expected family with the
-    // annotation's range check.
-    if let Some(expected_family) = expected.and_then(str_prim_family_name)
-        && let Some(primitive) = expected
-    {
+    // scan's default `I64`/`F64` folds into the expected family (the
+    // statement walk already checked the literal against the pin).
+    if let Some(expected_family) = expected.and_then(str_prim_family_name) {
         for (family, value, _) in resolved.iter_mut() {
             let Some(expr) = *value else { continue };
-            if *family != Some("`I64`") || !matches!(expr.kind, ExprKind::Lit(_)) {
+            if !matches!(*family, Some("`I64`") | Some("`F64`"))
+                || !matches!(expr.kind, ExprKind::Lit(_))
+            {
                 continue;
-            }
-            if let Some(mut literal_diagnostics) = check_const_literal_against_type(
-                owner.id,
-                ConstLiteralType::Primitive(primitive),
-                expr,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
-            )? {
-                diagnostics.append(&mut literal_diagnostics);
             }
             *family = Some(expected_family);
         }
@@ -14256,6 +14246,7 @@ fn check_function_str_local_block(
                             expr,
                             locals,
                             str_bindings,
+                            None,
                             type_paths,
                             symbols,
                             inputs,
@@ -14277,6 +14268,7 @@ fn check_function_str_local_block(
                     expr,
                     locals,
                     str_bindings,
+                    None,
                     type_paths,
                     symbols,
                     inputs,
@@ -14707,6 +14699,7 @@ fn str_stmt_expr_unit(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    expected: Option<sai_resolve::prelude::PrimTy>,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -14740,6 +14733,7 @@ fn str_stmt_expr_unit(
                 then,
                 locals,
                 str_bindings,
+                expected,
                 type_paths,
                 symbols,
                 inputs,
@@ -14762,6 +14756,7 @@ fn str_stmt_expr_unit(
                         else_block,
                         locals,
                         str_bindings,
+                        expected,
                         type_paths,
                         symbols,
                         inputs,
@@ -14782,6 +14777,7 @@ fn str_stmt_expr_unit(
                         els,
                         locals,
                         str_bindings,
+                        expected,
                         type_paths,
                         symbols,
                         inputs,
@@ -14815,6 +14811,7 @@ fn str_stmt_expr_unit(
                     body,
                     locals,
                     str_bindings,
+                    expected,
                     type_paths,
                     symbols,
                     inputs,
@@ -14917,6 +14914,7 @@ fn str_stmt_expr_unit(
                 body,
                 locals,
                 str_bindings,
+                expected,
                 type_paths,
                 symbols,
                 inputs,
@@ -14975,11 +14973,16 @@ fn str_stmt_expr_unit(
                     (StrStmtLoopFrame::Loop, Some(value)) => match value.kind {
                         ExprKind::Lit(Lit::Str(_)) => Ok(Some(Vec::new())),
                         ExprKind::Lit(literal) => {
-                            // A scalar break literal defaults like the
-                            // checker's unresolved literal (`I64`/`F64`) —
-                            // an out-of-range literal still reports its
-                            // range error.
-                            let Some(literal_type) = str_scalar_literal_default(literal) else {
+                            // A scalar break literal checks against the
+                            // enclosing loop's expected type when the
+                            // initializer pins one (`let n: I8 = loop {
+                            // break 200 }` -> out of range), else it
+                            // defaults like the checker's unresolved
+                            // literal (`I64`/`F64`).
+                            let Some(literal_type) = expected
+                                .map(ConstLiteralType::Primitive)
+                                .or_else(|| str_scalar_literal_default(literal))
+                            else {
                                 return Ok(None);
                             };
                             check_const_literal_against_type(
@@ -14999,7 +15002,7 @@ fn str_stmt_expr_unit(
                             value,
                             locals,
                             str_bindings,
-                            None,
+                            expected,
                             type_paths,
                             symbols,
                             inputs,
@@ -15587,6 +15590,7 @@ fn str_stmt_block_unit(
     block: &sai_hir::expressions::Block<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    expected: Option<sai_resolve::prelude::PrimTy>,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -15726,6 +15730,7 @@ fn str_stmt_block_unit(
                     expr,
                     locals,
                     &inner_bindings,
+                    expected,
                     type_paths,
                     symbols,
                     inputs,
@@ -15749,6 +15754,7 @@ fn str_stmt_block_unit(
             tail,
             locals,
             &inner_bindings,
+            expected,
             type_paths,
             symbols,
             inputs,
@@ -16042,6 +16048,7 @@ fn str_loop_level_expr(
             expr,
             locals,
             str_bindings,
+            None,
             type_paths,
             symbols,
             inputs,
@@ -16701,6 +16708,7 @@ fn check_function_str_tail(
             body,
             locals,
             str_bindings,
+            None,
             type_paths,
             symbols,
             inputs,
@@ -54289,6 +54297,9 @@ property "shared"() {}
             "pub fn str_ann_i8_loop_break_lit_oob() -> Str {\n    let n: I8 = loop {\n        break 200\n    }\n    \"a\"\n}\n",
             "pub fn str_match_i8_ann_init() -> Str {\n    let s = \"a\"\n    let m: I8 = match s {\n        \"x\" => 1,\n        _ => 2,\n    }\n    \"a\"\n}\n",
             "pub fn str_match_ann_i8_arm_mismatch() -> Str {\n    let s = \"a\"\n    let m: I8 = match s {\n        \"x\" => 1,\n        _ => \"a\",\n    }\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_loop_break_block_oob() -> Str {\n    let n: I8 = loop {\n        break {\n            200\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_ann_f32_loop_break_float() -> Str {\n    let n: F32 = loop {\n        break 1.0\n    }\n    \"a\"\n}\n",
+            "pub fn str_ann_u64_loop_break_int() -> Str {\n    let n: U64 = loop {\n        break 9223372036854775808\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54304,7 +54315,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 155);
+        assert_eq!(resolved.owners().len(), 158);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54343,6 +54354,7 @@ property "shared"() {}
             .chain(&resolved.owners()[145..147])
             .chain(&resolved.owners()[149..152])
             .chain(&resolved.owners()[153..154])
+            .chain(&resolved.owners()[156..158])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54398,6 +54410,7 @@ property "shared"() {}
             (143, sai_diagnostics::Code::TypeMismatch),
             (152, sai_diagnostics::Code::LiteralOutOfRange),
             (154, sai_diagnostics::Code::TypeMismatch),
+            (155, sai_diagnostics::Code::LiteralOutOfRange),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
