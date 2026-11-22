@@ -13714,9 +13714,13 @@ fn check_function_str_local_block(
         str_bindings.insert(binding);
     }
     let Some(tail) = block.tail else {
-        // A block without a tail yields `()` — the tail unification
-        // reports `expected `Str`, found `()` like the checker's
-        // MISSING_RETURN_VALUE / branch mismatch.
+        // A block without a tail yields `!` when a statement diverges
+        // (`return`, `break`, `continue`, an endless `loop`, ...); `!`
+        // unifies with `Str`. Otherwise it yields `()` — the tail
+        // unification reports `expected `Str`, found `()``.
+        if str_block_diverges(block) {
+            return Ok(Some(diagnostics));
+        }
         diagnostics.push(const_literal_diagnostic(
             owner.id,
             inputs,
@@ -13925,7 +13929,16 @@ fn str_stmt_expr_unit(
                 str_stmt_loop_break_families(body, locals, str_bindings, &mut contributions);
                 if let Some((first_family, _)) = contributions.first().copied() {
                     for (family, span) in contributions.iter().skip(1) {
-                        if *family != first_family {
+                        if *family == first_family {
+                            continue;
+                        }
+                        if first_family == "`()`" || *family == "`()`" {
+                            // A bare `break` unifies β with `()`: mixing it
+                            // with a valued `break` is the checker's
+                            // INVALID_BREAK_VALUE, not a type mismatch.
+                            diagnostics
+                                .push(str_invalid_break_value(owner, *span, inputs, snapshot)?);
+                        } else {
                             diagnostics.push(const_literal_diagnostic(
                                 owner.id,
                                 inputs,
@@ -14152,6 +14165,69 @@ fn str_stmt_break_families_expr(
         }
         _ => {}
     }
+}
+
+// Whether an expression diverges (`!`): `return`/`break`/`continue`, a
+// `loop` no unlabeled break can reach, an `if` whose both branches
+// diverge, a `match` whose arms all diverge, or a nested diverging
+// block. A diverging block yields `!`, which unifies with `Str` — no
+// `expected `Str`, found `()`` tail diagnostic.
+fn str_expr_diverges(expr: &HirExpr<'_>) -> bool {
+    match expr.kind {
+        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
+        ExprKind::Loop {
+            body,
+            source: LoopSource::Loop,
+            ..
+        } => !str_loop_body_has_break(body),
+        ExprKind::Loop {
+            source: LoopSource::While,
+            ..
+        } => false,
+        ExprKind::If { then, els, .. } => {
+            str_block_diverges(then) && els.is_some_and(|els| str_expr_diverges(els))
+        }
+        ExprKind::Block(inner) => str_block_diverges(inner),
+        ExprKind::Match { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|arm| str_expr_diverges(arm.body))
+        }
+        _ => false,
+    }
+}
+
+// Whether a `loop` body contains any unlabeled `break` at its own frame
+// (if branches and return values still target it; nested loops carry
+// their own).
+fn str_loop_body_has_break(block: &sai_hir::expressions::Block<'_>) -> bool {
+    fn expr_has_break(expr: &HirExpr<'_>) -> bool {
+        match expr.kind {
+            ExprKind::Break { label: None, .. } => true,
+            ExprKind::Break { .. } => false,
+            ExprKind::If { then, els, .. } => {
+                str_loop_body_has_break(then)
+                    || els.is_some_and(|els| match els.kind {
+                        ExprKind::Block(else_block) => str_loop_body_has_break(else_block),
+                        ExprKind::If { .. } => expr_has_break(els),
+                        _ => false,
+                    })
+            }
+            ExprKind::Return(Some(value)) => expr_has_break(value),
+            _ => false,
+        }
+    }
+    block
+        .stmts
+        .iter()
+        .any(|stmt| matches!(stmt.kind, sai_hir::expressions::StmtKind::Expr(expr) if expr_has_break(expr)))
+        || block.tail.is_some_and(|tail| expr_has_break(tail))
+}
+
+fn str_block_diverges(block: &sai_hir::expressions::Block<'_>) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|stmt| matches!(stmt.kind, sai_hir::expressions::StmtKind::Expr(expr) if str_expr_diverges(expr)))
+        || block.tail.is_some_and(|tail| str_expr_diverges(tail))
 }
 
 // A statement-only block: every statement must be an admitted `Str`
@@ -52696,6 +52772,9 @@ property "shared"() {}
             "pub fn str_break_if_while_ctx() -> Str {\n    loop { break if true { while true {} } else { \"a\" }\n    break \"z\" }\n}\n",
             "pub fn str_loop_break_unit_then_value() -> Str {\n    loop { break\n    break \"a\" }\n    \"a\"\n}\n",
             "pub fn str_if_tail_break() -> Str {\n    if true { break } else { \"a\" }\n}\n",
+            "pub fn str_return_diverging_block() -> Str {\n    return \"a\"\n    let s = \"b\"\n}\n",
+            "pub fn str_loop_break_value_then_unit() -> Str {\n    loop { break \"a\"\n    break }\n    \"a\"\n}\n",
+            "pub fn str_while_body_no_tail() -> Str {\n    while true {}\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -52711,7 +52790,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 108);
+        assert_eq!(resolved.owners().len(), 111);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -52733,6 +52812,7 @@ property "shared"() {}
             .chain(&resolved.owners()[91..97])
             .chain(&resolved.owners()[98..100])
             .chain(&resolved.owners()[104..105])
+            .chain(&resolved.owners()[108..109])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -52748,7 +52828,7 @@ property "shared"() {}
             );
         }
         for index in [
-            4, 17, 21, 28, 32, 33, 37, 38, 46, 51, 61, 68, 76, 86, 90, 97, 102, 105, 106,
+            4, 17, 21, 28, 32, 33, 37, 38, 46, 51, 61, 68, 76, 86, 90, 97, 102, 105, 110,
         ] {
             let mismatch = resolved.owners()[index]
                 .body_type_check()
@@ -52769,7 +52849,9 @@ property "shared"() {}
             (100, sai_diagnostics::Code::BreakOutsideLoop),
             (101, sai_diagnostics::Code::ContinueOutsideLoop),
             (103, sai_diagnostics::Code::LiteralOutOfRange),
+            (106, sai_diagnostics::Code::InvalidBreakValue),
             (107, sai_diagnostics::Code::BreakOutsideLoop),
+            (109, sai_diagnostics::Code::InvalidBreakValue),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
