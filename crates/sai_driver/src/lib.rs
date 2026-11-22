@@ -14397,9 +14397,15 @@ fn str_condition(
         target_cfg,
     )? {
         // Compound value shapes (`if`/`match`) already reported the
-        // offending branch against the `Bool` expectation — only a bare
-        // family mismatch on a quiet walk adds the operand diagnostic.
-        if family != "`Bool`" && family != "`!`" && value_diagnostics.is_empty() {
+        // offending branch against the `Bool` expectation — a
+        // type-mismatch free walk (pattern errors only) still needs the
+        // operand diagnostic.
+        if family != "`Bool`"
+            && family != "`!`"
+            && !value_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+        {
             value_diagnostics.push(const_literal_diagnostic(
                 owner.id,
                 inputs,
