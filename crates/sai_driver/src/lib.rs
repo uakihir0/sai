@@ -13287,23 +13287,25 @@ fn check_function_str_local_block(
                 diagnostics.append(&mut else_diagnostics);
             }
             // `let s = loop { break <Str> }` seeds β from break values.
+            // The initializer needs a clean `Str` yield — an all-scalar
+            // `loop` binds a non-`Str` local the walk cannot model.
             ExprKind::Loop {
                 body,
                 label: None,
                 source: LoopSource::Loop,
             } => {
-                let mut inner_bindings = str_bindings.clone();
                 let Some(mut loop_diagnostics) = str_loop_str_body(
                     owner,
                     return_ty,
                     body,
-                    &mut inner_bindings,
+                    str_bindings,
                     locals,
                     type_paths,
                     symbols,
                     inputs,
                     snapshot,
                     target_cfg,
+                    true,
                 )?
                 else {
                     return Ok(None);
@@ -13471,13 +13473,14 @@ fn str_stmt_block_is_unit(
     })
 }
 
-// A `loop` body that yields `Str`: statements follow the unit-block rules
-// (`Str` `let`s with literal or group-path initializers, asserts, unit
-// expressions) plus `break <Str>` — a `Str` literal, a group path, or a
-// scalar literal producing the recoverable mismatch diagnostic. At least
-// one `Str`-typed break must exist for the loop to yield `Str`; the cloned
-// binding set keeps `let`s scoped to the loop body.
-fn str_loop_str_body(
+// One level of a `Str`-yielding `loop` body: statements follow the `Str`
+// `let`/assert rules; expression statements and the tail may be unit
+// control flow or `break <value>` contributions to the enclosing loop's
+// β. `if` blocks recurse into this level (their breaks target the same
+// loop); nested loops are checked as unit (their breaks are their own).
+// Returns `(clean_yield, any_break, diagnostics)`: `clean_yield` means at
+// least one break produced a `Str` value without diagnostics.
+fn str_loop_level_block(
     owner: &HirOwner<'_>,
     return_ty: Ty<'_>,
     block: &sai_hir::expressions::Block<'_>,
@@ -13488,12 +13491,13 @@ fn str_loop_str_body(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
-) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+) -> Result<Option<(bool, bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     if block.safety != sai_hir::Safety::Safe {
         return Ok(None);
     }
     let mut diagnostics = Vec::new();
-    let mut yields_str = false;
+    let mut clean_yield = false;
+    let mut any_break = false;
     for stmt in block.stmts {
         match stmt.kind {
             sai_hir::expressions::StmtKind::Assert { cond, msg, .. } => {
@@ -13533,52 +13537,11 @@ fn str_loop_str_body(
                 };
                 str_bindings.insert(binding);
             }
-            sai_hir::expressions::StmtKind::Expr(expr) => match expr.kind {
-                ExprKind::Break {
-                    label: None,
-                    value: Some(value),
-                } => {
-                    let Some((yields, mut value_diagnostics)) = str_break_value(
-                        owner,
-                        return_ty,
-                        value,
-                        str_bindings,
-                        locals,
-                        type_paths,
-                        symbols,
-                        inputs,
-                        snapshot,
-                        target_cfg,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    yields_str |= yields;
-                    diagnostics.append(&mut value_diagnostics);
-                }
-                _ if str_stmt_expr_is_unit(
-                    expr,
-                    locals,
-                    str_bindings,
-                    type_paths,
-                    symbols,
-                    inputs,
-                ) => {}
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
-        }
-    }
-    if let Some(tail) = block.tail {
-        match tail.kind {
-            ExprKind::Break {
-                label: None,
-                value: Some(value),
-            } => {
-                let Some((yields, mut value_diagnostics)) = str_break_value(
+            sai_hir::expressions::StmtKind::Expr(expr) => {
+                let Some((clean, broken, mut expr_diagnostics)) = str_loop_level_expr(
                     owner,
                     return_ty,
-                    value,
+                    expr,
                     str_bindings,
                     locals,
                     type_paths,
@@ -13590,15 +13553,178 @@ fn str_loop_str_body(
                 else {
                     return Ok(None);
                 };
-                yields_str |= yields;
-                diagnostics.append(&mut value_diagnostics);
-            }
-            _ if str_stmt_expr_is_unit(tail, locals, str_bindings, type_paths, symbols, inputs) => {
+                clean_yield |= clean;
+                any_break |= broken;
+                diagnostics.append(&mut expr_diagnostics);
             }
             _ => return Ok(None),
         }
     }
-    if !yields_str {
+    if let Some(tail) = block.tail {
+        let Some((clean, broken, mut tail_diagnostics)) = str_loop_level_expr(
+            owner,
+            return_ty,
+            tail,
+            str_bindings,
+            locals,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        clean_yield |= clean;
+        any_break |= broken;
+        diagnostics.append(&mut tail_diagnostics);
+    }
+    Ok(Some((clean_yield, any_break, diagnostics)))
+}
+
+// One expression at a `loop` level: `if` over a literal `Bool` condition
+// recurses into both branches at this level, a nested `loop`/`while` must
+// be unit, `break <value>` contributes to β through `str_break_value`,
+// and `continue` is neutral. A valueless `break` targets this loop and
+// dilutes β with `()` — it gates rather than silently mixing.
+fn str_loop_level_expr(
+    owner: &HirOwner<'_>,
+    return_ty: Ty<'_>,
+    expr: &HirExpr<'_>,
+    str_bindings: &mut std::collections::HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<(bool, bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
+    match expr.kind {
+        ExprKind::If {
+            cond,
+            then,
+            els: Some(els),
+        } => {
+            let ExprKind::Block(else_block) = els.kind else {
+                return Ok(None);
+            };
+            if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+                || then.safety != sai_hir::Safety::Safe
+                || else_block.safety != sai_hir::Safety::Safe
+            {
+                return Ok(None);
+            }
+            let mut then_bindings = str_bindings.clone();
+            let Some((then_clean, then_broken, mut diagnostics)) = str_loop_level_block(
+                owner,
+                return_ty,
+                then,
+                &mut then_bindings,
+                locals,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            let mut else_bindings = str_bindings.clone();
+            let Some((else_clean, else_broken, mut else_diagnostics)) = str_loop_level_block(
+                owner,
+                return_ty,
+                else_block,
+                &mut else_bindings,
+                locals,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            diagnostics.append(&mut else_diagnostics);
+            Ok(Some((
+                then_clean || else_clean,
+                then_broken || else_broken,
+                diagnostics,
+            )))
+        }
+        ExprKind::Loop {
+            body,
+            label: None,
+            source,
+        } if matches!(source, LoopSource::Loop | LoopSource::While)
+            && str_stmt_block_is_unit(body, locals, str_bindings, type_paths, symbols, inputs) =>
+        {
+            Ok(Some((false, false, Vec::new())))
+        }
+        ExprKind::Break {
+            label: None,
+            value: Some(value),
+        } => {
+            let Some((clean, diagnostics)) = str_break_value(
+                owner,
+                return_ty,
+                value,
+                str_bindings,
+                locals,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some((clean, true, diagnostics)))
+        }
+        ExprKind::Continue { label: None } => Ok(Some((false, false, Vec::new()))),
+        _ => Ok(None),
+    }
+}
+
+// A `loop` body that yields `Str`, checked via `str_loop_level_block`:
+// when `need_clean` is set (a `let` initializer) at least one break must
+// yield a clean `Str` value — an all-scalar loop is a non-`Str`
+// initializer and gates; at tail position any break contribution admits,
+// carrying its diagnostics. The cloned binding set keeps loop-body `let`s
+// scoped to the loop.
+fn str_loop_str_body(
+    owner: &HirOwner<'_>,
+    return_ty: Ty<'_>,
+    block: &sai_hir::expressions::Block<'_>,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    need_clean: bool,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let mut inner_bindings = str_bindings.clone();
+    let Some((clean_yield, any_break, diagnostics)) = str_loop_level_block(
+        owner,
+        return_ty,
+        block,
+        &mut inner_bindings,
+        locals,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !any_break || (need_clean && !clean_yield) {
         return Ok(None);
     }
     Ok(Some(diagnostics))
@@ -13626,6 +13752,9 @@ fn str_break_value(
     {
         return Ok(Some((true, Vec::new())));
     }
+    // Scalar literals count as a break contribution but not a clean `Str`
+    // yield: the recoverable mismatch still surfaces, while a `let`
+    // initializer needs at least one clean yield to seed the group.
     if is_direct_function_scalar_literal(value) {
         let Some(value_diagnostics) = check_const_literal_leaf(
             owner, return_ty, value, type_paths, symbols, inputs, snapshot, target_cfg,
@@ -13633,7 +13762,7 @@ fn str_break_value(
         else {
             return Ok(None);
         };
-        return Ok(Some((true, value_diagnostics)));
+        return Ok(Some((false, value_diagnostics)));
     }
     Ok(None)
 }
@@ -13738,18 +13867,18 @@ fn check_function_str_tail(
         source: LoopSource::Loop,
     } = tail.kind
     {
-        let mut inner_bindings = str_bindings.clone();
         return str_loop_str_body(
             owner,
             return_ty,
             body,
-            &mut inner_bindings,
+            str_bindings,
             locals,
             type_paths,
             symbols,
             inputs,
             snapshot,
             target_cfg,
+            false,
         );
     }
     // `return e` tails check `e` against the `Str` group — bare `return`
@@ -51089,6 +51218,8 @@ property "shared"() {}
             "pub fn str_while_break() -> Str {\n    while true { break \"a\" }\n}\n",
             "pub fn str_loop_nested_break() -> Str {\n    loop { if true { break \"a\" } else { break \"b\" } }\n}\n",
             "pub fn str_loop_no_yield() -> Str {\n    loop { break }\n}\n",
+            "pub fn str_loop_mixed_break() -> Str {\n    loop { if true { break } else { }\n    break \"a\" }\n}\n",
+            "pub fn str_loop_int_init() -> Str {\n    let n = loop { break 1 }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51104,7 +51235,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 55);
+        assert_eq!(resolved.owners().len(), 57);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -51114,6 +51245,7 @@ property "shared"() {}
             .chain(&resolved.owners()[35..37])
             .chain(&resolved.owners()[41..45])
             .chain(&resolved.owners()[48..51])
+            .chain(&resolved.owners()[53..54])
         {
             assert!(matches!(
                 owner
@@ -51143,7 +51275,8 @@ property "shared"() {}
             .chain(&resolved.owners()[32..35])
             .chain(&resolved.owners()[38..41])
             .chain(&resolved.owners()[45..48])
-            .chain(&resolved.owners()[52..])
+            .chain(&resolved.owners()[52..53])
+            .chain(&resolved.owners()[54..])
         {
             assert!(matches!(
                 owner
