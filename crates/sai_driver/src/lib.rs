@@ -13364,6 +13364,8 @@ fn str_expr_family(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -13412,9 +13414,28 @@ fn str_expr_family(
                 return Ok(None);
             };
             diagnostics.append(&mut else_diagnostics);
+            if let Some(pin_family) = expected.and_then(str_prim_family_name) {
+                // Under a pin (`let x: I8 = if`, a `Bool` condition
+                // operand) each branch checks against it like the
+                // checker — `if flag { n } else { false }` reports the
+                // `n` branch as `expected Bool, found I64`, not a
+                // branch-vs-branch join mismatch.
+                for (branch_family, span) in [(then_family, then.span), (else_family, els.span)] {
+                    if branch_family != pin_family && branch_family != "`!`" {
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            span,
+                            sai_diagnostics::Code::TypeMismatch,
+                            format!("expected {pin_family}, found {branch_family}"),
+                            "type mismatch",
+                        )?);
+                    }
+                }
             // A diverging branch yields `!`, which unifies with the other
             // branch's family — only a concrete disagreement reports.
-            if then_family != else_family && then_family != "`!`" && else_family != "`!`" {
+            } else if then_family != else_family && then_family != "`!`" && else_family != "`!`" {
                 diagnostics.push(const_literal_diagnostic(
                     owner.id,
                     inputs,
@@ -13707,11 +13728,6 @@ fn str_match_family(
     let mut bool_cover = (false, false);
     let mut arm_families = Vec::with_capacity(arms.len());
     for arm in arms {
-        if let Some(guard) = arm.guard
-            && !matches!(guard.kind, ExprKind::Lit(Lit::Bool(_)))
-        {
-            return Ok(None);
-        }
         let mut arm_bindings = str_bindings.clone();
         if catch_all {
             diagnostics.push(const_literal_diagnostic(
@@ -13752,6 +13768,26 @@ fn str_match_family(
                 && matches!(arm.pat.kind, PatKind::Wild | PatKind::Binding { .. });
             if let Some(binding) = binding {
                 arm_bindings.insert(binding, scrutinee_family);
+            }
+            // Guards evaluate like `check_if_condition` — the pattern
+            // binding is already seeded (`n if n > 0`).
+            if let Some(guard) = arm.guard {
+                let Some(mut guard_diagnostics) = str_condition(
+                    owner,
+                    guard,
+                    locals,
+                    &arm_bindings,
+                    inputs,
+                    snapshot,
+                    symbols,
+                    target_cfg,
+                    return_ty,
+                    type_paths,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut guard_diagnostics);
             }
         }
         let Some((arm_family, mut arm_diagnostics)) = str_expr_family(
@@ -13934,6 +13970,7 @@ fn str_loop_family(
         symbols,
         inputs,
         &mut contributions,
+        false,
     );
     // A `break` whose value classifies carries its family; an unclassed
     // value gets one pass through the expression walk (`break if`/nested
@@ -14163,6 +14200,8 @@ fn str_condition(
     snapshot: &WorkspaceSnapshot,
     symbols: &Interner,
     target_cfg: &TargetCfg,
+    return_ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
         || str_comparison_condition(cond, locals, str_bindings)
@@ -14300,6 +14339,85 @@ fn str_condition(
             "type mismatch",
         )?]));
     }
+    // `not`/`and`/`or` recurse like `check_logical_operand`: each operand
+    // evaluates as a Bool condition, so `if a and a`, `if not flag`, and
+    // match guards `k if a or b` are supported; a scalar literal or
+    // non-Bool binding operand still reports `expected Bool`.
+    if let ExprKind::Unary(UnOp::Not, operand) = cond.kind {
+        return str_condition(
+            owner,
+            operand,
+            locals,
+            str_bindings,
+            inputs,
+            snapshot,
+            symbols,
+            target_cfg,
+            return_ty,
+            type_paths,
+        );
+    }
+    if let ExprKind::Binary(BinOp::And | BinOp::Or, lhs, rhs) = cond.kind {
+        let mut diagnostics = Vec::new();
+        for operand in [lhs, rhs] {
+            let Some(mut operand_diagnostics) = str_condition(
+                owner,
+                operand,
+                locals,
+                str_bindings,
+                inputs,
+                snapshot,
+                symbols,
+                target_cfg,
+                return_ty,
+                type_paths,
+            )?
+            else {
+                return Ok(None);
+            };
+            diagnostics.append(&mut operand_diagnostics);
+        }
+        return Ok(Some(diagnostics));
+    }
+    // Any other supported value shape is the checker's operand probe —
+    // `check_expr_value(operand, Bool)`: the family resolves against the
+    // `Bool` the condition demands (literal operands check against the
+    // pin) and a non-`Bool` result reports the operand mismatch.
+    if let Some((family, mut value_diagnostics)) = str_expr_family(
+        owner,
+        return_ty,
+        cond,
+        locals,
+        str_bindings,
+        Some(sai_resolve::prelude::PrimTy::Bool),
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )? {
+        // Compound value shapes (`if`/`match`) already reported the
+        // offending branch against the `Bool` expectation — a
+        // type-mismatch free walk (pattern errors only) still needs the
+        // operand diagnostic.
+        if family != "`Bool`"
+            && family != "`!`"
+            && !value_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+        {
+            value_diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                cond.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `Bool`, found {family}"),
+                "type mismatch",
+            )?);
+        }
+        return Ok(Some(value_diagnostics));
+    }
     Ok(None)
 }
 
@@ -14331,6 +14449,8 @@ fn check_function_str_local_block(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -14587,6 +14707,8 @@ fn check_function_str_local_block(
                     snapshot,
                     symbols,
                     target_cfg,
+                    return_ty,
+                    type_paths,
                 )?
                 else {
                     return Ok(None);
@@ -14860,11 +14982,7 @@ fn str_stmt_expr_unit(
     frame: StrStmtLoopFrame,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     match expr.kind {
-        ExprKind::If {
-            cond,
-            then,
-            els: Some(els),
-        } => {
+        ExprKind::If { cond, then, els } => {
             let Some(mut diagnostics) = str_condition(
                 owner,
                 cond,
@@ -14874,6 +14992,8 @@ fn str_stmt_expr_unit(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -14897,54 +15017,60 @@ fn str_stmt_expr_unit(
                 return Ok(None);
             };
             diagnostics.append(&mut then_diagnostics);
-            // `else { ... }` is a unit block; `else if` is itself a unit
-            // statement expression — the recursion checks its own cond.
-            let mut else_diagnostics = match els.kind {
-                ExprKind::Block(else_block) => {
-                    let Some(d) = str_stmt_block_unit(
-                        owner,
-                        return_ty,
-                        else_block,
-                        locals,
-                        str_bindings,
-                        expected,
-                        type_paths,
-                        symbols,
-                        inputs,
-                        snapshot,
-                        target_cfg,
-                        break_ctx,
-                        frame,
-                    )?
-                    else {
-                        return Ok(None);
+            // `check_if_stmt`: no `else` is complete; `else { ... }` is a
+            // unit block; `else if` is itself a unit statement
+            // expression — the recursion checks its own cond.
+            match els {
+                None => {}
+                Some(els) => {
+                    let mut else_diagnostics = match els.kind {
+                        ExprKind::Block(else_block) => {
+                            let Some(d) = str_stmt_block_unit(
+                                owner,
+                                return_ty,
+                                else_block,
+                                locals,
+                                str_bindings,
+                                expected,
+                                type_paths,
+                                symbols,
+                                inputs,
+                                snapshot,
+                                target_cfg,
+                                break_ctx,
+                                frame,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            d
+                        }
+                        ExprKind::If { .. } => {
+                            let Some(d) = str_stmt_expr_unit(
+                                owner,
+                                return_ty,
+                                els,
+                                locals,
+                                str_bindings,
+                                expected,
+                                type_paths,
+                                symbols,
+                                inputs,
+                                snapshot,
+                                target_cfg,
+                                break_ctx,
+                                frame,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            d
+                        }
+                        _ => return Ok(None),
                     };
-                    d
+                    diagnostics.append(&mut else_diagnostics);
                 }
-                ExprKind::If { .. } => {
-                    let Some(d) = str_stmt_expr_unit(
-                        owner,
-                        return_ty,
-                        els,
-                        locals,
-                        str_bindings,
-                        expected,
-                        type_paths,
-                        symbols,
-                        inputs,
-                        snapshot,
-                        target_cfg,
-                        break_ctx,
-                        frame,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    d
-                }
-                _ => return Ok(None),
-            };
-            diagnostics.append(&mut else_diagnostics);
+            }
             Ok(Some(diagnostics))
         }
         // A `loop` body walks at `Loop` frame; the `while` desugaring's
@@ -14990,6 +15116,7 @@ fn str_stmt_expr_unit(
                     symbols,
                     inputs,
                     &mut contributions,
+                    false,
                 );
                 // Unclassed contributions get the same silent expression-
                 // walk pass as `str_loop_family` — the statement walk
@@ -15269,6 +15396,8 @@ fn str_stmt_expr_unit(
                             snapshot,
                             symbols,
                             target_cfg,
+                            return_ty,
+                            type_paths,
                         )?
                         else {
                             return Ok(None);
@@ -15355,6 +15484,10 @@ fn str_stmt_break_family(
     value: Option<&HirExpr<'_>>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    pure: bool,
 ) -> Option<&'static str> {
     let Some(value) = value else {
         return Some("`()`");
@@ -15362,7 +15495,16 @@ fn str_stmt_break_family(
     match value.kind {
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal).or(Some("`ByteStr`")),
-        _ => str_binding_family(value, locals, str_bindings),
+        // `break if`/`match`/`block`/`loop` values classify through the
+        // pure initializer walk like the diagnostic `str_break_value` —
+        // only in the pure scan: the diagnostic walk's contributions
+        // carry pin-adjusted families from `str_break_value` instead.
+        _ => str_binding_family(value, locals, str_bindings).or_else(|| {
+            pure.then(|| {
+                str_pure_init_family(value, locals, str_bindings, type_paths, symbols, inputs)
+            })
+            .flatten()
+        }),
     }
 }
 
@@ -15378,6 +15520,7 @@ fn str_stmt_loop_break_families<'h>(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     out: &mut Vec<(Option<&'static str>, Option<&'h HirExpr<'h>>, sai_hir::Span)>,
+    pure: bool,
 ) {
     // `let` bindings declared in this block scope the following
     // statements' contributions — a scalar local's `break n` carries its
@@ -15420,15 +15563,54 @@ fn str_stmt_loop_break_families<'h>(
                     local.insert(binding, family);
                 }
             }
-            sai_hir::expressions::StmtKind::Expr(expr) => {
-                str_stmt_break_families_expr(expr, locals, &local, type_paths, symbols, inputs, out)
-            }
+            sai_hir::expressions::StmtKind::Expr(expr) => str_stmt_break_families_expr(
+                expr, locals, &local, type_paths, symbols, inputs, out, pure,
+            ),
             _ => {}
         }
     }
     if let Some(tail) = block.tail {
-        str_stmt_break_families_expr(tail, locals, &local, type_paths, symbols, inputs, out);
+        str_stmt_break_families_expr(tail, locals, &local, type_paths, symbols, inputs, out, pure);
     }
+}
+
+// The diagnostic-free counterpart of `str_condition`'s admission: any
+// literal (a `Lit::Bool` is clean, other literals are the checker's
+// recoverable `expected Bool`), a comparison shape, or a comparison
+// binary whose operands both classify — everything else gates.
+fn str_pure_condition(
+    cond: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    if matches!(cond.kind, ExprKind::Lit(_)) {
+        return true;
+    }
+    if str_comparison_condition(cond, locals, str_bindings) {
+        return true;
+    }
+    if let ExprKind::Binary(
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+        lhs,
+        rhs,
+    ) = cond.kind
+    {
+        return str_condition_operand_family(lhs, locals, str_bindings).is_some()
+            && str_condition_operand_family(rhs, locals, str_bindings).is_some();
+    }
+    if let ExprKind::Unary(UnOp::Not, operand) = cond.kind {
+        return str_pure_condition(operand, locals, str_bindings, type_paths, symbols, inputs);
+    }
+    if let ExprKind::Binary(BinOp::And | BinOp::Or, lhs, rhs) = cond.kind {
+        return str_pure_condition(lhs, locals, str_bindings, type_paths, symbols, inputs)
+            && str_pure_condition(rhs, locals, str_bindings, type_paths, symbols, inputs);
+    }
+    // The diagnostic twin evaluates any supported value shape through
+    // the operand probe — only the admission matters here.
+    str_pure_init_family(cond, locals, str_bindings, type_paths, symbols, inputs).is_some()
 }
 
 // The family a `let` initializer binds without running the diagnostic
@@ -15485,6 +15667,7 @@ fn str_pure_init_family(
                 symbols,
                 inputs,
                 &mut contributions,
+                true,
             );
             // The same literal-vs-pin fold as the diagnostic walk, minus
             // diagnostics — the statement walk emits those itself.
@@ -15502,7 +15685,7 @@ fn str_pure_init_family(
             prims.dedup();
             if let [prim] = prims.as_slice() {
                 for (family, value, _) in contributions.iter_mut() {
-                    if *family == Some("`I64`")
+                    if matches!(*family, Some("`I64`") | Some("`F64`"))
                         && matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_)))
                     {
                         *family = Some(*prim);
@@ -15513,12 +15696,10 @@ fn str_pure_init_family(
                 .iter()
                 .filter_map(|contribution| contribution.0)
                 .filter(|family| *family != "`!`");
-            let first = families.next()?;
-            if families.any(|family| family != first) {
-                None
-            } else {
-                Some(first)
-            }
+            // Any classed contribution admits the loop — a family
+            // disagreement is the diagnostic walk's fold mismatch, not
+            // a gate.
+            families.next()
         }
         ExprKind::Match {
             scrutinee,
@@ -15574,11 +15755,6 @@ fn str_pure_match_family(
     let mut arm_families: Vec<(Option<&'static str>, Option<&HirExpr<'_>>, sai_hir::Span)> =
         Vec::with_capacity(arms.len());
     for arm in arms {
-        if let Some(guard) = arm.guard
-            && !matches!(guard.kind, ExprKind::Lit(Lit::Bool(_)))
-        {
-            return None;
-        }
         let mut arm_bindings = str_bindings.clone();
         if catch_all {
             if let PatKind::Binding {
@@ -15633,6 +15809,11 @@ fn str_pure_match_family(
                 }
                 _ => return None,
             }
+            if let Some(guard) = arm.guard
+                && !str_pure_condition(guard, locals, &arm_bindings, type_paths, symbols, inputs)
+            {
+                return None;
+            }
         }
         let arm_family =
             str_pure_init_family(arm.body, locals, &arm_bindings, type_paths, symbols, inputs)?;
@@ -15653,7 +15834,9 @@ fn str_pure_match_family(
     prims.dedup();
     if let [prim] = prims.as_slice() {
         for (family, value, _) in arm_families.iter_mut() {
-            if *family == Some("`I64`") && matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_))) {
+            if matches!(*family, Some("`I64`") | Some("`F64`"))
+                && matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_)))
+            {
                 *family = Some(*prim);
             }
         }
@@ -15720,11 +15903,20 @@ fn str_stmt_break_families_expr<'h>(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     out: &mut Vec<(Option<&'static str>, Option<&'h HirExpr<'h>>, sai_hir::Span)>,
+    pure: bool,
 ) {
     match expr.kind {
         ExprKind::Break { label: None, value } => {
             out.push((
-                str_stmt_break_family(value, locals, str_bindings),
+                str_stmt_break_family(
+                    value,
+                    locals,
+                    str_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    pure,
+                ),
                 value,
                 value.map(|v| v.span).unwrap_or(expr.span),
             ));
@@ -15738,6 +15930,7 @@ fn str_stmt_break_families_expr<'h>(
                 symbols,
                 inputs,
                 out,
+                pure,
             );
             if let Some(els) = els {
                 match els.kind {
@@ -15749,6 +15942,7 @@ fn str_stmt_break_families_expr<'h>(
                         symbols,
                         inputs,
                         out,
+                        pure,
                     ),
                     ExprKind::If { .. } => str_stmt_break_families_expr(
                         els,
@@ -15758,6 +15952,7 @@ fn str_stmt_break_families_expr<'h>(
                         symbols,
                         inputs,
                         out,
+                        pure,
                     ),
                     _ => {}
                 }
@@ -15772,6 +15967,7 @@ fn str_stmt_break_families_expr<'h>(
                 symbols,
                 inputs,
                 out,
+                pure,
             );
         }
         ExprKind::Block(inner) => str_stmt_loop_break_families(
@@ -15782,6 +15978,7 @@ fn str_stmt_break_families_expr<'h>(
             symbols,
             inputs,
             out,
+            pure,
         ),
         ExprKind::Match {
             scrutinee, arms, ..
@@ -15814,6 +16011,7 @@ fn str_stmt_break_families_expr<'h>(
                     symbols,
                     inputs,
                     out,
+                    pure,
                 );
             }
         }
@@ -15924,6 +16122,8 @@ fn str_stmt_block_unit(
                     snapshot,
                     symbols,
                     target_cfg,
+                    return_ty,
+                    type_paths,
                 )?
                 else {
                     return Ok(None);
@@ -16116,6 +16316,8 @@ fn str_loop_level_block(
                     snapshot,
                     symbols,
                     target_cfg,
+                    return_ty,
+                    type_paths,
                 )?
                 else {
                     return Ok(None);
@@ -16258,16 +16460,18 @@ fn str_loop_level_expr(
     target_cfg: &TargetCfg,
 ) -> Result<Option<(bool, bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     match expr.kind {
-        ExprKind::If {
-            cond,
-            then,
-            els: Some(els),
-        } => {
-            let else_block = match els.kind {
-                ExprKind::Block(block) => Some(block),
-                // `else if` nests the next `if` — recurse at loop level.
-                ExprKind::If { .. } => None,
-                _ => return Ok(None),
+        ExprKind::If { cond, then, els } => {
+            // `check_if_stmt` admits `els: None` — the missing else just
+            // continues the loop with no contribution.
+            let else_block = match els {
+                None => None,
+                Some(els) => match els.kind {
+                    ExprKind::Block(block) => Some(block),
+                    // `else if` nests the next `if` — recurse at loop
+                    // level through the synthetic `if` expression below.
+                    ExprKind::If { .. } => None,
+                    _ => return Ok(None),
+                },
             };
             let Some(mut cond_diagnostics) = str_condition(
                 owner,
@@ -16278,6 +16482,8 @@ fn str_loop_level_expr(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -16305,12 +16511,14 @@ fn str_loop_level_expr(
             };
             diagnostics.append(&mut cond_diagnostics);
             let mut else_bindings = str_bindings.clone();
-            let (else_clean, else_broken, mut else_diagnostics) =
-                if let Some(else_block) = else_block {
+            let (else_clean, else_broken, mut else_diagnostics) = match els {
+                // No `else` — the loop continues with no contribution.
+                None => (false, false, Vec::new()),
+                Some(_) if else_block.is_some() => {
                     let Some(t) = str_loop_level_block(
                         owner,
                         return_ty,
-                        else_block,
+                        else_block.unwrap(),
                         &mut else_bindings,
                         locals,
                         type_paths,
@@ -16323,7 +16531,9 @@ fn str_loop_level_expr(
                         return Ok(None);
                     };
                     t
-                } else {
+                }
+                // `else if` — recurse at loop level.
+                Some(els) => {
                     let Some(t) = str_loop_level_expr(
                         owner,
                         return_ty,
@@ -16340,7 +16550,8 @@ fn str_loop_level_expr(
                         return Ok(None);
                     };
                     t
-                };
+                }
+            };
             diagnostics.append(&mut else_diagnostics);
             Ok(Some((
                 then_clean || else_clean,
@@ -16726,6 +16937,8 @@ fn check_function_str_match(
                 snapshot,
                 symbols,
                 target_cfg,
+                return_ty,
+                type_paths,
             )?
             else {
                 return Ok(None);
@@ -16857,6 +17070,8 @@ fn check_function_str_tail(
             snapshot,
             symbols,
             target_cfg,
+            return_ty,
+            type_paths,
         )?
         else {
             return Ok(None);
@@ -54610,6 +54825,25 @@ property "shared"() {}
             "pub fn str_scalar_match_stmt_unreachable() -> Str {\n    let n = 1\n    match n {\n        _ => {\n        }\n        2 => {\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_match_stmt_let() -> Str {\n    let n = 1\n    match n {\n        1 => {\n            let m = n\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_match_stmt_guard() -> Str {\n    let n = 1\n    match n {\n        1 if true => {\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_guard_cmp() -> Str {\n    let n = 1\n    match n {\n        1 if n == 1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_guard_binding() -> Str {\n    let n = 1\n    match n {\n        k if n > 0 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_guard_mismatch() -> Str {\n    let n = 1\n    match n {\n        1 if n == \"x\" => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_guard_lit() -> Str {\n    let n = 1\n    match n {\n        1 if 1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_guard_loop_seed() -> Str {\n    let n = 1\n    let m = loop {\n        let t = match n {\n            1 if n == 1 => 1,\n            _ => 2,\n        }\n        break t\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_guard_add() -> Str {\n    let n = 1\n    match n {\n        1 if n + 1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_cond_and() -> Str {\n    let a = true\n    if a and a {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_not() -> Str {\n    let a = true\n    if not a {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_or() -> Str {\n    let a = true\n    while a or a {\n        break\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_guard_and() -> Str {\n    let n = 1\n    let a = true\n    match n {\n        1 if a and true => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_cond_and_lit() -> Str {\n    let a = true\n    if a and 1 {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_not_str() -> Str {\n    let a = true\n    if not \"s\" {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_and_gate() -> Str {\n    let a = true\n    if a and 1 + 2 {\n    }\n    \"a\"\n}\n",
+            "pub fn str_loop_if_no_else() -> Str {\n    let flag = true\n    loop {\n        if not flag {\n        }\n        break \"ok\"\n    }\n}\n",
+            "pub fn str_scalar_cond_and_if() -> Str {\n    let a = true\n    if a and if a { true } else { a } {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_if_tm() -> Str {\n    let a = true\n    if a and if a { 1 } else { true } {\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_guard_if() -> Str {\n    let n = 1\n    let a = true\n    match n {\n        1 if if a { true } else { a } => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_loop_match_guard_loop() -> Str {\n    let n = 1\n    let flag = true\n    loop {\n        let t = match n {\n            1 if loop {\n                break if flag {\n                    true\n                } else {\n                    false\n                }\n            } => 1,\n            _ => 2,\n        }\n        break t\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_cond_if_branch_tm() -> Str {\n    let a = true\n    let n = 1\n    if a and if a { n } else { true } {\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54625,7 +54859,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 179);
+        assert_eq!(resolved.owners().len(), 198);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54669,6 +54903,13 @@ property "shared"() {}
             .chain(&resolved.owners()[170..171])
             .chain(&resolved.owners()[171..173])
             .chain(&resolved.owners()[177..179])
+            .chain(&resolved.owners()[179..181])
+            .chain(&resolved.owners()[183..184])
+            .chain(&resolved.owners()[185..189])
+            .chain(&resolved.owners()[192..193])
+            .chain(&resolved.owners()[193..194])
+            .chain(&resolved.owners()[195..196])
+            .chain(&resolved.owners()[196..197])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54733,6 +54974,12 @@ property "shared"() {}
             (174, sai_diagnostics::Code::NonExhaustiveMatch),
             (175, sai_diagnostics::Code::TypeMismatch),
             (176, sai_diagnostics::Code::UnreachablePattern),
+            (181, sai_diagnostics::Code::TypeMismatch),
+            (182, sai_diagnostics::Code::TypeMismatch),
+            (189, sai_diagnostics::Code::TypeMismatch),
+            (190, sai_diagnostics::Code::TypeMismatch),
+            (194, sai_diagnostics::Code::TypeMismatch),
+            (197, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -54817,6 +55064,8 @@ property "shared"() {}
             .chain(&resolved.owners()[69..70])
             .chain(&resolved.owners()[168..169])
             .chain(&resolved.owners()[173..174])
+            .chain(&resolved.owners()[184..185])
+            .chain(&resolved.owners()[191..192])
         {
             assert!(matches!(
                 owner

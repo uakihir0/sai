@@ -10313,3 +10313,33 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** driver fixture test green on the pinned toolchain.
 - **Hostile review:** arm bodies run at the caller's `frame`/`break_ctx`, so `break` inside an arm inside a `loop` still targets that loop; the per-arm binding clone keeps pattern variables scoped.
 - **Remaining scope:** scalar scrutinee parameters, `Str` in `LocalType`, `for`/`if let`/`while let`, full guard expressions in the family walk, multi-owner lowering.
+
+### IR-1108 (2026-11-23): real guard expressions in match arms (`-> Str` bodies)
+
+- **Decision:** arm guards in `str_match_family`/`str_pure_match_family` now admit the same condition shapes the checker evaluates via `check_if_condition` instead of only `Lit::Bool`: `match n { 1 if n == 1 => "a", k if n > 0 => "a", .. }` is supported. The diagnostic walk runs `str_condition` on the guard after seeding the pattern binding (`k if n > 0` sees `k`), so a family-mismatched comparison reports `expected <left>, found <right>` and a non-Bool literal reports the `expected Bool` mismatch; the pure twin uses the new `str_pure_condition` (diagnostic-free admission mirror). Guarded arms still do not count as the catch-all (`_ if true` does not satisfy exhaustiveness), matching the checker.
+- **Reason:** the checker checks any condition expression in a match-arm guard; restricting to `Lit::Bool` made valid programs gate.
+- **Failure boundary:** guard shapes `str_condition` does not admit (arithmetic `n + 1`, calls, field expressions) still gate — those need the wider expression checker.
+- **Planned verification matrix:** `str_scalar_match_guard_cmp`/`str_scalar_match_guard_binding`/`str_scalar_match_guard_loop_seed` (clean), `str_scalar_match_guard_mismatch`/`str_scalar_match_guard_lit` (TypeMismatch), `str_scalar_match_guard_add` (stays gated).
+- **Verification:** driver fixture test green on the pinned toolchain.
+- **Hostile review:** the pattern binding is seeded into the arm-local binding map before the guard is evaluated, mirroring the checker's `check_match_arm_pattern` → `check_if_condition` order; post-catch-all arms still skip the guard like the checker.
+- **Remaining scope:** scalar scrutinee parameters, `Str` in `LocalType`, `for`/`if let`/`while let`, wider guard/condition expressions, multi-owner lowering.
+
+### IR-1109 (2026-11-23): logical condition shapes and else-less `if` statements (`-> Str` bodies)
+
+- **Decision:** `str_condition`/`str_pure_condition` now admit `not`/`and`/`or` recursively like `check_logical_operand` — `if a and a`, `if not flag`, `while a or a`, assert conditions and match guards (`k if a and true`) are supported; each operand evaluates as a Bool condition so a scalar literal or non-Bool binding operand still reports `expected Bool` on the operand. Statement-position `if` without `else` is admitted like `check_if_stmt` (`els: None`).
+- **Reason:** the checker's `check_if_condition` admits the logical forms and `check_if_stmt` requires no `else`; restricting to literals and comparisons made valid programs gate.
+- **Failure boundary:** operand shapes neither `str_condition` leaf admits (arithmetic, calls, field expressions) still gate — `if a and 1 + 2` stays Unsupported.
+- **Planned verification matrix:** `str_scalar_cond_and`/`str_scalar_cond_not`/`str_scalar_cond_or`/`str_scalar_match_guard_and` (clean, else-less `if`), `str_scalar_cond_and_lit`/`str_scalar_cond_not_str` (TypeMismatch), `str_scalar_cond_and_gate` (stays gated).
+- **Verification:** driver fixture test green on the pinned toolchain.
+- **Hostile review:** the diagnostic walk's `str_condition_operand` (Str-leaf) admission keeps its `expected Bool` mismatch diagnostic; the pure twin mirrors admission only, including bound paths of any family and skipping post-catch-all arm guards like `check_match_stmt`.
+- **Remaining scope:** scalar scrutinee parameters, `Str` in `LocalType`, `for`/`if let`/`while let`, field/call conditions, multi-owner lowering.
+
+### IR-1110 (2026-11-23): value-shape condition operands and else-less loop-level `if` (`-> Str` bodies)
+
+- **Decision:** `str_condition` falls back to the `str_expr_family` value walk at `Bool` expectation for condition/operand shapes the structured leaves do not admit — `if`/`match`/block/loop expressions work as conditions and logical operands (`if a and if a { 1 } else { true }`, match-guard `if`-expressions). A non-`Bool` result reports `expected Bool, found <family>` on the operand, mirroring `check_logical_operand_probe`/`check_expr_value(operand, Bool)`. `str_pure_condition` mirrors admission through `str_pure_init_family`. `str_loop_level_expr` also admits `els: None` like `check_if_stmt` (`loop { if c {} break "a" }`).
+- **Reason:** the checker's `check_if_condition`/`check_logical_operand` check any operand expression's type against `Bool`; restricting conditions to literal/comparison/logical leaves made valid programs gate.
+- **Failure boundary:** shapes `str_expr_family` does not lower (arithmetic binaries `a + 1`, calls, fields) still gate.
+- **Planned verification matrix:** `str_scalar_cond_and_if`/`str_scalar_match_guard_if`/`str_loop_if_no_else` (clean), `str_scalar_cond_if_tm` (`expected Bool` per literal branch).
+- **Verification:** driver fixture test green on the pinned toolchain.
+- **Hostile review:** the fallback runs after every structured leaf so `Lit`/`Path`/comparison shapes keep their exact diagnostics; literal operands check against the `Bool` pin through `str_literal_family_init`, matching the checker's operand diagnostics rather than a synthetic `expected Bool`.
+- **Remaining scope:** arithmetic/call/field conditions, scalar scrutinee parameters, `Str` in `LocalType`, `for`/`if let`/`while let`, multi-owner lowering.
