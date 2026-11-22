@@ -13229,6 +13229,14 @@ fn str_condition(
         rhs,
     ) = cond.kind
     {
+        // A comparison with no `Str` operand is not the group's condition —
+        // pure scalar comparisons like `1 == 1` stay gated rather than
+        // drawing `expected Str` diagnostics.
+        if !str_condition_operand(lhs, locals, str_bindings)
+            && !str_condition_operand(rhs, locals, str_bindings)
+        {
+            return Ok(None);
+        }
         let mut diagnostics = Vec::new();
         for operand in [lhs, rhs] {
             if str_condition_operand(operand, locals, str_bindings) {
@@ -13614,11 +13622,14 @@ fn str_stmt_block_is_unit(
         match stmt.kind {
             sai_hir::expressions::StmtKind::Assert { cond, msg, .. } => {
                 if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
-                    && !str_comparison_condition(cond, locals, str_bindings)
+                    && !str_comparison_condition(cond, locals, &inner_bindings)
                 {
                     return false;
                 }
-                if !msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))) {
+                if !msg.is_none_or(|msg| {
+                    matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))
+                        || str_binding_path(msg, locals, &inner_bindings)
+                }) {
                     return false;
                 }
             }
@@ -51822,6 +51833,8 @@ property "shared"() {}
             "pub fn str_assert_cmp() -> Str {\n    let s = \"a\"\n    let t = \"b\"\n    assert s < t, \"m\"\n    s\n}\n",
             "pub fn str_while_eq() -> Str {\n    let s = \"a\"\n    while s == \"a\" { break }\n    s\n}\n",
             "pub fn str_match_binding_guard() -> Str {\n    let s = \"a\"\n    match s { v if v == \"x\" => v, _ => \"z\" }\n}\n",
+            "pub fn str_while_local_assert_eq() -> Str {\n    let s = \"a\"\n    while s == \"a\" { let t = \"b\"\n    assert t == \"b\", t\n    break }\n    s\n}\n",
+            "pub fn str_if_scalar_eq() -> Str {\n    if 1 == 1 { \"a\" } else { \"b\" }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51837,8 +51850,8 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 95);
-        for owner in resolved.owners()[..4]
+        assert_eq!(resolved.owners().len(), 97);
+        for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
             .chain(&resolved.owners()[20..21])
@@ -51856,14 +51869,19 @@ property "shared"() {}
             .chain(&resolved.owners()[77..80])
             .chain(&resolved.owners()[83..86])
             .chain(&resolved.owners()[87..90])
-            .chain(&resolved.owners()[91..])
+            .chain(&resolved.owners()[91..96])
+            .enumerate()
         {
-            assert!(matches!(
-                owner
-                    .body_type_check()
-                    .expect("Str local body check succeeds"),
-                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
-            ));
+            let (index, owner) = (index, owner);
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("Str local body check succeeds"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ),
+                "clean owner #{index} produced diagnostics"
+            );
         }
         for index in [4, 21, 37, 51, 61, 68, 76, 86, 90] {
             let mismatch = resolved.owners()[index]
@@ -51905,6 +51923,7 @@ property "shared"() {}
             .chain(&resolved.owners()[64..66])
             .chain(&resolved.owners()[69..70])
             .chain(&resolved.owners()[80..83])
+            .chain(&resolved.owners()[96..97])
         {
             assert!(matches!(
                 owner
