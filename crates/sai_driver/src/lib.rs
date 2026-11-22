@@ -8777,9 +8777,12 @@ fn check_function_body_primitive_local_block(
                     &preceding_bindings,
                     locals,
                     inputs,
+                    symbols,
+                    type_paths,
                     self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
+                    &mut primitive_types,
                 )
             })
         {
@@ -8923,9 +8926,12 @@ fn is_supported_direct_call_argument_shape(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     // A tainted argument tree (`bump(self.missing + 1)`,
     // `bump(-self.missing)`) recovers like the statement-position tainted
@@ -8937,8 +8943,11 @@ fn is_supported_direct_call_argument_shape(
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
             unknown_self_fields,
+            primitive_types,
         )
     {
         return true;
@@ -8947,6 +8956,20 @@ fn is_supported_direct_call_argument_shape(
         ExprKind::Lit(_) => is_direct_function_scalar_literal(expression),
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        // A `{ ...; e }` argument admits like an inner block: `bump({ 1 })`
+        // behaves as `bump(1)`, statements included.
+        ExprKind::Block(inner) => primitive_inner_block_shape_is_supported(
+            inner,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         // A known self field passes its declared type like a path
         // argument; an unknown field recovers through the tainted leaf
         // path so the `UnknownField` diagnostic survives.
@@ -9076,9 +9099,12 @@ fn primitive_logical_init_operand_shape_is_supported(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     let is_preceding_or_field = |operand: &HirExpr<'_>| match operand.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
@@ -9097,18 +9123,24 @@ fn primitive_logical_init_operand_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            primitive_types,
         ),
         ExprKind::Unary(UnOp::Not, inner) => primitive_logical_init_operand_shape_is_supported(
             inner,
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            primitive_types,
         ),
         ExprKind::Binary(operator, left, right) => match operator {
             BinOp::And | BinOp::Or => {
@@ -9117,17 +9149,23 @@ fn primitive_logical_init_operand_shape_is_supported(
                     preceding_bindings,
                     locals,
                     inputs,
+                    symbols,
+                    type_paths,
                     self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
+                    primitive_types,
                 ) && primitive_logical_init_operand_shape_is_supported(
                     right,
                     preceding_bindings,
                     locals,
                     inputs,
+                    symbols,
+                    type_paths,
                     self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
+                    primitive_types,
                 )
             }
             // Comparison leaves under `and`/`or` route through
@@ -9140,21 +9178,64 @@ fn primitive_logical_init_operand_shape_is_supported(
                     preceding_bindings,
                     locals,
                     inputs,
+                    symbols,
+                    type_paths,
                     self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
+                    primitive_types,
                 ) && primitive_nested_operand_shape_is_supported(
                     right,
                     preceding_bindings,
                     locals,
                     inputs,
+                    symbols,
+                    type_paths,
                     self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
+                    primitive_types,
                 )
             }
             _ => false,
         },
+        // A block operand under `and`/`or` contributes its tail —
+        // `flag and { let t = other\n  t }` behaves as `flag and other and
+        // t` — statements admit like the inner-block predicate, and the
+        // tail itself must be a logical operand.
+        ExprKind::Block(inner) => {
+            if inner.safety != sai_hir::Safety::Safe {
+                return false;
+            }
+            let mut inner_bindings = preceding_bindings.clone();
+            inner.stmts.iter().all(|stmt| {
+                primitive_let_statement_shape_is_supported(
+                    stmt,
+                    &mut inner_bindings,
+                    primitive_types,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                )
+            }) && inner.tail.is_some_and(|tail| {
+                primitive_logical_init_operand_shape_is_supported(
+                    tail,
+                    &inner_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            })
+        }
         _ => false,
     }
 }
@@ -9257,9 +9338,12 @@ fn primitive_direct_call_operand_shape_is_supported(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     let ExprKind::Call {
         args, base: None, ..
@@ -9278,9 +9362,12 @@ fn primitive_direct_call_operand_shape_is_supported(
                         preceding_bindings,
                         locals,
                         inputs,
+                        symbols,
+                        type_paths,
                         self_field_projections,
                         unknown_self_fields,
                         direct_call_signatures,
+                        primitive_types,
                     )
                 })
         })
@@ -9317,8 +9404,11 @@ fn primitive_tainted_operand_shape_is_supported(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     match operand.kind {
         ExprKind::Lit(_) => is_direct_function_scalar_literal(operand),
@@ -9333,9 +9423,12 @@ fn primitive_tainted_operand_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
             unknown_self_fields,
             None,
+            primitive_types,
         ),
         ExprKind::Unary(UnOp::Neg, inner) => match inner.kind {
             ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
@@ -9373,15 +9466,21 @@ fn primitive_tainted_operand_shape_is_supported(
                 preceding_bindings,
                 locals,
                 inputs,
+                symbols,
+                type_paths,
                 self_field_projections,
                 unknown_self_fields,
+                primitive_types,
             ) && primitive_tainted_operand_shape_is_supported(
                 right,
                 preceding_bindings,
                 locals,
                 inputs,
+                symbols,
+                type_paths,
                 self_field_projections,
                 unknown_self_fields,
+                primitive_types,
             )
         }
         _ => false,
@@ -9395,9 +9494,12 @@ fn primitive_nested_operand_shape_is_supported(
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     match operand.kind {
         ExprKind::Lit(_) => is_direct_function_scalar_literal(operand),
@@ -9412,9 +9514,12 @@ fn primitive_nested_operand_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            primitive_types,
         ),
         // Unary operands desugar to the same `let t = <unary>` binding the
         // initializer checker handles, so they mirror the initializer-position
@@ -9426,9 +9531,12 @@ fn primitive_nested_operand_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            primitive_types,
         ),
         ExprKind::Unary(UnOp::Neg, inner) => match inner.kind {
             ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
@@ -9469,19 +9577,40 @@ fn primitive_nested_operand_shape_is_supported(
                 preceding_bindings,
                 locals,
                 inputs,
+                symbols,
+                type_paths,
                 self_field_projections,
                 unknown_self_fields,
                 direct_call_signatures,
+                primitive_types,
             ) && primitive_nested_operand_shape_is_supported(
                 right,
                 preceding_bindings,
                 locals,
                 inputs,
+                symbols,
+                type_paths,
                 self_field_projections,
                 unknown_self_fields,
                 direct_call_signatures,
+                primitive_types,
             )
         }
+        // A block operand checks like a value-position block: `1 + { 2 }`
+        // behaves as `1 + 2`, and statement-bearing operands admit through
+        // the same inner-block predicate as statement position.
+        ExprKind::Block(inner) => primitive_inner_block_shape_is_supported(
+            inner,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         _ => false,
     }
 }
@@ -9575,9 +9704,12 @@ fn primitive_value_expression_shape_is_supported(
                             &preceding_bindings,
                             locals,
                             inputs,
+                            symbols,
+                            type_paths,
                             self_field_projections,
                             unknown_self_fields,
                             direct_call_signatures,
+                            primitive_types,
                         )
                     })
             }) => {}
@@ -9599,9 +9731,12 @@ fn primitive_value_expression_shape_is_supported(
                 preceding_bindings,
                 locals,
                 inputs,
+                symbols,
+                type_paths,
                 self_field_projections,
                 unknown_self_fields,
                 direct_call_signatures,
+                primitive_types,
             ) {
                 return false;
             }
@@ -9671,7 +9806,7 @@ fn primitive_value_expression_shape_is_supported(
                         || unknown_self_fields
                             .is_some_and(|fields| fields.contains(&operand.hir_id)))
             };
-            let is_preceding_path_or_unknown_field = |operand: &HirExpr<'_>| {
+            let mut is_preceding_path_or_unknown_field = |operand: &HirExpr<'_>| {
                 is_preceding_path(operand)
                     || is_known_or_unknown_self_field(operand)
                     || primitive_nested_operand_shape_is_supported(
@@ -9679,22 +9814,28 @@ fn primitive_value_expression_shape_is_supported(
                         preceding_bindings,
                         locals,
                         inputs,
+                        symbols,
+                        type_paths,
                         self_field_projections,
                         unknown_self_fields,
                         direct_call_signatures,
+                        primitive_types,
                     )
             };
             let supported_shape = match operator {
                 BinOp::And | BinOp::Or => {
-                    let operand_is_supported = |operand: &HirExpr<'_>| {
+                    let mut operand_is_supported = |operand: &HirExpr<'_>| {
                         primitive_logical_init_operand_shape_is_supported(
                             operand,
                             preceding_bindings,
                             locals,
                             inputs,
+                            symbols,
+                            type_paths,
                             self_field_projections,
                             unknown_self_fields,
                             direct_call_signatures,
+                            primitive_types,
                         )
                     };
                     operand_is_supported(left) && operand_is_supported(right)
@@ -10378,9 +10519,12 @@ fn primitive_nested_block_tail_shape_is_supported(
                             preceding_bindings,
                             locals,
                             inputs,
+                            symbols,
+                            type_paths,
                             self_field_projections,
                             unknown_self_fields,
                             direct_call_signatures,
+                            primitive_types,
                         )
                     })
             }),
@@ -10511,9 +10655,12 @@ fn primitive_if_branch_tail_shape_is_supported(
                             preceding_bindings,
                             locals,
                             inputs,
+                            symbols,
+                            type_paths,
                             self_field_projections,
                             unknown_self_fields,
                             direct_call_signatures,
+                            primitive_types,
                         )
                     })
             }),
@@ -90932,6 +91079,27 @@ property "shared"() {}
             "    let result = ~x\n",
             "    result\n",
             "}\n",
+            "pub fn let_stmt_block_operand() -> I32 {\n",
+            "    let x = 1 + { let y = 2\n        y }\n",
+            "    x\n",
+            "}\n",
+            "pub fn let_logical_block_operand() -> Bool {\n",
+            "    let flag = true\n",
+            "    let x = flag and { flag }\n",
+            "    x\n",
+            "}\n",
+            "pub fn let_logical_stmt_block_operand() -> Bool {\n",
+            "    let flag = true\n",
+            "    let x = flag and { let t = flag\n        t }\n",
+            "    x\n",
+            "}\n",
+            "pub fn call_block_arg() -> I32 {\n",
+            "    take_i32({ 1 })\n",
+            "}\n",
+            "pub fn call_stmt_block_arg() -> I32 {\n",
+            "    take_i32({ let y = 2\n        y })\n",
+            "}\n",
+            "pub fn take_i32(v: I32) -> I32 { v }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -90953,7 +91121,8 @@ property "shared"() {}
         // tails, and inner `let` statements all check cleanly. Branch
         // tails admit the same nesting.
         for index in [
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 22, 23,
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26,
+            27, 28,
         ] {
             let check = resolved.owners()[index]
                 .body_type_check()
@@ -90973,7 +91142,7 @@ property "shared"() {}
         // the unresolved-binding boundary and an `if` tail without
         // `else` stays gated with the if-tail boundary; supported inner
         // statements (let, expr, assert, assign) admit like flat bodies.
-        for index in [11, 15, 20, 21] {
+        for index in [11, 15, 21] {
             let check = resolved.owners()[index]
                 .body_type_check()
                 .expect("gated nested-block-tail check has an independent result");

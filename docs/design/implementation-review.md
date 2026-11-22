@@ -9921,3 +9921,47 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** Pinned Rust 1.99.1, focused driver test passes; `cargo fmt --all` and `git diff --check` clean.
 - **Hostile review:** The recursive tail check propagates `deferred_neg_result`/`deferred_bitnot_result` so `let x = { -y }` keeps flat-initializer deferral provenance. Inner-block literals join the outer literal scope (transparent-initializer semantics, matching `if`/`match` joins) — `let x = { 1 }; take_u8(x)` resolves `x` to `U8`, deliberately mirroring `let x = if c { 1 } else { 2 }`.
 - **Remaining scope:** `{ e }` as a binary operand, `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1071 (2026-11-21): Statement-free block operands
+
+- **Decision:** A statement-free block is an operand — `1 + { 2 }`, `first * { second + third }` — with the tail admitted through the same nested-operand predicate.
+- **Reason:** `check_operand_local_type` already falls back to `check_initializer_value`, whose IR-1070 `Block` arm evaluates `{ ...; tail }` faithfully; the only gate was the driver's nested-operand mirror, which now admits `ExprKind::Block` when `stmts.is_empty()` and the tail itself admits.
+- **Failure boundary and judgment:** Statement-bearing block operands (`1 + { let y = 2\n  y }`) stay gated — admitting them means threading the statement predicate's extra inputs through the operand predicate, deferred to a later slice. Empty/unsafe blocks keep their gates.
+- **Review required:** None — checker semantics unchanged; the mirror composes reviewed predicates.
+- **Planned verification matrix:** Driver `function_body_type_check_nested_block_tails` — `let_block_operand` flips to supported-clean; `let_empty_block_init` stays gated.
+- **Verification:** Pinned Rust 1.99.1, focused driver test passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Verified the checker needed no parallel change — `check_operand_local_type`'s `check_initializer_value` fallback evaluates the inner statements (none here) and tail identically to a flat operand, including literal-variable joining for `1 + { 2 }`.
+- **Remaining scope:** Statement-bearing block operands, `Str` literal locals, tuple/index tails, `for`/`while let`/`if let`, match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1072 (2026-11-21): Statement-bearing block operands
+
+- **Decision:** Widens IR-1071: a block operand may carry statements — `1 + { let y = 2\n  y }` — admitted through `primitive_inner_block_shape_is_supported` instead of the statement-free tail check.
+- **Reason:** The operand predicate now threads `symbols`, `type_paths`, and `primitive_types` through the nested-operand, logical-init-operand, tainted-operand, and direct-call-argument predicates, matching the parameter list the statement predicate already needs. The checker needed no change: `check_operand_local_type` reaches `check_initializer_value`, whose `Block` arm checks inner statements and the tail.
+- **Failure boundary and judgment:** `{ cond }` under `and`/`or` (`a and { cond }`) stays gated — logical-init operands route comparisons through the nested predicate but `and`/`or` leaves themselves keep the leaf boundary. Empty and unsafe block operands keep their gates.
+- **Review required:** None — signature threading plus delegation to the reviewed inner-block predicate.
+- **Planned verification matrix:** Driver `function_body_type_check_nested_block_tails` — new `let_stmt_block_operand` (`1 + { let y = 2\n  y }`) supported-clean; `let_empty_block_init` stays gated.
+- **Verification:** Pinned Rust 1.99.1, focused driver test passes; full driver suite green; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Two closures that call the nested/logical predicates became `mut` (they now borrow `primitive_types` mutably) — mechanical fallout, no semantic change. The tainted-operand predicate passes `None` for call signatures as before.
+- **Remaining scope:** `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1073 (2026-11-21): Block operands under `and`/`or`
+
+- **Decision:** A block is a logical operand — `flag and { flag }`, `flag and { let t = flag\n  t }` — closing the operand-position gap IR-1072 left.
+- **Reason:** `primitive_logical_init_operand_shape_is_supported` gains an `ExprKind::Block` arm that admits inner statements through `primitive_let_statement_shape_is_supported` (into a cloned binding scope) and the tail through itself — `{ let t = flag\n  t }` resolves `t` from the inner scope. The checker needed no change: `check_logical_operand`'s fallback reaches `check_operand_local_type` → `check_initializer_value`'s `Block` arm.
+- **Failure boundary and judgment:** Empty and unsafe blocks keep their gates; unsupported inner statements and non-logical tails gate through the composed predicates. Unary tails with folded-literal operands (`{ ~1 }`) keep the long-standing path/field-only unary-tail boundary — consistent with IR-998/999, not a regression (a review finding claiming otherwise was rejected).
+- **Review required:** None — composes reviewed predicates; checker semantics unchanged.
+- **Planned verification matrix:** Driver `function_body_type_check_nested_block_tails` — `let_logical_block_operand`, `let_logical_stmt_block_operand` supported-clean.
+- **Verification:** Pinned Rust 1.99.1, focused driver test passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** The tail checks against `inner_bindings` (not the outer set) so an inner `let`'s binding is usable; the outer `preceding_bindings` is cloned, so inner declarations cannot leak into sibling operands.
+- **Remaining scope:** `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.
+
+### IR-1074 (2026-11-21): Block expressions as call arguments
+
+- **Decision:** A `{ ...; e }` block is a call argument — `take_i32({ 1 })`, `take_i32({ let y = 2\n  y })` — completing operand-position block coverage.
+- **Reason:** `check_direct_call`'s per-argument dispatch gains a `Block` arm: the inner block checks via `check_block_expected(block, *expected)` (statements through `check_stmt`, tail against the parameter type), and the argument expression records `Concrete(expected)`. The driver mirror's `is_supported_direct_call_argument_shape` delegates `ExprKind::Block` to `primitive_inner_block_shape_is_supported`.
+- **Failure boundary and judgment:** Empty and unsafe blocks keep their gates; unsupported inner statements and tails gate through the composed predicates.
+- **Review required:** None — delegates to reviewed paths.
+- **Planned verification matrix:** Driver `function_body_type_check_nested_block_tails` — `call_block_arg`, `call_stmt_block_arg` supported-clean.
+- **Verification:** Pinned Rust 1.99.1, focused driver test passes; `cargo fmt --all` and `git diff --check` clean.
+- **Hostile review:** Unlike the `Path`/operand arms, the `Block` arm skips `check_annotated_path` — the block already unified its tail against the parameter inside `check_block_expected`, so no second constraint site is needed.
+- **Remaining scope:** `Str` literal locals, tuple/index tails, `for`/`while let`/`if let` (need `IntoIterator`/`Option` ADTs), match patterns beyond literal/wildcard/binding/range/or, move/borrow analysis, lowering/evaluation, CLI Stage 0.

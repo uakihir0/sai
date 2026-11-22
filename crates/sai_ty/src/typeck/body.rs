@@ -5250,6 +5250,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
                 }
+                // A `{ ...; e }` argument checks its inner statements and
+                // tail against the parameter type like any other value
+                // block — `bump({ 1 })` behaves as `bump(1)`.
+                ExprKind::Block(block) => {
+                    if block.safety != Safety::Safe {
+                        return Err(());
+                    }
+                    self.check_block_expected(block, *expected)?;
+                    self.record_expression_type(
+                        argument.expr.hir_id,
+                        LocalType::Concrete(*expected),
+                    );
+                }
                 _ => return Err(()),
             }
         }
