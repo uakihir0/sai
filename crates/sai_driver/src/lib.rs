@@ -9103,6 +9103,39 @@ fn is_supported_direct_call_argument_shape(
                     )
                 })
         }
+        // `if`/`match` operands admit the same branch shapes the tail
+        // position does — `1 + if c {1} else {2}` behaves as the
+        // unannotated `let x = if ...` join.
+        ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
+            expression,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source,
+        } => primitive_match_tail_shape_is_supported(
+            scrutinee,
+            arms,
+            source,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         _ => false,
     }
 }
@@ -9301,6 +9334,39 @@ fn primitive_logical_init_operand_shape_is_supported(
                 )
             })
         }
+        // `if`/`match` operands admit the same branch shapes the tail
+        // position does — `1 + if c {1} else {2}` behaves as the
+        // unannotated `let x = if ...` join.
+        ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
+            operand,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source,
+        } => primitive_match_tail_shape_is_supported(
+            scrutinee,
+            arms,
+            source,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         _ => false,
     }
 }
@@ -9666,6 +9732,39 @@ fn primitive_nested_operand_shape_is_supported(
         // the same inner-block predicate as statement position.
         ExprKind::Block(inner) => primitive_inner_block_shape_is_supported(
             inner,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+        // `if`/`match` operands admit the same branch shapes the tail
+        // position does — `1 + if c {1} else {2}` behaves as the
+        // unannotated `let x = if ...` join.
+        ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
+            operand,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source,
+        } => primitive_match_tail_shape_is_supported(
+            scrutinee,
+            arms,
+            source,
             preceding_bindings,
             locals,
             inputs,
@@ -78841,7 +78940,7 @@ property "shared"() {}
                 .expect("unsupported bitwise body check is gated");
             if matches!(
                 index,
-                12 | 13 | 15 | 17 | 29 | 33 | 34 | 35 | 65 | 66 | 72 | 73 | 76
+                12 | 13 | 15 | 17 | 29 | 33 | 34 | 35 | 46 | 47 | 48 | 65 | 66 | 72 | 73 | 76
             ) {
                 continue;
             }
@@ -78869,7 +78968,10 @@ property "shared"() {}
         }
         // `left & (right ^ extra)`, `(left + right) & right` and `1 << 2`
         // evaluate cleanly through the operand probes.
-        for index in [72, 73, 76] {
+        // `left & (1.0 + 1.0)`, `left | 1.0` nested inside `^`, and the
+        // path-operand forms join the float operand's third site into the
+        // group — resolution fixes every site to the shared float type.
+        for index in [46, 47, 48, 72, 73, 76] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
                 .expect("nested-operand body check is available")
@@ -79798,7 +79900,7 @@ property "shared"() {}
             "a deferred `-x` on a merge child declared before its parent must still error: {:?}",
             owners[59].body_type_check()
         );
-        for index in [13, 14, 17] {
+        for index in [13, 17] {
             assert!(
                 matches!(
                     owners[index]
@@ -79809,6 +79911,18 @@ property "shared"() {}
                 "function owner {index} should remain gated"
             );
         }
+        // `x = 3` on `var x = 1; x = 2` unifies through a merge child —
+        // the literal-variable's single additional site is full, so the
+        // third site joins the resolution group instead of gating.
+        assert!(
+            matches!(
+                owners[14]
+                    .body_type_check()
+                    .expect("a third literal assignment site is checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "function owner 14 unexpectedly failed the three-site merge"
+        );
     }
 
     #[test]
@@ -80111,7 +80225,7 @@ property "shared"() {}
         // Owner 14 (`x = if flag { 1 } else { 2 }` on a literal variable)
         // is supported: the if-join's literal variable merges into `x`'s
         // group through the assignment merge arm.
-        for index in [13, 15, 16, 17] {
+        for index in [13, 15, 16] {
             let check = owners[index]
                 .body_type_check()
                 .expect("unannotated and non-exhaustive forms are gated");
@@ -80120,6 +80234,16 @@ property "shared"() {}
                 "function owner {index} should remain gated: {check:?}"
             );
         }
+        // A `match` join with three literal arm sites merges the third
+        // site into the group — the two-site limit lifts for further
+        // same-kind literal sites.
+        let check = owners[17]
+            .body_type_check()
+            .expect("a three-site match join is checked");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+            "function owner 17 unexpectedly failed the three-site join: {check:?}"
+        );
         let check = owners[14]
             .body_type_check()
             .expect("a literal-variable if right side is checked");
@@ -91191,6 +91315,20 @@ property "shared"() {}
             "    x\n",
             "}\n",
             "pub fn not_and_block_tail() -> Bool { not (true and { true }) }\n",
+            "pub fn if_operand(flag: Bool) -> I32 {\n",
+            "    let x = 1 + if flag { 2 } else { 3 }\n",
+            "    x\n",
+            "}\n",
+            "pub fn if_call_arg(flag: Bool) -> I32 {\n",
+            "    take_i32(if flag { 1 } else { 2 })\n",
+            "}\n",
+            "pub fn if_logical_leaf(flag: Bool, other: Bool) -> Bool {\n",
+            "    flag and if other { true } else { false }\n",
+            "}\n",
+            "pub fn match_operand(flag: Bool) -> I32 {\n",
+            "    let x = 1 + match flag { true => 2, false => 3, _ => 0 }\n",
+            "    x\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -91213,7 +91351,7 @@ property "shared"() {}
         // tails admit the same nesting.
         for index in [
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26,
-            27, 28, 30, 31, 32, 33, 34, 35, 36,
+            27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
         ] {
             let check = resolved.owners()[index]
                 .body_type_check()

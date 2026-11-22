@@ -2600,6 +2600,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.check_logical_operand_type(operand, operand_type)?;
                 Ok(PrimTy::Bool)
             }
+            // `if`/`match` logical operands check each branch against the
+            // `Bool` the logical position demands — `flag and if c { true }
+            // else { false }` behaves like the annotated `let x: Bool = if`.
+            ExprKind::If { .. } | ExprKind::Match { .. } => {
+                let local_type = self.check_expr_value(operand, PrimTy::Bool)?;
+                self.concrete_local_type(local_type).ok_or(())
+            }
             _ => self
                 .check_operand_local_type(operand)
                 .ok()
@@ -3393,7 +3400,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     // Unsupported, so admitting a superset here is consistent.
     fn logical_operand_shape_is_admissible(&self, operand: &Expr<'hir>) -> bool {
         match operand.kind {
-            ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Block(_) => true,
+            ExprKind::Lit(_)
+            | ExprKind::Path(_)
+            | ExprKind::Block(_)
+            | ExprKind::If { .. }
+            | ExprKind::Match { .. } => true,
             ExprKind::Field { .. } => self.self_field_leaf_is_admissible(operand),
             ExprKind::Call { base: None, .. } => self
                 .input
@@ -3421,7 +3432,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     // initializer unary shapes, nested binary trees, and blocks.
     fn operand_shape_is_admissible(&self, operand: &Expr<'hir>) -> bool {
         match operand.kind {
-            ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Block(_) => true,
+            ExprKind::Lit(_)
+            | ExprKind::Path(_)
+            | ExprKind::Block(_)
+            | ExprKind::If { .. }
+            | ExprKind::Match { .. } => true,
             ExprKind::Field { .. } => self.self_field_leaf_is_admissible(operand),
             ExprKind::Call { base: None, .. } => self
                 .input
@@ -5014,9 +5029,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     /// Joins one literal tail into the shared literal variable: the first
-    /// site creates it, a second site joins through the existing
-    /// additional-site machinery (kind mismatches and further sites gate).
-    /// Concrete literal kinds (`Bool`/`Byte`/`Char`) gate — the binding's
+    /// site creates it, a second site joins through the additional-site
+    /// machinery, and further sites merge into the group (kind mismatches
+    /// still gate). Concrete literal kinds (`Bool`/`Byte`/`Char`) gate —
     /// branch tails must agree on one concrete type, which the shared
     /// literal-variable machinery does not express yet.
     fn join_literal_site(
@@ -5347,6 +5362,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     };
                     self.record_expression_type(argument.expr.hir_id, local_type);
                     self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                }
+                // `if`/`match` arguments check against the parameter type
+                // through the same branch join the tail position uses —
+                // `bump(if c { 1 } else { 2 })` behaves as `bump(1)` when
+                // the parameter is `I32`.
+                ExprKind::If { .. } | ExprKind::Match { .. } => {
+                    self.check_expr_expected(argument.expr, *expected)?;
+                    self.record_expression_type(
+                        argument.expr.hir_id,
+                        LocalType::Concrete(*expected),
+                    );
                 }
                 // A `{ ...; e }` argument checks its inner statements and
                 // tail against the parameter type like any other value
@@ -6799,17 +6825,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
             return Err(());
         }
-        let Some(variable) = self.literal_variables.get_mut(id) else {
+        let Some(variable) = self.literal_variables.get(id) else {
             return Err(());
         };
-        if variable.kind != PrimitiveLiteralKind::Integer
-            || variable.resolved.is_some()
-            || variable.additional_site.is_some()
-        {
+        if variable.kind != PrimitiveLiteralKind::Integer || variable.resolved.is_some() {
             return Err(());
         }
-        variable.additional_site = Some(LiteralSite { literal, origin });
-        Ok(())
+        if variable.additional_site.is_none() {
+            self.literal_variables[id].additional_site = Some(LiteralSite { literal, origin });
+            return Ok(());
+        }
+        // A third and further constraint sites join the group as merge
+        // children — `1 + join(2, 3)` and three-or-more-site `match` joins
+        // keep every literal in one resolution group.
+        let local_type =
+            self.local_type_for_unannotated_literal(literal, PrimitiveLiteralKind::Integer, origin);
+        let LocalType::LiteralVariable(site) = local_type else {
+            return Err(());
+        };
+        self.merge_literal_variables(id, site)
     }
 
     fn add_float_literal_constraint(
@@ -6821,17 +6855,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::FloatingPoint) {
             return Err(());
         }
-        let Some(variable) = self.literal_variables.get_mut(id) else {
+        let Some(variable) = self.literal_variables.get(id) else {
             return Err(());
         };
-        if variable.kind != PrimitiveLiteralKind::FloatingPoint
-            || variable.resolved.is_some()
-            || variable.additional_site.is_some()
-        {
+        if variable.kind != PrimitiveLiteralKind::FloatingPoint || variable.resolved.is_some() {
             return Err(());
         }
-        variable.additional_site = Some(LiteralSite { literal, origin });
-        Ok(())
+        if variable.additional_site.is_none() {
+            self.literal_variables[id].additional_site = Some(LiteralSite { literal, origin });
+            return Ok(());
+        }
+        let local_type = self.local_type_for_unannotated_literal(
+            literal,
+            PrimitiveLiteralKind::FloatingPoint,
+            origin,
+        );
+        let LocalType::LiteralVariable(site) = local_type else {
+            return Err(());
+        };
+        self.merge_literal_variables(id, site)
     }
 
     /// Links `other` into `id` so both resolve to one type — the merge an

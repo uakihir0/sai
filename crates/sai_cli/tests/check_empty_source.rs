@@ -10304,6 +10304,7 @@ fn public_match_tail_bodies_emit_check_results() {
         "pub fn choose(flag: Bool) -> I32 { var x: I32 = 0\n x = if flag { 1 } else { 2 }\n x }\n",
         "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 2 }\n x }\n",
         "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, _ => 2 }\n x }\n",
+        "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, 1 => 2, _ => 3 }\n x }\n",
         "pub fn choose(value: I32) -> I32 { match value { 0 | 1 => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 1..=5 => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { n if n > 0 => 1, _ => 0 } }\n",
@@ -10388,7 +10389,6 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose() -> I32 { var x = 0.5\n    var c = 1\n    let r = x << c\n    r\n }\n",
         "pub fn choose(flag: Bool) -> I32 { let x = if flag { 1 } else { 1.0 }\n x }\n",
         "pub fn choose(flag: Bool, a: I32) -> I32 { let x = if flag { 1 } else { a }\n x }\n",
-        "pub fn choose(value: I32) -> I32 { let x = match value { 0 => 1, 1 => 2, _ => 3 }\n x }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -12130,6 +12130,24 @@ fn primitive_bitwise_path_pairs_accept_matching_integer_and_byte_types() {
             "    let left: I32 = right\n",
             "    let value = left | right\n",
             "    value\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn nested_integer_literal_pair_rhs() -> I32 {\n",
+            "    let result = 1 & (2 ^ 3)\n",
+            "    result\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn nested_integer_literal_pair_left() -> I32 {\n",
+            "    let result = (1 & 2) ^ 3\n",
+            "    result\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn chained_integer_literal_pairs() -> I32 {\n",
+            "    let result = 1 & 2 | 3\n",
+            "    result\n",
             "}\n",
         ),
     ] {
@@ -16107,18 +16125,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         fixture(
             "pub fn float_byte_literal_pair() -> F32",
             "let result = 1.0 & b'a'",
-        ),
-        fixture(
-            "pub fn nested_integer_literal_pair_rhs() -> I32",
-            "let result = 1 & (2 ^ 3)",
-        ),
-        fixture(
-            "pub fn nested_integer_literal_pair_left() -> I32",
-            "let result = (1 & 2) ^ 3",
-        ),
-        fixture(
-            "pub fn chained_integer_literal_pairs() -> I32",
-            "let result = 1 & 2 | 3",
         ),
         fixture(
             "pub fn generic_integer_literal_pair<T>() -> I32",
