@@ -13707,11 +13707,6 @@ fn str_match_family(
     let mut bool_cover = (false, false);
     let mut arm_families = Vec::with_capacity(arms.len());
     for arm in arms {
-        if let Some(guard) = arm.guard
-            && !matches!(guard.kind, ExprKind::Lit(Lit::Bool(_)))
-        {
-            return Ok(None);
-        }
         let mut arm_bindings = str_bindings.clone();
         if catch_all {
             diagnostics.push(const_literal_diagnostic(
@@ -13752,6 +13747,24 @@ fn str_match_family(
                 && matches!(arm.pat.kind, PatKind::Wild | PatKind::Binding { .. });
             if let Some(binding) = binding {
                 arm_bindings.insert(binding, scrutinee_family);
+            }
+            // Guards evaluate like `check_if_condition` — the pattern
+            // binding is already seeded (`n if n > 0`).
+            if let Some(guard) = arm.guard {
+                let Some(mut guard_diagnostics) = str_condition(
+                    owner,
+                    guard,
+                    locals,
+                    &arm_bindings,
+                    inputs,
+                    snapshot,
+                    symbols,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut guard_diagnostics);
             }
         }
         let Some((arm_family, mut arm_diagnostics)) = str_expr_family(
@@ -15431,6 +15444,33 @@ fn str_stmt_loop_break_families<'h>(
     }
 }
 
+// The diagnostic-free counterpart of `str_condition`'s admission: any
+// literal (a `Lit::Bool` is clean, other literals are the checker's
+// recoverable `expected Bool`), a comparison shape, or a comparison
+// binary whose operands both classify — everything else gates.
+fn str_pure_condition(
+    cond: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+) -> bool {
+    if matches!(cond.kind, ExprKind::Lit(_)) {
+        return true;
+    }
+    if str_comparison_condition(cond, locals, str_bindings) {
+        return true;
+    }
+    if let ExprKind::Binary(
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+        lhs,
+        rhs,
+    ) = cond.kind
+    {
+        return str_condition_operand_family(lhs, locals, str_bindings).is_some()
+            && str_condition_operand_family(rhs, locals, str_bindings).is_some();
+    }
+    false
+}
+
 // The family a `let` initializer binds without running the diagnostic
 // walk — literals, local paths, `if`/`block`/`loop` joins. An unclassed
 // shape leaves the binding unrecorded (the body walk already gated it).
@@ -15574,11 +15614,6 @@ fn str_pure_match_family(
     let mut arm_families: Vec<(Option<&'static str>, Option<&HirExpr<'_>>, sai_hir::Span)> =
         Vec::with_capacity(arms.len());
     for arm in arms {
-        if let Some(guard) = arm.guard
-            && !matches!(guard.kind, ExprKind::Lit(Lit::Bool(_)))
-        {
-            return None;
-        }
         let mut arm_bindings = str_bindings.clone();
         if catch_all {
             if let PatKind::Binding {
@@ -15633,6 +15668,11 @@ fn str_pure_match_family(
                 }
                 _ => return None,
             }
+        }
+        if let Some(guard) = arm.guard
+            && !str_pure_condition(guard, locals, &arm_bindings)
+        {
+            return None;
         }
         let arm_family =
             str_pure_init_family(arm.body, locals, &arm_bindings, type_paths, symbols, inputs)?;
@@ -54610,6 +54650,12 @@ property "shared"() {}
             "pub fn str_scalar_match_stmt_unreachable() -> Str {\n    let n = 1\n    match n {\n        _ => {\n        }\n        2 => {\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_match_stmt_let() -> Str {\n    let n = 1\n    match n {\n        1 => {\n            let m = n\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_match_stmt_guard() -> Str {\n    let n = 1\n    match n {\n        1 if true => {\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_guard_cmp() -> Str {\n    let n = 1\n    match n {\n        1 if n == 1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_guard_binding() -> Str {\n    let n = 1\n    match n {\n        k if n > 0 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_guard_mismatch() -> Str {\n    let n = 1\n    match n {\n        1 if n == \"x\" => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_guard_lit() -> Str {\n    let n = 1\n    match n {\n        1 if 1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_guard_loop_seed() -> Str {\n    let n = 1\n    let m = loop {\n        let t = match n {\n            1 if n == 1 => 1,\n            _ => 2,\n        }\n        break t\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_guard_add() -> Str {\n    let n = 1\n    match n {\n        1 if n + 1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54625,7 +54671,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 179);
+        assert_eq!(resolved.owners().len(), 185);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54669,6 +54715,8 @@ property "shared"() {}
             .chain(&resolved.owners()[170..171])
             .chain(&resolved.owners()[171..173])
             .chain(&resolved.owners()[177..179])
+            .chain(&resolved.owners()[179..181])
+            .chain(&resolved.owners()[183..184])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54733,6 +54781,8 @@ property "shared"() {}
             (174, sai_diagnostics::Code::NonExhaustiveMatch),
             (175, sai_diagnostics::Code::TypeMismatch),
             (176, sai_diagnostics::Code::UnreachablePattern),
+            (181, sai_diagnostics::Code::TypeMismatch),
+            (182, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -54817,6 +54867,7 @@ property "shared"() {}
             .chain(&resolved.owners()[69..70])
             .chain(&resolved.owners()[168..169])
             .chain(&resolved.owners()[173..174])
+            .chain(&resolved.owners()[184..185])
         {
             assert!(matches!(
                 owner

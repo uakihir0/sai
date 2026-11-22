@@ -10313,3 +10313,13 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** driver fixture test green on the pinned toolchain.
 - **Hostile review:** arm bodies run at the caller's `frame`/`break_ctx`, so `break` inside an arm inside a `loop` still targets that loop; the per-arm binding clone keeps pattern variables scoped.
 - **Remaining scope:** scalar scrutinee parameters, `Str` in `LocalType`, `for`/`if let`/`while let`, full guard expressions in the family walk, multi-owner lowering.
+
+### IR-1108 (2026-11-23): real guard expressions in match arms (`-> Str` bodies)
+
+- **Decision:** arm guards in `str_match_family`/`str_pure_match_family` now admit the same condition shapes the checker evaluates via `check_if_condition` instead of only `Lit::Bool`: `match n { 1 if n == 1 => "a", k if n > 0 => "a", .. }` is supported. The diagnostic walk runs `str_condition` on the guard after seeding the pattern binding (`k if n > 0` sees `k`), so a family-mismatched comparison reports `expected <left>, found <right>` and a non-Bool literal reports the `expected Bool` mismatch; the pure twin uses the new `str_pure_condition` (diagnostic-free admission mirror). Guarded arms still do not count as the catch-all (`_ if true` does not satisfy exhaustiveness), matching the checker.
+- **Reason:** the checker checks any condition expression in a match-arm guard; restricting to `Lit::Bool` made valid programs gate.
+- **Failure boundary:** guard shapes `str_condition` does not admit (arithmetic `n + 1`, calls, field expressions) still gate — those need the wider expression checker.
+- **Planned verification matrix:** `str_scalar_match_guard_cmp`/`str_scalar_match_guard_binding`/`str_scalar_match_guard_loop_seed` (clean), `str_scalar_match_guard_mismatch`/`str_scalar_match_guard_lit` (TypeMismatch), `str_scalar_match_guard_add` (stays gated).
+- **Verification:** driver fixture test green on the pinned toolchain.
+- **Hostile review:** the pattern binding is seeded into the arm-local binding map before the guard is evaluated, mirroring the checker's `check_match_arm_pattern` → `check_if_condition` order; post-catch-all arms still skip the guard like the checker.
+- **Remaining scope:** scalar scrutinee parameters, `Str` in `LocalType`, `for`/`if let`/`while let`, wider guard/condition expressions, multi-owner lowering.
