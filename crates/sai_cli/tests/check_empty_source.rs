@@ -9967,7 +9967,6 @@ fn primitive_logical_non_bool_annotation_reports_and_recovers_as_bool() {
 #[test]
 fn unsupported_primitive_logical_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn logical(flag: Bool) -> Bool {\n    let inferred = 1\n    let result = inferred and flag\n    result\n}\n",
         "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and right + true\n    result\n}\n",
         "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and later\n    let later: Bool = right\n    result\n}\n",
         "pub fn logical(right: Bool) -> Bool {\n    let result = result and right\n    result\n}\n",
@@ -10039,6 +10038,48 @@ fn primitive_local_not_reports_operand_mismatch_and_recovers_as_bool() {
 }
 
 #[test]
+fn primitive_literal_variable_not_and_logical_operands_report_type_mismatch() {
+    for (source, operand, target) in [
+        (
+            "pub fn logical() -> Bool {\n    let inferred = 1\n    let result = not inferred\n    result\n}\n",
+            "not inferred",
+            "inferred",
+        ),
+        (
+            "pub fn logical(flag: Bool) -> Bool {\n    let inferred = 1\n    let result = inferred and flag\n    result\n}\n",
+            "inferred and",
+            "inferred",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let operand_start = source
+            .find(operand)
+            .map(|start| start + operand.find(target).expect("target inside operand"))
+            .expect("operand exists");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "a literal variable that can never be Bool reports one mismatch:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the operand mismatch is a type diagnostic, not a gate:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            "expected `Bool`, found `I64`",
+            operand_start,
+            operand_start + target.len(),
+        );
+    }
+}
+
+#[test]
 fn primitive_local_not_diagnostics_follow_initializer_source_order() {
     let source = concat!(
         "pub fn ordered(non_bool: I32, bool_value: Bool) -> Bool {\n",
@@ -10097,7 +10138,6 @@ fn primitive_local_not_diagnostics_follow_initializer_source_order() {
 #[test]
 fn unsupported_primitive_local_not_shapes_remain_gated() {
     for source in [
-        "pub fn logical() -> Bool {\n    let inferred = 1\n    let result = not inferred\n    result\n}\n",
         "pub fn logical(left: I32, right: I32) -> Bool {\n    let result = not (left + right)\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let result = not missing\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let result = not later\n    let later: Bool = flag\n    result\n}\n",
