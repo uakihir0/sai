@@ -3393,7 +3393,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     // Unsupported, so admitting a superset here is consistent.
     fn logical_operand_shape_is_admissible(&self, operand: &Expr<'hir>) -> bool {
         match operand.kind {
-            ExprKind::Lit(_) | ExprKind::Path(_) => true,
+            ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Block(_) => true,
             ExprKind::Field { .. } => self.self_field_leaf_is_admissible(operand),
             ExprKind::Call { base: None, .. } => self
                 .input
