@@ -13350,6 +13350,210 @@ fn str_expr_family(
         return Ok(Some(found));
     }
     match expr.kind {
+        ExprKind::Unary(operator, operand) => {
+            let Some((family, mut diagnostics)) = str_expr_family(
+                owner,
+                return_ty,
+                operand,
+                locals,
+                str_bindings,
+                None,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            match operator {
+                // `not` is the logical operator — a non-`Bool` operand
+                // reports the checker's `expected Bool` like
+                // `check_logical_operand_type`.
+                sai_hir::expressions::UnOp::Not => {
+                    if family != "`Bool`" && family != "`!`" {
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            operand.span,
+                            sai_diagnostics::Code::TypeMismatch,
+                            format!("expected `Bool`, found {family}"),
+                            "type mismatch",
+                        )?);
+                    }
+                    Ok(Some(("`Bool`", diagnostics)))
+                }
+                // `-x`/`~x` keep the operand's family; a non-numeric
+                // operand reports the arithmetic expectation.
+                sai_hir::expressions::UnOp::Neg | sai_hir::expressions::UnOp::BitNot => {
+                    if family != "`!`"
+                        && !matches!(family, "`Bool`" | "`Str`" | "`ByteStr`" | "`()`")
+                    {
+                        return Ok(Some((family, diagnostics)));
+                    }
+                    if family == "`!`" {
+                        return Ok(Some((family, diagnostics)));
+                    }
+                    diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        operand.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected `I64`, found {family}"),
+                        "type mismatch",
+                    )?);
+                    Ok(Some((family, diagnostics)))
+                }
+                _ => Ok(None),
+            }
+        }
+        ExprKind::Binary(operator, lhs, rhs) => {
+            let Some((left_family, mut left_diagnostics)) = str_expr_family(
+                owner,
+                return_ty,
+                lhs,
+                locals,
+                str_bindings,
+                None,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some((right_family, mut right_diagnostics)) = str_expr_family(
+                owner,
+                return_ty,
+                rhs,
+                locals,
+                str_bindings,
+                None,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            let mut diagnostics = Vec::new();
+            diagnostics.append(&mut left_diagnostics);
+            diagnostics.append(&mut right_diagnostics);
+            // `and`/`or` take Bool operands and yield `Bool` — a
+            // non-`Bool` operand reports `expected Bool` like
+            // `check_logical_operand_type`.
+            if matches!(operator, BinOp::And | BinOp::Or) {
+                for (operand, family) in [(lhs, left_family), (rhs, right_family)] {
+                    if family != "`Bool`" && family != "`!`" {
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            operand.span,
+                            sai_diagnostics::Code::TypeMismatch,
+                            format!("expected `Bool`, found {family}"),
+                            "type mismatch",
+                        )?);
+                    }
+                }
+                return Ok(Some(("`Bool`", diagnostics)));
+            }
+            // `!` unifies with the other operand's family.
+            let (left_family, right_family) = if left_family == "`!`" {
+                (right_family, right_family)
+            } else if right_family == "`!`" {
+                (left_family, left_family)
+            } else {
+                (left_family, right_family)
+            };
+            // A literal operand against a scalar-primitive operand
+            // folds to the other's primitive like the checker coercing
+            // the literal; two literal operands keep their defaults.
+            let fold = |expr: &HirExpr<'_>,
+                        own: &'static str,
+                        other_expr: &HirExpr<'_>,
+                        other: &'static str| {
+                if own != other
+                    && matches!(expr.kind, ExprKind::Lit(_))
+                    && !matches!(other_expr.kind, ExprKind::Lit(_))
+                    && primitive_method_field_type(other.trim_matches('`')).is_some()
+                {
+                    other
+                } else {
+                    own
+                }
+            };
+            let (left_family, right_family) = (
+                fold(lhs, left_family, rhs, right_family),
+                fold(rhs, right_family, lhs, left_family),
+            );
+            let comparison = matches!(
+                operator,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            );
+            if left_family == right_family {
+                for operand in [lhs, rhs] {
+                    let ExprKind::Lit(_) = operand.kind else {
+                        continue;
+                    };
+                    let Some(primitive) =
+                        primitive_method_field_type(left_family.trim_matches('`'))
+                    else {
+                        continue;
+                    };
+                    let Some(mut operand_diagnostics) = check_const_literal_against_type(
+                        owner.id,
+                        ConstLiteralType::Primitive(primitive),
+                        operand,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    diagnostics.append(&mut operand_diagnostics);
+                }
+                if comparison {
+                    return Ok(Some(("`Bool`", diagnostics)));
+                }
+                // `Str`/`Bool`/`()` have no arithmetic operators — the
+                // same-family non-comparison case reports the operand.
+                if matches!(left_family, "`Str`" | "`ByteStr`" | "`Bool`" | "`()`") {
+                    diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        lhs.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected `I64`, found {left_family}"),
+                        "type mismatch",
+                    )?);
+                }
+                return Ok(Some((left_family, diagnostics)));
+            }
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                rhs.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected {left_family}, found {right_family}"),
+                "type mismatch",
+            )?);
+            Ok(Some((
+                if comparison { "`Bool`" } else { left_family },
+                diagnostics,
+            )))
+        }
         ExprKind::If {
             cond,
             then,
@@ -14627,6 +14831,52 @@ fn check_function_str_local_block(
         // { 2 }` gives `n: I64`. `Str`-joining shapes fall through to the
         // shared `Str` walk (it emits the recoverable branch
         // diagnostics), and unclassed shapes gate.
+        // Operand trees (`let m = n + 1`, `let m = -n`, `let m = n < 2`)
+        // bind whatever family the fold reports — a `Str` result only
+        // arises from arithmetic on `Str` operands, which already
+        // carries the operand diagnostic.
+        if matches!(init.kind, ExprKind::Unary(_, _) | ExprKind::Binary(_, _, _))
+            && let Some((family, mut init_diagnostics)) = str_expr_family(
+                owner,
+                return_ty,
+                init,
+                locals,
+                str_bindings,
+                expected,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+        {
+            let PatKind::Binding {
+                mode: sai_hir::patterns::BindingMode::Value,
+                binding,
+                sub: None,
+                ..
+            } = pat.kind
+            else {
+                return Ok(None);
+            };
+            if let Some(pinned) = pinned
+                && family != pinned
+                && family != "`!`"
+            {
+                init_diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    init.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!("expected {pinned}, found {family}"),
+                    "type mismatch",
+                )?);
+            }
+            diagnostics.append(&mut init_diagnostics);
+            str_bindings.insert(binding, pinned.unwrap_or(family));
+            continue;
+        }
         if matches!(
             init.kind,
             ExprKind::If { .. }
@@ -15627,6 +15877,67 @@ fn str_pure_init_family(
     match init.kind {
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal),
+        ExprKind::Unary(operator, operand) => {
+            let family =
+                str_pure_init_family(operand, locals, str_bindings, type_paths, symbols, inputs)?;
+            match operator {
+                // `not` yields `Bool` regardless of the operand — a
+                // non-`Bool` operand is the diagnostic walk's report.
+                sai_hir::expressions::UnOp::Not => Some("`Bool`"),
+                sai_hir::expressions::UnOp::Neg | sai_hir::expressions::UnOp::BitNot => {
+                    Some(family)
+                }
+                _ => None,
+            }
+        }
+        ExprKind::Binary(operator, lhs, rhs) => {
+            let left =
+                str_pure_init_family(lhs, locals, str_bindings, type_paths, symbols, inputs)?;
+            let right =
+                str_pure_init_family(rhs, locals, str_bindings, type_paths, symbols, inputs)?;
+            if matches!(
+                operator,
+                BinOp::And
+                    | BinOp::Or
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+            ) {
+                return Some("`Bool`");
+            }
+            let (left, right) = if left == "`!`" {
+                (right, right)
+            } else if right == "`!`" {
+                (left, left)
+            } else {
+                (left, right)
+            };
+            let left = if left != right
+                && matches!(lhs.kind, ExprKind::Lit(_))
+                && !matches!(rhs.kind, ExprKind::Lit(_))
+                && primitive_method_field_type(right.trim_matches('`')).is_some()
+            {
+                right
+            } else {
+                left
+            };
+            let right = if left != right
+                && matches!(rhs.kind, ExprKind::Lit(_))
+                && !matches!(lhs.kind, ExprKind::Lit(_))
+                && primitive_method_field_type(left.trim_matches('`')).is_some()
+            {
+                left
+            } else {
+                right
+            };
+            let _ = right;
+            // A family disagreement is the diagnostic walk's report —
+            // the pure scan admits with the left family.
+            Some(left)
+        }
         ExprKind::If {
             then,
             els: Some(els),
@@ -54844,6 +55155,14 @@ property "shared"() {}
             "pub fn str_scalar_match_guard_if() -> Str {\n    let n = 1\n    let a = true\n    match n {\n        1 if if a { true } else { a } => \"a\",\n        _ => \"b\",\n    }\n}\n",
             "pub fn str_loop_match_guard_loop() -> Str {\n    let n = 1\n    let flag = true\n    loop {\n        let t = match n {\n            1 if loop {\n                break if flag {\n                    true\n                } else {\n                    false\n                }\n            } => 1,\n            _ => 2,\n        }\n        break t\n    }\n    \"a\"\n}\n",
             "pub fn str_scalar_cond_if_branch_tm() -> Str {\n    let a = true\n    let n = 1\n    if a and if a { n } else { true } {\n    }\n    \"a\"\n}\n",
+            "pub fn str_bin_add_let() -> Str {\n    let s = \"a\"\n    let n = 1\n    let m = n + 1\n    s\n}\n",
+            "pub fn str_bin_pin_lor() -> Str {\n    let s = \"a\"\n    let n: I8 = 1\n    let m = n + 200\n    s\n}\n",
+            "pub fn str_bin_family_tm() -> Str {\n    let s = \"a\"\n    let n: I8 = 1\n    let o: I64 = 1\n    let m = n + o\n    s\n}\n",
+            "pub fn str_unary_neg_not() -> Str {\n    let s = \"a\"\n    let n = 1\n    let m = -n\n    let a = true\n    let b = not a\n    s\n}\n",
+            "pub fn str_unary_not_nonbool_tm() -> Str {\n    let s = \"a\"\n    let n = 1\n    let m = not n\n    s\n}\n",
+            "pub fn str_bin_and_tm() -> Str {\n    let s = \"a\"\n    let a = true\n    let m = a and 1\n    s\n}\n",
+            "pub fn str_bin_str_arith_tm() -> Str {\n    let s = \"a\"\n    let m = s + 1\n    s\n}\n",
+            "pub fn str_bin_cmp_bool() -> Str {\n    let s = \"a\"\n    let n = 1\n    let m = n < 2\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54859,7 +55178,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 198);
+        assert_eq!(resolved.owners().len(), 206);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54910,6 +55229,9 @@ property "shared"() {}
             .chain(&resolved.owners()[193..194])
             .chain(&resolved.owners()[195..196])
             .chain(&resolved.owners()[196..197])
+            .chain(&resolved.owners()[198..199])
+            .chain(&resolved.owners()[201..202])
+            .chain(&resolved.owners()[205..206])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54976,10 +55298,17 @@ property "shared"() {}
             (176, sai_diagnostics::Code::UnreachablePattern),
             (181, sai_diagnostics::Code::TypeMismatch),
             (182, sai_diagnostics::Code::TypeMismatch),
+            (184, sai_diagnostics::Code::TypeMismatch),
+            (191, sai_diagnostics::Code::TypeMismatch),
             (189, sai_diagnostics::Code::TypeMismatch),
             (190, sai_diagnostics::Code::TypeMismatch),
             (194, sai_diagnostics::Code::TypeMismatch),
             (197, sai_diagnostics::Code::TypeMismatch),
+            (199, sai_diagnostics::Code::LiteralOutOfRange),
+            (200, sai_diagnostics::Code::TypeMismatch),
+            (202, sai_diagnostics::Code::TypeMismatch),
+            (203, sai_diagnostics::Code::TypeMismatch),
+            (204, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -55053,26 +55382,18 @@ property "shared"() {}
         // A `Str` parameter seeds the group, so copies and a param tail are
         // supported; non-`Str` statements, `var` bindings, and generic-arg
         // paths stay gated.
-        for owner in resolved.owners()[7..8]
-            .iter()
-            .chain(&resolved.owners()[18..19])
-            .chain(&resolved.owners()[22..24])
-            .chain(&resolved.owners()[29..30])
-            .chain(&resolved.owners()[34..35])
-            .chain(&resolved.owners()[39..40])
-            .chain(&resolved.owners()[64..65])
-            .chain(&resolved.owners()[69..70])
-            .chain(&resolved.owners()[168..169])
-            .chain(&resolved.owners()[173..174])
-            .chain(&resolved.owners()[184..185])
-            .chain(&resolved.owners()[191..192])
-        {
-            assert!(matches!(
-                owner
-                    .body_type_check()
-                    .expect("unsupported Str-local body check succeeds"),
-                FunctionBodyTypeCheck::Unsupported
-            ));
+        for index in [7, 18, 22, 23, 29, 34, 39, 64, 168, 173] {
+            let owner = &resolved.owners()[index];
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("unsupported Str-local body check succeeds"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "owner #{index}: expected Unsupported, got {:?}",
+                owner.body_type_check()
+            );
         }
     }
 
