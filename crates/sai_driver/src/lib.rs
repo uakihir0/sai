@@ -13451,12 +13451,13 @@ fn str_expr_family(
             body,
             source: LoopSource::Loop,
             ..
-        } if expected.is_none() => str_loop_family(
+        } => str_loop_family(
             owner,
             return_ty,
             body,
             str_bindings,
             locals,
+            expected,
             type_paths,
             symbols,
             inputs,
@@ -13467,7 +13468,7 @@ fn str_expr_family(
             scrutinee,
             arms,
             source: MatchSource::Normal,
-        } if expected.is_none() => str_match_family(
+        } => str_match_family(
             owner,
             return_ty,
             scrutinee,
@@ -13475,6 +13476,7 @@ fn str_expr_family(
             expr.span,
             locals,
             str_bindings,
+            expected,
             type_paths,
             symbols,
             inputs,
@@ -13501,6 +13503,7 @@ fn str_match_family(
     span: sai_hir::Span,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    expected: Option<sai_resolve::prelude::PrimTy>,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -13513,7 +13516,11 @@ fn str_match_family(
         return Ok(None);
     }
     let mut diagnostics = Vec::new();
-    let mut family: Option<&'static str> = None;
+    // A scalar annotation seeds the arm join like the checker's β — a
+    // literal arm body checks against the annotation through the
+    // expression walk's `expected`, and a differing arm family reports
+    // `expected <pin>, found <family>`.
+    let mut family: Option<&'static str> = expected.and_then(str_prim_family_name);
     let mut catch_all = false;
     let mut arm_families = Vec::with_capacity(arms.len());
     for arm in arms {
@@ -13605,7 +13612,7 @@ fn str_match_family(
             arm.body,
             locals,
             &arm_bindings,
-            None,
+            expected,
             type_paths,
             symbols,
             inputs,
@@ -13742,6 +13749,7 @@ fn str_loop_family(
     body: &sai_hir::expressions::Block<'_>,
     str_bindings: &StrLocalBindings,
     locals: &LocalResolution,
+    expected: Option<sai_resolve::prelude::PrimTy>,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -13793,7 +13801,7 @@ fn str_loop_family(
                 value,
                 locals,
                 str_bindings,
-                None,
+                expected,
                 type_paths,
                 symbols,
                 inputs,
@@ -13807,6 +13815,32 @@ fn str_loop_family(
             None => return Ok(None),
         }
     }
+    // An annotated `let n: I8 = loop { .. }` pins every literal
+    // contribution to the annotation like the checker's β seeding — the
+    // scan's default `I64` folds into the expected family with the
+    // annotation's range check.
+    if let Some(expected_family) = expected.and_then(str_prim_family_name)
+        && let Some(primitive) = expected
+    {
+        for (family, value, _) in resolved.iter_mut() {
+            let Some(expr) = *value else { continue };
+            if *family != Some("`I64`") || !matches!(expr.kind, ExprKind::Lit(_)) {
+                continue;
+            }
+            if let Some(mut literal_diagnostics) = check_const_literal_against_type(
+                owner.id,
+                ConstLiteralType::Primitive(primitive),
+                expr,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )? {
+                diagnostics.append(&mut literal_diagnostics);
+            }
+            *family = Some(expected_family);
+        }
+    }
     str_fold_literal_contributions(
         owner,
         &mut resolved,
@@ -13816,7 +13850,7 @@ fn str_loop_family(
         target_cfg,
         &mut diagnostics,
     )?;
-    let mut family: Option<&'static str> = None;
+    let mut family: Option<&'static str> = expected.and_then(str_prim_family_name);
     for (contribution, _value, span) in resolved {
         let contribution = contribution.expect("every contribution resolved above");
         if contribution == "`!`" {
@@ -14325,14 +14359,17 @@ fn check_function_str_local_block(
             str_bindings.insert(binding, pinned.unwrap_or(family));
             continue;
         }
-        // Non-literal initializers — `if`/`loop`/block — that join a
-        // non-`Str` family bind it directly: `let n = if c { 1 } else { 2 }`
-        // gives `n: I64`. `Str`-joining shapes fall through to the shared
-        // `Str` walk (it emits the recoverable branch diagnostics), and
-        // unclassed shapes gate.
+        // Non-literal initializers — `if`/`loop`/`match`/block — that join
+        // a non-`Str` family bind it directly: `let n = if c { 1 } else
+        // { 2 }` gives `n: I64`. `Str`-joining shapes fall through to the
+        // shared `Str` walk (it emits the recoverable branch
+        // diagnostics), and unclassed shapes gate.
         if matches!(
             init.kind,
-            ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::Loop { .. }
+            ExprKind::If { .. }
+                | ExprKind::Block(_)
+                | ExprKind::Loop { .. }
+                | ExprKind::Match { .. }
         ) && let Some((family, mut init_diagnostics)) = str_expr_family(
             owner,
             return_ty,
@@ -54248,6 +54285,10 @@ property "shared"() {}
             "pub fn str_loop_match_seed_break_mismatch() -> Str {\n    let s = \"a\"\n    loop {\n        let n = match s {\n            \"x\" => 1,\n            _ => 2,\n        }\n        return if true {\n            break n\n        } else {\n            break \"a\"\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_loop_break_match_ann_arm_fold() -> Str {\n    let x: I8 = 1\n    let n = loop {\n        break match \"s\" {\n            \"b\" => x,\n            _ => 1,\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_loop_break_match_arm_binding() -> Str {\n    let s = \"a\"\n    loop {\n        return match s {\n            other => {\n                break other\n            }\n        }\n    }\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_loop_break_lit() -> Str {\n    let n: I8 = loop {\n        break 1\n    }\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_loop_break_lit_oob() -> Str {\n    let n: I8 = loop {\n        break 200\n    }\n    \"a\"\n}\n",
+            "pub fn str_match_i8_ann_init() -> Str {\n    let s = \"a\"\n    let m: I8 = match s {\n        \"x\" => 1,\n        _ => 2,\n    }\n    \"a\"\n}\n",
+            "pub fn str_match_ann_i8_arm_mismatch() -> Str {\n    let s = \"a\"\n    let m: I8 = match s {\n        \"x\" => 1,\n        _ => \"a\",\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54263,7 +54304,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 151);
+        assert_eq!(resolved.owners().len(), 155);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54278,6 +54319,7 @@ property "shared"() {}
             .chain(&resolved.owners()[53..54])
             .chain(&resolved.owners()[56..60])
             .chain(&resolved.owners()[63..64])
+            .chain(&resolved.owners()[65..66])
             .chain(&resolved.owners()[66..68])
             .chain(&resolved.owners()[70..71])
             .chain(&resolved.owners()[72..76])
@@ -54299,7 +54341,8 @@ property "shared"() {}
             .chain(&resolved.owners()[137..138])
             .chain(&resolved.owners()[140..141])
             .chain(&resolved.owners()[145..147])
-            .chain(&resolved.owners()[149..151])
+            .chain(&resolved.owners()[149..152])
+            .chain(&resolved.owners()[153..154])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54351,6 +54394,10 @@ property "shared"() {}
             (144, sai_diagnostics::Code::TypeMismatch),
             (147, sai_diagnostics::Code::LiteralOutOfRange),
             (148, sai_diagnostics::Code::TypeMismatch),
+            (142, sai_diagnostics::Code::InvalidBreakValue),
+            (143, sai_diagnostics::Code::TypeMismatch),
+            (152, sai_diagnostics::Code::LiteralOutOfRange),
+            (154, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -54431,9 +54478,8 @@ property "shared"() {}
             .chain(&resolved.owners()[29..30])
             .chain(&resolved.owners()[34..35])
             .chain(&resolved.owners()[39..40])
-            .chain(&resolved.owners()[64..66])
+            .chain(&resolved.owners()[64..65])
             .chain(&resolved.owners()[69..70])
-            .chain(&resolved.owners()[142..144])
         {
             assert!(matches!(
                 owner
