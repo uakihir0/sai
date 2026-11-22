@@ -5708,11 +5708,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_logical_not(&mut self, operand: &'hir Expr<'hir>) -> Result<LocalType, ()> {
-        let operand_type = self
-            .check_local_path(operand)
-            .ok()
-            .and_then(|local_type| self.concrete_local_type(local_type))
-            .ok_or(())?;
+        // The shared probe falls back to the literal-variable family
+        // default, so `apply_bool(not inferred)` reports the `Bool`
+        // mismatch like the initializer positions.
+        let operand_type = self.check_logical_operand_probe(operand)?;
         match primitive_bool_operand_result(operand_type) {
             PrimitiveBoolOperandResult::Bool => {}
             PrimitiveBoolOperandResult::TypeMismatch { found } => {
