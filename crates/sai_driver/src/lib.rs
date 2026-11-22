@@ -14811,7 +14811,9 @@ fn str_stmt_expr_unit(
                     body,
                     locals,
                     str_bindings,
-                    expected,
+                    // A nested `loop` opens its own β — the enclosing
+                    // initializer's pin does not reach its `break`s.
+                    None,
                     type_paths,
                     symbols,
                     inputs,
@@ -14914,7 +14916,7 @@ fn str_stmt_expr_unit(
                 body,
                 locals,
                 str_bindings,
-                expected,
+                None,
                 type_paths,
                 symbols,
                 inputs,
@@ -54300,6 +54302,7 @@ property "shared"() {}
             "pub fn str_ann_i8_loop_break_block_oob() -> Str {\n    let n: I8 = loop {\n        break {\n            200\n        }\n    }\n    \"a\"\n}\n",
             "pub fn str_ann_f32_loop_break_float() -> Str {\n    let n: F32 = loop {\n        break 1.0\n    }\n    \"a\"\n}\n",
             "pub fn str_ann_u64_loop_break_int() -> Str {\n    let n: U64 = loop {\n        break 9223372036854775808\n    }\n    \"a\"\n}\n",
+            "pub fn str_ann_i8_loop_nested_oob() -> Str {\n    let n: I8 = loop {\n        loop {\n            break 200\n        }\n        break 1\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54315,7 +54318,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 158);
+        assert_eq!(resolved.owners().len(), 159);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54354,7 +54357,7 @@ property "shared"() {}
             .chain(&resolved.owners()[145..147])
             .chain(&resolved.owners()[149..152])
             .chain(&resolved.owners()[153..154])
-            .chain(&resolved.owners()[156..158])
+            .chain(&resolved.owners()[156..159])
             .enumerate()
         {
             let (index, owner) = (index, owner);
