@@ -7726,7 +7726,7 @@ fn can_track_unannotated_integer_remainder_pair_alias(
 /// `Some(is_empty)` when both literal bounds are comparable same-kind
 /// literals; `None` leaves non-comparable bound pairs to the per-literal
 /// type checks that already ran.
-fn literal_range_is_empty<'hir>(
+pub fn literal_range_is_empty<'hir>(
     start: &Option<PatRangeEnd<'hir>>,
     end: &Option<PatRangeEnd<'hir>>,
     inclusive: bool,
