@@ -7628,7 +7628,7 @@ fn check_function_body_type(
         ) {
             // A `Str` parameter seeds the `Str` local group: `let copy = param`
             // and a param-path tail both resolve through it.
-            let mut str_bindings = std::collections::HashSet::from([body_parameter.binding]);
+            let mut str_bindings = StrLocalBindings::from([(body_parameter.binding, "`Str`")]);
             let Some(diagnostics) = check_function_str_local_block(
                 owner,
                 *sig.ret.expect("Str return is present"),
@@ -7782,8 +7782,10 @@ fn check_function_body_type(
             Some(FunctionDirectType::Str)
         ) {
             // Two `Str` parameters seed the `Str` local group together.
-            let mut str_bindings =
-                std::collections::HashSet::from([first_body.binding, second_body.binding]);
+            let mut str_bindings = StrLocalBindings::from([
+                (first_body.binding, "`Str`"),
+                (second_body.binding, "`Str`"),
+            ]);
             let Some(diagnostics) = check_function_str_local_block(
                 owner,
                 *sig.ret.expect("Str return is present"),
@@ -7989,7 +7991,7 @@ fn check_function_body_type(
             Some(FunctionDirectType::Str) => {
                 // `Str` locals bind only string literals and earlier `Str`
                 // locals: `let s = "a"`, `let t: Str = s`.
-                let mut str_bindings = std::collections::HashSet::new();
+                let mut str_bindings = StrLocalBindings::new();
                 let Some(diagnostics) = check_function_str_local_block(
                     owner,
                     *return_ty,
@@ -13156,10 +13158,15 @@ fn is_direct_const_literal_or_unit(value: &HirExpr<'_>) -> bool {
     }
 }
 
+// `Str` body locals: a binding id maps to its group family — `"`Str`"`
+// for `Str` literals/copies and the literal family (`"`I64`"`, `"`F64`"`,
+// `"`Bool`"`, `"`Byte`"`, `"`Char`"`) for scalar literal locals.
+type StrLocalBindings = std::collections::BTreeMap<sai_hir::BindingId, &'static str>;
+
 fn str_binding_path(
     expression: &HirExpr<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
 ) -> bool {
     let ExprKind::Path(path) = expression.kind else {
         return false;
@@ -13173,7 +13180,7 @@ fn str_binding_path(
             base: Res::Local(binding),
             resolved_segments: 1,
             segment_count: 1,
-        }) if str_bindings.contains(binding)
+        }) if matches!(str_bindings.get(binding), Some(&"`Str`"))
     )
 }
 
@@ -13185,7 +13192,7 @@ fn str_binding_path(
 fn str_condition_operand(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
 ) -> bool {
     matches!(expr.kind, ExprKind::Lit(Lit::Str(_))) || str_binding_path(expr, locals, str_bindings)
 }
@@ -13196,7 +13203,7 @@ fn str_condition_operand(
 fn str_comparison_condition(
     cond: &HirExpr<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
 ) -> bool {
     matches!(
         cond.kind,
@@ -13216,7 +13223,7 @@ fn str_assert_msg(
     owner: &HirOwner<'_>,
     msg: &HirExpr<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
@@ -13248,7 +13255,7 @@ fn str_condition(
     owner: &HirOwner<'_>,
     cond: &HirExpr<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     symbols: &Interner,
@@ -13372,7 +13379,7 @@ fn check_function_str_local_block(
     owner: &HirOwner<'_>,
     return_ty: Ty<'_>,
     block: &sai_hir::expressions::Block<'_>,
-    str_bindings: &mut std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &mut StrLocalBindings,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
@@ -13671,7 +13678,7 @@ fn check_function_str_local_block(
                         ..
                     } = arm.pat.kind
                     {
-                        bindings.insert(binding);
+                        bindings.insert(binding, "`Str`");
                     }
                     matches!(arm.body.kind, ExprKind::Lit(Lit::Str(_)))
                         || str_binding_path(arm.body, locals, &bindings)
@@ -13711,7 +13718,7 @@ fn check_function_str_local_block(
         else {
             return Ok(None);
         };
-        str_bindings.insert(binding);
+        str_bindings.insert(binding, "`Str`");
     }
     let Some(tail) = block.tail else {
         // A block without a tail yields `!` when a statement diverges
@@ -13800,7 +13807,7 @@ fn str_stmt_expr_unit(
     return_ty: Ty<'_>,
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -14098,7 +14105,7 @@ fn str_stmt_expr_unit(
 fn str_stmt_break_family(
     value: Option<&HirExpr<'_>>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
 ) -> Option<&'static str> {
     let Some(value) = value else {
         return Some("`()`");
@@ -14120,7 +14127,7 @@ fn str_stmt_break_family(
 fn str_stmt_loop_break_families(
     block: &sai_hir::expressions::Block<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     out: &mut Vec<(&'static str, sai_hir::Span)>,
 ) {
     for stmt in block.stmts {
@@ -14137,7 +14144,7 @@ fn str_stmt_loop_break_families(
 fn str_stmt_break_families_expr(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     out: &mut Vec<(&'static str, sai_hir::Span)>,
 ) {
     match expr.kind {
@@ -14162,6 +14169,12 @@ fn str_stmt_break_families_expr(
         }
         ExprKind::Return(Some(value)) => {
             str_stmt_break_families_expr(value, locals, str_bindings, out);
+        }
+        ExprKind::Block(inner) => str_stmt_loop_break_families(inner, locals, str_bindings, out),
+        ExprKind::Match { arms, .. } => {
+            for arm in arms {
+                str_stmt_break_families_expr(arm.body, locals, str_bindings, out);
+            }
         }
         _ => {}
     }
@@ -14212,6 +14225,8 @@ fn str_loop_body_has_break(block: &sai_hir::expressions::Block<'_>) -> bool {
                     })
             }
             ExprKind::Return(Some(value)) => expr_has_break(value),
+            ExprKind::Block(inner) => str_loop_body_has_break(inner),
+            ExprKind::Match { arms, .. } => arms.iter().any(|arm| expr_has_break(arm.body)),
             _ => false,
         }
     }
@@ -14241,7 +14256,7 @@ fn str_stmt_block_unit(
     return_ty: Ty<'_>,
     block: &sai_hir::expressions::Block<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -14309,7 +14324,7 @@ fn str_stmt_block_unit(
                 else {
                     return Ok(None);
                 };
-                inner_bindings.insert(binding);
+                inner_bindings.insert(binding, "`Str`");
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
                 let Some(mut expr_diagnostics) = str_stmt_expr_unit(
@@ -14368,7 +14383,7 @@ fn str_loop_level_block(
     owner: &HirOwner<'_>,
     return_ty: Ty<'_>,
     block: &sai_hir::expressions::Block<'_>,
-    str_bindings: &mut std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &mut StrLocalBindings,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
@@ -14436,7 +14451,7 @@ fn str_loop_level_block(
                 else {
                     return Ok(None);
                 };
-                str_bindings.insert(binding);
+                str_bindings.insert(binding, "`Str`");
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
                 let Some((clean, broken, mut expr_diagnostics)) = str_loop_level_expr(
@@ -14493,7 +14508,7 @@ fn str_loop_level_expr(
     owner: &HirOwner<'_>,
     return_ty: Ty<'_>,
     expr: &HirExpr<'_>,
-    str_bindings: &mut std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &mut StrLocalBindings,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
@@ -14655,7 +14670,7 @@ fn str_loop_str_body(
     owner: &HirOwner<'_>,
     return_ty: Ty<'_>,
     block: &sai_hir::expressions::Block<'_>,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
@@ -14698,7 +14713,7 @@ fn str_loop_str_body(
 fn str_break_ctx_clean(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
 ) -> bool {
     str_clean_expr(expr, locals, str_bindings, false)
 }
@@ -14706,7 +14721,7 @@ fn str_break_ctx_clean(
 fn str_clean_block(
     block: &sai_hir::expressions::Block<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     loop_level: bool,
 ) -> bool {
     let mut bindings = str_bindings.clone();
@@ -14725,7 +14740,7 @@ fn str_clean_block(
                 } = pat.kind
                 {
                     if str_clean_expr(init, locals, &bindings, loop_level) {
-                        bindings.insert(binding);
+                        bindings.insert(binding, "`Str`");
                     }
                 }
             }
@@ -14741,7 +14756,7 @@ fn str_clean_block(
 fn str_clean_expr(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     loop_level: bool,
 ) -> bool {
     match expr.kind {
@@ -14768,7 +14783,7 @@ fn str_clean_expr(
                 ..
             } = arm.pat.kind
             {
-                bindings.insert(binding);
+                bindings.insert(binding, "`Str`");
             }
             str_clean_expr(arm.body, locals, &bindings, loop_level)
         }),
@@ -14792,7 +14807,7 @@ fn str_break_value(
     owner: &HirOwner<'_>,
     return_ty: Ty<'_>,
     value: &HirExpr<'_>,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
@@ -14898,7 +14913,7 @@ fn check_function_str_match(
     return_ty: Ty<'_>,
     scrutinee: &HirExpr<'_>,
     arms: &[sai_hir::expressions::Arm<'_>],
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
@@ -14926,7 +14941,7 @@ fn check_function_str_match(
             ..
         } = arm.pat.kind
         {
-            arm_bindings.insert(binding);
+            arm_bindings.insert(binding, "`Str`");
         }
         if let Some(guard) = arm.guard {
             let Some(mut guard_diagnostics) = str_condition(
@@ -14962,7 +14977,7 @@ fn check_function_str_match(
                 ..
             } = arm.pat.kind
             {
-                arm_bindings.insert(binding);
+                arm_bindings.insert(binding, "`Str`");
             }
         } else {
             match arm.pat.kind {
@@ -15018,7 +15033,7 @@ fn check_function_str_match(
                     ..
                 } => {
                     catch_all = !guarded;
-                    arm_bindings.insert(binding);
+                    arm_bindings.insert(binding, "`Str`");
                 }
                 _ => return Ok(None),
             }
@@ -15064,7 +15079,7 @@ fn check_function_str_tail(
     return_ty: Ty<'_>,
     tail: &HirExpr<'_>,
     locals: &LocalResolution,
-    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+    str_bindings: &StrLocalBindings,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -52775,6 +52790,7 @@ property "shared"() {}
             "pub fn str_return_diverging_block() -> Str {\n    return \"a\"\n    let s = \"b\"\n}\n",
             "pub fn str_loop_break_value_then_unit() -> Str {\n    loop { break \"a\"\n    break }\n    \"a\"\n}\n",
             "pub fn str_while_body_no_tail() -> Str {\n    while true {}\n}\n",
+            "pub fn str_return_break_block() -> Str {\n    loop { return { break } }\n    let s = \"b\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -52790,7 +52806,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 111);
+        assert_eq!(resolved.owners().len(), 112);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -52852,6 +52868,7 @@ property "shared"() {}
             (106, sai_diagnostics::Code::InvalidBreakValue),
             (107, sai_diagnostics::Code::BreakOutsideLoop),
             (109, sai_diagnostics::Code::InvalidBreakValue),
+            (111, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
