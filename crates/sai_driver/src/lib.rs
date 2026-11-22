@@ -13587,8 +13587,15 @@ fn str_expr_family(
                             | "`F64`"
                     )
                 });
+            let operand_is_literalish = |operand: &HirExpr<'_>| {
+                matches!(operand.kind, ExprKind::Lit(_))
+                    || str_binding_entry(operand, locals, str_bindings)
+                        .is_some_and(|entry| entry.literal.is_some())
+            };
+            let operands_share_literal_kind =
+                operand_is_literalish(lhs) && operand_is_literalish(rhs);
             let operand_expected = |operand: &HirExpr<'_>| {
-                if numeric_pin && matches!(operand.kind, ExprKind::Lit(_)) {
+                if numeric_pin && operands_share_literal_kind && operand_is_literalish(operand) {
                     expected
                 } else {
                     None
@@ -15334,6 +15341,60 @@ fn check_function_str_local_block(
             snapshot,
             target_cfg,
         )? {
+            let PatKind::Binding {
+                mode: sai_hir::patterns::BindingMode::Value,
+                binding,
+                sub: None,
+                ..
+            } = pat.kind
+            else {
+                return Ok(None);
+            };
+            if let Some(pinned) = pinned
+                && family != pinned
+                && family != "`!`"
+            {
+                init_diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    init.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!("expected {pinned}, found {family}"),
+                    "type mismatch",
+                )?);
+            }
+            diagnostics.append(&mut init_diagnostics);
+            str_bindings.insert(
+                binding,
+                str_let_entry(init, family, pinned, locals, str_bindings),
+            );
+            continue;
+        }
+        // Non-literal initializers — `if`/`loop`/`match`/block — that join
+        // a non-`Str` family bind it directly: `let n = if c { 1 } else
+        // { 2 }` gives `n: I64`. `Str`-joining shapes fall through to the
+        // shared `Str` walk (it emits the recoverable branch
+        // diagnostics), and unclassed shapes gate.
+        // Operand trees (`let m = n + 1`, `let m = -n`, `let m = n < 2`)
+        // bind whatever family the fold reports — a `Str` result only
+        // arises from arithmetic on `Str` operands, which already
+        // carries the operand diagnostic.
+        if matches!(init.kind, ExprKind::Unary(_, _) | ExprKind::Binary(_, _, _))
+            && let Some((family, mut init_diagnostics)) = str_expr_family(
+                owner,
+                return_ty,
+                init,
+                locals,
+                str_bindings,
+                expected,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+        {
             let PatKind::Binding {
                 mode: sai_hir::patterns::BindingMode::Value,
                 binding,
@@ -17242,10 +17303,7 @@ fn str_stmt_block_unit(
                 diagnostics.append(&mut init_diagnostics);
                 inner_bindings.insert(
                     binding,
-                    StrLocalEntry {
-                        family: pinned.unwrap_or(family),
-                        literal: None,
-                    },
+                    str_let_entry(init, family, pinned, locals, &inner_bindings),
                 );
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
@@ -55913,6 +55971,7 @@ property "shared"() {}
             "pub fn str_bin_shift_litvar_count() -> Str {\n    let s = \"a\"\n    let n = 1\n    let c = 1\n    let m = n << c\n    s\n}\n",
             "pub fn str_bin_shift_count_oob() -> Str {\n    let s = \"a\"\n    let n = 1\n    let c = 4294967296\n    let m = n << c\n    s\n}\n",
             "pub fn str_bin_shift_ann_pin() -> Str {\n    let s = \"a\"\n    let c = 1\n    let m: U8 = 1 << c\n    s\n}\n",
+            "pub fn str_bin_pin_mixed_tm() -> Str {\n    let s = \"a\"\n    let wide: I64 = 5\n    let m: I8 = wide + 200\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -55928,7 +55987,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 217);
+        assert_eq!(resolved.owners().len(), 218);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -56069,6 +56128,7 @@ property "shared"() {}
             (212, sai_diagnostics::Code::OperatorNotSupported),
             (213, sai_diagnostics::Code::OperatorNotSupported),
             (215, sai_diagnostics::Code::LiteralOutOfRange),
+            (217, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
