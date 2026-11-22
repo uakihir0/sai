@@ -13951,6 +13951,7 @@ fn str_loop_family(
         symbols,
         inputs,
         &mut contributions,
+        false,
     );
     // A `break` whose value classifies carries its family; an unclassed
     // value gets one pass through the expression walk (`break if`/nested
@@ -15087,6 +15088,7 @@ fn str_stmt_expr_unit(
                     symbols,
                     inputs,
                     &mut contributions,
+                    false,
                 );
                 // Unclassed contributions get the same silent expression-
                 // walk pass as `str_loop_family` — the statement walk
@@ -15454,6 +15456,10 @@ fn str_stmt_break_family(
     value: Option<&HirExpr<'_>>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    pure: bool,
 ) -> Option<&'static str> {
     let Some(value) = value else {
         return Some("`()`");
@@ -15461,7 +15467,16 @@ fn str_stmt_break_family(
     match value.kind {
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal).or(Some("`ByteStr`")),
-        _ => str_binding_family(value, locals, str_bindings),
+        // `break if`/`match`/`block`/`loop` values classify through the
+        // pure initializer walk like the diagnostic `str_break_value` —
+        // only in the pure scan: the diagnostic walk's contributions
+        // carry pin-adjusted families from `str_break_value` instead.
+        _ => str_binding_family(value, locals, str_bindings).or_else(|| {
+            pure.then(|| {
+                str_pure_init_family(value, locals, str_bindings, type_paths, symbols, inputs)
+            })
+            .flatten()
+        }),
     }
 }
 
@@ -15477,6 +15492,7 @@ fn str_stmt_loop_break_families<'h>(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     out: &mut Vec<(Option<&'static str>, Option<&'h HirExpr<'h>>, sai_hir::Span)>,
+    pure: bool,
 ) {
     // `let` bindings declared in this block scope the following
     // statements' contributions — a scalar local's `break n` carries its
@@ -15519,14 +15535,14 @@ fn str_stmt_loop_break_families<'h>(
                     local.insert(binding, family);
                 }
             }
-            sai_hir::expressions::StmtKind::Expr(expr) => {
-                str_stmt_break_families_expr(expr, locals, &local, type_paths, symbols, inputs, out)
-            }
+            sai_hir::expressions::StmtKind::Expr(expr) => str_stmt_break_families_expr(
+                expr, locals, &local, type_paths, symbols, inputs, out, pure,
+            ),
             _ => {}
         }
     }
     if let Some(tail) = block.tail {
-        str_stmt_break_families_expr(tail, locals, &local, type_paths, symbols, inputs, out);
+        str_stmt_break_families_expr(tail, locals, &local, type_paths, symbols, inputs, out, pure);
     }
 }
 
@@ -15623,6 +15639,7 @@ fn str_pure_init_family(
                 symbols,
                 inputs,
                 &mut contributions,
+                true,
             );
             // The same literal-vs-pin fold as the diagnostic walk, minus
             // diagnostics — the statement walk emits those itself.
@@ -15858,11 +15875,20 @@ fn str_stmt_break_families_expr<'h>(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     out: &mut Vec<(Option<&'static str>, Option<&'h HirExpr<'h>>, sai_hir::Span)>,
+    pure: bool,
 ) {
     match expr.kind {
         ExprKind::Break { label: None, value } => {
             out.push((
-                str_stmt_break_family(value, locals, str_bindings),
+                str_stmt_break_family(
+                    value,
+                    locals,
+                    str_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    pure,
+                ),
                 value,
                 value.map(|v| v.span).unwrap_or(expr.span),
             ));
@@ -15876,6 +15902,7 @@ fn str_stmt_break_families_expr<'h>(
                 symbols,
                 inputs,
                 out,
+                pure,
             );
             if let Some(els) = els {
                 match els.kind {
@@ -15887,6 +15914,7 @@ fn str_stmt_break_families_expr<'h>(
                         symbols,
                         inputs,
                         out,
+                        pure,
                     ),
                     ExprKind::If { .. } => str_stmt_break_families_expr(
                         els,
@@ -15896,6 +15924,7 @@ fn str_stmt_break_families_expr<'h>(
                         symbols,
                         inputs,
                         out,
+                        pure,
                     ),
                     _ => {}
                 }
@@ -15910,6 +15939,7 @@ fn str_stmt_break_families_expr<'h>(
                 symbols,
                 inputs,
                 out,
+                pure,
             );
         }
         ExprKind::Block(inner) => str_stmt_loop_break_families(
@@ -15920,6 +15950,7 @@ fn str_stmt_break_families_expr<'h>(
             symbols,
             inputs,
             out,
+            pure,
         ),
         ExprKind::Match {
             scrutinee, arms, ..
@@ -15952,6 +15983,7 @@ fn str_stmt_break_families_expr<'h>(
                     symbols,
                     inputs,
                     out,
+                    pure,
                 );
             }
         }
