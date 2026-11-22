@@ -13487,11 +13487,174 @@ fn str_expr_family(
     }
 }
 
-// A `match` over a `Str` scrutinee joins its arm-body families the way
-// `check_function_str_match` joins yields: `Str` literal and all-`Str`
-// or-patterns match the scrutinee, a non-`Str` literal pattern reports
-// `expected `Str`, found <lit>`, wildcard/binding arms are catch-alls
-// (binding arms seed `Str`), an arm after a catch-all reports
+// Mirrors `check_match_arm_pattern` for one arm's pattern: literal
+// patterns check against the scrutinee primitive (a `Str` scrutinee
+// compares by family name like the literal-join admission), or-patterns
+// are all-literal, literal range bounds check and report
+// EMPTY_RANGE_PATTERN, wildcard/binding arms are the catch-all (the
+// binding seeds the scrutinee family — returned for the caller to
+// install). Returns `None` when the pattern gates.
+#[allow(clippy::too_many_arguments)]
+fn str_match_arm_pattern(
+    owner: &HirOwner<'_>,
+    pat: &HirPat<'_>,
+    is_unguarded: bool,
+    scrutinee_prim: Option<sai_resolve::prelude::PrimTy>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    diagnostics: &mut Vec<Diagnostic>,
+    bool_cover: &mut (bool, bool),
+) -> Result<Option<Option<sai_hir::BindingId>>, OwnerControlFlowResolutionError> {
+    // One literal pattern, checked like `check_match_literal_pattern`
+    // against the scrutinee primitive — `Str` scrutinee patterns keep
+    // the family-name comparison.
+    let mut check_pattern_literal = |literal: Lit<'_>,
+                                     diagnostics: &mut Vec<Diagnostic>|
+     -> Result<Option<()>, OwnerControlFlowResolutionError> {
+        match scrutinee_prim {
+            Some(primitive) => {
+                if is_unguarded && let Lit::Bool(value) = literal {
+                    if value {
+                        bool_cover.0 = true;
+                    } else {
+                        bool_cover.1 = true;
+                    }
+                }
+                if str_scalar_family_name(literal).is_none() {
+                    return Ok(None);
+                }
+                match sai_ty::typeck::literal::check_primitive_literal(
+                    primitive,
+                    literal,
+                    symbols,
+                    target_cfg.pointer_width(),
+                ) {
+                    sai_ty::typeck::literal::PrimitiveLiteralResult::Match => {}
+                    sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => {
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            pat.span,
+                            sai_diagnostics::Code::TypeMismatch,
+                            format!(
+                                "expected `{}`, found {}",
+                                const_primitive_name(primitive),
+                                str_pattern_literal_name(literal)
+                                    .expect("scalar literal names itself"),
+                            ),
+                            "type mismatch",
+                        )?);
+                    }
+                    sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
+                        let label = if matches!(literal, Lit::Int { .. }) {
+                            "integer"
+                        } else {
+                            "floating-point"
+                        };
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            pat.span,
+                            sai_diagnostics::Code::LiteralOutOfRange,
+                            format!(
+                                "{label} literal is out of range for `{}`",
+                                const_primitive_name(primitive),
+                            ),
+                            "literal out of range",
+                        )?);
+                    }
+                }
+                Ok(Some(()))
+            }
+            None => match literal {
+                Lit::Str(_) => Ok(Some(())),
+                literal => {
+                    let Some(found) = str_pattern_literal_name(literal) else {
+                        return Ok(None);
+                    };
+                    diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        pat.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected `Str`, found {found}"),
+                        "type mismatch",
+                    )?);
+                    Ok(Some(()))
+                }
+            },
+        }
+    };
+    match pat.kind {
+        PatKind::Lit(literal) => match check_pattern_literal(literal, diagnostics)? {
+            Some(()) => Ok(Some(None)),
+            None => Ok(None),
+        },
+        PatKind::Or(alternatives) => {
+            if alternatives.is_empty() {
+                return Ok(None);
+            }
+            for alternative in alternatives {
+                let PatKind::Lit(literal) = alternative.kind else {
+                    return Ok(None);
+                };
+                if check_pattern_literal(literal, diagnostics)?.is_none() {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(None))
+        }
+        // `l1..=l2` literal bounds check against the scrutinee primitive
+        // like the checker's range admission; an empty range reports
+        // EMPTY_RANGE_PATTERN.
+        PatKind::Range {
+            start,
+            end,
+            inclusive,
+        } if scrutinee_prim.is_some() => {
+            for bound in [start, end] {
+                let Some(PatRangeEnd::Lit(literal)) = bound else {
+                    return Ok(None);
+                };
+                if check_pattern_literal(literal, diagnostics)?.is_none() {
+                    return Ok(None);
+                }
+            }
+            if sai_ty::typeck::body::literal_range_is_empty(&start, &end, inclusive) == Some(true) {
+                diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    pat.span,
+                    sai_diagnostics::Code::EmptyRangePattern,
+                    "range pattern matches no value".to_owned(),
+                    "empty range",
+                )?);
+            }
+            Ok(Some(None))
+        }
+        PatKind::Wild => Ok(Some(None)),
+        PatKind::Binding {
+            mode: sai_hir::patterns::BindingMode::Value,
+            binding,
+            sub: None,
+            ..
+        } => Ok(Some(Some(binding))),
+        _ => Ok(None),
+    }
+}
+
+// A `match` joins its arm-body families: a `Str` scrutinee admits `Str`
+// literal and all-`Str` or-patterns like `check_function_str_match`; a
+// scalar-family path scrutinee admits literal / or / literal-range
+// patterns checked against its primitive plus a Bool domain cover like
+// `check_match_arm_pattern`. Wildcard/binding arms are catch-alls (a
+// binding seeds the scrutinee family), an arm after a catch-all reports
 // UNREACHABLE_PATTERN, and a missing catch-all reports
 // NON_EXHAUSTIVE_MATCH. Anything the bounded walk cannot type gates.
 #[allow(clippy::too_many_arguments)]
@@ -13510,11 +13673,27 @@ fn str_match_family(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<(&'static str, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
-    let scrutinee_str = matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_)))
-        || str_binding_family(scrutinee, locals, str_bindings) == Some("`Str`");
-    if !scrutinee_str || arms.is_empty() {
+    let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
+        Some("`Str`")
+    } else {
+        str_binding_family(scrutinee, locals, str_bindings)
+    };
+    let Some(scrutinee_family) = scrutinee_family else {
+        return Ok(None);
+    };
+    if arms.is_empty() {
         return Ok(None);
     }
+    // A scalar scrutinee resolves to its primitive for the checker's
+    // literal-pattern rules; `Str` stays on the literal-join admission.
+    let scrutinee_prim = if scrutinee_family == "`Str`" {
+        None
+    } else {
+        match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
+            Some(primitive) => Some(primitive),
+            None => return Ok(None),
+        }
+    };
     let mut diagnostics = Vec::new();
     // A scalar annotation seeds the arm join like the checker's β — a
     // literal arm body checks against the annotation through the
@@ -13522,6 +13701,10 @@ fn str_match_family(
     // `expected <pin>, found <family>`.
     let mut family: Option<&'static str> = expected.and_then(str_prim_family_name);
     let mut catch_all = false;
+    // Bool-domain coverage like `check_match_arm_pattern`:
+    // `match flag { true => .., false => .. }` is exhaustive without a
+    // catch-all.
+    let mut bool_cover = (false, false);
     let mut arm_families = Vec::with_capacity(arms.len());
     for arm in arms {
         if let Some(guard) = arm.guard
@@ -13547,63 +13730,28 @@ fn str_match_family(
                 ..
             } = arm.pat.kind
             {
-                arm_bindings.insert(binding, "`Str`");
+                arm_bindings.insert(binding, scrutinee_family);
             }
         } else {
-            match arm.pat.kind {
-                PatKind::Lit(Lit::Str(_)) => {}
-                PatKind::Lit(literal) => {
-                    let Some(found) = str_pattern_literal_name(literal) else {
-                        return Ok(None);
-                    };
-                    diagnostics.push(const_literal_diagnostic(
-                        owner.id,
-                        inputs,
-                        snapshot,
-                        arm.pat.span,
-                        sai_diagnostics::Code::TypeMismatch,
-                        format!("expected `Str`, found {found}"),
-                        "type mismatch",
-                    )?);
-                }
-                PatKind::Or(alternatives) => {
-                    if alternatives.is_empty() {
-                        return Ok(None);
-                    }
-                    for alternative in alternatives {
-                        match alternative.kind {
-                            PatKind::Lit(Lit::Str(_)) => {}
-                            PatKind::Lit(literal) => {
-                                let Some(found) = str_pattern_literal_name(literal) else {
-                                    return Ok(None);
-                                };
-                                diagnostics.push(const_literal_diagnostic(
-                                    owner.id,
-                                    inputs,
-                                    snapshot,
-                                    arm.pat.span,
-                                    sai_diagnostics::Code::TypeMismatch,
-                                    format!("expected `Str`, found {found}"),
-                                    "type mismatch",
-                                )?);
-                            }
-                            _ => return Ok(None),
-                        }
-                    }
-                }
-                PatKind::Wild => {
-                    catch_all = arm.guard.is_none();
-                }
-                PatKind::Binding {
-                    mode: sai_hir::patterns::BindingMode::Value,
-                    binding,
-                    sub: None,
-                    ..
-                } => {
-                    catch_all = arm.guard.is_none();
-                    arm_bindings.insert(binding, "`Str`");
-                }
-                _ => return Ok(None),
+            let Some(binding) = str_match_arm_pattern(
+                owner,
+                &arm.pat,
+                arm.guard.is_none(),
+                scrutinee_prim,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                &mut diagnostics,
+                &mut bool_cover,
+            )?
+            else {
+                return Ok(None);
+            };
+            catch_all = arm.guard.is_none()
+                && matches!(arm.pat.kind, PatKind::Wild | PatKind::Binding { .. });
+            if let Some(binding) = binding {
+                arm_bindings.insert(binding, scrutinee_family);
             }
         }
         let Some((arm_family, mut arm_diagnostics)) = str_expr_family(
@@ -13658,7 +13806,10 @@ fn str_match_family(
             _ => {}
         }
     }
-    if !catch_all {
+    if !catch_all
+        && !(scrutinee_prim == Some(sai_resolve::prelude::PrimTy::Bool)
+            && bool_cover == (true, true))
+    {
         diagnostics.push(const_literal_diagnostic(
             owner.id,
             inputs,
@@ -15275,12 +15426,25 @@ fn str_pure_match_family(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
 ) -> Option<&'static str> {
-    if !(matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_)))
-        || str_binding_family(scrutinee, locals, str_bindings) == Some("`Str`"))
-        || arms.is_empty()
-    {
+    let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
+        Some("`Str`")
+    } else {
+        str_binding_family(scrutinee, locals, str_bindings)
+    };
+    let Some(scrutinee_family) = scrutinee_family else {
+        return None;
+    };
+    if arms.is_empty() {
         return None;
     }
+    let scrutinee_prim = if scrutinee_family == "`Str`" {
+        None
+    } else {
+        match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
+            Some(primitive) => Some(primitive),
+            None => return None,
+        }
+    };
     let mut catch_all = false;
     let mut arm_families: Vec<(Option<&'static str>, Option<&HirExpr<'_>>, sai_hir::Span)> =
         Vec::with_capacity(arms.len());
@@ -15299,22 +15463,35 @@ fn str_pure_match_family(
                 ..
             } = arm.pat.kind
             {
-                arm_bindings.insert(binding, "`Str`");
+                arm_bindings.insert(binding, scrutinee_family);
             }
         } else {
+            let admit_literal = |literal: Lit<'_>| -> bool {
+                match scrutinee_prim {
+                    Some(_) => str_scalar_family_name(literal).is_some(),
+                    None => {
+                        matches!(literal, Lit::Str(_))
+                            || str_pattern_literal_name(literal).is_some()
+                    }
+                }
+            };
             match arm.pat.kind {
-                PatKind::Lit(Lit::Str(_)) => {}
-                PatKind::Lit(literal) if str_pattern_literal_name(literal).is_some() => {}
-                PatKind::Lit(_) => return None,
+                PatKind::Lit(literal) if admit_literal(literal) => {}
                 PatKind::Or(alternatives) => {
                     if alternatives.is_empty() {
                         return None;
                     }
                     for alternative in alternatives {
                         match alternative.kind {
-                            PatKind::Lit(Lit::Str(_)) => {}
-                            PatKind::Lit(literal)
-                                if str_pattern_literal_name(literal).is_some() => {}
+                            PatKind::Lit(literal) if admit_literal(literal) => {}
+                            _ => return None,
+                        }
+                    }
+                }
+                PatKind::Range { start, end, .. } if scrutinee_prim.is_some() => {
+                    for bound in [start, end] {
+                        match bound {
+                            Some(PatRangeEnd::Lit(literal)) if admit_literal(literal) => {}
                             _ => return None,
                         }
                     }
@@ -15327,7 +15504,7 @@ fn str_pure_match_family(
                     ..
                 } => {
                     catch_all = arm.guard.is_none();
-                    arm_bindings.insert(binding, "`Str`");
+                    arm_bindings.insert(binding, scrutinee_family);
                 }
                 _ => return None,
             }
@@ -15484,13 +15661,17 @@ fn str_stmt_break_families_expr<'h>(
         ExprKind::Match {
             scrutinee, arms, ..
         } => {
-            // A binding arm types the pattern variable as `Str` — break
-            // values inside the arm (`break other`) classify through it.
-            let scrutinee_str = matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_)))
-                || str_binding_family(scrutinee, locals, str_bindings) == Some("`Str`");
+            // A binding arm types the pattern variable as the scrutinee
+            // family — break values inside the arm (`break other`)
+            // classify through it.
+            let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
+                Some("`Str`")
+            } else {
+                str_binding_family(scrutinee, locals, str_bindings)
+            };
             for arm in arms {
                 let mut arm_bindings = str_bindings.clone();
-                if scrutinee_str
+                if let Some(family) = scrutinee_family
                     && let PatKind::Binding {
                         mode: sai_hir::patterns::BindingMode::Value,
                         binding,
@@ -15498,7 +15679,7 @@ fn str_stmt_break_families_expr<'h>(
                         ..
                     } = arm.pat.kind
                 {
-                    arm_bindings.insert(binding, "`Str`");
+                    arm_bindings.insert(binding, family);
                 }
                 str_stmt_break_families_expr(
                     arm.body,
@@ -16352,13 +16533,15 @@ fn str_pattern_literal_name(literal: Lit<'_>) -> Option<&'static str> {
     }
 }
 
-// A `match` over a `Str` group path mirrors `check_match_tail`: `Str`
-// literal patterns match, wild/binding patterns are the catch-all (a
-// binding seeds the arm's group), arms after a catch-all diagnose
-// unreachable but still check, and a missing catch-all diagnoses
-// non-exhaustive. Guards, non-`Normal` sources, and other pattern kinds
-// gate; a non-`Str` literal pattern mirrors the checker's
-// `expected Str, found <lit>` diagnostic.
+// A `match` mirrors `check_match_tail`: a `Str` group path admits `Str`
+// literal patterns; a scalar-family path admits literal / or / literal
+// range patterns checked against its primitive plus Bool domain cover.
+// Wild/binding patterns are the catch-all (a binding seeds the
+// scrutinee family), arms after a catch-all diagnose unreachable but
+// still check, and a missing catch-all diagnoses non-exhaustive.
+// Non-`Normal` sources and other pattern kinds gate; a non-`Str`
+// literal pattern mirrors the checker's `expected Str, found <lit>`
+// diagnostic.
 fn check_function_str_match(
     owner: &HirOwner<'_>,
     return_ty: Ty<'_>,
@@ -16374,11 +16557,25 @@ fn check_function_str_match(
     break_ctx: bool,
     frame: StrStmtLoopFrame,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    if !str_binding_path(scrutinee, locals, str_bindings) {
+    let scrutinee_family = if str_binding_path(scrutinee, locals, str_bindings) {
+        Some("`Str`")
+    } else {
+        str_binding_family(scrutinee, locals, str_bindings)
+    };
+    let Some(scrutinee_family) = scrutinee_family else {
         return Ok(None);
-    }
+    };
+    let scrutinee_prim = if scrutinee_family == "`Str`" {
+        None
+    } else {
+        match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
+            Some(primitive) => Some(primitive),
+            None => return Ok(None),
+        }
+    };
     let mut diagnostics = Vec::new();
     let mut catch_all = false;
+    let mut bool_cover = (false, false);
     for arm in arms {
         // Mirrors `check_match_arm_pattern`: a guarded arm may fail its
         // guard, so it never counts as the catch-all. The leaf subset
@@ -16392,7 +16589,7 @@ fn check_function_str_match(
             ..
         } = arm.pat.kind
         {
-            arm_bindings.insert(binding, "`Str`");
+            arm_bindings.insert(binding, scrutinee_family);
         }
         if let Some(guard) = arm.guard {
             let Some(mut guard_diagnostics) = str_condition(
@@ -16428,65 +16625,27 @@ fn check_function_str_match(
                 ..
             } = arm.pat.kind
             {
-                arm_bindings.insert(binding, "`Str`");
+                arm_bindings.insert(binding, scrutinee_family);
             }
         } else {
-            match arm.pat.kind {
-                PatKind::Lit(Lit::Str(_)) => {}
-                PatKind::Lit(literal) => {
-                    let Some(found) = str_pattern_literal_name(literal) else {
-                        return Ok(None);
-                    };
-                    diagnostics.push(const_literal_diagnostic(
-                        owner.id,
-                        inputs,
-                        snapshot,
-                        arm.pat.span,
-                        sai_diagnostics::Code::TypeMismatch,
-                        format!("expected `Str`, found {found}"),
-                        "type mismatch",
-                    )?);
-                }
-                // `l1 | l2 | …` alternatives must all be literals —
-                // mirrors `check_match_arm_pattern`.
-                PatKind::Or(alternatives) => {
-                    if alternatives.is_empty() {
-                        return Ok(None);
-                    }
-                    for alternative in alternatives {
-                        match alternative.kind {
-                            PatKind::Lit(Lit::Str(_)) => {}
-                            PatKind::Lit(literal) => {
-                                let Some(found) = str_pattern_literal_name(literal) else {
-                                    return Ok(None);
-                                };
-                                diagnostics.push(const_literal_diagnostic(
-                                    owner.id,
-                                    inputs,
-                                    snapshot,
-                                    arm.pat.span,
-                                    sai_diagnostics::Code::TypeMismatch,
-                                    format!("expected `Str`, found {found}"),
-                                    "type mismatch",
-                                )?);
-                            }
-                            _ => return Ok(None),
-                        }
-                    }
-                }
-                PatKind::Wild => {
-                    catch_all = !guarded;
-                }
-                PatKind::Binding {
-                    mode: sai_hir::patterns::BindingMode::Value,
-                    binding,
-                    sub: None,
-                    ..
-                } => {
-                    catch_all = !guarded;
-                    arm_bindings.insert(binding, "`Str`");
-                }
-                _ => return Ok(None),
+            let Some(binding) = str_match_arm_pattern(
+                owner,
+                &arm.pat,
+                !guarded,
+                scrutinee_prim,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                &mut diagnostics,
+                &mut bool_cover,
+            )?
+            else {
+                return Ok(None);
+            };
+            catch_all = !guarded && matches!(arm.pat.kind, PatKind::Wild | PatKind::Binding { .. });
+            if let Some(binding) = binding {
+                arm_bindings.insert(binding, scrutinee_family);
             }
         }
         let Some(mut arm_diagnostics) = check_function_str_tail(
@@ -16508,7 +16667,10 @@ fn check_function_str_match(
         };
         diagnostics.append(&mut arm_diagnostics);
     }
-    if !catch_all {
+    if !catch_all
+        && !(scrutinee_prim == Some(sai_resolve::prelude::PrimTy::Bool)
+            && bool_cover == (true, true))
+    {
         diagnostics.push(const_literal_diagnostic(
             owner.id,
             inputs,
@@ -54303,6 +54465,18 @@ property "shared"() {}
             "pub fn str_ann_f32_loop_break_float() -> Str {\n    let n: F32 = loop {\n        break 1.0\n    }\n    \"a\"\n}\n",
             "pub fn str_ann_u64_loop_break_int() -> Str {\n    let n: U64 = loop {\n        break 9223372036854775808\n    }\n    \"a\"\n}\n",
             "pub fn str_ann_i8_loop_nested_oob() -> Str {\n    let n: I8 = loop {\n        loop {\n            break 200\n        }\n        break 1\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_let_str() -> Str {\n    let n = 1\n    let m = match n {\n        1 => \"a\",\n        _ => \"b\",\n    }\n    m\n}\n",
+            "pub fn str_scalar_match_tail() -> Str {\n    let n = 1\n    match n {\n        1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_or() -> Str {\n    let n = 1\n    match n {\n        1 | 2 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_range() -> Str {\n    let n = 1\n    match n {\n        1..=3 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_bool_cover() -> Str {\n    let b = true\n    match b {\n        true => \"a\",\n        false => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_lit_oob() -> Str {\n    let n: I8 = 1\n    match n {\n        200 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_pat_mismatch() -> Str {\n    let n = 1\n    match n {\n        'a' => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_empty_range() -> Str {\n    let n = 1\n    match n {\n        3..=1 => \"a\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_no_catch() -> Str {\n    let n = 1\n    match n {\n        1 => \"a\"\n    }\n}\n",
+            "pub fn str_scalar_match_str_pat() -> Str {\n    let n = 1\n    match n {\n        \"a\" => \"x\",\n        _ => \"b\",\n    }\n}\n",
+            "pub fn str_scalar_match_arm_break_seed() -> Str {\n    let n = 1\n    let m = loop {\n        let t = match n {\n            _ => 1,\n            k => k,\n        }\n        break t\n    }\n    \"a\"\n}\n",
+            "pub fn str_scalar_match_break_in_arm() -> Str {\n    let n = 1\n    let m = loop {\n        return match n {\n            k => break k,\n        }\n    }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -54318,7 +54492,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 159);
+        assert_eq!(resolved.owners().len(), 171);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -54358,6 +54532,8 @@ property "shared"() {}
             .chain(&resolved.owners()[149..152])
             .chain(&resolved.owners()[153..154])
             .chain(&resolved.owners()[156..159])
+            .chain(&resolved.owners()[159..164])
+            .chain(&resolved.owners()[170..171])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -54414,6 +54590,11 @@ property "shared"() {}
             (152, sai_diagnostics::Code::LiteralOutOfRange),
             (154, sai_diagnostics::Code::TypeMismatch),
             (155, sai_diagnostics::Code::LiteralOutOfRange),
+            (164, sai_diagnostics::Code::LiteralOutOfRange),
+            (165, sai_diagnostics::Code::TypeMismatch),
+            (166, sai_diagnostics::Code::EmptyRangePattern),
+            (167, sai_diagnostics::Code::NonExhaustiveMatch),
+            (169, sai_diagnostics::Code::UnreachablePattern),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -54496,6 +54677,7 @@ property "shared"() {}
             .chain(&resolved.owners()[39..40])
             .chain(&resolved.owners()[64..65])
             .chain(&resolved.owners()[69..70])
+            .chain(&resolved.owners()[168..169])
         {
             assert!(matches!(
                 owner
