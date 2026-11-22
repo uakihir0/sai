@@ -7618,124 +7618,153 @@ fn check_function_body_type(
         _ => return Ok(FunctionBodyTypeCheck::Unsupported),
     };
     let diagnostics = if let Some((parameter, body_parameter)) = parameter {
-        if !block.stmts.is_empty() {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        }
-        let Some(tail) = block.tail else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        };
-        if let ExprKind::If {
-            cond,
-            then,
-            els: Some(else_expr),
-        } = tail.kind
-        {
-            let Some(return_ty) = sig.ret else {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            };
-            if !matches!(
-                resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
-                Some(FunctionDirectType::Primitive(_))
-            ) {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            }
-            let condition_diagnostics = if function_if_condition_uses_parameter_binding(
-                cond,
-                body_parameter,
+        if matches!(
+            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
+            Some(FunctionDirectType::Str)
+        ) && matches!(
+            sig.ret
+                .and_then(|ty| { resolve_function_direct_type(*ty, type_paths, symbols, inputs) }),
+            Some(FunctionDirectType::Str)
+        ) {
+            // A `Str` parameter seeds the `Str` local group: `let copy = param`
+            // and a param-path tail both resolve through it.
+            let mut str_bindings = std::collections::HashSet::from([body_parameter.binding]);
+            let Some(diagnostics) = check_function_str_local_block(
+                owner,
+                *sig.ret.expect("Str return is present"),
+                block,
+                &mut str_bindings,
                 locals,
+                type_paths,
+                symbols,
                 inputs,
-            ) && matches!(
-                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
-                Some(FunctionDirectType::Primitive(
-                    sai_resolve::prelude::PrimTy::Bool
-                ))
-            ) {
-                Some(Vec::new())
-            } else {
-                check_function_if_parameter_comparison_condition(
-                    owner,
-                    cond,
-                    *parameter.ty,
-                    body_parameter,
-                    locals,
-                    type_paths,
-                    symbols,
-                    inputs,
-                    snapshot,
-                    target_cfg,
-                )?
-            };
-            let Some(mut condition_diagnostics) = condition_diagnostics else {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            };
-            let Some(mut branch_diagnostics) = check_function_if_literal_branches(
-                owner, *return_ty, true, then, else_expr, type_paths, symbols, inputs, snapshot,
+                snapshot,
                 target_cfg,
             )?
             else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             };
-            condition_diagnostics.append(&mut branch_diagnostics);
-            condition_diagnostics
+            diagnostics
         } else {
-            let ExprKind::Path(path) = tail.kind else {
+            if !block.stmts.is_empty() {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            let Some(tail) = block.tail else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             };
-            if path.root != PathRoot::Plain
-                || path.segments.len() != 1
-                || path.segments[0].args.is_some()
-                || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+            if let ExprKind::If {
+                cond,
+                then,
+                els: Some(else_expr),
+            } = tail.kind
             {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            }
-            if !matches!(
-                locals.paths.get(&path.hir_id),
-                Some(PathRes {
-                    base: Res::Local(resolved_binding),
-                    resolved_segments: 1,
-                    segment_count: 1,
-                }) if *resolved_binding == body_parameter.binding
-            ) {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            }
-
-            let Some(found) =
-                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
-            else {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            };
-            let expected = match sig.ret {
-                Some(ty) => {
-                    let Some(expected) =
-                        resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-                    else {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    };
-                    expected
-                }
-                None => FunctionDirectType::Unit,
-            };
-            if found == FunctionDirectType::Str || expected == FunctionDirectType::Str {
-                if found != FunctionDirectType::Str || expected != FunctionDirectType::Str {
+                let Some(return_ty) = sig.ret else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                if !matches!(
+                    resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+                    Some(FunctionDirectType::Primitive(_))
+                ) {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
-                Vec::new()
-            } else if expected == found || expected == FunctionDirectType::Unit {
-                Vec::new()
-            } else {
-                vec![const_literal_diagnostic(
-                    owner.id,
+                let condition_diagnostics = if function_if_condition_uses_parameter_binding(
+                    cond,
+                    body_parameter,
+                    locals,
                     inputs,
-                    snapshot,
-                    tail.span,
-                    sai_diagnostics::Code::TypeMismatch,
-                    format!(
-                        "expected `{}`, found `{}`",
-                        function_direct_type_name(expected),
-                        function_direct_type_name(found)
-                    ),
-                    "type mismatch",
-                )?]
+                ) && matches!(
+                    resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
+                    Some(FunctionDirectType::Primitive(
+                        sai_resolve::prelude::PrimTy::Bool
+                    ))
+                ) {
+                    Some(Vec::new())
+                } else {
+                    check_function_if_parameter_comparison_condition(
+                        owner,
+                        cond,
+                        *parameter.ty,
+                        body_parameter,
+                        locals,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )?
+                };
+                let Some(mut condition_diagnostics) = condition_diagnostics else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                let Some(mut branch_diagnostics) = check_function_if_literal_branches(
+                    owner, *return_ty, true, then, else_expr, type_paths, symbols, inputs,
+                    snapshot, target_cfg,
+                )?
+                else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                condition_diagnostics.append(&mut branch_diagnostics);
+                condition_diagnostics
+            } else {
+                let ExprKind::Path(path) = tail.kind else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                if path.root != PathRoot::Plain
+                    || path.segments.len() != 1
+                    || path.segments[0].args.is_some()
+                    || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+                {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+                if !matches!(
+                    locals.paths.get(&path.hir_id),
+                    Some(PathRes {
+                        base: Res::Local(resolved_binding),
+                        resolved_segments: 1,
+                        segment_count: 1,
+                    }) if *resolved_binding == body_parameter.binding
+                ) {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+
+                let Some(found) =
+                    resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+                else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                let expected = match sig.ret {
+                    Some(ty) => {
+                        let Some(expected) =
+                            resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+                        else {
+                            return Ok(FunctionBodyTypeCheck::Unsupported);
+                        };
+                        expected
+                    }
+                    None => FunctionDirectType::Unit,
+                };
+                if found == FunctionDirectType::Str || expected == FunctionDirectType::Str {
+                    if found != FunctionDirectType::Str || expected != FunctionDirectType::Str {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    }
+                    Vec::new()
+                } else if expected == found || expected == FunctionDirectType::Unit {
+                    Vec::new()
+                } else {
+                    vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        tail.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!(
+                            "expected `{}`, found `{}`",
+                            function_direct_type_name(expected),
+                            function_direct_type_name(found)
+                        ),
+                        "type mismatch",
+                    )?]
+                }
             }
         }
     } else if let Some((first, first_body, second, second_body)) = parameter_pair {
@@ -7925,59 +7954,22 @@ fn check_function_body_type(
                 // `Str` locals bind only string literals and earlier `Str`
                 // locals: `let s = "a"`, `let t: Str = s`.
                 let mut str_bindings = std::collections::HashSet::new();
-                for stmt in block.stmts {
-                    let sai_hir::expressions::StmtKind::Let {
-                        pat,
-                        ty,
-                        init,
-                        els: None,
-                    } = stmt.kind
-                    else {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    };
-                    if let Some(ty) = ty
-                        && resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-                            != Some(FunctionDirectType::Str)
-                    {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    }
-                    let init_is_str = match init.kind {
-                        ExprKind::Lit(Lit::Str(_)) => true,
-                        _ => str_binding_path(init, locals, &str_bindings),
-                    };
-                    if !init_is_str {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    }
-                    let PatKind::Binding {
-                        mode: sai_hir::patterns::BindingMode::Value,
-                        binding,
-                        sub: None,
-                        ..
-                    } = pat.kind
-                    else {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    };
-                    str_bindings.insert(binding);
-                }
-                let Some(tail) = block.tail else {
+                let Some(diagnostics) = check_function_str_local_block(
+                    owner,
+                    *return_ty,
+                    block,
+                    &mut str_bindings,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 };
-                if str_binding_path(tail, locals, &str_bindings) {
-                    Vec::new()
-                } else {
-                    if !matches!(tail.kind, ExprKind::Lit(Lit::Str(_)))
-                        && !is_direct_function_scalar_literal(tail)
-                    {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    }
-                    let Some(diagnostics) = check_const_literal_leaf(
-                        owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
-                    )?
-                    else {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    };
-                    diagnostics
-                }
+                diagnostics
             }
             None => return Ok(FunctionBodyTypeCheck::Unsupported),
         }
@@ -13144,6 +13136,70 @@ fn str_binding_path(
             resolved_segments: 1,
             segment_count: 1,
         }) if str_bindings.contains(binding)
+    )
+}
+
+// `Str` locals bind only string literals and earlier `Str` bindings:
+// `let s = "a"`, `let t: Str = s`. `str_bindings` may be pre-seeded with a
+// `Str` parameter binding.
+fn check_function_str_local_block(
+    owner: &HirOwner<'_>,
+    return_ty: Ty<'_>,
+    block: &sai_hir::expressions::Block<'_>,
+    str_bindings: &mut std::collections::HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    for stmt in block.stmts {
+        let sai_hir::expressions::StmtKind::Let {
+            pat,
+            ty,
+            init,
+            els: None,
+        } = stmt.kind
+        else {
+            return Ok(None);
+        };
+        if let Some(ty) = ty
+            && resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+                != Some(FunctionDirectType::Str)
+        {
+            return Ok(None);
+        }
+        let init_is_str = match init.kind {
+            ExprKind::Lit(Lit::Str(_)) => true,
+            _ => str_binding_path(init, locals, str_bindings),
+        };
+        if !init_is_str {
+            return Ok(None);
+        }
+        let PatKind::Binding {
+            mode: sai_hir::patterns::BindingMode::Value,
+            binding,
+            sub: None,
+            ..
+        } = pat.kind
+        else {
+            return Ok(None);
+        };
+        str_bindings.insert(binding);
+    }
+    let Some(tail) = block.tail else {
+        return Ok(None);
+    };
+    if str_binding_path(tail, locals, str_bindings) {
+        return Ok(Some(Vec::new()));
+    }
+    if !matches!(tail.kind, ExprKind::Lit(Lit::Str(_))) && !is_direct_function_scalar_literal(tail)
+    {
+        return Ok(None);
+    }
+    check_const_literal_leaf(
+        owner, return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
     )
 }
 
@@ -50412,7 +50468,9 @@ property "shared"() {}
             "pub fn non_str_local() -> Str {\n    let value = 1\n    \"text\"\n}\n",
             "pub fn non_str_annotated_local() -> Str {\n    let value: I32 = \"text\"\n    value\n}\n",
             "pub fn str_local_var_binding() -> Str {\n    var value = \"text\"\n    value\n}\n",
+            "pub fn str_local_copy(value: Str) -> Str {\n    let copied = value\n    copied\n}\n",
             "pub fn str_local_param_tail(value: Str) -> Str {\n    let copy = \"text\"\n    value\n}\n",
+            "pub fn str_local_annotated_copy(value: Str) -> Str {\n    let copied: Str = value\n    copied\n}\n",
             "pub fn str_local_generic_tail() -> Str {\n    let value = \"text\"\n    value<I32>\n}\n",
             "pub fn str_local_generic_init() -> Str {\n    let value = \"text\"\n    let copy = value<I32>\n    copy\n}\n",
         );
@@ -50430,8 +50488,11 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 11);
-        for owner in &resolved.owners()[..4] {
+        assert_eq!(resolved.owners().len(), 13);
+        for owner in resolved.owners()[..4]
+            .iter()
+            .chain(&resolved.owners()[8..11])
+        {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -50447,9 +50508,13 @@ property "shared"() {}
         };
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
-        // Non-Str statements, `var` bindings, and tails that leave the `Str`
-        // local group stay gated.
-        for owner in &resolved.owners()[5..] {
+        // A `Str` parameter seeds the group, so copies and a param tail are
+        // supported; non-`Str` statements, `var` bindings, and generic-arg
+        // paths stay gated.
+        for owner in resolved.owners()[5..8]
+            .iter()
+            .chain(&resolved.owners()[11..])
+        {
             assert!(matches!(
                 owner
                     .body_type_check()
