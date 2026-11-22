@@ -7768,119 +7768,151 @@ fn check_function_body_type(
             }
         }
     } else if let Some((first, first_body, second, second_body)) = parameter_pair {
-        if !block.stmts.is_empty() {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        }
-        let Some(tail) = block.tail else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        };
-        let ExprKind::If {
-            cond,
-            then,
-            els: Some(else_expr),
-        } = tail.kind
-        else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        };
-        let Some(return_ty) = sig.ret else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        };
-        if !matches!(
-            resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
-            Some(FunctionDirectType::Primitive(_))
-        ) {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        }
-        let first_parameter_type =
-            resolve_function_direct_type(*first.ty, type_paths, symbols, inputs);
-        let second_parameter_type =
-            resolve_function_direct_type(*second.ty, type_paths, symbols, inputs);
-        let (comparison_condition, condition_is_negated) = match cond.kind {
-            ExprKind::Unary(UnOp::Not, operand) => (operand, true),
-            _ => (cond, false),
-        };
-        let condition_is_supported_when_negated = matches!(
-            comparison_condition.kind,
-            ExprKind::Binary(
-                BinOp::And
-                    | BinOp::Or
-                    | BinOp::Eq
-                    | BinOp::Ne
-                    | BinOp::Lt
-                    | BinOp::Le
-                    | BinOp::Gt
-                    | BinOp::Ge,
-                _,
-                _
-            )
-        );
-        let parameter_types_are_supported = match comparison_condition.kind {
-            ExprKind::Binary(BinOp::And | BinOp::Or, _, _) => {
-                let bool_type = Some(FunctionDirectType::Primitive(
-                    sai_resolve::prelude::PrimTy::Bool,
-                ));
-                first_parameter_type == bool_type && second_parameter_type == bool_type
-            }
-            ExprKind::Binary(
-                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
-                _,
-                _,
-            ) => matches!(
-                (first_parameter_type, second_parameter_type),
-                (
-                    Some(FunctionDirectType::Primitive(first)),
-                    Some(FunctionDirectType::Primitive(second))
-                ) if first == second
+        if matches!(
+            (
+                resolve_function_direct_type(*first.ty, type_paths, symbols, inputs),
+                resolve_function_direct_type(*second.ty, type_paths, symbols, inputs),
             ),
-            _ => false,
-        };
-        let mixed_condition_diagnostics = check_function_if_mixed_logical_comparison_condition(
-            owner,
-            comparison_condition,
-            !condition_is_negated,
-            *first.ty,
-            first_body,
-            *second.ty,
-            second_body,
-            locals,
-            type_paths,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-        )?;
-        let direct_condition_is_supported = (!condition_is_negated
-            || condition_is_supported_when_negated)
-            && function_if_binary_condition_uses_parameter_bindings(
+            (Some(FunctionDirectType::Str), Some(FunctionDirectType::Str))
+        ) && matches!(
+            sig.ret
+                .and_then(|ty| { resolve_function_direct_type(*ty, type_paths, symbols, inputs) }),
+            Some(FunctionDirectType::Str)
+        ) {
+            // Two `Str` parameters seed the `Str` local group together.
+            let mut str_bindings =
+                std::collections::HashSet::from([first_body.binding, second_body.binding]);
+            let Some(diagnostics) = check_function_str_local_block(
+                owner,
+                *sig.ret.expect("Str return is present"),
+                block,
+                &mut str_bindings,
+                locals,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            diagnostics
+        } else {
+            if !block.stmts.is_empty() {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            let Some(tail) = block.tail else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            let ExprKind::If {
+                cond,
+                then,
+                els: Some(else_expr),
+            } = tail.kind
+            else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            let Some(return_ty) = sig.ret else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            if !matches!(
+                resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+                Some(FunctionDirectType::Primitive(_))
+            ) {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            let first_parameter_type =
+                resolve_function_direct_type(*first.ty, type_paths, symbols, inputs);
+            let second_parameter_type =
+                resolve_function_direct_type(*second.ty, type_paths, symbols, inputs);
+            let (comparison_condition, condition_is_negated) = match cond.kind {
+                ExprKind::Unary(UnOp::Not, operand) => (operand, true),
+                _ => (cond, false),
+            };
+            let condition_is_supported_when_negated = matches!(
+                comparison_condition.kind,
+                ExprKind::Binary(
+                    BinOp::And
+                        | BinOp::Or
+                        | BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge,
+                    _,
+                    _
+                )
+            );
+            let parameter_types_are_supported = match comparison_condition.kind {
+                ExprKind::Binary(BinOp::And | BinOp::Or, _, _) => {
+                    let bool_type = Some(FunctionDirectType::Primitive(
+                        sai_resolve::prelude::PrimTy::Bool,
+                    ));
+                    first_parameter_type == bool_type && second_parameter_type == bool_type
+                }
+                ExprKind::Binary(
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+                    _,
+                    _,
+                ) => matches!(
+                    (first_parameter_type, second_parameter_type),
+                    (
+                        Some(FunctionDirectType::Primitive(first)),
+                        Some(FunctionDirectType::Primitive(second))
+                    ) if first == second
+                ),
+                _ => false,
+            };
+            let mixed_condition_diagnostics = check_function_if_mixed_logical_comparison_condition(
+                owner,
                 comparison_condition,
+                !condition_is_negated,
+                *first.ty,
                 first_body,
+                *second.ty,
                 second_body,
                 locals,
+                type_paths,
+                symbols,
                 inputs,
-            )
-            && parameter_types_are_supported;
-        let condition_is_supported =
-            direct_condition_is_supported || mixed_condition_diagnostics.is_some();
-        let Some(mut diagnostics) = check_function_if_literal_branches(
-            owner,
-            *return_ty,
-            condition_is_supported,
-            then,
-            else_expr,
-            type_paths,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-        )?
-        else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        };
-        if let Some(mut condition_diagnostics) = mixed_condition_diagnostics {
-            condition_diagnostics.append(&mut diagnostics);
-            condition_diagnostics
-        } else {
-            diagnostics
+                snapshot,
+                target_cfg,
+            )?;
+            let direct_condition_is_supported = (!condition_is_negated
+                || condition_is_supported_when_negated)
+                && function_if_binary_condition_uses_parameter_bindings(
+                    comparison_condition,
+                    first_body,
+                    second_body,
+                    locals,
+                    inputs,
+                )
+                && parameter_types_are_supported;
+            let condition_is_supported =
+                direct_condition_is_supported || mixed_condition_diagnostics.is_some();
+            let Some(mut diagnostics) = check_function_if_literal_branches(
+                owner,
+                *return_ty,
+                condition_is_supported,
+                then,
+                else_expr,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            if let Some(mut condition_diagnostics) = mixed_condition_diagnostics {
+                condition_diagnostics.append(&mut diagnostics);
+                condition_diagnostics
+            } else {
+                diagnostics
+            }
         }
     } else {
         let Some(return_ty) = sig.ret else {
@@ -50471,6 +50503,9 @@ property "shared"() {}
             "pub fn str_local_copy(value: Str) -> Str {\n    let copied = value\n    copied\n}\n",
             "pub fn str_local_param_tail(value: Str) -> Str {\n    let copy = \"text\"\n    value\n}\n",
             "pub fn str_local_annotated_copy(value: Str) -> Str {\n    let copied: Str = value\n    copied\n}\n",
+            "pub fn multi_str_identity(value: Str, other: Str) -> Str { other }\n",
+            "pub fn multi_str_local(value: Str, other: Str) -> Str {\n    let copied = value\n    copied\n}\n",
+            "pub fn multi_str_lit_tail(value: Str, other: Str) -> Str {\n    let copied = other\n    \"text\"\n}\n",
             "pub fn str_local_generic_tail() -> Str {\n    let value = \"text\"\n    value<I32>\n}\n",
             "pub fn str_local_generic_init() -> Str {\n    let value = \"text\"\n    let copy = value<I32>\n    copy\n}\n",
         );
@@ -50488,10 +50523,10 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 13);
+        assert_eq!(resolved.owners().len(), 16);
         for owner in resolved.owners()[..4]
             .iter()
-            .chain(&resolved.owners()[8..11])
+            .chain(&resolved.owners()[8..14])
         {
             assert!(matches!(
                 owner
@@ -50513,7 +50548,7 @@ property "shared"() {}
         // paths stay gated.
         for owner in resolved.owners()[5..8]
             .iter()
-            .chain(&resolved.owners()[11..])
+            .chain(&resolved.owners()[14..16])
         {
             assert!(matches!(
                 owner
