@@ -13319,9 +13319,22 @@ fn check_function_str_local_block(
                 arms,
                 source: MatchSource::Normal,
             } => {
+                // A binding arm types the pattern variable as `Str` (the
+                // scrutinee's type), so `other => other` yields `Str` even
+                // though the outer group does not know `other` yet.
                 let arm_yields_str = arms.iter().any(|arm| {
+                    let mut bindings = str_bindings.clone();
+                    if let PatKind::Binding {
+                        mode: sai_hir::patterns::BindingMode::Value,
+                        binding,
+                        sub: None,
+                        ..
+                    } = arm.pat.kind
+                    {
+                        bindings.insert(binding);
+                    }
                     matches!(arm.body.kind, ExprKind::Lit(Lit::Str(_)))
-                        || str_binding_path(arm.body, locals, str_bindings)
+                        || str_binding_path(arm.body, locals, &bindings)
                 });
                 if !arm_yields_str {
                     return Ok(None);
@@ -51400,6 +51413,7 @@ property "shared"() {}
             "pub fn str_match_guard() -> Str {\n    let s = \"a\"\n    match s { \"x\" if true => \"y\", _ => \"z\" }\n}\n",
             "pub fn str_match_int_scrutinee(n: I32) -> Str {\n    match n { _ => \"a\" }\n}\n",
             "pub fn str_match_int_init() -> Str {\n    let s = \"a\"\n    let m = match s { \"x\" => 1, _ => 2 }\n    \"a\"\n}\n",
+            "pub fn str_match_binding_init() -> Str {\n    let s = \"a\"\n    let m = match s { other => other }\n    m\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -51415,7 +51429,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 66);
+        assert_eq!(resolved.owners().len(), 67);
         for owner in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[8..17])
@@ -51427,6 +51441,7 @@ property "shared"() {}
             .chain(&resolved.owners()[48..51])
             .chain(&resolved.owners()[53..54])
             .chain(&resolved.owners()[57..60])
+            .chain(&resolved.owners()[66..])
         {
             assert!(matches!(
                 owner
@@ -51471,7 +51486,7 @@ property "shared"() {}
             .chain(&resolved.owners()[45..48])
             .chain(&resolved.owners()[52..53])
             .chain(&resolved.owners()[54..57])
-            .chain(&resolved.owners()[63..])
+            .chain(&resolved.owners()[63..66])
         {
             assert!(matches!(
                 owner
