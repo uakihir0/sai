@@ -13357,9 +13357,7 @@ fn str_default_unresolved_literals(
         let Some(seed) = entry.literal.as_ref() else {
             continue;
         };
-        if carried.contains(&std::rc::Rc::as_ptr(&seed.resolved))
-            || seed.resolved.get().is_some()
-        {
+        if carried.contains(&std::rc::Rc::as_ptr(&seed.resolved)) || seed.resolved.get().is_some() {
             continue;
         }
         let (default_name, primitive, kind_word) = match seed.literal {
@@ -13467,8 +13465,7 @@ fn str_literal_family_init(
                     // literals a `U64` sibling accepts (`w + 2^64-1`).
                     // Non-scalar literals (`b"..."`) bind no family the
                     // walk can model — the caller gates them.
-                    return Ok(str_scalar_family_name(literal)
-                        .map(|family| (family, Vec::new())));
+                    return Ok(str_scalar_family_name(literal).map(|family| (family, Vec::new())));
                 }
             };
             let Some(diagnostics) = check_const_literal_against_type(
@@ -14852,7 +14849,29 @@ fn str_loop_family(
             None => None,
         };
         match evaluated {
-            Some((family, _diagnostics)) => resolved.push((Some(family), value, span)),
+            // The contribution fold derives the family diagnostics —
+            // only the range errors produced while resolving literal
+            // seeds inside the value are emitted nowhere else.
+            // The statement walk types every break value itself — the
+            // only diagnostics unique to this re-evaluation are the
+            // range errors a shared literal seed produced while
+            // resolving under the pin (the seed keeps the resolution,
+            // so the error would otherwise never surface).
+            Some((family, value_diagnostics)) => {
+                for diagnostic in value_diagnostics {
+                    if diagnostic.code != sai_diagnostics::Code::LiteralOutOfRange
+                        || diagnostics.iter().any(|existing| {
+                            existing.code == diagnostic.code
+                                && existing.primary().map(|location| location.span)
+                                    == diagnostic.primary().map(|location| location.span)
+                        })
+                    {
+                        continue;
+                    }
+                    diagnostics.push(diagnostic);
+                }
+                resolved.push((Some(family), value, span));
+            }
             None => return Ok(None),
         }
     }
@@ -16075,7 +16094,23 @@ fn str_stmt_expr_unit(
                         None => None,
                     };
                     match evaluated {
-                        Some((family, _)) => resolved.push((Some(family), value, span)),
+                        Some((family, value_diagnostics)) => {
+                            for diagnostic in value_diagnostics {
+                                if diagnostic.code != sai_diagnostics::Code::LiteralOutOfRange
+                                    || diagnostics.iter().any(|existing| {
+                                        existing.code == diagnostic.code
+                                            && existing.primary().map(|location| location.span)
+                                                == diagnostic
+                                                    .primary()
+                                                    .map(|location| location.span)
+                                    })
+                                {
+                                    continue;
+                                }
+                                diagnostics.push(diagnostic);
+                            }
+                            resolved.push((Some(family), value, span));
+                        }
                         None => return Ok(None),
                     }
                 }
@@ -56078,7 +56113,7 @@ property "shared"() {}
             "pub fn str_bin_pin_mixed_tm() -> Str {\n    let s = \"a\"\n    let wide: I64 = 5\n    let m: I8 = wide + 200\n    s\n}\n",
             "pub fn str_match_guard_op_tm() -> Str {\n    let s = \"a\"\n    let m = match s {\n        \"x\" if s + 1 => \"y\"\n        _ => \"w\"\n    }\n    m\n}\n",
             "pub fn str_litvar_conflicting_pins_tm() -> Str {\n    let s = \"a\"\n    let n = 1\n    let a: I64 = n\n    let b: U32 = n\n    s\n}\n",
-            "pub fn str_bin_fold_wide_literal() -> Str {\n    let s = \"a\"\n    let w: U64 = 5\n    let m = w + 18446744073709551615\n    s\n}\n",
+            "pub fn str_bin_fold_wide_literal() -> Str {\n    let s = \"a\"\n    let w: U64 = 5\n    let m = w + 18446744073709551615\n    s\n}\npub fn str_litvar_bytestring_gate() -> Str {\n    let b = b\"abc\"\n    \"a\"\n}\npub fn str_litvar_loop_pin_oob() -> Str {\n    let n = 300\n    let m: U8 = loop { break n + 1 }\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -56094,7 +56129,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 221);
+        assert_eq!(resolved.owners().len(), 223);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -56122,7 +56157,7 @@ property "shared"() {}
             .chain(&resolved.owners()[104..105])
             .chain(&resolved.owners()[108..109])
             .chain(&resolved.owners()[112..113])
-            .chain(&resolved.owners()[115..117])
+            .chain(&resolved.owners()[116..117])
             .chain(&resolved.owners()[119..120])
             .chain(&resolved.owners()[122..123])
             .chain(&resolved.owners()[125..126])
@@ -56194,6 +56229,7 @@ property "shared"() {}
             (107, sai_diagnostics::Code::BreakOutsideLoop),
             (109, sai_diagnostics::Code::InvalidBreakValue),
             (111, sai_diagnostics::Code::TypeMismatch),
+            (115, sai_diagnostics::Code::LiteralOutOfRange),
             (128, sai_diagnostics::Code::LiteralOutOfRange),
             (135, sai_diagnostics::Code::LiteralOutOfRange),
             (136, sai_diagnostics::Code::TypeMismatch),
@@ -56238,6 +56274,7 @@ property "shared"() {}
             (217, sai_diagnostics::Code::TypeMismatch),
             (218, sai_diagnostics::Code::TypeMismatch),
             (219, sai_diagnostics::Code::TypeMismatch),
+            (222, sai_diagnostics::Code::LiteralOutOfRange),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -56311,7 +56348,7 @@ property "shared"() {}
         // A `Str` parameter seeds the group, so copies and a param tail are
         // supported; non-`Str` statements, `var` bindings, and generic-arg
         // paths stay gated.
-        for index in [7, 18, 22, 23, 29, 34, 39, 64, 168, 173, 211] {
+        for index in [7, 18, 22, 23, 29, 34, 39, 64, 168, 173, 211, 221] {
             let owner = &resolved.owners()[index];
             assert!(
                 matches!(
