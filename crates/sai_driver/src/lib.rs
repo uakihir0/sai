@@ -7614,14 +7614,13 @@ fn check_function_body_type(
     };
 
     let block = match body.value.kind {
-        ExprKind::Block(block)
-            if block.safety == sai_hir::Safety::Safe && block.stmts.is_empty() =>
-        {
-            block
-        }
+        ExprKind::Block(block) if block.safety == sai_hir::Safety::Safe => block,
         _ => return Ok(FunctionBodyTypeCheck::Unsupported),
     };
     let diagnostics = if let Some((parameter, body_parameter)) = parameter {
+        if !block.stmts.is_empty() {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
         let Some(tail) = block.tail else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
@@ -7740,6 +7739,9 @@ fn check_function_body_type(
             }
         }
     } else if let Some((first, first_body, second, second_body)) = parameter_pair {
+        if !block.stmts.is_empty() {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
         let Some(tail) = block.tail else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
@@ -7856,8 +7858,13 @@ fn check_function_body_type(
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
         match resolve_function_direct_type(*return_ty, type_paths, symbols, inputs) {
-            Some(FunctionDirectType::Unit) if block.tail.is_none() => Vec::new(),
+            Some(FunctionDirectType::Unit) if block.stmts.is_empty() && block.tail.is_none() => {
+                Vec::new()
+            }
             Some(FunctionDirectType::Unit) => {
+                if !block.stmts.is_empty() {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
                 let Some(tail) = block.tail else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 };
@@ -7873,6 +7880,9 @@ fn check_function_body_type(
                 diagnostics
             }
             Some(FunctionDirectType::Primitive(_)) => {
+                if !block.stmts.is_empty() {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
                 let Some(tail) = block.tail else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 };
@@ -7912,21 +7922,62 @@ fn check_function_body_type(
                 }
             }
             Some(FunctionDirectType::Str) => {
+                // `Str` locals bind only string literals and earlier `Str`
+                // locals: `let s = "a"`, `let t: Str = s`.
+                let mut str_bindings = std::collections::HashSet::new();
+                for stmt in block.stmts {
+                    let sai_hir::expressions::StmtKind::Let {
+                        pat,
+                        ty,
+                        init,
+                        els: None,
+                    } = stmt.kind
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    if let Some(ty) = ty
+                        && resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+                            != Some(FunctionDirectType::Str)
+                    {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    }
+                    let init_is_str = match init.kind {
+                        ExprKind::Lit(Lit::Str(_)) => true,
+                        _ => str_binding_path(init, locals, &str_bindings),
+                    };
+                    if !init_is_str {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    }
+                    let PatKind::Binding {
+                        mode: sai_hir::patterns::BindingMode::Value,
+                        binding,
+                        sub: None,
+                        ..
+                    } = pat.kind
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    str_bindings.insert(binding);
+                }
                 let Some(tail) = block.tail else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 };
-                if !matches!(tail.kind, ExprKind::Lit(Lit::Str(_)))
-                    && !is_direct_function_scalar_literal(tail)
-                {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                if str_binding_path(tail, locals, &str_bindings) {
+                    Vec::new()
+                } else {
+                    if !matches!(tail.kind, ExprKind::Lit(Lit::Str(_)))
+                        && !is_direct_function_scalar_literal(tail)
+                    {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    }
+                    let Some(diagnostics) = check_const_literal_leaf(
+                        owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+                    )?
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    diagnostics
                 }
-                let Some(diagnostics) = check_const_literal_leaf(
-                    owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
-                )?
-                else {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                };
-                diagnostics
             }
             None => return Ok(FunctionBodyTypeCheck::Unsupported),
         }
@@ -13073,6 +13124,27 @@ fn is_direct_const_literal_or_unit(value: &HirExpr<'_>) -> bool {
         ExprKind::Tuple(elements) => elements.is_empty(),
         _ => false,
     }
+}
+
+fn str_binding_path(
+    expression: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &std::collections::HashSet<sai_hir::BindingId>,
+) -> bool {
+    let ExprKind::Path(path) = expression.kind else {
+        return false;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return false;
+    }
+    matches!(
+        locals.paths.get(&path.hir_id),
+        Some(PathRes {
+            base: Res::Local(binding),
+            resolved_segments: 1,
+            segment_count: 1,
+        }) if str_bindings.contains(binding)
+    )
 }
 
 fn check_const_literal_leaf(
@@ -50330,6 +50402,64 @@ property "shared"() {}
     }
 
     #[test]
+    fn function_body_type_check_accepts_str_literal_locals() {
+        let root = concat!(
+            "pub fn local_str_return() -> Str {\n    let value = \"text\"\n    value\n}\n",
+            "pub fn annotated_str_local() -> Str {\n    let value: Str = \"text\"\n    value\n}\n",
+            "pub fn str_local_alias() -> Str {\n    let value = \"text\"\n    let copy = value\n    copy\n}\n",
+            "pub fn str_local_literal_tail() -> Str {\n    let value = \"text\"\n    \"other\"\n}\n",
+            "pub fn str_local_mismatch_tail() -> Str {\n    let value = \"text\"\n    42\n}\n",
+            "pub fn non_str_local() -> Str {\n    let value = 1\n    \"text\"\n}\n",
+            "pub fn non_str_annotated_local() -> Str {\n    let value: I32 = \"text\"\n    value\n}\n",
+            "pub fn str_local_var_binding() -> Str {\n    var value = \"text\"\n    value\n}\n",
+            "pub fn str_local_param_tail(value: Str) -> Str {\n    let copy = \"text\"\n    value\n}\n",
+            "pub fn str_local_generic_tail() -> Str {\n    let value = \"text\"\n    value<I32>\n}\n",
+            "pub fn str_local_generic_init() -> Str {\n    let value = \"text\"\n    let copy = value<I32>\n    copy\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 11);
+        for owner in &resolved.owners()[..4] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("Str local body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        let mismatch = resolved.owners()[4]
+            .body_type_check()
+            .expect("Str local mismatch tail body check succeeds");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = mismatch else {
+            panic!("a non-Str literal tail stays a recoverable type error");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        // Non-Str statements, `var` bindings, and tails that leave the `Str`
+        // local group stay gated.
+        for owner in &resolved.owners()[5..] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unsupported Str-local body check succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+    }
+
+    #[test]
     fn function_body_type_check_accepts_direct_scalar_literal_tails_without_parameters() {
         let root = concat!(
             "pub fn identity(value: I32) -> I32 { value }\n",
@@ -79095,6 +79225,17 @@ property "shared"() {}
                     owner
                         .body_type_check()
                         .expect("nested-operand initializer is checked"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ));
+                continue;
+            }
+            if index == 11 {
+                // `let value = "text"; value` binds the unannotated `Str`
+                // literal local and returns it through the path tail.
+                assert!(matches!(
+                    owner
+                        .body_type_check()
+                        .expect("Str literal local is checked"),
                     FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
                 ));
                 continue;
