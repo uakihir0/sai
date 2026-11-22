@@ -14020,6 +14020,7 @@ fn check_function_str_local_block(
             };
             if let Some(pinned) = pinned
                 && family != pinned
+                && family != "`!`"
             {
                 init_diagnostics.push(const_literal_diagnostic(
                     owner.id,
@@ -15027,6 +15028,7 @@ fn str_stmt_block_unit(
                 };
                 if let Some(pinned) = pinned
                     && family != pinned
+                    && family != "`!`"
                 {
                     init_diagnostics.push(const_literal_diagnostic(
                         owner.id,
@@ -15187,6 +15189,7 @@ fn str_loop_level_block(
                 };
                 if let Some(pinned) = pinned
                     && family != pinned
+                    && family != "`!`"
                 {
                     init_diagnostics.push(const_literal_diagnostic(
                         owner.id,
