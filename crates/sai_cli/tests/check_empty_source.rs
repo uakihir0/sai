@@ -4828,6 +4828,7 @@ fn primitive_bodies_admit_str_method_calls() {
         "pub fn str_len_arith(value: Str) -> USize { value.len() + 1 }\n",
         "pub fn str_len_let(value: Str) -> USize {\n    let n = value.len()\n    n\n}\n",
         "pub fn str_if_call_condition(value: Str) -> Bool {\n    if value.is_empty() { true } else { false }\n}\n",
+        "pub fn str_match_init(flag: Bool) -> USize {\n    let s = match flag { true => \"a\", _ => \"b\" }\n    s.len()\n}\n",
         "pub fn str_while_call_condition(value: Str) -> Bool {\n    while value.is_empty() { break }\n    true\n}\n",
         "pub fn str_assert_call_condition(value: Str) -> Bool {\n    assert value.is_empty()\n    true\n}\n",
         "pub fn str_len_trivia(value: Str) -> USize { value.len /* note */ () }\n",

@@ -2863,6 +2863,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.record_expression_type(init.hir_id, LocalType::Str);
                 Ok(LocalType::Str)
             }
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => {
+                self.check_match_tail(scrutinee, arms, source, LocalType::Str)?;
+                self.record_expression_type(init.hir_id, LocalType::Str);
+                Ok(LocalType::Str)
+            }
             ExprKind::Lit(literal) => {
                 self.errors.push(PrimitiveBodyError {
                     node: init.hir_id,
@@ -3951,7 +3960,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     scrutinee,
                     arms,
                     source,
-                } => self.check_match_tail(scrutinee, arms, source, expected)?,
+                } => {
+                    self.check_match_tail(scrutinee, arms, source, LocalType::Concrete(expected))?
+                }
                 // A `return` in tail position is the never-typed exit
                 // expression: the value is checked against the
                 // function's return type (not the surrounding expected
@@ -4742,6 +4753,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 };
                 self.check_str_branch_tail(els)
             }
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => self
+                .check_match_tail(scrutinee, arms, source, LocalType::Str)
+                .map(|_| ()),
             _ => Err(()),
         }
     }
@@ -4825,21 +4843,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.str_branch_block_shaped_in(then, str_bindings)
                     && els.is_some_and(|els| self.str_shaped_initializer_in(els, str_bindings))
             }
+            // `any`, not `all`: the kernel diagnoses non-`Str` arms
+            // (`{ _ => 1 }` in a `Str` join) instead of gating.
             ExprKind::Match { arms, .. } => {
                 !arms.is_empty()
-                    && arms.iter().all(|arm| match arm.body.kind {
-                        ExprKind::Path(_) => {
-                            self.plain_local_path_binding(arm.body)
-                                .is_some_and(|binding| {
-                                    str_bindings.contains(&binding)
-                                        || matches!(
-                                            self.known_bindings.get(&binding),
-                                            Some(LocalType::Str)
-                                        )
-                                })
-                        }
-                        _ => false,
-                    })
+                    && arms
+                        .iter()
+                        .any(|arm| self.str_shaped_initializer_in(arm.body, str_bindings))
             }
             _ => false,
         }
@@ -4986,8 +4996,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     source,
                 } => match annotation {
                     Some(expected) => {
-                        self.check_match_tail(scrutinee, arms, source, expected)?;
+                        self.check_match_tail(
+                            scrutinee,
+                            arms,
+                            source,
+                            LocalType::Concrete(expected),
+                        )?;
                         LocalType::Concrete(expected)
+                    }
+                    // `let s = match c { true => "a", _ => "b" }` binds
+                    // a `Str` local; other shapes join the literal group.
+                    None if self.str_shaped_initializer(init) => {
+                        self.check_str_annotated_initializer(init)?
                     }
                     None => self.check_literal_join_match(scrutinee, arms, source)?,
                 },
@@ -5295,7 +5315,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         scrutinee: &'hir Expr<'hir>,
         arms: &'hir [Arm<'hir>],
         source: MatchSource,
-        expected: PrimTy,
+        expected: LocalType,
     ) -> Result<LocalType, ()> {
         if !matches!(source, MatchSource::Normal) {
             return Err(());
@@ -5333,7 +5353,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             .insert(binding, LocalType::Concrete(scrutinee_type)),
                     ));
                 }
-                let body_result = self.check_expr_expected(arm.body, expected);
+                let body_result = self.check_match_arm_body_expected(arm.body, expected);
                 self.restore_arm_binding(&mut arm_binding);
                 body_result?;
                 continue;
@@ -5353,7 +5373,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .guard
                 .map(|guard| self.check_if_condition(guard))
                 .unwrap_or(Ok(()))
-                .and_then(|_| self.check_expr_expected(arm.body, expected));
+                .and_then(|_| self.check_match_arm_body_expected(arm.body, expected));
             self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
@@ -5363,7 +5383,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
             });
         }
-        Ok(LocalType::Concrete(expected))
+        Ok(expected)
+    }
+
+    // An arm body's expected type: concrete locals check through the
+    // shared expected path; `Str` arms check through the Str branch-tail
+    // walk so `let s: Str = match c { .. }` joins the slice.
+    fn check_match_arm_body_expected(
+        &mut self,
+        body: &'hir Expr<'hir>,
+        expected: LocalType,
+    ) -> Result<(), ()> {
+        match expected {
+            LocalType::Concrete(expected) => self.check_expr_expected(body, expected),
+            LocalType::Str => self.check_str_branch_tail(body),
+            _ => Err(()),
+        }
     }
 
     /// Validates one arm's pattern under the bounded exhaustiveness rule:

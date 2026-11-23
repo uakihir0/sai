@@ -11439,12 +11439,19 @@ fn str_shaped_local_init(
         // `let t = self.text` aliases a `Str` field; a `match`
         // yields `Str` when every arm body is a `Str` binding.
         ExprKind::Field { .. } => str_self_field_projected_family(init, inputs) == Some("`Str`"),
+        // `let s = match c { true => "a", _ => 1 }` admits so the
+        // kernel diagnoses the non-`Str` arm instead of gating.
         ExprKind::Match { arms, .. } => {
             !arms.is_empty()
-                && arms.iter().all(|arm| match arm.body.kind {
-                    ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
-                        .is_some_and(|source| str_bindings.contains(&source)),
-                    _ => false,
+                && arms.iter().any(|arm| {
+                    str_shaped_local_init(
+                        arm.body,
+                        locals,
+                        inputs,
+                        str_bindings,
+                        symbols,
+                        type_paths,
+                    )
                 })
         }
         // `let s = if c { "a" } else { "b" }` yields `Str` when both
@@ -61390,6 +61397,10 @@ property "shared"() {}
             "pub fn str_match_scrutinee(value: Str) -> I32 { match value { _ => 0 } }\n",
             "pub fn str_assign_to_primitive() -> I32 { var n = 1\n    n = \"a\"\n    0 }\n",
             "pub fn str_annotated_bytestring_init() -> I32 { let s: Str = b\"a\"\n    0 }\n",
+            "pub fn str_match_init(flag: Bool) -> USize { let s = match flag { true => \"a\", _ => \"b\" }\n    s.len() }\n",
+            "pub fn str_match_init_annotated(n: I32) -> USize { let s: Str = match n { 1 => \"a\", _ => \"b\" }\n    s.len() }\n",
+            "pub fn str_match_init_nested(flag: Bool, other: Bool) -> USize { let s = match flag { true => if other { \"a\" } else { \"c\" }, _ => \"b\" }\n    s.len() }\n",
+            "pub fn str_match_init_mismatch(n: I32) -> USize { let s = match n { 1 => \"a\", _ => 1 }\n    s.len() }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61406,7 +61417,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 29);
+        assert_eq!(owners.len(), 33);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -61417,6 +61428,16 @@ property "shared"() {}
                 owner
                     .body_type_check()
                     .expect("Str local function body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        // `match` initializers yielding `Str` arm bodies — literal,
+        // annotated, and nested-`if` arm shapes — check cleanly too.
+        for owner in &owners[29..32] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("Str match-initializer function body check succeeds"),
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
@@ -61441,6 +61462,9 @@ property "shared"() {}
             // `let s: Str = b"a"` — the `Str` annotation's literal
             // mismatch names the literal kind, not a gate.
             (28, "expected `Str`, found a byte string literal"),
+            // `let s = match n { 1 => "a", _ => 1 }` — the non-`Str`
+            // arm reports against `Str`, not a gate.
+            (32, "expected `Str`, found an integer literal"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
