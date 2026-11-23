@@ -15025,7 +15025,7 @@ fn str_match_family(
     let mut arm_families = Vec::with_capacity(arms.len());
     for arm in arms {
         let mut arm_bindings = str_bindings.clone();
-        if catch_all {
+        if catch_all && !arm.synthesized {
             diagnostics.push(const_literal_diagnostic(
                 owner.id,
                 inputs,
@@ -18227,7 +18227,12 @@ fn str_stmt_expr_unit(
             for arm in arms {
                 let mut arm_bindings = str_bindings.clone();
                 let guarded = arm.guard.is_some();
-                if catch_all {
+                // A synthesized `_` arm — the `if let`/`while let`
+                // desugar's else/break arm — is never diagnosed: an
+                // always-matching real arm like `if let _ = s` would
+                // otherwise report UnreachablePattern on code the user
+                // did not write.
+                if catch_all && !arm.synthesized {
                     diagnostics.push(const_literal_diagnostic(
                         owner.id,
                         inputs,
@@ -20418,7 +20423,7 @@ fn check_function_str_match(
             diagnostics.append(&mut guard_diagnostics);
         }
         let guarded = arm.guard.is_some();
-        if catch_all {
+        if catch_all && !arm.synthesized {
             diagnostics.push(const_literal_diagnostic(
                 owner.id,
                 inputs,
