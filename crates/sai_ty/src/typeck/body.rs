@@ -4806,9 +4806,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Lit(Lit::Str(_)) => true,
             // `local_paths` is keyed by the path's id, not the
             // enclosing expression's — resolve the binding first.
-            ExprKind::Path(_) => self
-                .plain_local_path_binding(init)
-                .is_some_and(|binding| str_bindings.contains(&binding)),
+            ExprKind::Path(_) => self.plain_local_path_binding(init).is_some_and(|binding| {
+                // Inner `let` bindings in branch blocks live in
+                // `known_bindings` after `check_stmt` runs, not in
+                // the input `str_bindings` set.
+                str_bindings.contains(&binding)
+                    || matches!(self.known_bindings.get(&binding), Some(LocalType::Str))
+            }),
             ExprKind::Field { .. } => matches!(
                 self.input
                     .str_self_field_projections
@@ -4824,9 +4828,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Match { arms, .. } => {
                 !arms.is_empty()
                     && arms.iter().all(|arm| match arm.body.kind {
-                        ExprKind::Path(_) => self
-                            .plain_local_path_binding(arm.body)
-                            .is_some_and(|binding| str_bindings.contains(&binding)),
+                        ExprKind::Path(_) => {
+                            self.plain_local_path_binding(arm.body)
+                                .is_some_and(|binding| {
+                                    str_bindings.contains(&binding)
+                                        || matches!(
+                                            self.known_bindings.get(&binding),
+                                            Some(LocalType::Str)
+                                        )
+                                })
+                        }
                         _ => false,
                     })
             }

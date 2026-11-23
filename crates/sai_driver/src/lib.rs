@@ -11379,16 +11379,29 @@ fn collect_str_branch_block_annotations(
     str_admissions: &mut StrShapeAdmissions,
 ) {
     for stmt in block.stmts {
-        if let StmtKind::Let { ty: Some(ty), .. } = stmt.kind {
-            match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
-                Some(FunctionDirectType::Primitive(local_type)) => {
-                    primitive_types.insert(ty.hir_id, local_type);
+        if let StmtKind::Let { ty, init, .. } = stmt.kind {
+            if let Some(ty) = ty {
+                match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
+                    Some(FunctionDirectType::Primitive(local_type)) => {
+                        primitive_types.insert(ty.hir_id, local_type);
+                    }
+                    Some(FunctionDirectType::Str) => {
+                        str_admissions.annotations.insert(ty.hir_id);
+                    }
+                    _ => {}
                 }
-                Some(FunctionDirectType::Str) => {
-                    str_admissions.annotations.insert(ty.hir_id);
-                }
-                _ => {}
             }
+            // Nested block/`if` initializers can carry their own
+            // annotated `let`s.
+            collect_str_branch_let_annotations(
+                init,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
         }
     }
     if let Some(tail) = block.tail {
