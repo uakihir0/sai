@@ -8183,8 +8183,25 @@ fn check_inherent_method_body_type(
         // `Field` node is seen.
         let mut call_callee_ids = HashSet::new();
         visit_block_expressions(method_block, &mut |expression| {
-            if let ExprKind::Call { callee, .. } = expression.kind {
-                call_callee_ids.insert(callee.hir_id);
+            // A `self.<name>` call callee is a field read of `name`: it is
+            // skipped when `name` is a real field or method (the walk
+            // gates the call itself), but an unknown `name` still reports
+            // `UnknownField` like a plain missing field read.
+            if let ExprKind::Call { callee, .. } = expression.kind
+                && let ExprKind::Field {
+                    base,
+                    name,
+                    args: None,
+                } = callee.kind
+                && is_direct_self_value_expression(base)
+                && let Ok(field_name) = symbols.resolve(name.sym)
+            {
+                let normalized = sai_syntax::normalize_identifier(field_name.as_ref());
+                if field_types.fields.contains_key(normalized.as_str())
+                    || field_types.method_names.contains(normalized.as_str())
+                {
+                    call_callee_ids.insert(callee.hir_id);
+                }
             }
             if collect_error.is_some()
                 || !matches!(expression.kind, ExprKind::Field { .. })
@@ -8560,6 +8577,10 @@ struct InherentMethodStrFields {
     type_name_span: sai_diagnostics::Span,
     fields: HashMap<String, &'static str>,
     candidate_names: Vec<String>,
+    // Method names of the impl — a `self.<name>(..)` call callee that is
+    // a real method is not a field read, while an unknown callee name
+    // still reports `UnknownField` like the checker.
+    method_names: HashSet<String>,
 }
 
 // The family a record field type contributes to the Str walk: `Str`
@@ -8685,6 +8706,17 @@ fn str_inherent_method_field_types(
         }
         candidate_names.push(field_spelling.to_owned());
     }
+    let method_names = impl_decl
+        .syntax()
+        .descendants()
+        .filter_map(ast::FnDecl::cast)
+        .filter_map(|function| function.name().and_then(|name| name.token()))
+        .map(|token| {
+            let spelling = token.text();
+            sai_syntax::normalize_identifier(spelling.strip_prefix("r#").unwrap_or(spelling))
+                .to_owned()
+        })
+        .collect();
     Some(InherentMethodStrFields {
         type_name: type_name
             .strip_prefix("r#")
@@ -8693,6 +8725,7 @@ fn str_inherent_method_field_types(
         type_name_span,
         fields: field_types,
         candidate_names,
+        method_names,
     })
 }
 
@@ -101623,6 +101656,12 @@ property "shared"() {}
             "  pub fn call(self: borrow Self) -> Str {\n",
             "    self.get(false)\n",
             "  }\n",
+            "  pub fn call_missing(self: borrow Self) -> Str {\n",
+            "    self.nope(false)\n",
+            "  }\n",
+            "  pub fn paren_missing(self: borrow Self) -> Str {\n",
+            "    (self.nope)(false)\n",
+            "  }\n",
             "  pub fn init(self: borrow Self, flag: Bool) -> Str {\n",
             "    let s = if flag { self.text } else { self.text }\n",
             "    s\n",
@@ -101647,7 +101686,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let methods = &results.owners()[0].members();
-        assert_eq!(methods.len(), 4);
+        assert_eq!(methods.len(), 6);
         let check = methods[0].body_type_check().expect("body check runs");
         assert!(
             matches!(check, FunctionBodyTypeCheck::Supported { .. }),
@@ -101671,11 +101710,21 @@ property "shared"() {}
             "call stays gated without a field error: {check:?}"
         );
         // `if`-branch field tails seed the `Str` initializer join.
-        let check = methods[3].body_type_check().expect("body check runs");
+        let check = methods[5].body_type_check().expect("body check runs");
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
             panic!("init binds the `Str` field: {check:?}");
         };
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // An unknown `self.<name>(..)` callee is a field read of `name`:
+        // `UnknownField` survives whether or not the callee is parenthesized.
+        for (index, name) in [(3, "call_missing"), (4, "paren_missing")] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} reports its field error: {check:?}");
+            };
+            assert_eq!(diagnostics.len(), 1, "{name}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
+        }
     }
 
     fn inherent_method_body_type_mismatches_keep_source_spans() {
