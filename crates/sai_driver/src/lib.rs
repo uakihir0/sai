@@ -13614,13 +13614,44 @@ fn str_expr_family(
     }
     match expr.kind {
         ExprKind::Unary(operator, operand) => {
+            // `-`/`~` on a literal operand takes the numeric expectation
+            // like the checker's `check_direct_call_bitwise_not_literal`
+            // (`take(~1)` against an `I8` parameter types the `1` as
+            // `I8`); path operands keep their own family.
+            let operand_expected = if matches!(
+                operator,
+                sai_hir::expressions::UnOp::Neg | sai_hir::expressions::UnOp::BitNot
+            ) && expected.and_then(str_prim_family_name).is_some_and(
+                |family| {
+                    matches!(
+                        family,
+                        "`I8`"
+                            | "`I16`"
+                            | "`I32`"
+                            | "`I64`"
+                            | "`U8`"
+                            | "`U16`"
+                            | "`U32`"
+                            | "`U64`"
+                            | "`ISize`"
+                            | "`USize`"
+                            | "`F32`"
+                            | "`F64`"
+                    )
+                },
+            ) && matches!(operand.kind, ExprKind::Lit(_))
+            {
+                expected
+            } else {
+                None
+            };
             let Some((family, mut diagnostics)) = str_expr_family(
                 owner,
                 return_ty,
                 operand,
                 locals,
                 str_bindings,
-                None,
+                operand_expected,
                 type_paths,
                 symbols,
                 inputs,
@@ -14330,6 +14361,20 @@ fn str_expr_family(
             };
             let mut diagnostics = Vec::new();
             for (argument, parameter) in args.iter().zip(&signature.parameters) {
+                // Mirrors the checker: named arguments on a function call
+                // report NAMED_ARGUMENT_ON_FUNCTION but still check
+                // positionally.
+                if let Some(name) = &argument.name {
+                    diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        name.span,
+                        sai_diagnostics::Code::NamedArgumentOnFunction,
+                        "named arguments are only allowed when constructing a record".to_owned(),
+                        "named argument is not allowed in a function call",
+                    )?);
+                }
                 let Some((family, mut arg_diagnostics)) = str_expr_family(
                     owner,
                     return_ty,
@@ -56352,11 +56397,14 @@ property "shared"() {}
         let root = concat!(
             "pub fn pick() -> I64 { 1 }\n",
             "pub fn take(n: I64) -> I64 { n }\n",
+            "pub fn take_i8(n: I8) -> I8 { n }\n",
             "pub fn let_call() -> Str {\n    let m = pick()\n    \"a\"\n}\n",
             "pub fn scrutinee_call() -> Str {\n    match pick() { 1 => \"a\", _ => \"b\" }\n}\n",
             "pub fn arg_call() -> Str {\n    let m = take(1)\n    \"a\"\n}\n",
+            "pub fn unary_arg() -> Str {\n    let m = take_i8(~1)\n    \"a\"\n}\n",
             "pub fn arg_mismatch() -> Str {\n    let m = take(\"a\")\n    \"b\"\n}\n",
             "pub fn tail_call() -> Str {\n    pick()\n}\n",
+            "pub fn named_arg() -> Str {\n    let m = take(n: 1)\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -56372,18 +56420,18 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 7);
-        for (index, owner) in resolved.owners()[2..5].iter().enumerate() {
+        assert_eq!(resolved.owners().len(), 10);
+        for (index, owner) in resolved.owners()[3..7].iter().enumerate() {
             match owner.body_type_check().expect("call body check succeeds") {
                 FunctionBodyTypeCheck::Supported { diagnostics } => {
                     assert!(diagnostics.is_empty(), "clean call body: {diagnostics:?}")
                 }
-                other => panic!("expected Supported, found {other:?} at index {}", index + 2),
+                other => panic!("expected Supported, found {other:?} at index {}", index + 3),
             }
         }
         for (index, message) in [
-            (5, "expected `I64`, found `Str`"),
-            (6, "expected `Str`, found `I64`"),
+            (7, "expected `I64`, found `Str`"),
+            (8, "expected `Str`, found `I64`"),
         ] {
             match resolved.owners()[index]
                 .body_type_check()
@@ -56396,6 +56444,19 @@ property "shared"() {}
                 }
                 other => panic!("expected Supported, found {other:?}"),
             }
+        }
+        match resolved.owners()[9]
+            .body_type_check()
+            .expect("named argument body check succeeds")
+        {
+            FunctionBodyTypeCheck::Supported { diagnostics } => {
+                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(
+                    diagnostics[0].code,
+                    sai_diagnostics::Code::NamedArgumentOnFunction
+                );
+            }
+            other => panic!("expected Supported, found {other:?}"),
         }
     }
 
