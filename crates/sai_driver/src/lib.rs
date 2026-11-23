@@ -8594,7 +8594,10 @@ fn inherent_method_primitive_field_types(
             {
                 return None;
             }
-        } else if ty_text == "Str" {
+        // `ty` spelled `Str` is the core string only while the file's
+        // own record is not itself named `Str` — a user `type Str`
+        // shadows the prelude name, and `text: Str` then points at it.
+        } else if ty_text == "Str" && normalized_type_name != "Str" {
             str_field_types.insert(normalized_field_name);
         } else {
             return None;
@@ -8950,6 +8953,11 @@ fn str_inherent_method_field_types(
             .source
             .text()
             .get(range.start().to_usize()..range.end().to_usize())?;
+        // A field spelled `Str` on a record itself named `Str` refers
+        // to the user type shadowing the prelude, not the core string.
+        if ty_text == "Str" && normalized_type_name == "Str" {
+            return None;
+        }
         let field_family = str_method_field_family(ty_text)?;
         if field_types
             .insert(normalized_field_name, field_family)
