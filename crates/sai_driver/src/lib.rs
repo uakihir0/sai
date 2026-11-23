@@ -16499,38 +16499,45 @@ fn str_condition(
         // report the checker's `expected <left>, found <right>` on the
         // right operand.
         let mut operand_diagnostics = Vec::new();
-        let mut operand_family =
-            |expr: &HirExpr<'_>| -> Result<Option<&'static str>, OwnerControlFlowResolutionError> {
-                if matches!(expr.kind, ExprKind::Call { .. }) {
-                    let Some((family, mut call_diagnostics)) = str_expr_family(
-                        owner,
-                        return_ty,
-                        expr,
-                        locals,
-                        str_bindings,
-                        None,
-                        type_paths,
-                        symbols,
-                        inputs,
-                        snapshot,
-                        target_cfg,
-                        call_signatures,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    operand_diagnostics.append(&mut call_diagnostics);
-                    return Ok(Some(family));
-                }
-                Ok(str_condition_operand_family(
-                    expr,
-                    locals,
-                    str_bindings,
-                    inputs,
-                ))
+        // Call operands evaluate first — their argument checking can
+        // resolve a literal variable the other operand reads
+        // (`n == self.echo(n)` pins `n` through `echo`'s parameter).
+        let mut calls_failed = false;
+        let mut call_families = [None, None];
+        for (index, operand) in [lhs, rhs].into_iter().enumerate() {
+            if !matches!(operand.kind, ExprKind::Call { .. }) {
+                continue;
+            }
+            let Some((family, mut diagnostics)) = str_expr_family(
+                owner,
+                return_ty,
+                operand,
+                locals,
+                str_bindings,
+                None,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                call_signatures,
+            )?
+            else {
+                calls_failed = true;
+                continue;
             };
-        let (Some(left_family), Some(right_family)) = (operand_family(lhs)?, operand_family(rhs)?)
-        else {
+            operand_diagnostics.append(&mut diagnostics);
+            call_families[index] = Some(family);
+        }
+        if calls_failed {
+            return Ok(None);
+        }
+        let (Some(left_family), Some(right_family)) = (
+            call_families[0]
+                .or_else(|| str_condition_operand_family(lhs, locals, str_bindings, inputs)),
+            call_families[1]
+                .or_else(|| str_condition_operand_family(rhs, locals, str_bindings, inputs)),
+        ) else {
             return Ok(None);
         };
         // `!` unifies with the other operand's family (a `let n =
@@ -16552,7 +16559,10 @@ fn str_condition(
                     other_expr: &HirExpr<'_>,
                     other: &'static str| {
             if own != other
-                && matches!(expr.kind, ExprKind::Lit(_))
+                && matches!(
+                    expr.kind,
+                    ExprKind::Lit(Lit::Int { .. } | Lit::Float { .. })
+                )
                 && !matches!(other_expr.kind, ExprKind::Lit(_))
                 && primitive_method_field_type(other.trim_matches('`')).is_some()
             {
@@ -102109,6 +102119,24 @@ property "shared"() {}
             "    self.prepare()\n",
             "    self.text\n",
             "  }\n",
+            "  pub fn echo(self: borrow Self, n: I32) -> I32 {\n",
+            "    n\n",
+            "  }\n",
+            "  pub fn lit_var_cmp(self: borrow Self) -> Str {\n",
+            "    let n = 1\n",
+            "    if n == self.echo(n) {\n",
+            "      self.text\n",
+            "    } else {\n",
+            "      self.text\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn reverse_cmp(self: borrow Self) -> Str {\n",
+            "    if \"ready\" == self.size() {\n",
+            "      self.text\n",
+            "    } else {\n",
+            "      self.text\n",
+            "    }\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -102129,7 +102157,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let methods = &results.owners()[0].members();
-        assert_eq!(methods.len(), 13);
+        assert_eq!(methods.len(), 16);
         // `self.<method>(..)` checks through the sibling signature —
         // a supported `Str` tail and a `Str` local initializer.
         for (index, name) in [(2, "ok"), (3, "chained")] {
@@ -102189,17 +102217,28 @@ property "shared"() {}
             };
             assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
         }
-        // A call operand family mismatch reports on the right operand.
-        let check = methods[10].body_type_check().expect("body check runs");
+        // A call operand family mismatch reports on the right operand,
+        // whichever side the call is on.
+        for (index, name, message) in [
+            (10, "cond_mismatch", "expected `I32`, found `Str`"),
+            (15, "reverse_cmp", "expected `Str`, found `I32`"),
+        ] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} reports its mismatch: {check:?}");
+            };
+            assert_eq!(diagnostics.len(), 1, "{name}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            assert_eq!(diagnostics[0].message, message, "{name}: {diagnostics:?}");
+        }
+        // A literal variable compared against a call resolves through
+        // the call's parameter — `n` pins to `I32` inside `self.echo(n)`
+        // before the comparison reads it.
+        let check = methods[14].body_type_check().expect("body check runs");
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
-            panic!("cond_mismatch reports its mismatch: {check:?}");
+            panic!("lit_var_cmp resolves through the call: {check:?}");
         };
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
-        assert_eq!(
-            diagnostics[0].message, "expected `I32`, found a string literal",
-            "{diagnostics:?}"
-        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
