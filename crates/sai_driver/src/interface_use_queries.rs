@@ -7222,6 +7222,7 @@ fn current_owner_inputs_from_prepared(input: &OwnedPhase1ModuleInput) -> Current
         retained_item_kinds,
         accepted_flags_attributes,
         source_ref: input.source_ref.clone(),
+        str_self_field_projections: std::cell::RefCell::new(None),
     }
 }
 

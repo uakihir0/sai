@@ -8167,6 +8167,36 @@ fn check_inherent_method_body_type(
         if explicit_params.len() > 2 {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         }
+        // `self.<field>` reads project the field's family —
+        // `Str`/`scalar` fields only; other field types keep the
+        // whole impl gated.
+        let Some(field_types) = str_inherent_method_field_types(*self_ty, symbols, inputs) else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        let mut self_field_projections = HashMap::new();
+        let mut field_diagnostics = Vec::new();
+        let mut collect_error = None;
+        visit_block_expressions(method_block, &mut |expression| {
+            if collect_error.is_some() || !matches!(expression.kind, ExprKind::Field { .. }) {
+                return;
+            }
+            match collect_str_inherent_method_self_field(
+                method_owner.id,
+                expression,
+                &field_types,
+                &mut self_field_projections,
+                &mut field_diagnostics,
+                symbols,
+                inputs,
+                snapshot,
+            ) {
+                Ok(_) => {}
+                Err(error) => collect_error = Some(error),
+            }
+        });
+        if let Some(error) = collect_error {
+            return Err(error);
+        }
         let mut str_bindings = StrLocalBindings::new();
         for (parameter, body_parameter) in explicit_params.iter().zip(explicit_body_params.iter()) {
             if parameter.mutable != body_parameter.mutable
@@ -8191,7 +8221,8 @@ fn check_inherent_method_body_type(
                 },
             );
         }
-        let Some(diagnostics) = check_function_str_local_block(
+        *inputs.str_self_field_projections.borrow_mut() = Some(self_field_projections);
+        let walk = check_function_str_local_block(
             method_owner,
             *sig.ret.expect("Str return is present"),
             method_block,
@@ -8205,9 +8236,19 @@ fn check_inherent_method_body_type(
             false,
             StrStmtLoopFrame::None,
             direct_call_signatures,
-        )?
-        else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
+        );
+        *inputs.str_self_field_projections.borrow_mut() = None;
+        let diagnostics = match walk? {
+            Some(diagnostics) => {
+                let mut all = field_diagnostics;
+                all.extend(diagnostics);
+                all
+            }
+            // A `self.<missing>` still reports its field diagnostic —
+            // the method is erroneous whether or not the rest of the
+            // body stayed inside the walk's shapes.
+            None if !field_diagnostics.is_empty() => field_diagnostics,
+            None => return Ok(FunctionBodyTypeCheck::Unsupported),
         };
         return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
     }
@@ -8307,7 +8348,13 @@ fn collect_inherent_method_self_field(
         Err(name) => {
             unknown_self_fields.insert(expression.hir_id);
             diagnostics.push(unknown_self_field_diagnostic(
-                owner, fields, name, inputs, snapshot,
+                owner,
+                &fields.type_name,
+                fields.type_name_span,
+                &fields.candidate_names,
+                name,
+                inputs,
+                snapshot,
             )?);
         }
     }
@@ -8493,6 +8540,226 @@ fn primitive_self_field_type(
     Some(field_types.get(field_name.as_ref()).copied().ok_or(name))
 }
 
+// The `self.<field>` families a `-> Str` method may read — `Str`
+// fields map to `` `Str` ``, scalar fields to their literal-family
+// name. Mirrors `InherentMethodPrimitiveFields`.
+struct InherentMethodStrFields {
+    type_name: String,
+    type_name_span: sai_diagnostics::Span,
+    fields: HashMap<String, &'static str>,
+    candidate_names: Vec<String>,
+}
+
+// The family a record field type contributes to the Str walk: `Str`
+// for `Str`, the literal-family name for scalars, `None` for types
+// the walk cannot model.
+fn str_method_field_family(ty: &str) -> Option<&'static str> {
+    if ty == "Str" {
+        return Some("`Str`");
+    }
+    primitive_method_field_type(ty).and_then(str_prim_family_name)
+}
+
+// The `Str` counterpart of `inherent_method_primitive_field_types`:
+// same file and declaration gates, field types mapped to families.
+fn str_inherent_method_field_types(
+    self_ty: Ty<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<InherentMethodStrFields> {
+    use sai_syntax::ast::AstNode as _;
+
+    let TyKind::Path(path) = self_ty.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return None;
+    }
+    let target_name = symbols.resolve(path.segments[0].name.sym).ok()?;
+    if primitive_method_field_type(target_name.as_ref()).is_some() {
+        return None;
+    }
+    let source_file = ast::SourceFile::cast(inputs.root.clone())?;
+    if source_file.module_header().is_some()
+        || source_file.test_decls().next().is_some()
+        || source_file.property_decls().next().is_some()
+        || source_file
+            .syntax()
+            .children()
+            .any(|child| ast::UseDecl::can_cast(child.kind()))
+    {
+        return None;
+    }
+    let mut type_decl = None;
+    let mut impl_decl = None;
+    for item in source_file.items() {
+        match item {
+            ast::Item::Type(decl) if type_decl.is_none() => type_decl = Some(decl),
+            ast::Item::Impl(decl) if impl_decl.is_none() => impl_decl = Some(decl),
+            ast::Item::Function(_) => {}
+            _ => return None,
+        }
+    }
+    let (Some(type_decl), Some(impl_decl)) = (type_decl, impl_decl) else {
+        return None;
+    };
+    let type_name_node = type_decl.name()?;
+    let type_name = type_name_node.token()?.text().to_owned();
+    let type_name_span =
+        sai_diagnostics::Span::new(inputs.source.id(), type_name_node.syntax().text_range());
+    let struct_def = type_decl.struct_def()?;
+    let fields = struct_def.fields()?;
+    if type_decl.attrs().next().is_some()
+        || type_decl
+            .syntax()
+            .children()
+            .any(|child| ast::GenericParamList::can_cast(child.kind()))
+        || type_decl
+            .syntax()
+            .descendants()
+            .any(|node| ast::Attribute::can_cast(node.kind()))
+        || struct_def.where_clause().is_some()
+        || fields.fields().next().is_none()
+        || impl_decl.attrs().next().is_some()
+        || impl_decl
+            .syntax()
+            .children()
+            .any(|child| ast::GenericParamList::can_cast(child.kind()))
+        || impl_decl
+            .syntax()
+            .descendants()
+            .any(|node| ast::Attribute::can_cast(node.kind()))
+        || impl_decl.unsafe_token().is_some()
+    {
+        return None;
+    }
+    let normalized_type_name =
+        sai_syntax::normalize_identifier(type_name.strip_prefix("r#").unwrap_or(&type_name));
+    if normalized_type_name != target_name.as_ref() {
+        return None;
+    }
+    let inherent_type = impl_decl.inherent_type()?;
+    let range = inherent_type.syntax().text_range();
+    if inputs
+        .source
+        .text()
+        .get(range.start().to_usize()..range.end().to_usize())
+        != Some(type_name.as_str())
+    {
+        return None;
+    }
+    let mut field_types = HashMap::new();
+    let mut candidate_names = Vec::new();
+    for field in fields.fields() {
+        if field.attrs().next().is_some() {
+            return None;
+        }
+        let field_name_node = field.name()?;
+        let field_name = field_name_node.token()?.text().to_owned();
+        let field_spelling = field_name.strip_prefix("r#").unwrap_or(&field_name);
+        let normalized_field_name = sai_syntax::normalize_identifier(field_spelling);
+        let ty = field.ty()?;
+        let range = ty.syntax().text_range();
+        let ty_text = inputs
+            .source
+            .text()
+            .get(range.start().to_usize()..range.end().to_usize())?;
+        let field_family = str_method_field_family(ty_text)?;
+        if field_types
+            .insert(normalized_field_name, field_family)
+            .is_some()
+        {
+            return None;
+        }
+        candidate_names.push(field_spelling.to_owned());
+    }
+    Some(InherentMethodStrFields {
+        type_name: type_name
+            .strip_prefix("r#")
+            .unwrap_or(&type_name)
+            .to_owned(),
+        type_name_span,
+        fields: field_types,
+        candidate_names,
+    })
+}
+
+// The `Str` counterpart of `primitive_self_field_type`: `Ok(family)`
+// for a known field, `Err(name)` for `self.<missing>` so the caller
+// emits the unknown-field diagnostic.
+fn str_self_field_family(
+    expression: &HirExpr<'_>,
+    field_types: &HashMap<String, &'static str>,
+    symbols: &Interner,
+) -> Option<Result<&'static str, Name>> {
+    let ExprKind::Field {
+        base,
+        name,
+        args: None,
+    } = expression.kind
+    else {
+        return None;
+    };
+    if !is_direct_self_value_expression(base) {
+        return None;
+    }
+    let field_name = symbols.resolve(name.sym).ok()?;
+    Some(field_types.get(field_name.as_ref()).copied().ok_or(name))
+}
+
+// Collect `self.<field>` projections for a `-> Str` method body:
+// known fields record their family by HirId, unknown fields emit the
+// unknown-field diagnostic so the gate can still surface it.
+fn collect_str_inherent_method_self_field(
+    owner: OwnerId,
+    expression: &HirExpr<'_>,
+    fields: &InherentMethodStrFields,
+    self_field_projections: &mut HashMap<HirId, &'static str>,
+    diagnostics: &mut Vec<Diagnostic>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<bool, OwnerControlFlowResolutionError> {
+    let Some(field_lookup) = str_self_field_family(expression, &fields.fields, symbols) else {
+        return Ok(false);
+    };
+    match field_lookup {
+        Ok(family) => {
+            self_field_projections.insert(expression.hir_id, family);
+        }
+        Err(name) => {
+            diagnostics.push(unknown_self_field_diagnostic(
+                owner,
+                &fields.type_name,
+                fields.type_name_span,
+                &fields.candidate_names,
+                name,
+                inputs,
+                snapshot,
+            )?);
+        }
+    }
+    Ok(true)
+}
+
+// The family a `self.<field>` expression carries while a `-> Str`
+// method walk runs — `None` for non-`self` bases and unprojected
+// fields (the caller gates or reports through the collect pass).
+fn str_self_field_projected_family(
+    expression: &HirExpr<'_>,
+    inputs: &CurrentOwnerInputs,
+) -> Option<&'static str> {
+    if !matches!(expression.kind, ExprKind::Field { .. }) {
+        return None;
+    }
+    inputs
+        .str_self_field_projections
+        .borrow()
+        .as_ref()?
+        .get(&expression.hir_id)
+        .copied()
+}
+
 fn name_node_id_for_span(root: &SyntaxNode, span: sai_hir::Span) -> Option<String> {
     fn visit(
         node: &SyntaxNode,
@@ -8527,7 +8794,9 @@ fn name_node_id_for_span(root: &SyntaxNode, span: sai_hir::Span) -> Option<Strin
 
 fn unknown_self_field_diagnostic(
     owner: OwnerId,
-    fields: &InherentMethodPrimitiveFields,
+    type_name: &str,
+    type_name_span: sai_diagnostics::Span,
+    candidate_names: &[String],
     name: Name,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -8540,10 +8809,9 @@ fn unknown_self_field_diagnostic(
             owner,
         ))?;
     let field = written_field.strip_prefix("r#").unwrap_or(written_field);
-    let include_all = fields.candidate_names.len() <= 5;
+    let include_all = candidate_names.len() <= 5;
     let threshold = (field.chars().count() / 3).max(1);
-    let mut candidates = fields
-        .candidate_names
+    let mut candidates = candidate_names
         .iter()
         .enumerate()
         .filter_map(|(declaration_order, candidate)| {
@@ -8571,7 +8839,7 @@ fn unknown_self_field_diagnostic(
     ))?;
     let declaration = sai_diagnostics::Location::from_decoded_source(
         inputs.source_ref.clone(),
-        fields.type_name_span,
+        type_name_span,
         &inputs.source,
     )
     .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
@@ -8583,7 +8851,7 @@ fn unknown_self_field_diagnostic(
     let mut diagnostic = Diagnostic::new(
         sai_diagnostics::Code::UnknownField,
         sai_diagnostics::Severity::Error,
-        format!("`{}` has no field `{field}`", fields.type_name),
+        format!("`{type_name}` has no field `{field}`"),
         Some(primary),
     );
     diagnostic.primary_label = "unknown field".to_owned();
@@ -8591,7 +8859,7 @@ fn unknown_self_field_diagnostic(
     diagnostic.package = inputs.source_ref.package.clone();
     diagnostic.data.insert(
         "type_name".to_owned(),
-        sai_diagnostics::Value::String(fields.type_name.clone()),
+        sai_diagnostics::Value::String(type_name.to_owned()),
     );
     diagnostic.data.insert(
         "field".to_owned(),
@@ -8610,7 +8878,7 @@ fn unknown_self_field_diagnostic(
     diagnostic
         .push_related(Related::DeclaredHere {
             location: declaration,
-            what: format!("`{}`", fields.type_name),
+            what: format!("`{type_name}`"),
         })
         .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
     if !candidate_names.is_empty() {
@@ -13814,6 +14082,9 @@ fn str_literal_family_init(
         }
         _ => {}
     }
+    if let Some(family) = str_self_field_projected_family(init, inputs) {
+        return Ok(Some((family, Vec::new())));
+    }
     let Some(entry) = str_binding_entry(init, locals, str_bindings) else {
         return Ok(None);
     };
@@ -13886,10 +14157,12 @@ fn str_condition_operand_family(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> Option<&'static str> {
     match expr.kind {
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal),
+        ExprKind::Field { .. } => str_self_field_projected_family(expr, inputs),
         _ => str_binding_family(expr, locals, str_bindings),
     }
 }
@@ -13930,6 +14203,9 @@ fn str_expr_family(
         target_cfg,
     )? {
         return Ok(Some(found));
+    }
+    if let Some(family) = str_self_field_projected_family(expr, inputs) {
+        return Ok(Some((family, Vec::new())));
     }
     match expr.kind {
         // `()` — the unit expression — carries the unit family (a
@@ -15075,7 +15351,9 @@ fn str_match_family(
     // then the general expression walk so calls and operand trees resolve.
     let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
         Some("`Str`")
-    } else if let Some(family) = str_binding_family(scrutinee, locals, str_bindings) {
+    } else if let Some(family) = str_self_field_projected_family(scrutinee, inputs)
+        .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
+    {
         Some(family)
     } else {
         let Some((family, mut scrutinee_diagnostics)) = str_expr_family(
@@ -15835,8 +16113,11 @@ fn str_condition_operand(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> bool {
-    matches!(expr.kind, ExprKind::Lit(Lit::Str(_))) || str_binding_path(expr, locals, str_bindings)
+    matches!(expr.kind, ExprKind::Lit(Lit::Str(_)))
+        || str_binding_path(expr, locals, str_bindings)
+        || str_self_field_projected_family(expr, inputs).is_some()
 }
 
 // A `Str` comparison condition leaf: `==`/`!=`/`<`/`<=`/`>`/`>=` over two
@@ -15846,6 +16127,7 @@ fn str_comparison_condition(
     cond: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> bool {
     matches!(
         cond.kind,
@@ -15853,8 +16135,8 @@ fn str_comparison_condition(
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
             lhs,
             rhs,
-        ) if str_condition_operand(lhs, locals, str_bindings)
-            && str_condition_operand(rhs, locals, str_bindings)
+        ) if str_condition_operand(lhs, locals, str_bindings, inputs)
+            && str_condition_operand(rhs, locals, str_bindings, inputs)
     )
 }
 
@@ -15922,7 +16204,7 @@ fn str_condition(
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
-        || str_comparison_condition(cond, locals, str_bindings)
+        || str_comparison_condition(cond, locals, str_bindings, inputs)
     {
         return Ok(Some(Vec::new()));
     }
@@ -15938,8 +16220,8 @@ fn str_condition(
         // range check); differing families report the checker's
         // `expected <left>, found <right>` on the right operand.
         let (Some(left_family), Some(right_family)) = (
-            str_condition_operand_family(lhs, locals, str_bindings),
-            str_condition_operand_family(rhs, locals, str_bindings),
+            str_condition_operand_family(lhs, locals, str_bindings, inputs),
+            str_condition_operand_family(rhs, locals, str_bindings, inputs),
         ) else {
             return Ok(None);
         };
@@ -16032,7 +16314,9 @@ fn str_condition(
             "type mismatch",
         )?]));
     }
-    if let Some(family) = str_binding_family(cond, locals, str_bindings) {
+    if let Some(family) = str_self_field_projected_family(cond, inputs)
+        .or_else(|| str_binding_family(cond, locals, str_bindings))
+    {
         if family == "`Bool`" || family == "`!`" {
             return Ok(Some(Vec::new()));
         }
@@ -16046,7 +16330,7 @@ fn str_condition(
             "type mismatch",
         )?]));
     }
-    if str_condition_operand(cond, locals, str_bindings) {
+    if str_condition_operand(cond, locals, str_bindings, inputs) {
         return Ok(Some(vec![const_literal_diagnostic(
             owner.id,
             inputs,
@@ -18566,7 +18850,9 @@ fn str_stmt_expr_unit(
             ) {
                 return Ok(None);
             }
-            let Some(scrutinee_family) = str_binding_family(scrutinee, locals, str_bindings) else {
+            let Some(scrutinee_family) = str_self_field_projected_family(scrutinee, inputs)
+                .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
+            else {
                 return Ok(None);
             };
             let scrutinee_prim = if scrutinee_family == "`Str`" {
@@ -18805,19 +19091,21 @@ fn str_stmt_break_family(
         // pure initializer walk like the diagnostic `str_break_value` —
         // only in the pure scan: the diagnostic walk's contributions
         // carry pin-adjusted families from `str_break_value` instead.
-        _ => str_binding_family(value, locals, str_bindings).or_else(|| {
-            pure.then(|| {
-                str_pure_init_family(
-                    value,
-                    locals,
-                    str_bindings,
-                    type_paths,
-                    symbols,
-                    inputs,
-                    call_signatures,
-                )
+        _ => str_self_field_projected_family(value, inputs).or_else(|| {
+            str_binding_family(value, locals, str_bindings).or_else(|| {
+                pure.then(|| {
+                    str_pure_init_family(
+                        value,
+                        locals,
+                        str_bindings,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        call_signatures,
+                    )
+                })
+                .flatten()
             })
-            .flatten()
         }),
     }
 }
@@ -18948,7 +19236,7 @@ fn str_pure_condition(
     if matches!(cond.kind, ExprKind::Lit(_)) {
         return true;
     }
-    if str_comparison_condition(cond, locals, str_bindings) {
+    if str_comparison_condition(cond, locals, str_bindings, inputs) {
         return true;
     }
     if let ExprKind::Binary(
@@ -19431,7 +19719,8 @@ fn str_pure_init_family(
             inputs,
             call_signatures,
         ),
-        _ => str_binding_family(init, locals, str_bindings),
+        _ => str_self_field_projected_family(init, inputs)
+            .or_else(|| str_binding_family(init, locals, str_bindings)),
     }
 }
 
@@ -19454,7 +19743,9 @@ fn str_pure_match_family(
 ) -> Option<&'static str> {
     let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
         Some("`Str`")
-    } else if let Some(family) = str_binding_family(scrutinee, locals, str_bindings) {
+    } else if let Some(family) = str_self_field_projected_family(scrutinee, inputs)
+        .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
+    {
         Some(family)
     } else {
         str_pure_init_family(
@@ -19795,7 +20086,8 @@ fn str_stmt_break_families_expr<'h>(
             let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
                 Some("`Str`")
             } else {
-                str_binding_family(scrutinee, locals, str_bindings)
+                str_self_field_projected_family(scrutinee, inputs)
+                    .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
             };
             for arm in arms {
                 let mut arm_bindings = str_bindings.clone();
@@ -20490,7 +20782,8 @@ fn str_loop_level_expr(
             let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
                 Some("`Str`")
             } else {
-                str_binding_family(scrutinee, locals, str_bindings)
+                str_self_field_projected_family(scrutinee, inputs)
+                    .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
             };
             let Some(scrutinee_family) = scrutinee_family else {
                 return Ok(None);
@@ -20836,7 +21129,9 @@ fn str_break_value(
     if matches!(value.kind, ExprKind::Lit(Lit::Str(_))) {
         return Ok(Some((true, Vec::new())));
     }
-    if let Some(family) = str_binding_family(value, locals, str_bindings) {
+    if let Some(family) = str_self_field_projected_family(value, inputs)
+        .or_else(|| str_binding_family(value, locals, str_bindings))
+    {
         if family == "`Str`" || family == "`!`" {
             return Ok(Some((true, Vec::new())));
         }
@@ -20997,7 +21292,9 @@ fn check_function_str_match(
     // then the general expression walk so calls and operand trees resolve.
     let scrutinee_family = if str_binding_path(scrutinee, locals, str_bindings) {
         Some("`Str`")
-    } else if let Some(family) = str_binding_family(scrutinee, locals, str_bindings) {
+    } else if let Some(family) = str_self_field_projected_family(scrutinee, inputs)
+        .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
+    {
         Some(family)
     } else {
         let Some((family, mut scrutinee_diagnostics)) = str_expr_family(
@@ -21205,7 +21502,9 @@ fn check_function_str_tail(
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    if let Some(family) = str_binding_family(tail, locals, str_bindings) {
+    if let Some(family) = str_self_field_projected_family(tail, inputs)
+        .or_else(|| str_binding_family(tail, locals, str_bindings))
+    {
         if family == "`Str`" || family == "`!`" {
             return Ok(Some(Vec::new()));
         }
@@ -21469,7 +21768,9 @@ fn check_function_str_tail(
                     }
                     (StrStmtLoopFrame::Loop, Some(value)) => match value.kind {
                         ExprKind::Lit(_) => Ok(Some(Vec::new())),
-                        _ if str_binding_family(value, locals, str_bindings).is_some() => {
+                        _ if str_self_field_projected_family(value, inputs).is_some()
+                            || str_binding_family(value, locals, str_bindings).is_some() =>
+                        {
                             Ok(Some(Vec::new()))
                         }
                         _ => Ok(None),
@@ -23382,6 +23683,11 @@ struct CurrentOwnerInputs {
     retained_item_kinds: HashMap<ast::ErasedAstId, ItemTreeKind>,
     accepted_flags_attributes: HashSet<ast::ErasedAstId>,
     source_ref: SourceRef,
+    // `self.<field>` projections for the method currently walking the
+    // Str path — set by `check_inherent_method_body_type` while a
+    // `-> Str` inherent method checks, `None` elsewhere. A `RefCell`
+    // keeps the shared `&CurrentOwnerInputs` threading unchanged.
+    str_self_field_projections: std::cell::RefCell<Option<HashMap<HirId, &'static str>>>,
 }
 
 fn index_top_level_owner_descriptors(
@@ -30762,6 +31068,7 @@ impl RootDatabase {
             retained_item_kinds,
             accepted_flags_attributes,
             source_ref,
+            str_self_field_projections: std::cell::RefCell::new(None),
         })
     }
 
@@ -101183,8 +101490,31 @@ property "shared"() {}
             "  pub fn field_read(self: borrow Self) -> Str {\n",
             "    self.text\n",
             "  }\n",
+            "  pub fn field_init(self: borrow Self) -> Str {\n",
+            "    let s = self.text\n",
+            "    s\n",
+            "  }\n",
+            "  pub fn field_cond(self: borrow Self) -> Str {\n",
+            "    let s = \"x\"\n",
+            "    if self.count == 1 {\n",
+            "      s\n",
+            "    } else {\n",
+            "      \"y\"\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn field_scrutinee(self: borrow Self) -> Str {\n",
+            "    match self.text {\n",
+            "      _ => \"m\"\n",
+            "    }\n",
+            "  }\n",
             "  pub fn bad_tail(self: borrow Self) -> Str {\n",
             "    1\n",
+            "  }\n",
+            "  pub fn scalar_tail(self: borrow Self) -> Str {\n",
+            "    self.count\n",
+            "  }\n",
+            "  pub fn missing(self: borrow Self) -> Str {\n",
+            "    self.nope\n",
             "  }\n",
             "  pub fn wide(self: borrow Self, a: Str, b: Str, c: Str) -> Str {\n",
             "    a\n",
@@ -101210,26 +101540,48 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let methods = &results.owners()[0].members();
-        assert_eq!(methods.len(), 6);
-        for (index, name) in ["get", "with_suffix", "counted"].iter().enumerate() {
+        assert_eq!(methods.len(), 11);
+        for (index, name) in [
+            "get",
+            "with_suffix",
+            "counted",
+            "field_read",
+            "field_init",
+            "field_cond",
+            "field_scrutinee",
+        ]
+        .iter()
+        .enumerate()
+        {
             let check = methods[index].body_type_check().expect("body check runs");
             let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
                 panic!("{name} stays supported");
             };
             assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
         }
-        let check = methods[3].body_type_check().expect("body check runs");
-        assert!(
-            matches!(check, FunctionBodyTypeCheck::Unsupported),
-            "self.<field> stays gated: {check:?}"
-        );
-        let check = methods[4].body_type_check().expect("body check runs");
+        let check = methods[7].body_type_check().expect("body check runs");
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
             panic!("a non-Str tail reports a recoverable mismatch: {check:?}");
         };
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
-        let check = methods[5].body_type_check().expect("body check runs");
+        let check = methods[8].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a scalar field tail reports a recoverable mismatch: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(
+            diagnostics[0].message, "expected `Str`, found `I32`",
+            "{diagnostics:?}"
+        );
+        let check = methods[9].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("self.<missing> reports its field diagnostic: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
+        let check = methods[10].body_type_check().expect("body check runs");
         assert!(
             matches!(check, FunctionBodyTypeCheck::Unsupported),
             ">2 explicit params stay gated: {check:?}"
