@@ -4654,10 +4654,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         for stmt in block.stmts {
             self.check_stmt(stmt)?;
         }
+        // Diverging exits (`return`/`break`/`continue`) never yield a
+        // value into the `Str` position: a tail-less block whose last
+        // statement diverges, or a diverging tail expression, closes
+        // the branch like `check_stmt_block` does for statement blocks.
         let Some(tail) = block.tail else {
-            return Err(());
+            return match block.stmts.last().map(|stmt| stmt.kind) {
+                Some(StmtKind::Expr(expression))
+                    if matches!(
+                        expression.kind,
+                        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
+                    ) =>
+                {
+                    Ok(())
+                }
+                _ => Err(()),
+            };
         };
-        self.check_str_branch_tail(tail)
+        match tail.kind {
+            ExprKind::Return(value) => self.check_return(tail.hir_id, value),
+            ExprKind::Break { label, value } => self.check_break(tail.hir_id, label, value),
+            ExprKind::Continue { label } => self.check_continue(tail.hir_id, label),
+            _ => self.check_str_branch_tail(tail),
+        }
     }
 
     // `Str`-yielding tail shapes in `if`/`else` branches: a `Str`
@@ -4732,18 +4751,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     LocalType::Error(_) => Ok(()),
                 }
             }
-            ExprKind::Field { .. } => match self
-                .input
-                .str_self_field_projections
-                .and_then(|fields| fields.get(&expression.hir_id))
-                .copied()
+            ExprKind::Field { .. }
+                if matches!(
+                    self.input
+                        .str_self_field_projections
+                        .and_then(|fields| fields.get(&expression.hir_id))
+                        .copied(),
+                    Some("`Str`")
+                ) =>
             {
-                Some("`Str`") => {
-                    self.record_expression_type(expression.hir_id, LocalType::Str);
-                    Ok(())
-                }
-                _ => Err(()),
-            },
+                self.record_expression_type(expression.hir_id, LocalType::Str);
+                Ok(())
+            }
             ExprKind::Block(block) => self.check_str_branch_block(block),
             ExprKind::If { cond, then, els } => {
                 self.check_if_condition(cond)?;
@@ -4760,8 +4779,61 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             } => self
                 .check_match_tail(scrutinee, arms, source, LocalType::Str)
                 .map(|_| ()),
-            _ => Err(()),
+            // Diverging expressions never yield into the `Str`
+            // position; `check_return`/`check_break`/`check_continue`
+            // still validate them in place.
+            ExprKind::Return(value) => self.check_return(expression.hir_id, value),
+            ExprKind::Break { label, value } => self.check_break(expression.hir_id, label, value),
+            ExprKind::Continue { label } => self.check_continue(expression.hir_id, label),
+            _ => self.check_str_branch_tail_mismatch(expression),
         }
+    }
+
+    // A branch tail that resolves to a non-`Str` type still reports
+    // the `Str` mismatch instead of gating: `value.len()` in a `Str`
+    // join is `expected `Str`, found `USize``, not unsupported.
+    fn check_str_branch_tail_mismatch(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
+        let local_type = match expression.kind {
+            ExprKind::Call { .. } => self.check_direct_call(expression, false)?,
+            ExprKind::Field { .. } => match self
+                .input
+                .self_field_projections
+                .and_then(|fields| fields.get(&expression.hir_id))
+            {
+                Some(primitive) => LocalType::Concrete(*primitive),
+                None => return Err(()),
+            },
+            _ => return Err(()),
+        };
+        match local_type {
+            LocalType::Concrete(found) => self.errors.push(PrimitiveBodyError {
+                node: expression.hir_id,
+                kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                    expected: ScalarType::Str,
+                    found: ScalarType::Primitive(found),
+                },
+            }),
+            LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                let Some(variable) = self.literal_variables.get(id) else {
+                    return Err(());
+                };
+                self.errors.push(PrimitiveBodyError {
+                    node: expression.hir_id,
+                    kind: match variable.resolved {
+                        Some(found) => PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                            expected: ScalarType::Str,
+                            found: ScalarType::Primitive(found),
+                        },
+                        None => PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                            expected: ScalarType::Str,
+                            found: ScalarLiteralKind::Primitive(variable.kind),
+                        },
+                    },
+                });
+            }
+            LocalType::Str | LocalType::Error(_) => {}
+        }
+        Ok(())
     }
 
     // Mirror of `check_str_branch_block`'s admission: a safe block
@@ -4795,12 +4867,32 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                 }
                 StmtKind::Assert { .. } => {}
+                // `return`/`break`/`continue` statements diverge —
+                // `check_stmt` validates them like any other body
+                // statement.
+                StmtKind::Expr(expression)
+                    if matches!(
+                        expression.kind,
+                        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
+                    ) => {}
                 _ => return false,
             }
         }
-        block
-            .tail
-            .is_some_and(|tail| self.str_shaped_initializer_in(tail, &inner))
+        match block.tail {
+            Some(tail) => self.str_shaped_initializer_in(tail, &inner),
+            // A tail-less block whose last statement diverges never
+            // yields `()` into the `Str` position.
+            None => matches!(
+                block.stmts.last().map(|stmt| stmt.kind),
+                Some(StmtKind::Expr(expression))
+                    if matches!(
+                        expression.kind,
+                        ExprKind::Return(..)
+                            | ExprKind::Break { .. }
+                            | ExprKind::Continue { .. }
+                    )
+            ),
+        }
     }
 
     // Whether an unannotated initializer yields `Str`: a `Str` literal,
@@ -4851,6 +4943,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         .iter()
                         .any(|arm| self.str_shaped_initializer_in(arm.body, str_bindings))
             }
+            // Diverging expressions never observe the `Str` yield.
+            ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
             _ => false,
         }
     }

@@ -11365,6 +11365,21 @@ fn collect_str_branch_let_annotations(
                 );
             }
         }
+        // `match` arm bodies carry their own annotated `let`s the
+        // same way `if` branches do.
+        ExprKind::Match { arms, .. } => {
+            for arm in arms {
+                collect_str_branch_let_annotations(
+                    arm.body,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
         _ => {}
     }
 }
@@ -11454,6 +11469,8 @@ fn str_shaped_local_init(
                     )
                 })
         }
+        // Diverging expressions never observe the `Str` yield.
+        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
         // `let s = if c { "a" } else { "b" }` yields `Str` when both
         // branches do (an `else if` chain recurses through `els`).
         ExprKind::If { then, els, .. } => {
@@ -11503,12 +11520,29 @@ fn str_shaped_branch_block(
                 }
             }
             StmtKind::Assert { .. } => {}
+            // `return`/`break`/`continue` statements diverge — the
+            // kernel validates them like any other body statement.
+            StmtKind::Expr(expression)
+                if matches!(
+                    expression.kind,
+                    ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
+                ) => {}
             _ => return false,
         }
     }
-    block.tail.is_some_and(|tail| {
-        str_shaped_local_init(tail, locals, inputs, &inner, symbols, type_paths)
-    })
+    match block.tail {
+        Some(tail) => str_shaped_local_init(tail, locals, inputs, &inner, symbols, type_paths),
+        // A tail-less block whose last statement diverges never
+        // yields `()` into the `Str` position.
+        None => matches!(
+            block.stmts.last().map(|stmt| stmt.kind),
+            Some(StmtKind::Expr(expression))
+                if matches!(
+                    expression.kind,
+                    ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
+                )
+        ),
+    }
 }
 
 fn primitive_if_tail_shape_is_supported(
@@ -61401,6 +61435,9 @@ property "shared"() {}
             "pub fn str_match_init_annotated(n: I32) -> USize { let s: Str = match n { 1 => \"a\", _ => \"b\" }\n    s.len() }\n",
             "pub fn str_match_init_nested(flag: Bool, other: Bool) -> USize { let s = match flag { true => if other { \"a\" } else { \"c\" }, _ => \"b\" }\n    s.len() }\n",
             "pub fn str_match_init_mismatch(n: I32) -> USize { let s = match n { 1 => \"a\", _ => 1 }\n    s.len() }\n",
+            "pub fn str_match_arm_let_annotation(flag: Bool) -> USize { let s: Str = match flag { true => { let n: I32 = 1\n        \"a\" }, _ => \"b\" }\n    s.len() }\n",
+            "pub fn str_match_arm_return(flag: Bool) -> USize { let s: Str = match flag { true => \"a\", _ => { return 1 } }\n    s.len() }\n",
+            "pub fn str_match_call_arm_mismatch(flag: Bool, value: Str) -> USize { let s = match flag { true => \"a\", _ => value.len() }\n    s.len() }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61417,7 +61454,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 33);
+        assert_eq!(owners.len(), 36);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -61438,6 +61475,16 @@ property "shared"() {}
                 owner
                     .body_type_check()
                     .expect("Str match-initializer function body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        // `match` arm bodies with annotated `let`s or diverging
+        // `return`s check like the other `Str` arms.
+        for owner in &owners[33..35] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("Str match-arm function body check succeeds"),
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
@@ -61465,6 +61512,9 @@ property "shared"() {}
             // `let s = match n { 1 => "a", _ => 1 }` — the non-`Str`
             // arm reports against `Str`, not a gate.
             (32, "expected `Str`, found an integer literal"),
+            // `let s = match flag { true => "a", _ => value.len() }` —
+            // the call arm resolves `USize` and reports against `Str`.
+            (35, "expected `Str`, found `USize`"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
