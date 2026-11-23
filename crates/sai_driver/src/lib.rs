@@ -13351,14 +13351,13 @@ fn str_let_entry(
         };
     }
     match init.kind {
-        ExprKind::Lit(literal)
-            if matches!(literal, Lit::Int { .. } | Lit::Float { .. }) =>
-        {
+        ExprKind::Lit(literal) if matches!(literal, Lit::Int { .. } | Lit::Float { .. }) => {
             // Only integer/float literals are literal variables —
             // `Str`/`Bool`/`Byte`/`Char` literal inits bind concrete.
             StrLocalEntry {
                 family,
-                literal: str_static_literal(literal).map(|literal| str_seed_new(literal, init.span)),
+                literal: str_static_literal(literal)
+                    .map(|literal| str_seed_new(literal, init.span)),
             }
         }
         ExprKind::Path(_) => {
@@ -14162,33 +14161,27 @@ fn str_expr_family(
                                     .filter(|seed| str_seed_resolved(seed).is_none())
                             });
                         match count_seed {
-                            Some(StrLiteralSeed {
-                                literal: Lit::Int { .. },
-                                origin,
-                                ..
-                            }) => {
+                            Some(
+                                seed @ StrLiteralSeed {
+                                    literal: Lit::Int { .. },
+                                    ..
+                                },
+                            ) => {
                                 // An unresolved integer literal
                                 // variable resolves to `U32` like
-                                // `resolve_literal_variable`; a seed
-                                // that cannot fit reports the range
-                                // error at its origin.
-                                if sai_ty::typeck::literal::check_primitive_literal(
-                                    sai_resolve::prelude::PrimTy::U32,
-                                    count_seed.unwrap().literal,
+                                // `resolve_literal_variable`; every
+                                // literal merged into its group
+                                // range-checks against `U32`.
+                                str_seed_resolve(
+                                    owner,
+                                    &seed,
+                                    "`U32`",
+                                    &mut diagnostics,
+                                    inputs,
+                                    snapshot,
                                     symbols,
-                                    target_cfg.pointer_width(),
-                                ) == sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange
-                                {
-                                    diagnostics.push(const_literal_diagnostic(
-                                        owner.id,
-                                        inputs,
-                                        snapshot,
-                                        origin,
-                                        sai_diagnostics::Code::LiteralOutOfRange,
-                                        "integer literal is out of range for `U32`".to_string(),
-                                        "literal out of range",
-                                    )?);
-                                }
+                                    target_cfg,
+                                )?;
                             }
                             // A non-integer literal variable resolves
                             // to its default family — same `expected
@@ -16139,7 +16132,10 @@ fn check_function_str_local_block(
                                         snapshot,
                                         rhs.span,
                                         sai_diagnostics::Code::TypeMismatch,
-                                        format!("expected {expected_family}, found {rhs_family}"),
+                                        format!(
+                                            "expected {rhs_family}, found {}",
+                                            str_lit_kind_word(seed.literal)
+                                        ),
                                         "type mismatch",
                                     )?);
                                 }
@@ -57062,6 +57058,9 @@ property "shared"() {}
             "pub fn assign_merge() -> Str {\n    var a = 1\n    var b = 2\n    a = b\n    let m: I8 = a\n    let k: I8 = b\n    \"a\"\n}\n",
             "pub fn assign_merge_mismatch() -> Str {\n    var a = 1\n    var f = 1.5\n    a = f\n    \"a\"\n}\n",
             "pub fn assign_resolved_lit_gate() -> Str {\n    var n = 1\n    n = give()\n    n = 300\n    \"a\"\n}\n",
+            "pub fn assign_bool_group() -> Str {\n    var b = true\n    var flag = false\n    b = flag\n    \"a\"\n}\n",
+            "pub fn assign_str_reassign() -> Str {\n    var s = \"a\"\n    s = \"b\"\n    \"a\"\n}\n",
+            "pub fn assign_shift_merge_range() -> Str {\n    var n = 1\n    var big = 68719476736\n    n = big\n    let s = 1 << n\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -57077,7 +57076,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 21);
+        assert_eq!(resolved.owners().len(), 24);
         for (index, owner) in resolved.owners()[1..5].iter().enumerate() {
             match owner.body_type_check().expect("var body check succeeds") {
                 FunctionBodyTypeCheck::Supported { diagnostics } => {
@@ -57124,6 +57123,11 @@ property "shared"() {}
                 sai_diagnostics::Code::TypeMismatch,
                 Some("expected `I64`, found a floating-point literal"),
             ),
+            (
+                23,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                Some("integer literal is out of range for `U32`"),
+            ),
         ] {
             match resolved.owners()[index]
                 .body_type_check()
@@ -57139,7 +57143,7 @@ property "shared"() {}
                 other => panic!("expected Supported, found {other:?} at index {index}"),
             }
         }
-        for index in [8, 12, 13, 14, 18] {
+        for index in [8, 12, 13, 14, 18, 21, 22] {
             match resolved.owners()[index]
                 .body_type_check()
                 .expect("clean var body check succeeds")
