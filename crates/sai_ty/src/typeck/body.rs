@@ -45,6 +45,10 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// unknown by the owner-aware driver. These act as error types so later
     /// local uses do not produce cascading primitive-type errors.
     pub unknown_self_fields: Option<&'a HashSet<HirId>>,
+    /// Direct `self.field` projections of `Str` family (`type` decl field
+    /// typed `Str` — outside `PrimTy`). A `let` binding initialized from
+    /// one becomes a `Str` local.
+    pub str_self_field_projections: Option<&'a HashMap<HirId, &'static str>>,
     pub local_paths: &'a HashMap<HirId, BindingId>,
     /// Direct, supported function signatures resolved for call expressions
     /// in this owner's simple block.
@@ -2824,6 +2828,33 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.record_expression_type(init.hir_id, LocalType::Str);
                 Ok(LocalType::Str)
             }
+            // `let s: Str = self.text` — a `Str` field projection.
+            ExprKind::Field { .. } => {
+                match self
+                    .input
+                    .str_self_field_projections
+                    .and_then(|fields| fields.get(&init.hir_id))
+                    .copied()
+                {
+                    Some("`Str`") => {
+                        self.record_expression_type(init.hir_id, LocalType::Str);
+                        Ok(LocalType::Str)
+                    }
+                    _ => Err(()),
+                }
+            }
+            // `let s: Str = if c { "a" } else { "b" }` — the condition
+            // checks like any `if` and each branch tail must yield `Str`.
+            ExprKind::If { cond, then, els } => {
+                self.check_if_condition(cond)?;
+                self.check_str_branch_block(then)?;
+                let Some(els) = els else {
+                    return Err(());
+                };
+                self.check_str_branch_tail(els)?;
+                self.record_expression_type(init.hir_id, LocalType::Str);
+                Ok(LocalType::Str)
+            }
             ExprKind::Lit(literal) => {
                 self.errors.push(PrimitiveBodyError {
                     node: init.hir_id,
@@ -3676,6 +3707,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .is_some_and(|fields| fields.contains_key(&operand.hir_id))
             || self
                 .input
+                .str_self_field_projections
+                .is_some_and(|fields| fields.contains_key(&operand.hir_id))
+            || self
+                .input
                 .unknown_self_fields
                 .is_some_and(|fields| fields.contains(&operand.hir_id))
     }
@@ -3770,13 +3805,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         } else {
             match expression.kind {
                 ExprKind::Call { .. } => self.check_direct_call(expression, false)?,
-                ExprKind::Field { .. } => LocalType::Concrete(
-                    self.input
+                ExprKind::Field { .. } => {
+                    if let Some(primitive) = self
+                        .input
                         .self_field_projections
                         .and_then(|fields| fields.get(&expression.hir_id))
-                        .copied()
-                        .ok_or(())?,
-                ),
+                    {
+                        LocalType::Concrete(*primitive)
+                    } else {
+                        match self
+                            .input
+                            .str_self_field_projections
+                            .and_then(|fields| fields.get(&expression.hir_id))
+                            .copied()
+                        {
+                            Some("`Str`") => LocalType::Str,
+                            _ => return Err(()),
+                        }
+                    }
+                }
                 ExprKind::Block(block) => {
                     self.check_block_expected(block, expected)?;
                     LocalType::Concrete(expected)
@@ -4578,6 +4625,133 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// carries the expected type. The deferred-operator flags let the `let`
     /// path keep its provenance tracking; an assignment ignores them because
     /// its target already has a concrete type.
+    // A `Str`-yielding branch block: only its tail matters — the
+    // bounded slice keeps statement bodies out (they stay gated).
+    fn check_str_branch_block(&mut self, block: &Block<'hir>) -> Result<(), ()> {
+        if !block.stmts.is_empty() {
+            return Err(());
+        }
+        let Some(tail) = block.tail else {
+            return Err(());
+        };
+        self.check_str_branch_tail(tail)
+    }
+
+    // `Str`-yielding tail shapes in `if`/`else` branches: a `Str`
+    // literal, a `Str` local, a `Str` field projection, or a nested
+    // block/`if` whose own tail qualifies. Other shapes report the
+    // `Str` mismatch the primary checker would, or stay gated.
+    fn check_str_branch_tail(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
+        match expression.kind {
+            ExprKind::Lit(Lit::Str(_)) => {
+                self.record_expression_type(expression.hir_id, LocalType::Str);
+                Ok(())
+            }
+            ExprKind::Lit(literal) => {
+                self.errors.push(PrimitiveBodyError {
+                    node: expression.hir_id,
+                    kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                        expected: ScalarType::Str,
+                        found: scalar_literal_kind(literal),
+                    },
+                });
+                Ok(())
+            }
+            ExprKind::Path(_) => match self.check_local_path(expression)? {
+                LocalType::Str => Ok(()),
+                LocalType::Concrete(found) => {
+                    self.errors.push(PrimitiveBodyError {
+                        node: expression.hir_id,
+                        kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                            expected: ScalarType::Str,
+                            found: ScalarType::Primitive(found),
+                        },
+                    });
+                    Ok(())
+                }
+                _ => Err(()),
+            },
+            ExprKind::Field { .. } => match self
+                .input
+                .str_self_field_projections
+                .and_then(|fields| fields.get(&expression.hir_id))
+                .copied()
+            {
+                Some("`Str`") => {
+                    self.record_expression_type(expression.hir_id, LocalType::Str);
+                    Ok(())
+                }
+                _ => Err(()),
+            },
+            ExprKind::Block(block) => self.check_str_branch_block(block),
+            ExprKind::If { cond, then, els } => {
+                self.check_if_condition(cond)?;
+                self.check_str_branch_block(then)?;
+                let Some(els) = els else {
+                    return Err(());
+                };
+                self.check_str_branch_tail(els)
+            }
+            _ => Err(()),
+        }
+    }
+
+    // Whether an unannotated initializer yields `Str`: a `Str` literal,
+    // a `Str` local, a `Str` field projection, a block/`if` whose
+    // branches all do, or a `match` over a `Str` scrutinee whose arms
+    // all yield a `Str` bound path. Mirrors the driver's
+    // `str_shaped_local_init` so admitted bodies never gate inside.
+    fn str_shaped_initializer(&mut self, init: &Expr<'hir>) -> bool {
+        match init.kind {
+            ExprKind::Lit(Lit::Str(_)) => true,
+            ExprKind::Path(_) => self
+                .input
+                .local_paths
+                .get(&init.hir_id)
+                .is_some_and(|binding| {
+                    self.input
+                        .str_bindings
+                        .is_some_and(|bindings| bindings.contains(binding))
+                }),
+            ExprKind::Field { .. } => matches!(
+                self.input
+                    .str_self_field_projections
+                    .and_then(|fields| fields.get(&init.hir_id))
+                    .copied(),
+                Some("`Str`")
+            ),
+            ExprKind::Block(block) => {
+                block.stmts.is_empty()
+                    && block
+                        .tail
+                        .is_some_and(|tail| self.str_shaped_initializer(tail))
+            }
+            ExprKind::If { then, els, .. } => {
+                then.stmts.is_empty()
+                    && then
+                        .tail
+                        .is_some_and(|tail| self.str_shaped_initializer(tail))
+                    && els.is_some_and(|els| self.str_shaped_initializer(els))
+            }
+            ExprKind::Match { arms, .. } => {
+                !arms.is_empty()
+                    && arms.iter().all(|arm| match arm.body.kind {
+                        ExprKind::Path(_) => self
+                            .input
+                            .local_paths
+                            .get(&arm.body.hir_id)
+                            .is_some_and(|binding| {
+                                self.input
+                                    .str_bindings
+                                    .is_some_and(|bindings| bindings.contains(binding))
+                            }),
+                        _ => false,
+                    })
+            }
+            _ => false,
+        }
+    }
+
     fn check_initializer_value(
         &mut self,
         init: &Expr<'hir>,
@@ -4706,6 +4880,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         self.check_if_tail(cond, then, els, expected)?;
                         LocalType::Concrete(expected)
                     }
+                    // `let s = if c { "a" } else { "b" }` binds a `Str`
+                    // local; other shapes join the literal group.
+                    None if self.str_shaped_initializer(init) => {
+                        self.check_str_annotated_initializer(init)?
+                    }
                     None => self.check_literal_join_if(cond, then, els)?,
                 },
                 ExprKind::Match {
@@ -4763,15 +4942,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                 }
                 ExprKind::Field { .. } => {
-                    let Some(field_type) = self
+                    let source_type = if let Some(field_type) = self
                         .input
                         .self_field_projections
                         .and_then(|fields| fields.get(&init.hir_id))
                         .copied()
-                    else {
-                        return Err(());
+                    {
+                        LocalType::Concrete(field_type)
+                    } else {
+                        match self
+                            .input
+                            .str_self_field_projections
+                            .and_then(|fields| fields.get(&init.hir_id))
+                            .copied()
+                        {
+                            Some("`Str`") => LocalType::Str,
+                            _ => return Err(()),
+                        }
                     };
-                    let source_type = LocalType::Concrete(field_type);
                     if let Some(expected) = annotation {
                         self.check_annotated_path(source_type, expected, init.hir_id)?;
                         LocalType::Concrete(expected)

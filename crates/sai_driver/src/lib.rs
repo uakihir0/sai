@@ -7569,6 +7569,7 @@ fn check_function_body_type(
             symbols,
             None,
             None,
+            None,
             inputs,
             snapshot,
             target_cfg,
@@ -8391,7 +8392,7 @@ fn check_inherent_method_body_type<'a>(
     // projections map the `-> Str` walk uses — publish it for the walk.
     let has_str_projections = !str_field_projections.is_empty();
     if has_str_projections {
-        *inputs.str_self_field_projections.borrow_mut() = Some(str_field_projections);
+        *inputs.str_self_field_projections.borrow_mut() = Some(str_field_projections.clone());
     }
     let prim_walk = check_function_body_primitive_local_block(
         method_owner,
@@ -8403,6 +8404,7 @@ fn check_inherent_method_body_type<'a>(
         semantic_types,
         symbols,
         Some(&self_field_projections),
+        Some(&str_field_projections),
         Some(&unknown_self_fields),
         inputs,
         snapshot,
@@ -9238,6 +9240,7 @@ fn check_function_body_primitive_local_block(
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    str_self_field_projections: Option<&HashMap<HirId, &'static str>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -9674,6 +9677,7 @@ fn check_function_body_primitive_local_block(
             str_annotations: Some(&str_admissions.annotations),
             primitive_types: &primitive_types,
             self_field_projections,
+            str_self_field_projections,
             unknown_self_fields,
             local_paths: &local_paths,
             call_signatures: direct_call_signatures,
@@ -10712,7 +10716,8 @@ fn primitive_value_expression_shape_is_supported(
         }
         ExprKind::Field { .. }
             if self_field_projections.is_some_and(|fields| fields.contains_key(&init.hir_id))
-                || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id)) => {}
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id))
+                || str_self_field_projected_family(init, inputs) == Some("`Str`") => {}
         ExprKind::Call {
             args, base: None, ..
         } if direct_call_signatures
@@ -11259,27 +11264,32 @@ fn primitive_let_statement_shape_is_supported(
         }
     }
 
-    if !primitive_value_expression_shape_is_supported(
-        init,
-        preceding_bindings,
-        locals,
-        inputs,
-        symbols,
-        type_paths,
-        self_field_projections,
-        unknown_self_fields,
-        direct_call_signatures,
-        primitive_types,
-    ) {
+    // `let s: Str = ..` and unannotated `Str`-yielding initializers are
+    // checked by the kernel's `Str` paths — the primitive shape mirror
+    // would reject them before the kernel sees them.
+    let str_init = str_annotated
+        || (ty.is_none() && str_shaped_local_init(init, locals, inputs, &str_admissions.locals));
+    if !str_init
+        && !primitive_value_expression_shape_is_supported(
+            init,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        )
+    {
         return false;
     }
     preceding_bindings.insert(binding);
     // Track the `Str` locals: an explicit `Str` annotation, or an
     // unannotated binding of a `Str` literal, another `Str` local, or a
     // nested block whose tail yields `Str` the same way.
-    if str_annotated
-        || (ty.is_none() && str_shaped_local_init(init, locals, inputs, &str_admissions.locals))
-    {
+    if str_init {
         str_admissions.locals.insert(binding);
     }
     true
@@ -11320,6 +11330,16 @@ fn str_shaped_local_init(
                                 .is_some_and(|source| str_bindings.contains(&source))
                         }
                         _ => false,
+                    });
+            }
+            // `let s = if c { "a" } else { "b" }` yields `Str` when both
+            // branches do (an `else if` chain recurses through `els`).
+            ExprKind::If { then, els, .. } => {
+                break then
+                    .tail
+                    .is_some_and(|tail| str_shaped_local_init(tail, locals, inputs, str_bindings))
+                    && els.is_some_and(|els| {
+                        str_shaped_local_init(els, locals, inputs, str_bindings)
                     });
             }
             _ => break false,
@@ -61258,6 +61278,9 @@ property "shared"() {}
             // not the literal's type.
             (22, "expected `Str`, found a byte string literal"),
             (23, "expected `I64`, found a string literal"),
+            // `let s: Str = b"a"` — the `Str` annotation's literal
+            // mismatch names the literal kind, not a gate.
+            (28, "expected `Str`, found a byte string literal"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
@@ -61286,10 +61309,10 @@ property "shared"() {}
         );
         assert_eq!(diagnostics[1].code, sai_diagnostics::Code::TypeMismatch);
         assert_eq!(diagnostics[1].message, "expected `I64`, found `Str`");
-        // Gated owners: `Str` arithmetic operands, a `Str` match scrutinee,
-        // a literal-variable `Str` assignment, and a `Slice<Byte>`
-        // initializer stay outside the slice.
-        for owner in &owners[25..] {
+        // Gated owners: `Str` arithmetic operands, a `Str` match
+        // scrutinee, and a literal-variable `Str` assignment stay
+        // outside the slice.
+        for owner in &owners[25..28] {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -61315,6 +61338,8 @@ property "shared"() {}
             "pub fn str_len_trivia(value: Str) -> USize { value.len /* note */ () }\n",
             "pub fn str_not_call(value: Str) -> Bool { not value.is_empty() }\n",
             "pub fn str_body_if_call(value: Str) -> Str { if value.is_empty() { \"a\" } else { \"b\" } }\n",
+            "pub fn str_if_init_len(flag: Bool) -> USize { let s = if flag { \"a\" } else { \"b\" }\n    s.len() }\n",
+            "pub fn str_if_init_annotated(flag: Bool) -> USize { let s: Str = if flag { \"a\" } else if flag { \"b\" } else { \"c\" }\n    s.len() }\n",
             "pub fn str_len_mismatch(value: Str) -> I32 { value.len() }\n",
             "pub fn str_len_bind(value: Str) -> Bool { let n: I32 = value.len()\n    true }\n",
             "pub fn str_len_condition(value: Str) -> Bool { if value.len() { true } else { false } }\n",
@@ -61342,13 +61367,14 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 24);
+        assert_eq!(owners.len(), 26);
         // Clean supported owners: `s.len()` -> `USize` and
         // `s.is_empty()` -> `Bool` on `Str` parameters, `Str` locals and
         // aliases, `Str` literals, and `self.<Str field>` receivers — in
-        // operand, `let`-initializer, `if`/`while`/`assert`/`not`
-        // condition, and `-> Str` body positions.
-        for owner in &owners[..13] {
+        // operand, `let`-initializer (literal, `if`-yielding, and
+        // `Str`-annotated `if`), `if`/`while`/`assert`/`not` condition,
+        // and `-> Str` body positions.
+        for owner in &owners[..15] {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -61359,10 +61385,10 @@ property "shared"() {}
         // The injected `USize`/`Bool` outputs produce the ordinary
         // primitive type mismatches in binding and condition positions.
         for (index, expected_message) in [
-            (13, "expected `I32`, found `USize`"),
-            (14, "expected `I32`, found `USize`"),
-            (15, "expected `Bool`, found `USize`"),
-            (16, "expected `USize`, found `Bool`"),
+            (15, "expected `I32`, found `USize`"),
+            (16, "expected `I32`, found `USize`"),
+            (17, "expected `Bool`, found `USize`"),
+            (18, "expected `USize`, found `Bool`"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
@@ -61377,7 +61403,7 @@ property "shared"() {}
         // Gated owners: unknown methods, call arguments, generic method
         // arguments, a parenthesized callee `(s.len)()`, a bare field
         // read, a non-`Str` receiver, and `s.chars()` stay outside.
-        for owner in &owners[17..] {
+        for owner in &owners[19..] {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -63502,6 +63528,7 @@ property "shared"() {}
                 primitive_types: &std::collections::HashMap::new(),
                 self_field_projections: None,
                 unknown_self_fields: None,
+                str_self_field_projections: None,
                 local_paths: &diagnostic_order_local_paths,
                 call_signatures: None,
                 mutable_params: None,
