@@ -14804,6 +14804,7 @@ fn str_match_arm_pattern(
     pat: &HirPat<'_>,
     is_unguarded: bool,
     scrutinee_prim: Option<sai_resolve::prelude::PrimTy>,
+    scrutinee_seed: Option<&std::rc::Rc<StrLiteralSeed>>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -14828,6 +14829,23 @@ fn str_match_arm_pattern(
                 }
                 if str_scalar_family_name(literal).is_none() {
                     return Ok(None);
+                }
+                // A literal-variable scrutinee's patterns join its group
+                // as deferred sites — they check against the resolved
+                // primitive at pin/default time instead of the
+                // provisional family now (`let n = 5; if let 300 = n {};
+                // let u: U8 = n` reports `300` out of range for `U8`).
+                if let Some(root) = scrutinee_seed
+                    && let Some(literal) = str_static_literal(literal)
+                    && matches!(literal, Lit::Int { .. } | Lit::Float { .. })
+                    && str_seed_resolved(&root).is_none()
+                    && str_seed_same_kind(literal, root.literal)
+                {
+                    let mut sites = root.sites.borrow_mut();
+                    if !sites.iter().any(|(l, s)| *l == literal && *s == pat.span) {
+                        sites.push((literal, pat.span));
+                    }
+                    return Ok(Some(()));
                 }
                 match sai_ty::typeck::literal::check_primitive_literal(
                     primitive,
@@ -14953,6 +14971,21 @@ fn str_match_arm_pattern(
     }
 }
 
+// A literal-variable scrutinee hands its shared seed to a binding arm
+// — `if let x = n` binds `x` into `n`'s group so a later pin
+// (`let small: U8 = x`) resolves the group like `let m = n` does.
+fn str_scrutinee_arm_entry(
+    scrutinee: &HirExpr<'_>,
+    scrutinee_family: &'static str,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+) -> StrLocalEntry {
+    str_binding_entry(scrutinee, locals, str_bindings).unwrap_or(StrLocalEntry {
+        family: scrutinee_family,
+        literal: None,
+    })
+}
+
 // A `match` joins its arm-body families: a `Str` scrutinee admits `Str`
 // literal and all-`Str` or-patterns like `check_function_str_match`; a
 // scalar-family path scrutinee admits literal / or / literal-range
@@ -15016,13 +15049,16 @@ fn str_match_family(
     }
     // A scalar scrutinee resolves to its primitive for the checker's
     // literal-pattern rules; `Str` stays on the literal-join admission.
-    // `if let`/`while let` desugarings are only admitted for a `Str`
-    // scrutinee — a scalar one keeps the checker's `Normal`-only gate
-    // (non-`Normal` sources `Err` there).
+    // `if let`/`while let` desugarings follow the scalar path too —
+    // their patterns check against the scrutinee primitive the same
+    // way a `Normal` match's do (`for`/`try` sources stay gated).
     let scrutinee_prim = if scrutinee_family == "`Str`" {
         None
     } else {
-        if !matches!(source, MatchSource::Normal) {
+        if !matches!(
+            source,
+            MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+        ) {
             return Ok(None);
         }
         match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
@@ -15030,6 +15066,11 @@ fn str_match_family(
             None => return Ok(None),
         }
     };
+    // A literal-variable scrutinee's group: pattern literals join it as
+    // deferred sites and a binding arm shares the seed.
+    let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings)
+        .and_then(|entry| entry.literal)
+        .map(|seed| str_seed_root(&seed));
     // A scalar annotation seeds the arm join like the checker's β — a
     // literal arm body checks against the annotation through the
     // expression walk's `expected`, and a differing arm family reports
@@ -15062,10 +15103,7 @@ fn str_match_family(
             {
                 arm_bindings.insert(
                     binding,
-                    StrLocalEntry {
-                        family: scrutinee_family,
-                        literal: None,
-                    },
+                    str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
                 );
             }
         } else {
@@ -15074,6 +15112,7 @@ fn str_match_family(
                 &arm.pat,
                 arm.guard.is_none(),
                 scrutinee_prim,
+                scrutinee_seed.as_ref(),
                 symbols,
                 inputs,
                 snapshot,
@@ -15089,10 +15128,7 @@ fn str_match_family(
             if let Some(binding) = binding {
                 arm_bindings.insert(
                     binding,
-                    StrLocalEntry {
-                        family: scrutinee_family,
-                        literal: None,
-                    },
+                    str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
                 );
             }
             // Guards evaluate like `check_if_condition` — the pattern
@@ -15349,7 +15385,7 @@ fn str_loop_family(
     // re-emitting them here would double-report. A value that still
     // cannot classify gates — it could produce a family the walk missed.
     let mut resolved = Vec::with_capacity(contributions.len());
-    for (contribution, value, span) in contributions {
+    for (contribution, value, span, scope) in contributions {
         if let Some(family) = contribution {
             resolved.push((Some(family), value, span));
             continue;
@@ -15360,7 +15396,7 @@ fn str_loop_family(
                 return_ty,
                 value,
                 locals,
-                str_bindings,
+                &scope,
                 expected,
                 type_paths,
                 symbols,
@@ -18232,7 +18268,7 @@ fn str_stmt_expr_unit(
                 // already emitted their diagnostics; still-unclassed
                 // values gate.
                 let mut resolved = Vec::with_capacity(contributions.len());
-                for (contribution, value, span) in contributions {
+                for (contribution, value, span, scope) in contributions {
                     if let Some(family) = contribution {
                         resolved.push((Some(family), value, span));
                         continue;
@@ -18243,7 +18279,7 @@ fn str_stmt_expr_unit(
                             return_ty,
                             value,
                             locals,
-                            str_bindings,
+                            &scope,
                             None,
                             type_paths,
                             symbols,
@@ -18457,13 +18493,11 @@ fn str_stmt_expr_unit(
         // path, patterns go through `str_match_arm_pattern`, arm bodies
         // must be blocks checked as statement blocks at this frame, and
         // binding arms seed the scrutinee family for the arm's guard
-        // and body. A `Str` scrutinee is outside the checker's
-        // `LocalType`, so the `Str` walk also admits the `if let`/
-        // `while let` desugarings here — their synthesized `_` arms
-        // carry non-block bodies (`()` for a missing else, `break` for
-        // `while let`, an else-if `if`/`match` chain for `else if
-        // let`). A scalar scrutinee keeps the checker's `Normal`-only
-        // gate (`if let`/`while let`/`for` Err there).
+        // and body. The `Str` walk admits the `if let`/`while let`
+        // desugarings for scalar scrutinees too — their synthesized
+        // `_` arms carry non-block bodies (`()` for a missing else,
+        // `break` for `while let`, an else-if `if`/`match` chain for
+        // `else if let`). `for`/`try` sources stay gated.
         ExprKind::Match {
             scrutinee,
             arms,
@@ -18481,7 +18515,10 @@ fn str_stmt_expr_unit(
             let scrutinee_prim = if scrutinee_family == "`Str`" {
                 None
             } else {
-                if !matches!(source, MatchSource::Normal) {
+                if !matches!(
+                    source,
+                    MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+                ) {
                     return Ok(None);
                 }
                 match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
@@ -18489,6 +18526,12 @@ fn str_stmt_expr_unit(
                     None => return Ok(None),
                 }
             };
+            // A literal-variable scrutinee's group: pattern literals
+            // join it as deferred sites and a binding arm shares the
+            // seed.
+            let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings)
+                .and_then(|entry| entry.literal)
+                .map(|seed| str_seed_root(&seed));
             let mut diagnostics = Vec::new();
             let mut catch_all = false;
             let mut bool_cover = (false, false);
@@ -18520,10 +18563,12 @@ fn str_stmt_expr_unit(
                     {
                         arm_bindings.insert(
                             binding,
-                            StrLocalEntry {
-                                family: scrutinee_family,
-                                literal: None,
-                            },
+                            str_scrutinee_arm_entry(
+                                scrutinee,
+                                scrutinee_family,
+                                locals,
+                                str_bindings,
+                            ),
                         );
                     }
                 } else {
@@ -18532,6 +18577,7 @@ fn str_stmt_expr_unit(
                         &arm.pat,
                         !guarded,
                         scrutinee_prim,
+                        scrutinee_seed.as_ref(),
                         symbols,
                         inputs,
                         snapshot,
@@ -18545,10 +18591,12 @@ fn str_stmt_expr_unit(
                     if let Some(binding) = binding {
                         arm_bindings.insert(
                             binding,
-                            StrLocalEntry {
-                                family: scrutinee_family,
-                                literal: None,
-                            },
+                            str_scrutinee_arm_entry(
+                                scrutinee,
+                                scrutinee_family,
+                                locals,
+                                str_bindings,
+                            ),
                         );
                     }
                     catch_all =
@@ -18728,7 +18776,15 @@ fn str_stmt_loop_break_families<'h>(
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
-    out: &mut Vec<(Option<&'static str>, Option<&'h HirExpr<'h>>, sai_hir::Span)>,
+    // The last element snapshots the bindings in scope at the `break` —
+    // arm-local pattern bindings exist only there, and a contribution
+    // re-evaluated later needs them (`match n { x => break x + 1 }`).
+    out: &mut Vec<(
+        Option<&'static str>,
+        Option<&'h HirExpr<'h>>,
+        sai_hir::Span,
+        StrLocalBindings,
+    )>,
     pure: bool,
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
@@ -18914,6 +18970,57 @@ fn str_pure_condition(
 // The family a `let` initializer binds without running the diagnostic
 // walk — literals, local paths, `if`/`block`/`loop` joins. An unclassed
 // shape leaves the binding unrecorded (the body walk already gated it).
+
+// A throwaway copy of the literal-variable seeds for pure scans — an
+// inference walk may resolve a seed while its diagnostics are
+// discarded (a shift count pins `U32`); resolving a shadow keeps the
+// real seed unresolved so the diagnostic walk still range-checks its
+// members and sites (`let n = 5000000000; if let x = n { 1 << x }`).
+fn str_shadow_str_bindings(str_bindings: &StrLocalBindings) -> StrLocalBindings {
+    let mut roots: HashMap<
+        *const std::cell::Cell<Option<&'static str>>,
+        std::rc::Rc<StrLiteralSeed>,
+    > = HashMap::new();
+    str_bindings
+        .iter()
+        .map(|(binding, entry)| {
+            let literal = entry.literal.as_ref().map(|seed| {
+                let root = str_seed_root(seed);
+                roots
+                    .entry(std::rc::Rc::as_ptr(&root.resolved))
+                    .or_insert_with(|| {
+                        std::rc::Rc::new(StrLiteralSeed {
+                            literal: root.literal,
+                            origin: root.origin,
+                            resolved: std::rc::Rc::new(std::cell::Cell::new(root.resolved.get())),
+                            sites: std::rc::Rc::new(std::cell::RefCell::new(
+                                root.sites.borrow().clone(),
+                            )),
+                            members: std::rc::Rc::new(std::cell::RefCell::new(
+                                root.members.borrow().clone(),
+                            )),
+                            merged_into: std::rc::Rc::new(std::cell::RefCell::new(None)),
+                        })
+                    });
+                // A value clone shares the shadow root's cells — the
+                // entry links into the shadowed group like the real
+                // seed links into the real root.
+                (**roots
+                    .get(&std::rc::Rc::as_ptr(&root.resolved))
+                    .expect("the shadow root was just inserted"))
+                .clone()
+            });
+            (
+                *binding,
+                StrLocalEntry {
+                    family: entry.family,
+                    literal,
+                },
+            )
+        })
+        .collect()
+}
+
 fn str_pure_init_family(
     init: &HirExpr<'_>,
     locals: &LocalResolution,
@@ -18924,6 +19031,7 @@ fn str_pure_init_family(
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Option<&'static str> {
+    let str_bindings = &str_shadow_str_bindings(str_bindings);
     match init.kind {
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal),
@@ -19223,7 +19331,7 @@ fn str_pure_init_family(
             // diagnostics — the statement walk emits those itself.
             let mut prims: Vec<_> = contributions
                 .iter()
-                .filter(|(_, value, _)| !matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_))))
+                .filter(|(_, value, _, _)| !matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_))))
                 .filter_map(|contribution| contribution.0)
                 .filter(|family| {
                     *family != "`!`"
@@ -19234,7 +19342,7 @@ fn str_pure_init_family(
             prims.sort_unstable();
             prims.dedup();
             if let [prim] = prims.as_slice() {
-                for (family, value, _) in contributions.iter_mut() {
+                for (family, value, _, _) in contributions.iter_mut() {
                     if matches!(*family, Some("`I64`") | Some("`F64`"))
                         && matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_)))
                     {
@@ -19311,7 +19419,10 @@ fn str_pure_match_family(
     let scrutinee_prim = if scrutinee_family == "`Str`" {
         None
     } else {
-        if !matches!(source, MatchSource::Normal) {
+        if !matches!(
+            source,
+            MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+        ) {
             return None;
         }
         match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
@@ -19334,10 +19445,7 @@ fn str_pure_match_family(
             {
                 arm_bindings.insert(
                     binding,
-                    StrLocalEntry {
-                        family: scrutinee_family,
-                        literal: None,
-                    },
+                    str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
                 );
             }
         } else {
@@ -19382,10 +19490,7 @@ fn str_pure_match_family(
                     catch_all = arm.guard.is_none();
                     arm_bindings.insert(
                         binding,
-                        StrLocalEntry {
-                            family: scrutinee_family,
-                            literal: None,
-                        },
+                        str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
                     );
                 }
                 _ => return None,
@@ -19529,7 +19634,15 @@ fn str_stmt_break_families_expr<'h>(
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
-    out: &mut Vec<(Option<&'static str>, Option<&'h HirExpr<'h>>, sai_hir::Span)>,
+    // The last element snapshots the bindings in scope at the `break` —
+    // arm-local pattern bindings exist only there, and a contribution
+    // re-evaluated later needs them (`match n { x => break x + 1 }`).
+    out: &mut Vec<(
+        Option<&'static str>,
+        Option<&'h HirExpr<'h>>,
+        sai_hir::Span,
+        StrLocalBindings,
+    )>,
     pure: bool,
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
@@ -19549,6 +19662,7 @@ fn str_stmt_break_families_expr<'h>(
                 ),
                 value,
                 value.map(|v| v.span).unwrap_or(expr.span),
+                str_bindings.clone(),
             ));
         }
         ExprKind::If { then, els, .. } => {
@@ -19639,10 +19753,12 @@ fn str_stmt_break_families_expr<'h>(
                 {
                     arm_bindings.insert(
                         binding,
-                        StrLocalEntry {
-                            family: family,
-                            literal: None,
-                        },
+                        str_binding_entry(scrutinee, locals, str_bindings).unwrap_or(
+                            StrLocalEntry {
+                                family,
+                                literal: None,
+                            },
+                        ),
                     );
                 }
                 str_stmt_break_families_expr(
@@ -20300,6 +20416,179 @@ fn str_loop_level_expr(
             };
             Ok(Some((clean, true, diagnostics)))
         }
+        // `if let`/`while let`/`match` at loop level: arm bodies walk
+        // like `if` branch blocks so their `break` values feed the
+        // loop's β (`let m = loop { if let x = n { break x + 1 } }`).
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            source,
+        } => {
+            if !matches!(
+                source,
+                MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+            ) {
+                return Ok(None);
+            }
+            let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
+                Some("`Str`")
+            } else {
+                str_binding_family(scrutinee, locals, str_bindings)
+            };
+            let Some(scrutinee_family) = scrutinee_family else {
+                return Ok(None);
+            };
+            let scrutinee_prim = if scrutinee_family == "`Str`" {
+                None
+            } else {
+                match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
+                    Some(primitive) => Some(primitive),
+                    None => return Ok(None),
+                }
+            };
+            // A literal-variable scrutinee's group: pattern literals
+            // join it as deferred sites and a binding arm shares the
+            // seed.
+            let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings)
+                .and_then(|entry| entry.literal)
+                .map(|seed| str_seed_root(&seed));
+            let mut diagnostics = Vec::new();
+            let mut catch_all = false;
+            let mut bool_cover = (false, false);
+            let mut clean = false;
+            let mut broken = false;
+            for arm in arms {
+                let mut arm_bindings = str_bindings.clone();
+                let guarded = arm.guard.is_some();
+                if catch_all && !arm.synthesized {
+                    diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        arm.pat.span,
+                        sai_diagnostics::Code::UnreachablePattern,
+                        "arm can never match".to_owned(),
+                        "unreachable pattern",
+                    )?);
+                } else {
+                    let Some(binding) = str_match_arm_pattern(
+                        owner,
+                        &arm.pat,
+                        !guarded,
+                        scrutinee_prim,
+                        scrutinee_seed.as_ref(),
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                        &mut diagnostics,
+                        &mut bool_cover,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    if let Some(binding) = binding {
+                        arm_bindings.insert(
+                            binding,
+                            str_scrutinee_arm_entry(
+                                scrutinee,
+                                scrutinee_family,
+                                locals,
+                                str_bindings,
+                            ),
+                        );
+                    }
+                    catch_all =
+                        !guarded && matches!(arm.pat.kind, PatKind::Wild | PatKind::Binding { .. });
+                    if let Some(guard) = arm.guard {
+                        let Some(mut guard_diagnostics) = str_condition(
+                            owner,
+                            guard,
+                            locals,
+                            &arm_bindings,
+                            inputs,
+                            snapshot,
+                            symbols,
+                            target_cfg,
+                            return_ty,
+                            type_paths,
+                            call_signatures,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        diagnostics.append(&mut guard_diagnostics);
+                    }
+                }
+                let (arm_clean, arm_broken, mut arm_diagnostics) = match arm.body.kind {
+                    ExprKind::Block(block) => {
+                        let Some(t) = str_loop_level_block(
+                            owner,
+                            return_ty,
+                            block,
+                            &mut arm_bindings,
+                            locals,
+                            type_paths,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                            call_signatures,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        t
+                    }
+                    // A synthesized `_` arm's `()` body continues the
+                    // loop; the else-if-chain and while-let `break`
+                    // shapes recurse at loop level.
+                    ExprKind::Tuple(elements) if arm.synthesized && elements.is_empty() => {
+                        (false, false, Vec::new())
+                    }
+                    ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::Break { .. }
+                        if arm.synthesized =>
+                    {
+                        let Some(t) = str_loop_level_expr(
+                            owner,
+                            return_ty,
+                            arm.body,
+                            &mut arm_bindings,
+                            locals,
+                            type_paths,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                            call_signatures,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        t
+                    }
+                    _ => return Ok(None),
+                };
+                clean = clean || arm_clean;
+                broken = broken || arm_broken;
+                diagnostics.append(&mut arm_diagnostics);
+            }
+            if !catch_all
+                && !(scrutinee_prim == Some(sai_resolve::prelude::PrimTy::Bool)
+                    && bool_cover == (true, true))
+            {
+                diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    scrutinee.span,
+                    sai_diagnostics::Code::NonExhaustiveMatch,
+                    "match does not cover every value".to_owned(),
+                    "non-exhaustive match",
+                )?);
+            }
+            Ok(Some((clean, broken, diagnostics)))
+        }
         ExprKind::Continue { label: None } => Ok(Some((false, false, Vec::new()))),
         _ => Ok(None),
     }
@@ -20430,10 +20719,11 @@ fn str_clean_expr(
             arms,
             source,
             ..
-        } => (matches!(source, MatchSource::Normal)
-            || (matches!(source, MatchSource::IfLet | MatchSource::WhileLet)
-                && str_binding_family(scrutinee, locals, str_bindings) == Some("`Str`")))
-            && arms.iter().any(|arm| {
+        } => {
+            matches!(
+                source,
+                MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+            ) && arms.iter().any(|arm| {
                 let mut bindings = str_bindings.clone();
                 if let PatKind::Binding {
                     mode:
@@ -20445,14 +20735,17 @@ fn str_clean_expr(
                 {
                     bindings.insert(
                         binding,
-                        StrLocalEntry {
-                            family: "`Str`",
-                            literal: None,
-                        },
+                        str_binding_entry(scrutinee, locals, str_bindings).unwrap_or(
+                            StrLocalEntry {
+                                family: "`Str`",
+                                literal: None,
+                            },
+                        ),
                     );
                 }
                 str_clean_expr(arm.body, locals, &bindings, loop_level)
-            }),
+            })
+        }
         ExprKind::Break {
             label: None,
             value: Some(value),
@@ -20543,6 +20836,36 @@ fn str_break_value(
             str_break_ctx_clean(value, locals, str_bindings),
             value_diagnostics,
         )));
+    }
+    // `break <scalar operand tree>` (`break x + 1`, `break f() + 1`)
+    // contributes its family to the loop's β — the same recoverable
+    // dilution a bound scalar produces, rather than gating the walk.
+    if let Some((family, mut value_diagnostics)) = str_expr_family(
+        owner,
+        return_ty,
+        value,
+        locals,
+        str_bindings,
+        None,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+        call_signatures,
+    )? {
+        if family != "`Str`" && family != "`!`" && family != "`()`" {
+            value_diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `Str`, found {family}"),
+                "type mismatch",
+            )?);
+        }
+        return Ok(Some((family == "`Str`", value_diagnostics)));
     }
     Ok(None)
 }
@@ -20643,12 +20966,16 @@ fn check_function_str_match(
     let Some(scrutinee_family) = scrutinee_family else {
         return Ok(None);
     };
-    // `if let`/`while let` desugarings are only admitted for a `Str`
-    // scrutinee — a scalar one keeps the checker's `Normal`-only gate.
+    // `if let`/`while let` desugarings follow the scalar path too —
+    // their patterns check against the scrutinee primitive the same
+    // way a `Normal` match's do (`for`/`try` sources stay gated).
     let scrutinee_prim = if scrutinee_family == "`Str`" {
         None
     } else {
-        if !matches!(source, MatchSource::Normal) {
+        if !matches!(
+            source,
+            MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+        ) {
             return Ok(None);
         }
         match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
@@ -20656,6 +20983,11 @@ fn check_function_str_match(
             None => return Ok(None),
         }
     };
+    // A literal-variable scrutinee's group: pattern literals join it as
+    // deferred sites and a binding arm shares the seed.
+    let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings)
+        .and_then(|entry| entry.literal)
+        .map(|seed| str_seed_root(&seed));
     let mut catch_all = false;
     let mut bool_cover = (false, false);
     for arm in arms {
@@ -20673,10 +21005,7 @@ fn check_function_str_match(
         {
             arm_bindings.insert(
                 binding,
-                StrLocalEntry {
-                    family: scrutinee_family,
-                    literal: None,
-                },
+                str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
             );
         }
         if let Some(guard) = arm.guard {
@@ -20718,10 +21047,7 @@ fn check_function_str_match(
             {
                 arm_bindings.insert(
                     binding,
-                    StrLocalEntry {
-                        family: scrutinee_family,
-                        literal: None,
-                    },
+                    str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
                 );
             }
         } else {
@@ -20730,6 +21056,7 @@ fn check_function_str_match(
                 &arm.pat,
                 !guarded,
                 scrutinee_prim,
+                scrutinee_seed.as_ref(),
                 symbols,
                 inputs,
                 snapshot,
@@ -20744,10 +21071,7 @@ fn check_function_str_match(
             if let Some(binding) = binding {
                 arm_bindings.insert(
                     binding,
-                    StrLocalEntry {
-                        family: scrutinee_family,
-                        literal: None,
-                    },
+                    str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
                 );
             }
         }
@@ -59084,6 +59408,8 @@ property "shared"() {}
             "pub fn str_init_match_block_literal_oob(s: Str) -> Str {\n    let m = match s {\n        \"a\" => {\n            18446744073709551615\n        }\n        _ => {\n            0\n        }\n    }\n    s\n}\npub fn str_init_if_let_litvar_u64(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        18446744073709551615\n    }\n    let u: U64 = big\n    s\n}\n",
             "pub fn str_init_if_let_litvar_float_tm(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        1.5\n    }\n    s\n}\npub fn str_init_if_let_litvar_group(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        2\n    }\n    let u: U64 = m\n    s\n}\n",
             "pub fn str_init_else_if_let_litvar_oob(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else if let \"b\" = s {\n        300\n    } else {\n        2\n    }\n    let u: U8 = m\n    s\n}\n",
+            "pub fn str_if_let_scalar_stmt(s: Str, n: I64) -> Str {\n    if let 1 = n {\n    }\n    s\n}\npub fn str_while_let_scalar(s: Str, n: I64) -> Str {\n    while let 1 = n {\n    }\n    s\n}\npub fn str_if_let_scalar_init(s: Str, n: I64) -> Str {\n    let big = 1\n    let m = if let 1 = n {\n        big\n    } else {\n        2\n    }\n    let u: U64 = m\n    s\n}\npub fn str_if_let_scalar_binding(s: Str, n: I64) -> Str {\n    if let x = n {\n    }\n    s\n}\npub fn str_if_let_scalar_oob(s: Str) -> Str {\n    let n: U8 = 1\n    if let 300 = n {\n    }\n    s\n}\npub fn str_tail_if_let_scalar_no_else_tm(s: Str, n: I64) -> Str {\n    if let 1 = n {\n        s\n    }\n}\n",
+            "pub fn str_if_let_litvar_pat_oob(s: Str) -> Str {\n    let n = 5\n    if let 300 = n {\n    }\n    let u: U8 = n\n    s\n}\npub fn str_if_let_litvar_binding_pin(s: Str) -> Str {\n    let n = 5\n    if let x = n {\n        let small: U8 = x\n    }\n    s\n}\npub fn str_loop_if_let_litvar_break(s: Str) -> Str {\n    let n = 5\n    let m = loop {\n        if let x = n {\n            break x + 1\n        }\n    }\n    s\n}\npub fn str_if_let_pinned_pat_oob(s: Str) -> Str {\n    let n: U8 = 5\n    if let 300 = n {\n    }\n    s\n}\npub fn str_if_let_float_int_pat(s: Str) -> Str {\n    let n = 1.5\n    if let 1 = n {\n    }\n    s\n}\npub fn str_if_let_shift_count_oob(s: Str) -> Str {\n    let n = 5000000000\n    let m = if let x = n {\n        1 << x\n    } else {\n        0\n    }\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -59099,7 +59425,8 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 249);
+        assert_eq!(resolved.owners().len(), 261);
+
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -59184,6 +59511,9 @@ property "shared"() {}
             .chain(&resolved.owners()[242..243])
             .chain(&resolved.owners()[245..246])
             .chain(&resolved.owners()[247..248])
+            .chain(&resolved.owners()[234..235])
+            .chain(&resolved.owners()[249..253])
+            .chain(&resolved.owners()[256..258])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -59278,6 +59608,12 @@ property "shared"() {}
             (246, sai_diagnostics::Code::TypeMismatch),
             (248, sai_diagnostics::Code::LiteralOutOfRange),
             (243, sai_diagnostics::Code::TypeMismatch),
+            (253, sai_diagnostics::Code::LiteralOutOfRange),
+            (255, sai_diagnostics::Code::LiteralOutOfRange),
+            (258, sai_diagnostics::Code::LiteralOutOfRange),
+            (259, sai_diagnostics::Code::TypeMismatch),
+            (260, sai_diagnostics::Code::LiteralOutOfRange),
+            (254, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -59351,7 +59687,7 @@ property "shared"() {}
         // A `Str` parameter seeds the group, so copies and a param tail are
         // supported; non-`Str` statements and generic-arg paths stay gated
         // (`var` bindings bind like `let` since IR-1114).
-        for index in [18, 22, 23, 29, 34, 39, 168, 211, 221, 234] {
+        for index in [18, 22, 23, 29, 34, 39, 168, 211, 221] {
             let owner = &resolved.owners()[index];
             assert!(
                 matches!(
