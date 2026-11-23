@@ -9228,6 +9228,34 @@ fn check_function_body_primitive_local_block(
     let Some(tail) = block.tail else {
         return Ok(None);
     };
+    // `s.len()`/`s.is_empty()` calls on `Str` receivers check as
+    // zero-parameter primitive calls: their signatures ride the same
+    // map every admission mirror reads, so augment it before any
+    // shape gate below consults it. `Str` lets anywhere in the body
+    // seed the receiver set alongside the `Str` parameters.
+    let mut str_call_receivers = str_admissions.locals.clone();
+    index_str_method_call_receivers(
+        block,
+        locals,
+        inputs,
+        symbols,
+        type_paths,
+        &mut str_call_receivers,
+    );
+    let mut augmented_call_signatures = direct_call_signatures.cloned().unwrap_or_default();
+    index_str_method_call_sites(
+        block,
+        &str_call_receivers,
+        locals,
+        inputs,
+        symbols,
+        &mut augmented_call_signatures,
+    );
+    let direct_call_signatures = if augmented_call_signatures.is_empty() {
+        direct_call_signatures
+    } else {
+        Some(&augmented_call_signatures)
+    };
     let is_supported_field_tail = matches!(tail.kind, ExprKind::Field { .. })
         && (self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id))
             || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
@@ -11019,7 +11047,12 @@ fn primitive_let_statement_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
         ) && msg.is_none_or(|msg| {
             // `Str` literal or a `Str`-typed local per N-C-20.
             matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))
@@ -11162,27 +11195,38 @@ fn primitive_let_statement_shape_is_supported(
     // unannotated binding of a `Str` literal, another `Str` local, or a
     // nested block whose tail yields `Str` the same way.
     if str_annotated
-        || (ty.is_none() && {
-            let mut str_init = init;
-            loop {
-                match str_init.kind {
-                    ExprKind::Block(block) => match block.tail {
-                        Some(inner_tail) => str_init = inner_tail,
-                        None => break false,
-                    },
-                    ExprKind::Lit(Lit::Str(_)) => break true,
-                    ExprKind::Path(path) => {
-                        break resolved_plain_local_path_binding(path, locals, inputs)
-                            .is_some_and(|source| str_admissions.locals.contains(&source));
-                    }
-                    _ => break false,
-                }
-            }
-        })
+        || (ty.is_none() && str_shaped_local_init(init, locals, inputs, &str_admissions.locals))
     {
         str_admissions.locals.insert(binding);
     }
     true
+}
+
+// Whether an unannotated `let` initializer yields a `Str`: a `Str`
+// literal, a path to an already-tracked `Str` binding, or a nested
+// block whose tail yields `Str` the same way. `str_bindings` carries
+// the `Str` bindings known so far.
+fn str_shaped_local_init(
+    init: &HirExpr<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    str_bindings: &HashSet<sai_hir::BindingId>,
+) -> bool {
+    let mut str_init = init;
+    loop {
+        match str_init.kind {
+            ExprKind::Block(block) => match block.tail {
+                Some(inner_tail) => str_init = inner_tail,
+                None => break false,
+            },
+            ExprKind::Lit(Lit::Str(_)) => break true,
+            ExprKind::Path(path) => {
+                break resolved_plain_local_path_binding(path, locals, inputs)
+                    .is_some_and(|source| str_bindings.contains(&source));
+            }
+            _ => break false,
+        }
+    }
 }
 
 fn primitive_if_tail_shape_is_supported(
@@ -11210,7 +11254,12 @@ fn primitive_if_tail_shape_is_supported(
         preceding_bindings,
         locals,
         inputs,
+        symbols,
+        type_paths,
         self_field_projections,
+        unknown_self_fields,
+        direct_call_signatures,
+        primitive_types,
     ) {
         return false;
     }
@@ -11257,12 +11306,18 @@ fn primitive_if_tail_shape_is_supported(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn primitive_if_condition_shape_is_supported(
     condition: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     match condition.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
@@ -11272,6 +11327,20 @@ fn primitive_if_condition_shape_is_supported(
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&condition.hir_id))
         }
+        // A `Bool` call — `if is_ready()` or `if s.is_empty()` — checks as an
+        // operand leaf the same way the checker's condition evaluation types it.
+        ExprKind::Call { .. } => primitive_direct_call_operand_shape_is_supported(
+            condition,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
             ExprKind::Path(operand_path) => {
                 resolved_plain_local_path_binding(operand_path, locals, inputs)
@@ -11280,6 +11349,18 @@ fn primitive_if_condition_shape_is_supported(
             ExprKind::Field { .. } => {
                 self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
             }
+            ExprKind::Call { .. } => primitive_direct_call_operand_shape_is_supported(
+                operand,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            ),
             // `not` operands recurse shallowly — the checker runs the shared
             // logical-operand machinery, so `not not`, `not true`, and nested
             // `and`/`or`/comparison operands are admitted here.
@@ -11827,7 +11908,12 @@ fn primitive_match_tail_shape_is_supported(
                 bindings,
                 locals,
                 inputs,
+                symbols,
+                type_paths,
                 self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
             ) {
                 return false;
             }
@@ -12115,7 +12201,12 @@ fn primitive_if_stmt_shape_is_supported(
         preceding_bindings,
         locals,
         inputs,
+        symbols,
+        type_paths,
         self_field_projections,
+        unknown_self_fields,
+        direct_call_signatures,
+        primitive_types,
     ) {
         return false;
     }
@@ -12247,7 +12338,12 @@ fn primitive_match_stmt_shape_is_supported(
                     bindings,
                     locals,
                     inputs,
+                    symbols,
+                    type_paths,
                     self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
                 ) {
                     return false;
                 }
@@ -13798,6 +13894,184 @@ fn direct_primitive_call_site(
             parameters: signature.parameters.clone(),
             output: signature.output,
         })
+}
+
+// The Stage-1 `Str` inherent methods the bounded walk admits: `len`
+// and `is_empty` (§16.9.2). Each takes only `self` and returns a
+// primitive, so a `s.len()`/`s.is_empty()` call on a `Str` receiver
+// checks as a zero-parameter primitive call — the call's
+// `PrimitiveCallSignature` rides the same map the admission mirrors
+// already consult, and sites the checker never reaches stay inert.
+fn str_method_call_output(name: Name, symbols: &Interner) -> Option<sai_resolve::prelude::PrimTy> {
+    let resolved = symbols.resolve(name.sym).ok()?;
+    match sai_syntax::normalize_identifier(resolved.as_ref()).as_str() {
+        "len" => Some(sai_resolve::prelude::PrimTy::USize),
+        "is_empty" => Some(sai_resolve::prelude::PrimTy::Bool),
+        _ => None,
+    }
+}
+
+// The `let` bindings whose initializer yields `Str` — the receivers a
+// `s.len()`/`s.is_empty()` call may name. `receivers` starts with the
+// body's `Str` parameters (and `Str`-family seeds in the `-> Str`
+// walk); the scan adds `let s: Str` and `let` bindings with a
+// `Str`-shaped initializer, recursing into nested blocks so a binding
+// at any depth seeds its own block's call sites. Shadowing stays
+// correct because paths resolve to their innermost binding.
+fn index_str_method_call_receivers(
+    block: &HirBlock<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    receivers: &mut HashSet<sai_hir::BindingId>,
+) {
+    for statement in block.stmts {
+        match statement.kind {
+            StmtKind::Let {
+                pat, ty, init, els, ..
+            } => {
+                if let PatKind::Binding { binding, .. } = pat.kind {
+                    let str_annotated = ty.is_some_and(|ty| {
+                        matches!(
+                            resolve_function_direct_type(*ty, type_paths, symbols, inputs),
+                            Some(FunctionDirectType::Str)
+                        )
+                    });
+                    if str_annotated
+                        || (ty.is_none() && str_shaped_local_init(init, locals, inputs, receivers))
+                    {
+                        receivers.insert(binding);
+                    }
+                }
+                index_str_method_call_receivers_in_expr(
+                    init, locals, inputs, symbols, type_paths, receivers,
+                );
+                if let Some(els) = els {
+                    index_str_method_call_receivers(
+                        els, locals, inputs, symbols, type_paths, receivers,
+                    );
+                }
+            }
+            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                index_str_method_call_receivers_in_expr(
+                    lhs, locals, inputs, symbols, type_paths, receivers,
+                );
+                index_str_method_call_receivers_in_expr(
+                    rhs, locals, inputs, symbols, type_paths, receivers,
+                );
+            }
+            StmtKind::Assert { cond, msg, .. } => {
+                index_str_method_call_receivers_in_expr(
+                    cond, locals, inputs, symbols, type_paths, receivers,
+                );
+                if let Some(msg) = msg {
+                    index_str_method_call_receivers_in_expr(
+                        msg, locals, inputs, symbols, type_paths, receivers,
+                    );
+                }
+            }
+            StmtKind::Expr(expression) => index_str_method_call_receivers_in_expr(
+                expression, locals, inputs, symbols, type_paths, receivers,
+            ),
+        }
+    }
+    if let Some(tail) = block.tail {
+        index_str_method_call_receivers_in_expr(
+            tail, locals, inputs, symbols, type_paths, receivers,
+        );
+    }
+}
+
+// Every block expression nested inside `expression` gets its own
+// `let` scan — `visit_expression_tree` already walks into blocks, so
+// intercepting each block node covers lets at any depth.
+fn index_str_method_call_receivers_in_expr(
+    expression: &HirExpr<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    receivers: &mut HashSet<sai_hir::BindingId>,
+) {
+    visit_expression_tree(expression, &mut |nested| {
+        let block = match nested.kind {
+            ExprKind::Block(block)
+            | ExprKind::AsyncBlock { block, .. }
+            | ExprKind::Region { block, .. } => block,
+            _ => return,
+        };
+        index_str_method_call_receivers(block, locals, inputs, symbols, type_paths, receivers);
+    });
+}
+
+// `s.len()` and `s.is_empty()` calls whose receiver resolves to a
+// `Str` — a `Str`-tracked local path, a `Str` literal, or a `self`
+// field of `Str` family in the `-> Str` method walk — are registered
+// as zero-parameter primitive calls. Arity mismatches (`s.len(1)`),
+// explicit generics (`s.len::<T>()`), and other `Str` methods
+// (`s.trim()`) are not registered and stay gated.
+fn index_str_method_call_sites(
+    block: &HirBlock<'_>,
+    receivers: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    calls: &mut HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>,
+) {
+    visit_block_expressions(block, &mut |expression| {
+        let ExprKind::Call {
+            callee,
+            args,
+            base: None,
+        } = expression.kind
+        else {
+            return;
+        };
+        if !args.is_empty() {
+            return;
+        }
+        let ExprKind::Field {
+            base,
+            name,
+            args: None,
+        } = callee.kind
+        else {
+            return;
+        };
+        // `s.len()` is method-call syntax; a parenthesized callee
+        // `(s.len)()` is a function-value read and stays gated — HIR
+        // erases the parens, so the source text after the callee decides.
+        if !str_call_callee_is_method_syntax(
+            inputs.source.text(),
+            callee.span.range.end().to_usize(),
+        ) {
+            return;
+        }
+        let Some(output) = str_method_call_output(name, symbols) else {
+            return;
+        };
+        let receiver_is_str = match base.kind {
+            ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| receivers.contains(&binding)),
+            ExprKind::Lit(Lit::Str(_)) => true,
+            ExprKind::Field { .. } => inputs
+                .str_self_field_projections
+                .borrow()
+                .as_ref()
+                .is_some_and(|fields| fields.get(&base.hir_id) == Some(&"`Str`")),
+            _ => false,
+        };
+        if receiver_is_str {
+            calls.entry(expression.hir_id).or_insert(
+                sai_ty::typeck::body::PrimitiveCallSignature {
+                    callee: callee.hir_id,
+                    parameters: Vec::new(),
+                    output,
+                },
+            );
+        }
+    });
 }
 
 fn check_const_tuple_literal(
@@ -16888,6 +17162,39 @@ fn check_function_str_local_block(
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    // `s.len()`/`s.is_empty()` calls on `Str` receivers check as
+    // zero-parameter primitive calls — augment the signature map so
+    // the call-family arm below admits them. `Str`-family bindings
+    // (parameters) and `let`s yielding `Str` seed the receivers;
+    // `self.<Str field>` receivers resolve through the projections
+    // input. Nested-block callers re-run this for their own lets.
+    let mut str_call_receivers: HashSet<sai_hir::BindingId> = str_bindings
+        .iter()
+        .filter(|(_, entry)| entry.family == "`Str`")
+        .map(|(binding, _)| *binding)
+        .collect();
+    index_str_method_call_receivers(
+        block,
+        locals,
+        inputs,
+        symbols,
+        type_paths,
+        &mut str_call_receivers,
+    );
+    let mut augmented_call_signatures = call_signatures.cloned().unwrap_or_default();
+    index_str_method_call_sites(
+        block,
+        &str_call_receivers,
+        locals,
+        inputs,
+        symbols,
+        &mut augmented_call_signatures,
+    );
+    let call_signatures = if augmented_call_signatures.is_empty() {
+        call_signatures
+    } else {
+        Some(&augmented_call_signatures)
+    };
     let carried = str_seed_cells(str_bindings);
     let mut diagnostics = Vec::new();
     for stmt in block.stmts {
@@ -60838,6 +61145,94 @@ property "shared"() {}
                 owner
                     .body_type_check()
                     .expect("gated Str function body check succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_admits_str_method_calls_in_primitive_bodies() {
+        let root = concat!(
+            "pub fn str_len(value: Str) -> USize { value.len() }\n",
+            "pub fn str_is_empty(value: Str) -> Bool { value.is_empty() }\n",
+            "pub fn str_local_len() -> USize { let s = \"a\"\n    s.len() }\n",
+            "pub fn str_alias_len(value: Str) -> USize { let t = value\n    t.len() }\n",
+            "pub fn str_literal_len() -> USize { \"a\".len() }\n",
+            "pub fn str_len_arith(value: Str) -> USize { value.len() + 1 }\n",
+            "pub fn str_len_let(value: Str) -> USize { let n = value.len()\n    n }\n",
+            "pub fn str_if_call_condition(value: Str) -> Bool { if value.is_empty() { true } else { false } }\n",
+            "pub fn str_while_call_condition(value: Str) -> Bool { while value.is_empty() { break }\n    true }\n",
+            "pub fn str_assert_call_condition(value: Str) -> Bool { assert value.is_empty()\n    true }\n",
+            "pub fn str_len_trivia(value: Str) -> USize { value.len /* note */ () }\n",
+            "pub fn str_not_call(value: Str) -> Bool { not value.is_empty() }\n",
+            "pub fn str_body_if_call(value: Str) -> Str { if value.is_empty() { \"a\" } else { \"b\" } }\n",
+            "pub fn str_len_mismatch(value: Str) -> I32 { value.len() }\n",
+            "pub fn str_len_bind(value: Str) -> Bool { let n: I32 = value.len()\n    true }\n",
+            "pub fn str_len_condition(value: Str) -> Bool { if value.len() { true } else { false } }\n",
+            "pub fn str_is_empty_mismatch(value: Str) -> USize { value.is_empty() }\n",
+            "pub fn str_trim(value: Str) -> Bool { value.trim()\n    true }\n",
+            "pub fn str_len_arg(value: Str) -> Bool { value.len(1)\n    true }\n",
+            "pub fn str_len_generic(value: Str) -> Bool { value.len<U8>()\n    true }\n",
+            "pub fn str_len_value(value: Str) -> Bool { (value.len)()\n    true }\n",
+            "pub fn str_len_bare(value: Str) -> Bool { value.len\n    true }\n",
+            "pub fn int_len() -> Bool { let n = 1\n    n.len()\n    true }\n",
+            "pub fn str_chars(value: Str) -> Bool { value.chars()\n    true }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 24);
+        // Clean supported owners: `s.len()` -> `USize` and
+        // `s.is_empty()` -> `Bool` on `Str` parameters, `Str` locals and
+        // aliases, `Str` literals, and `self.<Str field>` receivers — in
+        // operand, `let`-initializer, `if`/`while`/`assert`/`not`
+        // condition, and `-> Str` body positions.
+        for owner in &owners[..13] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("Str method call function body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        // The injected `USize`/`Bool` outputs produce the ordinary
+        // primitive type mismatches in binding and condition positions.
+        for (index, expected_message) in [
+            (13, "expected `I32`, found `USize`"),
+            (14, "expected `I32`, found `USize`"),
+            (15, "expected `Bool`, found `USize`"),
+            (16, "expected `USize`, found `Bool`"),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("Str method call mismatch remains in the supported slice")
+            else {
+                panic!("Str method call mismatch remains in the supported slice");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            assert_eq!(diagnostics[0].message, expected_message);
+        }
+        // Gated owners: unknown methods, call arguments, generic method
+        // arguments, a parenthesized callee `(s.len)()`, a bare field
+        // read, a non-`Str` receiver, and `s.chars()` stay outside.
+        for owner in &owners[17..] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("gated Str method call check succeeds"),
                 FunctionBodyTypeCheck::Unsupported
             ));
         }

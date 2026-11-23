@@ -5403,6 +5403,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     .copied()
                     .ok_or(())?,
             ),
+            // A `Bool` call in condition position — `if is_ready()` or
+            // `if s.is_empty()` — types like the operand-position call.
+            ExprKind::Call { .. } => self.check_direct_call(condition, false)?,
             // `not e` conditions admit the same operand-position logical
             // shapes as `let x = not e` — `not not`, `not true`, and nested
             // `and`/`or`/comparison operands recurse in source order.
