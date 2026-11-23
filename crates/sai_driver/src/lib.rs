@@ -15571,9 +15571,9 @@ fn str_init_deferred_seed(
             .sites
             .borrow()
             .iter()
-            .any(|(_, span)| *span == leaf.span)
+            .any(|(_, span)| *span == expr.span)
         {
-            root.sites.borrow_mut().push((literal, leaf.span));
+            root.sites.borrow_mut().push((literal, expr.span));
         }
     }
     group
@@ -15674,7 +15674,7 @@ fn str_fold_literal_contributions(
                 else {
                     return Ok(());
                 };
-                for (family, value, span) in contributions.iter_mut() {
+                for (family, value, _) in contributions.iter_mut() {
                     // Only literals of the variable's own family join the
                     // group — an integer variable's group never absorbs
                     // a float literal (`{ big } else { 1.5 }` keeps `F64`
@@ -15689,7 +15689,7 @@ fn str_fold_literal_contributions(
                         continue;
                     };
                     if let Some(literal) = str_static_literal(literal) {
-                        root.sites.borrow_mut().push((literal, *span));
+                        root.sites.borrow_mut().push((literal, expr.span));
                     }
                 }
                 return Ok(());
