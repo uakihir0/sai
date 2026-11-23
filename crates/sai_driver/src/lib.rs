@@ -15016,13 +15016,16 @@ fn str_match_family(
     }
     // A scalar scrutinee resolves to its primitive for the checker's
     // literal-pattern rules; `Str` stays on the literal-join admission.
-    // `if let`/`while let` desugarings are only admitted for a `Str`
-    // scrutinee — a scalar one keeps the checker's `Normal`-only gate
-    // (non-`Normal` sources `Err` there).
+    // `if let`/`while let` desugarings follow the scalar path too —
+    // their patterns check against the scrutinee primitive the same
+    // way a `Normal` match's do (`for`/`try` sources stay gated).
     let scrutinee_prim = if scrutinee_family == "`Str`" {
         None
     } else {
-        if !matches!(source, MatchSource::Normal) {
+        if !matches!(
+            source,
+            MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+        ) {
             return Ok(None);
         }
         match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
@@ -18457,13 +18460,11 @@ fn str_stmt_expr_unit(
         // path, patterns go through `str_match_arm_pattern`, arm bodies
         // must be blocks checked as statement blocks at this frame, and
         // binding arms seed the scrutinee family for the arm's guard
-        // and body. A `Str` scrutinee is outside the checker's
-        // `LocalType`, so the `Str` walk also admits the `if let`/
-        // `while let` desugarings here — their synthesized `_` arms
-        // carry non-block bodies (`()` for a missing else, `break` for
-        // `while let`, an else-if `if`/`match` chain for `else if
-        // let`). A scalar scrutinee keeps the checker's `Normal`-only
-        // gate (`if let`/`while let`/`for` Err there).
+        // and body. The `Str` walk admits the `if let`/`while let`
+        // desugarings for scalar scrutinees too — their synthesized
+        // `_` arms carry non-block bodies (`()` for a missing else,
+        // `break` for `while let`, an else-if `if`/`match` chain for
+        // `else if let`). `for`/`try` sources stay gated.
         ExprKind::Match {
             scrutinee,
             arms,
@@ -18481,7 +18482,10 @@ fn str_stmt_expr_unit(
             let scrutinee_prim = if scrutinee_family == "`Str`" {
                 None
             } else {
-                if !matches!(source, MatchSource::Normal) {
+                if !matches!(
+                    source,
+                    MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+                ) {
                     return Ok(None);
                 }
                 match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
@@ -19311,7 +19315,10 @@ fn str_pure_match_family(
     let scrutinee_prim = if scrutinee_family == "`Str`" {
         None
     } else {
-        if !matches!(source, MatchSource::Normal) {
+        if !matches!(
+            source,
+            MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+        ) {
             return None;
         }
         match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
@@ -20430,10 +20437,11 @@ fn str_clean_expr(
             arms,
             source,
             ..
-        } => (matches!(source, MatchSource::Normal)
-            || (matches!(source, MatchSource::IfLet | MatchSource::WhileLet)
-                && str_binding_family(scrutinee, locals, str_bindings) == Some("`Str`")))
-            && arms.iter().any(|arm| {
+        } => {
+            matches!(
+                source,
+                MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+            ) && arms.iter().any(|arm| {
                 let mut bindings = str_bindings.clone();
                 if let PatKind::Binding {
                     mode:
@@ -20446,13 +20454,15 @@ fn str_clean_expr(
                     bindings.insert(
                         binding,
                         StrLocalEntry {
-                            family: "`Str`",
+                            family: str_binding_family(scrutinee, locals, str_bindings)
+                                .unwrap_or("`Str`"),
                             literal: None,
                         },
                     );
                 }
                 str_clean_expr(arm.body, locals, &bindings, loop_level)
-            }),
+            })
+        }
         ExprKind::Break {
             label: None,
             value: Some(value),
@@ -20643,12 +20653,16 @@ fn check_function_str_match(
     let Some(scrutinee_family) = scrutinee_family else {
         return Ok(None);
     };
-    // `if let`/`while let` desugarings are only admitted for a `Str`
-    // scrutinee — a scalar one keeps the checker's `Normal`-only gate.
+    // `if let`/`while let` desugarings follow the scalar path too —
+    // their patterns check against the scrutinee primitive the same
+    // way a `Normal` match's do (`for`/`try` sources stay gated).
     let scrutinee_prim = if scrutinee_family == "`Str`" {
         None
     } else {
-        if !matches!(source, MatchSource::Normal) {
+        if !matches!(
+            source,
+            MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+        ) {
             return Ok(None);
         }
         match primitive_method_field_type(scrutinee_family.trim_matches('`')) {
@@ -59084,6 +59098,7 @@ property "shared"() {}
             "pub fn str_init_match_block_literal_oob(s: Str) -> Str {\n    let m = match s {\n        \"a\" => {\n            18446744073709551615\n        }\n        _ => {\n            0\n        }\n    }\n    s\n}\npub fn str_init_if_let_litvar_u64(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        18446744073709551615\n    }\n    let u: U64 = big\n    s\n}\n",
             "pub fn str_init_if_let_litvar_float_tm(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        1.5\n    }\n    s\n}\npub fn str_init_if_let_litvar_group(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        2\n    }\n    let u: U64 = m\n    s\n}\n",
             "pub fn str_init_else_if_let_litvar_oob(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else if let \"b\" = s {\n        300\n    } else {\n        2\n    }\n    let u: U8 = m\n    s\n}\n",
+            "pub fn str_if_let_scalar_stmt(s: Str, n: I64) -> Str {\n    if let 1 = n {\n    }\n    s\n}\npub fn str_while_let_scalar(s: Str, n: I64) -> Str {\n    while let 1 = n {\n    }\n    s\n}\npub fn str_if_let_scalar_init(s: Str, n: I64) -> Str {\n    let big = 1\n    let m = if let 1 = n {\n        big\n    } else {\n        2\n    }\n    let u: U64 = m\n    s\n}\npub fn str_if_let_scalar_binding(s: Str, n: I64) -> Str {\n    if let x = n {\n    }\n    s\n}\npub fn str_if_let_scalar_oob(s: Str) -> Str {\n    let n: U8 = 1\n    if let 300 = n {\n    }\n    s\n}\npub fn str_tail_if_let_scalar_no_else_tm(s: Str, n: I64) -> Str {\n    if let 1 = n {\n        s\n    }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -59099,7 +59114,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 249);
+        assert_eq!(resolved.owners().len(), 255);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -59184,6 +59199,8 @@ property "shared"() {}
             .chain(&resolved.owners()[242..243])
             .chain(&resolved.owners()[245..246])
             .chain(&resolved.owners()[247..248])
+            .chain(&resolved.owners()[234..235])
+            .chain(&resolved.owners()[249..253])
             .enumerate()
         {
             let (index, owner) = (index, owner);
@@ -59278,6 +59295,8 @@ property "shared"() {}
             (246, sai_diagnostics::Code::TypeMismatch),
             (248, sai_diagnostics::Code::LiteralOutOfRange),
             (243, sai_diagnostics::Code::TypeMismatch),
+            (253, sai_diagnostics::Code::LiteralOutOfRange),
+            (254, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
                 .body_type_check()
@@ -59351,7 +59370,7 @@ property "shared"() {}
         // A `Str` parameter seeds the group, so copies and a param tail are
         // supported; non-`Str` statements and generic-arg paths stay gated
         // (`var` bindings bind like `let` since IR-1114).
-        for index in [18, 22, 23, 29, 34, 39, 168, 211, 221, 234] {
+        for index in [18, 22, 23, 29, 34, 39, 168, 211, 221] {
             let owner = &resolved.owners()[index];
             assert!(
                 matches!(
