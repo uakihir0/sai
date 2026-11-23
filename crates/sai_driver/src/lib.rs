@@ -8200,11 +8200,10 @@ fn check_inherent_method_body_type(
                         ..
                     } if is_direct_self_value_expression(base)
                 )
-                && inputs
-                    .source
-                    .text()
-                    .get(callee.span.range.end().to_usize()..)
-                    .is_some_and(|rest| rest.trim_start().starts_with('('))
+                && str_call_callee_is_method_syntax(
+                    inputs.source.text(),
+                    callee.span.range.end().to_usize(),
+                )
             {
                 call_callee_ids.insert(callee.hir_id);
             }
@@ -8716,6 +8715,45 @@ fn str_inherent_method_field_types(
         fields: field_types,
         candidate_names,
     })
+}
+
+// Whether the token after `offset` in `text` is `(` — the method-call
+// syntax check for a `self.<name>` call callee. Whitespace and `//` /
+// `/* */` comments (nested, like the lexer) count as trivia.
+fn str_call_callee_is_method_syntax(text: &str, offset: usize) -> bool {
+    let mut rest = text.get(offset..).unwrap_or("");
+    loop {
+        rest = rest.trim_start();
+        if let Some(line) = rest.strip_prefix("//") {
+            rest = line.split_once('\n').map(|(_, after)| after).unwrap_or("");
+            continue;
+        }
+        if rest.starts_with("/*") {
+            let bytes = rest.as_bytes();
+            let mut depth = 1_u32;
+            let mut pos = 2;
+            while pos + 1 < bytes.len() {
+                if &bytes[pos..pos + 2] == b"/*" {
+                    depth += 1;
+                    pos += 2;
+                } else if &bytes[pos..pos + 2] == b"*/" {
+                    depth -= 1;
+                    pos += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    pos += 1;
+                }
+            }
+            if depth != 0 {
+                return false;
+            }
+            rest = &rest[pos..];
+            continue;
+        }
+        return rest.starts_with('(');
+    }
 }
 
 // The `Str` counterpart of `primitive_self_field_type`: `Ok(family)`
@@ -101655,6 +101693,9 @@ property "shared"() {}
             "    let s = if flag { self.text } else { self.text }\n",
             "    s\n",
             "  }\n",
+            "  pub fn comment_call(self: borrow Self) -> Str {\n",
+            "    self.get /* note */ (false)\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -101675,7 +101716,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let methods = &results.owners()[0].members();
-        assert_eq!(methods.len(), 6);
+        assert_eq!(methods.len(), 7);
         let check = methods[0].body_type_check().expect("body check runs");
         assert!(
             matches!(check, FunctionBodyTypeCheck::Supported { .. }),
@@ -101692,9 +101733,10 @@ property "shared"() {}
             diagnostics[0].message, "expected `I32`, found `Str`",
             "{diagnostics:?}"
         );
-        // `self.<name>(..)` is method-call syntax — real or missing, the
-        // callee is not a field read, and the call itself stays gated.
-        for (index, name) in [(2, "call"), (3, "call_missing")] {
+        // `self.<name>(..)` is method-call syntax — real or missing, with
+        // or without trivia before the paren — the callee is not a field
+        // read, and the call itself stays gated.
+        for (index, name) in [(2, "call"), (3, "call_missing"), (6, "comment_call")] {
             let check = methods[index].body_type_check().expect("body check runs");
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
