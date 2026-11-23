@@ -13353,8 +13353,7 @@ fn str_let_entry(
     match init.kind {
         ExprKind::Lit(literal) if str_scalar_family_name(literal).is_some() => StrLocalEntry {
             family,
-            literal: str_static_literal(literal)
-                .map(|literal| str_seed_new(literal, init.span)),
+            literal: str_static_literal(literal).map(|literal| str_seed_new(literal, init.span)),
         },
         ExprKind::Path(_) => {
             str_binding_entry(init, locals, str_bindings)
@@ -13469,9 +13468,7 @@ fn str_default_unresolved_literals(
             continue;
         };
         let root = str_seed_root(seed);
-        if carried.contains(&std::rc::Rc::as_ptr(&root.resolved))
-            || root.resolved.get().is_some()
-        {
+        if carried.contains(&std::rc::Rc::as_ptr(&root.resolved)) || root.resolved.get().is_some() {
             continue;
         }
         let default_name = match seed.literal {
@@ -13684,7 +13681,11 @@ fn str_literal_family_init(
     // accept keeps its default family and the caller's pin/fold compare
     // reports `expected <pin>, found <family>`. Resolving the variable
     // fixes it — a later conflicting pin sees the resolved family.
-    if let Some(resolved) = entry.literal.as_ref().and_then(|seed| str_seed_resolved(seed)) {
+    if let Some(resolved) = entry
+        .literal
+        .as_ref()
+        .and_then(|seed| str_seed_resolved(seed))
+    {
         return Ok(Some((resolved, Vec::new())));
     }
     if let (Some(primitive), Some(seed)) = (expected, entry.literal) {
@@ -14067,7 +14068,10 @@ fn str_expr_family(
                     ExprKind::Path(_) => {
                         match str_binding_entry(lhs, locals, str_bindings) {
                             Some(entry) => {
-                                match entry.literal.filter(|seed| str_seed_resolved(seed).is_none()) {
+                                match entry
+                                    .literal
+                                    .filter(|seed| str_seed_resolved(seed).is_none())
+                                {
                                     // A non-integer literal variable
                                     // resolves to its default family, then
                                     // the bitwise check applies below.
@@ -14147,7 +14151,9 @@ fn str_expr_family(
                     _ => {
                         let count_seed =
                             str_binding_entry(rhs, locals, str_bindings).and_then(|entry| {
-                                entry.literal.filter(|seed| str_seed_resolved(seed).is_none())
+                                entry
+                                    .literal
+                                    .filter(|seed| str_seed_resolved(seed).is_none())
                             });
                         match count_seed {
                             Some(StrLiteralSeed {
@@ -15901,62 +15907,156 @@ fn check_function_str_local_block(
                     )?);
                 }
                 let entry = str_bindings.get(&binding).expect("place is bound");
-                let expected_family = entry
+                // Only integer/float literal inits are literal
+                // variables — `Bool`/`Byte`/`Char` literals are
+                // concrete in the checker too.
+                let place_seed = entry
                     .literal
-                    .as_ref()
-                    .and_then(|seed| str_seed_resolved(seed))
-                    .unwrap_or(entry.family);
-                // A literal right side joins an unresolved literal
-                // variable like the checker's literal constraint: a
-                // same-kind literal records another site (its range
-                // checks when the variable resolves); a different
-                // literal kind reports the mismatch now; and a `Bool`/
-                // `Byte`/`Char` variable's literal site is an Err in
-                // the checker, so it gates.
-                if let Some(seed) = entry
-                    .literal
-                    .as_ref()
-                    .filter(|seed| seed.resolved.get().is_none())
-                    && let ExprKind::Lit(literal) = rhs.kind
+                    .clone()
+                    .filter(|seed| matches!(seed.literal, Lit::Int { .. } | Lit::Float { .. }));
+                let place_resolved = place_seed.as_ref().and_then(|seed| str_seed_resolved(seed));
+                let expected_family = place_resolved.unwrap_or(entry.family);
+                let rhs_entry = if let ExprKind::Path(_) = rhs.kind {
+                    str_binding_entry(rhs, locals, str_bindings)
+                } else {
+                    None
+                };
+
+                if let ExprKind::Lit(literal) = rhs.kind
+                    && let Some(seed) = place_seed.as_ref()
                 {
-                    let same_kind = matches!(
-                        (seed.literal, literal),
-                        (Lit::Int { .. }, Lit::Int { .. })
-                            | (Lit::Float { .. }, Lit::Float { .. })
-                            | (Lit::Bool(_), Lit::Bool(_))
-                            | (Lit::Byte(_), Lit::Byte(_))
-                            | (Lit::Char(_), Lit::Char(_))
-                    );
-                    match seed.literal {
-                        Lit::Int { .. } | Lit::Float { .. } if same_kind => {
-                            seed.sites
-                                .borrow_mut()
-                                .push((str_static_literal(literal).unwrap(), rhs.span));
+                    // A literal right side joins an unresolved literal
+                    // variable as another constraint site — its range
+                    // checks when the variable resolves. Once resolved,
+                    // a literal right side is the checker's Err.
+                    if place_resolved.is_some() {
+                        return Ok(None);
+                    }
+                    if str_seed_same_kind(seed.literal, literal) {
+                        str_seed_root(seed)
+                            .sites
+                            .borrow_mut()
+                            .push((str_static_literal(literal).unwrap(), rhs.span));
+                    } else {
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            rhs.span,
+                            sai_diagnostics::Code::TypeMismatch,
+                            format!(
+                                "expected {}, found {}",
+                                str_seed_default_family(seed.literal),
+                                str_lit_kind_word(literal)
+                            ),
+                            "type mismatch",
+                        )?);
+                    }
+                } else if let Some(rhs_seed) = rhs_entry
+                    .as_ref()
+                    .and_then(|rhs_entry| rhs_entry.literal.as_ref())
+                    .filter(|_| str_family_prim(expected_family).is_some())
+                {
+                    // `x = y` where `y` carries a literal variable —
+                    // the checker's merge matrix: resolved on either
+                    // side checks like its concrete type; two
+                    // unresolved variables merge (same kind) or report
+                    // a literal-type mismatch (different kinds).
+                    let rhs_resolved = str_seed_resolved(rhs_seed);
+                    let literal_mismatch = |expected: &str, found: Lit<'_>| {
+                        (expected.to_owned(), str_lit_kind_word(found))
+                    };
+                    let mut mismatch = None;
+                    match (place_seed.as_ref(), place_resolved, rhs_resolved) {
+                        (Some(place_seed), None, None) => {
+                            if !std::rc::Rc::ptr_eq(
+                                &str_seed_root(place_seed).resolved,
+                                &str_seed_root(rhs_seed).resolved,
+                            ) {
+                                if str_seed_same_kind(place_seed.literal, rhs_seed.literal) {
+                                    str_seed_merge(place_seed, rhs_seed);
+                                } else {
+                                    mismatch = Some(literal_mismatch(
+                                        str_seed_default_family(place_seed.literal),
+                                        rhs_seed.literal,
+                                    ));
+                                }
+                            }
                         }
-                        Lit::Int { .. } | Lit::Float { .. } => {
-                            let found = match literal {
-                                Lit::Int { .. } => "an integer literal",
-                                Lit::Float { .. } => "a floating-point literal",
-                                Lit::Bool(_) => "a Bool literal",
-                                Lit::Byte(_) => "a byte literal",
-                                Lit::Char(_) => "a character literal",
-                                Lit::Str(_) => "a string literal",
-                                Lit::ByteStr(_) => "a byte-string literal",
-                            };
-                            diagnostics.push(const_literal_diagnostic(
-                                owner.id,
-                                inputs,
-                                snapshot,
-                                rhs.span,
-                                sai_diagnostics::Code::TypeMismatch,
-                                format!(
-                                    "expected `{}`, found {found}",
-                                    expected_family.trim_matches('`')
-                                ),
-                                "type mismatch",
-                            )?);
+                        (Some(place_seed), None, Some(found)) => {
+                            if str_seed_accepts_family(place_seed.literal, found) {
+                                str_seed_resolve(
+                                    owner,
+                                    place_seed,
+                                    found,
+                                    &mut diagnostics,
+                                    inputs,
+                                    snapshot,
+                                    symbols,
+                                    target_cfg,
+                                )?;
+                            } else {
+                                mismatch = Some(literal_mismatch(found, place_seed.literal));
+                            }
                         }
-                        _ => return Ok(None),
+                        (Some(_), Some(expected), None) => {
+                            if str_seed_accepts_family(rhs_seed.literal, expected) {
+                                str_seed_resolve(
+                                    owner,
+                                    rhs_seed,
+                                    expected,
+                                    &mut diagnostics,
+                                    inputs,
+                                    snapshot,
+                                    symbols,
+                                    target_cfg,
+                                )?;
+                            } else {
+                                mismatch = Some(literal_mismatch(expected, rhs_seed.literal));
+                            }
+                        }
+                        (None, _, None) => {
+                            if str_seed_accepts_family(rhs_seed.literal, expected_family) {
+                                str_seed_resolve(
+                                    owner,
+                                    rhs_seed,
+                                    expected_family,
+                                    &mut diagnostics,
+                                    inputs,
+                                    snapshot,
+                                    symbols,
+                                    target_cfg,
+                                )?;
+                            } else {
+                                mismatch =
+                                    Some(literal_mismatch(expected_family, rhs_seed.literal));
+                            }
+                        }
+                        (_, place_resolved, Some(found)) => {
+                            let expected = place_resolved.unwrap_or(expected_family);
+                            if expected != found {
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    rhs.span,
+                                    sai_diagnostics::Code::TypeMismatch,
+                                    format!("expected {expected}, found {found}"),
+                                    "type mismatch",
+                                )?);
+                            }
+                        }
+                    }
+                    if let Some((expected, found_word)) = mismatch {
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            rhs.span,
+                            sai_diagnostics::Code::TypeMismatch,
+                            format!("expected {expected}, found {found_word}"),
+                            "type mismatch",
+                        )?);
                     }
                 } else {
                     let expected_prim = str_family_prim(expected_family);
@@ -15978,38 +16078,65 @@ fn check_function_str_local_block(
                         return Ok(None);
                     };
                     diagnostics.append(&mut rhs_diagnostics);
-                    if let Some(seed) = entry
-                        .literal
-                        .as_ref()
-                        .filter(|seed| seed.resolved.get().is_none())
-                    {
+                    if let Some(seed) = place_seed.as_ref().filter(|_| place_resolved.is_none()) {
                         // A concretely typed right side resolves the
-                        // variable (`var n = 1; n = count`): the place
-                        // takes the right side's family; `Str`/`()`
-                        // results report the mismatch against the
-                        // variable's default.
+                        // variable — but only when the literal kind
+                        // accepts the family (`check_annotated_path` on
+                        // a literal variable): `n = flag` reports
+                        // `expected `Bool`, found an integer literal`.
                         if rhs_family != "`!`" {
-                            if str_family_prim(rhs_family).is_some() {
-                                str_seed_resolve(
-                                    owner,
-                                    seed,
-                                    rhs_family,
-                                    &mut diagnostics,
-                                    inputs,
-                                    snapshot,
-                                    symbols,
-                                    target_cfg,
-                                )?;
-                            } else {
-                                diagnostics.push(const_literal_diagnostic(
-                                    owner.id,
-                                    inputs,
-                                    snapshot,
-                                    rhs.span,
-                                    sai_diagnostics::Code::TypeMismatch,
-                                    format!("expected {expected_family}, found {rhs_family}"),
-                                    "type mismatch",
-                                )?);
+                            match str_family_prim(rhs_family) {
+                                Some(rhs_prim) => {
+                                    match sai_ty::typeck::literal::check_primitive_literal(
+                                        rhs_prim,
+                                        seed.literal,
+                                        symbols,
+                                        target_cfg.pointer_width(),
+                                    ) {
+                                        sai_ty::typeck::literal::PrimitiveLiteralResult::Match
+                                        | sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
+                                            // `str_seed_resolve`
+                                            // range-checks every
+                                            // recorded literal —
+                                            // including the origin.
+                                            str_seed_resolve(
+                                                owner,
+                                                seed,
+                                                rhs_family,
+                                                &mut diagnostics,
+                                                inputs,
+                                                snapshot,
+                                                symbols,
+                                                target_cfg,
+                                            )?;
+                                        }
+                                        sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => {
+                                            diagnostics.push(const_literal_diagnostic(
+                                                owner.id,
+                                                inputs,
+                                                snapshot,
+                                                rhs.span,
+                                                sai_diagnostics::Code::TypeMismatch,
+                                                format!(
+                                                    "expected {rhs_family}, found {}",
+                                                    str_lit_kind_word(seed.literal)
+                                                ),
+                                                "type mismatch",
+                                            )?);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    diagnostics.push(const_literal_diagnostic(
+                                        owner.id,
+                                        inputs,
+                                        snapshot,
+                                        rhs.span,
+                                        sai_diagnostics::Code::TypeMismatch,
+                                        format!("expected {expected_family}, found {rhs_family}"),
+                                        "type mismatch",
+                                    )?);
+                                }
                             }
                         }
                     } else if rhs_family != expected_family && rhs_family != "`!`" {
@@ -56923,6 +57050,12 @@ property "shared"() {}
             "pub fn var_param(var s: Str) -> Str {\n    s = \"b\"\n    s\n}\n",
             "pub fn var_param_tail(var s: Str) -> Str { s }\n",
             "pub fn var_value(var value: Str) -> Str { value }\n",
+            "pub fn assign_resolve_range() -> Str {\n    var n = 300\n    n = give()\n    \"a\"\n}\n",
+            "pub fn assign_resolve_kind() -> Str {\n    let flag: Bool = true\n    var n = 1\n    n = flag\n    \"a\"\n}\n",
+            "pub fn assign_copy_sites() -> Str {\n    var n = 1\n    n = 300\n    let copy = n\n    let m: I8 = copy\n    \"a\"\n}\n",
+            "pub fn assign_merge() -> Str {\n    var a = 1\n    var b = 2\n    a = b\n    let m: I8 = a\n    let k: I8 = b\n    \"a\"\n}\n",
+            "pub fn assign_merge_mismatch() -> Str {\n    var a = 1\n    var f = 1.5\n    a = f\n    \"a\"\n}\n",
+            "pub fn assign_resolved_lit_gate() -> Str {\n    var n = 1\n    n = give()\n    n = 300\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -56938,7 +57071,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 15);
+        assert_eq!(resolved.owners().len(), 21);
         for (index, owner) in resolved.owners()[1..5].iter().enumerate() {
             match owner.body_type_check().expect("var body check succeeds") {
                 FunctionBodyTypeCheck::Supported { diagnostics } => {
@@ -56965,6 +57098,26 @@ property "shared"() {}
                 Some("integer literal is out of range for `I8`"),
             ),
             (10, sai_diagnostics::Code::InvalidAssignTarget, None),
+            (
+                15,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                Some("integer literal is out of range for `I8`"),
+            ),
+            (
+                16,
+                sai_diagnostics::Code::TypeMismatch,
+                Some("expected `Bool`, found an integer literal"),
+            ),
+            (
+                17,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                Some("integer literal is out of range for `I8`"),
+            ),
+            (
+                19,
+                sai_diagnostics::Code::TypeMismatch,
+                Some("expected `I64`, found a floating-point literal"),
+            ),
         ] {
             match resolved.owners()[index]
                 .body_type_check()
@@ -56980,7 +57133,7 @@ property "shared"() {}
                 other => panic!("expected Supported, found {other:?} at index {index}"),
             }
         }
-        for index in [8, 12, 13, 14] {
+        for index in [8, 12, 13, 14, 18] {
             match resolved.owners()[index]
                 .body_type_check()
                 .expect("clean var body check succeeds")
@@ -56991,12 +57144,18 @@ property "shared"() {}
                 other => panic!("expected Supported, found {other:?} at index {index}"),
             }
         }
-        assert!(matches!(
-            resolved.owners()[11]
-                .body_type_check()
-                .expect("compound assign body check succeeds"),
-            FunctionBodyTypeCheck::Unsupported
-        ));
+        for index in [11, 20] {
+            assert!(
+                matches!(
+                    resolved.owners()[index]
+                        .body_type_check()
+                        .expect("gate body check succeeds"),
+                    FunctionBodyTypeCheck::Unsupported
+                ),
+                "index {index}: {:?}",
+                resolved.owners()[index].body_type_check()
+            );
+        }
     }
 
     #[test]
