@@ -13862,6 +13862,11 @@ fn str_expr_family(
         return Ok(Some(found));
     }
     match expr.kind {
+        // `()` — the unit expression — carries the unit family (a
+        // synthesized `if let` else arm is exactly this; an explicit
+        // `()` arm or operand compares against the join like the
+        // checker's unit type).
+        ExprKind::Tuple(elements) if elements.is_empty() => Ok(Some(("`()`", Vec::new()))),
         ExprKind::Unary(operator, operand) => {
             // `-`/`~` on a literal operand takes the numeric expectation
             // like the checker's `check_direct_call_bitwise_not_literal`
@@ -15118,6 +15123,15 @@ fn str_match_family(
         };
         diagnostics.append(&mut arm_diagnostics);
         arm_families.push((Some(arm_family), Some(arm.body), arm.body.span));
+    }
+    // `if let` without `else` desugars a synthesized `_` arm whose body
+    // is `()` — the match's type is `()` regardless of the real arm's
+    // yield, so the join is skipped and the expression reports `()` (a
+    // `Str` pin still reports `expected `Str`, found `()` downstream).
+    if arms.iter().any(|arm| {
+        arm.synthesized && matches!(arm.body.kind, ExprKind::Tuple(elements) if elements.is_empty())
+    }) {
+        return Ok(Some(("`()`", diagnostics)));
     }
     // Literal arm bodies fold into a single pinned/primitive arm family
     // like the checker's β unification: `x => x` (x: I8) then
@@ -17660,9 +17674,17 @@ fn check_function_str_local_block(
             } => {
                 // A binding arm types the pattern variable as `Str` (the
                 // scrutinee's type), so `other => other` yields `Str` even
-                // though the outer group does not know `other` yet.
-                let arm_yields_str =
-                    arms.iter().any(|arm| {
+                // though the outer group does not know `other` yet. An
+                // `if let` without `else` desugars a synthesized `_` arm
+                // whose body is `()`, so the match's type is `()` — the
+                // initializer is not a `Str` match, and a `()` local is
+                // outside `LocalType`, so the init gates like the
+                // checker's unit local.
+                let arm_yields_str = !arms.iter().any(|arm| {
+                    arm.synthesized
+                        && matches!(arm.body.kind, ExprKind::Tuple(elements) if elements.is_empty())
+                })
+                    && arms.iter().any(|arm| {
                         let mut bindings = str_bindings.clone();
                         if let PatKind::Binding {
                             mode:
@@ -18678,6 +18700,7 @@ fn str_pure_init_family(
     match init.kind {
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal),
+        ExprKind::Tuple(elements) if elements.is_empty() => Some("`()`"),
         ExprKind::Unary(operator, operand) => {
             let family = str_pure_init_family(
                 operand,
@@ -19165,10 +19188,17 @@ fn str_pure_match_family(
         )?;
         arm_families.push((Some(arm_family), Some(arm.body), arm.body.span));
     }
+    // A no-`else` `if let`'s synthesized `_` arm carries `()` — the
+    // match's type is `()` like in the diagnostic walk.
+    if arms.iter().any(|arm| {
+        arm.synthesized && matches!(arm.body.kind, ExprKind::Tuple(elements) if elements.is_empty())
+    }) {
+        return Some("`()`");
+    }
     // The literal-vs-pin fold, minus diagnostics.
     let mut prims: Vec<_> = arm_families
         .iter()
-        .filter(|(_, value, _)| !matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_))))
+        .filter(|(_, value, _)| str_literal_contribution(*value).is_none())
         .filter_map(|contribution| contribution.0)
         .filter(|family| {
             *family != "`!`"
