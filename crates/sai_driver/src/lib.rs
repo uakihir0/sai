@@ -7569,6 +7569,7 @@ fn check_function_body_type(
             symbols,
             None,
             None,
+            None,
             inputs,
             snapshot,
             target_cfg,
@@ -7637,6 +7638,15 @@ fn check_function_body_type(
                     literal: None,
                 },
             )]);
+            let augmented_str_calls = str_method_call_signatures(
+                block,
+                &str_bindings,
+                direct_call_signatures,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+            );
             let Some(diagnostics) = check_function_str_local_block(
                 owner,
                 *sig.ret.expect("Str return is present"),
@@ -7650,7 +7660,7 @@ fn check_function_body_type(
                 target_cfg,
                 false,
                 StrStmtLoopFrame::None,
-                direct_call_signatures,
+                augmented_str_calls.as_ref().or(direct_call_signatures),
             )?
             else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -7808,6 +7818,15 @@ fn check_function_body_type(
                     },
                 ),
             ]);
+            let augmented_str_calls = str_method_call_signatures(
+                block,
+                &str_bindings,
+                direct_call_signatures,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+            );
             let Some(diagnostics) = check_function_str_local_block(
                 owner,
                 *sig.ret.expect("Str return is present"),
@@ -7821,7 +7840,7 @@ fn check_function_body_type(
                 target_cfg,
                 false,
                 StrStmtLoopFrame::None,
-                direct_call_signatures,
+                augmented_str_calls.as_ref().or(direct_call_signatures),
             )?
             else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8015,6 +8034,15 @@ fn check_function_body_type(
                 // `Str` locals bind only string literals and earlier `Str`
                 // locals: `let s = "a"`, `let t: Str = s`.
                 let mut str_bindings = StrLocalBindings::new();
+                let augmented_str_calls = str_method_call_signatures(
+                    block,
+                    &str_bindings,
+                    direct_call_signatures,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                );
                 let Some(diagnostics) = check_function_str_local_block(
                     owner,
                     *return_ty,
@@ -8028,7 +8056,7 @@ fn check_function_body_type(
                     target_cfg,
                     false,
                     StrStmtLoopFrame::None,
-                    direct_call_signatures,
+                    augmented_str_calls.as_ref().or(direct_call_signatures),
                 )?
                 else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8275,6 +8303,15 @@ fn check_inherent_method_body_type<'a>(
         }
         *inputs.str_self_field_projections.borrow_mut() = Some(self_field_projections);
         *inputs.str_self_method_calls.borrow_mut() = Some(self_method_calls);
+        let augmented_str_calls = str_method_call_signatures(
+            method_block,
+            &str_bindings,
+            direct_call_signatures,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+        );
         let walk = check_function_str_local_block(
             method_owner,
             *sig.ret.expect("Str return is present"),
@@ -8288,7 +8325,7 @@ fn check_inherent_method_body_type<'a>(
             target_cfg,
             false,
             StrStmtLoopFrame::None,
-            direct_call_signatures,
+            augmented_str_calls.as_ref().or(direct_call_signatures),
         );
         *inputs.str_self_field_projections.borrow_mut() = None;
         *inputs.str_self_method_calls.borrow_mut() = None;
@@ -8310,6 +8347,7 @@ fn check_inherent_method_body_type<'a>(
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
     let mut self_field_projections = HashMap::new();
+    let mut str_field_projections = HashMap::new();
     let mut unknown_self_fields = HashSet::new();
     let mut diagnostics = Vec::new();
     // Self-field operands desugar to `let t = self.f`, so every `self.f`
@@ -8327,6 +8365,7 @@ fn check_inherent_method_body_type<'a>(
             true,
             &field_types,
             &mut self_field_projections,
+            &mut str_field_projections,
             &mut unknown_self_fields,
             &mut diagnostics,
             symbols,
@@ -8349,7 +8388,13 @@ fn check_inherent_method_body_type<'a>(
         params: explicit_body_params,
         ..*body
     };
-    if let Some((type_diagnostics, type_results)) = check_function_body_primitive_local_block(
+    // `self.<Str field>.len()`/`is_empty()` receivers read the same
+    // projections map the `-> Str` walk uses — publish it for the walk.
+    let has_str_projections = !str_field_projections.is_empty();
+    if has_str_projections {
+        *inputs.str_self_field_projections.borrow_mut() = Some(str_field_projections.clone());
+    }
+    let prim_walk = check_function_body_primitive_local_block(
         method_owner,
         explicit_sig,
         &explicit_body,
@@ -8359,11 +8404,16 @@ fn check_inherent_method_body_type<'a>(
         semantic_types,
         symbols,
         Some(&self_field_projections),
+        Some(&str_field_projections),
         Some(&unknown_self_fields),
         inputs,
         snapshot,
         target_cfg,
-    )? {
+    );
+    if has_str_projections {
+        *inputs.str_self_field_projections.borrow_mut() = None;
+    }
+    if let Some((type_diagnostics, type_results)) = prim_walk? {
         diagnostics.extend(type_diagnostics);
         *primitive_type_results = Some(type_results);
         Ok(FunctionBodyTypeCheck::Supported { diagnostics })
@@ -8376,6 +8426,9 @@ struct InherentMethodPrimitiveFields {
     type_name: String,
     type_name_span: sai_diagnostics::Span,
     fields: HashMap<String, sai_resolve::prelude::PrimTy>,
+    // `Str` fields are not `PrimTy`, but `self.<name>` on one is a
+    // valid `s.len()`/`s.is_empty()` receiver — tracked by name.
+    str_fields: HashSet<String>,
     candidate_names: Vec<String>,
 }
 
@@ -8385,6 +8438,7 @@ fn collect_inherent_method_self_field(
     collect_known_type: bool,
     fields: &InherentMethodPrimitiveFields,
     self_field_projections: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+    str_field_projections: &mut HashMap<HirId, &'static str>,
     unknown_self_fields: &mut HashSet<HirId>,
     diagnostics: &mut Vec<Diagnostic>,
     symbols: &Interner,
@@ -8400,6 +8454,20 @@ fn collect_inherent_method_self_field(
         }
         Ok(_) => {}
         Err(name) => {
+            // A `Str` field is not a primitive projection but is a
+            // valid `len`/`is_empty` receiver — record its family.
+            let is_str_field = symbols.resolve(name.sym).ok().is_some_and(|spelling| {
+                fields.str_fields.contains(
+                    sai_syntax::normalize_identifier(
+                        spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+                    )
+                    .as_str(),
+                )
+            });
+            if is_str_field {
+                str_field_projections.insert(expression.hir_id, "`Str`");
+                return Ok(true);
+            }
             unknown_self_fields.insert(expression.hir_id);
             diagnostics.push(unknown_self_field_diagnostic(
                 owner,
@@ -8505,6 +8573,7 @@ fn inherent_method_primitive_field_types(
         return None;
     }
     let mut field_types = HashMap::new();
+    let mut str_field_types = HashSet::new();
     let mut candidate_names = Vec::new();
     for field in fields.fields() {
         if field.attrs().next().is_some() {
@@ -8520,11 +8589,19 @@ fn inherent_method_primitive_field_types(
             .source
             .text()
             .get(range.start().to_usize()..range.end().to_usize())?;
-        let field_type = primitive_method_field_type(ty_text)?;
-        if field_types
-            .insert(normalized_field_name, field_type)
-            .is_some()
-        {
+        if let Some(field_type) = primitive_method_field_type(ty_text) {
+            if field_types
+                .insert(normalized_field_name, field_type)
+                .is_some()
+            {
+                return None;
+            }
+        // `ty` spelled `Str` is the core string only while the file's
+        // own record is not itself named `Str` — a user `type Str`
+        // shadows the prelude name, and `text: Str` then points at it.
+        } else if ty_text == "Str" && normalized_type_name != "Str" {
+            str_field_types.insert(normalized_field_name);
+        } else {
             return None;
         }
         candidate_names.push(field_spelling.to_owned());
@@ -8536,6 +8613,7 @@ fn inherent_method_primitive_field_types(
             .to_owned(),
         type_name_span,
         fields: field_types,
+        str_fields: str_field_types,
         candidate_names,
     })
 }
@@ -8877,6 +8955,11 @@ fn str_inherent_method_field_types(
             .source
             .text()
             .get(range.start().to_usize()..range.end().to_usize())?;
+        // A field spelled `Str` on a record itself named `Str` refers
+        // to the user type shadowing the prelude, not the core string.
+        if ty_text == "Str" && normalized_type_name == "Str" {
+            return None;
+        }
         let field_family = str_method_field_family(ty_text)?;
         if field_types
             .insert(normalized_field_name, field_family)
@@ -9157,6 +9240,7 @@ fn check_function_body_primitive_local_block(
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    str_self_field_projections: Option<&HashMap<HirId, &'static str>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -9227,6 +9311,36 @@ fn check_function_body_primitive_local_block(
     }
     let Some(tail) = block.tail else {
         return Ok(None);
+    };
+    // `s.len()`/`s.is_empty()` calls on `Str` receivers check as
+    // zero-parameter primitive calls: their signatures ride the same
+    // map every admission mirror reads, so augment it before any
+    // shape gate below consults it. `Str` lets anywhere in the body
+    // seed the receiver set alongside the `Str` parameters.
+    let mut str_call_receivers = str_admissions.locals.clone();
+    let mut str_call_scanned = HashSet::new();
+    index_str_method_call_receivers(
+        block,
+        locals,
+        inputs,
+        symbols,
+        type_paths,
+        &mut str_call_receivers,
+        &mut str_call_scanned,
+    );
+    let mut augmented_call_signatures = direct_call_signatures.cloned().unwrap_or_default();
+    index_str_method_call_sites(
+        block,
+        &str_call_receivers,
+        locals,
+        inputs,
+        symbols,
+        &mut augmented_call_signatures,
+    );
+    let direct_call_signatures = if augmented_call_signatures.is_empty() {
+        direct_call_signatures
+    } else {
+        Some(&augmented_call_signatures)
     };
     let is_supported_field_tail = matches!(tail.kind, ExprKind::Field { .. })
         && (self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id))
@@ -9563,6 +9677,7 @@ fn check_function_body_primitive_local_block(
             str_annotations: Some(&str_admissions.annotations),
             primitive_types: &primitive_types,
             self_field_projections,
+            str_self_field_projections,
             unknown_self_fields,
             local_paths: &local_paths,
             call_signatures: direct_call_signatures,
@@ -10601,7 +10716,8 @@ fn primitive_value_expression_shape_is_supported(
         }
         ExprKind::Field { .. }
             if self_field_projections.is_some_and(|fields| fields.contains_key(&init.hir_id))
-                || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id)) => {}
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id))
+                || str_self_field_projected_family(init, inputs) == Some("`Str`") => {}
         ExprKind::Call {
             args, base: None, ..
         } if direct_call_signatures
@@ -11019,7 +11135,12 @@ fn primitive_let_statement_shape_is_supported(
             preceding_bindings,
             locals,
             inputs,
+            symbols,
+            type_paths,
             self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
         ) && msg.is_none_or(|msg| {
             // `Str` literal or a `Str`-typed local per N-C-20.
             matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))
@@ -11143,46 +11264,244 @@ fn primitive_let_statement_shape_is_supported(
         }
     }
 
-    if !primitive_value_expression_shape_is_supported(
-        init,
-        preceding_bindings,
-        locals,
-        inputs,
-        symbols,
-        type_paths,
-        self_field_projections,
-        unknown_self_fields,
-        direct_call_signatures,
-        primitive_types,
-    ) {
+    // `let s: Str = ..` and unannotated `Str`-yielding initializers are
+    // checked by the kernel's `Str` paths — the primitive shape mirror
+    // would reject them before the kernel sees them.
+    let str_init = str_annotated
+        || (ty.is_none()
+            && str_shaped_local_init(
+                init,
+                locals,
+                inputs,
+                &str_admissions.locals,
+                symbols,
+                type_paths,
+            ));
+    // Annotations on `let` statements inside `Str` branch blocks
+    // belong to the same `primitive_types`/`annotations` maps the
+    // kernel reads — collect them so `check_stmt` resolves the inner
+    // annotation.
+    if str_init {
+        collect_str_branch_let_annotations(
+            init,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            primitive_types,
+            str_admissions,
+        );
+    }
+    if !str_init
+        && !primitive_value_expression_shape_is_supported(
+            init,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        )
+    {
         return false;
     }
     preceding_bindings.insert(binding);
     // Track the `Str` locals: an explicit `Str` annotation, or an
     // unannotated binding of a `Str` literal, another `Str` local, or a
     // nested block whose tail yields `Str` the same way.
-    if str_annotated
-        || (ty.is_none() && {
-            let mut str_init = init;
-            loop {
-                match str_init.kind {
-                    ExprKind::Block(block) => match block.tail {
-                        Some(inner_tail) => str_init = inner_tail,
-                        None => break false,
-                    },
-                    ExprKind::Lit(Lit::Str(_)) => break true,
-                    ExprKind::Path(path) => {
-                        break resolved_plain_local_path_binding(path, locals, inputs)
-                            .is_some_and(|source| str_admissions.locals.contains(&source));
-                    }
-                    _ => break false,
-                }
-            }
-        })
-    {
+    if str_init {
         str_admissions.locals.insert(binding);
     }
     true
+}
+
+// Collects the annotations of `let` statements inside the branch
+// blocks of a `Str`-shaped initializer — the admission walk only sees
+// top-level statements, so without this pass an inner `let n: I32 = 1`
+// has no `primitive_types` entry and the kernel rejects it.
+fn collect_str_branch_let_annotations(
+    init: &HirExpr<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+    str_admissions: &mut StrShapeAdmissions,
+) {
+    match init.kind {
+        ExprKind::Block(block) => {
+            collect_str_branch_block_annotations(
+                block,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        ExprKind::If { then, els, .. } => {
+            collect_str_branch_block_annotations(
+                then,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+            if let Some(els) = els {
+                collect_str_branch_let_annotations(
+                    els,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_str_branch_block_annotations(
+    block: &HirBlock<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+    str_admissions: &mut StrShapeAdmissions,
+) {
+    for stmt in block.stmts {
+        if let StmtKind::Let { ty, init, .. } = stmt.kind {
+            if let Some(ty) = ty {
+                match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
+                    Some(FunctionDirectType::Primitive(local_type)) => {
+                        primitive_types.insert(ty.hir_id, local_type);
+                    }
+                    Some(FunctionDirectType::Str) => {
+                        str_admissions.annotations.insert(ty.hir_id);
+                    }
+                    _ => {}
+                }
+            }
+            // Nested block/`if` initializers can carry their own
+            // annotated `let`s.
+            collect_str_branch_let_annotations(
+                init,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+    }
+    if let Some(tail) = block.tail {
+        collect_str_branch_let_annotations(
+            tail,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            primitive_types,
+            str_admissions,
+        );
+    }
+}
+
+// Whether an unannotated `let` initializer yields a `Str`: a `Str`
+// literal, a path to an already-tracked `Str` binding, or a nested
+// block whose tail yields `Str` the same way. `str_bindings` carries
+// the `Str` bindings known so far.
+fn str_shaped_local_init(
+    init: &HirExpr<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    str_bindings: &HashSet<sai_hir::BindingId>,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+) -> bool {
+    match init.kind {
+        ExprKind::Block(block) => {
+            str_shaped_branch_block(block, locals, inputs, str_bindings, symbols, type_paths)
+        }
+        ExprKind::Lit(Lit::Str(_)) => true,
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|source| str_bindings.contains(&source)),
+        // `let t = self.text` aliases a `Str` field; a `match`
+        // yields `Str` when every arm body is a `Str` binding.
+        ExprKind::Field { .. } => str_self_field_projected_family(init, inputs) == Some("`Str`"),
+        ExprKind::Match { arms, .. } => {
+            !arms.is_empty()
+                && arms.iter().all(|arm| match arm.body.kind {
+                    ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                        .is_some_and(|source| str_bindings.contains(&source)),
+                    _ => false,
+                })
+        }
+        // `let s = if c { "a" } else { "b" }` yields `Str` when both
+        // branches do (an `else if` chain recurses through `els`).
+        ExprKind::If { then, els, .. } => {
+            str_shaped_branch_block(then, locals, inputs, str_bindings, symbols, type_paths)
+                && els.is_some_and(|els| {
+                    str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
+                })
+        }
+        _ => false,
+    }
+}
+
+// A `Str`-yielding branch block: safe, statements limited to `let`/
+// `assert` (the shapes `check_stmt` covers inside branch blocks), and
+// a `Str`-shaped tail. `let` statements inside the block seed the
+// `Str` set the tail resolves against (`let t = "x"` then `t`).
+fn str_shaped_branch_block(
+    block: &HirBlock<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    str_bindings: &HashSet<sai_hir::BindingId>,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+) -> bool {
+    if block.safety != sai_hir::Safety::Safe {
+        return false;
+    }
+    let mut inner = str_bindings.clone();
+    for stmt in block.stmts {
+        match stmt.kind {
+            StmtKind::Let { pat, ty, init, .. } => {
+                let str_annotated = ty.is_some_and(|ty| {
+                    matches!(
+                        resolve_function_direct_type(*ty, type_paths, symbols, inputs),
+                        Some(FunctionDirectType::Str)
+                    )
+                });
+                if let PatKind::Binding { binding, .. } = pat.kind {
+                    if str_annotated
+                        || (ty.is_none()
+                            && str_shaped_local_init(
+                                init, locals, inputs, &inner, symbols, type_paths,
+                            ))
+                    {
+                        inner.insert(binding);
+                    }
+                }
+            }
+            StmtKind::Assert { .. } => {}
+            _ => return false,
+        }
+    }
+    block.tail.is_some_and(|tail| {
+        str_shaped_local_init(tail, locals, inputs, &inner, symbols, type_paths)
+    })
 }
 
 fn primitive_if_tail_shape_is_supported(
@@ -11210,7 +11529,12 @@ fn primitive_if_tail_shape_is_supported(
         preceding_bindings,
         locals,
         inputs,
+        symbols,
+        type_paths,
         self_field_projections,
+        unknown_self_fields,
+        direct_call_signatures,
+        primitive_types,
     ) {
         return false;
     }
@@ -11257,12 +11581,18 @@ fn primitive_if_tail_shape_is_supported(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn primitive_if_condition_shape_is_supported(
     condition: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     match condition.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
@@ -11272,6 +11602,20 @@ fn primitive_if_condition_shape_is_supported(
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&condition.hir_id))
         }
+        // A `Bool` call — `if is_ready()` or `if s.is_empty()` — checks as an
+        // operand leaf the same way the checker's condition evaluation types it.
+        ExprKind::Call { .. } => primitive_direct_call_operand_shape_is_supported(
+            condition,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
             ExprKind::Path(operand_path) => {
                 resolved_plain_local_path_binding(operand_path, locals, inputs)
@@ -11280,6 +11624,18 @@ fn primitive_if_condition_shape_is_supported(
             ExprKind::Field { .. } => {
                 self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
             }
+            ExprKind::Call { .. } => primitive_direct_call_operand_shape_is_supported(
+                operand,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            ),
             // `not` operands recurse shallowly — the checker runs the shared
             // logical-operand machinery, so `not not`, `not true`, and nested
             // `and`/`or`/comparison operands are admitted here.
@@ -11827,7 +12183,12 @@ fn primitive_match_tail_shape_is_supported(
                 bindings,
                 locals,
                 inputs,
+                symbols,
+                type_paths,
                 self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
             ) {
                 return false;
             }
@@ -12115,7 +12476,12 @@ fn primitive_if_stmt_shape_is_supported(
         preceding_bindings,
         locals,
         inputs,
+        symbols,
+        type_paths,
         self_field_projections,
+        unknown_self_fields,
+        direct_call_signatures,
+        primitive_types,
     ) {
         return false;
     }
@@ -12247,7 +12613,12 @@ fn primitive_match_stmt_shape_is_supported(
                     bindings,
                     locals,
                     inputs,
+                    symbols,
+                    type_paths,
                     self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
                 ) {
                     return false;
                 }
@@ -13798,6 +14169,269 @@ fn direct_primitive_call_site(
             parameters: signature.parameters.clone(),
             output: signature.output,
         })
+}
+
+// The Stage-1 `Str` inherent methods the bounded walk admits: `len`
+// and `is_empty` (§16.9.2). Each takes only `self` and returns a
+// primitive, so a `s.len()`/`s.is_empty()` call on a `Str` receiver
+// checks as a zero-parameter primitive call — the call's
+// `PrimitiveCallSignature` rides the same map the admission mirrors
+// already consult, and sites the checker never reaches stay inert.
+fn str_method_call_output(name: Name, symbols: &Interner) -> Option<sai_resolve::prelude::PrimTy> {
+    let resolved = symbols.resolve(name.sym).ok()?;
+    match sai_syntax::normalize_identifier(resolved.as_ref()).as_str() {
+        "len" => Some(sai_resolve::prelude::PrimTy::USize),
+        "is_empty" => Some(sai_resolve::prelude::PrimTy::Bool),
+        _ => None,
+    }
+}
+
+// Whole-body `s.len()`/`s.is_empty()` indexing for a `-> Str` walk:
+// returns `call_signatures` augmented with the pseudo-signatures of
+// every `Str`-receiver site, or `None` when the body has none. Run
+// once at the top level — nested-block recursions share the map.
+fn str_method_call_signatures(
+    block: &HirBlock<'_>,
+    str_bindings: &StrLocalBindings,
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+) -> Option<HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>> {
+    let mut calls = call_signatures.cloned().unwrap_or_default();
+    let before = calls.len();
+    let mut receivers: HashSet<sai_hir::BindingId> = str_bindings
+        .iter()
+        .filter(|(_, entry)| entry.family == "`Str`")
+        .map(|(binding, _)| *binding)
+        .collect();
+    let mut scanned = HashSet::new();
+    index_str_method_call_receivers(
+        block,
+        locals,
+        inputs,
+        symbols,
+        type_paths,
+        &mut receivers,
+        &mut scanned,
+    );
+    index_str_method_call_sites(block, &receivers, locals, inputs, symbols, &mut calls);
+    if calls.len() > before {
+        Some(calls)
+    } else {
+        None
+    }
+}
+
+// The `let` bindings whose initializer yields `Str` — the receivers a
+// `s.len()`/`s.is_empty()` call may name. `receivers` starts with the
+// body's `Str` parameters (and `Str`-family seeds in the `-> Str`
+// walk); the scan adds `let s: Str` and `let` bindings with a
+// `Str`-shaped initializer, recursing into nested blocks so a binding
+// at any depth seeds its own block's call sites. Shadowing stays
+// correct because paths resolve to their innermost binding.
+fn index_str_method_call_receivers(
+    block: &HirBlock<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    receivers: &mut HashSet<sai_hir::BindingId>,
+    scanned: &mut HashSet<HirId>,
+) {
+    // The expression visitor descends into nested blocks itself, so
+    // without this guard a block is re-scanned once per enclosing
+    // statement expression — exponential on deep nesting.
+    if !scanned.insert(block.hir_id) {
+        return;
+    }
+    for statement in block.stmts {
+        match statement.kind {
+            StmtKind::Let {
+                pat, ty, init, els, ..
+            } => {
+                // Scan the initializer first so a `match`-arm binding
+                // inside it is visible to `str_shaped_local_init`.
+                index_str_method_call_receivers_in_expr(
+                    init, locals, inputs, symbols, type_paths, receivers, scanned,
+                );
+                if let PatKind::Binding { binding, .. } = pat.kind {
+                    let str_annotated = ty.is_some_and(|ty| {
+                        matches!(
+                            resolve_function_direct_type(*ty, type_paths, symbols, inputs),
+                            Some(FunctionDirectType::Str)
+                        )
+                    });
+                    if str_annotated
+                        || (ty.is_none()
+                            && str_shaped_local_init(
+                                init, locals, inputs, receivers, symbols, type_paths,
+                            ))
+                    {
+                        receivers.insert(binding);
+                    }
+                }
+                if let Some(els) = els {
+                    index_str_method_call_receivers(
+                        els, locals, inputs, symbols, type_paths, receivers, scanned,
+                    );
+                }
+            }
+            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                index_str_method_call_receivers_in_expr(
+                    lhs, locals, inputs, symbols, type_paths, receivers, scanned,
+                );
+                index_str_method_call_receivers_in_expr(
+                    rhs, locals, inputs, symbols, type_paths, receivers, scanned,
+                );
+            }
+            StmtKind::Assert { cond, msg, .. } => {
+                index_str_method_call_receivers_in_expr(
+                    cond, locals, inputs, symbols, type_paths, receivers, scanned,
+                );
+                if let Some(msg) = msg {
+                    index_str_method_call_receivers_in_expr(
+                        msg, locals, inputs, symbols, type_paths, receivers, scanned,
+                    );
+                }
+            }
+            StmtKind::Expr(expression) => index_str_method_call_receivers_in_expr(
+                expression, locals, inputs, symbols, type_paths, receivers, scanned,
+            ),
+        }
+    }
+    if let Some(tail) = block.tail {
+        index_str_method_call_receivers_in_expr(
+            tail, locals, inputs, symbols, type_paths, receivers, scanned,
+        );
+    }
+}
+
+// Every block nested inside `expression` gets its own `let` scan:
+// `visit_expression_tree` walks into block expressions and yields their
+// contents, while `if`/`loop`/`closure` bodies are `HirBlock`s it never
+// yields — intercept both so a `let` at any depth registers. `match`
+// arms over a `Str` scrutinee bind `Str` values.
+fn index_str_method_call_receivers_in_expr(
+    expression: &HirExpr<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    receivers: &mut HashSet<sai_hir::BindingId>,
+    scanned: &mut HashSet<HirId>,
+) {
+    visit_expression_tree(expression, &mut |nested| match nested.kind {
+        ExprKind::Block(block)
+        | ExprKind::AsyncBlock { block, .. }
+        | ExprKind::Region { block, .. } => index_str_method_call_receivers(
+            block, locals, inputs, symbols, type_paths, receivers, scanned,
+        ),
+        ExprKind::If { then, .. } => index_str_method_call_receivers(
+            then, locals, inputs, symbols, type_paths, receivers, scanned,
+        ),
+        ExprKind::Loop { body, .. } => index_str_method_call_receivers(
+            body, locals, inputs, symbols, type_paths, receivers, scanned,
+        ),
+        ExprKind::Closure(closure) => index_str_method_call_receivers(
+            closure.body,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            receivers,
+            scanned,
+        ),
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } if str_method_call_receiver_is_str(scrutinee, receivers, locals, inputs) => {
+            for arm in arms.iter() {
+                if let PatKind::Binding { binding, .. } = arm.pat.kind {
+                    receivers.insert(binding);
+                }
+            }
+        }
+        _ => {}
+    });
+}
+
+// Whether `expression` is a `Str` receiver for `len`/`is_empty` — a
+// `Path` to a `Str`-tracked binding, a `Str` literal, or a `self.<field>`
+// projection of `Str` family.
+fn str_method_call_receiver_is_str(
+    expression: &HirExpr<'_>,
+    receivers: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    match expression.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| receivers.contains(&binding)),
+        ExprKind::Lit(Lit::Str(_)) => true,
+        ExprKind::Field { .. } => {
+            str_self_field_projected_family(expression, inputs) == Some("`Str`")
+        }
+        _ => false,
+    }
+}
+
+// `s.len()` and `s.is_empty()` calls whose receiver resolves to a
+// `Str` — a `Str`-tracked local path, a `Str` literal, or a `self`
+// field of `Str` family in the `-> Str` method walk — are registered
+// as zero-parameter primitive calls. Arity mismatches (`s.len(1)`),
+// explicit generics (`s.len::<T>()`), and other `Str` methods
+// (`s.trim()`) are not registered and stay gated.
+fn index_str_method_call_sites(
+    block: &HirBlock<'_>,
+    receivers: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    calls: &mut HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>,
+) {
+    visit_block_expressions(block, &mut |expression| {
+        let ExprKind::Call {
+            callee,
+            args,
+            base: None,
+        } = expression.kind
+        else {
+            return;
+        };
+        if !args.is_empty() {
+            return;
+        }
+        let ExprKind::Field {
+            base,
+            name,
+            args: None,
+        } = callee.kind
+        else {
+            return;
+        };
+        // `s.len()` is method-call syntax; a parenthesized callee
+        // `(s.len)()` is a function-value read and stays gated — HIR
+        // erases the parens, so the source text after the callee decides.
+        if !str_call_callee_is_method_syntax(
+            inputs.source.text(),
+            callee.span.range.end().to_usize(),
+        ) {
+            return;
+        }
+        let Some(output) = str_method_call_output(name, symbols) else {
+            return;
+        };
+        if str_method_call_receiver_is_str(base, receivers, locals, inputs) {
+            calls.entry(expression.hir_id).or_insert(
+                sai_ty::typeck::body::PrimitiveCallSignature {
+                    callee: callee.hir_id,
+                    parameters: Vec::new(),
+                    output,
+                },
+            );
+        }
+    });
 }
 
 fn check_const_tuple_literal(
@@ -16888,6 +17522,8 @@ fn check_function_str_local_block(
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    // `s.len()`/`s.is_empty()` call sites were indexed by the top-level
+    // caller and ride `call_signatures` — nested blocks share the map.
     let carried = str_seed_cells(str_bindings);
     let mut diagnostics = Vec::new();
     for stmt in block.stmts {
@@ -60802,6 +61438,9 @@ property "shared"() {}
             // not the literal's type.
             (22, "expected `Str`, found a byte string literal"),
             (23, "expected `I64`, found a string literal"),
+            // `let s: Str = b"a"` — the `Str` annotation's literal
+            // mismatch names the literal kind, not a gate.
+            (28, "expected `Str`, found a byte string literal"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
@@ -60830,14 +61469,109 @@ property "shared"() {}
         );
         assert_eq!(diagnostics[1].code, sai_diagnostics::Code::TypeMismatch);
         assert_eq!(diagnostics[1].message, "expected `I64`, found `Str`");
-        // Gated owners: `Str` arithmetic operands, a `Str` match scrutinee,
-        // a literal-variable `Str` assignment, and a `Slice<Byte>`
-        // initializer stay outside the slice.
-        for owner in &owners[25..] {
+        // Gated owners: `Str` arithmetic operands, a `Str` match
+        // scrutinee, and a literal-variable `Str` assignment stay
+        // outside the slice.
+        for owner in &owners[25..28] {
             assert!(matches!(
                 owner
                     .body_type_check()
                     .expect("gated Str function body check succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_admits_str_method_calls_in_primitive_bodies() {
+        let root = concat!(
+            "pub fn str_len(value: Str) -> USize { value.len() }\n",
+            "pub fn str_is_empty(value: Str) -> Bool { value.is_empty() }\n",
+            "pub fn str_local_len() -> USize { let s = \"a\"\n    s.len() }\n",
+            "pub fn str_alias_len(value: Str) -> USize { let t = value\n    t.len() }\n",
+            "pub fn str_literal_len() -> USize { \"a\".len() }\n",
+            "pub fn str_len_arith(value: Str) -> USize { value.len() + 1 }\n",
+            "pub fn str_len_let(value: Str) -> USize { let n = value.len()\n    n }\n",
+            "pub fn str_if_call_condition(value: Str) -> Bool { if value.is_empty() { true } else { false } }\n",
+            "pub fn str_while_call_condition(value: Str) -> Bool { while value.is_empty() { break }\n    true }\n",
+            "pub fn str_assert_call_condition(value: Str) -> Bool { assert value.is_empty()\n    true }\n",
+            "pub fn str_len_trivia(value: Str) -> USize { value.len /* note */ () }\n",
+            "pub fn str_not_call(value: Str) -> Bool { not value.is_empty() }\n",
+            "pub fn str_body_if_call(value: Str) -> Str { if value.is_empty() { \"a\" } else { \"b\" } }\n",
+            "pub fn str_if_init_len(flag: Bool) -> USize { let s = if flag { \"a\" } else { \"b\" }\n    s.len() }\n",
+            "pub fn str_if_init_annotated(flag: Bool) -> USize { let s: Str = if flag { \"a\" } else if flag { \"b\" } else { \"c\" }\n    s.len() }\n",
+            "pub fn str_if_init_local(flag: Bool) -> USize { let text = \"a\"\n    let s = if flag { text } else { \"b\" }\n    s.len() }\n",
+            "pub fn str_block_init_let() -> USize { let s = { let n: I32 = 1\n        \"a\" }\n    s.len() }\n",
+            "pub fn str_len_mismatch(value: Str) -> I32 { value.len() }\n",
+            "pub fn str_len_bind(value: Str) -> Bool { let n: I32 = value.len()\n    true }\n",
+            "pub fn str_len_condition(value: Str) -> Bool { if value.len() { true } else { false } }\n",
+            "pub fn str_is_empty_mismatch(value: Str) -> USize { value.is_empty() }\n",
+            "pub fn str_trim(value: Str) -> Bool { value.trim()\n    true }\n",
+            "pub fn str_len_arg(value: Str) -> Bool { value.len(1)\n    true }\n",
+            "pub fn str_len_generic(value: Str) -> Bool { value.len<U8>()\n    true }\n",
+            "pub fn str_len_value(value: Str) -> Bool { (value.len)()\n    true }\n",
+            "pub fn str_len_bare(value: Str) -> Bool { value.len\n    true }\n",
+            "pub fn int_len() -> Bool { let n = 1\n    n.len()\n    true }\n",
+            "pub fn str_chars(value: Str) -> Bool { value.chars()\n    true }\n",
+            "pub fn str_unsafe_branch(flag: Bool) -> USize { let s = if flag { unsafe { \"a\" } } else { \"b\" }\n    s.len() }\n",
+            "pub fn str_block_expr_stmt() -> USize { let s = { 1\n        \"a\" }\n    s.len() }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 30);
+        // Clean supported owners: `s.len()` -> `USize` and
+        // `s.is_empty()` -> `Bool` on `Str` parameters, `Str` locals and
+        // aliases, `Str` literals, and `self.<Str field>` receivers — in
+        // operand, `let`-initializer (literal, `if`-yielding, and
+        // `Str`-annotated `if`), `if`/`while`/`assert`/`not` condition,
+        // and `-> Str` body positions.
+        for owner in &owners[..17] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("Str method call function body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        // The injected `USize`/`Bool` outputs produce the ordinary
+        // primitive type mismatches in binding and condition positions.
+        for (index, expected_message) in [
+            (17, "expected `I32`, found `USize`"),
+            (18, "expected `I32`, found `USize`"),
+            (19, "expected `Bool`, found `USize`"),
+            (20, "expected `USize`, found `Bool`"),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("Str method call mismatch remains in the supported slice")
+            else {
+                panic!("Str method call mismatch remains in the supported slice");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            assert_eq!(diagnostics[0].message, expected_message);
+        }
+        // Gated owners: unknown methods, call arguments, generic method
+        // arguments, a parenthesized callee `(s.len)()`, a bare field
+        // read, a non-`Str` receiver, and `s.chars()` stay outside.
+        for owner in &owners[21..] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("gated Str method call check succeeds"),
                 FunctionBodyTypeCheck::Unsupported
             ));
         }
@@ -62958,6 +63692,7 @@ property "shared"() {}
                 primitive_types: &std::collections::HashMap::new(),
                 self_field_projections: None,
                 unknown_self_fields: None,
+                str_self_field_projections: None,
                 local_paths: &diagnostic_order_local_paths,
                 call_signatures: None,
                 mutable_params: None,

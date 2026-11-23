@@ -4769,6 +4769,10 @@ fn primitive_body_str_mismatches_report_type_diagnostics() {
             "expected `Str`, found an integer literal",
         ),
         (
+            "pub fn str_annotated_bytestring() -> Bool {\n    let s: Str = b\"a\"\n    true\n}\n",
+            "expected `Str`, found a byte string literal",
+        ),
+        (
             "pub fn bool_str_eq(value: Str) -> Bool { true == value }\n",
             "expected `Bool`, found `Str`",
         ),
@@ -4807,7 +4811,78 @@ fn primitive_body_str_forms_outside_the_slice_remain_gated() {
         "pub fn str_arith() -> Bool {\n    let s = \"a\"\n    s + 1 == 2\n}\n",
         "pub fn str_match() -> Bool {\n    let s = \"a\"\n    match s { \"x\" => true, _ => false }\n}\n",
         "pub fn str_assign_int() -> Bool {\n    var n = 1\n    n = \"a\"\n    true\n}\n",
-        "pub fn str_annotated_bytestring() -> Bool {\n    let s: Str = b\"a\"\n    true\n}\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
+fn primitive_bodies_admit_str_method_calls() {
+    for source in [
+        "pub fn str_len(value: Str) -> USize { value.len() }\n",
+        "pub fn str_is_empty(value: Str) -> Bool { value.is_empty() }\n",
+        "pub fn str_local_len() -> USize {\n    let s = \"a\"\n    s.len()\n}\n",
+        "pub fn str_alias_len(value: Str) -> USize {\n    let t = value\n    t.len()\n}\n",
+        "pub fn str_literal_len() -> USize { \"a\".len() }\n",
+        "pub fn str_len_arith(value: Str) -> USize { value.len() + 1 }\n",
+        "pub fn str_len_let(value: Str) -> USize {\n    let n = value.len()\n    n\n}\n",
+        "pub fn str_if_call_condition(value: Str) -> Bool {\n    if value.is_empty() { true } else { false }\n}\n",
+        "pub fn str_while_call_condition(value: Str) -> Bool {\n    while value.is_empty() { break }\n    true\n}\n",
+        "pub fn str_assert_call_condition(value: Str) -> Bool {\n    assert value.is_empty()\n    true\n}\n",
+        "pub fn str_len_trivia(value: Str) -> USize { value.len /* note */ () }\n",
+        "pub fn str_not_call(value: Str) -> Bool { not value.is_empty() }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_body_str_method_call_mismatches_report_type_diagnostics() {
+    for (source, expected) in [
+        (
+            "pub fn str_len_mismatch(value: Str) -> I32 { value.len() }\n",
+            "expected `I32`, found `USize`",
+        ),
+        (
+            "pub fn str_len_bind(value: Str) -> Bool {\n    let n: I32 = value.len()\n    true\n}\n",
+            "expected `I32`, found `USize`",
+        ),
+        (
+            "pub fn str_len_condition(value: Str) -> Bool {\n    if value.len() { true } else { false }\n}\n",
+            "expected `Bool`, found `USize`",
+        ),
+        (
+            "pub fn str_is_empty_mismatch(value: Str) -> USize { value.is_empty() }\n",
+            "expected `USize`, found `Bool`",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: Str method call mismatch should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && stdout.contains(expected)
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a supported type mismatch naming {expected}:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn primitive_body_str_method_call_forms_outside_the_slice_remain_gated() {
+    for source in [
+        "pub fn str_trim(value: Str) -> Bool {\n    value.trim()\n    true\n}\n",
+        "pub fn str_len_arg(value: Str) -> Bool {\n    value.len(1)\n    true\n}\n",
+        "pub fn str_len_generic(value: Str) -> Bool {\n    value.len<U8>()\n    true\n}\n",
+        "pub fn str_len_value(value: Str) -> Bool {\n    (value.len)()\n    true\n}\n",
+        "pub fn str_len_bare(value: Str) -> Bool {\n    value.len\n    true\n}\n",
+        "pub fn int_len() -> Bool {\n    let n = 1\n    n.len()\n    true\n}\n",
+        "pub fn str_chars(value: Str) -> Bool {\n    value.chars()\n    true\n}\n",
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);
@@ -21129,12 +21204,13 @@ fn binary_bitwise_byte_scalar_literal_rhs_exclusions_remain_behind_the_stage_gat
 }
 
 #[test]
-fn direct_self_recursive_single_function_does_not_bypass_the_stage_gate() {
+fn direct_self_recursive_single_function_checks() {
     let source = "pub fn recurse(value: I32) -> I32 { recurse(recurse(value)) }\n";
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "nested direct self-recursive function",
+    assert!(
+        output.status.success(),
+        "nested direct self-recursive function checks:\n{}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
