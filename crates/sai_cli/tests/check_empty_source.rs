@@ -10793,9 +10793,7 @@ fn assign_statement_errors_emit_their_diagnostics() {
 
 #[test]
 fn unsupported_var_forms_remain_gated() {
-    for source in [
-        "pub fn run() -> I32 { var total: I32 = 0\n    missing = 1\n    total\n }\n",
-    ] {
+    for source in ["pub fn run() -> I32 { var total: I32 = 0\n    missing = 1\n    total\n }\n"] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 }
