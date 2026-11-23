@@ -7653,6 +7653,7 @@ fn check_function_body_type(
                 target_cfg,
                 false,
                 StrStmtLoopFrame::None,
+                direct_call_signatures,
             )?
             else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -7823,6 +7824,7 @@ fn check_function_body_type(
                 target_cfg,
                 false,
                 StrStmtLoopFrame::None,
+                direct_call_signatures,
             )?
             else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8029,6 +8031,7 @@ fn check_function_body_type(
                     target_cfg,
                     false,
                     StrStmtLoopFrame::None,
+                    direct_call_signatures,
                 )?
                 else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -13593,6 +13596,8 @@ fn str_expr_family(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<(&'static str, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     if let Some(found) = str_literal_family_init(
         owner,
@@ -13621,6 +13626,7 @@ fn str_expr_family(
                 inputs,
                 snapshot,
                 target_cfg,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -13729,6 +13735,7 @@ fn str_expr_family(
                 inputs,
                 snapshot,
                 target_cfg,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -13745,6 +13752,7 @@ fn str_expr_family(
                 inputs,
                 snapshot,
                 target_cfg,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -14211,6 +14219,7 @@ fn str_expr_family(
                 target_cfg,
                 return_ty,
                 type_paths,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -14232,6 +14241,7 @@ fn str_expr_family(
                 inputs,
                 snapshot,
                 target_cfg,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -14251,6 +14261,7 @@ fn str_expr_family(
                         inputs,
                         snapshot,
                         target_cfg,
+                        call_signatures,
                     )
                 }
                 _ => Ok(None),
@@ -14300,6 +14311,60 @@ fn str_expr_family(
                 diagnostics,
             )))
         }
+        // A direct call resolves through the projected callee signature:
+        // arguments check against the parameter primitives and the call
+        // yields the callee's output family.
+        ExprKind::Call {
+            args, base: None, ..
+        } => {
+            let Some(signature) =
+                call_signatures.and_then(|signatures| signatures.get(&expr.hir_id))
+            else {
+                return Ok(None);
+            };
+            if args.len() != signature.parameters.len() {
+                return Ok(None);
+            }
+            let Some(result_family) = str_prim_family_name(signature.output) else {
+                return Ok(None);
+            };
+            let mut diagnostics = Vec::new();
+            for (argument, parameter) in args.iter().zip(&signature.parameters) {
+                let Some((family, mut arg_diagnostics)) = str_expr_family(
+                    owner,
+                    return_ty,
+                    argument.expr,
+                    locals,
+                    str_bindings,
+                    Some(*parameter),
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    call_signatures,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut arg_diagnostics);
+                if let Some(parameter_family) = str_prim_family_name(*parameter)
+                    && family != parameter_family
+                    && family != "`!`"
+                {
+                    diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        argument.expr.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected {parameter_family}, found {family}"),
+                        "type mismatch",
+                    )?);
+                }
+            }
+            Ok(Some((result_family, diagnostics)))
+        }
         ExprKind::Block(block) => str_block_family(
             owner,
             return_ty,
@@ -14312,6 +14377,7 @@ fn str_expr_family(
             inputs,
             snapshot,
             target_cfg,
+            call_signatures,
         ),
         ExprKind::Loop {
             body,
@@ -14329,6 +14395,7 @@ fn str_expr_family(
             inputs,
             snapshot,
             target_cfg,
+            call_signatures,
         ),
         ExprKind::Match {
             scrutinee,
@@ -14348,6 +14415,7 @@ fn str_expr_family(
             inputs,
             snapshot,
             target_cfg,
+            call_signatures,
         ),
         _ => Ok(None),
     }
@@ -14538,11 +14606,36 @@ fn str_match_family(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<(&'static str, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
+    let mut diagnostics = Vec::new();
+    // The scrutinee walks like the checker's: locals and literals first,
+    // then the general expression walk so calls and operand trees resolve.
     let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
         Some("`Str`")
+    } else if let Some(family) = str_binding_family(scrutinee, locals, str_bindings) {
+        Some(family)
     } else {
-        str_binding_family(scrutinee, locals, str_bindings)
+        let Some((family, mut scrutinee_diagnostics)) = str_expr_family(
+            owner,
+            return_ty,
+            scrutinee,
+            locals,
+            str_bindings,
+            None,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            call_signatures,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut scrutinee_diagnostics);
+        Some(family)
     };
     let Some(scrutinee_family) = scrutinee_family else {
         return Ok(None);
@@ -14560,7 +14653,6 @@ fn str_match_family(
             None => return Ok(None),
         }
     };
-    let mut diagnostics = Vec::new();
     // A scalar annotation seeds the arm join like the checker's β — a
     // literal arm body checks against the annotation through the
     // expression walk's `expected`, and a differing arm family reports
@@ -14640,6 +14732,7 @@ fn str_match_family(
                     target_cfg,
                     return_ty,
                     type_paths,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -14659,6 +14752,7 @@ fn str_match_family(
             inputs,
             snapshot,
             target_cfg,
+            call_signatures,
         )?
         else {
             return Ok(None);
@@ -14731,6 +14825,8 @@ fn str_block_family(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<(&'static str, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     if block.safety != sai_hir::Safety::Safe {
         return Ok(None);
@@ -14748,8 +14844,18 @@ fn str_block_family(
             return Ok(None);
         };
         let Some((family, mut stmt_diagnostics)) = str_expr_family(
-            owner, return_ty, init, locals, &inner, None, type_paths, symbols, inputs, snapshot,
+            owner,
+            return_ty,
+            init,
+            locals,
+            &inner,
+            None,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
             target_cfg,
+            call_signatures,
         )?
         else {
             return Ok(None);
@@ -14776,8 +14882,18 @@ fn str_block_family(
         return Ok(None);
     };
     let Some((family, mut tail_diagnostics)) = str_expr_family(
-        owner, return_ty, tail, locals, &inner, expected, type_paths, symbols, inputs, snapshot,
+        owner,
+        return_ty,
+        tail,
+        locals,
+        &inner,
+        expected,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
         target_cfg,
+        call_signatures,
     )?
     else {
         return Ok(None);
@@ -14805,6 +14921,8 @@ fn str_loop_family(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<(&'static str, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     let Some(mut diagnostics) = str_stmt_block_unit(
         owner,
@@ -14820,6 +14938,7 @@ fn str_loop_family(
         target_cfg,
         false,
         StrStmtLoopFrame::Loop,
+        call_signatures,
     )?
     else {
         return Ok(None);
@@ -14834,6 +14953,7 @@ fn str_loop_family(
         inputs,
         &mut contributions,
         false,
+        call_signatures,
     );
     // A `break` whose value classifies carries its family; an unclassed
     // value gets one pass through the expression walk (`break if`/nested
@@ -14859,6 +14979,7 @@ fn str_loop_family(
                 inputs,
                 snapshot,
                 target_cfg,
+                call_signatures,
             )?,
             None => None,
         };
@@ -15087,6 +15208,8 @@ fn str_condition(
     target_cfg: &TargetCfg,
     return_ty: Ty<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
         || str_comparison_condition(cond, locals, str_bindings)
@@ -15240,6 +15363,7 @@ fn str_condition(
             target_cfg,
             return_ty,
             type_paths,
+            call_signatures,
         );
     }
     if let ExprKind::Binary(BinOp::And | BinOp::Or, lhs, rhs) = cond.kind {
@@ -15256,6 +15380,7 @@ fn str_condition(
                 target_cfg,
                 return_ty,
                 type_paths,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -15280,6 +15405,7 @@ fn str_condition(
         inputs,
         snapshot,
         target_cfg,
+        call_signatures,
     )? {
         // Compound value shapes (`if`/`match`) already reported the
         // offending branch against the `Bool` expectation — a
@@ -15319,6 +15445,8 @@ fn check_function_str_local_block(
     target_cfg: &TargetCfg,
     break_ctx: bool,
     frame: StrStmtLoopFrame,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let carried = str_seed_cells(str_bindings);
     let mut diagnostics = Vec::new();
@@ -15337,6 +15465,7 @@ fn check_function_str_local_block(
                 target_cfg,
                 return_ty,
                 type_paths,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -15376,6 +15505,7 @@ fn check_function_str_local_block(
                             inputs,
                             snapshot,
                             target_cfg,
+                            call_signatures,
                         )?
                         else {
                             return Ok(None);
@@ -15411,6 +15541,7 @@ fn check_function_str_local_block(
                             target_cfg,
                             break_ctx,
                             StrStmtLoopFrame::Loop,
+                            call_signatures,
                         )?
                         else {
                             return Ok(None);
@@ -15433,6 +15564,7 @@ fn check_function_str_local_block(
                     target_cfg,
                     break_ctx,
                     frame,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -15520,21 +15652,23 @@ fn check_function_str_local_block(
         // bind whatever family the fold reports — a `Str` result only
         // arises from arithmetic on `Str` operands, which already
         // carries the operand diagnostic.
-        if matches!(init.kind, ExprKind::Unary(_, _) | ExprKind::Binary(_, _, _))
-            && let Some((family, mut init_diagnostics)) = str_expr_family(
-                owner,
-                return_ty,
-                init,
-                locals,
-                str_bindings,
-                expected,
-                type_paths,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
-            )?
-        {
+        if matches!(
+            init.kind,
+            ExprKind::Unary(_, _) | ExprKind::Binary(_, _, _) | ExprKind::Call { base: None, .. }
+        ) && let Some((family, mut init_diagnostics)) = str_expr_family(
+            owner,
+            return_ty,
+            init,
+            locals,
+            str_bindings,
+            expected,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            call_signatures,
+        )? {
             let PatKind::Binding {
                 mode: sai_hir::patterns::BindingMode::Value,
                 binding,
@@ -15586,6 +15720,7 @@ fn check_function_str_local_block(
             // A scalar pin must bind through this path too — a matching
             // family (`I8` init on `x: I8`) or a `Str` mismatch (`x: I8 =
             // "a"`) both bind the pin rather than the Str-initializer walk.
+            call_signatures,
         )? && (family != "`Str`" || pinned.is_some_and(|p| p != "`Str`"))
         {
             let PatKind::Binding {
@@ -15650,6 +15785,7 @@ fn check_function_str_local_block(
                     target_cfg,
                     return_ty,
                     type_paths,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -15691,6 +15827,7 @@ fn check_function_str_local_block(
                     target_cfg,
                     break_ctx,
                     frame,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -15711,6 +15848,7 @@ fn check_function_str_local_block(
                         target_cfg,
                         break_ctx,
                         frame,
+                        call_signatures,
                     )?
                     else {
                         return Ok(None);
@@ -15731,6 +15869,7 @@ fn check_function_str_local_block(
                         target_cfg,
                         break_ctx,
                         frame,
+                        call_signatures,
                     )?
                     else {
                         return Ok(None);
@@ -15759,6 +15898,7 @@ fn check_function_str_local_block(
                     snapshot,
                     target_cfg,
                     true,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -15812,6 +15952,7 @@ fn check_function_str_local_block(
                     target_cfg,
                     break_ctx,
                     frame,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -15869,6 +16010,7 @@ fn check_function_str_local_block(
         target_cfg,
         break_ctx,
         frame,
+        call_signatures,
     )?
     else {
         return Ok(None);
@@ -15943,6 +16085,8 @@ fn str_stmt_expr_unit(
     target_cfg: &TargetCfg,
     break_ctx: bool,
     frame: StrStmtLoopFrame,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     match expr.kind {
         ExprKind::If { cond, then, els } => {
@@ -15957,6 +16101,7 @@ fn str_stmt_expr_unit(
                 target_cfg,
                 return_ty,
                 type_paths,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -15975,6 +16120,7 @@ fn str_stmt_expr_unit(
                 target_cfg,
                 break_ctx,
                 frame,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -16002,6 +16148,7 @@ fn str_stmt_expr_unit(
                                 target_cfg,
                                 break_ctx,
                                 frame,
+                                call_signatures,
                             )?
                             else {
                                 return Ok(None);
@@ -16023,6 +16170,7 @@ fn str_stmt_expr_unit(
                                 target_cfg,
                                 break_ctx,
                                 frame,
+                                call_signatures,
                             )?
                             else {
                                 return Ok(None);
@@ -16061,6 +16209,7 @@ fn str_stmt_expr_unit(
                     target_cfg,
                     false,
                     StrStmtLoopFrame::Loop,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -16080,6 +16229,7 @@ fn str_stmt_expr_unit(
                     inputs,
                     &mut contributions,
                     false,
+                    call_signatures,
                 );
                 // Unclassed contributions get the same silent expression-
                 // walk pass as `str_loop_family` — the statement walk
@@ -16104,6 +16254,7 @@ fn str_stmt_expr_unit(
                             inputs,
                             snapshot,
                             target_cfg,
+                            call_signatures,
                         )?,
                         None => None,
                     };
@@ -16181,6 +16332,7 @@ fn str_stmt_expr_unit(
                 target_cfg,
                 false,
                 StrStmtLoopFrame::While,
+                call_signatures,
             ),
             _ => Ok(None),
         },
@@ -16202,6 +16354,7 @@ fn str_stmt_expr_unit(
                             inputs,
                             snapshot,
                             target_cfg,
+                            call_signatures,
                         )?
                         else {
                             return Ok(None);
@@ -16267,6 +16420,7 @@ fn str_stmt_expr_unit(
                             inputs,
                             snapshot,
                             target_cfg,
+                            call_signatures,
                         )? {
                             Some((_, value_diagnostics)) => Ok(Some(value_diagnostics)),
                             None => Ok(None),
@@ -16389,6 +16543,7 @@ fn str_stmt_expr_unit(
                             target_cfg,
                             return_ty,
                             type_paths,
+                            call_signatures,
                         )?
                         else {
                             return Ok(None);
@@ -16413,6 +16568,7 @@ fn str_stmt_expr_unit(
                     target_cfg,
                     break_ctx,
                     frame,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -16452,6 +16608,7 @@ fn str_stmt_expr_unit(
                 target_cfg,
                 break_ctx,
                 frame,
+                call_signatures,
             ),
             None => Ok(Some(vec![const_literal_diagnostic(
                 owner.id,
@@ -16479,6 +16636,8 @@ fn str_stmt_break_family(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     pure: bool,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Option<&'static str> {
     let Some(value) = value else {
         return Some("`()`");
@@ -16492,7 +16651,15 @@ fn str_stmt_break_family(
         // carry pin-adjusted families from `str_break_value` instead.
         _ => str_binding_family(value, locals, str_bindings).or_else(|| {
             pure.then(|| {
-                str_pure_init_family(value, locals, str_bindings, type_paths, symbols, inputs)
+                str_pure_init_family(
+                    value,
+                    locals,
+                    str_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    call_signatures,
+                )
             })
             .flatten()
         }),
@@ -16512,6 +16679,8 @@ fn str_stmt_loop_break_families<'h>(
     inputs: &CurrentOwnerInputs,
     out: &mut Vec<(Option<&'static str>, Option<&'h HirExpr<'h>>, sai_hir::Span)>,
     pure: bool,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) {
     // `let` bindings declared in this block scope the following
     // statements' contributions — a scalar local's `break n` carries its
@@ -16539,7 +16708,15 @@ fn str_stmt_loop_break_families<'h>(
                             _ => None,
                         }
                     }
-                    None => str_pure_init_family(init, locals, &local, type_paths, symbols, inputs),
+                    None => str_pure_init_family(
+                        init,
+                        locals,
+                        &local,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        call_signatures,
+                    ),
                 };
                 if let (
                     Some(family),
@@ -16561,13 +16738,31 @@ fn str_stmt_loop_break_families<'h>(
                 }
             }
             sai_hir::expressions::StmtKind::Expr(expr) => str_stmt_break_families_expr(
-                expr, locals, &local, type_paths, symbols, inputs, out, pure,
+                expr,
+                locals,
+                &local,
+                type_paths,
+                symbols,
+                inputs,
+                out,
+                pure,
+                call_signatures,
             ),
             _ => {}
         }
     }
     if let Some(tail) = block.tail {
-        str_stmt_break_families_expr(tail, locals, &local, type_paths, symbols, inputs, out, pure);
+        str_stmt_break_families_expr(
+            tail,
+            locals,
+            &local,
+            type_paths,
+            symbols,
+            inputs,
+            out,
+            pure,
+            call_signatures,
+        );
     }
 }
 
@@ -16582,6 +16777,8 @@ fn str_pure_condition(
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     if matches!(cond.kind, ExprKind::Lit(_)) {
         return true;
@@ -16597,21 +16794,69 @@ fn str_pure_condition(
     {
         // Comparison operands are value positions — any supported
         // operand tree admits like the diagnostic walk's probe.
-        return str_pure_init_family(lhs, locals, str_bindings, type_paths, symbols, inputs)
-            .is_some()
-            && str_pure_init_family(rhs, locals, str_bindings, type_paths, symbols, inputs)
-                .is_some();
+        return str_pure_init_family(
+            lhs,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            call_signatures,
+        )
+        .is_some()
+            && str_pure_init_family(
+                rhs,
+                locals,
+                str_bindings,
+                type_paths,
+                symbols,
+                inputs,
+                call_signatures,
+            )
+            .is_some();
     }
     if let ExprKind::Unary(UnOp::Not, operand) = cond.kind {
-        return str_pure_condition(operand, locals, str_bindings, type_paths, symbols, inputs);
+        return str_pure_condition(
+            operand,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            call_signatures,
+        );
     }
     if let ExprKind::Binary(BinOp::And | BinOp::Or, lhs, rhs) = cond.kind {
-        return str_pure_condition(lhs, locals, str_bindings, type_paths, symbols, inputs)
-            && str_pure_condition(rhs, locals, str_bindings, type_paths, symbols, inputs);
+        return str_pure_condition(
+            lhs,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            call_signatures,
+        ) && str_pure_condition(
+            rhs,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            call_signatures,
+        );
     }
     // The diagnostic twin evaluates any supported value shape through
     // the operand probe — only the admission matters here.
-    str_pure_init_family(cond, locals, str_bindings, type_paths, symbols, inputs).is_some()
+    str_pure_init_family(
+        cond,
+        locals,
+        str_bindings,
+        type_paths,
+        symbols,
+        inputs,
+        call_signatures,
+    )
+    .is_some()
 }
 
 // The family a `let` initializer binds without running the diagnostic
@@ -16624,13 +16869,22 @@ fn str_pure_init_family(
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Option<&'static str> {
     match init.kind {
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal),
         ExprKind::Unary(operator, operand) => {
-            let family =
-                str_pure_init_family(operand, locals, str_bindings, type_paths, symbols, inputs)?;
+            let family = str_pure_init_family(
+                operand,
+                locals,
+                str_bindings,
+                type_paths,
+                symbols,
+                inputs,
+                call_signatures,
+            )?;
             match operator {
                 // `not` yields `Bool` regardless of the operand — a
                 // non-`Bool` operand is the diagnostic walk's report.
@@ -16642,10 +16896,24 @@ fn str_pure_init_family(
             }
         }
         ExprKind::Binary(operator, lhs, rhs) => {
-            let left =
-                str_pure_init_family(lhs, locals, str_bindings, type_paths, symbols, inputs)?;
-            let right =
-                str_pure_init_family(rhs, locals, str_bindings, type_paths, symbols, inputs)?;
+            let left = str_pure_init_family(
+                lhs,
+                locals,
+                str_bindings,
+                type_paths,
+                symbols,
+                inputs,
+                call_signatures,
+            )?;
+            let right = str_pure_init_family(
+                rhs,
+                locals,
+                str_bindings,
+                type_paths,
+                symbols,
+                inputs,
+                call_signatures,
+            )?;
             if matches!(
                 operator,
                 BinOp::And
@@ -16811,15 +17079,34 @@ fn str_pure_init_family(
             els: Some(els),
             ..
         } => {
-            let then_family =
-                str_pure_block_family(then, locals, str_bindings, type_paths, symbols, inputs)?;
+            let then_family = str_pure_block_family(
+                then,
+                locals,
+                str_bindings,
+                type_paths,
+                symbols,
+                inputs,
+                call_signatures,
+            )?;
             let else_family = match els.kind {
-                ExprKind::Block(block) => {
-                    str_pure_block_family(block, locals, str_bindings, type_paths, symbols, inputs)
-                }
-                ExprKind::If { .. } | ExprKind::Loop { .. } => {
-                    str_pure_init_family(els, locals, str_bindings, type_paths, symbols, inputs)
-                }
+                ExprKind::Block(block) => str_pure_block_family(
+                    block,
+                    locals,
+                    str_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    call_signatures,
+                ),
+                ExprKind::If { .. } | ExprKind::Loop { .. } => str_pure_init_family(
+                    els,
+                    locals,
+                    str_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    call_signatures,
+                ),
                 _ => None,
             }?;
             // `!` unifies with the other branch's family.
@@ -16829,9 +17116,39 @@ fn str_pure_init_family(
                 then_family
             })
         }
-        ExprKind::Block(block) => {
-            str_pure_block_family(block, locals, str_bindings, type_paths, symbols, inputs)
+        // Direct calls admit like the diagnostic walk: signature,
+        // arity, and every argument supported.
+        ExprKind::Call {
+            args, base: None, ..
+        } => {
+            let signature = call_signatures.and_then(|signatures| signatures.get(&init.hir_id))?;
+            if args.len() != signature.parameters.len() {
+                return None;
+            }
+            let result_family = str_prim_family_name(signature.output)?;
+            for (argument, parameter) in args.iter().zip(&signature.parameters) {
+                str_pure_init_family(
+                    argument.expr,
+                    locals,
+                    str_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    call_signatures,
+                )?;
+                let _ = parameter;
+            }
+            Some(result_family)
         }
+        ExprKind::Block(block) => str_pure_block_family(
+            block,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            call_signatures,
+        ),
         ExprKind::Loop {
             body,
             source: LoopSource::Loop,
@@ -16847,6 +17164,7 @@ fn str_pure_init_family(
                 inputs,
                 &mut contributions,
                 true,
+                call_signatures,
             );
             // The same literal-vs-pin fold as the diagnostic walk, minus
             // diagnostics — the statement walk emits those itself.
@@ -16892,6 +17210,7 @@ fn str_pure_init_family(
             type_paths,
             symbols,
             inputs,
+            call_signatures,
         ),
         _ => str_binding_family(init, locals, str_bindings),
     }
@@ -16910,11 +17229,23 @@ fn str_pure_match_family(
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Option<&'static str> {
     let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
         Some("`Str`")
+    } else if let Some(family) = str_binding_family(scrutinee, locals, str_bindings) {
+        Some(family)
     } else {
-        str_binding_family(scrutinee, locals, str_bindings)
+        str_pure_init_family(
+            scrutinee,
+            locals,
+            str_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            call_signatures,
+        )
     };
     let Some(scrutinee_family) = scrutinee_family else {
         return None;
@@ -17001,13 +17332,28 @@ fn str_pure_match_family(
                 _ => return None,
             }
             if let Some(guard) = arm.guard
-                && !str_pure_condition(guard, locals, &arm_bindings, type_paths, symbols, inputs)
+                && !str_pure_condition(
+                    guard,
+                    locals,
+                    &arm_bindings,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    call_signatures,
+                )
             {
                 return None;
             }
         }
-        let arm_family =
-            str_pure_init_family(arm.body, locals, &arm_bindings, type_paths, symbols, inputs)?;
+        let arm_family = str_pure_init_family(
+            arm.body,
+            locals,
+            &arm_bindings,
+            type_paths,
+            symbols,
+            inputs,
+            call_signatures,
+        )?;
         arm_families.push((Some(arm_family), Some(arm.body), arm.body.span));
     }
     // The literal-vs-pin fold, minus diagnostics.
@@ -17059,6 +17405,8 @@ fn str_pure_block_family(
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Option<&'static str> {
     let mut inner = str_bindings.clone();
     for stmt in block.stmts {
@@ -17071,7 +17419,15 @@ fn str_pure_block_family(
         else {
             return None;
         };
-        let family = str_pure_init_family(init, locals, &inner, type_paths, symbols, inputs)?;
+        let family = str_pure_init_family(
+            init,
+            locals,
+            &inner,
+            type_paths,
+            symbols,
+            inputs,
+            call_signatures,
+        )?;
         let PatKind::Binding {
             mode: sai_hir::patterns::BindingMode::Value,
             binding,
@@ -17089,7 +17445,15 @@ fn str_pure_block_family(
             },
         );
     }
-    str_pure_init_family(block.tail?, locals, &inner, type_paths, symbols, inputs)
+    str_pure_init_family(
+        block.tail?,
+        locals,
+        &inner,
+        type_paths,
+        symbols,
+        inputs,
+        call_signatures,
+    )
 }
 
 fn str_stmt_break_families_expr<'h>(
@@ -17101,6 +17465,8 @@ fn str_stmt_break_families_expr<'h>(
     inputs: &CurrentOwnerInputs,
     out: &mut Vec<(Option<&'static str>, Option<&'h HirExpr<'h>>, sai_hir::Span)>,
     pure: bool,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) {
     match expr.kind {
         ExprKind::Break { label: None, value } => {
@@ -17113,6 +17479,7 @@ fn str_stmt_break_families_expr<'h>(
                     symbols,
                     inputs,
                     pure,
+                    call_signatures,
                 ),
                 value,
                 value.map(|v| v.span).unwrap_or(expr.span),
@@ -17128,6 +17495,7 @@ fn str_stmt_break_families_expr<'h>(
                 inputs,
                 out,
                 pure,
+                call_signatures,
             );
             if let Some(els) = els {
                 match els.kind {
@@ -17140,6 +17508,7 @@ fn str_stmt_break_families_expr<'h>(
                         inputs,
                         out,
                         pure,
+                        call_signatures,
                     ),
                     ExprKind::If { .. } => str_stmt_break_families_expr(
                         els,
@@ -17150,6 +17519,7 @@ fn str_stmt_break_families_expr<'h>(
                         inputs,
                         out,
                         pure,
+                        call_signatures,
                     ),
                     _ => {}
                 }
@@ -17165,6 +17535,7 @@ fn str_stmt_break_families_expr<'h>(
                 inputs,
                 out,
                 pure,
+                call_signatures,
             );
         }
         ExprKind::Block(inner) => str_stmt_loop_break_families(
@@ -17176,6 +17547,7 @@ fn str_stmt_break_families_expr<'h>(
             inputs,
             out,
             pure,
+            call_signatures,
         ),
         ExprKind::Match {
             scrutinee, arms, ..
@@ -17215,6 +17587,7 @@ fn str_stmt_break_families_expr<'h>(
                     inputs,
                     out,
                     pure,
+                    call_signatures,
                 );
             }
         }
@@ -17307,6 +17680,8 @@ fn str_stmt_block_unit(
     target_cfg: &TargetCfg,
     break_ctx: bool,
     frame: StrStmtLoopFrame,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if block.safety != sai_hir::Safety::Safe {
         return Ok(None);
@@ -17328,6 +17703,7 @@ fn str_stmt_block_unit(
                     target_cfg,
                     return_ty,
                     type_paths,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -17401,6 +17777,7 @@ fn str_stmt_block_unit(
                             inputs,
                             snapshot,
                             target_cfg,
+                            call_signatures,
                         )?
                         else {
                             return Ok(None);
@@ -17453,6 +17830,7 @@ fn str_stmt_block_unit(
                     target_cfg,
                     break_ctx,
                     frame,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -17477,6 +17855,7 @@ fn str_stmt_block_unit(
             target_cfg,
             break_ctx,
             frame,
+            call_signatures,
         )?
         else {
             return Ok(None);
@@ -17514,6 +17893,8 @@ fn str_loop_level_block(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<(bool, bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     if block.safety != sai_hir::Safety::Safe {
         return Ok(None);
@@ -17536,6 +17917,7 @@ fn str_loop_level_block(
                     target_cfg,
                     return_ty,
                     type_paths,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -17629,6 +18011,7 @@ fn str_loop_level_block(
                     inputs,
                     snapshot,
                     target_cfg,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -17652,6 +18035,7 @@ fn str_loop_level_block(
             inputs,
             snapshot,
             target_cfg,
+            call_signatures,
         )?
         else {
             return Ok(None);
@@ -17689,6 +18073,8 @@ fn str_loop_level_expr(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<(bool, bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     match expr.kind {
         ExprKind::If { cond, then, els } => {
@@ -17715,6 +18101,7 @@ fn str_loop_level_expr(
                 target_cfg,
                 return_ty,
                 type_paths,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -17736,6 +18123,7 @@ fn str_loop_level_expr(
                 inputs,
                 snapshot,
                 target_cfg,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -17757,6 +18145,7 @@ fn str_loop_level_expr(
                         inputs,
                         snapshot,
                         target_cfg,
+                        call_signatures,
                     )?
                     else {
                         return Ok(None);
@@ -17776,6 +18165,7 @@ fn str_loop_level_expr(
                         inputs,
                         snapshot,
                         target_cfg,
+                        call_signatures,
                     )?
                     else {
                         return Ok(None);
@@ -17806,6 +18196,7 @@ fn str_loop_level_expr(
             target_cfg,
             false,
             StrStmtLoopFrame::Loop,
+            call_signatures,
         )?
         .map(|diagnostics| (false, false, diagnostics))),
         // A valueless `break` targets the `Str`-seeded loop and dilutes β
@@ -17833,6 +18224,7 @@ fn str_loop_level_expr(
                 inputs,
                 snapshot,
                 target_cfg,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -17862,6 +18254,8 @@ fn str_loop_str_body(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
     need_clean: bool,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let mut inner_bindings = str_bindings.clone();
     let Some((clean_yield, any_break, diagnostics)) = str_loop_level_block(
@@ -17875,6 +18269,7 @@ fn str_loop_str_body(
         inputs,
         snapshot,
         target_cfg,
+        call_signatures,
     )?
     else {
         return Ok(None);
@@ -18010,6 +18405,8 @@ fn str_break_value(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<(bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     if matches!(value.kind, ExprKind::Lit(Lit::Str(_))) {
         return Ok(Some((true, Vec::new())));
@@ -18059,6 +18456,7 @@ fn str_break_value(
             target_cfg,
             true,
             StrStmtLoopFrame::Loop,
+            call_signatures,
         )?
         else {
             return Ok(None);
@@ -18135,11 +18533,36 @@ fn check_function_str_match(
     target_cfg: &TargetCfg,
     break_ctx: bool,
     frame: StrStmtLoopFrame,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let mut diagnostics = Vec::new();
+    // The scrutinee walks like the checker's: locals and literals first,
+    // then the general expression walk so calls and operand trees resolve.
     let scrutinee_family = if str_binding_path(scrutinee, locals, str_bindings) {
         Some("`Str`")
+    } else if let Some(family) = str_binding_family(scrutinee, locals, str_bindings) {
+        Some(family)
     } else {
-        str_binding_family(scrutinee, locals, str_bindings)
+        let Some((family, mut scrutinee_diagnostics)) = str_expr_family(
+            owner,
+            return_ty,
+            scrutinee,
+            locals,
+            str_bindings,
+            None,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            call_signatures,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut scrutinee_diagnostics);
+        Some(family)
     };
     let Some(scrutinee_family) = scrutinee_family else {
         return Ok(None);
@@ -18152,7 +18575,6 @@ fn check_function_str_match(
             None => return Ok(None),
         }
     };
-    let mut diagnostics = Vec::new();
     let mut catch_all = false;
     let mut bool_cover = (false, false);
     for arm in arms {
@@ -18188,6 +18610,7 @@ fn check_function_str_match(
                 target_cfg,
                 return_ty,
                 type_paths,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -18260,6 +18683,7 @@ fn check_function_str_match(
             target_cfg,
             break_ctx,
             frame,
+            call_signatures,
         )?
         else {
             return Ok(None);
@@ -18299,6 +18723,8 @@ fn check_function_str_tail(
     target_cfg: &TargetCfg,
     break_ctx: bool,
     frame: StrStmtLoopFrame,
+
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if let Some(family) = str_binding_family(tail, locals, str_bindings) {
         if family == "`Str`" || family == "`!`" {
@@ -18333,6 +18759,7 @@ fn check_function_str_tail(
             target_cfg,
             return_ty,
             type_paths,
+            call_signatures,
         )?
         else {
             return Ok(None);
@@ -18364,6 +18791,7 @@ fn check_function_str_tail(
             target_cfg,
             break_ctx,
             frame,
+            call_signatures,
         )?
         else {
             return Ok(None);
@@ -18384,6 +18812,7 @@ fn check_function_str_tail(
                 target_cfg,
                 break_ctx,
                 frame,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -18403,6 +18832,7 @@ fn check_function_str_tail(
                 target_cfg,
                 break_ctx,
                 frame,
+                call_signatures,
             )?
             else {
                 return Ok(None);
@@ -18432,6 +18862,7 @@ fn check_function_str_tail(
             target_cfg,
             break_ctx,
             frame,
+            call_signatures,
         );
     }
     // `loop { break <Str> }` tails yield `Str` from their break values;
@@ -18455,6 +18886,7 @@ fn check_function_str_tail(
             snapshot,
             target_cfg,
             false,
+            call_signatures,
         );
     }
     // A `while` tail yields `()` — the desugared body walks at `While`
@@ -18481,6 +18913,7 @@ fn check_function_str_tail(
             target_cfg,
             false,
             StrStmtLoopFrame::While,
+            call_signatures,
         )?
         else {
             return Ok(None);
@@ -18513,6 +18946,7 @@ fn check_function_str_tail(
                     inputs,
                     snapshot,
                     target_cfg,
+                    call_signatures,
                 )?
                 else {
                     return Ok(None);
@@ -18609,6 +19043,7 @@ fn check_function_str_tail(
             target_cfg,
             break_ctx,
             frame,
+            call_signatures,
         );
     }
     // `return e` tails check `e` against the `Str` group; a bare
@@ -18639,7 +19074,41 @@ fn check_function_str_tail(
             target_cfg,
             break_ctx,
             frame,
+            call_signatures,
         );
+    }
+    // A direct call tail resolves through the callee signature and
+    // unifies against `Str` like the checker's tail rule (`!` unifies).
+    if let ExprKind::Call { base: None, .. } = tail.kind {
+        let Some((family, mut diagnostics)) = str_expr_family(
+            owner,
+            return_ty,
+            tail,
+            locals,
+            str_bindings,
+            None,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            call_signatures,
+        )?
+        else {
+            return Ok(None);
+        };
+        if family != "`Str`" && family != "`!`" {
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                tail.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `Str`, found {family}"),
+                "type mismatch",
+            )?);
+        }
+        return Ok(Some(diagnostics));
     }
     if !matches!(tail.kind, ExprKind::Lit(Lit::Str(_))) && !is_direct_function_scalar_literal(tail)
     {
@@ -55875,6 +56344,58 @@ property "shared"() {}
                     .expect("unsupported body check succeeds"),
                 FunctionBodyTypeCheck::Unsupported
             ));
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_admits_direct_calls_in_str_bodies() {
+        let root = concat!(
+            "pub fn pick() -> I64 { 1 }\n",
+            "pub fn take(n: I64) -> I64 { n }\n",
+            "pub fn let_call() -> Str {\n    let m = pick()\n    \"a\"\n}\n",
+            "pub fn scrutinee_call() -> Str {\n    match pick() { 1 => \"a\", _ => \"b\" }\n}\n",
+            "pub fn arg_call() -> Str {\n    let m = take(1)\n    \"a\"\n}\n",
+            "pub fn arg_mismatch() -> Str {\n    let m = take(\"a\")\n    \"b\"\n}\n",
+            "pub fn tail_call() -> Str {\n    pick()\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 7);
+        for (index, owner) in resolved.owners()[2..5].iter().enumerate() {
+            match owner.body_type_check().expect("call body check succeeds") {
+                FunctionBodyTypeCheck::Supported { diagnostics } => {
+                    assert!(diagnostics.is_empty(), "clean call body: {diagnostics:?}")
+                }
+                other => panic!("expected Supported, found {other:?} at index {}", index + 2),
+            }
+        }
+        for (index, message) in [
+            (5, "expected `I64`, found `Str`"),
+            (6, "expected `Str`, found `I64`"),
+        ] {
+            match resolved.owners()[index]
+                .body_type_check()
+                .expect("mismatch body check succeeds")
+            {
+                FunctionBodyTypeCheck::Supported { diagnostics } => {
+                    assert_eq!(diagnostics.len(), 1);
+                    assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+                    assert_eq!(diagnostics[0].message, message);
+                }
+                other => panic!("expected Supported, found {other:?}"),
+            }
         }
     }
 
