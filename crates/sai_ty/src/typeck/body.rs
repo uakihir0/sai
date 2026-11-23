@@ -4696,7 +4696,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         });
                         Ok(())
                     }
-                    _ => Err(()),
+                    LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                        let Some(variable) = self.literal_variables.get(id) else {
+                            return Err(());
+                        };
+                        match variable.resolved {
+                            Some(found) => self.errors.push(PrimitiveBodyError {
+                                node: expression.hir_id,
+                                kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                                    expected: ScalarType::Str,
+                                    found: ScalarType::Primitive(found),
+                                },
+                            }),
+                            None => self.errors.push(PrimitiveBodyError {
+                                node: expression.hir_id,
+                                kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                    expected: ScalarType::Str,
+                                    found: ScalarLiteralKind::Primitive(variable.kind),
+                                },
+                            }),
+                        }
+                        Ok(())
+                    }
+                    LocalType::Error(_) => Ok(()),
                 }
             }
             ExprKind::Field { .. } => match self
@@ -4725,16 +4747,42 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     // Mirror of `check_str_branch_block`'s admission: a safe block
-    // whose statements are `let`s and whose tail is `Str`-shaped.
-    fn str_branch_block_shaped(&mut self, block: &Block<'hir>) -> bool {
-        block.safety == Safety::Safe
-            && block
-                .stmts
-                .iter()
-                .all(|stmt| matches!(stmt.kind, StmtKind::Let { .. }))
-            && block
-                .tail
-                .is_some_and(|tail| self.str_shaped_initializer(tail))
+    // whose statements are `let`s/`assert`s the checker handles and
+    // whose tail is `Str`-shaped. `let` statements inside the block
+    // seed the `Str` set the tail resolves against (`let t = "x"` then
+    // `t` as the tail).
+    fn str_branch_block_shaped_in(
+        &mut self,
+        block: &Block<'hir>,
+        str_bindings: &HashSet<BindingId>,
+    ) -> bool {
+        if block.safety != Safety::Safe {
+            return false;
+        }
+        let mut inner = str_bindings.clone();
+        for stmt in block.stmts {
+            match stmt.kind {
+                StmtKind::Let { pat, ty, init, .. } => {
+                    let str_annotated = ty.is_some_and(|ty| {
+                        self.input
+                            .str_annotations
+                            .is_some_and(|annotations| annotations.contains(&ty.hir_id))
+                    });
+                    if let PatKind::Binding { binding, .. } = pat.kind {
+                        if str_annotated
+                            || (ty.is_none() && self.str_shaped_initializer_in(init, &inner))
+                        {
+                            inner.insert(binding);
+                        }
+                    }
+                }
+                StmtKind::Assert { .. } => {}
+                _ => return false,
+            }
+        }
+        block
+            .tail
+            .is_some_and(|tail| self.str_shaped_initializer_in(tail, &inner))
     }
 
     // Whether an unannotated initializer yields `Str`: a `Str` literal,
@@ -4743,15 +4791,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     // all yield a `Str` bound path. Mirrors the driver's
     // `str_shaped_local_init` so admitted bodies never gate inside.
     fn str_shaped_initializer(&mut self, init: &Expr<'hir>) -> bool {
+        match self.input.str_bindings {
+            Some(bindings) => self.str_shaped_initializer_in(init, bindings),
+            None => self.str_shaped_initializer_in(init, &HashSet::new()),
+        }
+    }
+
+    fn str_shaped_initializer_in(
+        &mut self,
+        init: &Expr<'hir>,
+        str_bindings: &HashSet<BindingId>,
+    ) -> bool {
         match init.kind {
             ExprKind::Lit(Lit::Str(_)) => true,
             // `local_paths` is keyed by the path's id, not the
             // enclosing expression's — resolve the binding first.
-            ExprKind::Path(_) => self.plain_local_path_binding(init).is_some_and(|binding| {
-                self.input
-                    .str_bindings
-                    .is_some_and(|bindings| bindings.contains(&binding))
-            }),
+            ExprKind::Path(_) => self
+                .plain_local_path_binding(init)
+                .is_some_and(|binding| str_bindings.contains(&binding)),
             ExprKind::Field { .. } => matches!(
                 self.input
                     .str_self_field_projections
@@ -4759,22 +4816,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     .copied(),
                 Some("`Str`")
             ),
-            ExprKind::Block(block) => self.str_branch_block_shaped(block),
+            ExprKind::Block(block) => self.str_branch_block_shaped_in(block, str_bindings),
             ExprKind::If { then, els, .. } => {
-                self.str_branch_block_shaped(then)
-                    && els.is_some_and(|els| self.str_shaped_initializer(els))
+                self.str_branch_block_shaped_in(then, str_bindings)
+                    && els.is_some_and(|els| self.str_shaped_initializer_in(els, str_bindings))
             }
             ExprKind::Match { arms, .. } => {
                 !arms.is_empty()
                     && arms.iter().all(|arm| match arm.body.kind {
-                        ExprKind::Path(_) => {
-                            self.plain_local_path_binding(arm.body)
-                                .is_some_and(|binding| {
-                                    self.input
-                                        .str_bindings
-                                        .is_some_and(|bindings| bindings.contains(&binding))
-                                })
-                        }
+                        ExprKind::Path(_) => self
+                            .plain_local_path_binding(arm.body)
+                            .is_some_and(|binding| str_bindings.contains(&binding)),
                         _ => false,
                     })
             }

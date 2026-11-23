@@ -11268,7 +11268,15 @@ fn primitive_let_statement_shape_is_supported(
     // checked by the kernel's `Str` paths — the primitive shape mirror
     // would reject them before the kernel sees them.
     let str_init = str_annotated
-        || (ty.is_none() && str_shaped_local_init(init, locals, inputs, &str_admissions.locals));
+        || (ty.is_none()
+            && str_shaped_local_init(
+                init,
+                locals,
+                inputs,
+                &str_admissions.locals,
+                symbols,
+                type_paths,
+            ));
     // Annotations on `let` statements inside `Str` branch blocks
     // belong to the same `primitive_types`/`annotations` maps the
     // kernel reads — collect them so `check_stmt` resolves the inner
@@ -11405,57 +11413,82 @@ fn str_shaped_local_init(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
     str_bindings: &HashSet<sai_hir::BindingId>,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
 ) -> bool {
-    let mut str_init = init;
-    loop {
-        match str_init.kind {
-            ExprKind::Block(block) => {
-                if block.safety != sai_hir::Safety::Safe
-                    || !block
-                        .stmts
-                        .iter()
-                        .all(|stmt| matches!(stmt.kind, StmtKind::Let { .. }))
-                {
-                    break false;
+    match init.kind {
+        ExprKind::Block(block) => {
+            str_shaped_branch_block(block, locals, inputs, str_bindings, symbols, type_paths)
+        }
+        ExprKind::Lit(Lit::Str(_)) => true,
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|source| str_bindings.contains(&source)),
+        // `let t = self.text` aliases a `Str` field; a `match`
+        // yields `Str` when every arm body is a `Str` binding.
+        ExprKind::Field { .. } => str_self_field_projected_family(init, inputs) == Some("`Str`"),
+        ExprKind::Match { arms, .. } => {
+            !arms.is_empty()
+                && arms.iter().all(|arm| match arm.body.kind {
+                    ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                        .is_some_and(|source| str_bindings.contains(&source)),
+                    _ => false,
+                })
+        }
+        // `let s = if c { "a" } else { "b" }` yields `Str` when both
+        // branches do (an `else if` chain recurses through `els`).
+        ExprKind::If { then, els, .. } => {
+            str_shaped_branch_block(then, locals, inputs, str_bindings, symbols, type_paths)
+                && els.is_some_and(|els| {
+                    str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
+                })
+        }
+        _ => false,
+    }
+}
+
+// A `Str`-yielding branch block: safe, statements limited to `let`/
+// `assert` (the shapes `check_stmt` covers inside branch blocks), and
+// a `Str`-shaped tail. `let` statements inside the block seed the
+// `Str` set the tail resolves against (`let t = "x"` then `t`).
+fn str_shaped_branch_block(
+    block: &HirBlock<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    str_bindings: &HashSet<sai_hir::BindingId>,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+) -> bool {
+    if block.safety != sai_hir::Safety::Safe {
+        return false;
+    }
+    let mut inner = str_bindings.clone();
+    for stmt in block.stmts {
+        match stmt.kind {
+            StmtKind::Let { pat, ty, init, .. } => {
+                let str_annotated = ty.is_some_and(|ty| {
+                    matches!(
+                        resolve_function_direct_type(*ty, type_paths, symbols, inputs),
+                        Some(FunctionDirectType::Str)
+                    )
+                });
+                if let PatKind::Binding { binding, .. } = pat.kind {
+                    if str_annotated
+                        || (ty.is_none()
+                            && str_shaped_local_init(
+                                init, locals, inputs, &inner, symbols, type_paths,
+                            ))
+                    {
+                        inner.insert(binding);
+                    }
                 }
-                match block.tail {
-                    Some(inner_tail) => str_init = inner_tail,
-                    None => break false,
-                }
             }
-            ExprKind::Lit(Lit::Str(_)) => break true,
-            ExprKind::Path(path) => {
-                break resolved_plain_local_path_binding(path, locals, inputs)
-                    .is_some_and(|source| str_bindings.contains(&source));
-            }
-            // `let t = self.text` aliases a `Str` field; a `match`
-            // yields `Str` when every arm body is a `Str` binding.
-            ExprKind::Field { .. } => {
-                break str_self_field_projected_family(str_init, inputs) == Some("`Str`");
-            }
-            ExprKind::Match { arms, .. } => {
-                break !arms.is_empty()
-                    && arms.iter().all(|arm| match arm.body.kind {
-                        ExprKind::Path(path) => {
-                            resolved_plain_local_path_binding(path, locals, inputs)
-                                .is_some_and(|source| str_bindings.contains(&source))
-                        }
-                        _ => false,
-                    });
-            }
-            // `let s = if c { "a" } else { "b" }` yields `Str` when both
-            // branches do (an `else if` chain recurses through `els`).
-            ExprKind::If { then, els, .. } => {
-                break then
-                    .tail
-                    .is_some_and(|tail| str_shaped_local_init(tail, locals, inputs, str_bindings))
-                    && els.is_some_and(|els| {
-                        str_shaped_local_init(els, locals, inputs, str_bindings)
-                    });
-            }
-            _ => break false,
+            StmtKind::Assert { .. } => {}
+            _ => return false,
         }
     }
+    block.tail.is_some_and(|tail| {
+        str_shaped_local_init(tail, locals, inputs, &inner, symbols, type_paths)
+    })
 }
 
 fn primitive_if_tail_shape_is_supported(
@@ -14218,7 +14251,10 @@ fn index_str_method_call_receivers(
                         )
                     });
                     if str_annotated
-                        || (ty.is_none() && str_shaped_local_init(init, locals, inputs, receivers))
+                        || (ty.is_none()
+                            && str_shaped_local_init(
+                                init, locals, inputs, receivers, symbols, type_paths,
+                            ))
                     {
                         receivers.insert(binding);
                     }
