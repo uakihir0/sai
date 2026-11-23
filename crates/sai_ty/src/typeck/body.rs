@@ -170,7 +170,7 @@ pub enum PrimitiveBodyErrorKind {
     /// `Str`.
     ScalarLiteralTypeMismatch {
         expected: ScalarType,
-        found: PrimitiveLiteralKind,
+        found: ScalarLiteralKind,
     },
     OperatorNotSupported {
         operator: BinOp,
@@ -248,6 +248,16 @@ enum PrimitiveBoolOperandResult {
 pub enum ScalarType {
     Primitive(PrimTy),
     Str,
+}
+
+/// The literal family a `Str`-position mismatch names: the primitive
+/// literal kinds plus the `Str` (`"a"`) and `Slice<Byte>` (`b"a"`)
+/// literals `primitive_literal_kind` excludes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScalarLiteralKind {
+    Primitive(PrimitiveLiteralKind),
+    Str,
+    ByteStr,
 }
 
 /// Scalar literal classes supported by the primitive literal kernel.
@@ -2471,21 +2481,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 };
                 match right.kind {
                     ExprKind::Lit(literal) => {
-                        let kind = match primitive_literal_kind(literal) {
-                            Some(kind) => PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
-                                expected,
-                                found: kind,
-                            },
-                            // A `Str` literal on the right of a non-`Str`
-                            // left reports `found `Str``.
-                            None => PrimitiveBodyErrorKind::ScalarTypeMismatch {
-                                expected,
-                                found: ScalarType::Str,
-                            },
-                        };
+                        // A literal names its own family — `1 == "a"`
+                        // reports `found a string literal`, `s == b"a"`
+                        // `found a byte string literal` (`Slice<Byte>`).
                         self.errors.push(PrimitiveBodyError {
                             node: right.hir_id,
-                            kind,
+                            kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                expected,
+                                found: scalar_literal_kind(literal),
+                            },
                         });
                     }
                     _ => {
@@ -2821,14 +2825,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 Ok(LocalType::Str)
             }
             ExprKind::Lit(literal) => {
-                let Some(kind) = primitive_literal_kind(literal) else {
-                    return Err(());
-                };
                 self.errors.push(PrimitiveBodyError {
                     node: init.hir_id,
                     kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
                         expected: ScalarType::Str,
-                        found: kind,
+                        found: scalar_literal_kind(literal),
                     },
                 });
                 Ok(LocalType::Str)
@@ -2861,7 +2862,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             node: init.hir_id,
                             kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
                                 expected: ScalarType::Str,
-                                found: variable.kind,
+                                found: ScalarLiteralKind::Primitive(variable.kind),
                             },
                         }),
                     }
@@ -2873,15 +2874,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     /// Classify a non-`Str` comparison operand into the scalar type a
-    /// `Str`-comparison mismatch names on its side: literals default to
-    /// their unannotated type (`1` -> `I64`), literal variables to their
+    /// `Str`-comparison mismatch names on its side: literals name their
+    /// own type (`true` -> `Bool`, `1` -> the `I64` family default) and
+    /// are still checked against it, so an out-of-range left literal
+    /// reports `LiteralOutOfRange`; literal variables name their
     /// resolution or family default.
     fn scalar_operand_scalar_type(&mut self, operand: &'hir Expr<'hir>) -> Result<ScalarType, ()> {
         if let ExprKind::Lit(literal) = operand.kind {
             let Some(kind) = primitive_literal_kind(literal) else {
                 return Err(());
             };
-            return Ok(ScalarType::Primitive(literal_variable_default_type(kind)));
+            let expected = match kind {
+                PrimitiveLiteralKind::Integer => PrimTy::I64,
+                PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
+                PrimitiveLiteralKind::Bool => PrimTy::Bool,
+                PrimitiveLiteralKind::Byte => PrimTy::Byte,
+                PrimitiveLiteralKind::Character => PrimTy::Char,
+            };
+            self.check_annotated_literal(expected, literal, kind, operand.hir_id);
+            return Ok(ScalarType::Primitive(expected));
         }
         match self.check_operand_local_type(operand)? {
             LocalType::Concrete(found) => Ok(ScalarType::Primitive(found)),
@@ -9274,6 +9285,20 @@ fn primitive_literal_kind(literal: Lit<'_>) -> Option<PrimitiveLiteralKind> {
         Lit::Byte(_) => Some(PrimitiveLiteralKind::Byte),
         Lit::Char(_) => Some(PrimitiveLiteralKind::Character),
         Lit::Str(_) | Lit::ByteStr(_) => None,
+    }
+}
+
+/// Every literal family a `Str`-position mismatch can name — total, unlike
+/// `primitive_literal_kind`, which excludes the `Str`/`Slice<Byte>` literals.
+fn scalar_literal_kind(literal: Lit<'_>) -> ScalarLiteralKind {
+    match literal {
+        Lit::Int { .. } => ScalarLiteralKind::Primitive(PrimitiveLiteralKind::Integer),
+        Lit::Float { .. } => ScalarLiteralKind::Primitive(PrimitiveLiteralKind::FloatingPoint),
+        Lit::Bool(_) => ScalarLiteralKind::Primitive(PrimitiveLiteralKind::Bool),
+        Lit::Byte(_) => ScalarLiteralKind::Primitive(PrimitiveLiteralKind::Byte),
+        Lit::Char(_) => ScalarLiteralKind::Primitive(PrimitiveLiteralKind::Character),
+        Lit::Str(_) => ScalarLiteralKind::Str,
+        Lit::ByteStr(_) => ScalarLiteralKind::ByteStr,
     }
 }
 

@@ -4738,6 +4738,8 @@ fn primitive_bodies_admit_str_locals_and_comparisons() {
         "pub fn str_assert_msg() -> Bool {\n    let s = \"a\"\n    assert true, s\n    true\n}\n",
         "pub fn str_var_assign() -> Bool {\n    var s: Str = \"a\"\n    s = \"b\"\n    true\n}\n",
         "pub fn str_if_condition() -> Bool {\n    let s = \"a\"\n    if s == \"b\" { true } else { false }\n}\n",
+        "pub fn str_not_comparison(value: Str) -> Bool { not (value == \"a\") }\n",
+        "pub fn str_block_init_assert() -> Bool {\n    let message = { \"oops\" }\n    assert true, message\n    true\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -4766,6 +4768,22 @@ fn primitive_body_str_mismatches_report_type_diagnostics() {
             "pub fn str_annotated_int() -> Bool {\n    let s: Str = 1\n    true\n}\n",
             "expected `Str`, found an integer literal",
         ),
+        (
+            "pub fn bool_str_eq(value: Str) -> Bool { true == value }\n",
+            "expected `Bool`, found `Str`",
+        ),
+        (
+            "pub fn byte_str_eq(value: Str) -> Bool { b'z' == value }\n",
+            "expected `Byte`, found `Str`",
+        ),
+        (
+            "pub fn str_bytestring_eq(value: Str) -> Bool { value == b\"a\" }\n",
+            "expected `Str`, found a byte string literal",
+        ),
+        (
+            "pub fn int_str_literal_eq() -> Bool { 1 == \"a\" }\n",
+            "expected `I64`, found a string literal",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
@@ -4789,6 +4807,7 @@ fn primitive_body_str_forms_outside_the_slice_remain_gated() {
         "pub fn str_arith() -> Bool {\n    let s = \"a\"\n    s + 1 == 2\n}\n",
         "pub fn str_match() -> Bool {\n    let s = \"a\"\n    match s { \"x\" => true, _ => false }\n}\n",
         "pub fn str_assign_int() -> Bool {\n    var n = 1\n    n = \"a\"\n    true\n}\n",
+        "pub fn str_annotated_bytestring() -> Bool {\n    let s: Str = b\"a\"\n    true\n}\n",
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);
