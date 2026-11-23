@@ -15470,6 +15470,13 @@ fn str_fold_literal_contributions(
     target_cfg: &TargetCfg,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<(), OwnerControlFlowResolutionError> {
+    // An arm yielding an unresolved literal variable is itself a
+    // literal contribution — a sibling literal joins the variable's
+    // group as a deferred site (checked when the group resolves), not
+    // eagerly against the provisional `I64`/`F64` family (`let big =
+    // 18446744073709551615; let m = if let "a" = s { big } else {
+    // 18446744073709551615 }` resolves `big` at `U64`, so the literal
+    // is in range).
     let mut prims = contributions
         .iter()
         .filter(|(_, value, _)| str_literal_contribution(*value).is_none())
@@ -15479,33 +15486,76 @@ fn str_fold_literal_contributions(
                 && *family != "`()`"
                 && primitive_method_field_type(family.trim_matches('`')).is_some()
         });
-    let (Some(prim), None) = (prims.next(), prims.next()) else {
-        return Ok(());
-    };
-    let Some(primitive) = primitive_method_field_type(prim.trim_matches('`')) else {
-        return Ok(());
-    };
-    for (family, value, _) in contributions.iter_mut() {
-        let Some(expr) = str_literal_contribution(*value) else {
-            continue;
-        };
-        if !matches!(*family, Some("`I64`") | Some("`F64`")) {
-            continue;
+    match (prims.next(), prims.next()) {
+        (Some(prim), None) => {
+            let Some(primitive) = primitive_method_field_type(prim.trim_matches('`')) else {
+                return Ok(());
+            };
+            for (family, value, _) in contributions.iter_mut() {
+                let Some(expr) = str_literal_contribution(*value) else {
+                    continue;
+                };
+                if !matches!(*family, Some("`I64`") | Some("`F64`")) {
+                    continue;
+                }
+                if let Some(mut literal_diagnostics) = check_const_literal_against_type(
+                    owner.id,
+                    ConstLiteralType::Primitive(primitive),
+                    expr,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )? {
+                    diagnostics.append(&mut literal_diagnostics);
+                }
+                *family = Some(prim);
+            }
+            Ok(())
         }
-        if let Some(mut literal_diagnostics) = check_const_literal_against_type(
-            owner.id,
-            ConstLiteralType::Primitive(primitive),
-            expr,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-        )? {
-            diagnostics.append(&mut literal_diagnostics);
+        (None, _) => {
+            // No concrete contribution: a single literal-variable group
+            // absorbs the sibling literals as deferred sites; with no
+            // variable every literal still checks against its default
+            // family (`match s { _ => 18446744073709551615 }` reports
+            // out-of-range for `I64`).
+            for (family, value, _) in contributions.iter_mut() {
+                // A bare `Lit` arm already seeds a literal variable —
+                // its range check fires when the group resolves or
+                // defaults at block end. Only a literal hidden behind a
+                // block tail (`{ ..; 300 }`) goes unchecked, so it still
+                // compares against the default family here.
+                if !matches!(value.map(|v| v.kind), Some(ExprKind::Block(_))) {
+                    continue;
+                }
+                let Some(expr) = str_literal_contribution(*value) else {
+                    continue;
+                };
+                let Some(default) = *family else {
+                    continue;
+                };
+                if !matches!(default, "`I64`" | "`F64`") {
+                    continue;
+                }
+                let Some(primitive) = primitive_method_field_type(default.trim_matches('`')) else {
+                    continue;
+                };
+                if let Some(mut literal_diagnostics) = check_const_literal_against_type(
+                    owner.id,
+                    ConstLiteralType::Primitive(primitive),
+                    expr,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )? {
+                    diagnostics.append(&mut literal_diagnostics);
+                }
+            }
+            Ok(())
         }
-        *family = Some(prim);
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 // `Str` locals bind only string literals and earlier `Str` bindings:
@@ -58854,6 +58904,7 @@ property "shared"() {}
             "pub fn str_litvar_conflicting_pins_tm() -> Str {\n    let s = \"a\"\n    let n = 1\n    let a: I64 = n\n    let b: U32 = n\n    s\n}\n",
             "pub fn str_bin_fold_wide_literal() -> Str {\n    let s = \"a\"\n    let w: U64 = 5\n    let m = w + 18446744073709551615\n    s\n}\npub fn str_litvar_bytestring_gate() -> Str {\n    let b = b\"abc\"\n    \"a\"\n}\npub fn str_litvar_loop_pin_oob() -> Str {\n    let n = 300\n    let m: U8 = loop { break n + 1 }\n    \"a\"\n}\npub fn str_scalar_param_cond(n: I64) -> Str {\n    if n == 1 { \"a\" } else { \"b\" }\n}\npub fn str_scalar_param_let(n: I64) -> Str {\n    let m = n\n    \"a\"\n}\npub fn str_scalar_param_tail(n: I64) -> Str {\n    n\n}\npub fn str_pair_mixed(s: Str, n: I64) -> Str {\n    match n { _ => s }\n}\npub fn str_pair_scalars(a: I64, b: I8) -> Str {\n    match b { _ => \"y\" }\n}\npub fn str_stmt_if_let(s: Str) -> Str {\n    if let \"a\" = s {\n    }\n    \"a\"\n}\npub fn str_stmt_while_let(s: Str) -> Str {\n    while let \"a\" = s {\n        break\n    }\n    \"a\"\n}\npub fn str_stmt_match_str(s: Str) -> Str {\n    match s {\n        \"a\" => {\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\npub fn str_tail_if_let(s: Str) -> Str {\n    if let \"a\" = s {\n        \"x\"\n    } else {\n        \"y\"\n    }\n}\npub fn str_tail_if_let_no_else_tm(s: Str) -> Str {\n    if let \"a\" = s {\n        \"x\"\n    }\n}\npub fn str_init_if_let(s: Str) -> Str {\n    let m = if let \"a\" = s {\n        \"x\"\n    } else {\n        \"y\"\n    }\n    m\n}\npub fn str_if_let_scalar_gate(n: I64) -> Str {\n    if let 1 = n {\n    }\n    \"a\"\n}\npub fn str_while_let_break_value(s: Str) -> Str {\n    while let \"a\" = s {\n        break 1\n    }\n    \"a\"\n}\npub fn str_tail_else_if_let(s: Str) -> Str {\n    if let \"a\" = s {\n        \"x\"\n    } else if let \"b\" = s {\n        \"y\"\n    } else {\n        \"z\"\n    }\n}\n",
             "pub fn str_stmt_if_let_always_match(s: Str) -> Str {\n    if let _ = s {\n    }\n    \"a\"\n}\npub fn str_stmt_while_let_always_match(s: Str) -> Str {\n    while let _ = s {\n        break\n    }\n    \"a\"\n}\npub fn str_tail_if_let_always_match(s: Str) -> Str {\n    if let _ = s {\n        \"x\"\n    } else {\n        \"y\"\n    }\n}\npub fn str_init_if_let_literal_join(s: Str, n: I8) -> Str {\n    let m = if let \"a\" = s {\n        n\n    } else {\n        1\n    }\n    s\n}\npub fn str_init_if_let_literal_range(s: Str, n: I8) -> Str {\n    let m = if let \"a\" = s {\n        n\n    } else {\n        300\n    }\n    s\n}\npub fn str_init_if_let_no_else_unit(s: Str) -> Str {\n    let m = if let \"a\" = s {\n        \"x\"\n    }\n    s\n}\npub fn str_init_if_let_no_else_tm(s: Str) -> Str {\n    let m: Str = if let \"a\" = s {\n        \"x\"\n    }\n    s\n}\n",
+            "pub fn str_init_match_block_literal_oob(s: Str) -> Str {\n    let m = match s {\n        \"a\" => {\n            18446744073709551615\n        }\n        _ => {\n            0\n        }\n    }\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -58869,7 +58920,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 244);
+        assert_eq!(resolved.owners().len(), 245);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -58903,7 +58954,23 @@ property "shared"() {}
             .chain(&resolved.owners()[125..126])
             .chain(&resolved.owners()[129..130])
             .chain(&resolved.owners()[131..135])
-            .chain(&resolved.owners()[137..138])
+            .enumerate()
+        {
+            let (index, owner) = (index, owner);
+            assert!(
+                matches!(
+                    owner
+                        .body_type_check()
+                        .expect("Str local body check succeeds"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ),
+                "clean owner #{index} produced diagnostics: {:?}",
+                owner.body_type_check()
+            );
+        }
+        for (index, owner) in resolved.owners()[137..138]
+            .iter()
+            .chain(&resolved.owners()[140..141])
             .chain(&resolved.owners()[140..141])
             .chain(&resolved.owners()[145..147])
             .chain(&resolved.owners()[149..152])
@@ -59026,6 +59093,7 @@ property "shared"() {}
             (225, sai_diagnostics::Code::TypeMismatch),
             (235, sai_diagnostics::Code::InvalidBreakValue),
             (241, sai_diagnostics::Code::LiteralOutOfRange),
+            (244, sai_diagnostics::Code::LiteralOutOfRange),
             (243, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
