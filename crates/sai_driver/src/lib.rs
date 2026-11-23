@@ -13680,25 +13680,77 @@ fn str_expr_family(
                     }
                     Ok(Some(("`Bool`", diagnostics)))
                 }
-                // `-x`/`~x` keep the operand's family; a non-numeric
-                // operand reports the arithmetic expectation.
+                // `-x`/`~x` keep the operand's family. Valid operand
+                // families mirror the checker's `is_neg_primitive`
+                // (signed integers and floats) and `is_bitwise_primitive`
+                // (integers and `Byte`); other concrete primitives report
+                // UnaryOperatorNotSupported. A `~` over a non-integer
+                // literal operand gates like the checker's
+                // `unary_tail_operand_is_admissible` — `take_f32(~1.0)`
+                // is outside the supported slice.
                 sai_hir::expressions::UnOp::Neg | sai_hir::expressions::UnOp::BitNot => {
-                    if family != "`!`"
-                        && !matches!(family, "`Bool`" | "`Str`" | "`ByteStr`" | "`()`")
-                    {
-                        return Ok(Some((family, diagnostics)));
-                    }
                     if family == "`!`" {
                         return Ok(Some((family, diagnostics)));
                     }
+                    let bit_not = matches!(operator, sai_hir::expressions::UnOp::BitNot);
+                    if bit_not
+                        && let ExprKind::Lit(literal) = operand.kind
+                        && !matches!(str_scalar_family_name(literal), Some("`I64`" | "`Byte`"))
+                    {
+                        return Ok(None);
+                    }
+                    let supported = if bit_not {
+                        matches!(
+                            family,
+                            "`I8`"
+                                | "`I16`"
+                                | "`I32`"
+                                | "`I64`"
+                                | "`U8`"
+                                | "`U16`"
+                                | "`U32`"
+                                | "`U64`"
+                                | "`ISize`"
+                                | "`USize`"
+                                | "`Byte`"
+                        )
+                    } else {
+                        matches!(
+                            family,
+                            "`I8`" | "`I16`" | "`I32`" | "`I64`" | "`ISize`" | "`F32`" | "`F64`"
+                        )
+                    };
+                    if supported {
+                        return Ok(Some((family, diagnostics)));
+                    }
+                    if matches!(family, "`Str`" | "`ByteStr`" | "`()`") {
+                        diagnostics.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            operand.span,
+                            sai_diagnostics::Code::TypeMismatch,
+                            format!("expected `I64`, found {family}"),
+                            "type mismatch",
+                        )?);
+                        return Ok(Some((family, diagnostics)));
+                    }
+                    let (operator_text, trait_name) = if bit_not {
+                        ("~", "BitNot")
+                    } else {
+                        ("-", "Neg")
+                    };
                     diagnostics.push(const_literal_diagnostic(
                         owner.id,
                         inputs,
                         snapshot,
-                        operand.span,
-                        sai_diagnostics::Code::TypeMismatch,
-                        format!("expected `I64`, found {family}"),
-                        "type mismatch",
+                        expr.span,
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        format!(
+                            "operator `{operator_text}` has no `{trait_name}` implementation for `{}`",
+                            family.trim_matches('`')
+                        ),
+                        "operator trait implementation is not available",
                     )?);
                     Ok(Some((family, diagnostics)))
                 }
@@ -56398,6 +56450,7 @@ property "shared"() {}
             "pub fn pick() -> I64 { 1 }\n",
             "pub fn take(n: I64) -> I64 { n }\n",
             "pub fn take_i8(n: I8) -> I8 { n }\n",
+            "pub fn take_f32(n: F32) -> F32 { n }\n",
             "pub fn let_call() -> Str {\n    let m = pick()\n    \"a\"\n}\n",
             "pub fn scrutinee_call() -> Str {\n    match pick() { 1 => \"a\", _ => \"b\" }\n}\n",
             "pub fn arg_call() -> Str {\n    let m = take(1)\n    \"a\"\n}\n",
@@ -56405,6 +56458,7 @@ property "shared"() {}
             "pub fn arg_mismatch() -> Str {\n    let m = take(\"a\")\n    \"b\"\n}\n",
             "pub fn tail_call() -> Str {\n    pick()\n}\n",
             "pub fn named_arg() -> Str {\n    let m = take(n: 1)\n    \"a\"\n}\n",
+            "pub fn bitnot_float_arg() -> Str {\n    let m = take_f32(~1.0)\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -56420,18 +56474,18 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 10);
-        for (index, owner) in resolved.owners()[3..7].iter().enumerate() {
+        assert_eq!(resolved.owners().len(), 12);
+        for (index, owner) in resolved.owners()[4..8].iter().enumerate() {
             match owner.body_type_check().expect("call body check succeeds") {
                 FunctionBodyTypeCheck::Supported { diagnostics } => {
                     assert!(diagnostics.is_empty(), "clean call body: {diagnostics:?}")
                 }
-                other => panic!("expected Supported, found {other:?} at index {}", index + 3),
+                other => panic!("expected Supported, found {other:?} at index {}", index + 4),
             }
         }
         for (index, message) in [
-            (7, "expected `I64`, found `Str`"),
-            (8, "expected `Str`, found `I64`"),
+            (8, "expected `I64`, found `Str`"),
+            (9, "expected `Str`, found `I64`"),
         ] {
             match resolved.owners()[index]
                 .body_type_check()
@@ -56445,7 +56499,7 @@ property "shared"() {}
                 other => panic!("expected Supported, found {other:?}"),
             }
         }
-        match resolved.owners()[9]
+        match resolved.owners()[10]
             .body_type_check()
             .expect("named argument body check succeeds")
         {
@@ -56458,6 +56512,12 @@ property "shared"() {}
             }
             other => panic!("expected Supported, found {other:?}"),
         }
+        assert!(matches!(
+            resolved.owners()[11]
+                .body_type_check()
+                .expect("float bitnot body check succeeds"),
+            FunctionBodyTypeCheck::Unsupported
+        ));
     }
 
     #[test]
