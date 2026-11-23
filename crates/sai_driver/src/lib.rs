@@ -11380,6 +11380,32 @@ fn collect_str_branch_let_annotations(
                 );
             }
         }
+        // `return`/`break` values can be blocks holding annotated
+        // `let`s (`{ return { let n: I32 = 1\n "a" } }`).
+        ExprKind::Return(Some(value)) => {
+            collect_str_branch_let_annotations(
+                value,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        ExprKind::Break {
+            value: Some(value), ..
+        } => {
+            collect_str_branch_let_annotations(
+                value,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
         _ => {}
     }
 }
@@ -11456,6 +11482,8 @@ fn str_shaped_local_init(
         ExprKind::Field { .. } => str_self_field_projected_family(init, inputs) == Some("`Str`"),
         // `let s = match c { true => "a", _ => 1 }` admits so the
         // kernel diagnoses the non-`Str` arm instead of gating.
+        // Diverging arms are neutral — they never yield `Str`, so they
+        // neither admit nor disqualify the `match`.
         ExprKind::Match { arms, .. } => {
             !arms.is_empty()
                 && arms.iter().any(|arm| {
@@ -11469,8 +11497,6 @@ fn str_shaped_local_init(
                     )
                 })
         }
-        // Diverging expressions never observe the `Str` yield.
-        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
         // `let s = if c { "a" } else { "b" }` yields `Str` when both
         // branches do (an `else if` chain recurses through `els`).
         ExprKind::If { then, els, .. } => {
@@ -11530,19 +11556,9 @@ fn str_shaped_branch_block(
             _ => return false,
         }
     }
-    match block.tail {
-        Some(tail) => str_shaped_local_init(tail, locals, inputs, &inner, symbols, type_paths),
-        // A tail-less block whose last statement diverges never
-        // yields `()` into the `Str` position.
-        None => matches!(
-            block.stmts.last().map(|stmt| stmt.kind),
-            Some(StmtKind::Expr(expression))
-                if matches!(
-                    expression.kind,
-                    ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
-                )
-        ),
-    }
+    block.tail.is_some_and(|tail| {
+        str_shaped_local_init(tail, locals, inputs, &inner, symbols, type_paths)
+    })
 }
 
 fn primitive_if_tail_shape_is_supported(
@@ -61438,6 +61454,8 @@ property "shared"() {}
             "pub fn str_match_arm_let_annotation(flag: Bool) -> USize { let s: Str = match flag { true => { let n: I32 = 1\n        \"a\" }, _ => \"b\" }\n    s.len() }\n",
             "pub fn str_match_arm_return(flag: Bool) -> USize { let s: Str = match flag { true => \"a\", _ => { return 1 } }\n    s.len() }\n",
             "pub fn str_match_call_arm_mismatch(flag: Bool, value: Str) -> USize { let s = match flag { true => \"a\", _ => value.len() }\n    s.len() }\n",
+            "pub fn numeric_match_diverging_arm(flag: Bool) -> I32 { let s = match flag { true => { return 1 }, _ => 2 }\n    s }\n",
+            "pub fn str_match_return_block_let(flag: Bool) -> I32 { let s: Str = match flag { true => { return { let n: I32 = 1\n            2 } }, _ => \"b\" }\n    1 }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61454,7 +61472,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 36);
+        assert_eq!(owners.len(), 38);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -61479,8 +61497,11 @@ property "shared"() {}
             ));
         }
         // `match` arm bodies with annotated `let`s or diverging
-        // `return`s check like the other `Str` arms.
-        for owner in &owners[33..35] {
+        // `return`s check like the other `Str` arms. Diverging arms
+        // stay neutral in joins: a numeric `match` with a `return`
+        // arm still literal-joins, and `return`-value blocks carry
+        // their own annotated `let`s.
+        for owner in owners[33..35].iter().chain(&owners[36..38]) {
             assert!(matches!(
                 owner
                     .body_type_check()

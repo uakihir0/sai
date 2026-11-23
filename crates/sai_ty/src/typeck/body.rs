@@ -4655,21 +4655,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.check_stmt(stmt)?;
         }
         // Diverging exits (`return`/`break`/`continue`) never yield a
-        // value into the `Str` position: a tail-less block whose last
-        // statement diverges, or a diverging tail expression, closes
+        // value into the `Str` position: a tail-less block containing
+        // a diverging statement, or a diverging tail expression, closes
         // the branch like `check_stmt_block` does for statement blocks.
         let Some(tail) = block.tail else {
-            return match block.stmts.last().map(|stmt| stmt.kind) {
-                Some(StmtKind::Expr(expression))
-                    if matches!(
-                        expression.kind,
-                        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
-                    ) =>
-                {
-                    Ok(())
-                }
-                _ => Err(()),
-            };
+            let diverges = block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt.kind,
+                    StmtKind::Expr(expression)
+                        if matches!(
+                            expression.kind,
+                            ExprKind::Return(..)
+                                | ExprKind::Break { .. }
+                                | ExprKind::Continue { .. }
+                        )
+                )
+            });
+            return if diverges { Ok(()) } else { Err(()) };
         };
         match tail.kind {
             ExprKind::Return(value) => self.check_return(tail.hir_id, value),
@@ -4878,21 +4880,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 _ => return false,
             }
         }
-        match block.tail {
-            Some(tail) => self.str_shaped_initializer_in(tail, &inner),
-            // A tail-less block whose last statement diverges never
-            // yields `()` into the `Str` position.
-            None => matches!(
-                block.stmts.last().map(|stmt| stmt.kind),
-                Some(StmtKind::Expr(expression))
-                    if matches!(
-                        expression.kind,
-                        ExprKind::Return(..)
-                            | ExprKind::Break { .. }
-                            | ExprKind::Continue { .. }
-                    )
-            ),
-        }
+        block
+            .tail
+            .is_some_and(|tail| self.str_shaped_initializer_in(tail, &inner))
     }
 
     // Whether an unannotated initializer yields `Str`: a `Str` literal,
@@ -4937,14 +4927,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             // `any`, not `all`: the kernel diagnoses non-`Str` arms
             // (`{ _ => 1 }` in a `Str` join) instead of gating.
+            // Diverging arms are neutral — they never yield `Str`, so
+            // they neither admit nor disqualify the `match`.
             ExprKind::Match { arms, .. } => {
                 !arms.is_empty()
                     && arms
                         .iter()
                         .any(|arm| self.str_shaped_initializer_in(arm.body, str_bindings))
             }
-            // Diverging expressions never observe the `Str` yield.
-            ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
             _ => false,
         }
     }
@@ -5730,7 +5720,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             .insert(binding, LocalType::Concrete(scrutinee_type)),
                     ));
                 }
-                let body_result = self.join_literal_site(arm.body, &mut joined);
+                let body_result = if self.arm_body_diverges(arm.body) {
+                    self.check_expr_value(arm.body, scrutinee_type).map(|_| ())
+                } else {
+                    self.join_literal_site(arm.body, &mut joined)
+                };
                 self.restore_arm_binding(&mut arm_binding);
                 body_result?;
                 continue;
@@ -5746,7 +5740,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .guard
                 .map(|guard| self.check_if_condition(guard))
                 .unwrap_or(Ok(()))
-                .and_then(|_| self.join_literal_site(arm.body, &mut joined));
+                .and_then(|_| {
+                    if self.arm_body_diverges(arm.body) {
+                        self.check_expr_value(arm.body, scrutinee_type).map(|_| ())
+                    } else {
+                        self.join_literal_site(arm.body, &mut joined)
+                    }
+                });
             self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
@@ -5760,6 +5760,32 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         };
         Ok(local)
+    }
+
+    // Whether an arm body can never produce a value: a `return`/
+    // `break`/`continue` expression, or a block carrying a diverging
+    // statement or a diverging tail. Diverging arms stay out of the
+    // literal join — they are checked against the enclosing expected
+    // type but contribute no literal site.
+    fn arm_body_diverges(&mut self, expression: &'hir Expr<'hir>) -> bool {
+        match expression.kind {
+            ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
+            ExprKind::Block(block) => {
+                block.stmts.iter().any(|stmt| {
+                    matches!(
+                        stmt.kind,
+                        StmtKind::Expr(expression)
+                            if matches!(
+                                expression.kind,
+                                ExprKind::Return(..)
+                                    | ExprKind::Break { .. }
+                                    | ExprKind::Continue { .. }
+                            )
+                    )
+                }) || block.tail.is_some_and(|tail| self.arm_body_diverges(tail))
+            }
+            _ => false,
+        }
     }
 
     /// Joins one literal tail into the shared literal variable: the first
