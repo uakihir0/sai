@@ -4657,20 +4657,36 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
                 Ok(())
             }
-            ExprKind::Path(_) => match self.check_local_path(expression)? {
-                LocalType::Str => Ok(()),
-                LocalType::Concrete(found) => {
-                    self.errors.push(PrimitiveBodyError {
-                        node: expression.hir_id,
-                        kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
-                            expected: ScalarType::Str,
-                            found: ScalarType::Primitive(found),
-                        },
-                    });
-                    Ok(())
+            ExprKind::Path(_) => {
+                // A `Str` parameter/local binds in `str_bindings`, not
+                // always in `known_bindings` — check the shared set
+                // first so `if flag { text } else { "b" }` resolves.
+                if self
+                    .plain_local_path_binding(expression)
+                    .is_some_and(|binding| {
+                        self.input
+                            .str_bindings
+                            .is_some_and(|bindings| bindings.contains(&binding))
+                    })
+                {
+                    self.record_expression_type(expression.hir_id, LocalType::Str);
+                    return Ok(());
                 }
-                _ => Err(()),
-            },
+                match self.check_local_path(expression)? {
+                    LocalType::Str => Ok(()),
+                    LocalType::Concrete(found) => {
+                        self.errors.push(PrimitiveBodyError {
+                            node: expression.hir_id,
+                            kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                                expected: ScalarType::Str,
+                                found: ScalarType::Primitive(found),
+                            },
+                        });
+                        Ok(())
+                    }
+                    _ => Err(()),
+                }
+            }
             ExprKind::Field { .. } => match self
                 .input
                 .str_self_field_projections
@@ -4704,15 +4720,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     fn str_shaped_initializer(&mut self, init: &Expr<'hir>) -> bool {
         match init.kind {
             ExprKind::Lit(Lit::Str(_)) => true,
-            ExprKind::Path(_) => self
-                .input
-                .local_paths
-                .get(&init.hir_id)
-                .is_some_and(|binding| {
-                    self.input
-                        .str_bindings
-                        .is_some_and(|bindings| bindings.contains(binding))
-                }),
+            // `local_paths` is keyed by the path's id, not the
+            // enclosing expression's — resolve the binding first.
+            ExprKind::Path(_) => self.plain_local_path_binding(init).is_some_and(|binding| {
+                self.input
+                    .str_bindings
+                    .is_some_and(|bindings| bindings.contains(&binding))
+            }),
             ExprKind::Field { .. } => matches!(
                 self.input
                     .str_self_field_projections
@@ -4720,31 +4734,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     .copied(),
                 Some("`Str`")
             ),
-            ExprKind::Block(block) => {
-                block.stmts.is_empty()
-                    && block
-                        .tail
-                        .is_some_and(|tail| self.str_shaped_initializer(tail))
-            }
+            ExprKind::Block(block) => self.str_branch_block_shaped(block),
             ExprKind::If { then, els, .. } => {
-                then.stmts.is_empty()
-                    && then
-                        .tail
-                        .is_some_and(|tail| self.str_shaped_initializer(tail))
+                self.str_branch_block_shaped(then)
                     && els.is_some_and(|els| self.str_shaped_initializer(els))
             }
             ExprKind::Match { arms, .. } => {
                 !arms.is_empty()
                     && arms.iter().all(|arm| match arm.body.kind {
-                        ExprKind::Path(_) => self
-                            .input
-                            .local_paths
-                            .get(&arm.body.hir_id)
-                            .is_some_and(|binding| {
-                                self.input
-                                    .str_bindings
-                                    .is_some_and(|bindings| bindings.contains(binding))
-                            }),
+                        ExprKind::Path(_) => {
+                            self.plain_local_path_binding(arm.body)
+                                .is_some_and(|binding| {
+                                    self.input
+                                        .str_bindings
+                                        .is_some_and(|bindings| bindings.contains(&binding))
+                                })
+                        }
                         _ => false,
                     })
             }
