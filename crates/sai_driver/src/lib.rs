@@ -8310,6 +8310,7 @@ fn check_inherent_method_body_type<'a>(
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
     let mut self_field_projections = HashMap::new();
+    let mut str_field_projections = HashMap::new();
     let mut unknown_self_fields = HashSet::new();
     let mut diagnostics = Vec::new();
     // Self-field operands desugar to `let t = self.f`, so every `self.f`
@@ -8327,6 +8328,7 @@ fn check_inherent_method_body_type<'a>(
             true,
             &field_types,
             &mut self_field_projections,
+            &mut str_field_projections,
             &mut unknown_self_fields,
             &mut diagnostics,
             symbols,
@@ -8349,7 +8351,13 @@ fn check_inherent_method_body_type<'a>(
         params: explicit_body_params,
         ..*body
     };
-    if let Some((type_diagnostics, type_results)) = check_function_body_primitive_local_block(
+    // `self.<Str field>.len()`/`is_empty()` receivers read the same
+    // projections map the `-> Str` walk uses — publish it for the walk.
+    let has_str_projections = !str_field_projections.is_empty();
+    if has_str_projections {
+        *inputs.str_self_field_projections.borrow_mut() = Some(str_field_projections);
+    }
+    let prim_walk = check_function_body_primitive_local_block(
         method_owner,
         explicit_sig,
         &explicit_body,
@@ -8363,7 +8371,11 @@ fn check_inherent_method_body_type<'a>(
         inputs,
         snapshot,
         target_cfg,
-    )? {
+    );
+    if has_str_projections {
+        *inputs.str_self_field_projections.borrow_mut() = None;
+    }
+    if let Some((type_diagnostics, type_results)) = prim_walk? {
         diagnostics.extend(type_diagnostics);
         *primitive_type_results = Some(type_results);
         Ok(FunctionBodyTypeCheck::Supported { diagnostics })
@@ -8376,6 +8388,9 @@ struct InherentMethodPrimitiveFields {
     type_name: String,
     type_name_span: sai_diagnostics::Span,
     fields: HashMap<String, sai_resolve::prelude::PrimTy>,
+    // `Str` fields are not `PrimTy`, but `self.<name>` on one is a
+    // valid `s.len()`/`s.is_empty()` receiver — tracked by name.
+    str_fields: HashSet<String>,
     candidate_names: Vec<String>,
 }
 
@@ -8385,6 +8400,7 @@ fn collect_inherent_method_self_field(
     collect_known_type: bool,
     fields: &InherentMethodPrimitiveFields,
     self_field_projections: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+    str_field_projections: &mut HashMap<HirId, &'static str>,
     unknown_self_fields: &mut HashSet<HirId>,
     diagnostics: &mut Vec<Diagnostic>,
     symbols: &Interner,
@@ -8400,6 +8416,20 @@ fn collect_inherent_method_self_field(
         }
         Ok(_) => {}
         Err(name) => {
+            // A `Str` field is not a primitive projection but is a
+            // valid `len`/`is_empty` receiver — record its family.
+            let is_str_field = symbols.resolve(name.sym).ok().is_some_and(|spelling| {
+                fields.str_fields.contains(
+                    sai_syntax::normalize_identifier(
+                        spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+                    )
+                    .as_str(),
+                )
+            });
+            if is_str_field {
+                str_field_projections.insert(expression.hir_id, "`Str`");
+                return Ok(true);
+            }
             unknown_self_fields.insert(expression.hir_id);
             diagnostics.push(unknown_self_field_diagnostic(
                 owner,
@@ -8520,11 +8550,16 @@ fn inherent_method_primitive_field_types(
             .source
             .text()
             .get(range.start().to_usize()..range.end().to_usize())?;
-        let field_type = primitive_method_field_type(ty_text)?;
-        if field_types
-            .insert(normalized_field_name, field_type)
-            .is_some()
-        {
+        if let Some(field_type) = primitive_method_field_type(ty_text) {
+            if field_types
+                .insert(normalized_field_name, field_type)
+                .is_some()
+            {
+                return None;
+            }
+        } else if ty_text == "Str" {
+            str_field_types.insert(normalized_field_name);
+        } else {
             return None;
         }
         candidate_names.push(field_spelling.to_owned());
@@ -8536,6 +8571,7 @@ fn inherent_method_primitive_field_types(
             .to_owned(),
         type_name_span,
         fields: field_types,
+        str_fields: str_field_types,
         candidate_names,
     })
 }
