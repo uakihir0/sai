@@ -15430,6 +15430,23 @@ fn str_loop_family(
 // `break x` (x: I8) and `break 2` join at `I8`. The literal is checked
 // against the pin, so an out-of-range value reports
 // LITERAL_OUT_OF_RANGE rather than a spurious join mismatch.
+// An arm contribution's literal leaf: a bare `Lit` body, or a block
+// whose tail is a literal — `x => { ..; 1 }` still yields the literal
+// for the join's literal-variable fold (`if let` arm bodies are always
+// blocks).
+fn str_literal_contribution<'a>(expr: Option<&'a HirExpr<'a>>) -> Option<&'a HirExpr<'a>> {
+    let expr = expr?;
+    if matches!(expr.kind, ExprKind::Lit(_)) {
+        return Some(expr);
+    }
+    if let ExprKind::Block(block) = expr.kind {
+        return block
+            .tail
+            .filter(|tail| matches!(tail.kind, ExprKind::Lit(_)));
+    }
+    None
+}
+
 fn str_fold_literal_contributions(
     owner: &HirOwner<'_>,
     contributions: &mut [(Option<&'static str>, Option<&HirExpr<'_>>, sai_hir::Span)],
@@ -15441,7 +15458,7 @@ fn str_fold_literal_contributions(
 ) -> Result<(), OwnerControlFlowResolutionError> {
     let mut prims = contributions
         .iter()
-        .filter(|(_, value, _)| !matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_))))
+        .filter(|(_, value, _)| str_literal_contribution(*value).is_none())
         .filter_map(|(family, _, _)| *family)
         .filter(|family| {
             *family != "`!`"
@@ -15455,8 +15472,10 @@ fn str_fold_literal_contributions(
         return Ok(());
     };
     for (family, value, _) in contributions.iter_mut() {
-        let Some(expr) = *value else { continue };
-        if *family != Some("`I64`") || !matches!(expr.kind, ExprKind::Lit(_)) {
+        let Some(expr) = str_literal_contribution(*value) else {
+            continue;
+        };
+        if !matches!(*family, Some("`I64`") | Some("`F64`")) {
             continue;
         }
         if let Some(mut literal_diagnostics) = check_const_literal_against_type(
@@ -19162,7 +19181,7 @@ fn str_pure_match_family(
     if let [prim] = prims.as_slice() {
         for (family, value, _) in arm_families.iter_mut() {
             if matches!(*family, Some("`I64`") | Some("`F64`"))
-                && matches!(value.map(|v| v.kind), Some(ExprKind::Lit(_)))
+                && str_literal_contribution(*value).is_some()
             {
                 *family = Some(*prim);
             }
