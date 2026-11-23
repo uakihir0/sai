@@ -30,6 +30,13 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     pub body: &'a Body<'hir>,
     pub return_type: PrimTy,
     pub initial_bindings: &'a HashMap<BindingId, PrimTy>,
+    /// `Str`-typed parameter bindings admitted by the owner-aware driver —
+    /// `Str` is not a `PrimTy`, so these bind `LocalType::Str`.
+    pub str_bindings: Option<&'a HashSet<BindingId>>,
+    /// Local annotation nodes (`let s: Str = ..`) whose type spells `Str`.
+    /// The driver resolves them textually the way `primitive_types` maps
+    /// primitive annotation nodes.
+    pub str_annotations: Option<&'a HashSet<HirId>>,
     pub primitive_types: &'a HashMap<HirId, PrimTy>,
     /// Direct `self.field` projection types resolved by the owner-aware
     /// driver. Other field expressions remain outside this body slice.
@@ -153,6 +160,18 @@ pub enum PrimitiveBodyErrorKind {
         expected: PrimTy,
         found: PrimTy,
     },
+    /// `expected <type>, found <type>` where either side may be `Str` —
+    /// `Str` is not a `PrimTy`, so `TypeMismatch` cannot name it.
+    ScalarTypeMismatch {
+        expected: ScalarType,
+        found: ScalarType,
+    },
+    /// `expected <type>, found <literal>` where the expected side may be
+    /// `Str`.
+    ScalarLiteralTypeMismatch {
+        expected: ScalarType,
+        found: PrimitiveLiteralKind,
+    },
     OperatorNotSupported {
         operator: BinOp,
         operand: PrimitiveOperatorOperand,
@@ -223,6 +242,14 @@ enum PrimitiveBoolOperandResult {
     Unsupported,
 }
 
+/// A scalar type the bounded checker can name: a primitive or `Str`
+/// (`Str` is `Adt(str)` — a nominal type outside `PrimTy`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScalarType {
+    Primitive(PrimTy),
+    Str,
+}
+
 /// Scalar literal classes supported by the primitive literal kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrimitiveLiteralKind {
@@ -236,6 +263,9 @@ pub enum PrimitiveLiteralKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalType {
     Concrete(PrimTy),
+    /// `Str` — a nominal type outside `PrimTy` (spec 6.8.7 admits it as a
+    /// comparison operand; every other operator position stays gated).
+    Str,
     LiteralVariable(usize),
     ErrorLiteralVariable(usize),
     Error(Option<PrimTy>),
@@ -308,13 +338,23 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         .iter()
         .map(|parameter| (parameter.binding, parameter.hir_id))
         .collect();
-    let known_bindings: HashMap<BindingId, LocalType> = input
+    let mut known_bindings: HashMap<BindingId, LocalType> = input
         .initial_bindings
         .iter()
         .map(|(binding, ty)| (*binding, LocalType::Concrete(*ty)))
         .collect();
+    if let Some(str_bindings) = input.str_bindings {
+        for binding in str_bindings {
+            known_bindings.insert(*binding, LocalType::Str);
+        }
+    }
     let binding_type_candidates = known_bindings.clone();
-    let trusted_bindings = input.initial_bindings.keys().copied().collect();
+    let trusted_bindings = input
+        .initial_bindings
+        .keys()
+        .copied()
+        .chain(input.str_bindings.into_iter().flatten().copied())
+        .collect();
     let mut expression_nodes = HashMap::new();
     if matches!(input.body.value.kind, ExprKind::Block(_)) {
         collect_primitive_expression_nodes(&input.body.value, &mut expression_nodes);
@@ -647,7 +687,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // and the optional message is a `Str` literal per N-C-20.
             self.check_if_condition(cond)?;
             if let Some(msg) = msg {
-                if !matches!(msg.kind, ExprKind::Lit(Lit::Str(_))) {
+                // The message is a `Str` literal or a `Str`-typed local per
+                // N-C-20 — a `Str` parameter or local path qualifies.
+                let str_message = matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))
+                    || matches!(self.check_operand_local_type(msg), Ok(LocalType::Str));
+                if !str_message {
                     return Err(());
                 }
             }
@@ -683,17 +727,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.mutable_bindings.insert(binding);
         }
 
-        let annotation = match ty {
-            Some(ty) => {
-                let Some(primitive) = self.input.primitive_types.get(&ty.hir_id).copied() else {
-                    return Err(());
-                };
-                if !supports_primitive_literal(primitive) {
-                    return Err(());
+        let (annotation, str_annotation) = match ty {
+            Some(ty) => match self.input.primitive_types.get(&ty.hir_id).copied() {
+                Some(primitive) => {
+                    if !supports_primitive_literal(primitive) {
+                        return Err(());
+                    }
+                    (Some(primitive), false)
                 }
-                Some(primitive)
-            }
-            None => None,
+                None if self
+                    .input
+                    .str_annotations
+                    .is_some_and(|annotations| annotations.contains(&ty.hir_id)) =>
+                {
+                    (None, true)
+                }
+                None => return Err(()),
+            },
+            None => (None, false),
         };
 
         let errors_before_initializer = self.errors.len();
@@ -701,7 +752,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             local_type,
             deferred_neg_result: initializer_is_deferred_neg_result,
             deferred_bitnot_result: initializer_is_deferred_bitnot_result,
-        } = self.check_initializer_value(init, annotation)?;
+        } = if str_annotation {
+            InitializerCheck {
+                local_type: self.check_str_annotated_initializer(init)?,
+                deferred_neg_result: false,
+                deferred_bitnot_result: false,
+            }
+        } else {
+            self.check_initializer_value(init, annotation)?
+        };
 
         if initializer_is_deferred_neg_result {
             self.deferred_neg_result_bindings.insert(binding);
@@ -939,9 +998,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
         self.record_expression_type(init.hir_id, local_type);
-        if let Some(annotation) = annotation {
-            self.binding_type_candidates
-                .insert(binding, LocalType::Concrete(annotation));
+        if let Some(local_type) = annotation
+            .map(LocalType::Concrete)
+            .or(str_annotation.then_some(LocalType::Str))
+        {
+            self.binding_type_candidates.insert(binding, local_type);
             self.binding_candidate_order.push(binding);
             self.annotated_bindings.insert(binding);
             self.binding_initializer_roots.insert(binding, init.hir_id);
@@ -2388,6 +2449,78 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         ) {
             return Err(());
         }
+
+        // `Str` operands compare like primitives: all six operators are
+        // built-in for `Str` (spec 6.8.7 — `==` byte equality, `<`
+        // lexicographic byte order). A `Str` literal or `Str`-typed path
+        // qualifies; the right operand is checked against the left's type,
+        // so a mismatch is always reported on the right operand except
+        // when the left side itself is the non-`Str` one.
+        let left_str = matches!(left.kind, ExprKind::Lit(Lit::Str(_)))
+            || matches!(self.check_operand_local_type(left), Ok(LocalType::Str));
+        let right_str = matches!(right.kind, ExprKind::Lit(Lit::Str(_)))
+            || matches!(self.check_operand_local_type(right), Ok(LocalType::Str));
+        if left_str || right_str {
+            if left_str != right_str {
+                // The right operand is checked against the left's type —
+                // the mismatch always lands on the right.
+                let expected = if left_str {
+                    ScalarType::Str
+                } else {
+                    self.scalar_operand_scalar_type(left)?
+                };
+                match right.kind {
+                    ExprKind::Lit(literal) => {
+                        let kind = match primitive_literal_kind(literal) {
+                            Some(kind) => PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                expected,
+                                found: kind,
+                            },
+                            // A `Str` literal on the right of a non-`Str`
+                            // left reports `found `Str``.
+                            None => PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                                expected,
+                                found: ScalarType::Str,
+                            },
+                        };
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind,
+                        });
+                    }
+                    _ => {
+                        let found = match self.check_operand_local_type(right)? {
+                            LocalType::Concrete(found) => ScalarType::Primitive(found),
+                            LocalType::Str => ScalarType::Str,
+                            LocalType::LiteralVariable(id)
+                            | LocalType::ErrorLiteralVariable(id) => {
+                                let Some(variable) = self.literal_variables.get(id) else {
+                                    return Err(());
+                                };
+                                ScalarType::Primitive(variable.resolved.unwrap_or_else(|| {
+                                    literal_variable_default_type(variable.kind)
+                                }))
+                            }
+                            // Already reported on its own — recover.
+                            LocalType::Error(_) => return Ok(LocalType::Concrete(PrimTy::Bool)),
+                        };
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind: PrimitiveBodyErrorKind::ScalarTypeMismatch { expected, found },
+                        });
+                    }
+                }
+            }
+            for operand in [left, right] {
+                if matches!(operand.kind, ExprKind::Lit(Lit::Str(_)))
+                    || matches!(self.check_operand_local_type(operand), Ok(LocalType::Str))
+                {
+                    self.record_expression_type(operand.hir_id, LocalType::Str);
+                }
+            }
+            return Ok(LocalType::Concrete(PrimTy::Bool));
+        }
+
         for (local_type, literal_expression, literal_entry) in [
             (
                 self.check_operand_local_type(left).ok(),
@@ -2622,6 +2755,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
     fn check_logical_operand_probe(&mut self, operand: &'hir Expr<'hir>) -> Result<PrimTy, ()> {
         let local_type = self.check_operand_local_type(operand)?;
+        if let LocalType::Str = local_type {
+            // `not s`/`s and x` — a `Str` operand in a `Bool` position
+            // reports the `Bool` mismatch and recovers as `Bool`.
+            self.errors.push(PrimitiveBodyError {
+                node: operand.hir_id,
+                kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                    expected: ScalarType::Primitive(PrimTy::Bool),
+                    found: ScalarType::Str,
+                },
+            });
+            return Ok(PrimTy::Bool);
+        }
         if let LocalType::LiteralVariable(id) = local_type {
             // An integer or floating-point literal variable can
             // never resolve to `Bool`, so `not x` reports the
@@ -2666,6 +2811,93 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(LocalType::Concrete(PrimTy::Bool))
     }
 
+    /// `let s: Str = init` or `s = init` on a `Str` place: `Str` literals
+    /// and `Str`-typed paths bind directly; a primitive initializer
+    /// reports the `Str` mismatch; anything else stays outside the slice.
+    fn check_str_annotated_initializer(&mut self, init: &Expr<'hir>) -> Result<LocalType, ()> {
+        match init.kind {
+            ExprKind::Lit(Lit::Str(_)) => {
+                self.record_expression_type(init.hir_id, LocalType::Str);
+                Ok(LocalType::Str)
+            }
+            ExprKind::Lit(literal) => {
+                let Some(kind) = primitive_literal_kind(literal) else {
+                    return Err(());
+                };
+                self.errors.push(PrimitiveBodyError {
+                    node: init.hir_id,
+                    kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                        expected: ScalarType::Str,
+                        found: kind,
+                    },
+                });
+                Ok(LocalType::Str)
+            }
+            _ => match self.check_local_path(init)? {
+                LocalType::Str => Ok(LocalType::Str),
+                LocalType::Concrete(found) => {
+                    self.errors.push(PrimitiveBodyError {
+                        node: init.hir_id,
+                        kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                            expected: ScalarType::Str,
+                            found: ScalarType::Primitive(found),
+                        },
+                    });
+                    Ok(LocalType::Str)
+                }
+                LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                    let Some(variable) = self.literal_variables.get(id) else {
+                        return Err(());
+                    };
+                    match variable.resolved {
+                        Some(found) => self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                                expected: ScalarType::Str,
+                                found: ScalarType::Primitive(found),
+                            },
+                        }),
+                        None => self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                expected: ScalarType::Str,
+                                found: variable.kind,
+                            },
+                        }),
+                    }
+                    Ok(LocalType::Str)
+                }
+                LocalType::Error(_) => Ok(LocalType::Str),
+            },
+        }
+    }
+
+    /// Classify a non-`Str` comparison operand into the scalar type a
+    /// `Str`-comparison mismatch names on its side: literals default to
+    /// their unannotated type (`1` -> `I64`), literal variables to their
+    /// resolution or family default.
+    fn scalar_operand_scalar_type(&mut self, operand: &'hir Expr<'hir>) -> Result<ScalarType, ()> {
+        if let ExprKind::Lit(literal) = operand.kind {
+            let Some(kind) = primitive_literal_kind(literal) else {
+                return Err(());
+            };
+            return Ok(ScalarType::Primitive(literal_variable_default_type(kind)));
+        }
+        match self.check_operand_local_type(operand)? {
+            LocalType::Concrete(found) => Ok(ScalarType::Primitive(found)),
+            LocalType::Str => Ok(ScalarType::Str),
+            LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                let Some(variable) = self.literal_variables.get(id) else {
+                    return Err(());
+                };
+                Ok(ScalarType::Primitive(variable.resolved.unwrap_or_else(
+                    || literal_variable_default_type(variable.kind),
+                )))
+            }
+            LocalType::Error(_) => Err(()),
+        }
+    }
+
     fn check_logical_operand_type(
         &mut self,
         operand: &'hir Expr<'hir>,
@@ -2693,7 +2925,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                 self.literal_variables.get(id)?.resolved?
             }
-            LocalType::Error(_) => return None,
+            LocalType::Str | LocalType::Error(_) => return None,
         };
         supports_primitive_literal(primitive).then_some(primitive)
     }
@@ -2772,6 +3004,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
             }
             LocalType::Concrete(_) => {}
+            LocalType::Str => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                        expected: ScalarType::Primitive(expected),
+                        found: ScalarType::Str,
+                    },
+                });
+            }
             LocalType::Error(_) => {}
             LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                 let Some((resolved, kind)) = self
@@ -3083,6 +3324,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         }
                     }
                     LocalType::Error(_) => LoopBreakState::Unfixed,
+                    // A `Str` break value cannot fix `β` — `LoopBreakState`
+                    // has no `Str` member, so the loop stays gated.
+                    LocalType::Str => return Err(()),
                 };
             }
             // A bare `break` inside `value` unified `β` with `()` — this
@@ -3099,6 +3343,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
                         });
                     }
+                }
+                LocalType::Str => {
+                    self.errors.push(PrimitiveBodyError {
+                        node: value.hir_id,
+                        kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                            expected: ScalarType::Primitive(expected),
+                            found: ScalarType::Str,
+                        },
+                    });
                 }
                 LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                     match self.literal_variable_group_type(id) {
@@ -3611,6 +3864,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         self.check_comparison(operator, left, right)?
                     }
                 }
+                ExprKind::Lit(Lit::Str(_)) => {
+                    self.record_expression_type(expression.hir_id, LocalType::Str);
+                    LocalType::Str
+                }
                 ExprKind::Lit(literal) => {
                     let Some(kind) = primitive_literal_kind(literal) else {
                         return Err(());
@@ -3676,6 +3933,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.check_concrete_tail_type(found, expected, expression.hir_id);
                 }
             }
+            LocalType::Str => {
+                self.errors.push(PrimitiveBodyError {
+                    node: expression.hir_id,
+                    kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                        expected: ScalarType::Primitive(expected),
+                        found: ScalarType::Str,
+                    },
+                });
+            }
             LocalType::Concrete(found) => {
                 self.check_concrete_tail_type(found, expected, expression.hir_id);
             }
@@ -3739,7 +4005,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
         if !matches!(
             local_type,
-            LocalType::Concrete(_) | LocalType::LiteralVariable(_)
+            LocalType::Concrete(_) | LocalType::Str | LocalType::LiteralVariable(_)
         ) {
             return Err(());
         }
@@ -3765,6 +4031,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             LocalType::Concrete(place_type) => {
                 self.check_initializer_value(rhs, Some(place_type))?;
                 self.record_expression_type(lhs.hir_id, LocalType::Concrete(place_type));
+                Ok(())
+            }
+            // `s = e` on a `Str` place desugars like `let s: Str = e` — the
+            // right side is checked against `Str` at the coercion site.
+            LocalType::Str => {
+                self.check_str_annotated_initializer(rhs)?;
+                self.record_expression_type(lhs.hir_id, LocalType::Str);
                 Ok(())
             }
             LocalType::LiteralVariable(id) => {
@@ -4373,6 +4646,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         } else {
             match init.kind {
+                ExprKind::Lit(Lit::Str(_)) => {
+                    // A `Str` literal is a concrete `Str` value — never a
+                    // literal variable. An annotated primitive coercion
+                    // site reports the `Str` mismatch like the checker.
+                    self.record_expression_type(init.hir_id, LocalType::Str);
+                    if let Some(expected) = annotation {
+                        self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                                expected: ScalarType::Primitive(expected),
+                                found: ScalarType::Str,
+                            },
+                        });
+                        LocalType::Concrete(expected)
+                    } else {
+                        LocalType::Str
+                    }
+                }
                 ExprKind::Lit(literal) => {
                     let Some(found) = primitive_literal_kind(literal) else {
                         return Err(());
@@ -5140,6 +5431,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
                 Ok(())
             }
+            LocalType::Str => {
+                self.errors.push(PrimitiveBodyError {
+                    node: condition.hir_id,
+                    kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                        expected: ScalarType::Primitive(PrimTy::Bool),
+                        found: ScalarType::Str,
+                    },
+                });
+                Ok(())
+            }
             _ => Err(()),
         }
     }
@@ -5893,9 +6194,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         match self.local_type_for_unannotated_literal(literal, kind, left.hir_id) {
             LocalType::LiteralVariable(id) => Some(id),
-            LocalType::Concrete(_) | LocalType::Error(_) | LocalType::ErrorLiteralVariable(_) => {
-                None
-            }
+            LocalType::Concrete(_)
+            | LocalType::Str
+            | LocalType::Error(_)
+            | LocalType::ErrorLiteralVariable(_) => None,
         }
     }
 

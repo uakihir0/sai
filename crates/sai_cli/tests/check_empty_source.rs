@@ -4726,6 +4726,76 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
 }
 
 #[test]
+fn primitive_bodies_admit_str_locals_and_comparisons() {
+    for source in [
+        "pub fn str_local_eq() -> Bool {\n    let s = \"a\"\n    s == \"a\"\n}\n",
+        "pub fn str_annotated_local() -> I32 {\n    let s: Str = \"a\"\n    1\n}\n",
+        "pub fn str_local_alias_eq() -> Bool {\n    let s = \"a\"\n    let t = s\n    t == s\n}\n",
+        "pub fn str_param_eq(value: Str) -> Bool { value == \"a\" }\n",
+        "pub fn str_params_eq(first: Str, second: Str) -> Bool {\n    first == second\n}\n",
+        "pub fn str_param_local_eq(value: Str) -> Bool {\n    let s = \"a\"\n    value == s\n}\n",
+        "pub fn str_all_ops(s: Str) -> Bool {\n    s != \"a\" and s < \"b\" and s <= \"c\" and s > \"d\" and s >= \"e\"\n}\n",
+        "pub fn str_assert_msg() -> Bool {\n    let s = \"a\"\n    assert true, s\n    true\n}\n",
+        "pub fn str_var_assign() -> Bool {\n    var s: Str = \"a\"\n    s = \"b\"\n    true\n}\n",
+        "pub fn str_if_condition() -> Bool {\n    let s = \"a\"\n    if s == \"b\" { true } else { false }\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_body_str_mismatches_report_type_diagnostics() {
+    for (source, expected) in [
+        (
+            "pub fn str_int_eq() -> Bool {\n    let s = \"a\"\n    s == 1\n}\n",
+            "expected `Str`, found an integer literal",
+        ),
+        (
+            "pub fn int_str_eq() -> Bool {\n    let s = \"a\"\n    1 == s\n}\n",
+            "expected `I64`, found `Str`",
+        ),
+        (
+            "pub fn str_if_path_condition() -> Bool {\n    let s = \"a\"\n    if s { true } else { false }\n}\n",
+            "expected `Bool`, found `Str`",
+        ),
+        (
+            "pub fn str_tail_mismatch(value: Str) -> I32 {\n    let n = 1\n    value\n}\n",
+            "expected `I32`, found `Str`",
+        ),
+        (
+            "pub fn str_annotated_int() -> Bool {\n    let s: Str = 1\n    true\n}\n",
+            "expected `Str`, found an integer literal",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: Str mismatch should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && stdout.contains(expected)
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a supported Str type mismatch naming {expected}:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn primitive_body_str_forms_outside_the_slice_remain_gated() {
+    for source in [
+        "pub fn str_arith() -> Bool {\n    let s = \"a\"\n    s + 1 == 2\n}\n",
+        "pub fn str_match() -> Bool {\n    let s = \"a\"\n    match s { \"x\" => true, _ => false }\n}\n",
+        "pub fn str_assign_int() -> Bool {\n    var n = 1\n    n = \"a\"\n    true\n}\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
 fn public_function_with_annotated_primitive_locals_emits_check_result() {
     for source in [
         "pub fn answer() -> I32 {\n    let first: U8 = 7\n    let value: I32 = 42\n    value\n}\n",
@@ -4978,12 +5048,11 @@ fn two_parameter_local_copy_type_mismatch_is_reported_at_initializer() {
 }
 
 #[test]
-fn unsupported_two_parameter_local_copy_forms_remain_gated() {
-    for source in [
-        "pub fn copy_pair(first: I32, second: Str) -> I32 {\n    let first_copy: I32 = first\n    let second_copy: Str = second\n    first_copy\n}\n",
-    ] {
-        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
-    }
+fn two_parameter_local_copy_with_a_str_parameter_emits_check_result() {
+    // `Str` parameters and `let s: Str` locals are checked in primitive
+    // bodies (IR-1121).
+    let source = "pub fn copy_pair(first: I32, second: Str) -> I32 {\n    let first_copy: I32 = first\n    let second_copy: Str = second\n    first_copy\n}\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
 
 #[test]
@@ -9644,8 +9713,18 @@ fn primitive_comparison_local_uses_shadowed_binding_and_source_order() {
 
 #[test]
 fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
+    // A `Str`-parameter comparison initializer is checked (IR-1121).
+    assert_success_result(
+        run_check(
+            "pub fn compare(left: Str, right: Str) -> Bool {\n    let result = left == right\n    result\n}\n",
+            "",
+            &[],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
     for source in [
-        "pub fn compare(left: Str, right: Str) -> Bool {\n    let result = left == right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left as I64 == right as I64\n    result\n}\n",
         "type IntegerAlias = I32\npub fn compare(left: IntegerAlias, right: IntegerAlias) -> Bool {\n    let result = left == right\n    result\n}\n",
     ] {
@@ -9889,13 +9968,23 @@ fn primitive_comparison_local_literal_errors_use_operand_spans_and_recover_as_bo
 
 #[test]
 fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
+    // A `Str` parameter compared to a string literal is checked (IR-1121).
+    assert_success_result(
+        run_check(
+            "pub fn compare(value: Str) -> Bool {\n    let result = value == \"text\"\n    result\n}\n",
+            "",
+            &[],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
     for source in [
         "pub fn compare(value: I32) -> Bool {\n    let result = 1 == 2\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < later\n    let later: I32 = 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = result < 1\n    result\n}\n",
         "pub fn compare(value: I32) -> Bool {\n    let result = value < missing\n    result\n}\n",
         "type IntegerAlias = I32\npub fn compare(value: IntegerAlias) -> Bool {\n    let result = value < 1\n    result\n}\n",
-        "pub fn compare(value: Str) -> Bool {\n    let result = value == \"text\"\n    result\n}\n",
         "pub fn compare(value: ()) -> Bool {\n    let result = value == ()\n    result\n}\n",
         "const LIMIT: I32 = 10\npub fn compare(value: I32) -> Bool {\n    let result = value < LIMIT\n    result\n}\n",
     ] {
@@ -10919,13 +11008,24 @@ fn public_single_primitive_parameter_comparison_with_literal_emits_check_results
 
 #[test]
 fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
+    // A `Str` parameter compared to a literal in an `if` condition is
+    // checked (IR-1121).
+    assert_success_result(
+        run_check(
+            "pub fn choose(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
+            "",
+            &[],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
     for source in [
         "const LIMIT: I8 = 10\npub fn choose(value: I8) -> I32 { if value < LIMIT { 1 } else { 2 } }\n",
         "const LIMIT: I8 = 10\npub fn choose(value: I8) -> I32 { if LIMIT < value { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < 11 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < other { 1 } else { 2 } }\n",
         "type I8Alias = I8\npub fn choose(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
-        "pub fn choose(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
         "pub fn choose(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if value < 10 { 1 } }\n",
     ] {
@@ -11530,7 +11630,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn raw_str_return() -> r#Str { \"text\" }\n",
         "type Text = Str\npub fn alias_str_return() -> Text { \"text\" }\n",
         "type Str = I32\npub fn shadowed_str_return() -> Str { \"text\" }\n",
-        "pub fn non_str_return() -> I32 { \"text\" }\n",
         concat!(
             "type StringOwner { marker: Bool }\n",
             "impl StringOwner {\n",
@@ -11539,7 +11638,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         ),
         "pub fn local() -> I32 {\nlet (first, second): (I32, I32) = (1, 2)\nfirst\n}\n",
         "pub fn local() -> I32 { let 0: I32 = 42 else { return 0 }\n1\n}\n",
-        "pub fn local() -> I32 { let value: I32 = \"text\"\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet value: Missing = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nmissing\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = b\"text\"\nvalue\n}\n",
@@ -11576,6 +11674,22 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         );
     }
 
+    // A `Str` literal tail in a primitive body reports the type mismatch
+    // instead of gating (IR-1121).
+    {
+        let source = "pub fn non_str_return() -> I32 { \"text\" }\n";
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && stdout.contains("expected `I32`, found a string literal")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "a `Str` literal tail reports its mismatch without a feature gate:\n{stdout}"
+        );
+    }
+
     // A scalar-parameter `Str` body is checked: a param-path tail reports the
     // group mismatch instead of gating.
     let source = "pub fn integer_param_to_str(value: I32) -> Str { value }\n";
@@ -11594,6 +11708,21 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         tail_start,
         tail_start + "value".len(),
     );
+
+    // An annotated primitive local initialized with a `Str` literal reports
+    // `expected `I32`, found `Str`` instead of gating (IR-1121).
+    {
+        let source = "pub fn local() -> I32 {\nlet value: I32 = \"text\"\nvalue\n}\n";
+        let output = run_check(source, "", &[], &[]);
+        assert_eq!(output.status.code(), Some(1), "checked body must fail");
+        let stdout = std::str::from_utf8(&output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && stdout.contains("expected `I32`, found `Str`")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "the annotated init reports its `Str` mismatch:\n{stdout}"
+        );
+    }
 
     assert_success_result(
         run_check(
