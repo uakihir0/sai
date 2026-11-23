@@ -8041,16 +8041,17 @@ fn check_function_body_type(
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
 }
 
-fn check_inherent_method_body_type(
-    impl_owner: &HirOwner<'_>,
+fn check_inherent_method_body_type<'a>(
+    impl_owner: &HirOwner<'a>,
     method_owner: &HirOwner<'_>,
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    method_call_sites: Option<&StrSelfMethodCallSiteInputs<'a, 'a>>,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
-    inputs: &CurrentOwnerInputs,
+    inputs: &'a CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
     primitive_type_results: &mut Option<sai_ty::typeck::body::PrimitiveBodyTypeResults>,
@@ -8173,7 +8174,14 @@ fn check_inherent_method_body_type(
         let Some(field_types) = str_inherent_method_field_types(*self_ty, symbols, inputs) else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
+        // `self.<method>(..)` calls resolve through the impl's sibling
+        // member signatures — each sibling lowered once for its HIR
+        // signature.
+        let method_signatures = method_call_sites
+            .map(|sites| str_inherent_self_method_signatures(sites, impl_owner, inputs, symbols))
+            .unwrap_or_default();
         let mut self_field_projections = HashMap::new();
+        let mut self_method_calls = HashMap::new();
         let mut field_diagnostics = Vec::new();
         let mut collect_error = None;
         // `self.<name>` under a call callee is a method call, not a
@@ -8206,6 +8214,17 @@ fn check_inherent_method_body_type(
                 )
             {
                 call_callee_ids.insert(callee.hir_id);
+                if let ExprKind::Field { name, .. } = callee.kind
+                    && let Ok(spelling) = symbols.resolve(name.sym)
+                    && let Some(signature) = method_signatures.get(
+                        sai_syntax::normalize_identifier(
+                            spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+                        )
+                        .as_str(),
+                    )
+                {
+                    self_method_calls.insert(expression.hir_id, signature.clone());
+                }
             }
             if collect_error.is_some()
                 || !matches!(expression.kind, ExprKind::Field { .. })
@@ -8255,6 +8274,7 @@ fn check_inherent_method_body_type(
             );
         }
         *inputs.str_self_field_projections.borrow_mut() = Some(self_field_projections);
+        *inputs.str_self_method_calls.borrow_mut() = Some(self_method_calls);
         let walk = check_function_str_local_block(
             method_owner,
             *sig.ret.expect("Str return is present"),
@@ -8271,6 +8291,7 @@ fn check_inherent_method_body_type(
             direct_call_signatures,
         );
         *inputs.str_self_field_projections.borrow_mut() = None;
+        *inputs.str_self_method_calls.borrow_mut() = None;
         let diagnostics = match walk? {
             Some(diagnostics) => {
                 let mut all = field_diagnostics;
@@ -8591,6 +8612,165 @@ fn str_method_field_family(ty: &str) -> Option<&'static str> {
         return Some("`Str`");
     }
     primitive_method_field_type(ty).and_then(str_prim_family_name)
+}
+
+// A `self.<method>(..)` call's signature in family terms: parameter
+// and output families resolved from the sibling method's HIR
+// signature by spelling (`Str`, primitives, `()`).
+#[derive(Clone)]
+struct StrSelfMethodCallSignature {
+    parameters: Vec<&'static str>,
+    output: &'static str,
+}
+
+// Lowering inputs for collecting `self.<method>(..)` call signatures:
+// the impl's member list plus what `lower_impl_item_owner` needs per
+// member. Only `-> Str` inherent methods consult it.
+struct StrSelfMethodCallSiteInputs<'a, 'hir> {
+    entries: &'a [&'a sai_hir::item_tree::ItemTreeEntry],
+    owners: &'a [OwnerId],
+    impl_item_id: sai_syntax::ast::ErasedAstId,
+    context: &'a HirLoweringContext<'a, 'hir>,
+    def_paths: &'a Arc<DefPathInterner>,
+}
+
+// A signature position type mapped to its family name by spelling —
+// `Str`, primitives, and `()` only; anything else makes the sibling
+// method uncallable from the Str walk.
+fn str_sig_ty_family(
+    ty: &Ty<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<&'static str> {
+    match ty.kind {
+        TyKind::Tuple(elements) if elements.is_empty() => Some("`()`"),
+        TyKind::Path(path)
+            if path.root == PathRoot::Plain
+                && path.segments.len() == 1
+                && path.segments[0].args.is_none()
+                && is_plain_ascii_identifier(path.segments[0].name, inputs) =>
+        {
+            let spelling = symbols.resolve(path.segments[0].name.sym).ok()?;
+            str_method_field_family(sai_syntax::normalize_identifier(spelling.as_ref()).as_str())
+        }
+        _ => None,
+    }
+}
+
+// The lowered sibling member's `self.<method>` signature: `borrow
+// Self` receiver, no generics/contracts/effects, every explicit param
+// and the return type resolvable to a family.
+fn str_self_method_signature(
+    member_hir: &HirOwner<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<(String, StrSelfMethodCallSignature)> {
+    let OwnerNode::ImplItem(method) = member_hir.node else {
+        return None;
+    };
+    let ImplItemKind::Fn {
+        sig,
+        generics,
+        has_body: true,
+    } = method.kind
+    else {
+        return None;
+    };
+    if sig.safety != sai_hir::Safety::Safe
+        || sig.is_async
+        || sig.borrows.is_some()
+        || sig.effects.is_some()
+        || !sig.requires.is_empty()
+        || !sig.ensures.is_empty()
+        || !generics.params.is_empty()
+        || !generics.where_preds.is_empty()
+        || !function_name_is_supported(method.name, symbols, inputs)
+    {
+        return None;
+    }
+    let Some((receiver, explicit_params)) = sig.params.split_first() else {
+        return None;
+    };
+    if !receiver.is_self
+        || receiver.mutable
+        || !matches!(
+            receiver.ty.kind,
+            TyKind::Borrow(
+                sai_hir::Mutability::Not,
+                inner
+            ) if matches!(
+                inner.kind,
+                TyKind::Path(path)
+                    if path.root == PathRoot::SelfType && path.segments.is_empty()
+            )
+        )
+        || explicit_params.iter().any(|parameter| parameter.is_self)
+    {
+        return None;
+    }
+    let parameters: Vec<&'static str> = explicit_params
+        .iter()
+        .map(|parameter| str_sig_ty_family(parameter.ty, symbols, inputs))
+        .collect::<Option<_>>()?;
+    let output = match sig.ret {
+        Some(ty) => str_sig_ty_family(ty, symbols, inputs)?,
+        None => "`()`",
+    };
+    let spelling = symbols.resolve(method.name.sym).ok()?;
+    let name =
+        sai_syntax::normalize_identifier(spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()));
+    Some((name, StrSelfMethodCallSignature { parameters, output }))
+}
+
+// The `self.<method>(..)` call signatures for one impl: every member
+// lowered once for its Fn signature, keyed by normalized method name.
+fn str_inherent_self_method_signatures<'hir>(
+    sites: &StrSelfMethodCallSiteInputs<'_, 'hir>,
+    impl_owner: &HirOwner<'hir>,
+    inputs: &'hir CurrentOwnerInputs,
+    symbols: &Interner,
+) -> HashMap<String, StrSelfMethodCallSignature> {
+    let mut signatures = HashMap::new();
+    for (entry, member_owner) in sites.entries.iter().zip(sites.owners.iter().copied()) {
+        let Ok(Some(expected_member_path)) = sites
+            .def_paths
+            .resolve_def_id(member_owner.def_id.to_def_id())
+        else {
+            continue;
+        };
+        let Ok((member_hir, _)) = lower_impl_item_owner(
+            member_owner,
+            &expected_member_path,
+            impl_owner,
+            sites.impl_item_id,
+            entry.ast_id,
+            &inputs.filtered_item_tree,
+            sites.context,
+        ) else {
+            continue;
+        };
+        if let Some((name, signature)) = str_self_method_signature(&member_hir, symbols, inputs) {
+            signatures.insert(name, signature);
+        }
+    }
+    signatures
+}
+
+// The `self.<method>(..)` call signature recorded for `expression`'s
+// `HirId`, when the collect pass resolved the callee to an impl method.
+fn str_self_method_call(
+    expression: &HirExpr<'_>,
+    inputs: &CurrentOwnerInputs,
+) -> Option<StrSelfMethodCallSignature> {
+    if !matches!(expression.kind, ExprKind::Call { .. }) {
+        return None;
+    }
+    inputs
+        .str_self_method_calls
+        .borrow()
+        .as_ref()?
+        .get(&expression.hir_id)
+        .cloned()
 }
 
 // The `Str` counterpart of `inherent_method_primitive_field_types`:
@@ -15071,25 +15251,53 @@ fn str_expr_family(
                 diagnostics,
             )))
         }
-        // A direct call resolves through the projected callee signature:
-        // arguments check against the parameter primitives and the call
-        // yields the callee's output family.
+        // A call resolves through its projected signature — a direct
+        // call through `call_signatures`, a `self.<method>(..)` call
+        // through the impl's sibling signatures collected for this
+        // body. Arguments check against the parameter families and the
+        // call yields the callee's output family.
         ExprKind::Call {
             args, base: None, ..
         } => {
-            let Some(signature) =
+            // (parameter family, expected primitive) pairs unify the
+            // two signature kinds; a `Str` parameter has no primitive
+            // expectation to forward.
+            let Some((parameters, result_family)) = (if let Some(signature) =
                 call_signatures.and_then(|signatures| signatures.get(&expr.hir_id))
-            else {
+            {
+                let Some(parameters) = signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| {
+                        str_prim_family_name(*parameter).map(|family| (family, Some(*parameter)))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return Ok(None);
+                };
+                let Some(result_family) = str_prim_family_name(signature.output) else {
+                    return Ok(None);
+                };
+                Some((parameters, result_family))
+            } else {
+                str_self_method_call(expr, inputs).map(|signature| {
+                    (
+                        signature
+                            .parameters
+                            .iter()
+                            .map(|family| (*family, str_family_prim(family)))
+                            .collect(),
+                        signature.output,
+                    )
+                })
+            }) else {
                 return Ok(None);
             };
-            if args.len() != signature.parameters.len() {
+            if args.len() != parameters.len() {
                 return Ok(None);
             }
-            let Some(result_family) = str_prim_family_name(signature.output) else {
-                return Ok(None);
-            };
             let mut diagnostics = Vec::new();
-            for (argument, parameter) in args.iter().zip(&signature.parameters) {
+            for (argument, (parameter_family, expected)) in args.iter().zip(&parameters) {
                 // Mirrors the checker: named arguments on a function call
                 // report NAMED_ARGUMENT_ON_FUNCTION but still check
                 // positionally.
@@ -15110,7 +15318,7 @@ fn str_expr_family(
                     argument.expr,
                     locals,
                     str_bindings,
-                    Some(*parameter),
+                    *expected,
                     type_paths,
                     symbols,
                     inputs,
@@ -15122,10 +15330,7 @@ fn str_expr_family(
                     return Ok(None);
                 };
                 diagnostics.append(&mut arg_diagnostics);
-                if let Some(parameter_family) = str_prim_family_name(*parameter)
-                    && family != parameter_family
-                    && family != "`!`"
-                {
+                if family != *parameter_family && family != "`!`" {
                     diagnostics.push(const_literal_diagnostic(
                         owner.id,
                         inputs,
@@ -16287,13 +16492,51 @@ fn str_condition(
     ) = cond.kind
     {
         // Operands carry literal families — `Str` for `Str` literals and
-        // bindings, the default scalar family otherwise. Equal families
-        // fold to `Bool` (literal operands still carry their default
-        // range check); differing families report the checker's
-        // `expected <left>, found <right>` on the right operand.
+        // bindings, the default scalar family otherwise; a call operand
+        // resolves through its signature (argument diagnostics carry
+        // through). Equal families fold to `Bool` (literal operands
+        // still carry their default range check); differing families
+        // report the checker's `expected <left>, found <right>` on the
+        // right operand.
+        let mut operand_diagnostics = Vec::new();
+        // Call operands evaluate first — their argument checking can
+        // resolve a literal variable the other operand reads
+        // (`n == self.echo(n)` pins `n` through `echo`'s parameter).
+        let mut calls_failed = false;
+        let mut call_families = [None, None];
+        for (index, operand) in [lhs, rhs].into_iter().enumerate() {
+            if !matches!(operand.kind, ExprKind::Call { .. }) {
+                continue;
+            }
+            let Some((family, mut diagnostics)) = str_expr_family(
+                owner,
+                return_ty,
+                operand,
+                locals,
+                str_bindings,
+                None,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                call_signatures,
+            )?
+            else {
+                calls_failed = true;
+                continue;
+            };
+            operand_diagnostics.append(&mut diagnostics);
+            call_families[index] = Some(family);
+        }
+        if calls_failed {
+            return Ok(None);
+        }
         let (Some(left_family), Some(right_family)) = (
-            str_condition_operand_family(lhs, locals, str_bindings, inputs),
-            str_condition_operand_family(rhs, locals, str_bindings, inputs),
+            call_families[0]
+                .or_else(|| str_condition_operand_family(lhs, locals, str_bindings, inputs)),
+            call_families[1]
+                .or_else(|| str_condition_operand_family(rhs, locals, str_bindings, inputs)),
         ) else {
             return Ok(None);
         };
@@ -16316,7 +16559,10 @@ fn str_condition(
                     other_expr: &HirExpr<'_>,
                     other: &'static str| {
             if own != other
-                && matches!(expr.kind, ExprKind::Lit(_))
+                && matches!(
+                    expr.kind,
+                    ExprKind::Lit(Lit::Int { .. } | Lit::Float { .. })
+                )
                 && !matches!(other_expr.kind, ExprKind::Lit(_))
                 && primitive_method_field_type(other.trim_matches('`')).is_some()
             {
@@ -16330,7 +16576,7 @@ fn str_condition(
             fold(rhs, right_family, lhs, left_family),
         );
         if left_family == right_family {
-            let mut diagnostics = Vec::new();
+            let mut diagnostics = operand_diagnostics;
             for operand in [lhs, rhs] {
                 let ExprKind::Lit(_) = operand.kind else {
                     continue;
@@ -16355,7 +16601,7 @@ fn str_condition(
             }
             return Ok(Some(diagnostics));
         }
-        return Ok(Some(vec![const_literal_diagnostic(
+        operand_diagnostics.push(const_literal_diagnostic(
             owner.id,
             inputs,
             snapshot,
@@ -16363,7 +16609,8 @@ fn str_condition(
             sai_diagnostics::Code::TypeMismatch,
             format!("expected {left_family}, found {right_family}"),
             "type mismatch",
-        )?]));
+        )?);
+        return Ok(Some(operand_diagnostics));
     }
     // A literal or `Str`-leaf condition in a `Bool` slot is the checker's
     // `expected Bool` mismatch — recoverable like the comparison-operand
@@ -18788,6 +19035,30 @@ fn str_stmt_expr_unit(
             ),
             _ => Ok(None),
         },
+        // A call statement discards its result — the args still check
+        // against the callee's signature (a `self.<method>(..)` call or
+        // a resolved direct call), so a `()` or any other output family
+        // is admitted.
+        ExprKind::Call { base: None, .. } => {
+            let Some((_, diagnostics)) = str_expr_family(
+                owner,
+                return_ty,
+                expr,
+                locals,
+                str_bindings,
+                expected,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                call_signatures,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(diagnostics))
+        }
         ExprKind::Break { label: None, value } => {
             if break_ctx {
                 // Breaks inside a `break` value still target the
@@ -19695,17 +19966,32 @@ fn str_pure_init_family(
                 then_family
             })
         }
-        // Direct calls admit like the diagnostic walk: signature,
-        // arity, and every argument supported.
+        // Calls admit like the diagnostic walk: a direct-call or
+        // `self.<method>(..)` signature, arity, and every argument
+        // supported.
         ExprKind::Call {
             args, base: None, ..
         } => {
-            let signature = call_signatures.and_then(|signatures| signatures.get(&init.hir_id))?;
-            if args.len() != signature.parameters.len() {
+            let (parameters, result_family) = if let Some(signature) =
+                call_signatures.and_then(|signatures| signatures.get(&init.hir_id))
+            {
+                (
+                    signature
+                        .parameters
+                        .iter()
+                        .map(|parameter| str_prim_family_name(*parameter))
+                        .collect::<Option<Vec<_>>>()?,
+                    str_prim_family_name(signature.output)?,
+                )
+            } else if let Some(signature) = str_self_method_call(init, inputs) {
+                (signature.parameters, signature.output)
+            } else {
+                return None;
+            };
+            if args.len() != parameters.len() {
                 return None;
             }
-            let result_family = str_prim_family_name(signature.output)?;
-            for (argument, parameter) in args.iter().zip(&signature.parameters) {
+            for argument in args {
                 str_pure_init_family(
                     argument.expr,
                     locals,
@@ -19715,7 +20001,6 @@ fn str_pure_init_family(
                     inputs,
                     call_signatures,
                 )?;
-                let _ = parameter;
             }
             Some(result_family)
         }
@@ -23765,6 +24050,9 @@ struct CurrentOwnerInputs {
     // `-> Str` inherent method checks, `None` elsewhere. A `RefCell`
     // keeps the shared `&CurrentOwnerInputs` threading unchanged.
     str_self_field_projections: std::cell::RefCell<Option<HashMap<HirId, &'static str>>>,
+    // `self.<method>(..)` call signatures for the same window — keyed
+    // by the call's `HirId`, holding parameter and output families.
+    str_self_method_calls: std::cell::RefCell<Option<HashMap<HirId, StrSelfMethodCallSignature>>>,
 }
 
 fn index_top_level_owner_descriptors(
@@ -31146,6 +31434,7 @@ impl RootDatabase {
             accepted_flags_attributes,
             source_ref,
             str_self_field_projections: std::cell::RefCell::new(None),
+            str_self_method_calls: std::cell::RefCell::new(None),
         })
     }
 
@@ -41856,8 +42145,16 @@ impl RootDatabase {
                 let module_aliases = module_aliases_for_scope(module_scope);
                 let parent_generics = owner_generic_parameters(&parent_hir);
                 let mut members = Vec::with_capacity(member_entries.len());
+                let method_call_sites = StrSelfMethodCallSiteInputs {
+                    entries: &member_entries,
+                    owners: parent_members,
+                    impl_item_id: descriptor.item_id,
+                    context: &context,
+                    def_paths,
+                };
                 for (entry, member_owner) in member_entries
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .zip(parent_members.iter().copied())
                 {
                     let Some(kind) = trait_impl_member_kind(descriptor.kind, entry.kind) else {
@@ -42014,6 +42311,7 @@ impl RootDatabase {
                                             &locals,
                                             resolved_type_paths,
                                             Some(&direct_call_signatures),
+                                            Some(&method_call_sites),
                                             &self.semantic_types,
                                             &self.symbols,
                                             &inputs,
@@ -101733,16 +102031,23 @@ property "shared"() {}
             diagnostics[0].message, "expected `I32`, found `Str`",
             "{diagnostics:?}"
         );
-        // `self.<name>(..)` is method-call syntax — real or missing, with
-        // or without trivia before the paren — the callee is not a field
-        // read, and the call itself stays gated.
-        for (index, name) in [(2, "call"), (3, "call_missing"), (6, "comment_call")] {
+        // `self.<name>(..)` is method-call syntax — the callee is not a
+        // field read. A name resolving to a sibling method checks the
+        // call through its signature (`Str` in, `Str` out); trivia
+        // before the paren keeps the same reading.
+        for (index, name) in [(2, "call"), (6, "comment_call")] {
             let check = methods[index].body_type_check().expect("body check runs");
-            assert!(
-                matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "{name} stays gated without a field error: {check:?}"
-            );
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} resolves its sibling method: {check:?}");
+            };
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
         }
+        // A name with no sibling method stays gated.
+        let check = methods[3].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "call_missing stays gated without a field error: {check:?}"
+        );
         // `if`-branch field tails seed the `Str` initializer join.
         let check = methods[5].body_type_check().expect("body check runs");
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
@@ -101759,6 +102064,184 @@ property "shared"() {}
         assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
     }
 
+    #[test]
+    fn inherent_method_body_type_check_str_self_method_calls() {
+        let root = concat!(
+            "type Greeting { text: Str, count: I32 }\n",
+            "impl Greeting {\n",
+            "  pub fn get(self: borrow Self, flag: Bool) -> Str {\n",
+            "    self.text\n",
+            "  }\n",
+            "  pub fn size(self: borrow Self) -> I32 {\n",
+            "    self.count\n",
+            "  }\n",
+            "  pub fn ok(self: borrow Self) -> Str {\n",
+            "    self.get(true)\n",
+            "  }\n",
+            "  pub fn chained(self: borrow Self) -> Str {\n",
+            "    let s = self.get(true)\n",
+            "    s\n",
+            "  }\n",
+            "  pub fn arg_mismatch(self: borrow Self) -> Str {\n",
+            "    self.get(self.count)\n",
+            "  }\n",
+            "  pub fn arity(self: borrow Self) -> Str {\n",
+            "    self.get(true, false)\n",
+            "  }\n",
+            "  pub fn wrong_output(self: borrow Self) -> Str {\n",
+            "    self.size()\n",
+            "  }\n",
+            "  pub fn named(self: borrow Self) -> Str {\n",
+            "    self.get(flag: true)\n",
+            "  }\n",
+            "  pub fn prepare(self: borrow Self) {\n",
+            "    let _ = self.count\n",
+            "  }\n",
+            "  pub fn cond_call(self: borrow Self) -> Str {\n",
+            "    if self.get(true) == \"ready\" {\n",
+            "      self.text\n",
+            "    } else {\n",
+            "      self.text\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn cond_mismatch(self: borrow Self) -> Str {\n",
+            "    if self.size() == \"ready\" {\n",
+            "      self.text\n",
+            "    } else {\n",
+            "      self.text\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn stmt_call(self: borrow Self) -> Str {\n",
+            "    self.get(true)\n",
+            "    self.text\n",
+            "  }\n",
+            "  pub fn stmt_unit(self: borrow Self) -> Str {\n",
+            "    self.prepare()\n",
+            "    self.text\n",
+            "  }\n",
+            "  pub fn echo(self: borrow Self, n: I32) -> I32 {\n",
+            "    n\n",
+            "  }\n",
+            "  pub fn lit_var_cmp(self: borrow Self) -> Str {\n",
+            "    let n = 1\n",
+            "    if n == self.echo(n) {\n",
+            "      self.text\n",
+            "    } else {\n",
+            "      self.text\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn reverse_cmp(self: borrow Self) -> Str {\n",
+            "    if \"ready\" == self.size() {\n",
+            "      self.text\n",
+            "    } else {\n",
+            "      self.text\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("inherent methods collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let methods = &results.owners()[0].members();
+        assert_eq!(methods.len(), 16);
+        // `self.<method>(..)` checks through the sibling signature —
+        // a supported `Str` tail and a `Str` local initializer.
+        for (index, name) in [(2, "ok"), (3, "chained")] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} checks through the signature: {check:?}");
+            };
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+        }
+        // An argument family mismatch reports the parameter's family.
+        let check = methods[4].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("arg_mismatch reports its mismatch: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(
+            diagnostics[0].message, "expected `Bool`, found `I32`",
+            "{diagnostics:?}"
+        );
+        // A wrong arity stays gated — the walk has no arity diagnostic.
+        let check = methods[5].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "arity stays gated: {check:?}"
+        );
+        // A non-`Str` output mismatches the `Str` return.
+        let check = methods[6].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("wrong_output reports its mismatch: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(
+            diagnostics[0].message, "expected `Str`, found `I32`",
+            "{diagnostics:?}"
+        );
+        // A named argument reports NamedArgumentOnFunction like the
+        // direct-call path but still checks positionally.
+        let check = methods[7].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("named reports its diagnostic: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::NamedArgumentOnFunction,
+            "{diagnostics:?}"
+        );
+        // A call in a comparison operand checks through its signature
+        // too, and a call statement checks its args while discarding
+        // the result — `Str`- and `()`-returning alike.
+        for (index, name) in [(9, "cond_call"), (11, "stmt_call"), (12, "stmt_unit")] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} checks through the signature: {check:?}");
+            };
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+        }
+        // A call operand family mismatch reports on the right operand,
+        // whichever side the call is on.
+        for (index, name, message) in [
+            (10, "cond_mismatch", "expected `I32`, found `Str`"),
+            (15, "reverse_cmp", "expected `Str`, found `I32`"),
+        ] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} reports its mismatch: {check:?}");
+            };
+            assert_eq!(diagnostics.len(), 1, "{name}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            assert_eq!(diagnostics[0].message, message, "{name}: {diagnostics:?}");
+        }
+        // A literal variable compared against a call resolves through
+        // the call's parameter — `n` pins to `I32` inside `self.echo(n)`
+        // before the comparison reads it.
+        let check = methods[14].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("lit_var_cmp resolves through the call: {check:?}");
+        };
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
     fn inherent_method_body_type_mismatches_keep_source_spans() {
         let root = concat!(
             "type Counter { marker: I32 }\n",
