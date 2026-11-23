@@ -13206,10 +13206,116 @@ struct StrLiteralSeed {
     origin: sai_hir::Span,
     resolved: std::rc::Rc<std::cell::Cell<Option<&'static str>>>,
     // Additional literal sites joined into the variable after the seed
-    // (assignment right sides, compound-assignment counts) — each
-    // checks against the resolved primitive like the checker's
-    // recorded literal constraints.
+    // (assignment right sides) — each checks against the resolved
+    // primitive like the checker's recorded literal constraints.
     sites: std::rc::Rc<std::cell::RefCell<Vec<(Lit<'static>, sai_hir::Span)>>>,
+    // The origin literal of every variable merged into this group —
+    // each checks once when the group resolves.
+    members: std::rc::Rc<std::cell::RefCell<Vec<(Lit<'static>, sai_hir::Span)>>>,
+    // Merge link like the checker's `merged_with`: `x = y` joins two
+    // unresolved same-kind variables into one group.
+    merged_into: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<StrLiteralSeed>>>>,
+}
+
+fn str_seed_new(literal: Lit<'static>, origin: sai_hir::Span) -> StrLiteralSeed {
+    StrLiteralSeed {
+        literal,
+        origin,
+        resolved: std::rc::Rc::new(std::cell::Cell::new(None)),
+        sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        members: std::rc::Rc::new(std::cell::RefCell::new(vec![(literal, origin)])),
+        merged_into: std::rc::Rc::new(std::cell::RefCell::new(None)),
+    }
+}
+
+// The merge-group root — children link upward like
+// `literal_variable_group_root`.
+fn str_seed_root(seed: &StrLiteralSeed) -> std::rc::Rc<StrLiteralSeed> {
+    let mut root = match seed.merged_into.borrow().clone() {
+        Some(root) => root,
+        None => return std::rc::Rc::new(seed.clone()),
+    };
+    loop {
+        let parent = root.merged_into.borrow().clone();
+        match parent {
+            Some(parent) => root = parent,
+            None => return root,
+        }
+    }
+}
+
+fn str_seed_resolved(seed: &StrLiteralSeed) -> Option<&'static str> {
+    str_seed_root(seed).resolved.get()
+}
+
+fn str_seed_same_kind(a: Lit<'_>, b: Lit<'_>) -> bool {
+    matches!(
+        (a, b),
+        (Lit::Int { .. }, Lit::Int { .. }) | (Lit::Float { .. }, Lit::Float { .. })
+    )
+}
+
+fn str_lit_kind_word(literal: Lit<'_>) -> &'static str {
+    match literal {
+        Lit::Int { .. } => "an integer literal",
+        Lit::Float { .. } => "a floating-point literal",
+        Lit::Bool(_) => "a Bool literal",
+        Lit::Byte(_) => "a byte literal",
+        Lit::Char(_) => "a character literal",
+        Lit::Str(_) => "a string literal",
+        Lit::ByteStr(_) => "a byte-string literal",
+    }
+}
+
+// The default family a literal kind reports in a mismatch —
+// `literal_variable_default_type`.
+fn str_seed_default_family(literal: Lit<'_>) -> &'static str {
+    match literal {
+        Lit::Float { .. } => "`F64`",
+        _ => "`I64`",
+    }
+}
+
+// Whether a literal of this kind can resolve to the family —
+// `literal_family_accepts`.
+fn str_seed_accepts_family(literal: Lit<'_>, family: &str) -> bool {
+    match literal {
+        Lit::Int { .. } => matches!(
+            family,
+            "`I8`"
+                | "`I16`"
+                | "`I32`"
+                | "`I64`"
+                | "`ISize`"
+                | "`U8`"
+                | "`U16`"
+                | "`U32`"
+                | "`U64`"
+                | "`USize`"
+        ),
+        Lit::Float { .. } => matches!(family, "`F32`" | "`F64`"),
+        _ => false,
+    }
+}
+
+// `x = y` on two unresolved same-kind literal variables: `y`'s group
+// links under `x`'s — members and sites move up so the group's
+// resolution checks every literal once, like `merge_literal_variables`.
+fn str_seed_merge(place: &StrLiteralSeed, rhs: &StrLiteralSeed) {
+    let place_root = str_seed_root(place);
+    let rhs_root = str_seed_root(rhs);
+    if std::rc::Rc::ptr_eq(&place_root.resolved, &rhs_root.resolved) {
+        return;
+    }
+    {
+        let mut members = rhs_root.members.borrow_mut();
+        place_root.members.borrow_mut().append(&mut members);
+    }
+    {
+        let mut sites = rhs_root.sites.borrow_mut();
+        place_root.sites.borrow_mut().append(&mut sites);
+    }
+    *rhs_root.merged_into.borrow_mut() = Some(place_root);
 }
 
 type StrLocalBindings = std::collections::BTreeMap<sai_hir::BindingId, StrLocalEntry>;
@@ -13247,12 +13353,8 @@ fn str_let_entry(
     match init.kind {
         ExprKind::Lit(literal) if str_scalar_family_name(literal).is_some() => StrLocalEntry {
             family,
-            literal: str_static_literal(literal).map(|literal| StrLiteralSeed {
-                literal,
-                origin: init.span,
-                resolved: std::rc::Rc::new(std::cell::Cell::new(None)),
-                sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
-            }),
+            literal: str_static_literal(literal)
+                .map(|literal| str_seed_new(literal, init.span)),
         },
         ExprKind::Path(_) => {
             str_binding_entry(init, locals, str_bindings)
@@ -13308,7 +13410,7 @@ fn str_binding_family(
         entry
             .literal
             .as_ref()
-            .and_then(|seed| seed.resolved.get())
+            .and_then(|seed| str_seed_resolved(seed))
             .unwrap_or(entry.family)
     })
 }
@@ -13343,7 +13445,7 @@ fn str_seed_cells(
     str_bindings
         .values()
         .filter_map(|entry| entry.literal.as_ref())
-        .map(|seed| std::rc::Rc::as_ptr(&seed.resolved))
+        .map(|seed| std::rc::Rc::as_ptr(&str_seed_root(seed).resolved))
         .collect()
 }
 
@@ -13366,12 +13468,15 @@ fn str_default_unresolved_literals(
         let Some(seed) = entry.literal.as_ref() else {
             continue;
         };
-        if carried.contains(&std::rc::Rc::as_ptr(&seed.resolved)) || seed.resolved.get().is_some() {
+        let root = str_seed_root(seed);
+        if carried.contains(&std::rc::Rc::as_ptr(&root.resolved))
+            || root.resolved.get().is_some()
+        {
             continue;
         }
-        let (default_name, primitive, kind_word) = match seed.literal {
-            Lit::Int { .. } => ("`I64`", sai_resolve::prelude::PrimTy::I64, "integer"),
-            Lit::Float { .. } => ("`F64`", sai_resolve::prelude::PrimTy::F64, "floating-point"),
+        let default_name = match seed.literal {
+            Lit::Int { .. } => "`I64`",
+            Lit::Float { .. } => "`F64`",
             _ => continue,
         };
         let _ = str_seed_resolve(
@@ -13384,24 +13489,6 @@ fn str_default_unresolved_literals(
             symbols,
             target_cfg,
         );
-        if sai_ty::typeck::literal::check_primitive_literal(
-            primitive,
-            seed.literal,
-            symbols,
-            target_cfg.pointer_width(),
-        ) == sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange
-            && let Ok(diagnostic) = const_literal_diagnostic(
-                owner.id,
-                inputs,
-                snapshot,
-                seed.origin,
-                sai_diagnostics::Code::LiteralOutOfRange,
-                format!("{kind_word} literal is out of range for {default_name}"),
-                "literal out of range",
-            )
-        {
-            diagnostics.push(diagnostic);
-        }
     }
     diagnostics
 }
@@ -13479,11 +13566,17 @@ fn str_seed_resolve(
     symbols: &Interner,
     target_cfg: &TargetCfg,
 ) -> Result<(), OwnerControlFlowResolutionError> {
-    seed.resolved.set(Some(resolved));
+    let root = str_seed_root(seed);
+    root.resolved.set(Some(resolved));
     let Some(primitive) = str_family_prim(resolved) else {
         return Ok(());
     };
-    for (literal, span) in seed.sites.borrow().iter() {
+    for (literal, span) in root
+        .members
+        .borrow()
+        .iter()
+        .chain(root.sites.borrow().iter())
+    {
         if sai_ty::typeck::literal::check_primitive_literal(
             primitive,
             *literal,
@@ -13591,7 +13684,7 @@ fn str_literal_family_init(
     // accept keeps its default family and the caller's pin/fold compare
     // reports `expected <pin>, found <family>`. Resolving the variable
     // fixes it — a later conflicting pin sees the resolved family.
-    if let Some(resolved) = entry.literal.as_ref().and_then(|seed| seed.resolved.get()) {
+    if let Some(resolved) = entry.literal.as_ref().and_then(|seed| str_seed_resolved(seed)) {
         return Ok(Some((resolved, Vec::new())));
     }
     if let (Some(primitive), Some(seed)) = (expected, entry.literal) {
@@ -13621,22 +13714,7 @@ fn str_literal_family_init(
                     (name, seed_diagnostics)
                 }
                 sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
-                    let mut seed_diagnostics = vec![const_literal_diagnostic(
-                        owner.id,
-                        inputs,
-                        snapshot,
-                        seed.origin,
-                        sai_diagnostics::Code::LiteralOutOfRange,
-                        format!(
-                            "{} literal is out of range for {name}",
-                            if matches!(literal, Lit::Int { .. }) {
-                                "integer"
-                            } else {
-                                "floating-point"
-                            }
-                        ),
-                        "literal out of range",
-                    )?];
+                    let mut seed_diagnostics = Vec::new();
                     str_seed_resolve(
                         owner,
                         &seed,
@@ -13980,19 +14058,16 @@ fn str_expr_family(
             if matches!(operator, BinOp::Shl | BinOp::Shr) {
                 let left_seed = match lhs.kind {
                     ExprKind::Lit(literal) => match literal {
-                        Lit::Int { .. } => Some(StrLiteralSeed {
-                            literal: str_static_literal(literal).unwrap(),
-                            origin: lhs.span,
-                            resolved: std::rc::Rc::new(std::cell::Cell::new(None)),
-                            sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
-                        }),
+                        Lit::Int { .. } => {
+                            Some(str_seed_new(str_static_literal(literal).unwrap(), lhs.span))
+                        }
                         Lit::Byte(_) => None,
                         _ => return Ok(None),
                     },
                     ExprKind::Path(_) => {
                         match str_binding_entry(lhs, locals, str_bindings) {
                             Some(entry) => {
-                                match entry.literal.filter(|seed| seed.resolved.get().is_none()) {
+                                match entry.literal.filter(|seed| str_seed_resolved(seed).is_none()) {
                                     // A non-integer literal variable
                                     // resolves to its default family, then
                                     // the bitwise check applies below.
@@ -14072,7 +14147,7 @@ fn str_expr_family(
                     _ => {
                         let count_seed =
                             str_binding_entry(rhs, locals, str_bindings).and_then(|entry| {
-                                entry.literal.filter(|seed| seed.resolved.get().is_none())
+                                entry.literal.filter(|seed| str_seed_resolved(seed).is_none())
                             });
                         match count_seed {
                             Some(StrLiteralSeed {
@@ -15829,7 +15904,7 @@ fn check_function_str_local_block(
                 let expected_family = entry
                     .literal
                     .as_ref()
-                    .and_then(|seed| seed.resolved.get())
+                    .and_then(|seed| str_seed_resolved(seed))
                     .unwrap_or(entry.family);
                 // A literal right side joins an unresolved literal
                 // variable like the checker's literal constraint: a
