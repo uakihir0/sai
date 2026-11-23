@@ -13258,15 +13258,11 @@ fn str_let_entry(
             str_binding_entry(init, locals, str_bindings)
                 .map(|entry| StrLocalEntry {
                     family: entry.family,
-                    // `let m = n` binds an independent literal
-                    // variable: the seed travels but the resolution
-                    // cell does not.
-                    literal: entry.literal.map(|seed| StrLiteralSeed {
-                        literal: seed.literal,
-                        origin: seed.origin,
-                        resolved: std::rc::Rc::new(std::cell::Cell::new(None)),
-                        sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
-                    }),
+                    // `let m = n` binds into the same literal-variable
+                    // group: the seed (and its constraint history) is
+                    // shared, so resolving either side checks every
+                    // recorded literal.
+                    literal: entry.literal,
                 })
                 .unwrap_or(StrLocalEntry {
                     family,
