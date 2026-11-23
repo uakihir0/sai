@@ -14838,6 +14838,8 @@ fn str_match_arm_pattern(
                 if let Some(root) = scrutinee_seed
                     && let Some(literal) = str_static_literal(literal)
                     && matches!(literal, Lit::Int { .. } | Lit::Float { .. })
+                    && str_seed_resolved(&root).is_none()
+                    && str_seed_same_kind(literal, root.literal)
                 {
                     let mut sites = root.sites.borrow_mut();
                     if !sites.iter().any(|(l, s)| *l == literal && *s == pat.span) {
@@ -18968,6 +18970,57 @@ fn str_pure_condition(
 // The family a `let` initializer binds without running the diagnostic
 // walk — literals, local paths, `if`/`block`/`loop` joins. An unclassed
 // shape leaves the binding unrecorded (the body walk already gated it).
+
+// A throwaway copy of the literal-variable seeds for pure scans — an
+// inference walk may resolve a seed while its diagnostics are
+// discarded (a shift count pins `U32`); resolving a shadow keeps the
+// real seed unresolved so the diagnostic walk still range-checks its
+// members and sites (`let n = 5000000000; if let x = n { 1 << x }`).
+fn str_shadow_str_bindings(str_bindings: &StrLocalBindings) -> StrLocalBindings {
+    let mut roots: HashMap<
+        *const std::cell::Cell<Option<&'static str>>,
+        std::rc::Rc<StrLiteralSeed>,
+    > = HashMap::new();
+    str_bindings
+        .iter()
+        .map(|(binding, entry)| {
+            let literal = entry.literal.as_ref().map(|seed| {
+                let root = str_seed_root(seed);
+                roots
+                    .entry(std::rc::Rc::as_ptr(&root.resolved))
+                    .or_insert_with(|| {
+                        std::rc::Rc::new(StrLiteralSeed {
+                            literal: root.literal,
+                            origin: root.origin,
+                            resolved: std::rc::Rc::new(std::cell::Cell::new(root.resolved.get())),
+                            sites: std::rc::Rc::new(std::cell::RefCell::new(
+                                root.sites.borrow().clone(),
+                            )),
+                            members: std::rc::Rc::new(std::cell::RefCell::new(
+                                root.members.borrow().clone(),
+                            )),
+                            merged_into: std::rc::Rc::new(std::cell::RefCell::new(None)),
+                        })
+                    });
+                // A value clone shares the shadow root's cells — the
+                // entry links into the shadowed group like the real
+                // seed links into the real root.
+                (**roots
+                    .get(&std::rc::Rc::as_ptr(&root.resolved))
+                    .expect("the shadow root was just inserted"))
+                .clone()
+            });
+            (
+                *binding,
+                StrLocalEntry {
+                    family: entry.family,
+                    literal,
+                },
+            )
+        })
+        .collect()
+}
+
 fn str_pure_init_family(
     init: &HirExpr<'_>,
     locals: &LocalResolution,
@@ -18978,6 +19031,7 @@ fn str_pure_init_family(
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Option<&'static str> {
+    let str_bindings = &str_shadow_str_bindings(str_bindings);
     match init.kind {
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal),
@@ -59355,7 +59409,7 @@ property "shared"() {}
             "pub fn str_init_if_let_litvar_float_tm(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        1.5\n    }\n    s\n}\npub fn str_init_if_let_litvar_group(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        2\n    }\n    let u: U64 = m\n    s\n}\n",
             "pub fn str_init_else_if_let_litvar_oob(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else if let \"b\" = s {\n        300\n    } else {\n        2\n    }\n    let u: U8 = m\n    s\n}\n",
             "pub fn str_if_let_scalar_stmt(s: Str, n: I64) -> Str {\n    if let 1 = n {\n    }\n    s\n}\npub fn str_while_let_scalar(s: Str, n: I64) -> Str {\n    while let 1 = n {\n    }\n    s\n}\npub fn str_if_let_scalar_init(s: Str, n: I64) -> Str {\n    let big = 1\n    let m = if let 1 = n {\n        big\n    } else {\n        2\n    }\n    let u: U64 = m\n    s\n}\npub fn str_if_let_scalar_binding(s: Str, n: I64) -> Str {\n    if let x = n {\n    }\n    s\n}\npub fn str_if_let_scalar_oob(s: Str) -> Str {\n    let n: U8 = 1\n    if let 300 = n {\n    }\n    s\n}\npub fn str_tail_if_let_scalar_no_else_tm(s: Str, n: I64) -> Str {\n    if let 1 = n {\n        s\n    }\n}\n",
-            "pub fn str_if_let_litvar_pat_oob(s: Str) -> Str {\n    let n = 5\n    if let 300 = n {\n    }\n    let u: U8 = n\n    s\n}\npub fn str_if_let_litvar_binding_pin(s: Str) -> Str {\n    let n = 5\n    if let x = n {\n        let small: U8 = x\n    }\n    s\n}\npub fn str_loop_if_let_litvar_break(s: Str) -> Str {\n    let n = 5\n    let m = loop {\n        if let x = n {\n            break x + 1\n        }\n    }\n    s\n}\n",
+            "pub fn str_if_let_litvar_pat_oob(s: Str) -> Str {\n    let n = 5\n    if let 300 = n {\n    }\n    let u: U8 = n\n    s\n}\npub fn str_if_let_litvar_binding_pin(s: Str) -> Str {\n    let n = 5\n    if let x = n {\n        let small: U8 = x\n    }\n    s\n}\npub fn str_loop_if_let_litvar_break(s: Str) -> Str {\n    let n = 5\n    let m = loop {\n        if let x = n {\n            break x + 1\n        }\n    }\n    s\n}\npub fn str_if_let_pinned_pat_oob(s: Str) -> Str {\n    let n: U8 = 5\n    if let 300 = n {\n    }\n    s\n}\npub fn str_if_let_float_int_pat(s: Str) -> Str {\n    let n = 1.5\n    if let 1 = n {\n    }\n    s\n}\npub fn str_if_let_shift_count_oob(s: Str) -> Str {\n    let n = 5000000000\n    let m = if let x = n {\n        1 << x\n    } else {\n        0\n    }\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -59371,7 +59425,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 258);
+        assert_eq!(resolved.owners().len(), 261);
 
         for (index, owner) in resolved.owners()[..4]
             .iter()
@@ -59556,6 +59610,9 @@ property "shared"() {}
             (243, sai_diagnostics::Code::TypeMismatch),
             (253, sai_diagnostics::Code::LiteralOutOfRange),
             (255, sai_diagnostics::Code::LiteralOutOfRange),
+            (258, sai_diagnostics::Code::LiteralOutOfRange),
+            (259, sai_diagnostics::Code::TypeMismatch),
+            (260, sai_diagnostics::Code::LiteralOutOfRange),
             (254, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
