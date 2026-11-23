@@ -8176,8 +8176,20 @@ fn check_inherent_method_body_type(
         let mut self_field_projections = HashMap::new();
         let mut field_diagnostics = Vec::new();
         let mut collect_error = None;
+        // `self.<name>` under a call callee is a method call, not a
+        // field read — the walk gates it, and the collect pass must not
+        // report a missing field for a real method. The visitor is
+        // parent-first, so the callee's `HirId` is recorded before its
+        // `Field` node is seen.
+        let mut call_callee_ids = HashSet::new();
         visit_block_expressions(method_block, &mut |expression| {
-            if collect_error.is_some() || !matches!(expression.kind, ExprKind::Field { .. }) {
+            if let ExprKind::Call { callee, .. } = expression.kind {
+                call_callee_ids.insert(callee.hir_id);
+            }
+            if collect_error.is_some()
+                || !matches!(expression.kind, ExprKind::Field { .. })
+                || call_callee_ids.contains(&expression.hir_id)
+            {
                 return;
             }
             match collect_str_inherent_method_self_field(
@@ -16117,7 +16129,7 @@ fn str_condition_operand(
 ) -> bool {
     matches!(expr.kind, ExprKind::Lit(Lit::Str(_)))
         || str_binding_path(expr, locals, str_bindings)
-        || str_self_field_projected_family(expr, inputs).is_some()
+        || str_self_field_projected_family(expr, inputs) == Some("`Str`")
 }
 
 // A `Str` comparison condition leaf: `==`/`!=`/`<`/`<=`/`>`/`>=` over two
@@ -18164,13 +18176,14 @@ fn check_function_str_local_block(
                 let branch_yields_str = |branch: &sai_hir::expressions::Block<'_>| {
                     branch.tail.is_some_and(|tail| {
                         matches!(tail.kind, ExprKind::Lit(Lit::Str(_)))
+                            || str_self_field_projected_family(tail, inputs) == Some("`Str`")
                             || str_binding_path(tail, locals, str_bindings)
                     })
                 };
                 let else_yields = match else_block {
                     Some(b) => branch_yields_str(b),
                     // `else if` — the nested chain's own clean-yield scan.
-                    None => str_clean_expr(els, locals, str_bindings, false),
+                    None => str_clean_expr(els, locals, str_bindings, false, inputs),
                 };
                 if !branch_yields_str(then) && !else_yields {
                     return Ok(None);
@@ -18305,7 +18318,7 @@ fn check_function_str_local_block(
                                 },
                             );
                         }
-                        str_clean_expr(arm.body, locals, &bindings, false)
+                        str_clean_expr(arm.body, locals, &bindings, false, inputs)
                     });
                 if !arm_yields_str {
                     return Ok(None);
@@ -21001,8 +21014,9 @@ fn str_break_ctx_clean(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> bool {
-    str_clean_expr(expr, locals, str_bindings, false)
+    str_clean_expr(expr, locals, str_bindings, false, inputs)
 }
 
 fn str_clean_block(
@@ -21010,13 +21024,14 @@ fn str_clean_block(
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
     loop_level: bool,
+    inputs: &CurrentOwnerInputs,
 ) -> bool {
     let mut bindings = str_bindings.clone();
     let mut clean = false;
     for stmt in block.stmts {
         match stmt.kind {
             sai_hir::expressions::StmtKind::Expr(expr) => {
-                clean |= str_clean_expr(expr, locals, &bindings, loop_level);
+                clean |= str_clean_expr(expr, locals, &bindings, loop_level, inputs);
             }
             sai_hir::expressions::StmtKind::Let { pat, init, .. } => {
                 if let PatKind::Binding {
@@ -21027,7 +21042,7 @@ fn str_clean_block(
                     ..
                 } = pat.kind
                 {
-                    if str_clean_expr(init, locals, &bindings, loop_level) {
+                    if str_clean_expr(init, locals, &bindings, loop_level, inputs) {
                         bindings.insert(
                             binding,
                             StrLocalEntry {
@@ -21044,7 +21059,7 @@ fn str_clean_block(
     clean
         || block
             .tail
-            .is_some_and(|tail| str_clean_expr(tail, locals, &bindings, loop_level))
+            .is_some_and(|tail| str_clean_expr(tail, locals, &bindings, loop_level, inputs))
 }
 
 fn str_clean_expr(
@@ -21052,18 +21067,20 @@ fn str_clean_expr(
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
     loop_level: bool,
+    inputs: &CurrentOwnerInputs,
 ) -> bool {
     match expr.kind {
         ExprKind::Lit(Lit::Str(_)) => true,
+        _ if str_self_field_projected_family(expr, inputs) == Some("`Str`") => true,
         ExprKind::If {
             then,
             els: Some(els),
             ..
         } => {
-            str_clean_block(then, locals, str_bindings, loop_level)
-                || str_clean_expr(els, locals, str_bindings, loop_level)
+            str_clean_block(then, locals, str_bindings, loop_level, inputs)
+                || str_clean_expr(els, locals, str_bindings, loop_level, inputs)
         }
-        ExprKind::Block(inner) => str_clean_block(inner, locals, str_bindings, loop_level),
+        ExprKind::Block(inner) => str_clean_block(inner, locals, str_bindings, loop_level, inputs),
         ExprKind::Match {
             scrutinee,
             arms,
@@ -21093,13 +21110,13 @@ fn str_clean_expr(
                         ),
                     );
                 }
-                str_clean_expr(arm.body, locals, &bindings, loop_level)
+                str_clean_expr(arm.body, locals, &bindings, loop_level, inputs)
             })
         }
         ExprKind::Break {
             label: None,
             value: Some(value),
-        } => str_clean_expr(value, locals, str_bindings, loop_level),
+        } => str_clean_expr(value, locals, str_bindings, loop_level, inputs),
         // A `loop` in value position yields its own break contributions;
         // at loop level the same loop is a statement whose breaks stay
         // inside it, so it is not scanned.
@@ -21107,7 +21124,7 @@ fn str_clean_expr(
             body,
             source: LoopSource::Loop,
             ..
-        } => !loop_level && str_clean_block(body, locals, str_bindings, true),
+        } => !loop_level && str_clean_block(body, locals, str_bindings, true, inputs),
         _ => str_binding_path(expr, locals, str_bindings),
     }
 }
@@ -21185,7 +21202,7 @@ fn str_break_value(
         // clean `Str` break contribution exists inside it — an all-integer
         // `if`/`match` produces no `Str` for a `let` initializer to seed.
         return Ok(Some((
-            str_break_ctx_clean(value, locals, str_bindings),
+            str_break_ctx_clean(value, locals, str_bindings, inputs),
             value_diagnostics,
         )));
     }
@@ -101586,6 +101603,79 @@ property "shared"() {}
             matches!(check, FunctionBodyTypeCheck::Unsupported),
             ">2 explicit params stay gated: {check:?}"
         );
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_str_self_fields() {
+        let root = concat!(
+            "type Greeting { text: Str, count: I32 }\n",
+            "impl Greeting {\n",
+            "  pub fn get(self: borrow Self, flag: Bool) -> Str {\n",
+            "    self.text\n",
+            "  }\n",
+            "  pub fn cmp(self: borrow Self) -> Str {\n",
+            "    if self.count == self.text {\n",
+            "      \"a\"\n",
+            "    } else {\n",
+            "      \"b\"\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn call(self: borrow Self) -> Str {\n",
+            "    self.get(false)\n",
+            "  }\n",
+            "  pub fn init(self: borrow Self, flag: Bool) -> Str {\n",
+            "    let s = if flag { self.text } else { self.text }\n",
+            "    s\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("inherent methods collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let methods = &results.owners()[0].members();
+        assert_eq!(methods.len(), 4);
+        let check = methods[0].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Supported { .. }),
+            "get: {check:?}"
+        );
+        // `I32` vs `Str` field operands report the comparison mismatch.
+        let check = methods[1].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("cmp reports its mismatch: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(
+            diagnostics[0].message, "expected `I32`, found `Str`",
+            "{diagnostics:?}"
+        );
+        // `self.<method>(..)` is a call — it gates, not an unknown field.
+        let check = methods[2].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "call stays gated without a field error: {check:?}"
+        );
+        // `if`-branch field tails seed the `Str` initializer join.
+        let check = methods[3].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("init binds the `Str` field: {check:?}");
+        };
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     fn inherent_method_body_type_mismatches_keep_source_spans() {
