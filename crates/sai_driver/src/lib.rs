@@ -8154,6 +8154,63 @@ fn check_inherent_method_body_type(
     let ExprKind::Block(method_block) = body.value.kind else {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
+    // `-> Str` methods run the Str walk on the explicit body — `self`
+    // is unbound there, so `self.<field>` operand shapes stay gated
+    // until the Str walk admits field reads.
+    if method_block.safety == sai_hir::Safety::Safe
+        && matches!(
+            sig.ret
+                .and_then(|ty| { resolve_function_direct_type(*ty, type_paths, symbols, inputs) }),
+            Some(FunctionDirectType::Str)
+        )
+    {
+        if explicit_params.len() > 2 {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
+        let mut str_bindings = StrLocalBindings::new();
+        for (parameter, body_parameter) in explicit_params.iter().zip(explicit_body_params.iter()) {
+            if parameter.mutable != body_parameter.mutable
+                || !parameter
+                    .name
+                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+                || parameter.name != body_parameter.name
+            {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            let Some(family) =
+                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+                    .and_then(str_parameter_family)
+            else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            str_bindings.insert(
+                body_parameter.binding,
+                StrLocalEntry {
+                    family,
+                    literal: None,
+                },
+            );
+        }
+        let Some(diagnostics) = check_function_str_local_block(
+            method_owner,
+            *sig.ret.expect("Str return is present"),
+            method_block,
+            &mut str_bindings,
+            locals,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            false,
+            StrStmtLoopFrame::None,
+            direct_call_signatures,
+        )?
+        else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
+    }
     let Some(field_types) = inherent_method_primitive_field_types(*self_ty, symbols, inputs) else {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
@@ -101104,6 +101161,81 @@ property "shared"() {}
     }
 
     #[test]
+    fn inherent_method_body_type_check_admits_str_returns() {
+        let root = concat!(
+            "type Greeting { text: Str, count: I32 }\n",
+            "impl Greeting {\n",
+            "  pub fn get(self: borrow Self) -> Str {\n",
+            "    \"hello\"\n",
+            "  }\n",
+            "  pub fn with_suffix(self: borrow Self, suffix: Str) -> Str {\n",
+            "    let s = suffix\n",
+            "    s\n",
+            "  }\n",
+            "  pub fn counted(self: borrow Self, n: I64) -> Str {\n",
+            "    let s = \"x\"\n",
+            "    if n == 1 {\n",
+            "      s\n",
+            "    } else {\n",
+            "      \"none\"\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn field_read(self: borrow Self) -> Str {\n",
+            "    self.text\n",
+            "  }\n",
+            "  pub fn bad_tail(self: borrow Self) -> Str {\n",
+            "    1\n",
+            "  }\n",
+            "  pub fn wide(self: borrow Self, a: Str, b: Str, c: Str) -> Str {\n",
+            "    a\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("inherent methods collect");
+
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let methods = &results.owners()[0].members();
+        assert_eq!(methods.len(), 6);
+        for (index, name) in ["get", "with_suffix", "counted"].iter().enumerate() {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} stays supported");
+            };
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+        }
+        let check = methods[3].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "self.<field> stays gated: {check:?}"
+        );
+        let check = methods[4].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a non-Str tail reports a recoverable mismatch: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        let check = methods[5].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            ">2 explicit params stay gated: {check:?}"
+        );
+    }
+
     fn inherent_method_body_type_mismatches_keep_source_spans() {
         let root = concat!(
             "type Counter { marker: I32 }\n",

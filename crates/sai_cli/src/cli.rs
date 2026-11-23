@@ -2162,6 +2162,7 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
                         | b"USize"
                         | b"F32"
                         | b"F64"
+                        | b"Str"
                 )
             })
     }) {
