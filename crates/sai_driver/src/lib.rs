@@ -9169,6 +9169,7 @@ fn check_function_body_primitive_local_block(
     OwnerControlFlowResolutionError,
 > {
     let mut initial_bindings = HashMap::new();
+    let mut str_admissions = StrShapeAdmissions::default();
     if sig.params.len() != body.params.len() {
         return Ok(None);
     }
@@ -9194,15 +9195,20 @@ fn check_function_body_primitive_local_block(
             }
             _ => return Ok(None),
         }
-        let Some(FunctionDirectType::Primitive(parameter_type)) =
-            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
-        else {
-            return Ok(None);
-        };
-        if !sai_ty::typeck::literal::supports_primitive_literal(parameter_type) {
-            return Ok(None);
+        match resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs) {
+            Some(FunctionDirectType::Primitive(parameter_type)) => {
+                if !sai_ty::typeck::literal::supports_primitive_literal(parameter_type) {
+                    return Ok(None);
+                }
+                initial_bindings.insert(body_parameter.binding, parameter_type);
+            }
+            // `Str` parameters are not `PrimTy` — they seed the `Str`
+            // admission set instead of the primitive binding map.
+            Some(FunctionDirectType::Str) => {
+                str_admissions.locals.insert(body_parameter.binding);
+            }
+            _ => return Ok(None),
         }
-        initial_bindings.insert(body_parameter.binding, parameter_type);
     }
 
     let Some(return_ty) = sig.ret else {
@@ -9259,6 +9265,9 @@ fn check_function_body_primitive_local_block(
             }
         }
     }
+    // `Str` parameters/leaves are admitted everywhere a preceding local
+    // is — the kernel decides which operand positions reject `Str`.
+    block_bindings.extend(str_admissions.locals.iter().copied());
     let is_supported_unary_tail = match tail.kind {
         ExprKind::Unary(operator, operand)
             if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) =>
@@ -9399,6 +9408,9 @@ fn check_function_body_primitive_local_block(
     }
 
     let mut preceding_bindings = initial_bindings.keys().copied().collect::<HashSet<_>>();
+    // `Str` parameters are admitted everywhere a preceding local is — the
+    // kernel decides which operand positions still reject `LocalType::Str`.
+    preceding_bindings.extend(str_admissions.locals.iter().copied());
     for stmt in block.stmts {
         if !primitive_let_statement_shape_is_supported(
             stmt,
@@ -9411,6 +9423,7 @@ fn check_function_body_primitive_local_block(
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            &mut str_admissions,
         ) {
             return Ok(None);
         }
@@ -9546,6 +9559,8 @@ fn check_function_body_primitive_local_block(
             body,
             return_type,
             initial_bindings: &initial_bindings,
+            str_bindings: Some(&str_admissions.locals),
+            str_annotations: Some(&str_admissions.annotations),
             primitive_types: &primitive_types,
             self_field_projections,
             unknown_self_fields,
@@ -10031,6 +10046,7 @@ fn primitive_logical_init_operand_shape_is_supported(
                     self_field_projections,
                     unknown_self_fields,
                     direct_call_signatures,
+                    &mut StrShapeAdmissions::default(),
                 )
             }) && inner.tail.is_some_and(|tail| {
                 primitive_logical_init_operand_shape_is_supported(
@@ -10492,6 +10508,24 @@ fn primitive_nested_operand_shape_is_supported(
     }
 }
 
+/// `Str`-family admissions collected beside the primitive maps while
+/// gating a `-> <prim>` body — `Str` is `Adt(str)`, not a `PrimTy`, so
+/// `Str` locals and `let _: Str` annotation nodes travel in their own
+/// sets. `Str` members also join `preceding_bindings` for admission; the
+/// kernel decides which operand positions still reject `LocalType::Str`.
+/// Nested-block lets share the gate but run on a fresh set: `Str`
+/// annotations and `Str`-path assert messages stay gated in nested
+/// blocks in this slice.
+#[derive(Default)]
+struct StrShapeAdmissions {
+    /// Bindings whose computed type is `Str` — `Str` parameters and
+    /// locals initialized from `Str` literals or other `Str` locals.
+    locals: HashSet<sai_hir::BindingId>,
+    /// Annotation nodes (`let s: Str = ..`) whose written type spells
+    /// `Str`; passed to the kernel like `primitive_types`.
+    annotations: HashSet<HirId>,
+}
+
 fn primitive_value_expression_shape_is_supported(
     expression: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
@@ -10869,6 +10903,7 @@ fn primitive_let_statement_shape_is_supported(
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     unknown_self_fields: Option<&HashSet<HirId>>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    str_admissions: &mut StrShapeAdmissions,
 ) -> bool {
     if let StmtKind::Expr(expression) = stmt.kind {
         // Statement-position `if`/`match` expressions discard their result;
@@ -10985,7 +11020,13 @@ fn primitive_let_statement_shape_is_supported(
             locals,
             inputs,
             self_field_projections,
-        ) && msg.is_none_or(|msg| matches!(msg.kind, ExprKind::Lit(Lit::Str(_))));
+        ) && msg.is_none_or(|msg| {
+            // `Str` literal or a `Str`-typed local per N-C-20.
+            matches!(msg.kind, ExprKind::Lit(Lit::Str(_)))
+                || matches!(msg.kind, ExprKind::Path(path)
+                    if resolved_plain_local_path_binding(path, locals, inputs)
+                        .is_some_and(|binding| str_admissions.locals.contains(&binding)))
+        });
     }
     if let StmtKind::Assign { lhs, rhs } = stmt.kind {
         // `place = e` (§6.13.1): a plain path to a preceding local; field,
@@ -11086,13 +11127,20 @@ fn primitive_let_statement_shape_is_supported(
     {
         return false;
     }
+    let mut str_annotated = false;
     if let Some(ty) = ty {
-        let Some(FunctionDirectType::Primitive(local_type)) =
-            resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-        else {
-            return false;
-        };
-        primitive_types.insert(ty.hir_id, local_type);
+        match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
+            Some(FunctionDirectType::Primitive(local_type)) => {
+                primitive_types.insert(ty.hir_id, local_type);
+            }
+            // `let s: Str` — the annotation is not a `PrimTy`; record it
+            // so the kernel binds the local `LocalType::Str`.
+            Some(FunctionDirectType::Str) => {
+                str_annotated = true;
+                str_admissions.annotations.insert(ty.hir_id);
+            }
+            _ => return false,
+        }
     }
 
     if !primitive_value_expression_shape_is_supported(
@@ -11110,6 +11158,30 @@ fn primitive_let_statement_shape_is_supported(
         return false;
     }
     preceding_bindings.insert(binding);
+    // Track the `Str` locals: an explicit `Str` annotation, or an
+    // unannotated binding of a `Str` literal, another `Str` local, or a
+    // nested block whose tail yields `Str` the same way.
+    if str_annotated
+        || (ty.is_none() && {
+            let mut str_init = init;
+            loop {
+                match str_init.kind {
+                    ExprKind::Block(block) => match block.tail {
+                        Some(inner_tail) => str_init = inner_tail,
+                        None => break false,
+                    },
+                    ExprKind::Lit(Lit::Str(_)) => break true,
+                    ExprKind::Path(path) => {
+                        break resolved_plain_local_path_binding(path, locals, inputs)
+                            .is_some_and(|source| str_admissions.locals.contains(&source));
+                    }
+                    _ => break false,
+                }
+            }
+        })
+    {
+        str_admissions.locals.insert(binding);
+    }
     true
 }
 
@@ -11289,6 +11361,7 @@ fn primitive_if_branch_shape_is_supported(
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            &mut StrShapeAdmissions::default(),
         )
     }) && block.tail.is_some_and(|tail| {
         primitive_if_branch_tail_shape_is_supported(
@@ -11343,6 +11416,7 @@ fn primitive_inner_block_shape_is_supported(
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            &mut StrShapeAdmissions::default(),
         ) {
             return false;
         }
@@ -11810,6 +11884,7 @@ fn primitive_stmt_block_shape_is_supported(
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            &mut StrShapeAdmissions::default(),
         )
     }) && match block.tail {
         // A `break`/`continue` tail (including the `while` desugaring's
@@ -11948,6 +12023,7 @@ fn primitive_loop_body_shape_is_supported(
             self_field_projections,
             unknown_self_fields,
             direct_call_signatures,
+            &mut StrShapeAdmissions::default(),
         )
     }) && match body.tail {
         None => true,
@@ -12682,6 +12758,22 @@ fn primitive_body_errors_to_diagnostics(
         };
         use sai_ty::typeck::body::{
             PrimitiveBodyErrorKind, PrimitiveLiteralKind, PrimitiveOperatorOperand,
+            ScalarLiteralKind, ScalarType,
+        };
+        let scalar_name = |scalar: ScalarType| match scalar {
+            ScalarType::Primitive(primitive) => const_primitive_name(primitive),
+            ScalarType::Str => "Str",
+        };
+        let scalar_literal_name = |kind: ScalarLiteralKind| match kind {
+            ScalarLiteralKind::Primitive(PrimitiveLiteralKind::Integer) => "an integer literal",
+            ScalarLiteralKind::Primitive(PrimitiveLiteralKind::FloatingPoint) => {
+                "a floating-point literal"
+            }
+            ScalarLiteralKind::Primitive(PrimitiveLiteralKind::Bool) => "a Bool literal",
+            ScalarLiteralKind::Primitive(PrimitiveLiteralKind::Byte) => "a byte literal",
+            ScalarLiteralKind::Primitive(PrimitiveLiteralKind::Character) => "a character literal",
+            ScalarLiteralKind::Str => "a string literal",
+            ScalarLiteralKind::ByteStr => "a byte string literal",
         };
         let diagnostic = match error.kind {
             PrimitiveBodyErrorKind::LiteralTypeMismatch { expected, found } => {
@@ -12766,6 +12858,36 @@ fn primitive_body_errors_to_diagnostics(
                 ),
                 "type mismatch",
             )?,
+            PrimitiveBodyErrorKind::ScalarTypeMismatch { expected, found } => {
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found `{}`",
+                        scalar_name(expected),
+                        scalar_name(found)
+                    ),
+                    "type mismatch",
+                )?
+            }
+            PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch { expected, found } => {
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found {}",
+                        scalar_name(expected),
+                        scalar_literal_name(found)
+                    ),
+                    "type mismatch",
+                )?
+            }
             PrimitiveBodyErrorKind::OperatorNotSupported { operator, operand } => {
                 let operator_text = match operator {
                     BinOp::Rem => "%",
@@ -13397,7 +13519,12 @@ fn is_direct_function_scalar_literal(expression: &HirExpr<'_>) -> bool {
     matches!(
         expression.kind,
         ExprKind::Lit(
-            Lit::Bool(_) | Lit::Char(_) | Lit::Byte(_) | Lit::Int { .. } | Lit::Float { .. }
+            Lit::Bool(_)
+                | Lit::Char(_)
+                | Lit::Byte(_)
+                | Lit::Int { .. }
+                | Lit::Float { .. }
+                | Lit::Str(_)
         )
     )
 }
@@ -60596,6 +60723,127 @@ property "shared"() {}
     }
 
     #[test]
+    fn function_body_type_check_admits_str_locals_and_comparisons_in_primitive_bodies() {
+        let root = concat!(
+            "pub fn str_param_echo(value: Str) -> I32 { 0 }\n",
+            "pub fn str_local_literal() -> I32 { let s = \"a\"\n    0 }\n",
+            "pub fn str_local_annotated() -> I32 { let s: Str = \"a\"\n    0 }\n",
+            "pub fn str_local_alias() -> I32 { let s = \"a\"\n    let t = s\n    0 }\n",
+            "pub fn str_param_alias(value: Str) -> I32 { let t = value\n    0 }\n",
+            "pub fn str_compare_literal(value: Str) -> Bool { value == \"a\" }\n",
+            "pub fn str_compare_locals() -> Bool { let a = \"x\"\n    let b = \"y\"\n    a == b }\n",
+            "pub fn str_compare_param(value: Str, other: Str) -> Bool { value < other }\n",
+            "pub fn str_var_assign() -> I32 { var s: Str = \"a\"\n    s = \"b\"\n    0 }\n",
+            "pub fn str_if_condition(value: Str) -> I32 { if value == \"a\" { 1 } else { 2 } }\n",
+            "pub fn str_assert_message(value: Str) -> I32 { assert true, value\n    0 }\n",
+            "pub fn str_not_comparison(value: Str) -> Bool { not (value == \"a\") }\n",
+            "pub fn str_block_init_assert() -> I32 { let message = { \"oops\" }\n    assert true, message\n    0 }\n",
+            "pub fn str_compare_mismatch() -> Bool { let s = \"a\"\n    s == 1 }\n",
+            "pub fn str_compare_left_primitive() -> Bool { let s = \"a\"\n    1 == s }\n",
+            "pub fn str_annotated_primitive_init() -> I32 { let s: Str = 1\n    0 }\n",
+            "pub fn str_primitive_annotated_str_init() -> I32 { let s: I32 = \"a\"\n    0 }\n",
+            "pub fn str_var_assign_literal() -> I32 { var s: Str = \"a\"\n    s = 1\n    0 }\n",
+            "pub fn str_if_path_condition(value: Str) -> I32 { if value { 1 } else { 2 } }\n",
+            "pub fn str_tail_mismatch(value: Str) -> I32 { let n = 1\n    value }\n",
+            "pub fn str_compare_bool_left(value: Str) -> Bool { true == value }\n",
+            "pub fn str_compare_byte_left(value: Str) -> Bool { b'z' == value }\n",
+            "pub fn str_compare_bytestring_right(value: Str) -> Bool { value == b\"a\" }\n",
+            "pub fn str_compare_str_literal_right() -> Bool { 1 == \"a\" }\n",
+            "pub fn str_compare_out_of_range_left(value: Str) -> Bool { 18446744073709551616 == value }\n",
+            "pub fn str_arithmetic_tail() -> I32 { let s = \"a\"\n    s + 1 }\n",
+            "pub fn str_match_scrutinee(value: Str) -> I32 { match value { _ => 0 } }\n",
+            "pub fn str_assign_to_primitive() -> I32 { var n = 1\n    n = \"a\"\n    0 }\n",
+            "pub fn str_annotated_bytestring_init() -> I32 { let s: Str = b\"a\"\n    0 }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 29);
+        // Clean supported owners: `Str` parameters, `Str` locals (literal,
+        // annotated, aliased, block-initialized), `Str` comparisons (also
+        // under `not`), a `var` `Str` place assignment, a `Str`-comparison
+        // `if` condition, and `Str`-local assert messages all check
+        // without diagnostics.
+        for owner in &owners[..13] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("Str local function body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        // Supported-with-diagnostics owners: scalar/`Str` mismatches report
+        // like the flat checker, naming `Str` on the `found` side.
+        for (index, expected_message) in [
+            (13, "expected `Str`, found an integer literal"),
+            (14, "expected `I64`, found `Str`"),
+            (15, "expected `Str`, found an integer literal"),
+            (16, "expected `I32`, found `Str`"),
+            (17, "expected `Str`, found an integer literal"),
+            (18, "expected `Bool`, found `Str`"),
+            (19, "expected `I32`, found `Str`"),
+            // Non-integer literal defaults: `Bool`/`Byte` literals are
+            // checked against their own family, not a `I64` default.
+            (20, "expected `Bool`, found `Str`"),
+            (21, "expected `Byte`, found `Str`"),
+            // `Slice<Byte>` and `Str` literal mismatches name the literal,
+            // not the literal's type.
+            (22, "expected `Str`, found a byte string literal"),
+            (23, "expected `I64`, found a string literal"),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("Str mismatch remains in the supported slice")
+            else {
+                panic!("Str mismatch remains in the supported slice");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            assert_eq!(diagnostics[0].message, expected_message);
+        }
+        // An out-of-range integer literal on the comparison's left reports
+        // the range failure AND the checked type mismatch on the `Str`
+        // operand — the same pair `check_comparison_literal` emits for a
+        // left literal.
+        let FunctionBodyTypeCheck::Supported { diagnostics } = owners[24]
+            .body_type_check()
+            .expect("out-of-range comparison stays in the supported slice")
+        else {
+            panic!("out-of-range comparison stays in the supported slice");
+        };
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::LiteralOutOfRange
+        );
+        assert_eq!(diagnostics[1].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(diagnostics[1].message, "expected `I64`, found `Str`");
+        // Gated owners: `Str` arithmetic operands, a `Str` match scrutinee,
+        // a literal-variable `Str` assignment, and a `Slice<Byte>`
+        // initializer stay outside the slice.
+        for owner in &owners[25..] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("gated Str function body check succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+    }
+
+    #[test]
     fn function_body_type_check_checks_one_annotated_primitive_local() {
         let root = concat!(
             "pub fn local() -> I32 {\n    let value: I32 = 42\n    value\n}\n",
@@ -62705,6 +62953,8 @@ property "shared"() {}
                 body: diagnostic_order_body,
                 return_type: PrimTy::Bool,
                 initial_bindings: &std::collections::HashMap::new(),
+                str_bindings: None,
+                str_annotations: None,
                 primitive_types: &std::collections::HashMap::new(),
                 self_field_projections: None,
                 unknown_self_fields: None,
@@ -65929,14 +66179,21 @@ property "shared"() {}
         );
 
         let str_owner = owner_named(&database, &resolved, "str_tail");
-        assert!(
-            matches!(
-                str_owner
-                    .body_type_check()
-                    .expect("str tail body query succeeds"),
-                FunctionBodyTypeCheck::Unsupported
-            ),
-            "a non-primitive literal tail stays outside this slice"
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: str_diagnostics,
+        } = str_owner
+            .body_type_check()
+            .expect("str tail body query succeeds")
+        else {
+            panic!("a `Str` literal tail in a primitive body reports the mismatch");
+        };
+        assert_eq!(
+            str_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["expected `I32`, found a string literal"],
+            "the `Str` literal tail reports its type mismatch"
         );
     }
 
@@ -89388,7 +89645,25 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [5, 6, 9, 11, 12, 13] {
+        {
+            // `if true { "text" } else { "other" }` — each `Str` branch is
+            // checked against the `I32` tail like the checker does.
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[11]
+                .body_type_check()
+                .expect("Str if branches are checked")
+            else {
+                panic!("`Str` `if` branches stay in the supported slice");
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>(),
+                ["expected `I32`, found `Str`", "expected `I32`, found `Str`"],
+                "each `Str` branch reports its mismatch"
+            );
+        }
+        for index in [5, 6, 9, 12, 13] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -89607,7 +89882,13 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [19, 26, 27, 28, 30] {
+        assert!(matches!(
+            owners[27]
+                .body_type_check()
+                .expect("a `Str` parameter comparison against a literal is checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for index in [19, 26, 28, 30] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -90219,6 +90500,7 @@ property "shared"() {}
             (51, sai_diagnostics::Code::InvalidBreakValue),
             (53, sai_diagnostics::Code::TypeMismatch),
             (54, sai_diagnostics::Code::InvalidBreakValue),
+            (47, sai_diagnostics::Code::TypeMismatch),
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -90229,7 +90511,7 @@ property "shared"() {}
                 "function owner {index} must report {code:?}: {check:?}"
             );
         }
-        for index in [26, 34, 35, 41, 47, 50] {
+        for index in [26, 34, 35, 41, 50] {
             let check = owners[index]
                 .body_type_check()
                 .expect("an out-of-slice loop form is gated");
@@ -90895,7 +91177,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the supported comparison slice: {check:?}"
             );
         }
-        for index in [29, 31, 32, 38, 40, 45] {
+        for index in [28, 29, 31, 32, 38, 40, 45] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -90939,7 +91221,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [27, 28, 39, 44, 46] {
+        for index in [27, 39, 44, 46] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
