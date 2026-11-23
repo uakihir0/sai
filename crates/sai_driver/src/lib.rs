@@ -13351,10 +13351,16 @@ fn str_let_entry(
         };
     }
     match init.kind {
-        ExprKind::Lit(literal) if str_scalar_family_name(literal).is_some() => StrLocalEntry {
-            family,
-            literal: str_static_literal(literal).map(|literal| str_seed_new(literal, init.span)),
-        },
+        ExprKind::Lit(literal)
+            if matches!(literal, Lit::Int { .. } | Lit::Float { .. }) =>
+        {
+            // Only integer/float literals are literal variables —
+            // `Str`/`Bool`/`Byte`/`Char` literal inits bind concrete.
+            StrLocalEntry {
+                family,
+                literal: str_static_literal(literal).map(|literal| str_seed_new(literal, init.span)),
+            }
+        }
         ExprKind::Path(_) => {
             str_binding_entry(init, locals, str_bindings)
                 .map(|entry| StrLocalEntry {
