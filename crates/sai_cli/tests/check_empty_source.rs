@@ -4769,6 +4769,10 @@ fn primitive_body_str_mismatches_report_type_diagnostics() {
             "expected `Str`, found an integer literal",
         ),
         (
+            "pub fn str_annotated_bytestring() -> Bool {\n    let s: Str = b\"a\"\n    true\n}\n",
+            "expected `Str`, found a byte string literal",
+        ),
+        (
             "pub fn bool_str_eq(value: Str) -> Bool { true == value }\n",
             "expected `Bool`, found `Str`",
         ),
@@ -4807,7 +4811,6 @@ fn primitive_body_str_forms_outside_the_slice_remain_gated() {
         "pub fn str_arith() -> Bool {\n    let s = \"a\"\n    s + 1 == 2\n}\n",
         "pub fn str_match() -> Bool {\n    let s = \"a\"\n    match s { \"x\" => true, _ => false }\n}\n",
         "pub fn str_assign_int() -> Bool {\n    var n = 1\n    n = \"a\"\n    true\n}\n",
-        "pub fn str_annotated_bytestring() -> Bool {\n    let s: Str = b\"a\"\n    true\n}\n",
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);

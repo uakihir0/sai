@@ -2843,6 +2843,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     _ => Err(()),
                 }
             }
+            // `let s: Str = { "a" }` or a statement-bearing block —
+            // the statements check like body statements and the tail
+            // must yield `Str`.
+            ExprKind::Block(block) => {
+                self.check_str_branch_block(block)?;
+                self.record_expression_type(init.hir_id, LocalType::Str);
+                Ok(LocalType::Str)
+            }
             // `let s: Str = if c { "a" } else { "b" }` — the condition
             // checks like any `if` and each branch tail must yield `Str`.
             ExprKind::If { cond, then, els } => {
@@ -4625,11 +4633,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// carries the expected type. The deferred-operator flags let the `let`
     /// path keep its provenance tracking; an assignment ignores them because
     /// its target already has a concrete type.
-    // A `Str`-yielding branch block: only its tail matters — the
-    // bounded slice keeps statement bodies out (they stay gated).
+    // A `Str`-yielding branch block: `unsafe` blocks stay gated, each
+    // statement checks like a body statement, and the tail yields
+    // `Str` through `check_str_branch_tail`.
     fn check_str_branch_block(&mut self, block: &Block<'hir>) -> Result<(), ()> {
-        if !block.stmts.is_empty() {
+        if block.safety != Safety::Safe {
             return Err(());
+        }
+        for stmt in block.stmts {
+            self.check_stmt(stmt)?;
         }
         let Some(tail) = block.tail else {
             return Err(());
@@ -4710,6 +4722,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             _ => Err(()),
         }
+    }
+
+    // Mirror of `check_str_branch_block`'s admission: a safe block
+    // whose statements are `let`s and whose tail is `Str`-shaped.
+    fn str_branch_block_shaped(&mut self, block: &Block<'hir>) -> bool {
+        block.safety == Safety::Safe
+            && block
+                .stmts
+                .iter()
+                .all(|stmt| matches!(stmt.kind, StmtKind::Let { .. }))
+            && block
+                .tail
+                .is_some_and(|tail| self.str_shaped_initializer(tail))
     }
 
     // Whether an unannotated initializer yields `Str`: a `Str` literal,
