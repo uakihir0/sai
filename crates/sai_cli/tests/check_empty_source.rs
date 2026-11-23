@@ -3365,6 +3365,42 @@ fn public_inherent_method_tail_field_mismatch_reports_the_field_span() {
 }
 
 #[test]
+fn public_inherent_method_str_return_on_str_field_emits_check_result() {
+    let source = concat!(
+        "type Greeting { text: Str }\n",
+        "impl Greeting {\n",
+        "    pub fn get(self: borrow Self) -> Str {\n",
+        "        \"hello\"\n",
+        "    }\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn public_inherent_method_str_return_mismatch_reports_type_error() {
+    let source = concat!(
+        "type Greeting { text: Str }\n",
+        "impl Greeting {\n",
+        "    pub fn get(self: borrow Self) -> Str {\n",
+        "        1\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `Str`, found an integer literal")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a wrong `-> Str` tail is diagnosed instead of gated:\n{stdout}"
+    );
+}
+
+#[test]
 fn public_inherent_method_field_mismatch_reports_the_field_span() {
     let source = concat!(
         "type Counter { count: I32 }\n",
