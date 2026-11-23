@@ -16492,14 +16492,45 @@ fn str_condition(
     ) = cond.kind
     {
         // Operands carry literal families — `Str` for `Str` literals and
-        // bindings, the default scalar family otherwise. Equal families
-        // fold to `Bool` (literal operands still carry their default
-        // range check); differing families report the checker's
-        // `expected <left>, found <right>` on the right operand.
-        let (Some(left_family), Some(right_family)) = (
-            str_condition_operand_family(lhs, locals, str_bindings, inputs),
-            str_condition_operand_family(rhs, locals, str_bindings, inputs),
-        ) else {
+        // bindings, the default scalar family otherwise; a call operand
+        // resolves through its signature (argument diagnostics carry
+        // through). Equal families fold to `Bool` (literal operands
+        // still carry their default range check); differing families
+        // report the checker's `expected <left>, found <right>` on the
+        // right operand.
+        let mut operand_diagnostics = Vec::new();
+        let mut operand_family =
+            |expr: &HirExpr<'_>| -> Result<Option<&'static str>, OwnerControlFlowResolutionError> {
+                if matches!(expr.kind, ExprKind::Call { .. }) {
+                    let Some((family, mut call_diagnostics)) = str_expr_family(
+                        owner,
+                        return_ty,
+                        expr,
+                        locals,
+                        str_bindings,
+                        None,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                        call_signatures,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    operand_diagnostics.append(&mut call_diagnostics);
+                    return Ok(Some(family));
+                }
+                Ok(str_condition_operand_family(
+                    expr,
+                    locals,
+                    str_bindings,
+                    inputs,
+                ))
+            };
+        let (Some(left_family), Some(right_family)) = (operand_family(lhs)?, operand_family(rhs)?)
+        else {
             return Ok(None);
         };
         // `!` unifies with the other operand's family (a `let n =
@@ -16535,7 +16566,7 @@ fn str_condition(
             fold(rhs, right_family, lhs, left_family),
         );
         if left_family == right_family {
-            let mut diagnostics = Vec::new();
+            let mut diagnostics = operand_diagnostics;
             for operand in [lhs, rhs] {
                 let ExprKind::Lit(_) = operand.kind else {
                     continue;
@@ -16560,7 +16591,7 @@ fn str_condition(
             }
             return Ok(Some(diagnostics));
         }
-        return Ok(Some(vec![const_literal_diagnostic(
+        operand_diagnostics.push(const_literal_diagnostic(
             owner.id,
             inputs,
             snapshot,
@@ -16568,7 +16599,8 @@ fn str_condition(
             sai_diagnostics::Code::TypeMismatch,
             format!("expected {left_family}, found {right_family}"),
             "type mismatch",
-        )?]));
+        )?);
+        return Ok(Some(operand_diagnostics));
     }
     // A literal or `Str`-leaf condition in a `Bool` slot is the checker's
     // `expected Bool` mismatch — recoverable like the comparison-operand
@@ -18993,6 +19025,30 @@ fn str_stmt_expr_unit(
             ),
             _ => Ok(None),
         },
+        // A call statement discards its result — the args still check
+        // against the callee's signature (a `self.<method>(..)` call or
+        // a resolved direct call), so a `()` or any other output family
+        // is admitted.
+        ExprKind::Call { base: None, .. } => {
+            let Some((_, diagnostics)) = str_expr_family(
+                owner,
+                return_ty,
+                expr,
+                locals,
+                str_bindings,
+                expected,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                call_signatures,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(diagnostics))
+        }
         ExprKind::Break { label: None, value } => {
             if break_ctx {
                 // Breaks inside a `break` value still target the
@@ -102028,6 +102084,31 @@ property "shared"() {}
             "  pub fn named(self: borrow Self) -> Str {\n",
             "    self.get(flag: true)\n",
             "  }\n",
+            "  pub fn prepare(self: borrow Self) {\n",
+            "    let _ = self.count\n",
+            "  }\n",
+            "  pub fn cond_call(self: borrow Self) -> Str {\n",
+            "    if self.get(true) == \"ready\" {\n",
+            "      self.text\n",
+            "    } else {\n",
+            "      self.text\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn cond_mismatch(self: borrow Self) -> Str {\n",
+            "    if self.size() == \"ready\" {\n",
+            "      self.text\n",
+            "    } else {\n",
+            "      self.text\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn stmt_call(self: borrow Self) -> Str {\n",
+            "    self.get(true)\n",
+            "    self.text\n",
+            "  }\n",
+            "  pub fn stmt_unit(self: borrow Self) -> Str {\n",
+            "    self.prepare()\n",
+            "    self.text\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -102048,7 +102129,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let methods = &results.owners()[0].members();
-        assert_eq!(methods.len(), 8);
+        assert_eq!(methods.len(), 13);
         // `self.<method>(..)` checks through the sibling signature —
         // a supported `Str` tail and a `Str` local initializer.
         for (index, name) in [(2, "ok"), (3, "chained")] {
@@ -102096,6 +102177,27 @@ property "shared"() {}
         assert_eq!(
             diagnostics[0].code,
             sai_diagnostics::Code::NamedArgumentOnFunction,
+            "{diagnostics:?}"
+        );
+        // A call in a comparison operand checks through its signature
+        // too, and a call statement checks its args while discarding
+        // the result — `Str`- and `()`-returning alike.
+        for (index, name) in [(9, "cond_call"), (11, "stmt_call"), (12, "stmt_unit")] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} checks through the signature: {check:?}");
+            };
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+        }
+        // A call operand family mismatch reports on the right operand.
+        let check = methods[10].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("cond_mismatch reports its mismatch: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(
+            diagnostics[0].message, "expected `I32`, found a string literal",
             "{diagnostics:?}"
         );
     }
