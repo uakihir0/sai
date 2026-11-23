@@ -11499,24 +11499,17 @@ fn str_shaped_local_init(
         }
         // `let s = if c { "a" } else { "b" }` yields `Str` when both
         // branches do (an `else if` chain recurses through `els`); a
-        // diverging branch is neutral — it never yields.
+        // diverging branch is neutral — it never yields. Each branch
+        // is evaluated once: a nested `if` chain must not re-scan it.
         ExprKind::If { then, els, .. } => {
-            (str_shaped_branch_block(then, locals, inputs, str_bindings, symbols, type_paths)
-                || str_diverging_local_block(then))
-                && els.is_some_and(|els| {
-                    str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
-                        || str_diverging_local_init(els)
-                })
-                && (str_shaped_branch_block(
-                    then,
-                    locals,
-                    inputs,
-                    str_bindings,
-                    symbols,
-                    type_paths,
-                ) || els.is_some_and(|els| {
-                    str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
-                }))
+            let then_str =
+                str_shaped_branch_block(then, locals, inputs, str_bindings, symbols, type_paths);
+            let els_str = els.is_some_and(|els| {
+                str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
+            });
+            (then_str || els_str)
+                && (then_str || str_diverging_local_block(then))
+                && (els_str || els.is_some_and(|els| str_diverging_local_init(els)))
         }
         _ => false,
     }
@@ -61505,6 +61498,8 @@ property "shared"() {}
             "pub fn numeric_if_diverging_else(flag: Bool) -> I32 { let s = if flag { 1 } else { return 2 }\n    s }\n",
             "pub fn numeric_match_diverging_tail(flag: Bool) -> I32 { let s = match flag { true => { return 1\n            2 }, _ => 3 }\n    s }\n",
             "pub fn all_diverging_match_init(flag: Bool) -> I32 { let s = match flag { _ => return 1 }\n    s }\n",
+            "pub fn numeric_match_let_then_return(flag: Bool) -> I32 { let s = match flag { true => { let n = 1\n            return 2 }, _ => 3 }\n    s }\n",
+            "pub fn never_condition(flag: Bool) -> I32 { let s = match flag { _ => return 1 }\n    if s { 1 } else { 2 } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61521,7 +61516,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 42);
+        assert_eq!(owners.len(), 44);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -61550,7 +61545,7 @@ property "shared"() {}
         // stay neutral in joins: a numeric `match` with a `return`
         // arm still literal-joins, and `return`-value blocks carry
         // their own annotated `let`s.
-        for owner in owners[33..35].iter().chain(&owners[36..42]) {
+        for owner in owners[33..35].iter().chain(&owners[36..44]) {
             assert!(matches!(
                 owner
                     .body_type_check()
