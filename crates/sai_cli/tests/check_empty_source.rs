@@ -4654,6 +4654,9 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
         "pub fn str_if_scalar_eq() -> Str {\n    if 1 == 1 { \"a\" } else { \"b\" }\n}\n",
         "pub fn str_labeled_loop() -> Str {\n    'l: loop { break }\n    \"a\"\n}\n",
         "pub fn str_loop_break_value() -> Str {\n    loop { break \"a\" }\n    \"b\"\n}\n",
+        "pub fn str_var_local() -> Str {\n    var s = \"a\"\n    s = \"b\"\n    s\n}\n",
+        "pub fn str_var_scalar_assign() -> Str {\n    var n = 1\n    n = 2\n    \"a\"\n}\n",
+        "pub fn str_var_param(var value: Str) -> Str {\n    value = \"b\"\n    value\n}\n",
         "pub fn answer() -> I32 { 42 }\n",
         "pub fn ready() -> Bool { true }\n",
         "pub fn letter() -> Char { 'z' }\n",
@@ -10790,11 +10793,19 @@ fn assign_statement_errors_emit_their_diagnostics() {
 
 #[test]
 fn unsupported_var_forms_remain_gated() {
+    for source in ["pub fn run() -> I32 { var total: I32 = 0\n    missing = 1\n    total\n }\n"] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn var_parameter_identities_emit_check_results() {
     for source in [
         "pub fn run(var value: I32) -> I32 { value\n }\n",
-        "pub fn run() -> I32 { var total: I32 = 0\n    missing = 1\n    total\n }\n",
+        "pub fn identity(var value: I32) -> I32 { value }\n",
+        "pub fn mutable_str_identity(var value: Str) -> Str { value }\n",
     ] {
-        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
 }
 
@@ -11471,7 +11482,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn str_param_to_integer(value: Str) -> I32 { value }\n",
         "pub fn str_param_to_unit(value: Str) -> () { value }\n",
         "pub fn str_param_without_return(value: Str) { value }\n",
-        "pub fn mutable_str_identity(var value: Str) -> Str { value }\n",
         "pub fn self_str_identity(self: Str) -> Str { self }\n",
         "type Text = Str\npub fn alias_str_identity(value: Text) -> Text { value }\n",
         "pub fn raw_str_identity(value: r#Str) -> r#Str { value }\n",
@@ -11507,7 +11517,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn raw_parameter(r#value: I32) -> I32 { r#value }\n",
         "pub fn raw_tail(value: I32) -> I32 { r#value }\n",
         "pub fn raw_type(value: r#I32) -> r#I32 { value }\n",
-        "pub fn identity(var value: I32) -> I32 { value }\n",
         "type Str = I32\npub fn shadowed_str_identity(value: Str) -> Str { value }\n",
         concat!(
             "type StrOwner { marker: Bool }\n",
