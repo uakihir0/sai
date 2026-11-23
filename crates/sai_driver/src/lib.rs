@@ -14206,47 +14206,55 @@ fn str_expr_family(
                 // literal variable resolves through the pin like the
                 // checker (range-checked against the pin's primitive).
                 let left_family = match left_seed {
-                    Some(StrLiteralSeed {
-                        literal: Lit::Int { .. },
-                        origin,
-                        ..
-                    }) => match expected.and_then(str_prim_family_name) {
-                        Some(name)
-                            if matches!(
-                                name,
-                                "`I8`"
-                                    | "`I16`"
-                                    | "`I32`"
-                                    | "`I64`"
-                                    | "`U8`"
-                                    | "`U16`"
-                                    | "`U32`"
-                                    | "`U64`"
-                                    | "`ISize`"
-                                    | "`USize`"
-                            ) =>
-                        {
-                            let primitive = expected.unwrap();
-                            if sai_ty::typeck::literal::check_primitive_literal(
-                                primitive,
-                                left_seed.unwrap().literal,
-                                symbols,
-                                target_cfg.pointer_width(),
-                            ) == sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange
+                    Some(
+                        seed @ StrLiteralSeed {
+                            literal: Lit::Int { .. },
+                            origin,
+                            ..
+                        },
+                    ) => match str_seed_resolved(&seed) {
+                        // The count resolution above may have resolved
+                        // the group already (`n << n`) — the result
+                        // keeps the resolved family.
+                        Some(resolved) => resolved,
+                        None => match expected.and_then(str_prim_family_name) {
+                            Some(name)
+                                if matches!(
+                                    name,
+                                    "`I8`"
+                                        | "`I16`"
+                                        | "`I32`"
+                                        | "`I64`"
+                                        | "`U8`"
+                                        | "`U16`"
+                                        | "`U32`"
+                                        | "`U64`"
+                                        | "`ISize`"
+                                        | "`USize`"
+                                ) =>
                             {
-                                diagnostics.push(const_literal_diagnostic(
-                                    owner.id,
-                                    inputs,
-                                    snapshot,
-                                    origin,
-                                    sai_diagnostics::Code::LiteralOutOfRange,
-                                    format!("integer literal is out of range for {name}"),
-                                    "literal out of range",
-                                )?);
+                                let primitive = expected.unwrap();
+                                if sai_ty::typeck::literal::check_primitive_literal(
+                                    primitive,
+                                    seed.literal,
+                                    symbols,
+                                    target_cfg.pointer_width(),
+                                ) == sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange
+                                {
+                                    diagnostics.push(const_literal_diagnostic(
+                                        owner.id,
+                                        inputs,
+                                        snapshot,
+                                        origin,
+                                        sai_diagnostics::Code::LiteralOutOfRange,
+                                        format!("integer literal is out of range for {name}"),
+                                        "literal out of range",
+                                    )?);
+                                }
+                                name
                             }
-                            name
-                        }
-                        _ => "`I64`",
+                            _ => "`I64`",
+                        },
                     },
                     _ => left_family,
                 };
@@ -57061,6 +57069,7 @@ property "shared"() {}
             "pub fn assign_bool_group() -> Str {\n    var b = true\n    var flag = false\n    b = flag\n    \"a\"\n}\n",
             "pub fn assign_str_reassign() -> Str {\n    var s = \"a\"\n    s = \"b\"\n    \"a\"\n}\n",
             "pub fn assign_shift_merge_range() -> Str {\n    var n = 1\n    var big = 68719476736\n    n = big\n    let s = 1 << n\n    \"a\"\n}\n",
+            "pub fn assign_shift_group_result() -> Str {\n    var n = 1\n    let s = n << n\n    n = s\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -57076,7 +57085,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 24);
+        assert_eq!(resolved.owners().len(), 25);
         for (index, owner) in resolved.owners()[1..5].iter().enumerate() {
             match owner.body_type_check().expect("var body check succeeds") {
                 FunctionBodyTypeCheck::Supported { diagnostics } => {
@@ -57143,7 +57152,7 @@ property "shared"() {}
                 other => panic!("expected Supported, found {other:?} at index {index}"),
             }
         }
-        for index in [8, 12, 13, 14, 18, 21, 22] {
+        for index in [8, 12, 13, 14, 18, 21, 22, 24] {
             match resolved.owners()[index]
                 .body_type_check()
                 .expect("clean var body check succeeds")
