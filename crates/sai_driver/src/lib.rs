@@ -15546,25 +15546,29 @@ fn str_fold_literal_contributions(
                     .all(|seed| std::rc::Rc::ptr_eq(&seed.resolved, &seeds[0].resolved));
             if one_group {
                 let root = seeds.pop().expect("one literal-variable group");
-                let var_family = contributions
+                let Some(var_family) = contributions
                     .iter()
                     .find(|(_, value, _)| literal_var_seed(*value).is_some())
-                    .and_then(|(family, _, _)| *family);
+                    .and_then(|(family, _, _)| *family)
+                else {
+                    return Ok(());
+                };
                 for (family, value, span) in contributions.iter_mut() {
+                    // Only literals of the variable's own family join the
+                    // group — an integer variable's group never absorbs
+                    // a float literal (`{ big } else { 1.5 }` keeps `F64`
+                    // so the join reports the integer/float mismatch).
+                    if *family != Some(var_family) {
+                        continue;
+                    }
                     let Some(expr) = str_literal_contribution(*value) else {
                         continue;
                     };
-                    if !matches!(*family, Some("`I64`") | Some("`F64`")) {
-                        continue;
-                    }
                     let ExprKind::Lit(literal) = expr.kind else {
                         continue;
                     };
                     if let Some(literal) = str_static_literal(literal) {
                         root.sites.borrow_mut().push((literal, *span));
-                    }
-                    if let Some(var_family) = var_family {
-                        *family = Some(var_family);
                     }
                 }
                 return Ok(());
@@ -58957,6 +58961,7 @@ property "shared"() {}
             "pub fn str_bin_fold_wide_literal() -> Str {\n    let s = \"a\"\n    let w: U64 = 5\n    let m = w + 18446744073709551615\n    s\n}\npub fn str_litvar_bytestring_gate() -> Str {\n    let b = b\"abc\"\n    \"a\"\n}\npub fn str_litvar_loop_pin_oob() -> Str {\n    let n = 300\n    let m: U8 = loop { break n + 1 }\n    \"a\"\n}\npub fn str_scalar_param_cond(n: I64) -> Str {\n    if n == 1 { \"a\" } else { \"b\" }\n}\npub fn str_scalar_param_let(n: I64) -> Str {\n    let m = n\n    \"a\"\n}\npub fn str_scalar_param_tail(n: I64) -> Str {\n    n\n}\npub fn str_pair_mixed(s: Str, n: I64) -> Str {\n    match n { _ => s }\n}\npub fn str_pair_scalars(a: I64, b: I8) -> Str {\n    match b { _ => \"y\" }\n}\npub fn str_stmt_if_let(s: Str) -> Str {\n    if let \"a\" = s {\n    }\n    \"a\"\n}\npub fn str_stmt_while_let(s: Str) -> Str {\n    while let \"a\" = s {\n        break\n    }\n    \"a\"\n}\npub fn str_stmt_match_str(s: Str) -> Str {\n    match s {\n        \"a\" => {\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\npub fn str_tail_if_let(s: Str) -> Str {\n    if let \"a\" = s {\n        \"x\"\n    } else {\n        \"y\"\n    }\n}\npub fn str_tail_if_let_no_else_tm(s: Str) -> Str {\n    if let \"a\" = s {\n        \"x\"\n    }\n}\npub fn str_init_if_let(s: Str) -> Str {\n    let m = if let \"a\" = s {\n        \"x\"\n    } else {\n        \"y\"\n    }\n    m\n}\npub fn str_if_let_scalar_gate(n: I64) -> Str {\n    if let 1 = n {\n    }\n    \"a\"\n}\npub fn str_while_let_break_value(s: Str) -> Str {\n    while let \"a\" = s {\n        break 1\n    }\n    \"a\"\n}\npub fn str_tail_else_if_let(s: Str) -> Str {\n    if let \"a\" = s {\n        \"x\"\n    } else if let \"b\" = s {\n        \"y\"\n    } else {\n        \"z\"\n    }\n}\n",
             "pub fn str_stmt_if_let_always_match(s: Str) -> Str {\n    if let _ = s {\n    }\n    \"a\"\n}\npub fn str_stmt_while_let_always_match(s: Str) -> Str {\n    while let _ = s {\n        break\n    }\n    \"a\"\n}\npub fn str_tail_if_let_always_match(s: Str) -> Str {\n    if let _ = s {\n        \"x\"\n    } else {\n        \"y\"\n    }\n}\npub fn str_init_if_let_literal_join(s: Str, n: I8) -> Str {\n    let m = if let \"a\" = s {\n        n\n    } else {\n        1\n    }\n    s\n}\npub fn str_init_if_let_literal_range(s: Str, n: I8) -> Str {\n    let m = if let \"a\" = s {\n        n\n    } else {\n        300\n    }\n    s\n}\npub fn str_init_if_let_no_else_unit(s: Str) -> Str {\n    let m = if let \"a\" = s {\n        \"x\"\n    }\n    s\n}\npub fn str_init_if_let_no_else_tm(s: Str) -> Str {\n    let m: Str = if let \"a\" = s {\n        \"x\"\n    }\n    s\n}\n",
             "pub fn str_init_match_block_literal_oob(s: Str) -> Str {\n    let m = match s {\n        \"a\" => {\n            18446744073709551615\n        }\n        _ => {\n            0\n        }\n    }\n    s\n}\npub fn str_init_if_let_litvar_u64(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        18446744073709551615\n    }\n    let u: U64 = big\n    s\n}\n",
+            "pub fn str_init_if_let_litvar_float_tm(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        1.5\n    }\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -58972,7 +58977,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 246);
+        assert_eq!(resolved.owners().len(), 247);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -59147,6 +59152,7 @@ property "shared"() {}
             (235, sai_diagnostics::Code::InvalidBreakValue),
             (241, sai_diagnostics::Code::LiteralOutOfRange),
             (244, sai_diagnostics::Code::LiteralOutOfRange),
+            (246, sai_diagnostics::Code::TypeMismatch),
             (243, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
