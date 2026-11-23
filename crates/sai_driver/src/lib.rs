@@ -15530,7 +15530,7 @@ fn str_init_deferred_seed(
         return None;
     }
     let mut group: Option<(&'static str, std::rc::Rc<StrLiteralSeed>)> = None;
-    for leaf in leaves {
+    for &leaf in &leaves {
         if str_literal_contribution(Some(leaf)).is_some() {
             continue;
         }
@@ -15541,6 +15541,39 @@ fn str_init_deferred_seed(
             None => group = Some((var_family, seed)),
             Some((_, existing)) if std::rc::Rc::ptr_eq(&existing.resolved, &seed.resolved) => {}
             _ => return None,
+        }
+    }
+    let Some((_, root)) = &group else {
+        return None;
+    };
+    for &leaf in &leaves {
+        // Literal leaves nested inside `else if let` chains never reach
+        // the fold's contribution list — registering them here keeps
+        // them constrained by the group the join result binds into
+        // (`let m = if let .. { big } else if let .. { 300 } else { 2 };
+        // let u: U8 = m` reports `300` out of range for `U8`).
+        let Some(expr) = str_literal_contribution(Some(leaf)) else {
+            continue;
+        };
+        let ExprKind::Lit(literal) = expr.kind else {
+            continue;
+        };
+        let Some(literal) = str_static_literal(literal) else {
+            continue;
+        };
+        if !matches!(
+            (root.literal, literal),
+            (Lit::Int { .. }, Lit::Int { .. }) | (Lit::Float { .. }, Lit::Float { .. })
+        ) {
+            continue;
+        }
+        if !root
+            .sites
+            .borrow()
+            .iter()
+            .any(|(_, span)| *span == leaf.span)
+        {
+            root.sites.borrow_mut().push((literal, leaf.span));
         }
     }
     group
@@ -59050,6 +59083,7 @@ property "shared"() {}
             "pub fn str_stmt_if_let_always_match(s: Str) -> Str {\n    if let _ = s {\n    }\n    \"a\"\n}\npub fn str_stmt_while_let_always_match(s: Str) -> Str {\n    while let _ = s {\n        break\n    }\n    \"a\"\n}\npub fn str_tail_if_let_always_match(s: Str) -> Str {\n    if let _ = s {\n        \"x\"\n    } else {\n        \"y\"\n    }\n}\npub fn str_init_if_let_literal_join(s: Str, n: I8) -> Str {\n    let m = if let \"a\" = s {\n        n\n    } else {\n        1\n    }\n    s\n}\npub fn str_init_if_let_literal_range(s: Str, n: I8) -> Str {\n    let m = if let \"a\" = s {\n        n\n    } else {\n        300\n    }\n    s\n}\npub fn str_init_if_let_no_else_unit(s: Str) -> Str {\n    let m = if let \"a\" = s {\n        \"x\"\n    }\n    s\n}\npub fn str_init_if_let_no_else_tm(s: Str) -> Str {\n    let m: Str = if let \"a\" = s {\n        \"x\"\n    }\n    s\n}\n",
             "pub fn str_init_match_block_literal_oob(s: Str) -> Str {\n    let m = match s {\n        \"a\" => {\n            18446744073709551615\n        }\n        _ => {\n            0\n        }\n    }\n    s\n}\npub fn str_init_if_let_litvar_u64(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        18446744073709551615\n    }\n    let u: U64 = big\n    s\n}\n",
             "pub fn str_init_if_let_litvar_float_tm(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        1.5\n    }\n    s\n}\npub fn str_init_if_let_litvar_group(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        2\n    }\n    let u: U64 = m\n    s\n}\n",
+            "pub fn str_init_else_if_let_litvar_oob(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else if let \"b\" = s {\n        300\n    } else {\n        2\n    }\n    let u: U8 = m\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -59065,7 +59099,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 248);
+        assert_eq!(resolved.owners().len(), 249);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -59242,6 +59276,7 @@ property "shared"() {}
             (241, sai_diagnostics::Code::LiteralOutOfRange),
             (244, sai_diagnostics::Code::LiteralOutOfRange),
             (246, sai_diagnostics::Code::TypeMismatch),
+            (248, sai_diagnostics::Code::LiteralOutOfRange),
             (243, sai_diagnostics::Code::TypeMismatch),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
