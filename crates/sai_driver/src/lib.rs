@@ -11498,14 +11498,59 @@ fn str_shaped_local_init(
                 })
         }
         // `let s = if c { "a" } else { "b" }` yields `Str` when both
-        // branches do (an `else if` chain recurses through `els`).
+        // branches do (an `else if` chain recurses through `els`); a
+        // diverging branch is neutral — it never yields.
         ExprKind::If { then, els, .. } => {
-            str_shaped_branch_block(then, locals, inputs, str_bindings, symbols, type_paths)
+            (str_shaped_branch_block(then, locals, inputs, str_bindings, symbols, type_paths)
+                || str_diverging_local_block(then))
                 && els.is_some_and(|els| {
                     str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
+                        || str_diverging_local_init(els)
                 })
+                && (str_shaped_branch_block(
+                    then,
+                    locals,
+                    inputs,
+                    str_bindings,
+                    symbols,
+                    type_paths,
+                ) || els.is_some_and(|els| {
+                    str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
+                }))
         }
         _ => false,
+    }
+}
+
+// Whether an expression position can never produce a value: a
+// `return`/`break`/`continue` expression, or a block/`if` whose own
+// value position diverges (a block ending in `return` diverges; one
+// with a diverging statement then a tail does not — its tail still
+// yields).
+fn str_diverging_local_init(init: &HirExpr<'_>) -> bool {
+    match init.kind {
+        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
+        ExprKind::Block(block) => str_diverging_local_block(block),
+        ExprKind::If { then, els, .. } => {
+            str_diverging_local_block(then) && els.is_some_and(|els| str_diverging_local_init(els))
+        }
+        _ => false,
+    }
+}
+
+fn str_diverging_local_block(block: &HirBlock<'_>) -> bool {
+    match block.tail {
+        Some(tail) => str_diverging_local_init(tail),
+        None => block.stmts.iter().any(|stmt| {
+            matches!(
+                stmt.kind,
+                StmtKind::Expr(expression)
+                    if matches!(
+                        expression.kind,
+                        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
+                    )
+            )
+        }),
     }
 }
 
@@ -61456,6 +61501,10 @@ property "shared"() {}
             "pub fn str_match_call_arm_mismatch(flag: Bool, value: Str) -> USize { let s = match flag { true => \"a\", _ => value.len() }\n    s.len() }\n",
             "pub fn numeric_match_diverging_arm(flag: Bool) -> I32 { let s = match flag { true => { return 1 }, _ => 2 }\n    s }\n",
             "pub fn str_match_return_block_let(flag: Bool) -> I32 { let s: Str = match flag { true => { return { let n: I32 = 1\n            2 } }, _ => \"b\" }\n    1 }\n",
+            "pub fn str_if_diverging_else(flag: Bool) -> USize { let s = if flag { \"a\" } else { return 1 }\n    s.len() }\n",
+            "pub fn numeric_if_diverging_else(flag: Bool) -> I32 { let s = if flag { 1 } else { return 2 }\n    s }\n",
+            "pub fn numeric_match_diverging_tail(flag: Bool) -> I32 { let s = match flag { true => { return 1\n            2 }, _ => 3 }\n    s }\n",
+            "pub fn all_diverging_match_init(flag: Bool) -> I32 { let s = match flag { _ => return 1 }\n    s }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61472,7 +61521,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 38);
+        assert_eq!(owners.len(), 42);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -61501,7 +61550,7 @@ property "shared"() {}
         // stay neutral in joins: a numeric `match` with a `return`
         // arm still literal-joins, and `return`-value blocks carry
         // their own annotated `let`s.
-        for owner in owners[33..35].iter().chain(&owners[36..38]) {
+        for owner in owners[33..35].iter().chain(&owners[36..42]) {
             assert!(matches!(
                 owner
                     .body_type_check()

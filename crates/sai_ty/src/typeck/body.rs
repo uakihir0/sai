@@ -4922,8 +4922,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ),
             ExprKind::Block(block) => self.str_branch_block_shaped_in(block, str_bindings),
             ExprKind::If { then, els, .. } => {
-                self.str_branch_block_shaped_in(then, str_bindings)
-                    && els.is_some_and(|els| self.str_shaped_initializer_in(els, str_bindings))
+                // A diverging branch is neutral — it never yields, so
+                // `if c { "a" } else { return 1 }` is `Str`-shaped.
+                self.str_branch_neutral_in(then, str_bindings)
+                    && els.is_some_and(|els| {
+                        self.str_shaped_initializer_in(els, str_bindings)
+                            || self.str_diverging_init_in(els)
+                    })
+                    && (self.str_branch_block_shaped_in(then, str_bindings)
+                        || els.is_some_and(|els| self.str_shaped_initializer_in(els, str_bindings)))
             }
             // `any`, not `all`: the kernel diagnoses non-`Str` arms
             // (`{ _ => 1 }` in a `Str` join) instead of gating.
@@ -4936,6 +4943,51 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         .any(|arm| self.str_shaped_initializer_in(arm.body, str_bindings))
             }
             _ => false,
+        }
+    }
+
+    // Whether a `then` block is `Str`-shaped or diverging in the
+    // mirror's sense.
+    fn str_branch_neutral_in(
+        &mut self,
+        block: &Block<'hir>,
+        str_bindings: &HashSet<BindingId>,
+    ) -> bool {
+        self.str_branch_block_shaped_in(block, str_bindings) || self.str_diverging_block_in(block)
+    }
+
+    // Whether an expression position can never produce a value: a
+    // `return`/`break`/`continue` expression, or a block/`if` whose own
+    // value position diverges (a block ending in `return` diverges; one
+    // with a diverging statement then a tail does not — its tail still
+    // yields).
+    fn str_diverging_init_in(&mut self, init: &Expr<'hir>) -> bool {
+        match init.kind {
+            ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
+            ExprKind::Block(block) => self.str_diverging_block_in(block),
+            ExprKind::If { then, els, .. } => {
+                self.str_diverging_block_in(then)
+                    && els.is_some_and(|els| self.str_diverging_init_in(els))
+            }
+            _ => false,
+        }
+    }
+
+    fn str_diverging_block_in(&mut self, block: &Block<'hir>) -> bool {
+        match block.tail {
+            Some(tail) => self.str_diverging_init_in(tail),
+            None => block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt.kind,
+                    StmtKind::Expr(expression)
+                        if matches!(
+                            expression.kind,
+                            ExprKind::Return(..)
+                                | ExprKind::Break { .. }
+                                | ExprKind::Continue { .. }
+                        )
+                )
+            }),
         }
     }
 
@@ -5655,26 +5707,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         self.check_if_condition(condition)?;
         let mut joined = None;
         for branch in [then, else_block] {
-            let tail = Self::literal_join_branch_tail(branch)?;
-            self.join_literal_site(tail, &mut joined)?;
+            self.join_literal_branch_site(branch, &mut joined)?;
         }
-        let Some(local) = joined else {
-            return Err(());
-        };
-        Ok(local)
-    }
-
-    fn literal_join_branch_tail(block: &'hir Block<'hir>) -> Result<&'hir Expr<'hir>, ()> {
-        if block.safety != Safety::Safe || !block.stmts.is_empty() {
-            return Err(());
-        }
-        let Some(tail) = block.tail else {
-            return Err(());
-        };
-        if !matches!(tail.kind, ExprKind::Lit(_)) {
-            return Err(());
-        }
-        Ok(tail)
+        // Both branches diverging leaves `β` unfixed — the `if` yields
+        // `!`.
+        Ok(joined.unwrap_or(LocalType::Error(None)))
     }
 
     /// Unannotated `let x = match value { 0 => 1, _ => 2 }` joins the arm
@@ -5720,11 +5757,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             .insert(binding, LocalType::Concrete(scrutinee_type)),
                     ));
                 }
-                let body_result = if self.arm_body_diverges(arm.body) {
-                    self.check_expr_value(arm.body, scrutinee_type).map(|_| ())
-                } else {
-                    self.join_literal_site(arm.body, &mut joined)
-                };
+                let body_result = self.join_literal_arm_site(arm.body, &mut joined);
                 self.restore_arm_binding(&mut arm_binding);
                 body_result?;
                 continue;
@@ -5740,13 +5773,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .guard
                 .map(|guard| self.check_if_condition(guard))
                 .unwrap_or(Ok(()))
-                .and_then(|_| {
-                    if self.arm_body_diverges(arm.body) {
-                        self.check_expr_value(arm.body, scrutinee_type).map(|_| ())
-                    } else {
-                        self.join_literal_site(arm.body, &mut joined)
-                    }
-                });
+                .and_then(|_| self.join_literal_arm_site(arm.body, &mut joined));
             self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
@@ -5756,36 +5783,70 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
             });
         }
-        let Some(local) = joined else {
-            return Err(());
-        };
-        Ok(local)
+        // Every arm diverging leaves `β` unfixed — the `match` yields
+        // `!`, which coerces to anything the binding's uses ask for.
+        Ok(joined.unwrap_or(LocalType::Error(None)))
     }
 
-    // Whether an arm body can never produce a value: a `return`/
-    // `break`/`continue` expression, or a block carrying a diverging
-    // statement or a diverging tail. Diverging arms stay out of the
-    // literal join — they are checked against the enclosing expected
-    // type but contribute no literal site.
-    fn arm_body_diverges(&mut self, expression: &'hir Expr<'hir>) -> bool {
+    // One arm body's contribution to the literal join: a literal tail
+    // joins; a `return`/`break`/`continue` body or a block that diverges
+    // contributes no site but still checks in place; a block whose tail
+    // survives a diverging statement keeps the tail's site (`{ return 1
+    // 2 }` still joins `2`).
+    fn join_literal_arm_site(
+        &mut self,
+        expression: &'hir Expr<'hir>,
+        joined: &mut Option<LocalType>,
+    ) -> Result<(), ()> {
         match expression.kind {
-            ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
-            ExprKind::Block(block) => {
-                block.stmts.iter().any(|stmt| {
-                    matches!(
-                        stmt.kind,
-                        StmtKind::Expr(expression)
-                            if matches!(
-                                expression.kind,
-                                ExprKind::Return(..)
-                                    | ExprKind::Break { .. }
-                                    | ExprKind::Continue { .. }
-                            )
-                    )
-                }) || block.tail.is_some_and(|tail| self.arm_body_diverges(tail))
+            ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => {
+                self.check_expr_stmt(expression)
             }
-            _ => false,
+            ExprKind::Block(block) => self.join_literal_branch_site(block, joined),
+            _ => self.join_literal_site(expression, joined),
         }
+    }
+
+    // A block-shaped join site: statements must be diverging exits
+    // (`check_stmt` validates them); the tail joins like an arm body,
+    // and a tail-less block is admitted only when a statement diverges.
+    fn join_literal_branch_site(
+        &mut self,
+        block: &'hir Block<'hir>,
+        joined: &mut Option<LocalType>,
+    ) -> Result<(), ()> {
+        if block.safety != Safety::Safe {
+            return Err(());
+        }
+        for stmt in block.stmts {
+            match stmt.kind {
+                StmtKind::Expr(expression)
+                    if matches!(
+                        expression.kind,
+                        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
+                    ) =>
+                {
+                    self.check_stmt(stmt)?;
+                }
+                _ => return Err(()),
+            }
+        }
+        match block.tail {
+            Some(tail) => self.join_literal_arm_site(tail, joined),
+            None if block.stmts.iter().any(|stmt| Self::stmt_diverges(stmt)) => Ok(()),
+            None => Err(()),
+        }
+    }
+
+    fn stmt_diverges(stmt: &Stmt<'hir>) -> bool {
+        matches!(
+            stmt.kind,
+            StmtKind::Expr(expression)
+                if matches!(
+                    expression.kind,
+                    ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
+                )
+        )
     }
 
     /// Joins one literal tail into the shared literal variable: the first
