@@ -13442,6 +13442,19 @@ fn str_let_entry(
                     literal: None,
                 })
         }
+        ExprKind::Match { .. }
+        | ExprKind::If { .. }
+        | ExprKind::Block(_)
+        | ExprKind::Loop { .. } => {
+            // A join that deferred to one literal-variable group binds
+            // the result into that group too — `let m = if let .. {
+            // big } else { 1 }` follows `big`'s resolution, not the
+            // provisional `I64` family the join reported.
+            let literal = str_init_deferred_seed(init, locals, str_bindings)
+                .filter(|(var_family, _)| *var_family == family)
+                .map(|(_, seed)| (*seed).clone());
+            StrLocalEntry { family, literal }
+        }
         _ => StrLocalEntry {
             family,
             literal: None,
@@ -15452,6 +15465,87 @@ fn str_loop_family(
 // whose tail is a literal — `x => { ..; 1 }` still yields the literal
 // for the join's literal-variable fold (`if let` arm bodies are always
 // blocks).
+// An arm/branch leaf that yields an unresolved literal variable:
+// unwraps block tails to the bound path and returns the variable's
+// family plus the root of its shared seed — the contribution the fold
+// defers sibling literals into and `let` inits share as a group.
+fn str_leaf_literal_seed(
+    expr: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+) -> Option<(&'static str, std::rc::Rc<StrLiteralSeed>)> {
+    let leaf = match expr.kind {
+        ExprKind::Block(block) => block.tail?,
+        _ => expr,
+    };
+    let entry = str_binding_entry(leaf, locals, str_bindings)?;
+    let seed = entry.literal?;
+    (str_seed_resolved(&seed).is_none()).then(|| (entry.family, str_seed_root(&seed)))
+}
+
+// The literal-join leaves of a `if`/`match`/`block` initializer — the
+// same contributions the fold sees. `false` marks a shape the seed
+// derivation cannot mirror (`loop` break values), which keeps the
+// binding's family provisional instead of guessing a group.
+fn str_yield_seed_leaves<'e>(expr: &'e HirExpr<'e>, out: &mut Vec<&'e HirExpr<'e>>) -> bool {
+    match expr.kind {
+        ExprKind::Block(block) => match block.tail {
+            Some(tail) => str_yield_seed_leaves(tail, out),
+            None => {
+                out.push(expr);
+                true
+            }
+        },
+        ExprKind::Match { arms, .. } => arms.iter().all(|arm| str_yield_seed_leaves(arm.body, out)),
+        ExprKind::If { then, els, .. } => {
+            let tail_ok = match then.tail {
+                Some(tail) => str_yield_seed_leaves(tail, out),
+                None => true,
+            };
+            tail_ok
+                && match els {
+                    Some(els) => str_yield_seed_leaves(els, out),
+                    None => true,
+                }
+        }
+        ExprKind::Loop { .. } => false,
+        _ => {
+            out.push(expr);
+            true
+        }
+    }
+}
+
+// The single literal-variable group an initializer's join deferred to —
+// `let big = 1; let m = if let "a" = s { big } else { 2 }` binds `m`
+// into `big`'s group, so `m` follows `big`'s resolution (`let u: U64 =
+// big` makes `m` `U64` too, like the checker's shared variable).
+fn str_init_deferred_seed(
+    init: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+) -> Option<(&'static str, std::rc::Rc<StrLiteralSeed>)> {
+    let mut leaves = Vec::new();
+    if !str_yield_seed_leaves(init, &mut leaves) {
+        return None;
+    }
+    let mut group: Option<(&'static str, std::rc::Rc<StrLiteralSeed>)> = None;
+    for leaf in leaves {
+        if str_literal_contribution(Some(leaf)).is_some() {
+            continue;
+        }
+        let Some((var_family, seed)) = str_leaf_literal_seed(leaf, locals, str_bindings) else {
+            return None;
+        };
+        match &group {
+            None => group = Some((var_family, seed)),
+            Some((_, existing)) if std::rc::Rc::ptr_eq(&existing.resolved, &seed.resolved) => {}
+            _ => return None,
+        }
+    }
+    group
+}
+
 fn str_literal_contribution<'a>(expr: Option<&'a HirExpr<'a>>) -> Option<&'a HirExpr<'a>> {
     let expr = expr?;
     if matches!(expr.kind, ExprKind::Lit(_)) {
@@ -15484,13 +15578,7 @@ fn str_fold_literal_contributions(
     // 18446744073709551615 }` resolves `big` at `U64`, so the literal
     // is in range).
     let literal_var_seed = |value: Option<&HirExpr<'_>>| -> Option<std::rc::Rc<StrLiteralSeed>> {
-        let leaf = match value?.kind {
-            ExprKind::Block(block) => block.tail?,
-            _ => value?,
-        };
-        let entry = str_binding_entry(leaf, locals, str_bindings)?;
-        let seed = entry.literal?;
-        (str_seed_resolved(&seed).is_none()).then(|| str_seed_root(&seed))
+        str_leaf_literal_seed(value?, locals, str_bindings).map(|(_, seed)| seed)
     };
     let mut prims = contributions
         .iter()
@@ -58961,7 +59049,7 @@ property "shared"() {}
             "pub fn str_bin_fold_wide_literal() -> Str {\n    let s = \"a\"\n    let w: U64 = 5\n    let m = w + 18446744073709551615\n    s\n}\npub fn str_litvar_bytestring_gate() -> Str {\n    let b = b\"abc\"\n    \"a\"\n}\npub fn str_litvar_loop_pin_oob() -> Str {\n    let n = 300\n    let m: U8 = loop { break n + 1 }\n    \"a\"\n}\npub fn str_scalar_param_cond(n: I64) -> Str {\n    if n == 1 { \"a\" } else { \"b\" }\n}\npub fn str_scalar_param_let(n: I64) -> Str {\n    let m = n\n    \"a\"\n}\npub fn str_scalar_param_tail(n: I64) -> Str {\n    n\n}\npub fn str_pair_mixed(s: Str, n: I64) -> Str {\n    match n { _ => s }\n}\npub fn str_pair_scalars(a: I64, b: I8) -> Str {\n    match b { _ => \"y\" }\n}\npub fn str_stmt_if_let(s: Str) -> Str {\n    if let \"a\" = s {\n    }\n    \"a\"\n}\npub fn str_stmt_while_let(s: Str) -> Str {\n    while let \"a\" = s {\n        break\n    }\n    \"a\"\n}\npub fn str_stmt_match_str(s: Str) -> Str {\n    match s {\n        \"a\" => {\n        }\n        _ => {\n        }\n    }\n    \"a\"\n}\npub fn str_tail_if_let(s: Str) -> Str {\n    if let \"a\" = s {\n        \"x\"\n    } else {\n        \"y\"\n    }\n}\npub fn str_tail_if_let_no_else_tm(s: Str) -> Str {\n    if let \"a\" = s {\n        \"x\"\n    }\n}\npub fn str_init_if_let(s: Str) -> Str {\n    let m = if let \"a\" = s {\n        \"x\"\n    } else {\n        \"y\"\n    }\n    m\n}\npub fn str_if_let_scalar_gate(n: I64) -> Str {\n    if let 1 = n {\n    }\n    \"a\"\n}\npub fn str_while_let_break_value(s: Str) -> Str {\n    while let \"a\" = s {\n        break 1\n    }\n    \"a\"\n}\npub fn str_tail_else_if_let(s: Str) -> Str {\n    if let \"a\" = s {\n        \"x\"\n    } else if let \"b\" = s {\n        \"y\"\n    } else {\n        \"z\"\n    }\n}\n",
             "pub fn str_stmt_if_let_always_match(s: Str) -> Str {\n    if let _ = s {\n    }\n    \"a\"\n}\npub fn str_stmt_while_let_always_match(s: Str) -> Str {\n    while let _ = s {\n        break\n    }\n    \"a\"\n}\npub fn str_tail_if_let_always_match(s: Str) -> Str {\n    if let _ = s {\n        \"x\"\n    } else {\n        \"y\"\n    }\n}\npub fn str_init_if_let_literal_join(s: Str, n: I8) -> Str {\n    let m = if let \"a\" = s {\n        n\n    } else {\n        1\n    }\n    s\n}\npub fn str_init_if_let_literal_range(s: Str, n: I8) -> Str {\n    let m = if let \"a\" = s {\n        n\n    } else {\n        300\n    }\n    s\n}\npub fn str_init_if_let_no_else_unit(s: Str) -> Str {\n    let m = if let \"a\" = s {\n        \"x\"\n    }\n    s\n}\npub fn str_init_if_let_no_else_tm(s: Str) -> Str {\n    let m: Str = if let \"a\" = s {\n        \"x\"\n    }\n    s\n}\n",
             "pub fn str_init_match_block_literal_oob(s: Str) -> Str {\n    let m = match s {\n        \"a\" => {\n            18446744073709551615\n        }\n        _ => {\n            0\n        }\n    }\n    s\n}\npub fn str_init_if_let_litvar_u64(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        18446744073709551615\n    }\n    let u: U64 = big\n    s\n}\n",
-            "pub fn str_init_if_let_litvar_float_tm(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        1.5\n    }\n    s\n}\n",
+            "pub fn str_init_if_let_litvar_float_tm(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        1.5\n    }\n    s\n}\npub fn str_init_if_let_litvar_group(s: Str) -> Str {\n    let big = 1\n    let m = if let \"a\" = s {\n        big\n    } else {\n        2\n    }\n    let u: U64 = m\n    s\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -58977,7 +59065,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 247);
+        assert_eq!(resolved.owners().len(), 248);
         for (index, owner) in resolved.owners()[..4]
             .iter()
             .chain(&resolved.owners()[5..6])
@@ -59061,6 +59149,7 @@ property "shared"() {}
             .chain(&resolved.owners()[237..241])
             .chain(&resolved.owners()[242..243])
             .chain(&resolved.owners()[245..246])
+            .chain(&resolved.owners()[247..248])
             .enumerate()
         {
             let (index, owner) = (index, owner);
