@@ -13318,6 +13318,59 @@ fn str_seed_merge(place: &StrLiteralSeed, rhs: &StrLiteralSeed) {
     *rhs_root.merged_into.borrow_mut() = Some(place_root);
 }
 
+// Whether the `let t = e` binding inside `x op= e`'s desugar binds an
+// unresolved literal variable — `check_initializer_value` produces one
+// for literal-only operand trees. `Some(Some(true))` is a float
+// variable, `Some(Some(false))` an integer variable, `Some(None)` a
+// literal-only tree whose kinds disagree (`1.5 + 2` fails the pair's
+// constraint), and `None` a tree with a concretely typed leaf.
+fn str_assign_op_rhs_literal_var(
+    expr: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+) -> Option<Option<bool>> {
+    match expr.kind {
+        ExprKind::Lit(Lit::Int { .. }) => Some(Some(false)),
+        ExprKind::Lit(Lit::Float { .. }) => Some(Some(true)),
+        ExprKind::Unary(
+            sai_hir::expressions::UnOp::Neg | sai_hir::expressions::UnOp::BitNot,
+            operand,
+        ) => str_assign_op_rhs_literal_var(operand, locals, str_bindings),
+        ExprKind::Binary(operator, left, right)
+            if matches!(
+                operator,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Rem
+                    | BinOp::WrapAdd
+                    | BinOp::WrapSub
+                    | BinOp::WrapMul
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr
+            ) =>
+        {
+            match (
+                str_assign_op_rhs_literal_var(left, locals, str_bindings),
+                str_assign_op_rhs_literal_var(right, locals, str_bindings),
+            ) {
+                (Some(left), Some(right)) => Some(if left == right { left } else { None }),
+                // A concrete leaf anywhere makes the tree concrete.
+                _ => None,
+            }
+        }
+        ExprKind::Path(_) => str_binding_entry(expr, locals, str_bindings)
+            .and_then(|entry| entry.literal)
+            .filter(|seed| str_seed_resolved(seed).is_none())
+            .map(|seed| Some(matches!(seed.literal, Lit::Float { .. }))),
+        _ => None,
+    }
+}
+
 // The right-operand type `place op= e` demands: `U32` for shift counts,
 // `Bool` for `&&=`/`||=`, and the place type for arithmetic and
 // bitwise compound operators — `check_assign_op_rhs_local_type`'s
@@ -16334,7 +16387,7 @@ fn check_function_str_local_block(
                         // operator (`x %= 2.0`).
                         if str_seed_same_kind(seed.literal, literal) {
                             if matches!(seed.literal, Lit::Float { .. }) && integer_only {
-                                diagnostics.push(const_literal_diagnostic(
+                                let mut diagnostic = const_literal_diagnostic(
                                     owner.id,
                                     inputs,
                                     snapshot,
@@ -16344,26 +16397,33 @@ fn check_function_str_local_block(
                                         "operator `{operator_text}` is not defined for floating-point values"
                                     ),
                                     operator_label,
-                                )?);
+                                )?;
+                                if op == BinOp::Rem {
+                                    diagnostic
+                                        .push_child(Child {
+                                            kind: ChildKind::Help,
+                                            message:
+                                                "use the floating-point `rem` method (for example, `left.rem(right)`)"
+                                                    .to_owned(),
+                                            location: None,
+                                        })
+                                        .map_err(|_| {
+                                            OwnerControlFlowResolutionError::InvalidSourceLocation(
+                                                owner.id,
+                                            )
+                                        })?;
+                                }
+                                diagnostics.push(diagnostic);
                             }
                             str_seed_root(seed)
                                 .sites
                                 .borrow_mut()
                                 .push((str_static_literal(literal).unwrap(), rhs.span));
                         } else {
-                            diagnostics.push(const_literal_diagnostic(
-                                owner.id,
-                                inputs,
-                                snapshot,
-                                rhs.span,
-                                sai_diagnostics::Code::TypeMismatch,
-                                format!(
-                                    "expected {}, found {}",
-                                    str_seed_default_family(seed.literal),
-                                    str_lit_kind_word(literal)
-                                ),
-                                "type mismatch",
-                            )?);
+                            // A different literal kind fails the
+                            // constraint like `add_integer_literal_constraint`
+                            // — `x += 2.5` on an integer variable gates.
+                            return Ok(None);
                         }
                         continue;
                     } else if logical {
@@ -16429,24 +16489,51 @@ fn check_function_str_local_block(
                                     target_cfg,
                                 )?;
                             } else {
-                                match rhs_family {
-                                    Some("`U32`") => {}
-                                    Some(rhs_family)
-                                        if str_family_prim(rhs_family).is_some_and(
-                                            sai_ty::typeck::literal::supports_primitive_literal,
-                                        ) =>
-                                    {
-                                        diagnostics.push(const_literal_diagnostic(
-                                            owner.id,
+                                // `x <<= 1 + 2` binds the count's
+                                // literal variable and resolves it to
+                                // `U32` — evaluate the count pinned.
+                                match str_assign_op_rhs_literal_var(rhs, locals, str_bindings) {
+                                    Some(Some(false)) => {
+                                        match str_expr_family(
+                                            owner,
+                                            return_ty,
+                                            rhs,
+                                            locals,
+                                            str_bindings,
+                                            Some(sai_resolve::prelude::PrimTy::U32),
+                                            type_paths,
+                                            symbols,
                                             inputs,
                                             snapshot,
-                                            rhs.span,
-                                            sai_diagnostics::Code::TypeMismatch,
-                                            format!("expected `U32`, found {rhs_family}"),
-                                            "type mismatch",
-                                        )?);
+                                            target_cfg,
+                                            call_signatures,
+                                        )? {
+                                            Some(("`U32`", mut rhs_diagnostics)) => {
+                                                diagnostics.append(&mut rhs_diagnostics);
+                                            }
+                                            _ => return Ok(None),
+                                        }
                                     }
-                                    _ => return Ok(None),
+                                    Some(_) => return Ok(None),
+                                    None => match rhs_family {
+                                        Some("`U32`") => {}
+                                        Some(rhs_family)
+                                            if str_family_prim(rhs_family).is_some_and(
+                                                sai_ty::typeck::literal::supports_primitive_literal,
+                                            ) =>
+                                        {
+                                            diagnostics.push(const_literal_diagnostic(
+                                                owner.id,
+                                                inputs,
+                                                snapshot,
+                                                rhs.span,
+                                                sai_diagnostics::Code::TypeMismatch,
+                                                format!("expected `U32`, found {rhs_family}"),
+                                                "type mismatch",
+                                            )?);
+                                        }
+                                        _ => return Ok(None),
+                                    },
                                 }
                             }
                         } else if let Some(rhs_seed) = rhs_seed {
@@ -16469,18 +16556,23 @@ fn check_function_str_local_block(
                                         sai_ty::typeck::literal::supports_primitive_literal,
                                     ) =>
                                 {
-                                    let resolves = if arithmetic {
-                                        // `x += f` resolves `x` to the
-                                        // operand's arithmetic type.
-                                        matches!(rhs_family, "`F32`" | "`F64`")
+                                    let resolves =
+                                        str_seed_accepts_family(seed.literal, rhs_family)
+                                            && if arithmetic {
+                                                // `x += f` resolves `x` to the
+                                                // operand's arithmetic type when
+                                                // the variable's literal kind
+                                                // accepts it — an integer
+                                                // variable cannot become `F64`.
+                                                matches!(rhs_family, "`F32`" | "`F64`")
                                             || str_family_prim(rhs_family).is_some_and(
                                                 sai_ty::typeck::literal::is_integer_primitive,
                                             )
-                                    } else {
-                                        str_family_prim(rhs_family).is_some_and(
-                                            sai_ty::typeck::literal::is_integer_primitive,
-                                        )
-                                    };
+                                            } else {
+                                                str_family_prim(rhs_family).is_some_and(
+                                                    sai_ty::typeck::literal::is_integer_primitive,
+                                                )
+                                            };
                                     if !resolves {
                                         return Ok(None);
                                     }
@@ -16522,29 +16614,15 @@ fn check_function_str_local_block(
                 match rhs.kind {
                     ExprKind::Lit(literal) => {
                         if logical {
-                            if !matches!(literal, Lit::Bool(_)) {
-                                match literal {
-                                    Lit::Int { .. } | Lit::Float { .. } => {
-                                        diagnostics.push(const_literal_diagnostic(
-                                            owner.id,
-                                            inputs,
-                                            snapshot,
-                                            rhs.span,
-                                            sai_diagnostics::Code::TypeMismatch,
-                                            format!(
-                                                "expected `Bool`, found {}",
-                                                str_lit_kind_word(literal)
-                                            ),
-                                            "type mismatch",
-                                        )?);
-                                    }
-                                    _ => return Ok(None),
-                                }
-                            }
-                        } else if shift {
-                            if !matches!(literal, Lit::Int { .. }) {
+                            // `&&=`/`||=` are not assign-operator
+                            // tokens — the logical compound operators
+                            // cannot reach this arm.
+                            return Ok(None);
+                        }
+                        if shift {
+                            let Lit::Int { .. } = literal else {
                                 return Ok(None);
-                            }
+                            };
                             if sai_ty::typeck::literal::check_primitive_literal(
                                 sai_resolve::prelude::PrimTy::U32,
                                 literal,
@@ -16562,200 +16640,10 @@ fn check_function_str_local_block(
                                     "literal out of range",
                                 )?);
                             }
-                        } else {
-                            match literal {
-                                Lit::Int { .. } | Lit::Float { .. }
-                                    if arithmetic || matches!(literal, Lit::Int { .. }) =>
-                                {
-                                    let checked = if arithmetic {
-                                        place_arithmetic
-                                    } else {
-                                        sai_ty::typeck::literal::is_integer_primitive(place_prim)
-                                    };
-                                    if checked {
-                                        match sai_ty::typeck::literal::check_primitive_literal(
-                                            place_prim,
-                                            literal,
-                                            symbols,
-                                            target_cfg.pointer_width(),
-                                        ) {
-                                            sai_ty::typeck::literal::PrimitiveLiteralResult::Match => {}
-                                            sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
-                                                let label = if matches!(literal, Lit::Int { .. }) {
-                                                    "integer"
-                                                } else {
-                                                    "floating-point"
-                                                };
-                                                diagnostics.push(const_literal_diagnostic(
-                                                    owner.id,
-                                                    inputs,
-                                                    snapshot,
-                                                    rhs.span,
-                                                    sai_diagnostics::Code::LiteralOutOfRange,
-                                                    format!(
-                                                        "{label} literal is out of range for `{place_name}`"
-                                                    ),
-                                                    "literal out of range",
-                                                )?);
-                                            }
-                                            sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => {
-                                                diagnostics.push(const_literal_diagnostic(
-                                                    owner.id,
-                                                    inputs,
-                                                    snapshot,
-                                                    rhs.span,
-                                                    sai_diagnostics::Code::TypeMismatch,
-                                                    format!(
-                                                        "expected {place_family}, found {}",
-                                                        str_lit_kind_word(literal)
-                                                    ),
-                                                    "type mismatch",
-                                                )?);
-                                            }
-                                        }
-                                    } else if op == BinOp::Rem
-                                        && matches!(
-                                            place_prim,
-                                            sai_resolve::prelude::PrimTy::F32
-                                                | sai_resolve::prelude::PrimTy::F64
-                                        )
-                                    {
-                                        let mut diagnostic = const_literal_diagnostic(
-                                            owner.id,
-                                            inputs,
-                                            snapshot,
-                                            stmt.span,
-                                            sai_diagnostics::Code::OperatorNotSupported,
-                                            format!(
-                                                "operator `{operator_text}` is not defined for `{place_name}`"
-                                            ),
-                                            "floating-point remainder is not supported",
-                                        )?;
-                                        diagnostic
-                                            .push_child(Child {
-                                                kind: ChildKind::Help,
-                                                message:
-                                                    "use the floating-point `rem` method (for example, `left.rem(right)`)"
-                                                        .to_owned(),
-                                                location: None,
-                                            })
-                                            .map_err(|_| {
-                                                OwnerControlFlowResolutionError::InvalidSourceLocation(
-                                                    owner.id,
-                                                )
-                                            })?;
-                                        diagnostics.push(diagnostic);
-                                    } else {
-                                        return Ok(None);
-                                    }
-                                }
-                                _ => return Ok(None),
-                            }
-                        }
-                    }
-                    _ => {
-                        // Path operands resolve like the desugared
-                        // binary's right side; other right sides are
-                        // the desugared `let t = e` binding's
-                        // initializer.
-                        let rhs_entry = str_binding_entry(rhs, locals, str_bindings);
-                        let rhs_seed = rhs_entry
-                            .as_ref()
-                            .and_then(|rhs_entry| rhs_entry.literal.as_ref())
-                            .filter(|rhs_seed| str_seed_resolved(rhs_seed).is_none());
-                        if let Some(rhs_seed) = rhs_seed {
-                            let joins = if shift {
-                                matches!(rhs_seed.literal, Lit::Int { .. })
-                            } else if logical {
-                                // Bool literal variables do not exist.
-                                false
-                            } else if arithmetic {
-                                matches!(rhs_seed.literal, Lit::Int { .. } | Lit::Float { .. })
-                                    && place_arithmetic
-                            } else {
-                                matches!(rhs_seed.literal, Lit::Int { .. })
-                                    && sai_ty::typeck::literal::is_integer_primitive(place_prim)
-                            };
-                            if !joins {
-                                return Ok(None);
-                            }
-                            str_seed_resolve(
-                                owner,
-                                rhs_seed,
-                                demanded_family(op, place_family),
-                                &mut diagnostics,
-                                inputs,
-                                snapshot,
-                                symbols,
-                                target_cfg,
-                            )?;
-                        } else {
-                            let rhs_family = if let ExprKind::Path(_) = rhs.kind {
-                                let Some(rhs_entry) = rhs_entry else {
-                                    return Ok(None);
-                                };
-                                rhs_entry
-                                    .literal
-                                    .as_ref()
-                                    .and_then(|seed| str_seed_resolved(seed))
-                                    .unwrap_or(rhs_entry.family)
-                            } else {
-                                match str_expr_family(
-                                    owner,
-                                    return_ty,
-                                    rhs,
-                                    locals,
-                                    str_bindings,
-                                    None,
-                                    type_paths,
-                                    symbols,
-                                    inputs,
-                                    snapshot,
-                                    target_cfg,
-                                    call_signatures,
-                                )? {
-                                    Some((rhs_family, mut rhs_diagnostics)) => {
-                                        diagnostics.append(&mut rhs_diagnostics);
-                                        rhs_family
-                                    }
-                                    None => return Ok(None),
-                                }
-                            };
-                            let Some(rhs_prim) = str_family_prim(rhs_family) else {
-                                return Ok(None);
-                            };
-                            let demanded = demanded_family(op, place_family);
-                            if rhs_family != demanded {
-                                diagnostics.push(const_literal_diagnostic(
-                                    owner.id,
-                                    inputs,
-                                    snapshot,
-                                    rhs.span,
-                                    sai_diagnostics::Code::TypeMismatch,
-                                    format!("expected {demanded}, found {rhs_family}"),
-                                    "type mismatch",
-                                )?);
-                            } else {
-                                let _ = rhs_prim;
-                            }
-                        }
-                        // The desugared binary's operator-level place
-                        // checks: a non-path right side is a hard Err
-                        // like `check_assign_op_rhs_local_type`; a path
-                        // right side keeps the checker's recoverable
-                        // diagnostics.
-                        if let ExprKind::Path(_) = rhs.kind {
-                            if logical && place_prim != sai_resolve::prelude::PrimTy::Bool {
-                                diagnostics.push(const_literal_diagnostic(
-                                    owner.id,
-                                    inputs,
-                                    snapshot,
-                                    stmt.span,
-                                    sai_diagnostics::Code::TypeMismatch,
-                                    format!("expected {place_family}, found `Bool`"),
-                                    "type mismatch",
-                                )?);
-                            } else if shift && !place_bitwise {
+                            // A non-bitwise place still reports the
+                            // operator like the desugared `x << e` —
+                            // `f <<= 2` diagnoses `<<` on `F64`.
+                            if !place_bitwise {
                                 diagnostics.push(const_literal_diagnostic(
                                     owner.id,
                                     inputs,
@@ -16768,26 +16656,69 @@ fn check_function_str_local_block(
                                     "shift operator is not supported for this primitive",
                                 )?);
                             }
-                        } else {
-                            let supported = if shift {
-                                place_bitwise
-                            } else if logical {
-                                place_prim == sai_resolve::prelude::PrimTy::Bool
-                            } else if arithmetic {
-                                place_arithmetic
-                            } else {
-                                place_bitwise
-                            };
-                            if !supported {
+                            continue;
+                        }
+                        let check_place_literal = |diagnostics: &mut Vec<
+                            sai_diagnostics::Diagnostic,
+                        >|
+                         -> Result<
+                            (),
+                            OwnerControlFlowResolutionError,
+                        > {
+                            match sai_ty::typeck::literal::check_primitive_literal(
+                                place_prim,
+                                literal,
+                                symbols,
+                                target_cfg.pointer_width(),
+                            ) {
+                                sai_ty::typeck::literal::PrimitiveLiteralResult::Match => {}
+                                sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
+                                    diagnostics.push(const_literal_diagnostic(
+                                        owner.id,
+                                        inputs,
+                                        snapshot,
+                                        rhs.span,
+                                        sai_diagnostics::Code::LiteralOutOfRange,
+                                        format!(
+                                            "{} literal is out of range for `{place_name}`",
+                                            if matches!(literal, Lit::Int { .. }) {
+                                                "integer"
+                                            } else {
+                                                "floating-point"
+                                            }
+                                        ),
+                                        "literal out of range",
+                                    )?);
+                                }
+                                sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => {
+                                    diagnostics.push(const_literal_diagnostic(
+                                        owner.id,
+                                        inputs,
+                                        snapshot,
+                                        rhs.span,
+                                        sai_diagnostics::Code::TypeMismatch,
+                                        format!(
+                                            "expected {place_family}, found {}",
+                                            str_lit_kind_word(literal)
+                                        ),
+                                        "type mismatch",
+                                    )?);
+                                }
+                            }
+                            Ok(())
+                        };
+                        if arithmetic || op == BinOp::Rem {
+                            if !matches!(literal, Lit::Int { .. } | Lit::Float { .. })
+                                || !place_arithmetic
+                            {
                                 return Ok(None);
                             }
+                            check_place_literal(&mut diagnostics)?;
                             if op == BinOp::Rem
-                                && matches!(
-                                    place_prim,
-                                    sai_resolve::prelude::PrimTy::F32
-                                        | sai_resolve::prelude::PrimTy::F64
-                                )
+                                && !sai_ty::typeck::literal::is_integer_primitive(place_prim)
                             {
+                                // `f %= t` reports the operator —
+                                // `report_unsupported_float_remainder`.
                                 let mut diagnostic = const_literal_diagnostic(
                                     owner.id,
                                     inputs,
@@ -16813,6 +16744,547 @@ fn check_function_str_local_block(
                                         )
                                     })?;
                                 diagnostics.push(diagnostic);
+                            }
+                        } else if matches!(op, BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul) {
+                            if !matches!(literal, Lit::Int { .. })
+                                || !sai_ty::typeck::literal::is_integer_primitive(place_prim)
+                            {
+                                return Ok(None);
+                            }
+                            check_place_literal(&mut diagnostics)?;
+                        } else {
+                            // Bitwise `x &= lit`: the desugared
+                            // `check_bitwise` admits every scalar place —
+                            // Byte, Bool, Char and float places report
+                            // the literal or the operator instead of
+                            // gating.
+                            let bitwise_ons =
+                                |diagnostics: &mut Vec<
+                                    sai_diagnostics::Diagnostic,
+                                >|
+                                 -> Result<(), OwnerControlFlowResolutionError> {
+                                    diagnostics.push(const_literal_diagnostic(
+                                        owner.id,
+                                        inputs,
+                                        snapshot,
+                                        stmt.span,
+                                        sai_diagnostics::Code::OperatorNotSupported,
+                                        format!(
+                                            "operator `{operator_text}` is not defined for `{place_name}`"
+                                        ),
+                                        "bitwise operator is not supported for this primitive",
+                                    )?);
+                                    Ok(())
+                                };
+                            let bitwise_otns = |diagnostics: &mut Vec<
+                                sai_diagnostics::Diagnostic,
+                            >,
+                                                  right: &str|
+                             -> Result<(), OwnerControlFlowResolutionError> {
+                                let trait_name = match op {
+                                    BinOp::BitAnd => "BitAnd",
+                                    BinOp::BitOr => "BitOr",
+                                    _ => "BitXor",
+                                };
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    stmt.span,
+                                    sai_diagnostics::Code::OperatorNotSupported,
+                                    format!(
+                                        "operator `{operator_text}` has no `{trait_name}<{right}>` implementation for `{place_name}`"
+                                    ),
+                                    "operator trait implementation is not available",
+                                )?);
+                                Ok(())
+                            };
+                            match literal {
+                                Lit::Int { .. } => {
+                                    if place_prim == sai_resolve::prelude::PrimTy::Char {
+                                        // Char bitwise is
+                                        // trait-selected — the count
+                                        // checks as `I64` before the
+                                        // missing impl reports.
+                                        if sai_ty::typeck::literal::check_primitive_literal(
+                                            sai_resolve::prelude::PrimTy::I64,
+                                            literal,
+                                            symbols,
+                                            target_cfg.pointer_width(),
+                                        ) == sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange
+                                        {
+                                            diagnostics.push(const_literal_diagnostic(
+                                                owner.id,
+                                                inputs,
+                                                snapshot,
+                                                rhs.span,
+                                                sai_diagnostics::Code::LiteralOutOfRange,
+                                                "integer literal is out of range for `I64`"
+                                                    .to_owned(),
+                                                "literal out of range",
+                                            )?);
+                                        }
+                                        bitwise_otns(&mut diagnostics, "I64")?;
+                                    } else {
+                                        check_place_literal(&mut diagnostics)?;
+                                        if matches!(
+                                            place_prim,
+                                            sai_resolve::prelude::PrimTy::Bool
+                                                | sai_resolve::prelude::PrimTy::F32
+                                                | sai_resolve::prelude::PrimTy::F64
+                                        ) {
+                                            bitwise_ons(&mut diagnostics)?;
+                                        }
+                                    }
+                                }
+                                Lit::Byte(_) => {
+                                    if place_prim == sai_resolve::prelude::PrimTy::Char {
+                                        bitwise_otns(&mut diagnostics, "Byte")?;
+                                    } else {
+                                        check_place_literal(&mut diagnostics)?;
+                                        if matches!(
+                                            place_prim,
+                                            sai_resolve::prelude::PrimTy::Bool
+                                                | sai_resolve::prelude::PrimTy::F32
+                                                | sai_resolve::prelude::PrimTy::F64
+                                        ) {
+                                            bitwise_ons(&mut diagnostics)?;
+                                        }
+                                    }
+                                }
+                                Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. } => {
+                                    if place_prim == sai_resolve::prelude::PrimTy::Char {
+                                        if matches!(literal, Lit::Float { .. })
+                                            && sai_ty::typeck::literal::check_primitive_literal(
+                                                sai_resolve::prelude::PrimTy::F64,
+                                                literal,
+                                                symbols,
+                                                target_cfg.pointer_width(),
+                                            ) == sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange
+                                        {
+                                            diagnostics.push(const_literal_diagnostic(
+                                                owner.id,
+                                                inputs,
+                                                snapshot,
+                                                rhs.span,
+                                                sai_diagnostics::Code::LiteralOutOfRange,
+                                                "floating-point literal is out of range for `F64`"
+                                                    .to_owned(),
+                                                "literal out of range",
+                                            )?);
+                                        }
+                                        bitwise_otns(
+                                            &mut diagnostics,
+                                            if matches!(literal, Lit::Bool(_)) {
+                                                "Bool"
+                                            } else if matches!(literal, Lit::Char(_)) {
+                                                "Char"
+                                            } else {
+                                                "F64"
+                                            },
+                                        )?;
+                                    } else {
+                                        check_place_literal(&mut diagnostics)?;
+                                        if matches!(
+                                            place_prim,
+                                            sai_resolve::prelude::PrimTy::Bool
+                                                | sai_resolve::prelude::PrimTy::F32
+                                                | sai_resolve::prelude::PrimTy::F64
+                                        ) {
+                                            bitwise_ons(&mut diagnostics)?;
+                                        }
+                                    }
+                                }
+                                _ => return Ok(None),
+                            }
+                        }
+                    }
+                    ExprKind::Path(_) => {
+                        // The desugared `x = x op t`: the operand pair
+                        // checks like `check_arithmetic`/`check_bitwise`/
+                        // `check_shift`, then the operator-level place
+                        // check runs.
+                        let Some(rhs_entry) = str_binding_entry(rhs, locals, str_bindings) else {
+                            return Ok(None);
+                        };
+                        let demanded = demanded_family(op, place_family);
+                        let right_family = if let Some(rhs_seed) = rhs_entry
+                            .literal
+                            .as_ref()
+                            .filter(|rhs_seed| str_seed_resolved(rhs_seed).is_none())
+                        {
+                            // An unresolved literal-variable operand
+                            // resolves to the demanded type when its
+                            // literal kind accepts it — an integer
+                            // variable cannot become `F64` or `Byte`.
+                            let joins = str_seed_accepts_family(rhs_seed.literal, demanded)
+                                && if arithmetic {
+                                    matches!(rhs_seed.literal, Lit::Int { .. } | Lit::Float { .. })
+                                } else {
+                                    matches!(rhs_seed.literal, Lit::Int { .. })
+                                };
+                            if !joins {
+                                return Ok(None);
+                            }
+                            str_seed_resolve(
+                                owner,
+                                rhs_seed,
+                                demanded,
+                                &mut diagnostics,
+                                inputs,
+                                snapshot,
+                                symbols,
+                                target_cfg,
+                            )?;
+                            demanded
+                        } else {
+                            rhs_entry
+                                .literal
+                                .as_ref()
+                                .and_then(|seed| str_seed_resolved(seed))
+                                .unwrap_or(rhs_entry.family)
+                        };
+                        let Some(rhs_prim) = str_family_prim(right_family) else {
+                            return Ok(None);
+                        };
+                        let rhs_arithmetic =
+                            sai_ty::typeck::literal::is_integer_primitive(rhs_prim)
+                                || matches!(
+                                    rhs_prim,
+                                    sai_resolve::prelude::PrimTy::F32
+                                        | sai_resolve::prelude::PrimTy::F64
+                                );
+                        if shift {
+                            if right_family != "`U32`" {
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    rhs.span,
+                                    sai_diagnostics::Code::TypeMismatch,
+                                    format!("expected `U32`, found {right_family}"),
+                                    "type mismatch",
+                                )?);
+                            }
+                            if !place_bitwise {
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    stmt.span,
+                                    sai_diagnostics::Code::OperatorNotSupported,
+                                    format!(
+                                        "operator `{operator_text}` is not defined for `{place_name}`"
+                                    ),
+                                    "shift operator is not supported for this primitive",
+                                )?);
+                            }
+                        } else if logical {
+                            if right_family != "`Bool`" {
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    rhs.span,
+                                    sai_diagnostics::Code::TypeMismatch,
+                                    format!("expected `Bool`, found {right_family}"),
+                                    "type mismatch",
+                                )?);
+                            }
+                            if place_prim != sai_resolve::prelude::PrimTy::Bool {
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    stmt.span,
+                                    sai_diagnostics::Code::TypeMismatch,
+                                    format!("expected {place_family}, found `Bool`"),
+                                    "type mismatch",
+                                )?);
+                            }
+                        } else if arithmetic {
+                            // `x += t` needs an arithmetic place and an
+                            // arithmetic operand — anything else has no
+                            // operator (`Unsupported` like the desugar).
+                            if !place_arithmetic || !rhs_arithmetic {
+                                return Ok(None);
+                            }
+                            if right_family != place_family {
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    rhs.span,
+                                    sai_diagnostics::Code::TypeMismatch,
+                                    format!("expected {place_family}, found {right_family}"),
+                                    "type mismatch",
+                                )?);
+                            }
+                        } else if op == BinOp::Rem {
+                            if !place_arithmetic || !rhs_arithmetic {
+                                return Ok(None);
+                            }
+                            if right_family != place_family {
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    rhs.span,
+                                    sai_diagnostics::Code::TypeMismatch,
+                                    format!("expected {place_family}, found {right_family}"),
+                                    "type mismatch",
+                                )?);
+                            }
+                            if !sai_ty::typeck::literal::is_integer_primitive(place_prim) {
+                                let mut diagnostic = const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    stmt.span,
+                                    sai_diagnostics::Code::OperatorNotSupported,
+                                    format!(
+                                        "operator `{operator_text}` is not defined for `{place_name}`"
+                                    ),
+                                    "floating-point remainder is not supported",
+                                )?;
+                                diagnostic
+                                    .push_child(Child {
+                                        kind: ChildKind::Help,
+                                        message:
+                                            "use the floating-point `rem` method (for example, `left.rem(right)`)"
+                                                .to_owned(),
+                                        location: None,
+                                    })
+                                    .map_err(|_| {
+                                        OwnerControlFlowResolutionError::InvalidSourceLocation(
+                                            owner.id,
+                                        )
+                                    })?;
+                                diagnostics.push(diagnostic);
+                            }
+                        } else if matches!(op, BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul) {
+                            if right_family != place_family
+                                && place_prim != sai_resolve::prelude::PrimTy::Char
+                            {
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    rhs.span,
+                                    sai_diagnostics::Code::TypeMismatch,
+                                    format!("expected {place_family}, found {right_family}"),
+                                    "type mismatch",
+                                )?);
+                            }
+                            if !sai_ty::typeck::literal::is_integer_primitive(place_prim) {
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    stmt.span,
+                                    sai_diagnostics::Code::OperatorNotSupported,
+                                    format!(
+                                        "operator `{operator_text}` is not defined for `{place_name}`"
+                                    ),
+                                    "wrapping arithmetic is not supported for this primitive",
+                                )?);
+                            }
+                        } else {
+                            // Bitwise on a concrete place — `check_bitwise`.
+                            if sai_ty::typeck::literal::is_integer_primitive(place_prim)
+                                || place_prim == sai_resolve::prelude::PrimTy::Byte
+                            {
+                                if right_family != place_family {
+                                    diagnostics.push(const_literal_diagnostic(
+                                        owner.id,
+                                        inputs,
+                                        snapshot,
+                                        rhs.span,
+                                        sai_diagnostics::Code::TypeMismatch,
+                                        format!("expected {place_family}, found {right_family}"),
+                                        "type mismatch",
+                                    )?);
+                                }
+                            } else if matches!(
+                                place_prim,
+                                sai_resolve::prelude::PrimTy::Bool
+                                    | sai_resolve::prelude::PrimTy::F32
+                                    | sai_resolve::prelude::PrimTy::F64
+                            ) {
+                                if right_family != place_family {
+                                    diagnostics.push(const_literal_diagnostic(
+                                        owner.id,
+                                        inputs,
+                                        snapshot,
+                                        rhs.span,
+                                        sai_diagnostics::Code::TypeMismatch,
+                                        format!("expected {place_family}, found {right_family}"),
+                                        "type mismatch",
+                                    )?);
+                                }
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    stmt.span,
+                                    sai_diagnostics::Code::OperatorNotSupported,
+                                    format!(
+                                        "operator `{operator_text}` is not defined for `{place_name}`"
+                                    ),
+                                    "bitwise operator is not supported for this primitive",
+                                )?);
+                            } else if place_prim == sai_resolve::prelude::PrimTy::Char {
+                                let trait_name = match op {
+                                    BinOp::BitAnd => "BitAnd",
+                                    BinOp::BitOr => "BitOr",
+                                    _ => "BitXor",
+                                };
+                                diagnostics.push(const_literal_diagnostic(
+                                    owner.id,
+                                    inputs,
+                                    snapshot,
+                                    stmt.span,
+                                    sai_diagnostics::Code::OperatorNotSupported,
+                                    format!(
+                                        "operator `{operator_text}` has no `{trait_name}<{place_name}>` implementation for `{place_name}`"
+                                    ),
+                                    "operator trait implementation is not available",
+                                )?);
+                            } else {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    _ => {
+                        // `x op= e` desugars to
+                        // `{ let t = e; x = x op t }` —
+                        // `check_assign_op_rhs_local_type` demands the
+                        // right-operand type and then checks the place.
+                        let demanded = demanded_family(op, place_family);
+                        let rhs_family =
+                            match str_assign_op_rhs_literal_var(rhs, locals, str_bindings) {
+                                Some(Some(float)) => {
+                                    // `1 + 2` binds an unresolved literal
+                                    // variable which the demanded type
+                                    // resolves when the operator admits its
+                                    // kind.
+                                    let joinable = arithmetic || !float;
+                                    if !joinable
+                                        || !(if float {
+                                            matches!(demanded, "`F32`" | "`F64`")
+                                        } else {
+                                            str_family_prim(demanded).is_some_and(
+                                                sai_ty::typeck::literal::is_integer_primitive,
+                                            )
+                                        })
+                                    {
+                                        return Ok(None);
+                                    }
+                                    match str_expr_family(
+                                        owner,
+                                        return_ty,
+                                        rhs,
+                                        locals,
+                                        str_bindings,
+                                        str_family_prim(demanded),
+                                        type_paths,
+                                        symbols,
+                                        inputs,
+                                        snapshot,
+                                        target_cfg,
+                                        call_signatures,
+                                    )? {
+                                        Some((rhs_family, mut rhs_diagnostics)) => {
+                                            diagnostics.append(&mut rhs_diagnostics);
+                                            rhs_family
+                                        }
+                                        None => return Ok(None),
+                                    }
+                                }
+                                // Literal kinds that disagree fail the
+                                // initializer's constraint.
+                                Some(None) => return Ok(None),
+                                None => match str_expr_family(
+                                    owner,
+                                    return_ty,
+                                    rhs,
+                                    locals,
+                                    str_bindings,
+                                    None,
+                                    type_paths,
+                                    symbols,
+                                    inputs,
+                                    snapshot,
+                                    target_cfg,
+                                    call_signatures,
+                                )? {
+                                    Some((rhs_family, mut rhs_diagnostics)) => {
+                                        diagnostics.append(&mut rhs_diagnostics);
+                                        rhs_family
+                                    }
+                                    None => return Ok(None),
+                                },
+                            };
+                        if str_family_prim(rhs_family).is_none() {
+                            return Ok(None);
+                        }
+                        if rhs_family != demanded {
+                            diagnostics.push(const_literal_diagnostic(
+                                owner.id,
+                                inputs,
+                                snapshot,
+                                rhs.span,
+                                sai_diagnostics::Code::TypeMismatch,
+                                format!("expected {demanded}, found {rhs_family}"),
+                                "type mismatch",
+                            )?);
+                        } else {
+                            // `right_type == place` — the operator-level
+                            // place check runs; a type mismatch returns
+                            // before it like the checker.
+                            let place_ok = if shift || logical {
+                                if shift {
+                                    sai_ty::typeck::literal::is_integer_primitive(place_prim)
+                                } else {
+                                    place_prim == sai_resolve::prelude::PrimTy::Bool
+                                }
+                            } else if arithmetic {
+                                place_arithmetic
+                            } else {
+                                sai_ty::typeck::literal::is_integer_primitive(place_prim)
+                            };
+                            if !place_ok {
+                                if op == BinOp::Rem {
+                                    // A float remainder reports the
+                                    // operator and keeps the owner.
+                                    let mut diagnostic = const_literal_diagnostic(
+                                        owner.id,
+                                        inputs,
+                                        snapshot,
+                                        stmt.span,
+                                        sai_diagnostics::Code::OperatorNotSupported,
+                                        format!(
+                                            "operator `{operator_text}` is not defined for `{place_name}`"
+                                        ),
+                                        "floating-point remainder is not supported",
+                                    )?;
+                                    diagnostic
+                                        .push_child(Child {
+                                            kind: ChildKind::Help,
+                                            message:
+                                                "use the floating-point `rem` method (for example, `left.rem(right)`)"
+                                                    .to_owned(),
+                                            location: None,
+                                        })
+                                        .map_err(|_| {
+                                            OwnerControlFlowResolutionError::InvalidSourceLocation(
+                                                owner.id,
+                                            )
+                                        })?;
+                                    diagnostics.push(diagnostic);
+                                } else {
+                                    return Ok(None);
+                                }
                             }
                         }
                     }
@@ -57743,6 +58215,24 @@ property "shared"() {}
             "pub fn op_assign_invalid() -> Str {\n    var n = 1\n    (n + 1) += 1\n    \"a\"\n}\n",
             "pub fn op_assign_str_gate() -> Str {\n    var s = \"a\"\n    s += \"b\"\n    \"a\"\n}\n",
             "pub fn op_assign_rhs_seed_range() -> Str {\n    var n: I8 = 1\n    var m = 300\n    n += m\n    \"a\"\n}\n",
+            "pub fn op_assign_var_to_float() -> Str {\n    var n = 1\n    let f: F64 = 1.0\n    n += f\n    \"a\"\n}\n",
+            "pub fn op_assign_var_seed_to_float() -> Str {\n    let f: F64 = 1.0\n    var m = 2\n    f += m\n    \"a\"\n}\n",
+            "pub fn op_assign_var_lit_kind() -> Str {\n    var n = 1\n    n += 2.5\n    \"a\"\n}\n",
+            "pub fn op_assign_var_int_lit() -> Str {\n    var f = 1.0\n    f += 2\n    \"a\"\n}\n",
+            "pub fn op_assign_var_merge_kind() -> Str {\n    var n = 1\n    var f = 1.5\n    n += f\n    \"a\"\n}\n",
+            "pub fn op_assign_expr_resolve() -> Str {\n    var n: I8 = 1\n    n += 1 + 2\n    \"a\"\n}\n",
+            "pub fn op_assign_shift_expr() -> Str {\n    var n: I8 = 1\n    n <<= 1 + 2\n    \"a\"\n}\n",
+            "pub fn op_assign_expr_range() -> Str {\n    var n: I8 = 1\n    n += 200 + 3\n    \"a\"\n}\n",
+            "pub fn op_assign_expr_to_float() -> Str {\n    var f: F64 = 1.0\n    f += 1 + 2\n    \"a\"\n}\n",
+            "pub fn op_assign_shift_ons() -> Str {\n    var f: F64 = 1.0\n    f <<= 2\n    \"a\"\n}\n",
+            "pub fn op_assign_rem_ons() -> Str {\n    var f: F64 = 1.0\n    var g: F64 = 2.0\n    f %= g\n    \"a\"\n}\n",
+            "pub fn op_assign_bitand_bool() -> Str {\n    var b = true\n    var c = false\n    b &= c\n    \"a\"\n}\n",
+            "pub fn op_assign_byte_lit() -> Str {\n    var b = b'y'\n    b &= b'x'\n    \"a\"\n}\n",
+            "pub fn op_assign_byte_int() -> Str {\n    var b = b'y'\n    b &= 1\n    \"a\"\n}\n",
+            "pub fn op_assign_char_bit() -> Str {\n    var c = 'a'\n    var d = 'b'\n    c &= d\n    \"a\"\n}\n",
+            "pub fn op_assign_rem_expr() -> Str {\n    var f: F64 = 1.0\n    f %= f + 1.0\n    \"a\"\n}\n",
+            "pub fn op_assign_rem_lit() -> Str {\n    var f: F64 = 1.0\n    f %= 2\n    \"a\"\n}\n",
+            "pub fn op_assign_wrap_ons() -> Str {\n    var b = true\n    var c = false\n    b +%= c\n    \"a\"\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -57758,7 +58248,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 42);
+        assert_eq!(resolved.owners().len(), 60);
         for (index, owner) in resolved.owners()[1..5].iter().enumerate() {
             match owner.body_type_check().expect("var body check succeeds") {
                 FunctionBodyTypeCheck::Supported { diagnostics } => {
@@ -57847,6 +58337,41 @@ property "shared"() {}
                 sai_diagnostics::Code::LiteralOutOfRange,
                 Some("integer literal is out of range for `I8`"),
             ),
+            (
+                51,
+                sai_diagnostics::Code::OperatorNotSupported,
+                Some("operator `<<` is not defined for `F64`"),
+            ),
+            (
+                52,
+                sai_diagnostics::Code::OperatorNotSupported,
+                Some("operator `%` is not defined for `F64`"),
+            ),
+            (
+                53,
+                sai_diagnostics::Code::OperatorNotSupported,
+                Some("operator `&` is not defined for `Bool`"),
+            ),
+            (
+                55,
+                sai_diagnostics::Code::TypeMismatch,
+                Some("expected `Byte`, found an integer literal"),
+            ),
+            (
+                56,
+                sai_diagnostics::Code::OperatorNotSupported,
+                Some("operator `&` has no `BitAnd<Char>` implementation for `Char`"),
+            ),
+            (
+                57,
+                sai_diagnostics::Code::OperatorNotSupported,
+                Some("operator `%` is not defined for `F64`"),
+            ),
+            (
+                59,
+                sai_diagnostics::Code::OperatorNotSupported,
+                Some("operator `+%` is not defined for `Bool`"),
+            ),
         ] {
             match resolved.owners()[index]
                 .body_type_check()
@@ -57863,7 +58388,7 @@ property "shared"() {}
             }
         }
         for index in [
-            8, 11, 12, 13, 14, 18, 21, 22, 24, 26, 27, 28, 29, 32, 34, 37,
+            8, 11, 12, 13, 14, 18, 21, 22, 24, 26, 27, 28, 29, 32, 34, 37, 47, 48, 54,
         ] {
             match resolved.owners()[index]
                 .body_type_check()
@@ -57875,7 +58400,53 @@ property "shared"() {}
                 other => panic!("expected Supported, found {other:?} at index {index}"),
             }
         }
-        for index in [20, 40] {
+        // `n += 200 + 3` resolves the literal variable to `I8` — the
+        // pinned evaluation reports the failing literal at both the
+        // operand site and the variable's resolution.
+        {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[49]
+                .body_type_check()
+                .expect("range body check succeeds")
+            else {
+                panic!(
+                    "expected Supported, found {:?}",
+                    resolved.owners()[49].body_type_check()
+                )
+            };
+            assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+            assert!(diagnostics.iter().all(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::LiteralOutOfRange
+                    && diagnostic.message == "integer literal is out of range for `I8`"
+            }));
+        }
+        // `f %= 2` reports the literal kind and the operator — the
+        // desugared remainder check emits both diagnostics.
+        {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[58]
+                .body_type_check()
+                .expect("float remainder body check succeeds")
+            else {
+                panic!(
+                    "expected Supported, found {:?}",
+                    resolved.owners()[58].body_type_check()
+                )
+            };
+            assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+            assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+            assert_eq!(
+                diagnostics[0].message,
+                "expected `F64`, found an integer literal"
+            );
+            assert_eq!(
+                diagnostics[1].code,
+                sai_diagnostics::Code::OperatorNotSupported
+            );
+            assert_eq!(
+                diagnostics[1].message,
+                "operator `%` is not defined for `F64`"
+            );
+        }
+        for index in [20, 40, 42, 43, 44, 45, 46, 50] {
             assert!(
                 matches!(
                     resolved.owners()[index]
