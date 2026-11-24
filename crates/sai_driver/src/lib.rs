@@ -12738,11 +12738,11 @@ fn str_break_value_in_expr(
             value: Some(value),
             ..
         } => {
-            // The `break` must reach the frame being probed: it
-            // names `target`, or is unlabeled while the scan is
-            // still inside that frame (inside a nested `loop` an
-            // unlabeled `break` binds to the inner frame).
-            if label.map(|label| label.name) != target || (in_outer && label.is_none()) {
+            // The `break` must reach the frame being probed: an
+            // unlabeled `break` while the scan is still inside that
+            // frame, or a `break` naming `target` (inside a nested
+            // `loop` an unlabeled `break` binds to the inner frame).
+            if !((label.is_none() && !in_outer) || label.map(|label| label.name) == target) {
                 return false;
             }
             str_shaped_local_init(
