@@ -19719,15 +19719,15 @@ fn check_function_str_local_block(
                 // and stays gated rather than borrowing the return type.
                 let branch_yields_str = |branch: &sai_hir::expressions::Block<'_>| {
                     branch.tail.is_some_and(|tail| {
-                        matches!(tail.kind, ExprKind::Lit(Lit::Str(_)))
-                            || str_self_field_projected_family(tail, inputs) == Some("`Str`")
-                            || str_binding_path(tail, locals, str_bindings)
+                        str_clean_expr(tail, locals, str_bindings, false, inputs, call_signatures)
                     })
                 };
                 let else_yields = match else_block {
                     Some(b) => branch_yields_str(b),
                     // `else if` — the nested chain's own clean-yield scan.
-                    None => str_clean_expr(els, locals, str_bindings, false, inputs),
+                    None => {
+                        str_clean_expr(els, locals, str_bindings, false, inputs, call_signatures)
+                    }
                 };
                 if !branch_yields_str(then) && !else_yields {
                     return Ok(None);
@@ -19862,7 +19862,7 @@ fn check_function_str_local_block(
                                 },
                             );
                         }
-                        str_clean_expr(arm.body, locals, &bindings, false, inputs)
+                        str_clean_expr(arm.body, locals, &bindings, false, inputs, call_signatures)
                     });
                 if !arm_yields_str {
                     return Ok(None);
@@ -22602,8 +22602,9 @@ fn str_break_ctx_clean(
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
     inputs: &CurrentOwnerInputs,
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
-    str_clean_expr(expr, locals, str_bindings, false, inputs)
+    str_clean_expr(expr, locals, str_bindings, false, inputs, call_signatures)
 }
 
 fn str_clean_block(
@@ -22612,13 +22613,15 @@ fn str_clean_block(
     str_bindings: &StrLocalBindings,
     loop_level: bool,
     inputs: &CurrentOwnerInputs,
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     let mut bindings = str_bindings.clone();
     let mut clean = false;
     for stmt in block.stmts {
         match stmt.kind {
             sai_hir::expressions::StmtKind::Expr(expr) => {
-                clean |= str_clean_expr(expr, locals, &bindings, loop_level, inputs);
+                clean |=
+                    str_clean_expr(expr, locals, &bindings, loop_level, inputs, call_signatures);
             }
             sai_hir::expressions::StmtKind::Let { pat, init, .. } => {
                 if let PatKind::Binding {
@@ -22629,7 +22632,8 @@ fn str_clean_block(
                     ..
                 } = pat.kind
                 {
-                    if str_clean_expr(init, locals, &bindings, loop_level, inputs) {
+                    if str_clean_expr(init, locals, &bindings, loop_level, inputs, call_signatures)
+                    {
                         bindings.insert(
                             binding,
                             StrLocalEntry {
@@ -22644,9 +22648,9 @@ fn str_clean_block(
         }
     }
     clean
-        || block
-            .tail
-            .is_some_and(|tail| str_clean_expr(tail, locals, &bindings, loop_level, inputs))
+        || block.tail.is_some_and(|tail| {
+            str_clean_expr(tail, locals, &bindings, loop_level, inputs, call_signatures)
+        })
 }
 
 fn str_clean_expr(
@@ -22655,6 +22659,7 @@ fn str_clean_expr(
     str_bindings: &StrLocalBindings,
     loop_level: bool,
     inputs: &CurrentOwnerInputs,
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> bool {
     match expr.kind {
         ExprKind::Lit(Lit::Str(_)) => true,
@@ -22664,10 +22669,45 @@ fn str_clean_expr(
             els: Some(els),
             ..
         } => {
-            str_clean_block(then, locals, str_bindings, loop_level, inputs)
-                || str_clean_expr(els, locals, str_bindings, loop_level, inputs)
+            str_clean_block(
+                then,
+                locals,
+                str_bindings,
+                loop_level,
+                inputs,
+                call_signatures,
+            ) || str_clean_expr(
+                els,
+                locals,
+                str_bindings,
+                loop_level,
+                inputs,
+                call_signatures,
+            )
         }
-        ExprKind::Block(inner) => str_clean_block(inner, locals, str_bindings, loop_level, inputs),
+        ExprKind::Block(inner) => str_clean_block(
+            inner,
+            locals,
+            str_bindings,
+            loop_level,
+            inputs,
+            call_signatures,
+        ),
+        // A `-> Str` call's output is a clean `Str` yield — direct
+        // calls resolve through `call_signatures`, `self.<method>(..)`
+        // calls through the body's sibling-method signatures.
+        ExprKind::Call {
+            callee, base: None, ..
+        } => {
+            call_signatures
+                .and_then(|signatures| signatures.get(&expr.hir_id))
+                .is_some_and(|signature| {
+                    signature.callee == callee.hir_id
+                        && signature.output == sai_ty::typeck::body::PrimitiveCallOutput::Str
+                })
+                || str_self_method_call(expr, inputs)
+                    .is_some_and(|signature| signature.output == "`Str`")
+        }
         ExprKind::Match {
             scrutinee,
             arms,
@@ -22697,13 +22737,27 @@ fn str_clean_expr(
                         ),
                     );
                 }
-                str_clean_expr(arm.body, locals, &bindings, loop_level, inputs)
+                str_clean_expr(
+                    arm.body,
+                    locals,
+                    &bindings,
+                    loop_level,
+                    inputs,
+                    call_signatures,
+                )
             })
         }
         ExprKind::Break {
             label: None,
             value: Some(value),
-        } => str_clean_expr(value, locals, str_bindings, loop_level, inputs),
+        } => str_clean_expr(
+            value,
+            locals,
+            str_bindings,
+            loop_level,
+            inputs,
+            call_signatures,
+        ),
         // A `loop` in value position yields its own break contributions;
         // at loop level the same loop is a statement whose breaks stay
         // inside it, so it is not scanned.
@@ -22711,7 +22765,10 @@ fn str_clean_expr(
             body,
             source: LoopSource::Loop,
             ..
-        } => !loop_level && str_clean_block(body, locals, str_bindings, true, inputs),
+        } => {
+            !loop_level
+                && str_clean_block(body, locals, str_bindings, true, inputs, call_signatures)
+        }
         _ => str_binding_path(expr, locals, str_bindings),
     }
 }
@@ -22789,7 +22846,7 @@ fn str_break_value(
         // clean `Str` break contribution exists inside it — an all-integer
         // `if`/`match` produces no `Str` for a `let` initializer to seed.
         return Ok(Some((
-            str_break_ctx_clean(value, locals, str_bindings, inputs),
+            str_break_ctx_clean(value, locals, str_bindings, inputs, call_signatures),
             value_diagnostics,
         )));
     }
@@ -61917,6 +61974,9 @@ property "shared"() {}
             "pub fn str_call_arg_mismatch() -> I32 { str_call_take_i32(str_call_make()) }\n",
             "pub fn str_call_str_param_gated() -> Str { str_call_id_str(\"a\") }\n",
             "pub fn str_call_arity() -> Str { str_call_make(1) }\n",
+            "pub fn str_call_if_call_branches(flag: Bool) -> USize { let s = if flag { str_call_make() } else { str_call_make() }\n    s.len() }\n",
+            "pub fn str_call_match_call_arms(flag: Bool) -> USize { let s = match flag { true => str_call_make(), _ => str_call_make() }\n    s.len() }\n",
+            "pub fn str_call_if_tail_calls(flag: Bool) -> Str { if flag { str_call_make() } else { str_call_make() } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61933,7 +61993,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 69);
+        assert_eq!(owners.len(), 72);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -61971,6 +62031,10 @@ property "shared"() {}
             // `Str` `loop` `break` value, an `if` initializer
             // branch, and a statement-position call all check.
             .chain(&owners[54..64])
+            // `-> Str` calls as every branch yield: `if`/`match`
+            // initializers where every arm is a call, and a `-> Str`
+            // `if` tail with call branches.
+            .chain(&owners[69..72])
         {
             assert!(matches!(
                 owner
