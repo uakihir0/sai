@@ -14306,7 +14306,7 @@ enum FunctionDirectType {
 #[derive(Clone, Debug)]
 struct PrimitiveFunctionCallSignature {
     owner: OwnerId,
-    parameters: Vec<sai_resolve::prelude::PrimTy>,
+    parameters: Vec<FunctionDirectType>,
     output: FunctionDirectType,
 }
 
@@ -14544,7 +14544,19 @@ fn direct_primitive_call_site(
             };
             Some(sai_ty::typeck::body::PrimitiveCallSignature {
                 callee: callee.hir_id,
-                parameters: signature.parameters.clone(),
+                parameters: signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| match parameter {
+                        FunctionDirectType::Primitive(primitive) => Some(
+                            sai_ty::typeck::body::PrimitiveCallParameter::Primitive(*primitive),
+                        ),
+                        FunctionDirectType::Str => {
+                            Some(sai_ty::typeck::body::PrimitiveCallParameter::Str)
+                        }
+                        FunctionDirectType::Unit => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?,
                 output,
             })
         })
@@ -16498,8 +16510,14 @@ fn str_expr_family(
                 let Some(parameters) = signature
                     .parameters
                     .iter()
-                    .map(|parameter| {
-                        str_prim_family_name(*parameter).map(|family| (family, Some(*parameter)))
+                    .map(|parameter| match parameter {
+                        sai_ty::typeck::body::PrimitiveCallParameter::Primitive(primitive) => {
+                            str_prim_family_name(*primitive)
+                                .map(|family| (family, Some(*primitive)))
+                        }
+                        // A `Str` parameter takes `Str`-family arguments
+                        // with no primitive expectation to forward.
+                        sai_ty::typeck::body::PrimitiveCallParameter::Str => Some(("`Str`", None)),
                     })
                     .collect::<Option<Vec<_>>>()
                 else {
@@ -21216,7 +21234,12 @@ fn str_pure_init_family(
                     signature
                         .parameters
                         .iter()
-                        .map(|parameter| str_prim_family_name(*parameter))
+                        .map(|parameter| match parameter {
+                            sai_ty::typeck::body::PrimitiveCallParameter::Primitive(primitive) => {
+                                str_prim_family_name(*primitive)
+                            }
+                            sai_ty::typeck::body::PrimitiveCallParameter::Str => Some("`Str`"),
+                        })
                         .collect::<Option<Vec<_>>>()?,
                     match signature.output {
                         sai_ty::typeck::body::PrimitiveCallOutput::Primitive(primitive) => {
@@ -33341,10 +33364,13 @@ impl RootDatabase {
                         Some(FunctionDirectType::Primitive(primitive))
                             if sai_ty::typeck::literal::supports_primitive_literal(primitive) =>
                         {
-                            Some(primitive)
+                            Some(FunctionDirectType::Primitive(primitive))
                         }
-                        Some(FunctionDirectType::Str | FunctionDirectType::Unit) | None => None,
-                        Some(FunctionDirectType::Primitive(_)) => None,
+                        // `s: Str` parameters project `Str` — `take_str(s)`
+                        // / `take_str("a")` bind like a `Str` annotation.
+                        Some(FunctionDirectType::Str) => Some(FunctionDirectType::Str),
+                        Some(FunctionDirectType::Unit | FunctionDirectType::Primitive(_))
+                        | None => None,
                     }
                 })
                 .collect::<Option<Vec<_>>>()
@@ -62082,6 +62108,14 @@ property "shared"() {}
             "pub fn str_call_if_tail_calls(flag: Bool) -> Str { if flag { str_call_make() } else { str_call_make() } }\n",
             "pub fn str_call_stmt_if_branch(flag: Bool) -> Bool { let s = if flag { { str_call_make()\n true } } else { false }\n    s }\n",
             "pub fn str_call_loop_if_tail_break(flag: Bool) -> Str { loop { if flag { break str_call_make() } } }\n",
+            "pub fn take_str_param(s: Str) -> USize { 0 }\n",
+            "pub fn str_call_str_param_local(flag: Bool) -> Bool { let s = \"a\"\n    take_str_param(s)\n    flag }\n",
+            "pub fn str_call_str_param_lit(flag: Bool) -> Bool { take_str_param(\"a\")\n    flag }\n",
+            "pub fn str_call_str_param_arg_call(flag: Bool) -> Bool { take_str_param(str_call_make())\n    flag }\n",
+            "pub fn str_call_str_param_if_arg(flag: Bool) -> Bool { take_str_param(if flag { \"a\" } else { \"b\" })\n    flag }\n",
+            "pub fn str_call_str_param_str_body(s: Str) -> Str { take_str_param(s)\n    s }\n",
+            "pub fn str_call_str_param_mismatch(flag: Bool) -> Bool { take_str_param(1)\n    flag }\n",
+            "pub fn str_call_str_param_path_mismatch(flag: Bool) -> Bool { let n = 1\n    take_str_param(n)\n    flag }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -62098,7 +62132,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 74);
+        assert_eq!(owners.len(), 82);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -62142,6 +62176,14 @@ property "shared"() {}
             // a statement `if`'s branch tail inside a `loop`.
             .chain(&owners[69..72])
             .chain(&owners[73..74])
+            // `Str` parameters: a `s: Str` callee and `Str`
+            // arguments — locals, literals, nested `-> Str`
+            // calls, `if` arguments — in primitive and `-> Str`
+            // bodies.
+            .chain(&owners[74..80])
+            // `str_call_id_str("a")` — the `s: Str` parameter now
+            // has a signature, so the call checks and yields `Str`.
+            .chain(&owners[67..68])
         {
             assert!(matches!(
                 owner
@@ -62191,6 +62233,10 @@ property "shared"() {}
             (64, "expected `I32`, found `Str`"),
             (65, "expected `Str`, found `I32`"),
             (66, "expected `I32`, found `Str`"),
+            // `take_str(1)` and `take_str(n)` name the literal kind
+            // against `Str` — `n`'s literal variable is unresolved.
+            (80, "expected `Str`, found an integer literal"),
+            (81, "expected `Str`, found an integer literal"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
@@ -62233,11 +62279,10 @@ property "shared"() {}
         assert_eq!(diagnostics[1].code, sai_diagnostics::Code::TypeMismatch);
         assert_eq!(diagnostics[1].message, "expected `I64`, found `Str`");
         // Gated owners: `Str` arithmetic operands, a `Str` match
-        // scrutinee, a literal-variable `Str` assignment, a call
-        // to a callee whose parameter is `Str`, and a `Str`-callee
-        // arity mismatch (the walk's positional-prefix bound, like
-        // `s.len(1)`) stay outside the slice.
-        for owner in owners[25..28].iter().chain(&owners[67..69]) {
+        // scrutinee, a literal-variable `Str` assignment, and a
+        // `Str`-callee arity mismatch (the walk's positional-prefix
+        // bound, like `s.len(1)`) stay outside the slice.
+        for owner in owners[25..28].iter().chain(&owners[68..69]) {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -71192,6 +71237,9 @@ property "shared"() {}
             ],
         );
         let float_call = assert_supported(&database, "float_call", &[]);
+        // `text_fn("text")` — the `Str` parameter now has a call
+        // signature, so the call checks cleanly and publishes I32.
+        let str_call = assert_supported(&database, "str_call", &[]);
         let float_mismatch = assert_supported(
             &database,
             "float_mismatch",
@@ -71199,7 +71247,6 @@ property "shared"() {}
         );
         for name in [
             "generic_call",
-            "str_call",
             "shadowed_call",
             "deep_nested_call",
             "nested_shadowed_call",
@@ -71226,8 +71273,6 @@ property "shared"() {}
             "remainder_path_pair_deep_nested_unsupported",
             "remainder_generic_target_call_argument",
             "remainder_path_pair_generic_target_unsupported",
-            "remainder_unsupported_signature_call_argument",
-            "remainder_path_pair_unsupported_signature_unsupported",
             "remainder_literal_left_float_unsupported",
             "remainder_literal_left_computed_left_unsupported",
             "remainder_literal_left_computed_right_unsupported",
@@ -71236,7 +71281,6 @@ property "shared"() {}
             "remainder_literal_left_forward_rhs_unsupported",
             "remainder_literal_left_deep_nested_unsupported",
             "remainder_literal_left_generic_target_unsupported",
-            "remainder_literal_left_unsupported_signature",
             "remainder_literal_pair_float_left_unsupported",
             "remainder_literal_pair_float_right_unsupported",
             "remainder_literal_pair_byte_unsupported",
@@ -71246,7 +71290,6 @@ property "shared"() {}
             "remainder_literal_pair_computed_right_unsupported",
             "remainder_literal_pair_deep_nested_unsupported",
             "remainder_literal_pair_generic_target_unsupported",
-            "remainder_literal_pair_unsupported_signature",
             "logical_forward_local_paths_unsupported",
             "logical_integer_literal_operand_unsupported",
             "logical_character_literal_operand_unsupported",
@@ -71271,7 +71314,6 @@ property "shared"() {}
             "direct_neg_global_path_unsupported",
             "direct_neg_deep_nested_call_unsupported",
             "direct_neg_generic_target_unsupported",
-            "direct_neg_unsupported_signature_unsupported",
             "shift_computed_operand_unsupported",
             "shift_call_operand_unsupported",
             "shift_generic_target_unsupported",
@@ -71289,7 +71331,6 @@ property "shared"() {}
             "shift_byte_rhs_computed_right_unsupported",
             "shift_byte_rhs_deep_nested_unsupported",
             "shift_byte_rhs_generic_target_unsupported",
-            "shift_byte_rhs_unsupported_signature",
             "shift_byte_rhs_string_unsupported",
             "shift_byte_rhs_byte_string_unsupported",
             "shift_byte_literal_lhs_string_rhs_unsupported",
@@ -71299,7 +71340,6 @@ property "shared"() {}
             "shift_integer_literal_lhs_computed_path_rhs_unsupported",
             "shift_integer_literal_lhs_deep_nested_unsupported",
             "shift_integer_literal_lhs_generic_target_unsupported",
-            "shift_integer_literal_lhs_unsupported_signature",
             "shift_integer_literal_lhs_forward_path_unsupported",
             "shift_integer_literal_lhs_self_path_unsupported",
             "shift_integer_literal_lhs_global_path_unsupported",
@@ -71309,10 +71349,8 @@ property "shared"() {}
             "shift_byte_literal_lhs_forward_count_unsupported",
             "shift_byte_literal_lhs_deep_nested_unsupported",
             "shift_byte_literal_lhs_generic_target_unsupported",
-            "shift_byte_literal_lhs_unsupported_signature",
             "shift_integer_literal_rhs_deep_nested_unsupported",
             "shift_integer_literal_rhs_generic_target_unsupported",
-            "shift_integer_literal_rhs_unsupported_signature",
             "bitwise_literal_rhs_bool_unsupported",
             "bitwise_literal_rhs_byte_string_unsupported",
             "bitwise_literal_rhs_computed_unsupported",
@@ -71321,7 +71359,6 @@ property "shared"() {}
             "bitwise_literal_rhs_forward_path_unsupported",
             "bitwise_literal_rhs_deep_call_unsupported",
             "bitwise_literal_rhs_generic_target_unsupported",
-            "bitwise_literal_rhs_unsupported_signature",
             "bitwise_literal_rhs_char_unsupported",
             "bitwise_literal_rhs_float_unsupported",
             "bitwise_integer_literal_forward_left_unsupported",
@@ -71341,7 +71378,6 @@ property "shared"() {}
             "bitwise_byte_scalar_literal_rhs_nested_operator_unsupported",
             "bitwise_byte_scalar_literal_rhs_deep_call_unsupported",
             "bitwise_byte_scalar_literal_rhs_generic_target_unsupported",
-            "bitwise_byte_scalar_literal_rhs_unsupported_signature",
             "bitwise_byte_literal_rhs_byte_string_unsupported",
             "bitwise_byte_literal_rhs_computed_unsupported",
             "bitwise_byte_literal_rhs_nested_operator_unsupported",
@@ -71351,7 +71387,6 @@ property "shared"() {}
             "bitwise_byte_literal_rhs_forward_unsupported",
             "bitwise_byte_literal_deep_call_unsupported",
             "bitwise_byte_literal_generic_target_unsupported",
-            "bitwise_byte_literal_unsupported_signature",
             "bitwise_bool_literal_left_path_unsupported",
             "bitwise_char_literal_left_path_unsupported",
             "bitwise_float_literal_left_path_unsupported",
@@ -71362,13 +71397,11 @@ property "shared"() {}
             "bitwise_byte_integer_literal_nested_operator_unsupported",
             "bitwise_byte_integer_literal_deep_call_unsupported",
             "bitwise_byte_integer_literal_generic_target_unsupported",
-            "bitwise_byte_integer_literal_unsupported_signature",
             "bitwise_integer_byte_literal_pair_unsupported",
             "bitwise_byte_literal_pair_computed_unsupported",
             "bitwise_byte_literal_pair_nested_operator_unsupported",
             "bitwise_byte_literal_pair_deep_call_unsupported",
             "bitwise_byte_literal_pair_generic_target_unsupported",
-            "bitwise_byte_literal_pair_unsupported_signature",
             "bitwise_bool_literal_pair_unsupported",
             "bitwise_char_literal_pair_unsupported",
             "bitwise_float_literal_pair_unsupported",
@@ -71401,6 +71434,41 @@ property "shared"() {}
             "call_comparison_operand_unsupported",
             "deep_comparison_call_unsupported",
         ] {
+            // `text_fn(..)` now has a `Str` parameter signature, so
+            // non-`Str` arguments report a `Str` mismatch instead of
+            // gating behind an unknown signature.
+            for name in [
+                "remainder_unsupported_signature_call_argument",
+                "remainder_path_pair_unsupported_signature_unsupported",
+                "remainder_literal_left_unsupported_signature",
+                "remainder_literal_pair_unsupported_signature",
+                "direct_neg_unsupported_signature_unsupported",
+                "shift_byte_rhs_unsupported_signature",
+                "shift_integer_literal_lhs_unsupported_signature",
+                "shift_byte_literal_lhs_unsupported_signature",
+                "shift_integer_literal_rhs_unsupported_signature",
+                "bitwise_literal_rhs_unsupported_signature",
+                "bitwise_byte_scalar_literal_rhs_unsupported_signature",
+                "bitwise_byte_literal_unsupported_signature",
+                "bitwise_byte_integer_literal_unsupported_signature",
+                "bitwise_byte_literal_pair_unsupported_signature",
+            ] {
+                // `b'x'`/`b'a'` shift counts and byte-literal bitwise
+                // operands report their inner mismatch beside the
+                // `Str` parameter mismatch.
+                let expected = match name {
+                    "shift_byte_rhs_unsupported_signature"
+                    | "bitwise_byte_scalar_literal_rhs_unsupported_signature"
+                    | "bitwise_byte_integer_literal_unsupported_signature" => {
+                        vec![
+                            sai_diagnostics::Code::TypeMismatch,
+                            sai_diagnostics::Code::TypeMismatch,
+                        ]
+                    }
+                    _ => vec![sai_diagnostics::Code::TypeMismatch],
+                };
+                assert_supported(&database, name, &expected);
+            }
             assert!(
                 matches!(
                     owner_named(&database, &resolved, name)
@@ -83736,6 +83804,17 @@ property "shared"() {}
                 "float_fn(1.5)".len()
             ),
             Some(PrimTy::F32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                str_call,
+                "pub fn str_call",
+                "text_fn(\"text\")",
+                0,
+                "text_fn(\"text\")".len()
+            ),
+            Some(PrimTy::I32)
         );
         assert_eq!(
             expression_type_at_range(
