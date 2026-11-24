@@ -17692,6 +17692,7 @@ fn str_expr_family(
         ExprKind::Loop {
             body,
             source: LoopSource::Loop,
+            label,
             ..
         } => str_loop_family(
             owner,
@@ -17705,6 +17706,7 @@ fn str_expr_family(
             inputs,
             snapshot,
             target_cfg,
+            label.map(|label| label.name),
             call_signatures,
         ),
         ExprKind::Match {
@@ -18288,6 +18290,7 @@ fn str_loop_family(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    frame_label: Option<Symbol>,
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<(&'static str, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
@@ -18321,6 +18324,7 @@ fn str_loop_family(
         inputs,
         &mut contributions,
         false,
+        frame_label,
         call_signatures,
     );
     // A `break` whose value classifies carries its family; an unclassed
@@ -21270,6 +21274,7 @@ fn str_stmt_expr_unit(
                     inputs,
                     &mut contributions,
                     false,
+                    label.map(|label| label.name),
                     call_signatures,
                 );
                 // Unclassed contributions get the same silent expression-
@@ -21835,6 +21840,7 @@ fn str_stmt_loop_break_families<'h>(
         StrLocalBindings,
     )>,
     pure: bool,
+    frame_label: Option<Symbol>,
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) {
@@ -21903,6 +21909,7 @@ fn str_stmt_loop_break_families<'h>(
                 inputs,
                 out,
                 pure,
+                frame_label,
                 call_signatures,
             ),
             _ => {}
@@ -21918,6 +21925,7 @@ fn str_stmt_loop_break_families<'h>(
             inputs,
             out,
             pure,
+            frame_label,
             call_signatures,
         );
     }
@@ -22386,6 +22394,7 @@ fn str_pure_init_family(
         ExprKind::Loop {
             body,
             source: LoopSource::Loop,
+            label,
             ..
         } => {
             let mut contributions = Vec::new();
@@ -22398,6 +22407,7 @@ fn str_pure_init_family(
                 inputs,
                 &mut contributions,
                 true,
+                label.map(|label| label.name),
                 call_signatures,
             );
             // The same literal-vs-pin fold as the diagnostic walk, minus
@@ -22720,11 +22730,16 @@ fn str_stmt_break_families_expr<'h>(
         StrLocalBindings,
     )>,
     pure: bool,
+    frame_label: Option<Symbol>,
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) {
     match expr.kind {
-        ExprKind::Break { label: None, value } => {
+        // A `break` contributes to this frame when it is unlabeled or
+        // names this frame's own label (`'inner: loop { break 'inner "a" }`).
+        ExprKind::Break { label, value }
+            if label.is_none() || label.map(|label| label.name) == frame_label =>
+        {
             out.push((
                 str_stmt_break_family(
                     value,
@@ -22751,6 +22766,7 @@ fn str_stmt_break_families_expr<'h>(
                 inputs,
                 out,
                 pure,
+                frame_label,
                 call_signatures,
             );
             if let Some(els) = els {
@@ -22764,6 +22780,7 @@ fn str_stmt_break_families_expr<'h>(
                         inputs,
                         out,
                         pure,
+                        frame_label,
                         call_signatures,
                     ),
                     ExprKind::If { .. } => str_stmt_break_families_expr(
@@ -22775,6 +22792,7 @@ fn str_stmt_break_families_expr<'h>(
                         inputs,
                         out,
                         pure,
+                        frame_label,
                         call_signatures,
                     ),
                     _ => {}
@@ -22791,6 +22809,7 @@ fn str_stmt_break_families_expr<'h>(
                 inputs,
                 out,
                 pure,
+                frame_label,
                 call_signatures,
             );
         }
@@ -22803,6 +22822,7 @@ fn str_stmt_break_families_expr<'h>(
             inputs,
             out,
             pure,
+            frame_label,
             call_signatures,
         ),
         ExprKind::Match {
@@ -22847,6 +22867,7 @@ fn str_stmt_break_families_expr<'h>(
                     inputs,
                     out,
                     pure,
+                    frame_label,
                     call_signatures,
                 );
             }
