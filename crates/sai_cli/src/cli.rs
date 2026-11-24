@@ -2010,26 +2010,32 @@ fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize>
         let sai_syntax::ast::Item::Const(constant) = item else {
             return None;
         };
-        if constant.attrs().next().is_some()
-            || !constant
-                .visibility()
-                .is_some_and(|visibility| visibility.pub_token().is_some())
-        {
-            return None;
-        }
-        let name = constant.name()?;
-        let name_token = name.token()?;
-        let written_name = name_token.text();
-        if written_name.starts_with("r#")
-            || !written_name
-                .bytes()
-                .all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
-        {
+        if !check_public_const_decl(&constant) {
             return None;
         }
         const_count = const_count.checked_add(1)?;
     }
     (const_count > 0).then_some(const_count)
+}
+
+// An unattributed `pub const` with an uppercase name — the shape the const
+// coverage slices accept.
+fn check_public_const_decl(constant: &sai_syntax::ast::ConstDecl) -> bool {
+    if constant.attrs().next().is_some()
+        || !constant
+            .visibility()
+            .is_some_and(|visibility| visibility.pub_token().is_some())
+    {
+        return false;
+    }
+    let Some(name_token) = constant.name().and_then(|name| name.token()) else {
+        return false;
+    };
+    let written_name = name_token.text();
+    !written_name.starts_with("r#")
+        && written_name
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
 fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
@@ -2280,6 +2286,11 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
             sai_syntax::ast::Item::Impl(impl_decl) => {
                 saw_impl = true;
                 impls.push(impl_decl);
+            }
+            sai_syntax::ast::Item::Const(constant) => {
+                if !check_public_const_decl(&constant) {
+                    return false;
+                }
             }
             _ => return false,
         }
@@ -2554,6 +2565,7 @@ fn check_mixed_public_item_coverage(
     function_resolutions: &sai_driver::FunctionOwnerResolutions,
     type_resolutions: Option<&sai_driver::TypeOwnerResolutions>,
     method_resolutions: &sai_driver::TraitImplMemberTestOnlyResolutions,
+    const_resolutions: &sai_driver::ConstOwnerResolutions,
 ) -> bool {
     if !source_is_candidate
         || scopes.modules.len() != 1
@@ -2568,6 +2580,7 @@ fn check_mixed_public_item_coverage(
                     | sai_driver::TopLevelOwnerKind::Enum
                     | sai_driver::TopLevelOwnerKind::Distinct
                     | sai_driver::TopLevelOwnerKind::Impl
+                    | sai_driver::TopLevelOwnerKind::Const
             )
         })
         || scopes
@@ -2582,6 +2595,12 @@ fn check_mixed_public_item_coverage(
             .filter(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Impl)
             .count()
             != method_resolutions.owners().len()
+        || scopes
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Const)
+            .count()
+            != const_resolutions.owners().len()
         || method_resolutions.owners().is_empty()
     {
         return false;
@@ -2606,6 +2625,11 @@ fn check_mixed_public_item_coverage(
         .iter()
         .map(|owner| owner.owner())
         .collect::<HashSet<_>>();
+    let resolved_const_owner_ids = const_resolutions
+        .owners()
+        .iter()
+        .map(sai_driver::ConstOwnerResolution::owner)
+        .collect::<HashSet<_>>();
     scopes
         .top_level_owners
         .iter()
@@ -2616,7 +2640,15 @@ fn check_mixed_public_item_coverage(
             sai_driver::TopLevelOwnerKind::Impl => {
                 resolved_impl_owner_ids.contains(&descriptor.owner)
             }
+            sai_driver::TopLevelOwnerKind::Const => {
+                resolved_const_owner_ids.contains(&descriptor.owner)
+            }
             _ => resolved_type_owner_ids.contains(&descriptor.owner),
+        })
+        && const_resolutions.owners().iter().all(|owner| {
+            owner
+                .literal_check()
+                .is_ok_and(sai_driver::ConstLiteralCheck::is_supported)
         })
         && type_resolutions.is_none_or(|resolutions| {
             resolutions
@@ -7292,6 +7324,7 @@ fn module_tree_workspace_check_diagnostics(
                                 owner.kind,
                                 sai_driver::TopLevelOwnerKind::Function
                                     | sai_driver::TopLevelOwnerKind::Impl
+                                    | sai_driver::TopLevelOwnerKind::Const
                             )
                         }) {
                             Some(
@@ -7401,6 +7434,7 @@ fn module_tree_workspace_check_diagnostics(
                         &function_resolutions,
                         type_resolutions.as_ref(),
                         &method_resolutions,
+                        &const_resolutions,
                     ) {
                         mixed_public_items_covered = true;
                     }
