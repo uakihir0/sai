@@ -8206,7 +8206,15 @@ fn check_inherent_method_body_type<'a>(
         // member signatures — each sibling lowered once for its HIR
         // signature.
         let method_signatures = method_call_sites
-            .map(|sites| str_inherent_self_method_signatures(sites, impl_owner, inputs, symbols))
+            .map(|sites| {
+                str_inherent_self_method_signatures(
+                    sites,
+                    impl_owner,
+                    inputs,
+                    symbols,
+                    field_types.str_name_taken,
+                )
+            })
             .unwrap_or_default();
         let mut self_field_projections = HashMap::new();
         let mut self_method_calls = HashMap::new();
@@ -8347,7 +8355,15 @@ fn check_inherent_method_body_type<'a>(
     // `self.<method>(..)` calls resolve through the impl's sibling
     // member signatures, like the `-> Str` walk's.
     let method_signatures = method_call_sites
-        .map(|sites| str_inherent_self_method_signatures(sites, impl_owner, inputs, symbols))
+        .map(|sites| {
+            str_inherent_self_method_signatures(
+                sites,
+                impl_owner,
+                inputs,
+                symbols,
+                field_types.str_name_taken,
+            )
+        })
         .unwrap_or_default();
     let mut call_callee_ids = HashSet::new();
     let mut self_method_calls = HashMap::new();
@@ -8472,13 +8488,8 @@ fn check_inherent_method_body_type<'a>(
         diagnostics.extend(type_diagnostics);
         *primitive_type_results = Some(type_results);
         Ok(FunctionBodyTypeCheck::Supported { diagnostics })
-    } else if diagnostics.is_empty() {
-        Ok(FunctionBodyTypeCheck::Unsupported)
     } else {
-        // A `self.<missing>` still reports its field diagnostic —
-        // the method is erroneous whether or not the rest of the
-        // body stayed inside the walk's shapes.
-        Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+        Ok(FunctionBodyTypeCheck::Unsupported)
     }
 }
 
@@ -8499,6 +8510,10 @@ struct InherentMethodPrimitiveFields {
     // by record name. One level deep — a record-typed field inside a
     // nested record keeps the impl gated.
     nested: HashMap<String, NestedRecordFields<sai_resolve::prelude::PrimTy>>,
+    // Any record in the file named `Str` shadows the prelude name —
+    // `Str` spellings in sibling signatures then name that record,
+    // not core `Str`.
+    str_name_taken: bool,
 }
 
 // The field table of a record-typed `self` field's own record —
@@ -8881,6 +8896,7 @@ fn inherent_method_primitive_field_types(
         candidate_names,
         record_fields: receiver_fields,
         nested,
+        str_name_taken,
     })
 }
 
@@ -8903,6 +8919,9 @@ fn primitive_method_field_type(ty: &str) -> Option<sai_resolve::prelude::PrimTy>
         "USize" => PrimTy::USize,
         "F32" => PrimTy::F32,
         "F64" => PrimTy::F64,
+        // `Int`/`UInt` are the prelude's `I64`/`U64` aliases.
+        "Int" => PrimTy::I64,
+        "UInt" => PrimTy::U64,
         _ => return None,
     })
 }
@@ -9016,14 +9035,20 @@ struct InherentMethodStrFields {
     // Family tables for each receiver's record, keyed by record name;
     // `Str` leaves carry the `` `Str` `` family inside `fields`.
     nested: HashMap<String, NestedRecordFields<&'static str>>,
+    // Any record in the file named `Str` shadows the prelude name —
+    // `Str` spellings in sibling signatures then name that record,
+    // not core `Str`.
+    str_name_taken: bool,
 }
 
 // The family a record field type contributes to the Str walk: `Str`
 // for `Str`, the literal-family name for scalars, `None` for types
 // the walk cannot model.
-fn str_method_field_family(ty: &str) -> Option<&'static str> {
+fn str_method_field_family(ty: &str, str_name_taken: bool) -> Option<&'static str> {
     if ty == "Str" {
-        return Some("`Str`");
+        // A `Str` spelling is the core string only while no record in
+        // the file is named `Str`.
+        return (!str_name_taken).then_some("`Str`");
     }
     primitive_method_field_type(ty).and_then(str_prim_family_name)
 }
@@ -9055,6 +9080,7 @@ fn str_sig_ty_family(
     ty: &Ty<'_>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+    str_name_taken: bool,
 ) -> Option<&'static str> {
     match ty.kind {
         TyKind::Tuple(elements) if elements.is_empty() => Some("`()`"),
@@ -9065,7 +9091,10 @@ fn str_sig_ty_family(
                 && is_plain_ascii_identifier(path.segments[0].name, inputs) =>
         {
             let spelling = symbols.resolve(path.segments[0].name.sym).ok()?;
-            str_method_field_family(sai_syntax::normalize_identifier(spelling.as_ref()).as_str())
+            str_method_field_family(
+                sai_syntax::normalize_identifier(spelling.as_ref()).as_str(),
+                str_name_taken,
+            )
         }
         _ => None,
     }
@@ -9078,6 +9107,7 @@ fn str_self_method_signature(
     member_hir: &HirOwner<'_>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+    str_name_taken: bool,
 ) -> Option<(String, StrSelfMethodCallSignature)> {
     let OwnerNode::ImplItem(method) = member_hir.node else {
         return None;
@@ -9124,10 +9154,10 @@ fn str_self_method_signature(
     }
     let parameters: Vec<&'static str> = explicit_params
         .iter()
-        .map(|parameter| str_sig_ty_family(parameter.ty, symbols, inputs))
+        .map(|parameter| str_sig_ty_family(parameter.ty, symbols, inputs, str_name_taken))
         .collect::<Option<_>>()?;
     let output = match sig.ret {
-        Some(ty) => str_sig_ty_family(ty, symbols, inputs)?,
+        Some(ty) => str_sig_ty_family(ty, symbols, inputs, str_name_taken)?,
         None => "`()`",
     };
     let spelling = symbols.resolve(method.name.sym).ok()?;
@@ -9143,6 +9173,7 @@ fn str_inherent_self_method_signatures<'hir>(
     impl_owner: &HirOwner<'hir>,
     inputs: &'hir CurrentOwnerInputs,
     symbols: &Interner,
+    str_name_taken: bool,
 ) -> HashMap<String, StrSelfMethodCallSignature> {
     let mut signatures = HashMap::new();
     for (entry, member_owner) in sites.entries.iter().zip(sites.owners.iter().copied()) {
@@ -9163,7 +9194,9 @@ fn str_inherent_self_method_signatures<'hir>(
         ) else {
             continue;
         };
-        if let Some((name, signature)) = str_self_method_signature(&member_hir, symbols, inputs) {
+        if let Some((name, signature)) =
+            str_self_method_signature(&member_hir, symbols, inputs, str_name_taken)
+        {
             signatures.insert(name, signature);
         }
     }
@@ -9277,7 +9310,7 @@ fn str_inherent_method_field_types(
             if ty_text == "Str" && str_name_taken {
                 return None;
             }
-            let Some(field_family) = str_method_field_family(ty_text) else {
+            let Some(field_family) = str_method_field_family(ty_text, str_name_taken) else {
                 // A record-typed field inside a receiver record would
                 // take the chain two levels deep — the impl stays gated.
                 return None;
@@ -9345,7 +9378,7 @@ fn str_inherent_method_field_types(
             sai_syntax::normalize_identifier(ty_text.strip_prefix("r#").unwrap_or(ty_text));
         if nested.contains_key(normalized_ty.as_str()) {
             receiver_fields.insert(field_name.clone(), normalized_ty);
-        } else if let Some(field_family) = str_method_field_family(ty_text) {
+        } else if let Some(field_family) = str_method_field_family(ty_text, str_name_taken) {
             if field_types
                 .insert(field_name.clone(), field_family)
                 .is_some()
@@ -9368,6 +9401,7 @@ fn str_inherent_method_field_types(
         candidate_names,
         record_fields: receiver_fields,
         nested,
+        str_name_taken,
     })
 }
 
@@ -10342,11 +10376,14 @@ fn is_supported_direct_call_argument_shape(
             primitive_types,
         ),
         // A known self field passes its declared type like a path
-        // argument; an unknown field recovers through the tainted leaf
+        // argument — a `Str`-family projection carries `LocalType::Str`,
+        // so `self.m(self.text)` arguments check against a `Str`
+        // parameter. An unknown field recovers through the tainted leaf
         // path so the `UnknownField` diagnostic survives.
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&expression.hir_id))
                 || unknown_self_fields.is_some_and(|fields| fields.contains(&expression.hir_id))
+                || str_self_field_projected_family(expression, inputs).is_some()
         }
         ExprKind::Unary(UnOp::Not, _) => is_supported_direct_call_not_argument_shape(
             expression,
@@ -104849,6 +104886,12 @@ property "shared"() {}
             "  pub fn call(self: borrow Self) -> Str {\n",
             "    self.inner.is_empty()\n",
             "  }\n",
+            "  pub fn take(self: borrow Self, s: Str) -> I32 {\n",
+            "    self.count\n",
+            "  }\n",
+            "  pub fn call_sig(self: borrow Self) -> I32 {\n",
+            "    self.take(\"a\")\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -104869,7 +104912,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let methods = &results.owners()[0].members();
-        assert_eq!(methods.len(), 3);
+        assert_eq!(methods.len(), 5);
         // `inner: Str` names the user record — `self.inner.v` projects
         // its `I32` leaf instead of gate or core-`Str` semantics.
         let check = methods[0].body_type_check().expect("body check runs");
@@ -104892,6 +104935,20 @@ property "shared"() {}
         assert!(
             matches!(check, FunctionBodyTypeCheck::Unsupported),
             "call stays gated: {check:?}"
+        );
+        // `s: Str` names the user record, not core `Str` — a record
+        // parameter is outside the primitive walk, so the method's own
+        // body gates too, and `self.take("a")` gates instead of passing
+        // a `Str` literal to a record parameter.
+        let check = methods[3].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "record-param method stays gated: {check:?}"
+        );
+        let check = methods[4].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "call_sig stays gated on the shadowed `Str` param: {check:?}"
         );
     }
 
@@ -104932,6 +104989,21 @@ property "shared"() {}
             "  pub fn paren_callee(self: borrow Self) -> I32 {\n",
             "    (self.size)()\n",
             "  }\n",
+            "  pub fn take_text(self: borrow Self, s: Str) -> I32 {\n",
+            "    self.size()\n",
+            "  }\n",
+            "  pub fn str_arg(self: borrow Self) -> I32 {\n",
+            "    self.take_text(self.text)\n",
+            "  }\n",
+            "  pub fn str_arg_bad(self: borrow Self) -> I32 {\n",
+            "    self.take_text(self.count)\n",
+            "  }\n",
+            "  pub fn take_int(self: borrow Self, x: Int) -> I32 {\n",
+            "    self.size()\n",
+            "  }\n",
+            "  pub fn int_arg(self: borrow Self) -> I32 {\n",
+            "    self.take_int(1)\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -104952,11 +105024,20 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let methods = &results.owners()[0].members();
-        assert_eq!(methods.len(), 9);
+        assert_eq!(methods.len(), 14);
         // `self.<method>(..)` calls in `-> <prim>` bodies resolve the
         // sibling's signature — positionally checked args, Str outputs
-        // bind like `-> Str` callees.
-        for (index, name) in [(2, "ok"), (3, "cond"), (4, "str_bind")] {
+        // bind like `-> Str` callees. A `Str` field passes its family
+        // as an argument, and the `Int` prelude alias types as `I64`.
+        for (index, name) in [
+            (2, "ok"),
+            (3, "cond"),
+            (4, "str_bind"),
+            (9, "take_text"),
+            (10, "str_arg"),
+            (12, "take_int"),
+            (13, "int_arg"),
+        ] {
             let check = methods[index].body_type_check().expect("body check runs");
             let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
                 panic!("{name} checks the sibling call: {check:?}");
@@ -104986,6 +105067,18 @@ property "shared"() {}
                 .any(|d| d.code == sai_diagnostics::Code::TypeMismatch),
             "{diagnostics:?}"
         );
+        // A `Str` field against a `Str` parameter checks; a scalar
+        // field reports the mismatch.
+        let check = methods[11].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("str_arg_bad reports: {check:?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == sai_diagnostics::Code::TypeMismatch),
+            "{diagnostics:?}"
+        );
         // A `self.<name>(..)` callee that is no sibling method is a
         // method call without a signature — the call gates, and no
         // `UnknownField` is reported for a method-syntax name.
@@ -104994,14 +105087,14 @@ property "shared"() {}
             matches!(check, FunctionBodyTypeCheck::Unsupported),
             "missing stays gated without a field error: {check:?}"
         );
-        // `(self.<name>)(..)` is a value read — an unknown name keeps
-        // its `UnknownField` diagnostic.
+        // `(self.<name>)(..)` is a value read — the prim walk's
+        // gate drops the collected `UnknownField` like any other
+        // unsupported shape, so the method stays gated.
         let check = methods[8].body_type_check().expect("body check runs");
-        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
-            panic!("paren_callee reports its field error: {check:?}");
-        };
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "paren_callee stays gated like other unsupported shapes: {check:?}"
+        );
     }
 
     #[test]
