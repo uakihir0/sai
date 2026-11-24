@@ -21247,6 +21247,36 @@ fn check_function_str_local_block(
                 };
                 diagnostics.append(&mut loop_diagnostics);
             }
+            // `let s = { <Str stmts> <Str tail> }` runs the shared
+            // statement walk on the block — the tail needs a clean
+            // `Str` yield like the `if` initializer's branch rule.
+            ExprKind::Block(inner) => {
+                if inner.safety != sai_hir::Safety::Safe
+                    || !str_clean_block(inner, locals, str_bindings, false, inputs, call_signatures)
+                {
+                    return Ok(None);
+                }
+                let mut inner_bindings = str_bindings.clone();
+                let Some(mut block_diagnostics) = check_function_str_local_block(
+                    owner,
+                    return_ty,
+                    inner,
+                    &mut inner_bindings,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    break_ctx,
+                    frame,
+                    call_signatures,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut block_diagnostics);
+            }
             // `let s = match s { ... }` needs a clean `Str` arm yield like
             // the `if` initializer's `branch_yields_str` rule.
             ExprKind::Match {
@@ -22684,10 +22714,12 @@ fn str_pure_init_family(
             } else {
                 return None;
             };
-            if args.len() != parameters.len() {
-                return None;
-            }
-            for argument in args {
+            // An arity mismatch is still a resolvable call shape —
+            // the diagnostic walk reports WRONG_ARGUMENT_COUNT — so
+            // only the shared positional prefix needs supported
+            // arguments; excess arguments stay unchecked like the
+            // kernel's bound.
+            for (argument, _) in args.iter().zip(&parameters) {
                 str_pure_init_family(
                     argument.expr,
                     locals,
@@ -23388,15 +23420,19 @@ fn str_stmt_block_unit(
                     target_cfg,
                 )? {
                     Some(found) => found,
-                    // `let n = if`/`loop`/`block`/`match` inside a
-                    // statement block binds the joined family like the
-                    // group-level initializer dispatch.
+                    // `let n = if`/`loop`/`block`/`match` and operand
+                    // or call initializers inside a statement block
+                    // bind their family like the group-level
+                    // initializer dispatch.
                     None if matches!(
                         init.kind,
                         ExprKind::If { .. }
                             | ExprKind::Block(_)
                             | ExprKind::Loop { .. }
                             | ExprKind::Match { .. }
+                            | ExprKind::Unary(_, _)
+                            | ExprKind::Binary(_, _, _)
+                            | ExprKind::Call { base: None, .. }
                     ) =>
                     {
                         let Some(found) = str_expr_family(
@@ -23593,7 +23629,7 @@ fn str_loop_level_block(
                     }
                     None => (None, None),
                 };
-                let Some((family, mut init_diagnostics)) = str_literal_family_init(
+                let (family, mut init_diagnostics) = match str_literal_family_init(
                     owner,
                     init,
                     locals,
@@ -23603,9 +23639,43 @@ fn str_loop_level_block(
                     inputs,
                     snapshot,
                     target_cfg,
-                )?
-                else {
-                    return Ok(None);
+                )? {
+                    Some(found) => found,
+                    // `let n = if`/`loop`/`block`/`match` and operand
+                    // or call initializers inside a `Str` loop body
+                    // bind their family like the group-level
+                    // initializer dispatch.
+                    None if matches!(
+                        init.kind,
+                        ExprKind::If { .. }
+                            | ExprKind::Block(_)
+                            | ExprKind::Loop { .. }
+                            | ExprKind::Match { .. }
+                            | ExprKind::Unary(_, _)
+                            | ExprKind::Binary(_, _, _)
+                            | ExprKind::Call { base: None, .. }
+                    ) =>
+                    {
+                        let Some(found) = str_expr_family(
+                            owner,
+                            return_ty,
+                            init,
+                            locals,
+                            str_bindings,
+                            expected,
+                            type_paths,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                            call_signatures,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        found
+                    }
+                    None => return Ok(None),
                 };
                 let PatKind::Binding {
                     mode:
