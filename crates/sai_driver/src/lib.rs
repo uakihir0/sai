@@ -22620,8 +22620,11 @@ fn str_clean_block(
     for stmt in block.stmts {
         match stmt.kind {
             sai_hir::expressions::StmtKind::Expr(expr) => {
-                clean |=
-                    str_clean_expr(expr, locals, &bindings, loop_level, inputs, call_signatures);
+                // A statement's own value is discarded, so only a
+                // `break <Str>` carried through it (possibly nested
+                // under `if`/`match`/`block`) counts as a `Str`
+                // yield.
+                clean |= str_stmt_str_break(expr, locals, &bindings, inputs, call_signatures);
             }
             sai_hir::expressions::StmtKind::Let { pat, init, .. } => {
                 if let PatKind::Binding {
@@ -22651,6 +22654,102 @@ fn str_clean_block(
         || block.tail.is_some_and(|tail| {
             str_clean_expr(tail, locals, &bindings, loop_level, inputs, call_signatures)
         })
+}
+
+// Whether a statement-position expression carries a `break <Str>`
+// contribution for the enclosing `loop`: its own value is discarded,
+// so only `break` statements nested under `if`/`match`/inner blocks
+// count. Value-position `loop`s are not scanned — their breaks bind
+// to themselves.
+fn str_stmt_str_break(
+    expr: &HirExpr<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> bool {
+    match expr.kind {
+        ExprKind::Break {
+            label: None,
+            value: Some(value),
+        } => str_clean_expr(value, locals, str_bindings, false, inputs, call_signatures),
+        ExprKind::Block(block) => {
+            str_stmt_block_str_break(block, locals, str_bindings, inputs, call_signatures)
+        }
+        ExprKind::If { then, els, .. } => {
+            str_stmt_block_str_break(then, locals, str_bindings, inputs, call_signatures)
+                || els.is_some_and(|els| {
+                    str_stmt_str_break(els, locals, str_bindings, inputs, call_signatures)
+                })
+        }
+        ExprKind::Match { arms, source, .. } => {
+            matches!(
+                source,
+                MatchSource::Normal | MatchSource::IfLet | MatchSource::WhileLet
+            ) && arms.iter().any(|arm| {
+                let mut bindings = str_bindings.clone();
+                if let PatKind::Binding {
+                    mode:
+                        sai_hir::patterns::BindingMode::Value | sai_hir::patterns::BindingMode::Var,
+                    binding,
+                    sub: None,
+                    ..
+                } = arm.pat.kind
+                {
+                    bindings.insert(
+                        binding,
+                        StrLocalEntry {
+                            family: "`Str`",
+                            literal: None,
+                        },
+                    );
+                }
+                str_stmt_str_break(arm.body, locals, &bindings, inputs, call_signatures)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn str_stmt_block_str_break(
+    block: &sai_hir::expressions::Block<'_>,
+    locals: &LocalResolution,
+    str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> bool {
+    let mut bindings = str_bindings.clone();
+    block.stmts.iter().any(|stmt| {
+        match stmt.kind {
+            sai_hir::expressions::StmtKind::Expr(expr) => {
+                str_stmt_str_break(expr, locals, &bindings, inputs, call_signatures)
+            }
+            // `let` bindings declared inside a scanned block seed
+            // the group for later `break t` statements.
+            sai_hir::expressions::StmtKind::Let { pat, init, .. } => {
+                if let PatKind::Binding {
+                    mode:
+                        sai_hir::patterns::BindingMode::Value | sai_hir::patterns::BindingMode::Var,
+                    binding,
+                    sub: None,
+                    ..
+                } = pat.kind
+                {
+                    if str_clean_expr(init, locals, &bindings, false, inputs, call_signatures) {
+                        bindings.insert(
+                            binding,
+                            StrLocalEntry {
+                                family: "`Str`",
+                                literal: None,
+                            },
+                        );
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    })
 }
 
 fn str_clean_expr(
@@ -61977,6 +62076,7 @@ property "shared"() {}
             "pub fn str_call_if_call_branches(flag: Bool) -> USize { let s = if flag { str_call_make() } else { str_call_make() }\n    s.len() }\n",
             "pub fn str_call_match_call_arms(flag: Bool) -> USize { let s = match flag { true => str_call_make(), _ => str_call_make() }\n    s.len() }\n",
             "pub fn str_call_if_tail_calls(flag: Bool) -> Str { if flag { str_call_make() } else { str_call_make() } }\n",
+            "pub fn str_call_stmt_if_branch(flag: Bool) -> Bool { let s = if flag { { str_call_make()\n true } } else { false }\n    s }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61993,7 +62093,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 72);
+        assert_eq!(owners.len(), 73);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
