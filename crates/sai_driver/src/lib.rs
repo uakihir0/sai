@@ -8644,7 +8644,6 @@ fn parse_inherent_method_record(
     let type_name_span =
         sai_diagnostics::Span::new(inputs.source.id(), type_name_node.syntax().text_range());
     let struct_def = type_decl.struct_def()?;
-    let fields = struct_def.fields()?;
     if type_decl.attrs().next().is_some()
         || type_decl
             .syntax()
@@ -8654,31 +8653,40 @@ fn parse_inherent_method_record(
             .syntax()
             .descendants()
             .any(|node| ast::Attribute::can_cast(node.kind()))
+        || type_decl.syntax().descendants().any(|node| {
+            node.kind() == sai_syntax::SyntaxKind::ERROR
+                || node
+                    .children_with_tokens()
+                    .any(|element| element.as_token().is_some_and(|token| token.has_error()))
+        })
         || struct_def.where_clause().is_some()
-        || fields.fields().next().is_none()
     {
         return None;
     }
+    // An empty record has no fields to verify — it is admissible as a
+    // sibling declaration without contributing projections.
     let mut parsed_fields = Vec::new();
-    for field in fields.fields() {
-        if field.attrs().next().is_some() {
-            return None;
+    if let Some(fields) = struct_def.fields() {
+        for field in fields.fields() {
+            if field.attrs().next().is_some() {
+                return None;
+            }
+            let field_name_node = field.name()?;
+            let field_name = field_name_node.token()?.text().to_owned();
+            let field_spelling = field_name.strip_prefix("r#").unwrap_or(&field_name);
+            let normalized_field_name = sai_syntax::normalize_identifier(field_spelling);
+            let ty = field.ty()?;
+            let range = ty.syntax().text_range();
+            let ty_text = inputs
+                .source
+                .text()
+                .get(range.start().to_usize()..range.end().to_usize())?;
+            parsed_fields.push((
+                normalized_field_name,
+                ty_text.to_owned(),
+                field_spelling.to_owned(),
+            ));
         }
-        let field_name_node = field.name()?;
-        let field_name = field_name_node.token()?.text().to_owned();
-        let field_spelling = field_name.strip_prefix("r#").unwrap_or(&field_name);
-        let normalized_field_name = sai_syntax::normalize_identifier(field_spelling);
-        let ty = field.ty()?;
-        let range = ty.syntax().text_range();
-        let ty_text = inputs
-            .source
-            .text()
-            .get(range.start().to_usize()..range.end().to_usize())?;
-        parsed_fields.push((
-            normalized_field_name,
-            ty_text.to_owned(),
-            field_spelling.to_owned(),
-        ));
     }
     Some(ParsedMethodRecord {
         type_name,
