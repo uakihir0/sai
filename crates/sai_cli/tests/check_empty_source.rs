@@ -3629,6 +3629,27 @@ fn public_field_naming_private_type_stays_gated() {
 }
 
 #[test]
+fn self_keyword_field_type_stays_gated() {
+    // `Self` is invalid outside `impl`/`trait` headers — a `type r#Self`
+    // decl must not let `s: Self` pass as a record name (IR-1135
+    // review).
+    let source = concat!(
+        "type r#Self { x: I32 }\n",
+        "type Outer { s: Self }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "a `Self` field type stays gated: {stdout}"
+    );
+}
+
+#[test]
 fn raw_ident_field_type_resolves_declared_type() {
     // `r#`-spelling differences between the field type and the `type`
     // decl resolve to the same record (IR-1135 review).

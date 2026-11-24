@@ -2199,9 +2199,14 @@ fn check_type_decl_primitive_fields(
                         return false;
                     };
                     let normalized = normalize_type_name(text);
-                    let declared = type_names
-                        .iter()
-                        .any(|name| normalize_type_name(name) == normalized);
+                    // `Self` is invalid outside `impl`/`trait` headers —
+                    // a `type r#Self` decl must not let it pass as a
+                    // record name (upstream rejects it on type-path
+                    // resolution).
+                    let declared = !matches!(text, "Self" | "self" | "r#Self" | "r#self")
+                        && type_names
+                            .iter()
+                            .any(|name| normalize_type_name(name) == normalized);
                     // A `pub` field on a public record exposing a
                     // package-private type is PRIVATE_TYPE_IN_PUBLIC_API
                     // upstream — the coverage gate cannot emit it, so
