@@ -20984,9 +20984,11 @@ fn check_function_str_local_block(
         }
         // Non-literal initializers — `if`/`loop`/`match`/block — that join
         // a non-`Str` family bind it directly: `let n = if c { 1 } else
-        // { 2 }` gives `n: I64`. `Str`-joining shapes fall through to the
-        // shared `Str` walk (it emits the recoverable branch
-        // diagnostics), and unclassed shapes gate.
+        // { 2 }` gives `n: I64`. `Str`-yielding shapes skip this probe
+        // entirely: its diagnostics would be discarded when the guard
+        // falls through to the `Str` match, but its shared literal-seed
+        // resolutions persist — `let n = 300; let s = { take_i8(n); "s" }`
+        // would resolve `n` to `I8` here and lose the range error.
         // Operand trees (`let m = n + 1`, `let m = -n`, `let m = n < 2`)
         // bind whatever family the fold reports — a `Str` result only
         // arises from arithmetic on `Str` operands, which already
@@ -21038,59 +21040,85 @@ fn check_function_str_local_block(
             );
             continue;
         }
+        // The probe binds non-`Str` families directly; a `Str` result
+        // falls through to the shared `Str` walk, which re-checks the
+        // initializer and emits the real diagnostics. The probe still
+        // resolves shared literal-seed cells as a side effect — losing
+        // the range error a second walk would report (`let n = 300; let
+        // s = { take_i8(n); "s" }` would bind `n` to `I8` here and the
+        // discarded diagnostic would never resurface). Snapshot the
+        // resolved cells first and roll them back whenever the probe
+        // does not bind the initializer.
         if matches!(
             init.kind,
             ExprKind::If { .. }
                 | ExprKind::Block(_)
                 | ExprKind::Loop { .. }
                 | ExprKind::Match { .. }
-        ) && let Some((family, mut init_diagnostics)) = str_expr_family(
-            owner,
-            return_ty,
-            init,
-            locals,
-            str_bindings,
-            expected,
-            type_paths,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-            // A scalar pin must bind through this path too — a matching
-            // family (`I8` init on `x: I8`) or a `Str` mismatch (`x: I8 =
-            // "a"`) both bind the pin rather than the Str-initializer walk.
-            call_signatures,
-        )? && (family != "`Str`" || pinned.is_some_and(|p| p != "`Str`"))
-        {
-            let PatKind::Binding {
-                mode: sai_hir::patterns::BindingMode::Value | sai_hir::patterns::BindingMode::Var,
-                binding,
-                sub: None,
-                ..
-            } = pat.kind
-            else {
-                return Ok(None);
-            };
-            if let Some(pinned) = pinned
-                && family != pinned
-                && family != "`!`"
+        ) {
+            let seed_snapshot: Vec<_> = str_bindings
+                .values()
+                .filter_map(|entry| entry.literal.as_ref())
+                .map(|seed| {
+                    let root = str_seed_root(seed);
+                    (root.resolved.clone(), root.resolved.get())
+                })
+                .collect();
+            let probe = str_expr_family(
+                owner,
+                return_ty,
+                init,
+                locals,
+                str_bindings,
+                expected,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                // A scalar pin must bind through this path too — a
+                // matching family (`I8` init on `x: I8`) or a `Str`
+                // mismatch (`x: I8 = "a"`) both bind the pin rather
+                // than the Str-initializer walk.
+                call_signatures,
+            )?;
+            if let Some((family, mut init_diagnostics)) = probe
+                && (family != "`Str`" || pinned.is_some_and(|p| p != "`Str`"))
             {
-                init_diagnostics.push(const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    init.span,
-                    sai_diagnostics::Code::TypeMismatch,
-                    format!("expected {pinned}, found {family}"),
-                    "type mismatch",
-                )?);
+                let PatKind::Binding {
+                    mode:
+                        sai_hir::patterns::BindingMode::Value | sai_hir::patterns::BindingMode::Var,
+                    binding,
+                    sub: None,
+                    ..
+                } = pat.kind
+                else {
+                    return Ok(None);
+                };
+                if let Some(pinned) = pinned
+                    && family != pinned
+                    && family != "`!`"
+                {
+                    init_diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        init.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected {pinned}, found {family}"),
+                        "type mismatch",
+                    )?);
+                }
+                diagnostics.append(&mut init_diagnostics);
+                str_bindings.insert(
+                    binding,
+                    str_let_entry(init, family, pinned, locals, str_bindings),
+                );
+                continue;
             }
-            diagnostics.append(&mut init_diagnostics);
-            str_bindings.insert(
-                binding,
-                str_let_entry(init, family, pinned, locals, str_bindings),
-            );
-            continue;
+            for (cell, value) in seed_snapshot {
+                cell.set(value);
+            }
         }
         // `let s = if <lit bool> { <Str block> } else { <Str block> }` runs
         // the shared block walk on each branch with a cloned binding set.
@@ -63668,7 +63696,8 @@ property "shared"() {}
                         .expect("Str local body check succeeds"),
                     FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
                 ),
-                "clean owner #{index} produced diagnostics: {:?}",
+                "clean owner #{index} {:?} produced diagnostics: {:?}",
+                owner.owner,
                 owner.body_type_check()
             );
         }
