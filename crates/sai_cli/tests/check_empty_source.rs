@@ -22095,9 +22095,10 @@ fn multi_file_source_reports_other_file_diagnostics() {
 }
 
 #[test]
-fn multi_file_source_with_non_mixed_file_stays_gated() {
-    // A file that is not mixed-shaped (a lone `pub fn`) keeps the
-    // whole package behind the coverage gate (IR-1141 bound).
+fn multi_file_source_with_fragment_files_checks() {
+    // fn-only / type-only / const-only sibling files join the covered
+    // set — every file just needs checked item kinds, and the package
+    // needs at least one impl owner overall (IR-1141).
     let root_source = concat!(
         "type Inner { s: Str }\n",
         "impl Inner {\n",
@@ -22109,13 +22110,42 @@ fn multi_file_source_with_non_mixed_file_stays_gated() {
     let output = run_check(
         root_source,
         "",
-        &[("src/fnonly.sai", "pub fn helper() -> I32 {\n    1\n}\n")],
+        &[
+            ("src/fnonly.sai", "pub fn helper() -> I32 {\n    1\n}\n"),
+            ("src/tyonly.sai", "type Extra { v: I32 }\n"),
+            ("src/consts.sai", "pub const LIMIT: I32 = 5\n"),
+        ],
         &[],
     );
-    assert!(!output.status.success(), "non-mixed file must gate");
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn multi_file_source_with_impl_only_file_stays_gated() {
+    // An `impl` whose record is not declared in the same file cannot
+    // resolve its self type (cross-file impls need `use`), so the
+    // package stays gated (IR-1141 bound).
+    let root_source = concat!(
+        "type Inner { s: Str }\n",
+        "impl Inner {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.s\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/implonly.sai",
+            "impl Inner {\n    pub fn other(self: borrow Self) -> Str {\n        self.s\n    }\n}\n",
+        )],
+        &[],
+    );
+    assert!(!output.status.success(), "impl-only file must gate");
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert!(
         stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
-        "non-mixed files stay behind the existing gate: {stdout}"
+        "impl-only files stay behind the existing gate: {stdout}"
     );
 }
