@@ -17767,11 +17767,32 @@ fn str_expr_family(
             }) else {
                 return Ok(None);
             };
-            if args.len() != parameters.len() {
-                return Ok(None);
-            }
             let mut diagnostics = Vec::new();
-            for (argument, (parameter_family, expected)) in args.iter().zip(&parameters) {
+            // Mirrors `check_direct_call`: an arity mismatch reports
+            // WRONG_ARGUMENT_COUNT and still checks the shared
+            // positional prefix; named arguments report on every
+            // written argument.
+            if args.len() != parameters.len() {
+                let noun = if parameters.len() == 1 {
+                    "argument"
+                } else {
+                    "arguments"
+                };
+                diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    expr.span,
+                    sai_diagnostics::Code::WrongArgumentCount,
+                    format!(
+                        "function expects {} {noun} but found {}",
+                        parameters.len(),
+                        args.len()
+                    ),
+                    "wrong number of arguments",
+                )?);
+            }
+            for (index, argument) in args.iter().enumerate() {
                 // Mirrors the checker: named arguments on a function call
                 // report NAMED_ARGUMENT_ON_FUNCTION but still check
                 // positionally.
@@ -17786,6 +17807,9 @@ fn str_expr_family(
                         "named argument is not allowed in a function call",
                     )?);
                 }
+                let Some((parameter_family, expected)) = parameters.get(index) else {
+                    continue;
+                };
                 let Some((family, mut arg_diagnostics)) = str_expr_family(
                     owner,
                     return_ty,
@@ -20960,9 +20984,11 @@ fn check_function_str_local_block(
         }
         // Non-literal initializers — `if`/`loop`/`match`/block — that join
         // a non-`Str` family bind it directly: `let n = if c { 1 } else
-        // { 2 }` gives `n: I64`. `Str`-joining shapes fall through to the
-        // shared `Str` walk (it emits the recoverable branch
-        // diagnostics), and unclassed shapes gate.
+        // { 2 }` gives `n: I64`. `Str`-yielding shapes skip this probe
+        // entirely: its diagnostics would be discarded when the guard
+        // falls through to the `Str` match, but its shared literal-seed
+        // resolutions persist — `let n = 300; let s = { take_i8(n); "s" }`
+        // would resolve `n` to `I8` here and lose the range error.
         // Operand trees (`let m = n + 1`, `let m = -n`, `let m = n < 2`)
         // bind whatever family the fold reports — a `Str` result only
         // arises from arithmetic on `Str` operands, which already
@@ -21014,59 +21040,85 @@ fn check_function_str_local_block(
             );
             continue;
         }
+        // The probe binds non-`Str` families directly; a `Str` result
+        // falls through to the shared `Str` walk, which re-checks the
+        // initializer and emits the real diagnostics. The probe still
+        // resolves shared literal-seed cells as a side effect — losing
+        // the range error a second walk would report (`let n = 300; let
+        // s = { take_i8(n); "s" }` would bind `n` to `I8` here and the
+        // discarded diagnostic would never resurface). Snapshot the
+        // resolved cells first and roll them back whenever the probe
+        // does not bind the initializer.
         if matches!(
             init.kind,
             ExprKind::If { .. }
                 | ExprKind::Block(_)
                 | ExprKind::Loop { .. }
                 | ExprKind::Match { .. }
-        ) && let Some((family, mut init_diagnostics)) = str_expr_family(
-            owner,
-            return_ty,
-            init,
-            locals,
-            str_bindings,
-            expected,
-            type_paths,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-            // A scalar pin must bind through this path too — a matching
-            // family (`I8` init on `x: I8`) or a `Str` mismatch (`x: I8 =
-            // "a"`) both bind the pin rather than the Str-initializer walk.
-            call_signatures,
-        )? && (family != "`Str`" || pinned.is_some_and(|p| p != "`Str`"))
-        {
-            let PatKind::Binding {
-                mode: sai_hir::patterns::BindingMode::Value | sai_hir::patterns::BindingMode::Var,
-                binding,
-                sub: None,
-                ..
-            } = pat.kind
-            else {
-                return Ok(None);
-            };
-            if let Some(pinned) = pinned
-                && family != pinned
-                && family != "`!`"
+        ) {
+            let seed_snapshot: Vec<_> = str_bindings
+                .values()
+                .filter_map(|entry| entry.literal.as_ref())
+                .map(|seed| {
+                    let root = str_seed_root(seed);
+                    (root.resolved.clone(), root.resolved.get())
+                })
+                .collect();
+            let probe = str_expr_family(
+                owner,
+                return_ty,
+                init,
+                locals,
+                str_bindings,
+                expected,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                // A scalar pin must bind through this path too — a
+                // matching family (`I8` init on `x: I8`) or a `Str`
+                // mismatch (`x: I8 = "a"`) both bind the pin rather
+                // than the Str-initializer walk.
+                call_signatures,
+            )?;
+            if let Some((family, mut init_diagnostics)) = probe
+                && (family != "`Str`" || pinned.is_some_and(|p| p != "`Str`"))
             {
-                init_diagnostics.push(const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    init.span,
-                    sai_diagnostics::Code::TypeMismatch,
-                    format!("expected {pinned}, found {family}"),
-                    "type mismatch",
-                )?);
+                let PatKind::Binding {
+                    mode:
+                        sai_hir::patterns::BindingMode::Value | sai_hir::patterns::BindingMode::Var,
+                    binding,
+                    sub: None,
+                    ..
+                } = pat.kind
+                else {
+                    return Ok(None);
+                };
+                if let Some(pinned) = pinned
+                    && family != pinned
+                    && family != "`!`"
+                {
+                    init_diagnostics.push(const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        init.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected {pinned}, found {family}"),
+                        "type mismatch",
+                    )?);
+                }
+                diagnostics.append(&mut init_diagnostics);
+                str_bindings.insert(
+                    binding,
+                    str_let_entry(init, family, pinned, locals, str_bindings),
+                );
+                continue;
             }
-            diagnostics.append(&mut init_diagnostics);
-            str_bindings.insert(
-                binding,
-                str_let_entry(init, family, pinned, locals, str_bindings),
-            );
-            continue;
+            for (cell, value) in seed_snapshot {
+                cell.set(value);
+            }
         }
         // `let s = if <lit bool> { <Str block> } else { <Str block> }` runs
         // the shared block walk on each branch with a cloned binding set.
@@ -21222,6 +21274,36 @@ fn check_function_str_local_block(
                     return Ok(None);
                 };
                 diagnostics.append(&mut loop_diagnostics);
+            }
+            // `let s = { <Str stmts> <Str tail> }` runs the shared
+            // statement walk on the block — the tail needs a clean
+            // `Str` yield like the `if` initializer's branch rule.
+            ExprKind::Block(inner) => {
+                if inner.safety != sai_hir::Safety::Safe
+                    || !str_clean_block(inner, locals, str_bindings, false, inputs, call_signatures)
+                {
+                    return Ok(None);
+                }
+                let mut inner_bindings = str_bindings.clone();
+                let Some(mut block_diagnostics) = check_function_str_local_block(
+                    owner,
+                    return_ty,
+                    inner,
+                    &mut inner_bindings,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    break_ctx,
+                    frame,
+                    call_signatures,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.append(&mut block_diagnostics);
             }
             // `let s = match s { ... }` needs a clean `Str` arm yield like
             // the `if` initializer's `branch_yields_str` rule.
@@ -22660,10 +22742,12 @@ fn str_pure_init_family(
             } else {
                 return None;
             };
-            if args.len() != parameters.len() {
-                return None;
-            }
-            for argument in args {
+            // An arity mismatch is still a resolvable call shape —
+            // the diagnostic walk reports WRONG_ARGUMENT_COUNT — so
+            // only the shared positional prefix needs supported
+            // arguments; excess arguments stay unchecked like the
+            // kernel's bound.
+            for (argument, _) in args.iter().zip(&parameters) {
                 str_pure_init_family(
                     argument.expr,
                     locals,
@@ -23364,15 +23448,19 @@ fn str_stmt_block_unit(
                     target_cfg,
                 )? {
                     Some(found) => found,
-                    // `let n = if`/`loop`/`block`/`match` inside a
-                    // statement block binds the joined family like the
-                    // group-level initializer dispatch.
+                    // `let n = if`/`loop`/`block`/`match` and operand
+                    // or call initializers inside a statement block
+                    // bind their family like the group-level
+                    // initializer dispatch.
                     None if matches!(
                         init.kind,
                         ExprKind::If { .. }
                             | ExprKind::Block(_)
                             | ExprKind::Loop { .. }
                             | ExprKind::Match { .. }
+                            | ExprKind::Unary(_, _)
+                            | ExprKind::Binary(_, _, _)
+                            | ExprKind::Call { base: None, .. }
                     ) =>
                     {
                         let Some(found) = str_expr_family(
@@ -23569,7 +23657,7 @@ fn str_loop_level_block(
                     }
                     None => (None, None),
                 };
-                let Some((family, mut init_diagnostics)) = str_literal_family_init(
+                let (family, mut init_diagnostics) = match str_literal_family_init(
                     owner,
                     init,
                     locals,
@@ -23579,9 +23667,43 @@ fn str_loop_level_block(
                     inputs,
                     snapshot,
                     target_cfg,
-                )?
-                else {
-                    return Ok(None);
+                )? {
+                    Some(found) => found,
+                    // `let n = if`/`loop`/`block`/`match` and operand
+                    // or call initializers inside a `Str` loop body
+                    // bind their family like the group-level
+                    // initializer dispatch.
+                    None if matches!(
+                        init.kind,
+                        ExprKind::If { .. }
+                            | ExprKind::Block(_)
+                            | ExprKind::Loop { .. }
+                            | ExprKind::Match { .. }
+                            | ExprKind::Unary(_, _)
+                            | ExprKind::Binary(_, _, _)
+                            | ExprKind::Call { base: None, .. }
+                    ) =>
+                    {
+                        let Some(found) = str_expr_family(
+                            owner,
+                            return_ty,
+                            init,
+                            locals,
+                            str_bindings,
+                            expected,
+                            type_paths,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                            call_signatures,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        found
+                    }
+                    None => return Ok(None),
                 };
                 let PatKind::Binding {
                     mode:
@@ -63574,7 +63696,8 @@ property "shared"() {}
                         .expect("Str local body check succeeds"),
                     FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
                 ),
-                "clean owner #{index} produced diagnostics: {:?}",
+                "clean owner #{index} {:?} produced diagnostics: {:?}",
+                owner.owner,
                 owner.body_type_check()
             );
         }
@@ -64047,6 +64170,8 @@ property "shared"() {}
             "pub fn str_call_str_param_path_mismatch(flag: Bool) -> Bool { let n = 1\n    take_str_param(n)\n    flag }\n",
             "pub fn str_call_str_param_if_arg_let(flag: Bool) -> Bool { take_str_param(if flag { let s: Str = \"a\"\n    s } else { \"b\" })\n    flag }\n",
             "pub fn str_call_str_param_if_arg_let_mismatch(flag: Bool) -> Bool { take_str_param(if flag { let n: I32 = \"x\"\n    \"a\" } else { \"b\" })\n    flag }\n",
+            "pub fn str_call_str_param_arity_many() -> Str { str_call_id_str(\"a\", \"b\") }\n",
+            "pub fn str_call_str_param_arity_none() -> Str { str_call_id_str() }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -64063,7 +64188,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 84);
+        assert_eq!(owners.len(), 86);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -64187,6 +64312,28 @@ property "shared"() {}
             assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
             assert_eq!(diagnostics[0].message, expected_message);
         }
+        // Arity mismatches report WRONG_ARGUMENT_COUNT like
+        // `check_direct_call` — against a zero-parameter callee and
+        // `Str`-parameter callees alike — instead of dropping out of
+        // the slice.
+        for (index, expected_message) in [
+            (68, "function expects 0 arguments but found 1"),
+            (84, "function expects 1 argument but found 2"),
+            (85, "function expects 1 argument but found 0"),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("Str call arity mismatch remains in the supported slice")
+            else {
+                panic!("Str call arity mismatch remains in the supported slice");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::WrongArgumentCount
+            );
+            assert_eq!(diagnostics[0].message, expected_message);
+        }
         // `break "a"` then a bare `break` under the `Str` `β` reports
         // INVALID_BREAK_VALUE, like bare-after-valued numeric loops.
         let FunctionBodyTypeCheck::Supported { diagnostics } = owners[50]
@@ -64218,10 +64365,9 @@ property "shared"() {}
         assert_eq!(diagnostics[1].code, sai_diagnostics::Code::TypeMismatch);
         assert_eq!(diagnostics[1].message, "expected `I64`, found `Str`");
         // Gated owners: `Str` arithmetic operands, a `Str` match
-        // scrutinee, a literal-variable `Str` assignment, and a
-        // `Str`-callee arity mismatch (the walk's positional-prefix
-        // bound, like `s.len(1)`) stay outside the slice.
-        for owner in owners[25..28].iter().chain(&owners[68..69]) {
+        // scrutinee, and a literal-variable `Str` assignment stay
+        // outside the slice.
+        for owner in owners[25..28].iter() {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -106733,11 +106879,21 @@ property "shared"() {}
             diagnostics[0].message, "expected `Bool`, found `I32`",
             "{diagnostics:?}"
         );
-        // A wrong arity stays gated — the walk has no arity diagnostic.
+        // A wrong arity reports WRONG_ARGUMENT_COUNT like
+        // `check_direct_call` — sibling-signature calls share the
+        // direct-call parameter arity rule.
         let check = methods[5].body_type_check().expect("body check runs");
-        assert!(
-            matches!(check, FunctionBodyTypeCheck::Unsupported),
-            "arity stays gated: {check:?}"
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("arity reports its arity error: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::WrongArgumentCount
+        );
+        assert_eq!(
+            diagnostics[0].message, "function expects 1 argument but found 2",
+            "{diagnostics:?}"
         );
         // A non-`Str` output mismatches the `Str` return.
         let check = methods[6].body_type_check().expect("body check runs");
