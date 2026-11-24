@@ -12843,7 +12843,7 @@ fn str_break_value_in_expr(
                     target,
                     true,
                     fuel,
-                )
+                ) || !str_loop_body_has_break(body, label.map(|label| label.name))
             }
         }
         _ => false,
@@ -18305,6 +18305,7 @@ fn str_loop_family(
         target_cfg,
         false,
         StrStmtLoopFrame::Loop,
+        None,
         call_signatures,
     )?
     else {
@@ -19187,6 +19188,7 @@ fn check_function_str_local_block(
                             target_cfg,
                             break_ctx,
                             StrStmtLoopFrame::Loop,
+                            None,
                             call_signatures,
                         )?
                         else {
@@ -19210,6 +19212,7 @@ fn check_function_str_local_block(
                     target_cfg,
                     break_ctx,
                     frame,
+                    None,
                     call_signatures,
                 )?
                 else {
@@ -21113,6 +21116,7 @@ fn str_stmt_expr_unit(
     target_cfg: &TargetCfg,
     break_ctx: bool,
     frame: StrStmtLoopFrame,
+    frame_label: Option<Symbol>,
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
@@ -21148,6 +21152,7 @@ fn str_stmt_expr_unit(
                 target_cfg,
                 break_ctx,
                 frame,
+                frame_label,
                 call_signatures,
             )?
             else {
@@ -21176,6 +21181,7 @@ fn str_stmt_expr_unit(
                                 target_cfg,
                                 break_ctx,
                                 frame,
+                                frame_label,
                                 call_signatures,
                             )?
                             else {
@@ -21198,6 +21204,7 @@ fn str_stmt_expr_unit(
                                 target_cfg,
                                 break_ctx,
                                 frame,
+                                frame_label,
                                 call_signatures,
                             )?
                             else {
@@ -21216,7 +21223,9 @@ fn str_stmt_expr_unit(
         // `if cond { <user body> } else { break }` body tail walks at
         // `While` frame so a user `break <value>` reports
         // INVALID_BREAK_VALUE.
-        ExprKind::Loop { body, source, .. } => match source {
+        ExprKind::Loop {
+            body, source, label, ..
+        } => match source {
             // A nested loop is a new β frame — breaks inside target the
             // inner loop, not the `Str`-seeded one, so `break_ctx`
             // resets.
@@ -21237,6 +21246,7 @@ fn str_stmt_expr_unit(
                     target_cfg,
                     false,
                     StrStmtLoopFrame::Loop,
+                    label.map(|label| label.name),
                     call_signatures,
                 )?
                 else {
@@ -21366,6 +21376,7 @@ fn str_stmt_expr_unit(
                 target_cfg,
                 false,
                 StrStmtLoopFrame::While,
+                label.map(|label| label.name),
                 call_signatures,
             ),
             _ => Ok(None),
@@ -21394,7 +21405,13 @@ fn str_stmt_expr_unit(
             };
             Ok(Some(diagnostics))
         }
-        ExprKind::Break { label: None, value } => {
+        ExprKind::Break { label, value } => {
+            // A `break` naming this frame's label binds here like an
+            // unlabeled `break`; any other label reaches an outer
+            // frame this walk does not model.
+            if !(label.is_none() || label.map(|label| label.name) == frame_label) {
+                return Ok(None);
+            }
             if break_ctx {
                 // Breaks inside a `break` value still target the
                 // `Str`-seeded loop: `break v` contributes like loop
@@ -21493,7 +21510,10 @@ fn str_stmt_expr_unit(
                 }
             }
         }
-        ExprKind::Continue { label: None } => {
+        ExprKind::Continue { label } => {
+            if !(label.is_none() || label.map(|label| label.name) == frame_label) {
+                return Ok(None);
+            }
             if frame == StrStmtLoopFrame::None && !break_ctx {
                 Ok(Some(vec![const_literal_diagnostic(
                     owner.id,
@@ -21663,6 +21683,7 @@ fn str_stmt_expr_unit(
                         target_cfg,
                         break_ctx,
                         frame,
+                        frame_label,
                         call_signatures,
                     )?,
                     _ if arm.synthesized => match arm.body.kind {
@@ -21685,6 +21706,7 @@ fn str_stmt_expr_unit(
                             target_cfg,
                             break_ctx,
                             frame,
+                            frame_label,
                             call_signatures,
                         )?,
                         _ => None,
@@ -22949,6 +22971,7 @@ fn str_stmt_block_unit(
     target_cfg: &TargetCfg,
     break_ctx: bool,
     frame: StrStmtLoopFrame,
+    frame_label: Option<Symbol>,
 
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
@@ -23100,6 +23123,7 @@ fn str_stmt_block_unit(
                     target_cfg,
                     break_ctx,
                     frame,
+                    frame_label,
                     call_signatures,
                 )?
                 else {
@@ -23125,6 +23149,7 @@ fn str_stmt_block_unit(
             target_cfg,
             break_ctx,
             frame,
+            frame_label,
             call_signatures,
         )?
         else {
@@ -24100,6 +24125,11 @@ fn str_loop_str_body(
         return Ok(None);
     };
     if !any_break || (need_clean && !clean_yield) {
+        // No `break` reaches this frame at all — the `loop` diverges
+        // and yields `!`, which unifies with `Str`.
+        if !any_break && !str_loop_body_has_break(block, frame_label) {
+            return Ok(Some(Vec::new()));
+        }
         return Ok(None);
     }
     Ok(Some(diagnostics))
@@ -24958,6 +24988,7 @@ fn check_function_str_tail(
     if let ExprKind::Loop {
         body,
         source: LoopSource::While | LoopSource::WhileLet,
+        label,
         ..
     } = tail.kind
     {
@@ -24975,6 +25006,7 @@ fn check_function_str_tail(
             target_cfg,
             false,
             StrStmtLoopFrame::While,
+            label.map(|label| label.name),
             call_signatures,
         )?
         else {
