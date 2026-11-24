@@ -16108,7 +16108,10 @@ struct StrLiteralSeed {
     sites: std::rc::Rc<std::cell::RefCell<Vec<(Lit<'static>, sai_hir::Span)>>>,
     // The origin literal of every variable merged into this group —
     // each checks once when the group resolves.
-    members: std::rc::Rc<std::cell::RefCell<Vec<(Lit<'static>, sai_hir::Span)>>>,
+    // `checked` marks a member literal the join's own fold already
+    // range-checked against its default family — resolving to that
+    // same family must not re-report; a different family re-checks.
+    members: std::rc::Rc<std::cell::RefCell<Vec<(Lit<'static>, sai_hir::Span, bool)>>>,
     // Merge link like the checker's `merged_with`: `x = y` joins two
     // unresolved same-kind variables into one group.
     merged_into: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<StrLiteralSeed>>>>,
@@ -16120,7 +16123,7 @@ fn str_seed_new(literal: Lit<'static>, origin: sai_hir::Span) -> StrLiteralSeed 
         origin,
         resolved: std::rc::Rc::new(std::cell::Cell::new(None)),
         sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
-        members: std::rc::Rc::new(std::cell::RefCell::new(vec![(literal, origin)])),
+        members: std::rc::Rc::new(std::cell::RefCell::new(vec![(literal, origin, false)])),
         merged_into: std::rc::Rc::new(std::cell::RefCell::new(None)),
     }
 }
@@ -16346,10 +16349,14 @@ fn str_let_entry(
             // A join that deferred to one literal-variable group binds
             // the result into that group too — `let m = if let .. {
             // big } else { 1 }` follows `big`'s resolution, not the
-            // provisional `I64` family the join reported.
+            // provisional `I64` family the join reported. An
+            // all-literal join is itself a fresh literal variable —
+            // `let k = if flag { 1 } else { 2 }` stays provisional until
+            // a comparison pins it.
             let literal = str_init_deferred_seed(init, locals, str_bindings)
                 .filter(|(var_family, _)| *var_family == family)
-                .map(|(_, seed)| (*seed).clone());
+                .map(|(_, seed)| (*seed).clone())
+                .or_else(|| str_init_literal_join_seed(init));
             StrLocalEntry { family, literal }
         }
         _ => StrLocalEntry {
@@ -16554,11 +16561,13 @@ fn str_seed_resolve(
         .members
         .borrow()
         .iter()
-        .chain(root.sites.borrow().iter())
+        .filter(|(literal, _, checked)| !checked || resolved != str_seed_default_family(*literal))
+        .map(|(literal, span, _)| (*literal, *span))
+        .chain(root.sites.borrow().iter().copied())
     {
         if sai_ty::typeck::literal::check_primitive_literal(
             primitive,
-            *literal,
+            literal,
             symbols,
             target_cfg.pointer_width(),
         ) == sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange
@@ -16567,7 +16576,7 @@ fn str_seed_resolve(
                 owner.id,
                 inputs,
                 snapshot,
-                *span,
+                span,
                 sai_diagnostics::Code::LiteralOutOfRange,
                 format!(
                     "{} literal is out of range for {resolved}",
@@ -18563,6 +18572,75 @@ fn str_init_deferred_seed(
     group
 }
 
+// An all-literal join carries its own fresh literal variable — the
+// checker binds `let k = if flag { 1 } else { 2 }` to an unresolved
+// `{integer}` that a later comparison or annotation pins. The first
+// literal is the member, the rest constraint sites.
+fn str_init_literal_join_seed(init: &HirExpr<'_>) -> Option<StrLiteralSeed> {
+    let mut leaves = Vec::new();
+    if !str_yield_seed_leaves(init, &mut leaves) {
+        return None;
+    }
+    let mut seed: Option<StrLiteralSeed> = None;
+    for leaf in leaves {
+        let ExprKind::Lit(literal) = leaf.kind else {
+            return None;
+        };
+        if !matches!(literal, Lit::Int { .. } | Lit::Float { .. }) {
+            return None;
+        }
+        let literal = str_static_literal(literal)?;
+        match &seed {
+            None => {
+                let fresh = str_seed_new(literal, leaf.span);
+                // The join fold already range-checked every literal
+                // against the literal default family — mark it so a
+                // resolve to that same family does not re-report.
+                fresh.members.borrow_mut()[0].2 = true;
+                seed = Some(fresh);
+            }
+            Some(existing) => {
+                if !str_seed_same_kind(existing.literal, literal) {
+                    return None;
+                }
+                existing
+                    .members
+                    .borrow_mut()
+                    .push((literal, leaf.span, true));
+            }
+        }
+    }
+    seed
+}
+
+// The provisional family an all-literal join reports — `I64`/`F64` —
+// used where a binding needs a family before the seed resolves.
+fn str_init_literal_join_family(init: &HirExpr<'_>) -> Option<&'static str> {
+    let mut leaves = Vec::new();
+    if !str_yield_seed_leaves(init, &mut leaves) {
+        return None;
+    }
+    let mut family = None;
+    for leaf in leaves {
+        let ExprKind::Lit(literal) = leaf.kind else {
+            return None;
+        };
+        if !matches!(literal, Lit::Int { .. } | Lit::Float { .. }) {
+            return None;
+        }
+        match (family, literal) {
+            (None, literal) => family = Some(str_seed_default_family(literal)),
+            (Some(found), literal) if str_seed_same_kind_literal_family(found, literal) => {}
+            _ => return None,
+        }
+    }
+    family
+}
+
+fn str_seed_same_kind_literal_family(family: &'static str, literal: Lit<'_>) -> bool {
+    str_seed_default_family(literal) == family
+}
+
 fn str_literal_contribution<'a>(expr: Option<&'a HirExpr<'a>>) -> Option<&'a HirExpr<'a>> {
     let expr = expr?;
     if matches!(expr.kind, ExprKind::Lit(_)) {
@@ -18944,8 +19022,11 @@ fn str_condition(
                 return Ok(own);
             }
             // A literal-variable operand on the other side groups rather
-            // than pins — `n == k` keeps both provisional.
-            if str_leaf_literal_seed(other_expr, locals, str_bindings).is_some() {
+            // than pins — `n == k` merges both into one provisional
+            // group like the checker's unification, so whichever
+            // comparison first pins the group constrains every member.
+            if let Some((_, other_seed)) = str_leaf_literal_seed(other_expr, locals, str_bindings) {
+                str_seed_merge(seed.as_ref(), other_seed.as_ref());
                 return Ok(own);
             }
             let Some(primitive) = str_family_prim(other) else {
@@ -23921,36 +24002,37 @@ fn str_outer_breaks_in_block(
             if let PatKind::Binding { binding, .. } = pat.kind {
                 // A path init carries its source's family — `let ok =
                 // flag` seeds `Bool`, not `Str`, so `assert ok` still
-                // checks the real binding.
+                // checks the real binding. Literal and literal-join
+                // inits keep their literal-variable seed so comparisons
+                // pin them like the main walk (`let n = 5` or
+                // `let k = if flag { 1 } else { 2 }`).
                 let seeded_family = if str_annotated {
                     Some("`Str`")
                 } else if ty.is_none() {
-                    str_binding_family(init, locals, &inner).or_else(|| {
-                        let seeds: HashSet<sai_hir::BindingId> = inner.keys().copied().collect();
-                        let mut seed_fuel = STR_LOOP_SCAN_FUEL;
-                        str_shaped_local_init(
-                            init,
-                            locals,
-                            inputs,
-                            &seeds,
-                            symbols,
-                            type_paths,
-                            call_signatures,
-                            &mut seed_fuel,
-                        )
-                        .then_some("`Str`")
-                    })
+                    str_binding_family(init, locals, &inner)
+                        .or_else(|| str_condition_operand_family(init, locals, &inner, inputs))
+                        .or_else(|| str_init_literal_join_family(init))
+                        .or_else(|| {
+                            let seeds: HashSet<sai_hir::BindingId> =
+                                inner.keys().copied().collect();
+                            let mut seed_fuel = STR_LOOP_SCAN_FUEL;
+                            str_shaped_local_init(
+                                init,
+                                locals,
+                                inputs,
+                                &seeds,
+                                symbols,
+                                type_paths,
+                                call_signatures,
+                                &mut seed_fuel,
+                            )
+                            .then_some("`Str`")
+                        })
                 } else {
                     None
                 };
                 if let Some(family) = seeded_family {
-                    inner.insert(
-                        binding,
-                        StrLocalEntry {
-                            family,
-                            literal: None,
-                        },
-                    );
+                    inner.insert(binding, str_let_entry(init, family, None, locals, &inner));
                 }
             }
         }
@@ -93849,6 +93931,8 @@ property "shared"() {}
             "pub fn str_lbl_seed_pin_range() -> Str {\n    'l: loop { loop { let n = 5000000000\n    let m: I8 = 3\n    assert n == m }\n    break \"a\" }\n}\n",
             "pub fn str_lbl_seed_pin_concrete() -> Str {\n    'l: loop { loop { let n = 5\n    let m: I64 = 3\n    let m8: I8 = 3\n    assert n == m\n    assert n == m8 }\n    break \"a\" }\n}\n",
             "pub fn str_lbl_seed_pin_site() -> Str {\n    'l: loop { loop { let n = 5\n    let m: I8 = 3\n    assert n == 300\n    assert n == m }\n    break \"a\" }\n}\n",
+            "pub fn str_lbl_litvar_join(flag: Bool) -> Str {\n    'l: loop { loop { let n = 5\n    let k = if flag { 1 } else { 2 }\n    let m: I8 = 3\n    assert n == k\n    assert n == m }\n    break \"a\" }\n}\n",
+            "pub fn str_lbl_litvar_join_oob(flag: Bool) -> Str {\n    'l: loop { loop { let n = 5\n    let k = if flag { 1 } else { 300 }\n    let m: I8 = 3\n    assert n == k\n    assert n == m }\n    break \"a\" }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -93864,9 +93948,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 22);
+        assert_eq!(owners.len(), 24);
 
-        for index in [0, 1, 2, 3, 4, 5, 6, 9, 11, 12, 14, 17, 18] {
+        for index in [0, 1, 2, 3, 4, 5, 6, 9, 11, 12, 14, 17, 18, 22] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a labeled Str break is checked");
@@ -93884,6 +93968,7 @@ property "shared"() {}
             (19, sai_diagnostics::Code::LiteralOutOfRange),
             (20, sai_diagnostics::Code::TypeMismatch),
             (21, sai_diagnostics::Code::LiteralOutOfRange),
+            (23, sai_diagnostics::Code::LiteralOutOfRange),
         ] {
             let check = owners[index]
                 .body_type_check()
