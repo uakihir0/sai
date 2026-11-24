@@ -4961,20 +4961,56 @@ fn unary_operators_over_unknown_self_fields_recover_through_field_errors() {
 }
 
 #[test]
+fn selfless_inherent_methods_check() {
+    // A method without a `self` receiver is an associated function —
+    // every parameter is explicit, so the same body dispatch a free
+    // `pub fn` uses checks it (IR-1136) — primitive local-block, `-> Str`
+    // walk, and param-path tails included.
+    let source = concat!(
+        "type Counter { marker: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn make() -> I32 {\n",
+        "        1\n",
+        "    }\n",
+        "    pub fn add_one(value: I32) -> I32 {\n",
+        "        let result = value + 1\n",
+        "        result\n",
+        "    }\n",
+        "    pub fn identity(value: I32) -> I32 {\n",
+        "        value\n",
+        "    }\n",
+        "    pub fn greet() -> Str {\n",
+        "        \"hi\"\n",
+        "    }\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+
+    // A mismatched tail still reports its diagnostic.
+    let source = concat!(
+        "type Counter { marker: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn bad() -> I32 {\n",
+        "        true\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+        "a selfless method's bad tail reports TYPE_MISMATCH: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "the selfless method body checks rather than gating: {stdout}"
+    );
+}
+
+#[test]
 fn unsupported_inherent_method_shapes_remain_gated() {
     let cases = [
-        (
-            "method without a receiver",
-            concat!(
-                "type Counter { marker: I32 }\n",
-                "impl Counter {\n",
-                "    pub fn add_one(value: I32) -> I32 {\n",
-                "        let result = value + 1\n",
-                "        result\n",
-                "    }\n",
-                "}\n",
-            ),
-        ),
         (
             "by-value receiver",
             concat!(
