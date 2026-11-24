@@ -8228,30 +8228,54 @@ fn check_inherent_method_body_type<'a>(
             // (e.g. `)`) keeps the field read and its `UnknownField`
             // diagnostic.
             if let ExprKind::Call { callee, .. } = expression.kind
-                && matches!(
-                    callee.kind,
-                    ExprKind::Field {
-                        base,
-                        args: None,
-                        ..
-                    } if is_direct_self_value_expression(base)
-                )
+                && matches!(callee.kind, ExprKind::Field { args: None, .. })
                 && str_call_callee_is_method_syntax(
                     inputs.source.text(),
                     callee.span.range.end().to_usize(),
                 )
             {
-                call_callee_ids.insert(callee.hir_id);
-                if let ExprKind::Field { name, .. } = callee.kind
-                    && let Ok(spelling) = symbols.resolve(name.sym)
-                    && let Some(signature) = method_signatures.get(
-                        sai_syntax::normalize_identifier(
-                            spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+                // `self.<method>(..)` resolves through the impl's
+                // sibling signatures; `self.<record-field>.<method>(..)`
+                // is method-call syntax too — the callee is not a field
+                // read either way, so the collect pass skips it (the
+                // call itself still gates: sibling signatures resolve
+                // `self` receivers only today).
+                let (is_self_call_shape, is_receiver_call_shape) = match callee.kind {
+                    ExprKind::Field { base, .. } if is_direct_self_value_expression(base) => {
+                        (true, false)
+                    }
+                    ExprKind::Field { base, .. } => (
+                        false,
+                        matches!(
+                            base.kind,
+                            ExprKind::Field {
+                                base: inner_base,
+                                name: inner_name,
+                                args: None,
+                            } if is_direct_self_value_expression(inner_base)
+                                && symbols.resolve(inner_name.sym).ok().is_some_and(
+                                    |field_name| field_types
+                                        .record_fields
+                                        .contains_key(field_name.as_ref()),
+                                )
+                        ),
+                    ),
+                    _ => (false, false),
+                };
+                if is_self_call_shape || is_receiver_call_shape {
+                    call_callee_ids.insert(callee.hir_id);
+                    if is_self_call_shape
+                        && let ExprKind::Field { name, .. } = callee.kind
+                        && let Ok(spelling) = symbols.resolve(name.sym)
+                        && let Some(signature) = method_signatures.get(
+                            sai_syntax::normalize_identifier(
+                                spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+                            )
+                            .as_str(),
                         )
-                        .as_str(),
-                    )
-                {
-                    self_method_calls.insert(expression.hir_id, signature.clone());
+                    {
+                        self_method_calls.insert(expression.hir_id, signature.clone());
+                    }
                 }
             }
             if collect_error.is_some()
