@@ -5054,13 +5054,32 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         block: &Block<'hir>,
         str_bindings: &HashSet<BindingId>,
     ) -> bool {
+        // `let` statements inside the loop body seed the `Str` set the
+        // `break` values resolve against (`let t = "x"` then `break t`).
+        let mut inner = str_bindings.clone();
+        for stmt in block.stmts {
+            if let StmtKind::Let { pat, ty, init, .. } = stmt.kind {
+                if let PatKind::Binding { binding, .. } = pat.kind {
+                    let str_annotated = ty.is_some_and(|ty| {
+                        self.input
+                            .str_annotations
+                            .is_some_and(|annotations| annotations.contains(&ty.hir_id))
+                    });
+                    if str_annotated
+                        || (ty.is_none() && self.str_shaped_initializer_in(init, &inner))
+                    {
+                        inner.insert(binding);
+                    }
+                }
+            }
+        }
         block.stmts.iter().any(|stmt| match stmt.kind {
-            StmtKind::Expr(expression) => self.str_break_value_in_expr(expression, str_bindings),
-            StmtKind::Let { init, .. } => self.str_break_value_in_expr(init, str_bindings),
+            StmtKind::Expr(expression) => self.str_break_value_in_expr(expression, &inner),
+            StmtKind::Let { init, .. } => self.str_break_value_in_expr(init, &inner),
             _ => false,
         }) || block
             .tail
-            .is_some_and(|tail| self.str_break_value_in_expr(tail, str_bindings))
+            .is_some_and(|tail| self.str_break_value_in_expr(tail, &inner))
     }
 
     fn str_break_value_in_expr(

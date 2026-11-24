@@ -11561,21 +11561,37 @@ fn str_break_value_in_block(
     symbols: &Interner,
     type_paths: Option<&TypeOwnerPathResolution>,
 ) -> bool {
+    // `let` statements inside the loop body seed the `Str` set the
+    // `break` values resolve against (`let t = "x"` then `break t`).
+    let mut inner = str_bindings.clone();
+    for stmt in block.stmts {
+        if let StmtKind::Let { pat, ty, init, .. } = stmt.kind {
+            let str_annotated = ty.is_some_and(|ty| {
+                matches!(
+                    resolve_function_direct_type(*ty, type_paths, symbols, inputs),
+                    Some(FunctionDirectType::Str)
+                )
+            });
+            if let PatKind::Binding { binding, .. } = pat.kind {
+                if str_annotated
+                    || (ty.is_none()
+                        && str_shaped_local_init(init, locals, inputs, &inner, symbols, type_paths))
+                {
+                    inner.insert(binding);
+                }
+            }
+        }
+    }
     block.stmts.iter().any(|stmt| match stmt.kind {
-        StmtKind::Expr(expression) => str_break_value_in_expr(
-            expression,
-            locals,
-            inputs,
-            str_bindings,
-            symbols,
-            type_paths,
-        ),
+        StmtKind::Expr(expression) => {
+            str_break_value_in_expr(expression, locals, inputs, &inner, symbols, type_paths)
+        }
         StmtKind::Let { init, .. } => {
-            str_break_value_in_expr(init, locals, inputs, str_bindings, symbols, type_paths)
+            str_break_value_in_expr(init, locals, inputs, &inner, symbols, type_paths)
         }
         _ => false,
     }) || block.tail.is_some_and(|tail| {
-        str_break_value_in_expr(tail, locals, inputs, str_bindings, symbols, type_paths)
+        str_break_value_in_expr(tail, locals, inputs, &inner, symbols, type_paths)
     })
 }
 
