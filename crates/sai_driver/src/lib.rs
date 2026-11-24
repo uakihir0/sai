@@ -11511,6 +11511,75 @@ fn str_shaped_local_init(
                 && (then_str || str_diverging_local_block(then))
                 && (els_str || els.is_some_and(|els| str_diverging_local_init(els)))
         }
+        // `let s = loop { break "a" }` yields `Str` when some `break`
+        // belonging to the loop carries a `Str`-shaped value. A nested
+        // `loop`'s `break`s bind to the inner frame, so its body is
+        // not scanned (a labeled `break 'outer` inside one is missed —
+        // bounded, and the kernel still validates the body).
+        ExprKind::Loop { body, source, .. } => {
+            source == LoopSource::Loop
+                && str_break_value_in_block(body, locals, inputs, str_bindings, symbols, type_paths)
+        }
+        _ => false,
+    }
+}
+
+// Whether any `break` that binds to this loop's frame carries a
+// `Str`-shaped value — `if`/`match`/block nests stay in the same
+// frame; a nested `loop`'s `break`s do not.
+fn str_break_value_in_block(
+    block: &HirBlock<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    str_bindings: &HashSet<sai_hir::BindingId>,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+) -> bool {
+    block.stmts.iter().any(|stmt| match stmt.kind {
+        StmtKind::Expr(expression) => str_break_value_in_expr(
+            expression,
+            locals,
+            inputs,
+            str_bindings,
+            symbols,
+            type_paths,
+        ),
+        StmtKind::Let { init, .. } => {
+            str_break_value_in_expr(init, locals, inputs, str_bindings, symbols, type_paths)
+        }
+        _ => false,
+    }) || block.tail.is_some_and(|tail| {
+        str_break_value_in_expr(tail, locals, inputs, str_bindings, symbols, type_paths)
+    })
+}
+
+fn str_break_value_in_expr(
+    expression: &HirExpr<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    str_bindings: &HashSet<sai_hir::BindingId>,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+) -> bool {
+    match expression.kind {
+        ExprKind::Break {
+            value: Some(value), ..
+        } => {
+            str_shaped_local_init(value, locals, inputs, str_bindings, symbols, type_paths)
+                || str_break_value_in_expr(value, locals, inputs, str_bindings, symbols, type_paths)
+        }
+        ExprKind::Block(block) => {
+            str_break_value_in_block(block, locals, inputs, str_bindings, symbols, type_paths)
+        }
+        ExprKind::If { then, els, .. } => {
+            str_break_value_in_block(then, locals, inputs, str_bindings, symbols, type_paths)
+                || els.is_some_and(|els| {
+                    str_break_value_in_expr(els, locals, inputs, str_bindings, symbols, type_paths)
+                })
+        }
+        ExprKind::Match { arms, .. } => arms.iter().any(|arm| {
+            str_break_value_in_expr(arm.body, locals, inputs, str_bindings, symbols, type_paths)
+        }),
         _ => false,
     }
 }
@@ -61500,6 +61569,14 @@ property "shared"() {}
             "pub fn all_diverging_match_init(flag: Bool) -> I32 { let s = match flag { _ => return 1 }\n    s }\n",
             "pub fn numeric_match_let_then_return(flag: Bool) -> I32 { let s = match flag { true => { let n = 1\n            return 2 }, _ => 3 }\n    s }\n",
             "pub fn never_condition(flag: Bool) -> I32 { let s = match flag { _ => return 1 }\n    if s { 1 } else { 2 } }\n",
+            "pub fn str_loop_init() -> USize { let s = loop { break \"a\" }\n    s.len() }\n",
+            "pub fn str_loop_annotated() -> USize { let s: Str = loop { break \"a\" }\n    s.len() }\n",
+            "pub fn str_loop_tail() -> Str { loop { break \"a\" } }\n",
+            "pub fn str_loop_if_break(flag: Bool) -> USize { let s = loop { break if flag { \"a\" } else { \"b\" } }\n    s.len() }\n",
+            "pub fn str_loop_local_break() -> USize { let t = \"x\"\n    let s = loop { if true { break t } }\n    s.len() }\n",
+            "pub fn str_loop_mismatch() -> USize { let s = loop { break \"a\"\n            break 1 }\n    s.len() }\n",
+            "pub fn str_loop_bare() -> USize { let s = loop { break \"a\"\n            break }\n    s.len() }\n",
+            "pub fn str_loop_break_after_literal() -> USize { let s = loop { break 1\n            break \"a\" }\n    s.len() }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61516,7 +61593,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 44);
+        assert_eq!(owners.len(), 52);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -61545,7 +61622,7 @@ property "shared"() {}
         // stay neutral in joins: a numeric `match` with a `return`
         // arm still literal-joins, and `return`-value blocks carry
         // their own annotated `let`s.
-        for owner in owners[33..35].iter().chain(&owners[36..44]) {
+        for owner in owners[33..35].iter().chain(&owners[36..49]) {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -61580,6 +61657,11 @@ property "shared"() {}
             // `let s = match flag { true => "a", _ => value.len() }` —
             // the call arm resolves `USize` and reports against `Str`.
             (35, "expected `Str`, found `USize`"),
+            // `loop` `Str` joins: a literal `break` after a `Str` one
+            // reports against `Str`; a `Str` `break` after a literal
+            // one names `β`'s `I64` default.
+            (49, "expected `Str`, found an integer literal"),
+            (51, "expected `I64`, found `Str`"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
@@ -61591,6 +61673,19 @@ property "shared"() {}
             assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
             assert_eq!(diagnostics[0].message, expected_message);
         }
+        // `break "a"` then a bare `break` under the `Str` `β` reports
+        // INVALID_BREAK_VALUE, like bare-after-valued numeric loops.
+        let FunctionBodyTypeCheck::Supported { diagnostics } = owners[50]
+            .body_type_check()
+            .expect("Str loop bare-break mismatch stays in the supported slice")
+        else {
+            panic!("Str loop bare-break mismatch stays in the supported slice");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::InvalidBreakValue
+        );
         // An out-of-range integer literal on the comparison's left reports
         // the range failure AND the checked type mismatch on the `Str`
         // operand — the same pair `check_comparison_literal` emits for a

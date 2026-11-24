@@ -481,6 +481,9 @@ enum LoopBreakState {
     Bare,
     Concrete(PrimTy),
     LiteralVariable(usize),
+    /// `β` joined `Str` — only `Str` break values fit; a concrete or
+    /// literal value reports the `Str` mismatch.
+    Str,
 }
 
 impl<'a, 'hir> FnCtxt<'a, 'hir> {
@@ -2872,6 +2875,20 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.record_expression_type(init.hir_id, LocalType::Str);
                 Ok(LocalType::Str)
             }
+            // `let s: Str = loop { break "a" }` — the loop seeds `β`
+            // with `Str`, so each `break` value checks against it.
+            ExprKind::Loop {
+                body,
+                label,
+                source,
+            } => {
+                if source != LoopSource::Loop {
+                    return Err(());
+                }
+                self.check_loop_value(init.hir_id, body, label, LoopBreakState::Str)?;
+                self.record_expression_type(init.hir_id, LocalType::Str);
+                Ok(LocalType::Str)
+            }
             ExprKind::Lit(literal) => {
                 self.errors.push(PrimitiveBodyError {
                     node: init.hir_id,
@@ -3305,6 +3322,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 LoopBreakState::Concrete(expected) => {
                     self.check_expr_expected(value, expected)?;
                 }
+                // `β` is `Str`: the value validates like a `Str`
+                // branch tail (mismatches report, unknowns gate).
+                LoopBreakState::Str => {
+                    self.check_str_branch_tail(value)?;
+                }
                 LoopBreakState::LiteralVariable(id) => {
                     // `β`'s group may have resolved through another
                     // constraint site between breaks — behave as if `β`
@@ -3327,7 +3349,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.loop_stack[index].break_state = LoopBreakState::Bare;
             }
             LoopBreakState::Bare => {}
-            LoopBreakState::Concrete(_) | LoopBreakState::LiteralVariable(_) => {
+            LoopBreakState::Concrete(_)
+            | LoopBreakState::LiteralVariable(_)
+            | LoopBreakState::Str => {
                 self.errors.push(PrimitiveBodyError {
                     node: hir_id,
                     kind: PrimitiveBodyErrorKind::InvalidBreakValue,
@@ -3383,9 +3407,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         }
                     }
                     LocalType::Error(_) => LoopBreakState::Unfixed,
-                    // A `Str` break value cannot fix `β` — `LoopBreakState`
-                    // has no `Str` member, so the loop stays gated.
-                    LocalType::Str => return Err(()),
+                    // A `Str` break value fixes `β` to `Str`.
+                    LocalType::Str => LoopBreakState::Str,
                 };
             }
             // A bare `break` inside `value` unified `β` with `()` — this
@@ -3444,6 +3467,39 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 LocalType::Error(_) => {}
             },
+            // `β` is `Str`: `Str` break values keep the state, an
+            // error type stays inert, and anything else reports the
+            // `Str` mismatch.
+            LoopBreakState::Str => match local_type {
+                LocalType::Str | LocalType::Error(_) => {}
+                LocalType::Concrete(found) => {
+                    self.errors.push(PrimitiveBodyError {
+                        node: value.hir_id,
+                        kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                            expected: ScalarType::Str,
+                            found: ScalarType::Primitive(found),
+                        },
+                    });
+                }
+                LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                    let Some(variable) = self.literal_variables.get(id) else {
+                        return Err(());
+                    };
+                    self.errors.push(PrimitiveBodyError {
+                        node: value.hir_id,
+                        kind: match variable.resolved {
+                            Some(found) => PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                                expected: ScalarType::Str,
+                                found: ScalarType::Primitive(found),
+                            },
+                            None => PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                expected: ScalarType::Str,
+                                found: ScalarLiteralKind::Primitive(variable.kind),
+                            },
+                        },
+                    });
+                }
+            },
             LoopBreakState::LiteralVariable(id) => match local_type {
                 // A concrete break value fixes `β` — later literal
                 // breaks keep flowing through it.
@@ -3497,6 +3553,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         });
                     }
                 }
+                // `break "a"` under a literal `β` names `β`'s default
+                // type against `Str`.
+                LocalType::Str => {
+                    let Some(kind) = self.literal_variables.get(id).map(|variable| variable.kind)
+                    else {
+                        return Err(());
+                    };
+                    self.errors.push(PrimitiveBodyError {
+                        node: value.hir_id,
+                        kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                            expected: ScalarType::Primitive(literal_variable_default_type(kind)),
+                            found: ScalarType::Str,
+                        },
+                    });
+                }
                 _ => return Err(()),
             },
         }
@@ -3509,6 +3580,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// `check_expr_value`, where `expected` is unused by the admitted
     /// shapes (the function's return type is passed as an inert stand-in).
     fn check_break_value(&mut self, value: &'hir Expr<'hir>) -> Result<LocalType, ()> {
+        // `Str`-shaped break values join `β` as `Str` — the whole
+        // expression validates like a `Str` branch tail.
+        if self.str_shaped_initializer(value) {
+            self.check_str_branch_tail(value)?;
+            return Ok(LocalType::Str);
+        }
         match value.kind {
             // `if`/`match` break values join `β`'s literal group through
             // the same literal-join path unannotated `let` initializers
@@ -3547,6 +3624,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             None => Ok(LocalType::LiteralVariable(id)),
                         }
                     }
+                    LoopBreakState::Str => Ok(LocalType::Str),
                     LoopBreakState::Unfixed | LoopBreakState::Bare => Err(()),
                 };
             }
@@ -4781,6 +4859,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             } => self
                 .check_match_tail(scrutinee, arms, source, LocalType::Str)
                 .map(|_| ()),
+            // A `loop` tail yielding `Str` break values: `β` seeds to
+            // `Str`, so each `break` value checks against it.
+            ExprKind::Loop {
+                body,
+                label,
+                source,
+            } => {
+                if source != LoopSource::Loop {
+                    return Err(());
+                }
+                self.check_loop_value(expression.hir_id, body, label, LoopBreakState::Str)
+                    .map(|_| ())
+            }
             // Diverging expressions never yield into the `Str`
             // position; `check_return`/`check_break`/`check_continue`
             // still validate them in place.
@@ -4943,6 +5034,55 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         .iter()
                         .any(|arm| self.str_shaped_initializer_in(arm.body, str_bindings))
             }
+            // `loop` is `Str`-shaped when some `break` belonging to it
+            // carries a `Str`-shaped value. A nested `loop`'s `break`s
+            // bind to the inner frame, so nested loop bodies are not
+            // scanned (a labeled `break 'outer` inside one is missed —
+            // bounded, and the kernel still validates the body).
+            ExprKind::Loop { body, source, .. } => {
+                source == LoopSource::Loop && self.str_break_value_in_block(body, str_bindings)
+            }
+            _ => false,
+        }
+    }
+
+    // Whether any `break` that binds to this loop's frame carries a
+    // `Str`-shaped value — `if`/`match`/block nests stay in the same
+    // frame; a nested `loop`'s `break`s do not.
+    fn str_break_value_in_block(
+        &mut self,
+        block: &Block<'hir>,
+        str_bindings: &HashSet<BindingId>,
+    ) -> bool {
+        block.stmts.iter().any(|stmt| match stmt.kind {
+            StmtKind::Expr(expression) => self.str_break_value_in_expr(expression, str_bindings),
+            StmtKind::Let { init, .. } => self.str_break_value_in_expr(init, str_bindings),
+            _ => false,
+        }) || block
+            .tail
+            .is_some_and(|tail| self.str_break_value_in_expr(tail, str_bindings))
+    }
+
+    fn str_break_value_in_expr(
+        &mut self,
+        expression: &Expr<'hir>,
+        str_bindings: &HashSet<BindingId>,
+    ) -> bool {
+        match expression.kind {
+            ExprKind::Break {
+                value: Some(value), ..
+            } => {
+                self.str_shaped_initializer_in(value, str_bindings)
+                    || self.str_break_value_in_expr(value, str_bindings)
+            }
+            ExprKind::Block(block) => self.str_break_value_in_block(block, str_bindings),
+            ExprKind::If { then, els, .. } => {
+                self.str_break_value_in_block(then, str_bindings)
+                    || els.is_some_and(|els| self.str_break_value_in_expr(els, str_bindings))
+            }
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .any(|arm| self.str_break_value_in_expr(arm.body, str_bindings)),
             _ => false,
         }
     }
@@ -5176,6 +5316,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                                         None => LocalType::LiteralVariable(id),
                                     }
                                 }
+                                LoopBreakState::Str => LocalType::Str,
                                 LoopBreakState::Unfixed | LoopBreakState::Bare => return Err(()),
                             }
                         }
