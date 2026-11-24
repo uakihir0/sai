@@ -8127,11 +8127,17 @@ fn check_cli_location(
         .get(&location.file.path)
         .cloned()
         .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
-    let decoded_source = sai_vfs::SourceFile::decode(sai_vfs::FileId::new(0), &source).ok();
-    let range = decoded_source_range_to_original(
-        decoded_source.as_ref(),
-        location.span.range.start().to_usize()..location.span.range.end().to_usize(),
-    );
+    let raw_range = location.span.range.start().to_usize()..location.span.range.end().to_usize();
+    // Manifest (`sai.package`) spans already count raw file bytes; source
+    // spans count the decoded (BOM-stripped) text and map back to bytes.
+    let is_manifest =
+        location.file.path == "sai.package" || location.file.path.ends_with("/sai.package");
+    let range = if is_manifest {
+        raw_range
+    } else {
+        let decoded_source = sai_vfs::SourceFile::decode(sai_vfs::FileId::new(0), &source).ok();
+        decoded_source_range_to_original(decoded_source.as_ref(), raw_range)
+    };
     let mut source_index = CliSourceIndex::new(source);
     let mut cli_location = source_index.location(&display_path, range, include_source_lines);
     cli_location.package = location.file.package.clone();
