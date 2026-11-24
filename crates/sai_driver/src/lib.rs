@@ -22486,6 +22486,11 @@ fn str_pure_init_family(
 ) -> Option<&'static str> {
     let str_bindings = &str_shadow_str_bindings(str_bindings);
     match init.kind {
+        // `self.<field>` reads admitted by the Str walk — the family
+        // comes from the projection map the driver fills while a
+        // `-> Str` method checks (`self.<record-field>` projections
+        // carry their record name, not a call-shape family).
+        ExprKind::Field { .. } => str_self_field_projected_family(init, inputs),
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal),
         ExprKind::Tuple(elements) if elements.is_empty() => Some("`()`"),
