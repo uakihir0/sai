@@ -8236,16 +8236,18 @@ fn check_inherent_method_body_type<'a>(
             // (e.g. `)`) keeps the field read and its `UnknownField`
             // diagnostic.
             // `self.<method>(..)` resolves through the impl's sibling
-            // signatures; `self.<record-field>.<method>(..)` is
-            // method-call syntax too — the callee is not a field read
-            // either way, so the collect pass skips it (the call
-            // itself still gates: signatures resolve `self` receivers
-            // only today). The visitor is parent-first, so the
+            // signatures; `self.<record-field>.<method>(..)` resolves
+            // against the receiver record's own impl through the
+            // sibling index. Either way the callee is not a field
+            // read, so the collect pass skips it (unsigned calls
+            // still gate). The visitor is parent-first, so the
             // callee's `HirId` is recorded before its `Field` node.
             self_method_call_site(
                 expression,
                 &field_types.record_fields,
                 &method_signatures,
+                method_call_sites.and_then(|sites| sites.sibling_impls),
+                field_types.str_name_taken,
                 &mut call_callee_ids,
                 &mut self_method_calls,
                 symbols,
@@ -8382,6 +8384,8 @@ fn check_inherent_method_body_type<'a>(
             expression,
             &field_types.record_fields,
             &method_signatures,
+            method_call_sites.and_then(|sites| sites.sibling_impls),
+            field_types.str_name_taken,
             &mut call_callee_ids,
             &mut self_method_calls,
             symbols,
@@ -9071,6 +9075,167 @@ struct StrSelfMethodCallSiteInputs<'a, 'hir> {
     impl_item_id: sai_syntax::ast::ErasedAstId,
     context: &'a HirLoweringContext<'a, 'hir>,
     def_paths: &'a Arc<DefPathInterner>,
+    // `self.<record-field>.<method>(..)` calls resolve against the
+    // receiver record's OWN impl — a lazily-built signature table per
+    // record name (that impl's members lower under this impl's
+    // lowering context; only owned family strings escape).
+    sibling_impls: Option<&'a SiblingImplIndex<'a, 'a, 'hir>>,
+}
+
+// The file-local data a sibling impl's signature table needs: every
+// impl descriptor, plus the same lowering inputs the current impl
+// uses (sibling impls in other files stay gated — their item tree is
+// not this file's). Tables are built on demand per record name.
+struct SiblingImplIndex<'a, 'ctx, 'hir> {
+    descriptors: &'a [TopLevelOwnerDescriptor],
+    top_level_owner_index: &'a HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
+    file: FileId,
+    inputs: &'hir CurrentOwnerInputs,
+    context: &'a HirLoweringContext<'ctx, 'hir>,
+    def_paths: &'a Arc<DefPathInterner>,
+    symbols: &'a Interner,
+    tables:
+        std::cell::RefCell<HashMap<String, Option<HashMap<String, StrSelfMethodCallSignature>>>>,
+}
+
+impl<'a, 'ctx, 'hir> SiblingImplIndex<'a, 'ctx, 'hir> {
+    // The `self.<record-field>.<method>(..)` sibling signature for
+    // `record_name`'s impl in this file; `None` when no same-file
+    // `impl <record_name>` exists or it has no such method.
+    fn signature(
+        &self,
+        record_name: &str,
+        method_name: &str,
+        str_name_taken: bool,
+    ) -> Option<StrSelfMethodCallSignature> {
+        let cached = self.tables.borrow().get(record_name).cloned();
+        let table = match cached {
+            Some(table) => table,
+            None => {
+                let table = self.build_table(record_name, str_name_taken);
+                self.tables
+                    .borrow_mut()
+                    .insert(record_name.to_string(), table.clone());
+                table
+            }
+        };
+        table?.get(method_name).cloned()
+    }
+
+    // Find `impl <record_name>` among the file's impl blocks and lower
+    // its members' signatures exactly like the current impl's — the
+    // same `borrow Self`-receiver and family-spelling gates apply.
+    // Every impl block naming the record contributes (methods may be
+    // split across several `impl` blocks); impls with generic
+    // parameters or `where` predicates are skipped — condition
+    // checking is outside the walk.
+    fn build_table(
+        &self,
+        record_name: &str,
+        str_name_taken: bool,
+    ) -> Option<HashMap<String, StrSelfMethodCallSignature>> {
+        let mut table = None;
+        for descriptor in self.descriptors {
+            if descriptor.kind != TopLevelOwnerKind::Impl || descriptor.file != self.file {
+                continue;
+            }
+            let Ok(parent_descriptor) = find_top_level_owner_descriptor(
+                self.top_level_owner_index,
+                descriptor.owner,
+                descriptor.file,
+                descriptor.item_id,
+                descriptor.kind,
+            ) else {
+                continue;
+            };
+            if self.inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::Impl)
+            {
+                continue;
+            }
+            let Some(parent_entry) = self.inputs.filtered_item_tree.items.iter().find(|entry| {
+                entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::Impl
+            }) else {
+                continue;
+            };
+            let member_entries: Vec<&sai_hir::item_tree::ItemTreeEntry> = parent_entry
+                .children
+                .iter()
+                .filter(|entry| {
+                    matches!(entry.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn)
+                })
+                .collect();
+            let Ok(Some(expected_parent_path)) = self
+                .def_paths
+                .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            else {
+                continue;
+            };
+            let Ok((parent_hir, _)) = lower_top_level_owner(
+                parent_descriptor,
+                &expected_parent_path,
+                &self.inputs.filtered_item_tree,
+                &self.inputs.retained_item_kinds,
+                self.context,
+            ) else {
+                continue;
+            };
+            let OwnerNode::Item(item) = parent_hir.node else {
+                continue;
+            };
+            let ItemKind::Impl {
+                generics,
+                kind: ImplKind::Inherent { self_ty },
+                items: parent_members,
+                ..
+            } = item.kind
+            else {
+                continue;
+            };
+            // Generic parameters and `where` predicates are outside the
+            // bounded walk — an impl carrying either stays unsigned.
+            if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                continue;
+            }
+            let TyKind::Path(path) = self_ty.kind else {
+                continue;
+            };
+            let Some(segment) = path.segments.last() else {
+                continue;
+            };
+            let Ok(spelling) = self.symbols.resolve(segment.name.sym) else {
+                continue;
+            };
+            if sai_syntax::normalize_identifier(
+                spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+            )
+            .as_str()
+                != record_name
+            {
+                continue;
+            }
+            let sub_sites = StrSelfMethodCallSiteInputs {
+                entries: &member_entries,
+                owners: parent_members,
+                impl_item_id: descriptor.item_id,
+                context: self.context,
+                def_paths: self.def_paths,
+                sibling_impls: None,
+            };
+            // The first declaration of a duplicate method name wins.
+            let signatures = str_inherent_self_method_signatures(
+                &sub_sites,
+                &parent_hir,
+                self.inputs,
+                self.symbols,
+                str_name_taken,
+            );
+            let table = table.get_or_insert_with(HashMap::new);
+            for (name, signature) in signatures {
+                table.entry(name).or_insert(signature);
+            }
+        }
+        table
+    }
 }
 
 // A signature position type mapped to its family name by spelling —
@@ -9517,6 +9682,8 @@ fn self_method_call_site(
     expression: &HirExpr<'_>,
     record_fields: &HashMap<String, String>,
     method_signatures: &HashMap<String, StrSelfMethodCallSignature>,
+    sibling_impls: Option<&SiblingImplIndex<'_, '_, '_>>,
+    str_name_taken: bool,
     call_callee_ids: &mut HashSet<HirId>,
     self_method_calls: &mut HashMap<HirId, (HirId, StrSelfMethodCallSignature)>,
     symbols: &Interner,
@@ -9569,6 +9736,31 @@ fn self_method_call_site(
         )
     {
         self_method_calls.insert(expression.hir_id, (callee.hir_id, signature.clone()));
+    }
+    // `self.<record-field>.<method>(..)` resolves the method against
+    // the receiver record's own impl — the sibling table for that
+    // record lowers on demand; a missing impl or method leaves the
+    // call unsigned (it gates like any unresolved method call).
+    if is_receiver_call_shape
+        && let ExprKind::Field { base, name, .. } = callee.kind
+        && let ExprKind::Field {
+            name: inner_name, ..
+        } = base.kind
+        && let (Ok(inner), Ok(method)) =
+            (symbols.resolve(inner_name.sym), symbols.resolve(name.sym))
+        && let Some(record_name) = record_fields.get(inner.as_ref())
+        && let Some(signature) = sibling_impls.and_then(|index| {
+            index.signature(
+                record_name,
+                sai_syntax::normalize_identifier(
+                    method.strip_prefix("r#").unwrap_or(method.as_ref()),
+                )
+                .as_str(),
+                str_name_taken,
+            )
+        })
+    {
+        self_method_calls.insert(expression.hir_id, (callee.hir_id, signature));
     }
 }
 
@@ -44274,7 +44466,7 @@ impl RootDatabase {
         );
         let mut owners = Vec::with_capacity(descriptors.len());
 
-        for descriptor in descriptors {
+        for descriptor in descriptors.iter().copied() {
             let inputs = match self.current_owner_inputs(
                 snapshot,
                 descriptor.file,
@@ -44403,12 +44595,26 @@ impl RootDatabase {
                 let module_aliases = module_aliases_for_scope(module_scope);
                 let parent_generics = owner_generic_parameters(&parent_hir);
                 let mut members = Vec::with_capacity(member_entries.len());
+                // `self.<record-field>.<method>(..)` calls need the
+                // receiver record's own impl — the sibling index lowers
+                // that impl's member signatures lazily, per record name.
+                let sibling_impl_index = SiblingImplIndex {
+                    descriptors: &descriptors,
+                    top_level_owner_index: &top_level_owner_index,
+                    file: descriptor.file,
+                    inputs: &inputs,
+                    context: &context,
+                    def_paths,
+                    symbols: &self.symbols,
+                    tables: std::cell::RefCell::new(HashMap::new()),
+                };
                 let method_call_sites = StrSelfMethodCallSiteInputs {
                     entries: &member_entries,
                     owners: parent_members,
                     impl_item_id: descriptor.item_id,
                     context: &context,
                     def_paths,
+                    sibling_impls: Some(&sibling_impl_index),
                 };
                 for (entry, member_owner) in member_entries
                     .iter()
@@ -105094,6 +105300,158 @@ property "shared"() {}
         assert!(
             matches!(check, FunctionBodyTypeCheck::Unsupported),
             "paren_callee stays gated like other unsupported shapes: {check:?}"
+        );
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_receiver_method_calls() {
+        let root = concat!(
+            "type Inner { v: I32, s: Str }\n",
+            "type Outer { count: I32, text: Str, inner: Inner }\n",
+            "impl Inner {\n",
+            "  pub fn size(self: borrow Self) -> I32 {\n",
+            "    self.v\n",
+            "  }\n",
+            "  pub fn get(self: borrow Self, flag: Bool) -> Str {\n",
+            "    self.s\n",
+            "  }\n",
+            "  pub fn take_text(self: borrow Self, s: Str) -> I32 {\n",
+            "    self.v\n",
+            "  }\n",
+            "}\n",
+            "impl Outer {\n",
+            "  pub fn ok(self: borrow Self) -> I32 {\n",
+            "    self.inner.size()\n",
+            "  }\n",
+            "  pub fn cond(self: borrow Self) -> I32 {\n",
+            "    if self.inner.size() == 1 {\n",
+            "      1\n",
+            "    } else {\n",
+            "      2\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn str_arg(self: borrow Self) -> I32 {\n",
+            "    self.inner.take_text(self.inner.s)\n",
+            "  }\n",
+            "  pub fn str_call(self: borrow Self) -> Str {\n",
+            "    self.inner.get(true)\n",
+            "  }\n",
+            "  pub fn arity(self: borrow Self) -> I32 {\n",
+            "    self.inner.size(1)\n",
+            "  }\n",
+            "  pub fn arg_mismatch(self: borrow Self) -> I32 {\n",
+            "    self.inner.get(1)\n",
+            "  }\n",
+            "  pub fn missing(self: borrow Self) -> I32 {\n",
+            "    self.inner.nope()\n",
+            "  }\n",
+            "  pub fn unrecorded(self: borrow Self) -> I32 {\n",
+            "    self.count.size()\n",
+            "  }\n",
+            "  pub fn second_block(self: borrow Self) -> I32 {\n",
+            "    self.inner.extra()\n",
+            "  }\n",
+            "  pub fn dup(self: borrow Self) -> I32 {\n",
+            "    self.inner.size()\n",
+            "  }\n",
+            "  pub fn dup_wrong(self: borrow Self) -> I32 {\n",
+            "    self.inner.size(true)\n",
+            "  }\n",
+            "}\n",
+            "// Methods split across several `impl` blocks all resolve\n",
+            "// through the record's signature table; a duplicate method\n",
+            "// name keeps the first declaration's signature.\n",
+            "impl Inner {\n",
+            "  pub fn extra(self: borrow Self) -> I32 {\n",
+            "    self.v\n",
+            "  }\n",
+            "  pub fn size(self: borrow Self, flag: Bool) -> I32 {\n",
+            "    self.v\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("inherent methods collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let methods = &results.owners()[1].members();
+        assert_eq!(methods.len(), 11);
+        // `self.<record-field>.<method>(..)` resolves the method on the
+        // receiver record's own impl: prim tails, conditions, `Str`
+        // arguments and `-> Str` outputs all check like `self.<method>`
+        // calls against the current impl.
+        for (index, name) in [
+            (0, "ok"),
+            (1, "cond"),
+            (2, "str_arg"),
+            (3, "str_call"),
+            (8, "second_block"),
+            (9, "dup"),
+        ] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} checks the receiver call: {check:?}");
+            };
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+        }
+        // `size` is declared twice across the `impl` blocks — the first
+        // declaration wins, so an argument reports the arity error.
+        let check = methods[10].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("dup_wrong reports: {check:?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == sai_diagnostics::Code::WrongArgumentCount),
+            "{diagnostics:?}"
+        );
+        let check = methods[4].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("arity reports: {check:?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == sai_diagnostics::Code::WrongArgumentCount),
+            "{diagnostics:?}"
+        );
+        let check = methods[5].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("arg_mismatch reports: {check:?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == sai_diagnostics::Code::TypeMismatch),
+            "{diagnostics:?}"
+        );
+        // `self.<record-field>.<missing>(..)` has no signature in the
+        // record's impl — the call gates with no `UnknownField`.
+        let check = methods[6].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "missing stays gated: {check:?}"
+        );
+        // `self.<scalar-field>.<method>(..)` is not a record receiver —
+        // the scalar field has no impl to call through, so it gates.
+        let check = methods[7].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "unrecorded stays gated: {check:?}"
         );
     }
 
