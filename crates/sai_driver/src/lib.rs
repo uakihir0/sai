@@ -10850,6 +10850,26 @@ fn is_supported_direct_call_argument_shape(
             direct_call_signatures,
             primitive_types,
         ),
+        // A `loop` argument yields its break type — `bump(loop { break 1 })`
+        // behaves as `bump(1)` under a primitive parameter and as
+        // `take_str("a")` under a `Str` parameter; the checker seeds `β`
+        // with the expected type in both cases.
+        ExprKind::Loop {
+            body,
+            source: LoopSource::Loop,
+            ..
+        } => primitive_loop_body_shape_is_supported(
+            body,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ),
         _ => false,
     }
 }
@@ -64172,6 +64192,11 @@ property "shared"() {}
             "pub fn str_call_str_param_if_arg_let_mismatch(flag: Bool) -> Bool { take_str_param(if flag { let n: I32 = \"x\"\n    \"a\" } else { \"b\" })\n    flag }\n",
             "pub fn str_call_str_param_arity_many() -> Str { str_call_id_str(\"a\", \"b\") }\n",
             "pub fn str_call_str_param_arity_none() -> Str { str_call_id_str() }\n",
+            "pub fn str_call_str_param_block_arg() -> Bool { take_str_param({ \"a\" })\n    true }\n",
+            "pub fn str_call_str_param_loop_arg() -> Bool { take_str_param(loop { break \"a\" })\n    true }\n",
+            "pub fn str_call_loop_arg_prim() -> I32 { str_call_take_i32(loop { break 1 }) }\n",
+            "pub fn str_call_str_param_block_mismatch() -> Bool { take_str_param({ let x = 1\n    2 })\n    true }\n",
+            "pub fn str_call_loop_arg_prim_mismatch() -> I32 { str_call_take_i32(loop { break \"a\" }) }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -64188,7 +64213,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 86);
+        assert_eq!(owners.len(), 91);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -64244,6 +64269,9 @@ property "shared"() {}
             // block — the annotation collector descends call
             // arguments so `let s: Str` reaches the kernel.
             .chain(&owners[82..83])
+            // Composite call arguments: `{ .. }` and `loop` args
+            // under `Str` and primitive parameters alike.
+            .chain(&owners[86..89])
         {
             assert!(matches!(
                 owner
@@ -64301,6 +64329,11 @@ property "shared"() {}
             // the collected annotation reports the literal mismatch
             // instead of dropping the whole body check.
             (83, "expected `I32`, found `Str`"),
+            // Composite-argument mismatches: a `Str` block tail under a
+            // `Str` parameter reports the literal kind; a `Str` `break`
+            // under a primitive parameter names `Str` on `found`.
+            (89, "expected `Str`, found an integer literal"),
+            (90, "expected `I32`, found `Str`"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()

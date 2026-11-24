@@ -5611,6 +5611,49 @@ fn str_callee_arity_mismatches_report_wrong_argument_count() {
 }
 
 #[test]
+fn composite_call_arguments_under_str_and_primitive_params_check() {
+    for source in [
+        // `{ .. }` and `loop` arguments under a `Str` parameter bind
+        // through the `Str` initializer walk like `let s: Str = { .. }`.
+        "pub fn take(s: Str) -> Bool { s.is_empty() }\npub fn tail() -> Bool { take({ \"a\" }) }\n",
+        "pub fn take(s: Str) -> Bool { s.is_empty() }\npub fn tail() -> Bool { take(loop { break \"a\" }) }\n",
+        // `loop` arguments under a primitive parameter join `break`
+        // values against the parameter type.
+        "pub fn bump(n: I32) -> I32 { n }\npub fn tail() -> I32 { bump(loop { break 1 }) }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn composite_call_argument_mismatches_report_type_errors() {
+    for (source, message) in [
+        (
+            "pub fn take(s: Str) -> Bool { s.is_empty() }\npub fn tail() -> Bool { take({ let x = 1\n    2 }) }\n",
+            "expected `Str`, found an integer literal",
+        ),
+        (
+            "pub fn bump(n: I32) -> I32 { n }\npub fn tail() -> I32 { bump(loop { break \"a\" }) }\n",
+            "expected `I32`, found `Str`",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: composite call argument mismatch should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && stdout.contains(message)
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a supported type-mismatch diagnostic {message:?}:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn public_function_with_annotated_primitive_locals_emits_check_result() {
     for source in [
         "pub fn answer() -> I32 {\n    let first: U8 = 7\n    let value: I32 = 42\n    value\n}\n",

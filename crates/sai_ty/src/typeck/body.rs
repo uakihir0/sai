@@ -6530,38 +6530,44 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // through the same branch join the tail position uses —
                 // `bump(if c { 1 } else { 2 })` behaves as `bump(1)` when
                 // the parameter is `I32`.
-                ExprKind::If { .. } | ExprKind::Match { .. } => match expected {
-                    PrimitiveCallParameter::Primitive(expected) => {
-                        self.check_expr_expected(argument.expr, expected)?;
-                        self.record_expression_type(
-                            argument.expr.hir_id,
-                            LocalType::Concrete(expected),
-                        );
+                ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::Loop { .. } => {
+                    match expected {
+                        PrimitiveCallParameter::Primitive(expected) => {
+                            self.check_expr_expected(argument.expr, expected)?;
+                            self.record_expression_type(
+                                argument.expr.hir_id,
+                                LocalType::Concrete(expected),
+                            );
+                        }
+                        // `take_str(if c { "a" } else { "b" })` — the `Str`
+                        // initializer walk checks condition, branches, and
+                        // arms like `let _: Str = if ..`.
+                        PrimitiveCallParameter::Str => {
+                            self.check_str_annotated_initializer(argument.expr)?;
+                        }
                     }
-                    // `take_str(if c { "a" } else { "b" })` — the `Str`
-                    // initializer walk checks condition, branches, and
-                    // arms like `let _: Str = if ..`.
-                    PrimitiveCallParameter::Str => {
-                        self.check_str_annotated_initializer(argument.expr)?;
-                    }
-                },
+                }
                 // A `{ ...; e }` argument checks its inner statements and
                 // tail against the parameter type like any other value
-                // block — `bump({ 1 })` behaves as `bump(1)`.
+                // block — `bump({ 1 })` behaves as `bump(1)`; under a `Str`
+                // parameter the `Str` initializer walk handles it the same
+                // way `let s: Str = { "a" }` does.
                 ExprKind::Block(block) => {
-                    let PrimitiveCallParameter::Primitive(expected) = expected else {
-                        // `{ .. }` arguments under a `Str` parameter stay
-                        // outside the slice.
-                        return Err(());
-                    };
                     if block.safety != Safety::Safe {
                         return Err(());
                     }
-                    self.check_block_expected(block, expected)?;
-                    self.record_expression_type(
-                        argument.expr.hir_id,
-                        LocalType::Concrete(expected),
-                    );
+                    match expected {
+                        PrimitiveCallParameter::Primitive(expected) => {
+                            self.check_block_expected(block, expected)?;
+                            self.record_expression_type(
+                                argument.expr.hir_id,
+                                LocalType::Concrete(expected),
+                            );
+                        }
+                        PrimitiveCallParameter::Str => {
+                            self.check_str_annotated_initializer(argument.expr)?;
+                        }
+                    }
                 }
                 _ => return Err(()),
             }
