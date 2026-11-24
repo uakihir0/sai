@@ -17767,11 +17767,32 @@ fn str_expr_family(
             }) else {
                 return Ok(None);
             };
-            if args.len() != parameters.len() {
-                return Ok(None);
-            }
             let mut diagnostics = Vec::new();
-            for (argument, (parameter_family, expected)) in args.iter().zip(&parameters) {
+            // Mirrors `check_direct_call`: an arity mismatch reports
+            // WRONG_ARGUMENT_COUNT and still checks the shared
+            // positional prefix; named arguments report on every
+            // written argument.
+            if args.len() != parameters.len() {
+                let noun = if parameters.len() == 1 {
+                    "argument"
+                } else {
+                    "arguments"
+                };
+                diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    expr.span,
+                    sai_diagnostics::Code::WrongArgumentCount,
+                    format!(
+                        "function expects {} {noun} but found {}",
+                        parameters.len(),
+                        args.len()
+                    ),
+                    "wrong number of arguments",
+                )?);
+            }
+            for (index, argument) in args.iter().enumerate() {
                 // Mirrors the checker: named arguments on a function call
                 // report NAMED_ARGUMENT_ON_FUNCTION but still check
                 // positionally.
@@ -17786,6 +17807,9 @@ fn str_expr_family(
                         "named argument is not allowed in a function call",
                     )?);
                 }
+                let Some((parameter_family, expected)) = parameters.get(index) else {
+                    continue;
+                };
                 let Some((family, mut arg_diagnostics)) = str_expr_family(
                     owner,
                     return_ty,
@@ -64047,6 +64071,8 @@ property "shared"() {}
             "pub fn str_call_str_param_path_mismatch(flag: Bool) -> Bool { let n = 1\n    take_str_param(n)\n    flag }\n",
             "pub fn str_call_str_param_if_arg_let(flag: Bool) -> Bool { take_str_param(if flag { let s: Str = \"a\"\n    s } else { \"b\" })\n    flag }\n",
             "pub fn str_call_str_param_if_arg_let_mismatch(flag: Bool) -> Bool { take_str_param(if flag { let n: I32 = \"x\"\n    \"a\" } else { \"b\" })\n    flag }\n",
+            "pub fn str_call_str_param_arity_many() -> Str { str_call_id_str(\"a\", \"b\") }\n",
+            "pub fn str_call_str_param_arity_none() -> Str { str_call_id_str() }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -64063,7 +64089,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 84);
+        assert_eq!(owners.len(), 86);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -64187,6 +64213,28 @@ property "shared"() {}
             assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
             assert_eq!(diagnostics[0].message, expected_message);
         }
+        // Arity mismatches report WRONG_ARGUMENT_COUNT like
+        // `check_direct_call` — against a zero-parameter callee and
+        // `Str`-parameter callees alike — instead of dropping out of
+        // the slice.
+        for (index, expected_message) in [
+            (68, "function expects 0 arguments but found 1"),
+            (84, "function expects 1 argument but found 2"),
+            (85, "function expects 1 argument but found 0"),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("Str call arity mismatch remains in the supported slice")
+            else {
+                panic!("Str call arity mismatch remains in the supported slice");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::WrongArgumentCount
+            );
+            assert_eq!(diagnostics[0].message, expected_message);
+        }
         // `break "a"` then a bare `break` under the `Str` `β` reports
         // INVALID_BREAK_VALUE, like bare-after-valued numeric loops.
         let FunctionBodyTypeCheck::Supported { diagnostics } = owners[50]
@@ -64218,10 +64266,9 @@ property "shared"() {}
         assert_eq!(diagnostics[1].code, sai_diagnostics::Code::TypeMismatch);
         assert_eq!(diagnostics[1].message, "expected `I64`, found `Str`");
         // Gated owners: `Str` arithmetic operands, a `Str` match
-        // scrutinee, a literal-variable `Str` assignment, and a
-        // `Str`-callee arity mismatch (the walk's positional-prefix
-        // bound, like `s.len(1)`) stay outside the slice.
-        for owner in owners[25..28].iter().chain(&owners[68..69]) {
+        // scrutinee, and a literal-variable `Str` assignment stay
+        // outside the slice.
+        for owner in owners[25..28].iter() {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -106733,11 +106780,21 @@ property "shared"() {}
             diagnostics[0].message, "expected `Bool`, found `I32`",
             "{diagnostics:?}"
         );
-        // A wrong arity stays gated — the walk has no arity diagnostic.
+        // A wrong arity reports WRONG_ARGUMENT_COUNT like
+        // `check_direct_call` — sibling-signature calls share the
+        // direct-call parameter arity rule.
         let check = methods[5].body_type_check().expect("body check runs");
-        assert!(
-            matches!(check, FunctionBodyTypeCheck::Unsupported),
-            "arity stays gated: {check:?}"
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("arity reports its arity error: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::WrongArgumentCount
+        );
+        assert_eq!(
+            diagnostics[0].message, "function expects 1 argument but found 2",
+            "{diagnostics:?}"
         );
         // A non-`Str` output mismatches the `Str` return.
         let check = methods[6].body_type_check().expect("body check runs");

@@ -5524,6 +5524,46 @@ fn primitive_body_str_method_call_forms_outside_the_slice_remain_gated() {
 }
 
 #[test]
+fn str_callee_arity_mismatches_report_wrong_argument_count() {
+    for (source, expected) in [
+        (
+            "pub fn make() -> Str { \"a\" }\npub fn tail() -> Str { make(1) }\n",
+            "function expects 0 arguments but found 1",
+        ),
+        (
+            "pub fn take(s: Str) -> Str { s }\npub fn tail() -> Str { take(\"a\", \"b\") }\n",
+            "function expects 1 argument but found 2",
+        ),
+        (
+            "pub fn take(s: Str) -> Str { s }\npub fn tail() -> Str { take() }\n",
+            "function expects 1 argument but found 0",
+        ),
+        (
+            "pub fn pair(a: Str, b: Str) -> Str { a }\npub fn tail() -> Str { pair(\"a\") }\n",
+            "function expects 2 arguments but found 1",
+        ),
+        (
+            "pub fn take(s: Str) -> Str { s }\npub fn bind() -> Str { let t = take(\"a\", \"b\")\n    t }\n",
+            "function expects 1 argument but found 2",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: Str callee arity mismatch should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"WRONG_ARGUMENT_COUNT\"")
+                && stdout.contains(expected)
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a supported wrong-argument-count diagnostic {expected:?}:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn public_function_with_annotated_primitive_locals_emits_check_result() {
     for source in [
         "pub fn answer() -> I32 {\n    let first: U8 = 7\n    let value: I32 = 42\n    value\n}\n",
