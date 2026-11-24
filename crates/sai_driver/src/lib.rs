@@ -12598,11 +12598,16 @@ fn str_shaped_local_init(
                 && (els_str || els.is_some_and(|els| str_diverging_local_init(els)))
         }
         // `let s = loop { break "a" }` yields `Str` when some `break`
-        // belonging to the loop carries a `Str`-shaped value. A nested
-        // `loop`'s `break`s bind to the inner frame, so its body is
-        // not scanned (a labeled `break 'outer` inside one is missed —
-        // bounded, and the kernel still validates the body).
-        ExprKind::Loop { body, source, .. } => {
+        // belonging to the loop carries a `Str`-shaped value — a
+        // `break` naming the loop's label inside a nested `loop`
+        // still yields to it, while other nested `break`s bind to
+        // the inner frame.
+        ExprKind::Loop {
+            body,
+            source,
+            label,
+            ..
+        } => {
             // Descending into a nested `loop` body is the only
             // scan that can multiply — same-frame `if`/`block`/
             // `match` nests are linear and stay free.
@@ -12616,6 +12621,8 @@ fn str_shaped_local_init(
                     symbols,
                     type_paths,
                     call_signatures,
+                    label.map(|label| label.name),
+                    false,
                     fuel,
                 )
             }
@@ -12626,7 +12633,9 @@ fn str_shaped_local_init(
 
 // Whether any `break` that binds to this loop's frame carries a
 // `Str`-shaped value — `if`/`match`/block nests stay in the same
-// frame; a nested `loop`'s `break`s do not.
+// frame; a nested `loop`'s `break`s do not, unless they name the
+// frame's `target` label (`in_outer` marks the descent: unlabeled
+// `break`s inside a nested `loop` bind to the inner frame).
 fn str_break_value_in_block(
     block: &HirBlock<'_>,
     locals: &LocalResolution,
@@ -12635,6 +12644,8 @@ fn str_break_value_in_block(
     symbols: &Interner,
     type_paths: Option<&TypeOwnerPathResolution>,
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    target: Option<Symbol>,
+    in_outer: bool,
     fuel: &mut usize,
 ) -> bool {
     // `let` statements inside the loop body seed the `Str` set the
@@ -12676,6 +12687,8 @@ fn str_break_value_in_block(
             symbols,
             type_paths,
             call_signatures,
+            target,
+            in_outer,
             fuel,
         ),
         StmtKind::Let { init, .. } => str_break_value_in_expr(
@@ -12686,6 +12699,8 @@ fn str_break_value_in_block(
             symbols,
             type_paths,
             call_signatures,
+            target,
+            in_outer,
             fuel,
         ),
         _ => false,
@@ -12698,6 +12713,8 @@ fn str_break_value_in_block(
             symbols,
             type_paths,
             call_signatures,
+            target,
+            in_outer,
             fuel,
         )
     })
@@ -12711,12 +12728,23 @@ fn str_break_value_in_expr(
     symbols: &Interner,
     type_paths: Option<&TypeOwnerPathResolution>,
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    target: Option<Symbol>,
+    in_outer: bool,
     fuel: &mut usize,
 ) -> bool {
     match expression.kind {
         ExprKind::Break {
-            value: Some(value), ..
+            label,
+            value: Some(value),
+            ..
         } => {
+            // The `break` must reach the frame being probed: it
+            // names `target`, or is unlabeled while the scan is
+            // still inside that frame (inside a nested `loop` an
+            // unlabeled `break` binds to the inner frame).
+            if label.map(|label| label.name) != target || (in_outer && label.is_none()) {
+                return false;
+            }
             str_shaped_local_init(
                 value,
                 locals,
@@ -12734,6 +12762,8 @@ fn str_break_value_in_expr(
                 symbols,
                 type_paths,
                 call_signatures,
+                target,
+                in_outer,
                 fuel,
             )
         }
@@ -12745,6 +12775,8 @@ fn str_break_value_in_expr(
             symbols,
             type_paths,
             call_signatures,
+            target,
+            in_outer,
             fuel,
         ),
         ExprKind::If { then, els, .. } => {
@@ -12756,6 +12788,8 @@ fn str_break_value_in_expr(
                 symbols,
                 type_paths,
                 call_signatures,
+                target,
+                in_outer,
                 fuel,
             ) || els.is_some_and(|els| {
                 str_break_value_in_expr(
@@ -12766,6 +12800,8 @@ fn str_break_value_in_expr(
                     symbols,
                     type_paths,
                     call_signatures,
+                    target,
+                    in_outer,
                     fuel,
                 )
             })
@@ -12779,9 +12815,37 @@ fn str_break_value_in_expr(
                 symbols,
                 type_paths,
                 call_signatures,
+                target,
+                in_outer,
                 fuel,
             )
         }),
+        // A `break` naming `target` inside a nested `loop` still
+        // reaches the probed frame; a nested `loop` re-using the
+        // label shadows it, so its `break 'l`s bind to the inner
+        // `l` and the body is skipped.
+        ExprKind::Loop {
+            body,
+            source,
+            label,
+            ..
+        } => {
+            source == LoopSource::Loop && label.map(|label| label.name) != target && *fuel > 0 && {
+                *fuel -= 1;
+                str_break_value_in_block(
+                    body,
+                    locals,
+                    inputs,
+                    str_bindings,
+                    symbols,
+                    type_paths,
+                    call_signatures,
+                    target,
+                    true,
+                    fuel,
+                )
+            }
+        }
         _ => false,
     }
 }
@@ -20835,6 +20899,7 @@ fn check_function_str_local_block(
             ExprKind::Loop {
                 body,
                 source: LoopSource::Loop,
+                label,
                 ..
             } => {
                 let Some(mut loop_diagnostics) = str_loop_str_body(
@@ -20849,6 +20914,7 @@ fn check_function_str_local_block(
                     snapshot,
                     target_cfg,
                     true,
+                    label.map(|label| label.name),
                     call_signatures,
                 )?
                 else {
@@ -22775,8 +22841,9 @@ fn str_expr_diverges(expr: &HirExpr<'_>) -> bool {
         ExprKind::Loop {
             body,
             source: LoopSource::Loop,
+            label,
             ..
-        } => !str_loop_body_has_break(body),
+        } => !str_loop_body_has_break(body, label.map(|label| label.name)),
         ExprKind::Loop {
             source: LoopSource::While,
             ..
@@ -22792,33 +22859,66 @@ fn str_expr_diverges(expr: &HirExpr<'_>) -> bool {
     }
 }
 
-// Whether a `loop` body contains any unlabeled `break` at its own frame
-// (if branches and return values still target it; nested loops carry
-// their own).
-fn str_loop_body_has_break(block: &sai_hir::expressions::Block<'_>) -> bool {
-    fn expr_has_break(expr: &HirExpr<'_>) -> bool {
-        match expr.kind {
-            ExprKind::Break { label: None, .. } => true,
-            ExprKind::Break { .. } => false,
-            ExprKind::If { then, els, .. } => {
-                str_loop_body_has_break(then)
-                    || els.is_some_and(|els| match els.kind {
-                        ExprKind::Block(else_block) => str_loop_body_has_break(else_block),
-                        ExprKind::If { .. } => expr_has_break(els),
-                        _ => false,
-                    })
-            }
-            ExprKind::Return(Some(value)) => expr_has_break(value),
-            ExprKind::Block(inner) => str_loop_body_has_break(inner),
-            ExprKind::Match { arms, .. } => arms.iter().any(|arm| expr_has_break(arm.body)),
-            _ => false,
-        }
-    }
+// Whether a `loop` body contains any `break` at its own frame — an
+// unlabeled `break`, or one naming the loop's `target` label, reached
+// through `if`/block/match nests and `return` values. A `break 'l`
+// inside a nested `loop` still reaches the outer `l` — unless the
+// nested `loop` re-uses `l`, which shadows it.
+fn str_loop_body_has_break(
+    block: &sai_hir::expressions::Block<'_>,
+    target: Option<Symbol>,
+) -> bool {
+    str_loop_body_has_break_nested(block, target, false)
+}
+
+fn str_loop_body_has_break_nested(
+    block: &sai_hir::expressions::Block<'_>,
+    target: Option<Symbol>,
+    in_nested: bool,
+) -> bool {
     block
         .stmts
         .iter()
-        .any(|stmt| matches!(stmt.kind, sai_hir::expressions::StmtKind::Expr(expr) if expr_has_break(expr)))
-        || block.tail.is_some_and(|tail| expr_has_break(tail))
+        .any(|stmt| matches!(stmt.kind, sai_hir::expressions::StmtKind::Expr(expr) if str_loop_body_has_break_inner_expr(expr, target, in_nested)))
+        || block
+            .tail
+            .is_some_and(|tail| str_loop_body_has_break_inner_expr(tail, target, in_nested))
+}
+
+fn str_loop_body_has_break_inner_expr(
+    expr: &HirExpr<'_>,
+    target: Option<Symbol>,
+    in_nested: bool,
+) -> bool {
+    match expr.kind {
+        ExprKind::Break { label, .. } => {
+            (label.is_none() && !in_nested) || label.map(|label| label.name) == target
+        }
+        ExprKind::If { then, els, .. } => {
+            str_loop_body_has_break_nested(then, target, in_nested)
+                || els.is_some_and(|els| match els.kind {
+                    ExprKind::Block(else_block) => {
+                        str_loop_body_has_break_nested(else_block, target, in_nested)
+                    }
+                    ExprKind::If { .. } => {
+                        str_loop_body_has_break_inner_expr(els, target, in_nested)
+                    }
+                    _ => false,
+                })
+        }
+        ExprKind::Return(Some(value)) => {
+            str_loop_body_has_break_inner_expr(value, target, in_nested)
+        }
+        ExprKind::Block(inner) => str_loop_body_has_break_nested(inner, target, in_nested),
+        ExprKind::Match { arms, .. } => arms
+            .iter()
+            .any(|arm| str_loop_body_has_break_inner_expr(arm.body, target, in_nested)),
+        ExprKind::Loop { body, label, .. } => {
+            label.map(|label| label.name) != target
+                && str_loop_body_has_break_nested(body, target, true)
+        }
+        _ => false,
+    }
 }
 
 fn str_block_diverges(block: &sai_hir::expressions::Block<'_>) -> bool {
@@ -23063,7 +23163,7 @@ fn str_loop_level_block(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
-
+    frame_label: Option<Symbol>,
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<(bool, bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     if block.safety != sai_hir::Safety::Safe {
@@ -23182,6 +23282,7 @@ fn str_loop_level_block(
                     inputs,
                     snapshot,
                     target_cfg,
+                    frame_label,
                     call_signatures,
                 )?
                 else {
@@ -23206,6 +23307,7 @@ fn str_loop_level_block(
             inputs,
             snapshot,
             target_cfg,
+            frame_label,
             call_signatures,
         )?
         else {
@@ -23244,7 +23346,7 @@ fn str_loop_level_expr(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
-
+    frame_label: Option<Symbol>,
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<(bool, bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     match expr.kind {
@@ -23294,6 +23396,7 @@ fn str_loop_level_expr(
                 inputs,
                 snapshot,
                 target_cfg,
+                frame_label,
                 call_signatures,
             )?
             else {
@@ -23316,6 +23419,7 @@ fn str_loop_level_expr(
                         inputs,
                         snapshot,
                         target_cfg,
+                        frame_label,
                         call_signatures,
                     )?
                     else {
@@ -23336,6 +23440,7 @@ fn str_loop_level_expr(
                         inputs,
                         snapshot,
                         target_cfg,
+                        frame_label,
                         call_signatures,
                     )?
                     else {
@@ -23353,6 +23458,63 @@ fn str_loop_level_expr(
         }
         // A nested `loop`/`while` is a statement with its own frame —
         // the statement walker covers its conditions and break rules.
+        // When it carries a `break` naming this loop's label the
+        // contribution reaches this frame instead.
+        ExprKind::Loop {
+            body,
+            label,
+            source: LoopSource::Loop,
+        } => {
+            if let Some(diagnostics) = str_stmt_expr_unit(
+                owner,
+                return_ty,
+                expr,
+                locals,
+                str_bindings,
+                None,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                false,
+                StrStmtLoopFrame::Loop,
+                call_signatures,
+            )? {
+                return Ok(Some((false, false, diagnostics)));
+            }
+            let Some(target) = frame_label else {
+                return Ok(None);
+            };
+            // A nested `loop` re-using the label shadows it — its
+            // `break 'l`s bind to the inner `l`.
+            if label.map(|label| label.name) == Some(target) {
+                return Ok(None);
+            }
+            let mut fuel = STR_LOOP_SCAN_FUEL;
+            let Some((clean, found, diagnostics)) = str_outer_breaks_in_block(
+                owner,
+                return_ty,
+                body,
+                str_bindings,
+                locals,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                target,
+                &mut fuel,
+                call_signatures,
+            )?
+            else {
+                return Ok(None);
+            };
+            if !found {
+                return Ok(None);
+            }
+            Ok(Some((clean, true, diagnostics)))
+        }
         ExprKind::Loop { .. } => Ok(str_stmt_expr_unit(
             owner,
             return_ty,
@@ -23372,18 +23534,20 @@ fn str_loop_level_expr(
         .map(|diagnostics| (false, false, diagnostics))),
         // A valueless `break` targets the `Str`-seeded loop and dilutes β
         // with `()` — the checker's INVALID_BREAK_VALUE on a Concrete β.
+        // A `break` naming this loop's label targets it the same way.
+        ExprKind::Break { label, value: None }
+            if label.is_none() || label.map(|label| label.name) == frame_label =>
+        {
+            Ok(Some((
+                false,
+                true,
+                vec![str_invalid_break_value(owner, expr.span, inputs, snapshot)?],
+            )))
+        }
         ExprKind::Break {
-            label: None,
-            value: None,
-        } => Ok(Some((
-            false,
-            true,
-            vec![str_invalid_break_value(owner, expr.span, inputs, snapshot)?],
-        ))),
-        ExprKind::Break {
-            label: None,
+            label,
             value: Some(value),
-        } => {
+        } if label.is_none() || label.map(|label| label.name) == frame_label => {
             let Some((clean, diagnostics)) = str_break_value(
                 owner,
                 return_ty,
@@ -23402,6 +23566,10 @@ fn str_loop_level_expr(
             };
             Ok(Some((clean, true, diagnostics)))
         }
+        // A `break`/`continue` naming another frame diverges out of
+        // this loop without contributing to it — the kernel validates
+        // the label, and the named frame's own walk collects it.
+        ExprKind::Break { .. } | ExprKind::Continue { .. } => Ok(Some((false, false, Vec::new()))),
         // `if let`/`while let`/`match` at loop level: arm bodies walk
         // like `if` branch blocks so their `break` values feed the
         // loop's β (`let m = loop { if let x = n { break x + 1 } }`).
@@ -23520,6 +23688,7 @@ fn str_loop_level_expr(
                             inputs,
                             snapshot,
                             target_cfg,
+                            frame_label,
                             call_signatures,
                         )?
                         else {
@@ -23547,6 +23716,7 @@ fn str_loop_level_expr(
                             inputs,
                             snapshot,
                             target_cfg,
+                            frame_label,
                             call_signatures,
                         )?
                         else {
@@ -23576,8 +23746,317 @@ fn str_loop_level_expr(
             }
             Ok(Some((clean, broken, diagnostics)))
         }
-        ExprKind::Continue { label: None } => Ok(Some((false, false, Vec::new()))),
         _ => Ok(None),
+    }
+}
+
+// Scans a nested `loop` body for `break`s that name the enclosing
+// `Str` loop's `target` label — they escape the inner frame and
+// contribute to the outer loop's β. Returns `(clean, found,
+// diagnostics)`; `found` marks at least one such `break`, and
+// `clean` at least one that yields `Str` cleanly. `break`s of the
+// nested loop's own frame and other labels are skipped (the kernel
+// checks them at their own frame).
+fn str_outer_breaks_in_block(
+    owner: &HirOwner<'_>,
+    return_ty: Ty<'_>,
+    block: &sai_hir::expressions::Block<'_>,
+    str_bindings: &StrLocalBindings,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    target: Symbol,
+    fuel: &mut usize,
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> Result<Option<(bool, bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
+    if block.safety != sai_hir::Safety::Safe {
+        return Ok(None);
+    }
+    let mut inner = str_bindings.clone();
+    // `let` statements inside the body seed the `Str` set `break`
+    // values resolve against (`let t = "x"` then `break 'l t`).
+    for stmt in block.stmts {
+        if let sai_hir::expressions::StmtKind::Let { pat, ty, init, .. } = stmt.kind {
+            let str_annotated = ty.is_some_and(|ty| {
+                matches!(
+                    resolve_function_direct_type(*ty, type_paths, symbols, inputs),
+                    Some(FunctionDirectType::Str)
+                )
+            });
+            if let PatKind::Binding { binding, .. } = pat.kind {
+                if str_annotated
+                    || (ty.is_none() && {
+                        let seeds: HashSet<sai_hir::BindingId> = inner.keys().copied().collect();
+                        let mut seed_fuel = STR_LOOP_SCAN_FUEL;
+                        str_shaped_local_init(
+                            init,
+                            locals,
+                            inputs,
+                            &seeds,
+                            symbols,
+                            type_paths,
+                            call_signatures,
+                            &mut seed_fuel,
+                        )
+                    })
+                {
+                    inner.insert(
+                        binding,
+                        StrLocalEntry {
+                            family: "`Str`",
+                            literal: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let mut clean = false;
+    let mut found = false;
+    let mut diagnostics = Vec::new();
+    for stmt in block.stmts {
+        if let sai_hir::expressions::StmtKind::Expr(expr) = stmt.kind {
+            let Some((e_clean, e_found, mut e_diags)) = str_outer_breaks_in_expr(
+                owner,
+                return_ty,
+                expr,
+                &inner,
+                locals,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                target,
+                fuel,
+                call_signatures,
+            )?
+            else {
+                return Ok(None);
+            };
+            clean |= e_clean;
+            found |= e_found;
+            diagnostics.append(&mut e_diags);
+        }
+    }
+    if let Some(tail) = block.tail {
+        let Some((e_clean, e_found, mut e_diags)) = str_outer_breaks_in_expr(
+            owner,
+            return_ty,
+            tail,
+            &inner,
+            locals,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            target,
+            fuel,
+            call_signatures,
+        )?
+        else {
+            return Ok(None);
+        };
+        clean |= e_clean;
+        found |= e_found;
+        diagnostics.append(&mut e_diags);
+    }
+    Ok(Some((clean, found, diagnostics)))
+}
+
+fn str_outer_breaks_in_expr(
+    owner: &HirOwner<'_>,
+    return_ty: Ty<'_>,
+    expr: &HirExpr<'_>,
+    str_bindings: &StrLocalBindings,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    target: Symbol,
+    fuel: &mut usize,
+    call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+) -> Result<Option<(bool, bool, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
+    match expr.kind {
+        ExprKind::Break {
+            label: Some(label),
+            value,
+            ..
+        } if label.name == target => match value {
+            Some(value) => {
+                let Some((clean, diagnostics)) = str_break_value(
+                    owner,
+                    return_ty,
+                    value,
+                    &mut str_bindings.clone(),
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    call_signatures,
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some((clean, true, diagnostics)))
+            }
+            // `break 'l` with no value dilutes the outer loop's β
+            // with `()` — INVALID_BREAK_VALUE like the checker.
+            None => Ok(Some((
+                false,
+                true,
+                vec![str_invalid_break_value(owner, expr.span, inputs, snapshot)?],
+            ))),
+        },
+        ExprKind::Break { .. } | ExprKind::Continue { .. } => Ok(Some((false, false, Vec::new()))),
+        ExprKind::Block(block) => str_outer_breaks_in_block(
+            owner,
+            return_ty,
+            block,
+            str_bindings,
+            locals,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            target,
+            fuel,
+            call_signatures,
+        ),
+        ExprKind::If { then, els, .. } => {
+            let Some((then_clean, then_found, mut diagnostics)) = str_outer_breaks_in_block(
+                owner,
+                return_ty,
+                then,
+                str_bindings,
+                locals,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                target,
+                fuel,
+                call_signatures,
+            )?
+            else {
+                return Ok(None);
+            };
+            let (mut else_clean, mut else_found) = (false, false);
+            if let Some(els) = els {
+                let Some((c, f, mut e_diags)) = str_outer_breaks_in_expr(
+                    owner,
+                    return_ty,
+                    els,
+                    str_bindings,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    target,
+                    fuel,
+                    call_signatures,
+                )?
+                else {
+                    return Ok(None);
+                };
+                else_clean = c;
+                else_found = f;
+                diagnostics.append(&mut e_diags);
+            }
+            Ok(Some((
+                then_clean || else_clean,
+                then_found || else_found,
+                diagnostics,
+            )))
+        }
+        ExprKind::Match { arms, .. } => {
+            let mut clean = false;
+            let mut found = false;
+            let mut diagnostics = Vec::new();
+            for arm in arms {
+                let Some((a_clean, a_found, mut a_diags)) = str_outer_breaks_in_expr(
+                    owner,
+                    return_ty,
+                    arm.body,
+                    str_bindings,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    target,
+                    fuel,
+                    call_signatures,
+                )?
+                else {
+                    return Ok(None);
+                };
+                clean |= a_clean;
+                found |= a_found;
+                diagnostics.append(&mut a_diags);
+            }
+            Ok(Some((clean, found, diagnostics)))
+        }
+        ExprKind::Return(Some(value)) => str_outer_breaks_in_expr(
+            owner,
+            return_ty,
+            value,
+            str_bindings,
+            locals,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            target,
+            fuel,
+            call_signatures,
+        ),
+        // A deeper `loop` re-using `target` shadows the label — its
+        // `break 'l`s bind to the inner `l`, so it is skipped.
+        ExprKind::Loop {
+            body,
+            label,
+            source,
+            ..
+        } => {
+            if source != LoopSource::Loop
+                || label.map(|label| label.name) == Some(target)
+                || *fuel == 0
+            {
+                return Ok(Some((false, false, Vec::new())));
+            }
+            *fuel -= 1;
+            str_outer_breaks_in_block(
+                owner,
+                return_ty,
+                body,
+                str_bindings,
+                locals,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                target,
+                fuel,
+                call_signatures,
+            )
+        }
+        _ => Ok(Some((false, false, Vec::new()))),
     }
 }
 
@@ -23599,7 +24078,7 @@ fn str_loop_str_body(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
     need_clean: bool,
-
+    frame_label: Option<Symbol>,
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let mut inner_bindings = str_bindings.clone();
@@ -23614,6 +24093,7 @@ fn str_loop_str_body(
         inputs,
         snapshot,
         target_cfg,
+        frame_label,
         call_signatures,
     )?
     else {
@@ -24446,10 +24926,12 @@ fn check_function_str_tail(
     }
     // `loop { break <Str> }` tails yield `Str` from their break values;
     // `while` loops stay gated (they yield `()`), and a label on the
-    // loop is admitted — labeled `break`/`continue` stays gated.
+    // loop is admitted — a `break`/`continue` naming it targets the
+    // same frame.
     if let ExprKind::Loop {
         body,
         source: LoopSource::Loop,
+        label,
         ..
     } = tail.kind
     {
@@ -24465,6 +24947,7 @@ fn check_function_str_tail(
             snapshot,
             target_cfg,
             false,
+            label.map(|label| label.name),
             call_signatures,
         );
     }
@@ -93135,6 +93618,73 @@ property "shared"() {}
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
                 "function owner {index} unexpectedly passed the loop slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_admits_labeled_str_breaks() {
+        let root = concat!(
+            "pub fn str_lbl_nested_yield() -> Str {\n    'l: loop { loop { break 'l \"a\" } }\n}\n",
+            "pub fn str_lbl_top_yield() -> Str {\n    'l: loop { break 'l \"a\" }\n}\n",
+            "pub fn str_lbl_continue() -> Str {\n    'l: loop { if true { continue 'l }\n    break \"a\" }\n}\n",
+            "pub fn str_lbl_init() -> Str {\n    let s = 'l: loop { loop { break 'l \"a\" } }\n    s\n}\n",
+            "pub fn str_lbl_ann_init() -> Str {\n    let s: Str = 'l: loop { loop { break 'l \"a\" } }\n    s\n}\n",
+            "pub fn str_lbl_mixed() -> Str {\n    'l: loop { loop { break 'l \"a\" }\n    break \"b\" }\n}\n",
+            "pub fn str_lbl_other_frame() -> Str {\n    'a: loop { 'b: loop { break 'a \"x\"\n    break 'b \"y\" }\n    break \"z\" }\n}\n",
+            "pub fn str_lbl_mismatch() -> Str {\n    'l: loop { loop { break 'l 1 } }\n}\n",
+            "pub fn str_lbl_bare() -> Str {\n    'l: loop { break 'l }\n}\n",
+            "pub fn str_lbl_shadowed() -> Str {\n    'l: loop { 'l: loop { break 'l \"a\" }\n    break \"b\" }\n}\n",
+            "pub fn str_lbl_undeclared() -> Str {\n    'l: loop { loop { break 'x \"a\" } }\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 11);
+
+        for index in [0, 1, 2, 3, 4, 5, 6] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a labeled Str break is checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the labeled Str break slice: {check:?}"
+            );
+        }
+        for (index, code) in [
+            (7, sai_diagnostics::Code::TypeMismatch),
+            (8, sai_diagnostics::Code::InvalidBreakValue),
+        ] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("a labeled Str break diagnostic is reported");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics }
+                    if diagnostics.iter().any(|diagnostic| diagnostic.code == code)),
+                "function owner {index} must report {code:?}: {check:?}"
+            );
+        }
+        // A nested `loop` re-using the target label shadows it (its
+        // `break 'l`s bind to the inner `l`), and a `break` naming an
+        // undeclared label stays outside the bounded walk — both gate.
+        for index in [9, 10] {
+            let check = owners[index]
+                .body_type_check()
+                .expect("an out-of-slice labeled break is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the labeled break slice: {check:?}"
             );
         }
     }
