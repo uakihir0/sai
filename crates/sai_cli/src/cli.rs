@@ -1741,7 +1741,8 @@ fn run_check(
     let root_analysis_is_covered = root_coverage.empty_root_module_only_covered
         || root_coverage.public_primitive_const_set_covered
         || root_coverage.single_public_function_body_covered
-        || root_coverage.single_public_inherent_method_body_covered;
+        || root_coverage.single_public_inherent_method_body_covered
+        || root_coverage.mixed_public_items_covered;
     let check_slice_is_supported = root_analysis_is_covered
         && empty_root_manifest_supported
         && root_manifest_semantically_valid
@@ -2074,6 +2075,199 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     }) && saw_function
 }
 
+// A `type` declaration's field names and types usable as an inherent
+// impl's record: every field named, attr-free, and primitive/`Str`.
+fn check_type_decl_primitive_fields(
+    type_decl: &sai_syntax::ast::TypeDecl,
+    source: &[u8],
+) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    let Some(struct_def) = type_decl.struct_def() else {
+        return false;
+    };
+    let Some(fields) = struct_def.fields() else {
+        return false;
+    };
+    if type_decl.attrs().next().is_some()
+        || type_decl
+            .syntax()
+            .children()
+            .any(|child| sai_syntax::ast::GenericParamList::can_cast(child.kind()))
+        || type_decl
+            .syntax()
+            .descendants()
+            .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+        || struct_def.where_clause().is_some()
+        || fields.fields().next().is_none()
+    {
+        return false;
+    }
+    let mut field_names = HashSet::new();
+    fields.fields().all(|field| {
+        let Some(field_name) = field
+            .name()
+            .and_then(|name| name.token())
+            .map(|token| token.text().to_owned())
+        else {
+            return false;
+        };
+        let normalized_field_name =
+            sai_syntax::normalize_identifier(field_name.strip_prefix("r#").unwrap_or(&field_name));
+        field_names.insert(normalized_field_name)
+            && field.attrs().next().is_none()
+            && field.ty().is_some_and(|ty| {
+                let range = ty.syntax().text_range();
+                let Some(type_text) = source.get(range.start().to_usize()..range.end().to_usize())
+                else {
+                    return false;
+                };
+                matches!(
+                    type_text,
+                    b"Bool"
+                        | b"Byte"
+                        | b"Char"
+                        | b"I8"
+                        | b"I16"
+                        | b"I32"
+                        | b"I64"
+                        | b"ISize"
+                        | b"U8"
+                        | b"U16"
+                        | b"U32"
+                        | b"U64"
+                        | b"USize"
+                        | b"F32"
+                        | b"F64"
+                        | b"Str"
+                )
+            })
+    })
+}
+
+// An `impl` block usable in a mixed source: attr-free, safe, inherent on
+// a `type` declared in the same file with primitive fields, all members
+// attr-free `pub fn`s with distinct names and bodies.
+fn check_impl_decl_is_inherent_public_methods(
+    impl_decl: &sai_syntax::ast::ImplDecl,
+    type_names: &HashSet<String>,
+    source: &[u8],
+) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    if impl_decl.attrs().next().is_some()
+        || impl_decl
+            .syntax()
+            .descendants()
+            .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+        || impl_decl.unsafe_token().is_some()
+    {
+        return false;
+    }
+    let Some(inherent_type) = impl_decl.inherent_type() else {
+        return false;
+    };
+    let range = inherent_type.syntax().text_range();
+    let Some(type_text) = source.get(range.start().to_usize()..range.end().to_usize()) else {
+        return false;
+    };
+    let Ok(type_text) = std::str::from_utf8(type_text) else {
+        return false;
+    };
+    if !type_names.contains(type_text) {
+        return false;
+    }
+    let Some(associated_items) = impl_decl.items() else {
+        return false;
+    };
+    let mut saw_method = false;
+    let mut method_names = HashSet::new();
+    associated_items.assoc_type_decls().next().is_none()
+        && associated_items.functions().all(|method| {
+            saw_method = true;
+            let name_is_distinct = method
+                .name()
+                .and_then(|name| name.token())
+                .map(|token| {
+                    let text = token.text();
+                    sai_syntax::normalize_identifier(text.strip_prefix("r#").unwrap_or(text))
+                })
+                .is_some_and(|normalized| method_names.insert(normalized));
+            name_is_distinct
+                && method.attrs().next().is_none()
+                && method.body().is_some()
+                && method
+                    .visibility()
+                    .is_some_and(|visibility| visibility.pub_token().is_some())
+        })
+        && saw_method
+}
+
+// A source of attr-free `pub fn`s plus attr-free `type` declarations and
+// attr-free `impl` blocks inherent on those types — the mixed kind the
+// combined coverage gate checks (IR-1133).
+fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    let Some(parsed) = sai_fmt::parse_source(source).ok() else {
+        return false;
+    };
+    let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
+        return false;
+    };
+    if source_file.module_header().is_some()
+        || source_file.test_decls().next().is_some()
+        || source_file.property_decls().next().is_some()
+        || source_file
+            .syntax()
+            .children()
+            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
+    {
+        return false;
+    }
+    let mut saw_function = false;
+    let mut saw_impl = false;
+    let mut type_names = HashSet::new();
+    let mut impls = Vec::new();
+    for item in source_file.items() {
+        match item {
+            sai_syntax::ast::Item::Function(function) => {
+                if function.attrs().next().is_some()
+                    || !function
+                        .visibility()
+                        .is_some_and(|visibility| visibility.pub_token().is_some())
+                {
+                    return false;
+                }
+                saw_function = true;
+            }
+            sai_syntax::ast::Item::Type(type_decl) => {
+                let Some(name) = type_decl
+                    .name()
+                    .and_then(|name| name.token())
+                    .map(|token| token.text().to_owned())
+                else {
+                    return false;
+                };
+                if !check_type_decl_primitive_fields(&type_decl, source) {
+                    return false;
+                }
+                type_names.insert(name);
+            }
+            sai_syntax::ast::Item::Impl(impl_decl) => {
+                saw_impl = true;
+                impls.push(impl_decl);
+            }
+            _ => return false,
+        }
+    }
+    saw_function
+        && saw_impl
+        && impls.iter().all(|impl_decl| {
+            check_impl_decl_is_inherent_public_methods(impl_decl, &type_names, source)
+        })
+}
+
 fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> bool {
     use sai_syntax::ast::AstNode as _;
 
@@ -2376,6 +2570,120 @@ fn check_public_inherent_method_body_coverage(
                 .is_ok_and(|diagnostics| diagnostics.is_empty())
             && method.lowering_diagnostics().is_empty()
     })
+}
+
+// The mixed-source coverage gate (IR-1133): every Function owner
+// resolved + supported + diagnostic-free, every type owner resolved via
+// `resolve_type_owner_paths` with a clean `path_resolution()`, and every
+// Impl owner resolved with all members checked `ImplMethod`s.
+fn check_mixed_public_item_coverage(
+    source_is_candidate: bool,
+    scopes: &sai_driver::Phase1PackageScopes,
+    function_resolutions: &sai_driver::FunctionOwnerResolutions,
+    type_resolutions: Option<&sai_driver::TypeOwnerResolutions>,
+    method_resolutions: &sai_driver::TraitImplMemberTestOnlyResolutions,
+) -> bool {
+    if !source_is_candidate
+        || scopes.modules.len() != 1
+        || !scopes.modules[0].imports.is_empty()
+        || scopes.top_level_owners.is_empty()
+        || scopes.top_level_owners.iter().any(|owner| {
+            !matches!(
+                owner.kind,
+                sai_driver::TopLevelOwnerKind::Function
+                    | sai_driver::TopLevelOwnerKind::Struct
+                    | sai_driver::TopLevelOwnerKind::Alias
+                    | sai_driver::TopLevelOwnerKind::Enum
+                    | sai_driver::TopLevelOwnerKind::Distinct
+                    | sai_driver::TopLevelOwnerKind::Impl
+            )
+        })
+        || scopes
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Function)
+            .count()
+            != function_resolutions.owners().len()
+        || scopes
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Impl)
+            .count()
+            != method_resolutions.owners().len()
+        || method_resolutions.owners().is_empty()
+    {
+        return false;
+    }
+
+    let resolved_owner_ids = function_resolutions
+        .owners()
+        .iter()
+        .map(|owner| owner.owner())
+        .collect::<HashSet<_>>();
+    let resolved_type_owner_ids = type_resolutions
+        .map(|resolutions| {
+            resolutions
+                .owners()
+                .iter()
+                .map(|owner| owner.owner())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let resolved_impl_owner_ids = method_resolutions
+        .owners()
+        .iter()
+        .map(|owner| owner.owner())
+        .collect::<HashSet<_>>();
+    scopes
+        .top_level_owners
+        .iter()
+        .all(|descriptor| match descriptor.kind {
+            sai_driver::TopLevelOwnerKind::Function => {
+                resolved_owner_ids.contains(&descriptor.owner)
+            }
+            sai_driver::TopLevelOwnerKind::Impl => {
+                resolved_impl_owner_ids.contains(&descriptor.owner)
+            }
+            _ => resolved_type_owner_ids.contains(&descriptor.owner),
+        })
+        && type_resolutions.is_none_or(|resolutions| {
+            resolutions
+                .owners()
+                .iter()
+                .all(|owner| owner.path_resolution().is_ok())
+        })
+        && function_resolutions.owners().iter().all(|owner| {
+            owner
+                .body_type_check()
+                .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
+                && owner
+                    .local_resolution()
+                    .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
+                && owner
+                    .resolution()
+                    .is_ok_and(|resolution| resolution.diagnostics.is_empty())
+                && owner.lowering_diagnostics().is_empty()
+        })
+        && method_resolutions.owners().iter().all(|impl_owner| {
+            impl_owner.error().is_none()
+                && impl_owner.lowering_diagnostics().is_empty()
+                && !impl_owner.members().is_empty()
+                && impl_owner.members().iter().all(|method| {
+                    method.parent_owner() == impl_owner.owner()
+                        && method.kind() == sai_driver::TraitImplMemberKind::ImplMethod
+                        && method
+                            .body_type_check()
+                            .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
+                        && method.local_resolution().is_ok_and(|locals| {
+                            locals.is_some_and(|locals| locals.diagnostics.is_empty())
+                        })
+                        && method.type_path_resolution().is_ok()
+                        && method
+                            .test_only_diagnostics()
+                            .is_ok_and(|diagnostics| diagnostics.is_empty())
+                        && method.lowering_diagnostics().is_empty()
+                })
+        })
 }
 
 fn active_public_name_diagnostics(
@@ -5793,6 +6101,7 @@ struct CheckRootCoverage {
     public_primitive_const_set_covered: bool,
     single_public_function_body_covered: bool,
     single_public_inherent_method_body_covered: bool,
+    mixed_public_items_covered: bool,
 }
 
 struct CheckSuccessRecord {
@@ -6171,9 +6480,23 @@ fn module_tree_workspace_check_diagnostics(
                 path == &root_source_path
                     && check_source_is_single_unattributed_public_inherent_method(source.as_ref())
             });
+    let root_mixed_items_source_candidate = root_const_input_shape
+        && inputs[0]
+            .source_inputs
+            .first()
+            .is_some_and(|(path, _, source)| {
+                let root_source_path = if inputs[0].source_directory == "." {
+                    "lib.sai".to_owned()
+                } else {
+                    format!("{}/lib.sai", inputs[0].source_directory)
+                };
+                path == &root_source_path
+                    && check_source_is_mixed_public_items(source.as_ref())
+            });
     let mut public_primitive_const_set_covered = false;
     let mut single_public_function_body_covered = false;
     let mut single_public_inherent_method_body_covered = false;
+    let mut mixed_public_items_covered = false;
     let mut database = RootDatabase::new()
         .map_err(|error| format!("could not initialize query database: {error:?}"))?;
     let package_graph_for_scopes = package_graph.clone();
@@ -6974,6 +7297,149 @@ fn module_tree_workspace_check_diagnostics(
                         single_public_inherent_method_body_covered = true;
                     }
                 }
+
+                if root_mixed_items_source_candidate {
+                    let function_resolutions = database
+                        .resolve_function_owner_analyses(
+                            &collection,
+                            module_tree,
+                            &workspace_snapshot,
+                        )
+                        .map_err(|error| {
+                            format!("function owner analysis failed: {error:?}")
+                        })?;
+                    let method_resolutions = database
+                        .resolve_trait_impl_member_test_only_paths(
+                            &collection,
+                            module_tree,
+                            &workspace_snapshot,
+                        )
+                        .map_err(|error| {
+                            format!("inherent method owner analysis failed: {error:?}")
+                        })?;
+                    let type_resolutions = if collection
+                        .scopes()
+                        .top_level_owners
+                        .iter()
+                        .any(|owner| {
+                            !matches!(
+                                owner.kind,
+                                sai_driver::TopLevelOwnerKind::Function
+                                    | sai_driver::TopLevelOwnerKind::Impl
+                            )
+                        })
+                    {
+                        Some(
+                            database
+                                .resolve_type_owner_paths(
+                                    &collection,
+                                    module_tree,
+                                    &workspace_snapshot,
+                                )
+                                .map_err(|error| {
+                                    format!("type owner path query failed: {error:?}")
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+                    let mut body_diagnostics = Vec::new();
+                    for owner in function_resolutions.owners() {
+                        match owner.body_type_check() {
+                            Ok(body_check) => {
+                                body_diagnostics.extend(body_check.diagnostics().iter().cloned())
+                            }
+                            Err(error) => {
+                                diagnostics.push(check_diagnostic_with_package(
+                                    check_internal_diagnostic(
+                                        &format!("function body type check failed: {error:?}"),
+                                        None,
+                                    ),
+                                    Some(&input.package_identity),
+                                ));
+                                errors = errors.saturating_add(1);
+                            }
+                        }
+                    }
+                    for owner in method_resolutions.owners() {
+                        if let Some(error) = owner.error() {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!("inherent impl analysis failed: {error:?}"),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                            continue;
+                        }
+                        for method in owner.members() {
+                            match method.body_type_check() {
+                                Ok(body_check) => body_diagnostics
+                                    .extend(body_check.diagnostics().iter().cloned()),
+                                Err(error) => {
+                                    diagnostics.push(check_diagnostic_with_package(
+                                        check_internal_diagnostic(
+                                            &format!(
+                                                "inherent method body type check failed: {error:?}"
+                                            ),
+                                            None,
+                                        ),
+                                        Some(&input.package_identity),
+                                    ));
+                                    errors = errors.saturating_add(1);
+                                }
+                            }
+                            match method.local_resolution() {
+                                Ok(Some(locals)) => {
+                                    body_diagnostics.extend(locals.diagnostics.iter().cloned())
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    diagnostics.push(check_diagnostic_with_package(
+                                        check_internal_diagnostic(
+                                            &format!(
+                                                "inherent method local resolution failed: {error:?}"
+                                            ),
+                                            None,
+                                        ),
+                                        Some(&input.package_identity),
+                                    ));
+                                    errors = errors.saturating_add(1);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(type_resolutions) = &type_resolutions {
+                        for owner in type_resolutions.owners() {
+                            body_diagnostics.extend(owner.lowering_diagnostics().iter().cloned());
+                            if let Ok(diagnostics) = owner.module_path_diagnostics() {
+                                body_diagnostics.extend(diagnostics.iter().cloned());
+                            }
+                        }
+                    }
+                    let (body_diagnostics, body_errors, body_warnings, body_infos) =
+                        phase1_check_diagnostics(
+                            &body_diagnostics,
+                            &workspace_source_by_key,
+                            &input.package_identity,
+                            include_source_lines,
+                        );
+                    diagnostics.extend(body_diagnostics);
+                    errors = errors.saturating_add(body_errors);
+                    warnings = warnings.saturating_add(body_warnings);
+                    infos = infos.saturating_add(body_infos);
+
+                    if check_mixed_public_item_coverage(
+                        true,
+                        collection.scopes(),
+                        &function_resolutions,
+                        type_resolutions.as_ref(),
+                        &method_resolutions,
+                    ) {
+                        mixed_public_items_covered = true;
+                    }
+                }
             }
 
             if let Some(graph) = package_graph_for_scopes.as_ref()
@@ -7577,6 +8043,7 @@ fn module_tree_workspace_check_diagnostics(
             public_primitive_const_set_covered,
             single_public_function_body_covered,
             single_public_inherent_method_body_covered,
+            mixed_public_items_covered,
         },
     })
 }
