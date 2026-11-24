@@ -18913,20 +18913,41 @@ fn str_condition(
         );
         // An unresolved literal variable against a concrete primitive
         // operand pins to it like the checker's comparison inference —
-        // `let n = 5; let m: I8 = 3; assert n == m` resolves `n` to `I8`.
-        // A literal kind the pin cannot accept keeps its family and the
-        // mismatch below reports `expected <left>, found <right>`.
+        // `let n = 5; let m: I8 = 3; assert n == m` resolves `n` to `I8`,
+        // and `n == m` with `m: I64` resolves `n` to `I64` so a later
+        // `n == i8` still mismatches. A literal kind the pin cannot
+        // accept keeps its family and the mismatch below reports
+        // `expected <left>, found <right>`.
         let pin = |expr: &HirExpr<'_>,
                    own: &'static str,
+                   other_expr: &HirExpr<'_>,
                    other: &'static str,
                    diagnostics: &mut Vec<Diagnostic>|
          -> Result<&'static str, OwnerControlFlowResolutionError> {
-            if own == other {
-                return Ok(own);
-            }
             let Some((_, seed)) = str_leaf_literal_seed(expr, locals, str_bindings) else {
                 return Ok(own);
             };
+            // A literal operand records a constraint site on the seed
+            // instead of pinning (`n == 300` checks `300` when `n` later
+            // resolves — an out-of-range literal is not lost).
+            if let ExprKind::Lit(literal) = other_expr.kind
+                && let Some(literal) = str_static_literal(literal)
+                && str_seed_same_kind(literal, seed.literal)
+            {
+                let mut sites = seed.sites.borrow_mut();
+                if !sites
+                    .iter()
+                    .any(|(l, s)| *l == literal && *s == other_expr.span)
+                {
+                    sites.push((literal, other_expr.span));
+                }
+                return Ok(own);
+            }
+            // A literal-variable operand on the other side groups rather
+            // than pins — `n == k` keeps both provisional.
+            if str_leaf_literal_seed(other_expr, locals, str_bindings).is_some() {
+                return Ok(own);
+            }
             let Some(primitive) = str_family_prim(other) else {
                 return Ok(own);
             };
@@ -18954,8 +18975,20 @@ fn str_condition(
             }
         };
         let (left_family, right_family) = (
-            pin(lhs, left_family, right_family, &mut operand_diagnostics)?,
-            pin(rhs, right_family, left_family, &mut operand_diagnostics)?,
+            pin(
+                lhs,
+                left_family,
+                rhs,
+                right_family,
+                &mut operand_diagnostics,
+            )?,
+            pin(
+                rhs,
+                right_family,
+                lhs,
+                left_family,
+                &mut operand_diagnostics,
+            )?,
         );
         if left_family == right_family {
             let mut diagnostics = operand_diagnostics;
@@ -93814,6 +93847,8 @@ property "shared"() {}
             "pub fn str_lbl_bool_local(flag: Bool) -> Str {\n    'l: loop { loop { let ok = flag\n    assert ok\n    break 'l \"a\" } }\n}\n",
             "pub fn str_lbl_seed_pin() -> Str {\n    'l: loop { loop { let n = 5\n    let m: I8 = 3\n    assert n == m }\n    break \"a\" }\n}\n",
             "pub fn str_lbl_seed_pin_range() -> Str {\n    'l: loop { loop { let n = 5000000000\n    let m: I8 = 3\n    assert n == m }\n    break \"a\" }\n}\n",
+            "pub fn str_lbl_seed_pin_concrete() -> Str {\n    'l: loop { loop { let n = 5\n    let m: I64 = 3\n    let m8: I8 = 3\n    assert n == m\n    assert n == m8 }\n    break \"a\" }\n}\n",
+            "pub fn str_lbl_seed_pin_site() -> Str {\n    'l: loop { loop { let n = 5\n    let m: I8 = 3\n    assert n == 300\n    assert n == m }\n    break \"a\" }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -93829,7 +93864,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 20);
+        assert_eq!(owners.len(), 22);
 
         for index in [0, 1, 2, 3, 4, 5, 6, 9, 11, 12, 14, 17, 18] {
             let check = owners[index]
@@ -93847,6 +93882,8 @@ property "shared"() {}
             (15, sai_diagnostics::Code::TypeMismatch),
             (16, sai_diagnostics::Code::TypeMismatch),
             (19, sai_diagnostics::Code::LiteralOutOfRange),
+            (20, sai_diagnostics::Code::TypeMismatch),
+            (21, sai_diagnostics::Code::LiteralOutOfRange),
         ] {
             let check = owners[index]
                 .body_type_check()
