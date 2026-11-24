@@ -7557,6 +7557,40 @@ fn check_function_body_type(
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     }
+    check_function_body_shape_dispatch(
+        owner,
+        sig,
+        body,
+        locals,
+        type_paths,
+        direct_call_signatures,
+        semantic_types,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+        primitive_type_results,
+    )
+}
+
+// The shape dispatch shared by free `pub fn` bodies and selfless
+// inherent methods (associated functions — every parameter explicit):
+// the primitive local-block walk first, then the `-> Str` walk and the
+// remaining statement/tail shapes.
+fn check_function_body_shape_dispatch(
+    owner: &HirOwner<'_>,
+    sig: sai_hir::body::FnSig<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    semantic_types: &sai_ty::ty::TyInterner,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    primitive_type_results: &mut Option<sai_ty::typeck::body::PrimitiveBodyTypeResults>,
+) -> Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError> {
     if sig.params.len() == body.params.len() {
         if let Some((diagnostics, type_results)) = check_function_body_primitive_local_block(
             owner,
@@ -8149,15 +8183,14 @@ fn check_inherent_method_body_type<'a>(
 
     // A method without a `self` receiver is an associated function —
     // every parameter is explicit, so it checks through the same
-    // primitive local-block walk a free `pub fn` uses. `-> Str`
-    // selfless methods and self-field projections stay gated (there
-    // is no `self` to project).
+    // body dispatch a free `pub fn` uses (primitive local-block and
+    // `-> Str` walks, param-path tails, all statement shapes).
     if !sig
         .params
         .first()
         .is_some_and(|parameter| parameter.is_self)
     {
-        if let Some((diagnostics, type_results)) = check_function_body_primitive_local_block(
+        return check_function_body_shape_dispatch(
             method_owner,
             sig,
             body,
@@ -8166,17 +8199,11 @@ fn check_inherent_method_body_type<'a>(
             direct_call_signatures,
             semantic_types,
             symbols,
-            None,
-            None,
-            None,
             inputs,
             snapshot,
             target_cfg,
-        )? {
-            *primitive_type_results = Some(type_results);
-            return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
-        }
-        return Ok(FunctionBodyTypeCheck::Unsupported);
+            primitive_type_results,
+        );
     }
 
     let Some((receiver, explicit_params)) = sig.params.split_first() else {
@@ -106161,6 +106188,12 @@ property "shared"() {}
             "        let result = value + 1\n",
             "        result\n",
             "    }\n",
+            "    pub fn identity(value: I32) -> I32 {\n",
+            "        value\n",
+            "    }\n",
+            "    pub fn greet() -> Str {\n",
+            "        \"hi\"\n",
+            "    }\n",
             "    pub fn bad() -> I32 {\n",
             "        true\n",
             "    }\n",
@@ -106186,17 +106219,17 @@ property "shared"() {}
         let owner = results
             .owners()
             .iter()
-            .find(|owner| owner.members().len() == 3)
+            .find(|owner| owner.members().len() == 5)
             .expect("the Counter impl owner");
         let methods = owner.members();
-        for (index, name) in [(0, "make"), (1, "add")] {
+        for (index, name) in [(0, "make"), (1, "add"), (2, "identity"), (3, "greet")] {
             let check = methods[index].body_type_check().expect("body check runs");
             let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
                 panic!("{name} is a supported selfless method: {check:?}");
             };
             assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
         }
-        let check = methods[2].body_type_check().expect("body check runs");
+        let check = methods[4].body_type_check().expect("body check runs");
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
             panic!("bad reports its tail error: {check:?}");
         };

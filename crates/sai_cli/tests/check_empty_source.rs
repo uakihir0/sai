@@ -4963,8 +4963,9 @@ fn unary_operators_over_unknown_self_fields_recover_through_field_errors() {
 #[test]
 fn selfless_inherent_methods_check() {
     // A method without a `self` receiver is an associated function —
-    // every parameter is explicit, so the primitive local-block walk a
-    // free `pub fn` uses checks it (IR-1136).
+    // every parameter is explicit, so the same body dispatch a free
+    // `pub fn` uses checks it (IR-1136) — primitive local-block, `-> Str`
+    // walk, and param-path tails included.
     let source = concat!(
         "type Counter { marker: I32 }\n",
         "impl Counter {\n",
@@ -4974,6 +4975,12 @@ fn selfless_inherent_methods_check() {
         "    pub fn add_one(value: I32) -> I32 {\n",
         "        let result = value + 1\n",
         "        result\n",
+        "    }\n",
+        "    pub fn identity(value: I32) -> I32 {\n",
+        "        value\n",
+        "    }\n",
+        "    pub fn greet() -> Str {\n",
+        "        \"hi\"\n",
         "    }\n",
         "}\n",
     );
