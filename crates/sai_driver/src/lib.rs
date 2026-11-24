@@ -21224,7 +21224,10 @@ fn str_stmt_expr_unit(
         // `While` frame so a user `break <value>` reports
         // INVALID_BREAK_VALUE.
         ExprKind::Loop {
-            body, source, label, ..
+            body,
+            source,
+            label,
+            ..
         } => match source {
             // A nested loop is a new β frame — breaks inside target the
             // inner loop, not the `Str`-seeded one, so `break_ctx`
@@ -24043,16 +24046,36 @@ fn str_outer_breaks_in_expr(
                 diagnostics,
             )))
         }
-        ExprKind::Match { arms, .. } => {
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => {
+            let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
+                Some("`Str`")
+            } else {
+                str_self_field_projected_family(scrutinee, inputs).or_else(|| {
+                    str_binding_entry(scrutinee, locals, str_bindings).map(|entry| entry.family)
+                })
+            };
             let mut clean = false;
             let mut found = false;
             let mut diagnostics = Vec::new();
             for arm in arms {
+                // A binding pattern types its variable as the
+                // scrutinee — `match s { other => break 'l other }`.
+                let mut arm_bindings = str_bindings.clone();
+                if let Some(scrutinee_family) = scrutinee_family
+                    && let PatKind::Binding { binding, .. } = arm.pat.kind
+                {
+                    arm_bindings.insert(
+                        binding,
+                        str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
+                    );
+                }
                 let Some((a_clean, a_found, mut a_diags)) = str_outer_breaks_in_expr(
                     owner,
                     return_ty,
                     arm.body,
-                    str_bindings,
+                    &arm_bindings,
                     locals,
                     type_paths,
                     symbols,
@@ -93705,6 +93728,10 @@ property "shared"() {}
             "pub fn str_lbl_bare() -> Str {\n    'l: loop { break 'l }\n}\n",
             "pub fn str_lbl_shadowed() -> Str {\n    'l: loop { 'l: loop { break 'l \"a\" }\n    break \"b\" }\n}\n",
             "pub fn str_lbl_undeclared() -> Str {\n    'l: loop { loop { break 'x \"a\" } }\n}\n",
+            "pub fn str_lbl_unlabeled_break() -> Str {\n    let s = 'l: loop { break \"a\" }\n    let n = s.len()\n    s\n}\n",
+            "pub fn str_lbl_inner_only() -> Str {\n    loop { 'l: loop { break 'l } }\n}\n",
+            "pub fn str_lbl_inner_diags() -> Str {\n    'l: loop { loop { assert 1\n    break 'l \"a\" } }\n}\n",
+            "pub fn str_lbl_match_binding() -> Str {\n    let s = \"a\"\n    'l: loop { loop { match s { other => break 'l other } } }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -93720,9 +93747,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 11);
+        assert_eq!(owners.len(), 15);
 
-        for index in [0, 1, 2, 3, 4, 5, 6] {
+        for index in [0, 1, 2, 3, 4, 5, 6, 9, 11, 12, 14] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a labeled Str break is checked");
@@ -93734,6 +93761,7 @@ property "shared"() {}
         for (index, code) in [
             (7, sai_diagnostics::Code::TypeMismatch),
             (8, sai_diagnostics::Code::InvalidBreakValue),
+            (13, sai_diagnostics::Code::TypeMismatch),
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -93744,10 +93772,9 @@ property "shared"() {}
                 "function owner {index} must report {code:?}: {check:?}"
             );
         }
-        // A nested `loop` re-using the target label shadows it (its
-        // `break 'l`s bind to the inner `l`), and a `break` naming an
-        // undeclared label stays outside the bounded walk — both gate.
-        for index in [9, 10] {
+        // A `break` naming an undeclared label stays outside the
+        // bounded walk and gates.
+        for index in [10] {
             let check = owners[index]
                 .body_type_check()
                 .expect("an out-of-slice labeled break is gated");
