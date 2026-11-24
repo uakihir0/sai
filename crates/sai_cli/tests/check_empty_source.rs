@@ -3347,6 +3347,23 @@ fn mixed_function_and_type_owners_stay_gated() {
 }
 
 #[test]
+fn duplicate_inherent_method_names_stay_gated() {
+    // Member-scope name duplicates are outside the checked slice — the
+    // impl must not pass silently (IR-1131 review).
+    let source = concat!(
+        "type Pair { left: I32, right: I32 }\n",
+        "impl Pair {\n",
+        "    pub fn sum(self: borrow Self) -> I32 { self.left + self.right }\n",
+        "    pub fn sum(self: borrow Self) -> I32 { self.left }\n",
+        "}\n",
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(source, "", &[], &[]),
+        "duplicate method names in one impl",
+    );
+}
+
+#[test]
 fn public_inherent_method_body_emits_check_result() {
     let source = concat!(
         "type Counter { marker: I32 }\n",

@@ -2177,12 +2177,24 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
     let Some(associated_items) = impl_decl.items() else {
         return false;
     };
-    // One or more unattributed `pub fn` methods, no associated types.
+    // One or more unattributed `pub fn` methods with distinct names —
+    // member-scope duplicate declarations are outside the checked slice —
+    // and no associated types.
     let mut saw_method = false;
+    let mut method_names = HashSet::new();
     associated_items.assoc_type_decls().next().is_none()
         && associated_items.functions().all(|method| {
             saw_method = true;
-            method.attrs().next().is_none()
+            let name_is_distinct = method
+                .name()
+                .and_then(|name| name.token())
+                .map(|token| {
+                    let text = token.text();
+                    sai_syntax::normalize_identifier(text.strip_prefix("r#").unwrap_or(text))
+                })
+                .is_some_and(|normalized| method_names.insert(normalized));
+            name_is_distinct
+                && method.attrs().next().is_none()
                 && method.body().is_some()
                 && method
                     .visibility()
