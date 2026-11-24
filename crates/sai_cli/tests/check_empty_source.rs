@@ -3416,6 +3416,53 @@ fn mixed_function_type_and_impl_owners_check() {
 }
 
 #[test]
+fn type_and_impl_only_source_checks() {
+    // `type` records + inherent `impl` methods without a free `pub fn`
+    // still produce covered owners — an impl cannot resolve without a
+    // declared type anyway (IR-1138).
+    let source = concat!(
+        "type Deep { text: Str, count: I32 }\n",
+        "type Inner { deep: Deep }\n",
+        "type Outer { inner: Inner }\n",
+        "impl Outer {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.inner.deep.text\n",
+        "    }\n",
+        "    pub fn get_num(self: borrow Self) -> I32 {\n",
+        "        self.inner.deep.count\n",
+        "    }\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn type_and_impl_only_source_reports_method_diagnostics() {
+    // Method bodies in a fn-less source report their own diagnostics
+    // instead of gating the file (IR-1138).
+    let source = concat!(
+        "type Deep { text: Str, count: I32 }\n",
+        "type Outer { deep: Deep }\n",
+        "impl Outer {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.deep.count\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "mismatched method tail must fail");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+        "expected TYPE_MISMATCH for the method tail: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "fn-less type+impl sources must not gate: {stdout}"
+    );
+}
+
+#[test]
 fn mixed_public_const_owners_check() {
     // A `pub const` beside `pub fn`/`type`/`impl` owners joins the mixed
     // coverage set — the const literal itself is validated (IR-1134).
