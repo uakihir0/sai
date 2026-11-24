@@ -4835,6 +4835,8 @@ fn primitive_bodies_admit_str_method_calls() {
         "pub fn str_assert_call_condition(value: Str) -> Bool {\n    assert value.is_empty()\n    true\n}\n",
         "pub fn str_len_trivia(value: Str) -> USize { value.len /* note */ () }\n",
         "pub fn str_not_call(value: Str) -> Bool { not value.is_empty() }\n",
+        "pub fn str_loop_init() -> USize {\n    let s = loop { break \"a\" }\n    s.len()\n}\n",
+        "pub fn str_loop_tail() -> Str { loop { break \"a\" } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -4846,6 +4848,10 @@ fn primitive_body_str_method_call_mismatches_report_type_diagnostics() {
         (
             "pub fn str_len_mismatch(value: Str) -> I32 { value.len() }\n",
             "expected `I32`, found `USize`",
+        ),
+        (
+            "pub fn str_loop_break_mismatch() -> Str {\n    let s = loop { break \"a\"\n        break 1 }\n    s\n}\n",
+            "expected `Str`, found an integer literal",
         ),
         (
             "pub fn str_len_bind(value: Str) -> Bool {\n    let n: I32 = value.len()\n    true\n}\n",

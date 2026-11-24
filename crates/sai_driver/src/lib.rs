@@ -11267,6 +11267,7 @@ fn primitive_let_statement_shape_is_supported(
     // `let s: Str = ..` and unannotated `Str`-yielding initializers are
     // checked by the kernel's `Str` paths — the primitive shape mirror
     // would reject them before the kernel sees them.
+    let mut str_scan_fuel = STR_LOOP_SCAN_FUEL;
     let str_init = str_annotated
         || (ty.is_none()
             && str_shaped_local_init(
@@ -11276,6 +11277,7 @@ fn primitive_let_statement_shape_is_supported(
                 &str_admissions.locals,
                 symbols,
                 type_paths,
+                &mut str_scan_fuel,
             ));
     // Annotations on `let` statements inside `Str` branch blocks
     // belong to the same `primitive_types`/`annotations` maps the
@@ -11406,6 +11408,19 @@ fn collect_str_branch_let_annotations(
                 str_admissions,
             );
         }
+        // `loop` bodies are statement blocks — a `let` inside the
+        // loop carries the same annotations.
+        ExprKind::Loop { body, .. } => {
+            collect_str_branch_block_annotations(
+                body,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
         _ => {}
     }
 }
@@ -11444,6 +11459,19 @@ fn collect_str_branch_block_annotations(
                 str_admissions,
             );
         }
+        // `if`/`match`/`loop` statements inside the block can carry
+        // annotated `let`s of their own.
+        if let StmtKind::Expr(expression) = stmt.kind {
+            collect_str_branch_let_annotations(
+                expression,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
     }
     if let Some(tail) = block.tail {
         collect_str_branch_let_annotations(
@@ -11458,6 +11486,11 @@ fn collect_str_branch_block_annotations(
     }
 }
 
+/// Bound on nested `loop`-body scans inside a single `Str`-shape
+/// probe: keeps `let a = loop { .. }` chains linear in the admitted
+/// slice instead of multiplying block scans.
+const STR_LOOP_SCAN_FUEL: usize = 64;
+
 // Whether an unannotated `let` initializer yields a `Str`: a `Str`
 // literal, a path to an already-tracked `Str` binding, or a nested
 // block whose tail yields `Str` the same way. `str_bindings` carries
@@ -11469,11 +11502,18 @@ fn str_shaped_local_init(
     str_bindings: &HashSet<sai_hir::BindingId>,
     symbols: &Interner,
     type_paths: Option<&TypeOwnerPathResolution>,
+    fuel: &mut usize,
 ) -> bool {
     match init.kind {
-        ExprKind::Block(block) => {
-            str_shaped_branch_block(block, locals, inputs, str_bindings, symbols, type_paths)
-        }
+        ExprKind::Block(block) => str_shaped_branch_block(
+            block,
+            locals,
+            inputs,
+            str_bindings,
+            symbols,
+            type_paths,
+            fuel,
+        ),
         ExprKind::Lit(Lit::Str(_)) => true,
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|source| str_bindings.contains(&source)),
@@ -11494,6 +11534,7 @@ fn str_shaped_local_init(
                         str_bindings,
                         symbols,
                         type_paths,
+                        fuel,
                     )
                 })
         }
@@ -11502,15 +11543,168 @@ fn str_shaped_local_init(
         // diverging branch is neutral — it never yields. Each branch
         // is evaluated once: a nested `if` chain must not re-scan it.
         ExprKind::If { then, els, .. } => {
-            let then_str =
-                str_shaped_branch_block(then, locals, inputs, str_bindings, symbols, type_paths);
+            let then_str = str_shaped_branch_block(
+                then,
+                locals,
+                inputs,
+                str_bindings,
+                symbols,
+                type_paths,
+                fuel,
+            );
             let els_str = els.is_some_and(|els| {
-                str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
+                str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths, fuel)
             });
             (then_str || els_str)
                 && (then_str || str_diverging_local_block(then))
                 && (els_str || els.is_some_and(|els| str_diverging_local_init(els)))
         }
+        // `let s = loop { break "a" }` yields `Str` when some `break`
+        // belonging to the loop carries a `Str`-shaped value. A nested
+        // `loop`'s `break`s bind to the inner frame, so its body is
+        // not scanned (a labeled `break 'outer` inside one is missed —
+        // bounded, and the kernel still validates the body).
+        ExprKind::Loop { body, source, .. } => {
+            // Descending into a nested `loop` body is the only
+            // scan that can multiply — same-frame `if`/`block`/
+            // `match` nests are linear and stay free.
+            source == LoopSource::Loop && *fuel > 0 && {
+                *fuel -= 1;
+                str_break_value_in_block(
+                    body,
+                    locals,
+                    inputs,
+                    str_bindings,
+                    symbols,
+                    type_paths,
+                    fuel,
+                )
+            }
+        }
+        _ => false,
+    }
+}
+
+// Whether any `break` that binds to this loop's frame carries a
+// `Str`-shaped value — `if`/`match`/block nests stay in the same
+// frame; a nested `loop`'s `break`s do not.
+fn str_break_value_in_block(
+    block: &HirBlock<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    str_bindings: &HashSet<sai_hir::BindingId>,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    fuel: &mut usize,
+) -> bool {
+    // `let` statements inside the loop body seed the `Str` set the
+    // `break` values resolve against (`let t = "x"` then `break t`).
+    let mut inner = str_bindings.clone();
+    for stmt in block.stmts {
+        if let StmtKind::Let { pat, ty, init, .. } = stmt.kind {
+            let str_annotated = ty.is_some_and(|ty| {
+                matches!(
+                    resolve_function_direct_type(*ty, type_paths, symbols, inputs),
+                    Some(FunctionDirectType::Str)
+                )
+            });
+            if let PatKind::Binding { binding, .. } = pat.kind {
+                if str_annotated
+                    || (ty.is_none()
+                        && str_shaped_local_init(
+                            init, locals, inputs, &inner, symbols, type_paths, fuel,
+                        ))
+                {
+                    inner.insert(binding);
+                }
+            }
+        }
+    }
+    block.stmts.iter().any(|stmt| match stmt.kind {
+        StmtKind::Expr(expression) => str_break_value_in_expr(
+            expression, locals, inputs, &inner, symbols, type_paths, fuel,
+        ),
+        StmtKind::Let { init, .. } => {
+            str_break_value_in_expr(init, locals, inputs, &inner, symbols, type_paths, fuel)
+        }
+        _ => false,
+    }) || block.tail.is_some_and(|tail| {
+        str_break_value_in_expr(tail, locals, inputs, &inner, symbols, type_paths, fuel)
+    })
+}
+
+fn str_break_value_in_expr(
+    expression: &HirExpr<'_>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+    str_bindings: &HashSet<sai_hir::BindingId>,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    fuel: &mut usize,
+) -> bool {
+    match expression.kind {
+        ExprKind::Break {
+            value: Some(value), ..
+        } => {
+            str_shaped_local_init(
+                value,
+                locals,
+                inputs,
+                str_bindings,
+                symbols,
+                type_paths,
+                fuel,
+            ) || str_break_value_in_expr(
+                value,
+                locals,
+                inputs,
+                str_bindings,
+                symbols,
+                type_paths,
+                fuel,
+            )
+        }
+        ExprKind::Block(block) => str_break_value_in_block(
+            block,
+            locals,
+            inputs,
+            str_bindings,
+            symbols,
+            type_paths,
+            fuel,
+        ),
+        ExprKind::If { then, els, .. } => {
+            str_break_value_in_block(
+                then,
+                locals,
+                inputs,
+                str_bindings,
+                symbols,
+                type_paths,
+                fuel,
+            ) || els.is_some_and(|els| {
+                str_break_value_in_expr(
+                    els,
+                    locals,
+                    inputs,
+                    str_bindings,
+                    symbols,
+                    type_paths,
+                    fuel,
+                )
+            })
+        }
+        ExprKind::Match { arms, .. } => arms.iter().any(|arm| {
+            str_break_value_in_expr(
+                arm.body,
+                locals,
+                inputs,
+                str_bindings,
+                symbols,
+                type_paths,
+                fuel,
+            )
+        }),
         _ => false,
     }
 }
@@ -11558,6 +11752,7 @@ fn str_shaped_branch_block(
     str_bindings: &HashSet<sai_hir::BindingId>,
     symbols: &Interner,
     type_paths: Option<&TypeOwnerPathResolution>,
+    fuel: &mut usize,
 ) -> bool {
     if block.safety != sai_hir::Safety::Safe {
         return false;
@@ -11576,7 +11771,7 @@ fn str_shaped_branch_block(
                     if str_annotated
                         || (ty.is_none()
                             && str_shaped_local_init(
-                                init, locals, inputs, &inner, symbols, type_paths,
+                                init, locals, inputs, &inner, symbols, type_paths, fuel,
                             ))
                     {
                         inner.insert(binding);
@@ -11595,7 +11790,7 @@ fn str_shaped_branch_block(
         }
     }
     block.tail.is_some_and(|tail| {
-        str_shaped_local_init(tail, locals, inputs, &inner, symbols, type_paths)
+        str_shaped_local_init(tail, locals, inputs, &inner, symbols, type_paths, fuel)
     })
 }
 
@@ -14358,10 +14553,17 @@ fn index_str_method_call_receivers(
                             Some(FunctionDirectType::Str)
                         )
                     });
+                    let mut str_scan_fuel = STR_LOOP_SCAN_FUEL;
                     if str_annotated
                         || (ty.is_none()
                             && str_shaped_local_init(
-                                init, locals, inputs, receivers, symbols, type_paths,
+                                init,
+                                locals,
+                                inputs,
+                                receivers,
+                                symbols,
+                                type_paths,
+                                &mut str_scan_fuel,
                             ))
                     {
                         receivers.insert(binding);
@@ -61500,6 +61702,16 @@ property "shared"() {}
             "pub fn all_diverging_match_init(flag: Bool) -> I32 { let s = match flag { _ => return 1 }\n    s }\n",
             "pub fn numeric_match_let_then_return(flag: Bool) -> I32 { let s = match flag { true => { let n = 1\n            return 2 }, _ => 3 }\n    s }\n",
             "pub fn never_condition(flag: Bool) -> I32 { let s = match flag { _ => return 1 }\n    if s { 1 } else { 2 } }\n",
+            "pub fn str_loop_init() -> USize { let s = loop { break \"a\" }\n    s.len() }\n",
+            "pub fn str_loop_annotated() -> USize { let s: Str = loop { break \"a\" }\n    s.len() }\n",
+            "pub fn str_loop_tail() -> Str { loop { break \"a\" } }\n",
+            "pub fn str_loop_if_break(flag: Bool) -> USize { let s = loop { break if flag { \"a\" } else { \"b\" } }\n    s.len() }\n",
+            "pub fn str_loop_local_break() -> USize { let t = \"x\"\n    let s = loop { if true { break t } }\n    s.len() }\n",
+            "pub fn str_loop_mismatch() -> USize { let s = loop { break \"a\"\n            break 1 }\n    s.len() }\n",
+            "pub fn str_loop_bare() -> USize { let s = loop { break \"a\"\n            break }\n    s.len() }\n",
+            "pub fn str_loop_break_after_literal() -> USize { let s = loop { break 1\n            break \"a\" }\n    s.len() }\n",
+            "pub fn str_loop_inner_lets(n: I32) -> USize { let s = loop { let n: I32 = 1\n            let text = \"a\"\n            break text }\n    s.len() }\n",
+            "pub fn str_loop_expr_break_mismatch(n: I32) -> USize { let s = loop { break \"a\"\n            break n + 1 }\n    s.len() }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61516,7 +61728,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 44);
+        assert_eq!(owners.len(), 54);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -61545,7 +61757,11 @@ property "shared"() {}
         // stay neutral in joins: a numeric `match` with a `return`
         // arm still literal-joins, and `return`-value blocks carry
         // their own annotated `let`s.
-        for owner in owners[33..35].iter().chain(&owners[36..44]) {
+        for owner in owners[33..35]
+            .iter()
+            .chain(&owners[36..49])
+            .chain(&owners[52..53])
+        {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -61580,6 +61796,14 @@ property "shared"() {}
             // `let s = match flag { true => "a", _ => value.len() }` —
             // the call arm resolves `USize` and reports against `Str`.
             (35, "expected `Str`, found `USize`"),
+            // `loop` `Str` joins: a literal `break` after a `Str` one
+            // reports against `Str`; a `Str` `break` after a literal
+            // one names `β`'s `I64` default.
+            (49, "expected `Str`, found an integer literal"),
+            (51, "expected `I64`, found `Str`"),
+            // `break n + 1` under a `Str` `β` reports the resolved
+            // type, not a gate.
+            (53, "expected `Str`, found `I32`"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
@@ -61591,6 +61815,19 @@ property "shared"() {}
             assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
             assert_eq!(diagnostics[0].message, expected_message);
         }
+        // `break "a"` then a bare `break` under the `Str` `β` reports
+        // INVALID_BREAK_VALUE, like bare-after-valued numeric loops.
+        let FunctionBodyTypeCheck::Supported { diagnostics } = owners[50]
+            .body_type_check()
+            .expect("Str loop bare-break mismatch stays in the supported slice")
+        else {
+            panic!("Str loop bare-break mismatch stays in the supported slice");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::InvalidBreakValue
+        );
         // An out-of-range integer literal on the comparison's left reports
         // the range failure AND the checked type mismatch on the `Str`
         // operand — the same pair `check_comparison_literal` emits for a
