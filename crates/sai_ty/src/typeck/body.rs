@@ -4896,7 +4896,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 Some(primitive) => LocalType::Concrete(*primitive),
                 None => return Err(()),
             },
-            _ => return Err(()),
+            // Any other resolvable expression (operand trees) still
+            // reports the `Str` mismatch with its resolved type
+            // instead of gating — `break n + 1` under a `Str` `β` is
+            // `expected `Str`, found `I32``.
+            _ => self.check_expr_value(expression, self.input.return_type)?,
         };
         match local_type {
             LocalType::Concrete(found) => self.errors.push(PrimitiveBodyError {
