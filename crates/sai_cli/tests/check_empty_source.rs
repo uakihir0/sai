@@ -22031,3 +22031,91 @@ fn unsupported_return_forms_remain_gated() {
         "unbound return values stay behind the existing gate:\n{stdout}"
     );
 }
+
+#[test]
+fn multi_file_mixed_source_checks() {
+    // Sources spanning several `.sai` files check when every file is
+    // mixed-shaped and no module imports (IR-1141).
+    let root_source = concat!(
+        "type Outer { inner: Inner }\n",
+        "type Inner { s: Str }\n",
+        "impl Outer {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.inner.s\n",
+        "    }\n",
+        "}\n",
+    );
+    let other_source = concat!(
+        "type Solo { n: I32 }\n",
+        "impl Solo {\n",
+        "    pub fn get_n(self: borrow Self) -> I32 {\n",
+        "        self.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(root_source, "", &[("src/other.sai", other_source)], &[]);
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn multi_file_source_reports_other_file_diagnostics() {
+    // Diagnostics from non-`lib.sai` files report their own file.
+    let root_source = concat!(
+        "type Outer { inner: Inner }\n",
+        "type Inner { s: Str }\n",
+        "impl Outer {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.inner.s\n",
+        "    }\n",
+        "}\n",
+    );
+    let other_source = concat!(
+        "type Solo { n: I32 }\n",
+        "impl Solo {\n",
+        "    pub fn get_n(self: borrow Self) -> I32 {\n",
+        "        self.missing\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(root_source, "", &[("src/other.sai", other_source)], &[]);
+    assert!(!output.status.success(), "unknown field must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"UNKNOWN_FIELD\""),
+        "expected UNKNOWN_FIELD from the second file: {stdout}"
+    );
+    assert!(
+        stdout.contains("src/other.sai"),
+        "diagnostic must point at the second file: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "multi-file sources must not gate: {stdout}"
+    );
+}
+
+#[test]
+fn multi_file_source_with_non_mixed_file_stays_gated() {
+    // A file that is not mixed-shaped (a lone `pub fn`) keeps the
+    // whole package behind the coverage gate (IR-1141 bound).
+    let root_source = concat!(
+        "type Inner { s: Str }\n",
+        "impl Inner {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.s\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/fnonly.sai", "pub fn helper() -> I32 {\n    1\n}\n")],
+        &[],
+    );
+    assert!(!output.status.success(), "non-mixed file must gate");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "non-mixed files stay behind the existing gate: {stdout}"
+    );
+}

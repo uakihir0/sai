@@ -2570,8 +2570,11 @@ fn check_public_primitive_const_set_coverage(
     scopes: &sai_driver::Phase1PackageScopes,
     const_resolutions: &sai_driver::ConstOwnerResolutions,
 ) -> bool {
-    if scopes.modules.len() != 1
-        || !scopes.modules[0].imports.is_empty()
+    if scopes.modules.is_empty()
+        || scopes
+            .modules
+            .iter()
+            .any(|module| !module.imports.is_empty())
         || scopes.top_level_owners.len() != source_count
         || const_resolutions.owners().len() != source_count
     {
@@ -2607,8 +2610,11 @@ fn check_public_function_body_coverage(
     type_resolutions: Option<&sai_driver::TypeOwnerResolutions>,
 ) -> bool {
     if !source_is_candidate
-        || scopes.modules.len() != 1
-        || !scopes.modules[0].imports.is_empty()
+        || scopes.modules.is_empty()
+        || scopes
+            .modules
+            .iter()
+            .any(|module| !module.imports.is_empty())
         || scopes.top_level_owners.is_empty()
         || scopes
             .top_level_owners
@@ -2679,8 +2685,11 @@ fn check_public_inherent_method_body_coverage(
     method_resolutions: &sai_driver::TraitImplMemberTestOnlyResolutions,
 ) -> bool {
     if !source_is_candidate
-        || scopes.modules.len() != 1
-        || !scopes.modules[0].imports.is_empty()
+        || scopes.modules.is_empty()
+        || scopes
+            .modules
+            .iter()
+            .any(|module| !module.imports.is_empty())
         || scopes.top_level_owners.len() != 2
         || method_resolutions.owners().len() != 1
         || scopes
@@ -2744,8 +2753,11 @@ fn check_mixed_public_item_coverage(
     const_resolutions: &sai_driver::ConstOwnerResolutions,
 ) -> bool {
     if !source_is_candidate
-        || scopes.modules.len() != 1
-        || !scopes.modules[0].imports.is_empty()
+        || scopes.modules.is_empty()
+        || scopes
+            .modules
+            .iter()
+            .any(|module| !module.imports.is_empty())
         || scopes.top_level_owners.is_empty()
         || scopes.top_level_owners.iter().any(|owner| {
             !matches!(
@@ -6660,7 +6672,21 @@ fn module_tree_workspace_check_diagnostics(
                 path == &root_source_path
                     && check_source_is_single_unattributed_public_inherent_method(source.as_ref())
             });
-    let root_mixed_items_source_candidate = root_const_input_shape
+    // Multi-file sources (IR-1141): the same root-package shape, but
+    // any number of `.sai` inputs — coverage additionally requires
+    // every file to be mixed-shaped and no module to import.
+    let root_multi_source_input_shape = inputs.len() == 1
+        && inputs[0].is_root_package
+        && !inputs[0].analyzes_tests
+        && !inputs[0].inspection_incomplete
+        && inputs[0].source_directory_exists
+        && !inputs[0].source_inputs.is_empty()
+        && package_manifests.len() == 1
+        && package_manifests[0].role == sai_package::manifest::PackageRole::Root
+        && wit_packages.is_empty()
+        && package_graph.is_none()
+        && target_cfg.is_some();
+    let root_mixed_items_source_candidate = root_multi_source_input_shape
         && inputs[0]
             .source_inputs
             .first()
@@ -6673,7 +6699,11 @@ fn module_tree_workspace_check_diagnostics(
                 path == &root_source_path
                     && !root_single_inherent_method_source_candidate
                     && check_source_is_mixed_public_items(source.as_ref())
-            });
+            })
+        && inputs[0]
+            .source_inputs
+            .iter()
+            .all(|(_, _, source)| check_source_is_mixed_public_items(source.as_ref()));
     let mut public_primitive_const_set_covered = false;
     let mut single_public_function_body_covered = false;
     let mut single_public_inherent_method_body_covered = false;
