@@ -8227,57 +8227,22 @@ fn check_inherent_method_body_type<'a>(
             // decides — `(` means method-call syntax, anything else
             // (e.g. `)`) keeps the field read and its `UnknownField`
             // diagnostic.
-            if let ExprKind::Call { callee, .. } = expression.kind
-                && matches!(callee.kind, ExprKind::Field { args: None, .. })
-                && str_call_callee_is_method_syntax(
-                    inputs.source.text(),
-                    callee.span.range.end().to_usize(),
-                )
-            {
-                // `self.<method>(..)` resolves through the impl's
-                // sibling signatures; `self.<record-field>.<method>(..)`
-                // is method-call syntax too — the callee is not a field
-                // read either way, so the collect pass skips it (the
-                // call itself still gates: sibling signatures resolve
-                // `self` receivers only today).
-                let (is_self_call_shape, is_receiver_call_shape) = match callee.kind {
-                    ExprKind::Field { base, .. } if is_direct_self_value_expression(base) => {
-                        (true, false)
-                    }
-                    ExprKind::Field { base, .. } => (
-                        false,
-                        matches!(
-                            base.kind,
-                            ExprKind::Field {
-                                base: inner_base,
-                                name: inner_name,
-                                args: None,
-                            } if is_direct_self_value_expression(inner_base)
-                                && symbols.resolve(inner_name.sym).ok().is_some_and(
-                                    |field_name| field_types
-                                        .record_fields
-                                        .contains_key(field_name.as_ref()),
-                                )
-                        ),
-                    ),
-                    _ => (false, false),
-                };
-                if is_self_call_shape || is_receiver_call_shape {
-                    call_callee_ids.insert(callee.hir_id);
-                    if is_self_call_shape
-                        && let ExprKind::Field { name, .. } = callee.kind
-                        && let Ok(spelling) = symbols.resolve(name.sym)
-                        && let Some(signature) = method_signatures.get(
-                            sai_syntax::normalize_identifier(
-                                spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
-                            )
-                            .as_str(),
-                        )
-                    {
-                        self_method_calls.insert(expression.hir_id, signature.clone());
-                    }
-                }
-            }
+            // `self.<method>(..)` resolves through the impl's sibling
+            // signatures; `self.<record-field>.<method>(..)` is
+            // method-call syntax too — the callee is not a field read
+            // either way, so the collect pass skips it (the call
+            // itself still gates: signatures resolve `self` receivers
+            // only today). The visitor is parent-first, so the
+            // callee's `HirId` is recorded before its `Field` node.
+            self_method_call_site(
+                expression,
+                &field_types.record_fields,
+                &method_signatures,
+                &mut call_callee_ids,
+                &mut self_method_calls,
+                symbols,
+                inputs,
+            );
             if collect_error.is_some()
                 || !matches!(expression.kind, ExprKind::Field { .. })
                 || call_callee_ids.contains(&expression.hir_id)
@@ -8326,7 +8291,12 @@ fn check_inherent_method_body_type<'a>(
             );
         }
         *inputs.str_self_field_projections.borrow_mut() = Some(self_field_projections);
-        *inputs.str_self_method_calls.borrow_mut() = Some(self_method_calls);
+        *inputs.str_self_method_calls.borrow_mut() = Some(
+            self_method_calls
+                .into_iter()
+                .map(|(hir_id, (_, signature))| (hir_id, signature))
+                .collect(),
+        );
         let augmented_str_calls = str_method_call_signatures(
             method_block,
             &str_bindings,
@@ -8374,13 +8344,37 @@ fn check_inherent_method_body_type<'a>(
     let mut str_field_projections = HashMap::new();
     let mut unknown_self_fields = HashSet::new();
     let mut diagnostics = Vec::new();
+    // `self.<method>(..)` calls resolve through the impl's sibling
+    // member signatures, like the `-> Str` walk's.
+    let method_signatures = method_call_sites
+        .map(|sites| str_inherent_self_method_signatures(sites, impl_owner, inputs, symbols))
+        .unwrap_or_default();
+    let mut call_callee_ids = HashSet::new();
+    let mut self_method_calls = HashMap::new();
     // Self-field operands desugar to `let t = self.f`, so every `self.f`
     // node in the body contributes its projection (or unknown-field
     // diagnostic); nodes that are not self fields stay unrecorded and
     // gate through the admission mirrors.
     let mut collect_error = None;
     visit_block_expressions(method_block, &mut |expression| {
-        if collect_error.is_some() || !matches!(expression.kind, ExprKind::Field { .. }) {
+        // A method-syntax `self.<name>(..)` callee is a call, not a
+        // field read — skipping it keeps `UnknownField` off a real
+        // method name; the call itself still gates without a
+        // signature (e.g. `self.<record-field>.<method>(..)`, which
+        // has no `self`-receiver signature today).
+        self_method_call_site(
+            expression,
+            &field_types.record_fields,
+            &method_signatures,
+            &mut call_callee_ids,
+            &mut self_method_calls,
+            symbols,
+            inputs,
+        );
+        if collect_error.is_some()
+            || !matches!(expression.kind, ExprKind::Field { .. })
+            || call_callee_ids.contains(&expression.hir_id)
+        {
             return;
         }
         match collect_inherent_method_self_field(
@@ -8412,6 +8406,43 @@ fn check_inherent_method_body_type<'a>(
         params: explicit_body_params,
         ..*body
     };
+    // `self.<method>(..)` calls join `direct_call_signatures` keyed by
+    // the call's `HirId` — the kernel resolves any call through the
+    // map regardless of the callee's shape, so a `Field` callee named
+    // `self.<method>` type-checks like a direct call once signed.
+    // `()` outputs or parameters are unrepresentable — those calls
+    // stay unsigned and gate.
+    let mut prim_calls = direct_call_signatures.cloned().unwrap_or_default();
+    for (call_hir_id, (callee_hir_id, signature)) in &self_method_calls {
+        let Some(output) = (match signature.output {
+            "`Str`" => Some(sai_ty::typeck::body::PrimitiveCallOutput::Str),
+            family => {
+                str_family_prim(family).map(sai_ty::typeck::body::PrimitiveCallOutput::Primitive)
+            }
+        }) else {
+            continue;
+        };
+        let Some(parameters) = signature
+            .parameters
+            .iter()
+            .map(|family| match *family {
+                "`Str`" => Some(sai_ty::typeck::body::PrimitiveCallParameter::Str),
+                other => str_family_prim(other)
+                    .map(sai_ty::typeck::body::PrimitiveCallParameter::Primitive),
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        prim_calls.insert(
+            *call_hir_id,
+            sai_ty::typeck::body::PrimitiveCallSignature {
+                callee: *callee_hir_id,
+                parameters,
+                output,
+            },
+        );
+    }
     // `self.<Str field>.len()`/`is_empty()` receivers read the same
     // projections map the `-> Str` walk uses — publish it for the walk.
     let has_str_projections = !str_field_projections.is_empty();
@@ -8424,7 +8455,7 @@ fn check_inherent_method_body_type<'a>(
         &explicit_body,
         locals,
         type_paths,
-        direct_call_signatures,
+        Some(&prim_calls),
         semantic_types,
         symbols,
         Some(&self_field_projections),
@@ -8441,8 +8472,13 @@ fn check_inherent_method_body_type<'a>(
         diagnostics.extend(type_diagnostics);
         *primitive_type_results = Some(type_results);
         Ok(FunctionBodyTypeCheck::Supported { diagnostics })
-    } else {
+    } else if diagnostics.is_empty() {
         Ok(FunctionBodyTypeCheck::Unsupported)
+    } else {
+        // A `self.<missing>` still reports its field diagnostic —
+        // the method is erroneous whether or not the rest of the
+        // body stayed inside the walk's shapes.
+        Ok(FunctionBodyTypeCheck::Supported { diagnostics })
     }
 }
 
@@ -9432,6 +9468,74 @@ fn nested_str_self_field_family<'a>(
         return Some(NestedSelfField::Known(*family));
     }
     Some(NestedSelfField::Unknown { name, record })
+}
+
+// A `self.<method>(..)`/`self.<record-field>.<method>(..)` method-syntax
+// callee is a call, not a field read — record its `HirId` so the field
+// collect pass skips it (the call still gates without a signature), and
+// store the sibling signature for `self.<method>(..)` callees. The
+// signature's `()` outputs/params may be unrepresentable downstream;
+// callers decide what to do with unsigned calls. A parenthesized callee
+// (`(self.<name>)(..)`) IS a value read: HIR erases the parens, so the
+// source text after the callee's span decides — `(` means method-call
+// syntax, anything else (e.g. `)`) keeps the field read.
+fn self_method_call_site(
+    expression: &HirExpr<'_>,
+    record_fields: &HashMap<String, String>,
+    method_signatures: &HashMap<String, StrSelfMethodCallSignature>,
+    call_callee_ids: &mut HashSet<HirId>,
+    self_method_calls: &mut HashMap<HirId, (HirId, StrSelfMethodCallSignature)>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) {
+    let ExprKind::Call { callee, .. } = expression.kind else {
+        return;
+    };
+    if !matches!(callee.kind, ExprKind::Field { args: None, .. })
+        || !str_call_callee_is_method_syntax(
+            inputs.source.text(),
+            callee.span.range.end().to_usize(),
+        )
+    {
+        return;
+    }
+    let (is_self_call_shape, is_receiver_call_shape) = match callee.kind {
+        ExprKind::Field { base, .. } if is_direct_self_value_expression(base) => (true, false),
+        ExprKind::Field { base, .. } => (
+            false,
+            matches!(
+                base.kind,
+                ExprKind::Field {
+                    base: inner_base,
+                    name: inner_name,
+                    args: None,
+                } if is_direct_self_value_expression(inner_base)
+                    && symbols
+                        .resolve(inner_name.sym)
+                        .ok()
+                        .is_some_and(|field_name| {
+                            record_fields.contains_key(field_name.as_ref())
+                        })
+            ),
+        ),
+        _ => (false, false),
+    };
+    if !is_self_call_shape && !is_receiver_call_shape {
+        return;
+    }
+    call_callee_ids.insert(callee.hir_id);
+    if is_self_call_shape
+        && let ExprKind::Field { name, .. } = callee.kind
+        && let Ok(spelling) = symbols.resolve(name.sym)
+        && let Some(signature) = method_signatures.get(
+            sai_syntax::normalize_identifier(
+                spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+            )
+            .as_str(),
+        )
+    {
+        self_method_calls.insert(expression.hir_id, (callee.hir_id, signature.clone()));
+    }
 }
 
 // Collect `self.<field>` projections for a `-> Str` method body:
@@ -104789,6 +104893,115 @@ property "shared"() {}
             matches!(check, FunctionBodyTypeCheck::Unsupported),
             "call stays gated: {check:?}"
         );
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_prim_self_method_calls() {
+        let root = concat!(
+            "type Greeting { count: I32, text: Str }\n",
+            "impl Greeting {\n",
+            "  pub fn size(self: borrow Self) -> I32 {\n",
+            "    self.count\n",
+            "  }\n",
+            "  pub fn get(self: borrow Self, flag: Bool) -> Str {\n",
+            "    self.text\n",
+            "  }\n",
+            "  pub fn ok(self: borrow Self) -> I32 {\n",
+            "    self.size()\n",
+            "  }\n",
+            "  pub fn cond(self: borrow Self) -> I32 {\n",
+            "    if self.size() == 1 {\n",
+            "      1\n",
+            "    } else {\n",
+            "      2\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn str_bind(self: borrow Self) -> I32 {\n",
+            "    let s = self.get(true)\n",
+            "    self.size()\n",
+            "  }\n",
+            "  pub fn arity(self: borrow Self) -> I32 {\n",
+            "    self.size(1)\n",
+            "  }\n",
+            "  pub fn arg_mismatch(self: borrow Self) -> I32 {\n",
+            "    self.get(1)\n",
+            "  }\n",
+            "  pub fn missing(self: borrow Self) -> I32 {\n",
+            "    self.nope()\n",
+            "  }\n",
+            "  pub fn paren_callee(self: borrow Self) -> I32 {\n",
+            "    (self.size)()\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("inherent methods collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let methods = &results.owners()[0].members();
+        assert_eq!(methods.len(), 9);
+        // `self.<method>(..)` calls in `-> <prim>` bodies resolve the
+        // sibling's signature — positionally checked args, Str outputs
+        // bind like `-> Str` callees.
+        for (index, name) in [(2, "ok"), (3, "cond"), (4, "str_bind")] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} checks the sibling call: {check:?}");
+            };
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+        }
+        // Wrong arity reports like a direct call.
+        let check = methods[5].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("arity reports: {check:?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == sai_diagnostics::Code::WrongArgumentCount),
+            "{diagnostics:?}"
+        );
+        // A literal `1` against the `Bool` parameter is a type error,
+        // not an arity error.
+        let check = methods[6].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("arg_mismatch reports: {check:?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == sai_diagnostics::Code::TypeMismatch),
+            "{diagnostics:?}"
+        );
+        // A `self.<name>(..)` callee that is no sibling method is a
+        // method call without a signature — the call gates, and no
+        // `UnknownField` is reported for a method-syntax name.
+        let check = methods[7].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "missing stays gated without a field error: {check:?}"
+        );
+        // `(self.<name>)(..)` is a value read — an unknown name keeps
+        // its `UnknownField` diagnostic.
+        let check = methods[8].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("paren_callee reports its field error: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
     }
 
     #[test]
