@@ -24186,9 +24186,10 @@ fn str_loop_str_body(
     };
     if !any_break || (need_clean && !clean_yield) {
         // No `break` reaches this frame at all — the `loop` diverges
-        // and yields `!`, which unifies with `Str`.
+        // and yields `!`, which unifies with `Str`. Statement
+        // diagnostics collected during the scan still report.
         if !any_break && !str_loop_body_has_break(block, frame_label) {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(diagnostics));
         }
         return Ok(None);
     }
