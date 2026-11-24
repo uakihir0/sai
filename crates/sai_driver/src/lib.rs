@@ -23840,8 +23840,13 @@ fn str_outer_breaks_in_block(
                 )
             });
             if let PatKind::Binding { binding, .. } = pat.kind {
-                if str_annotated
-                    || (ty.is_none() && {
+                // A path init carries its source's family — `let ok =
+                // flag` seeds `Bool`, not `Str`, so `assert ok` still
+                // checks the real binding.
+                let seeded_family = if str_annotated {
+                    Some("`Str`")
+                } else if ty.is_none() {
+                    str_binding_family(init, locals, &inner).or_else(|| {
                         let seeds: HashSet<sai_hir::BindingId> = inner.keys().copied().collect();
                         let mut seed_fuel = STR_LOOP_SCAN_FUEL;
                         str_shaped_local_init(
@@ -23854,12 +23859,16 @@ fn str_outer_breaks_in_block(
                             call_signatures,
                             &mut seed_fuel,
                         )
+                        .then_some("`Str`")
                     })
-                {
+                } else {
+                    None
+                };
+                if let Some(family) = seeded_family {
                     inner.insert(
                         binding,
                         StrLocalEntry {
-                            family: "`Str`",
+                            family,
                             literal: None,
                         },
                     );
@@ -93754,6 +93763,9 @@ property "shared"() {}
             "pub fn str_lbl_inner_only() -> Str {\n    loop { 'l: loop { break 'l } }\n}\n",
             "pub fn str_lbl_inner_diags() -> Str {\n    'l: loop { loop { assert 1\n    break 'l \"a\" } }\n}\n",
             "pub fn str_lbl_match_binding() -> Str {\n    let s = \"a\"\n    'l: loop { loop { match s { other => break 'l other } } }\n}\n",
+            "pub fn str_lbl_diverge_diags() -> Str {\n    'l: loop { loop { assert 1 }\n    break \"a\" }\n}\n",
+            "pub fn str_lbl_own_frame_mismatch() -> Str {\n    'l: loop { 'inner: loop { break 'inner \"a\"\n    break 1 }\n    break \"a\" }\n}\n",
+            "pub fn str_lbl_bool_local(flag: Bool) -> Str {\n    'l: loop { loop { let ok = flag\n    assert ok\n    break 'l \"a\" } }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -93769,9 +93781,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 15);
+        assert_eq!(owners.len(), 18);
 
-        for index in [0, 1, 2, 3, 4, 5, 6, 9, 11, 12, 14] {
+        for index in [0, 1, 2, 3, 4, 5, 6, 9, 11, 12, 14, 17] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a labeled Str break is checked");
@@ -93784,6 +93796,8 @@ property "shared"() {}
             (7, sai_diagnostics::Code::TypeMismatch),
             (8, sai_diagnostics::Code::InvalidBreakValue),
             (13, sai_diagnostics::Code::TypeMismatch),
+            (15, sai_diagnostics::Code::TypeMismatch),
+            (16, sai_diagnostics::Code::TypeMismatch),
         ] {
             let check = owners[index]
                 .body_type_check()
