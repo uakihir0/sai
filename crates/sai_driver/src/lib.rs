@@ -45604,24 +45604,39 @@ impl RootDatabase {
                     &self.symbols,
                     other_def_paths,
                 );
-                // A `type Str` in the impl's own file shadows the
-                // prelude `Str` for its signature spellings.
-                let other_str_taken = ast::SourceFile::cast(other_inputs.root.clone())
-                    .map(|file| {
-                        file.items().any(|item| match item {
-                            ast::Item::Type(decl) => decl
-                                .name()
-                                .and_then(|name| name.token())
-                                .is_some_and(|token| {
+                // The impl file's own records, parsed like the
+                // same-file machinery does — a `type Str` among them
+                // shadows the prelude `Str` for that file's signature
+                // spellings, and a record named like the impl's self
+                // type means `impl X` binds to a *different* `X` than
+                // the receiver's (name-based resolution can't relate
+                // them) — such an impl is skipped rather than
+                // adopted.
+                let other_record_names: Vec<String> =
+                    ast::SourceFile::cast(other_inputs.root.clone())
+                        .map(|file| {
+                            file.items()
+                                .filter_map(|item| match item {
+                                    ast::Item::Type(decl) => {
+                                        parse_inherent_method_record(&decl, &other_inputs)
+                                    }
+                                    _ => None,
+                                })
+                                .map(|record| {
                                     sai_syntax::normalize_identifier(
-                                        token.text().strip_prefix("r#").unwrap_or(token.text()),
-                                    ) == "Str"
-                                }),
-                            _ => false,
+                                        record
+                                            .type_name
+                                            .strip_prefix("r#")
+                                            .unwrap_or(&record.type_name),
+                                    )
+                                    .as_str()
+                                    .to_owned()
+                                })
+                                .collect()
                         })
-                    })
-                    .unwrap_or(false);
-                if let Some(signatures) = sibling_impl_member_signatures(
+                        .unwrap_or_default();
+                let other_str_taken = other_record_names.iter().any(|name| name == "Str");
+                if let Some((record, signatures)) = sibling_impl_member_signatures(
                     other,
                     &top_level_owner_index,
                     &other_inputs,
@@ -45630,7 +45645,10 @@ impl RootDatabase {
                     &self.symbols,
                     other_str_taken,
                 ) {
-                    sibling_impl_tables.insert(other.owner, signatures);
+                    if other_record_names.iter().any(|name| *name == record) {
+                        continue;
+                    }
+                    sibling_impl_tables.insert(other.owner, (record, signatures));
                 }
             }
 
