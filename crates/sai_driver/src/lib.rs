@@ -8147,6 +8147,38 @@ fn check_inherent_method_body_type<'a>(
         return Ok(FunctionBodyTypeCheck::Unsupported);
     }
 
+    // A method without a `self` receiver is an associated function —
+    // every parameter is explicit, so it checks through the same
+    // primitive local-block walk a free `pub fn` uses. `-> Str`
+    // selfless methods and self-field projections stay gated (there
+    // is no `self` to project).
+    if !sig
+        .params
+        .first()
+        .is_some_and(|parameter| parameter.is_self)
+    {
+        if let Some((diagnostics, type_results)) = check_function_body_primitive_local_block(
+            method_owner,
+            sig,
+            body,
+            locals,
+            type_paths,
+            direct_call_signatures,
+            semantic_types,
+            symbols,
+            None,
+            None,
+            None,
+            inputs,
+            snapshot,
+            target_cfg,
+        )? {
+            *primitive_type_results = Some(type_results);
+            return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
+        }
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+
     let Some((receiver, explicit_params)) = sig.params.split_first() else {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
@@ -106111,6 +106143,68 @@ property "shared"() {}
         assert!(
             matches!(check, FunctionBodyTypeCheck::Unsupported),
             "deep_mid_unknown stays gated: {check:?}"
+        );
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_selfless_methods() {
+        // A method without a `self` receiver is an associated function —
+        // every parameter is explicit, so the same primitive local-block
+        // walk a free `pub fn` uses checks it.
+        let root = concat!(
+            "type Counter { count: I32 }\n",
+            "impl Counter {\n",
+            "    pub fn make() -> I32 {\n",
+            "        1\n",
+            "    }\n",
+            "    pub fn add(value: I32) -> I32 {\n",
+            "        let result = value + 1\n",
+            "        result\n",
+            "    }\n",
+            "    pub fn bad() -> I32 {\n",
+            "        true\n",
+            "    }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("inherent methods collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let owner = results
+            .owners()
+            .iter()
+            .find(|owner| owner.members().len() == 3)
+            .expect("the Counter impl owner");
+        let methods = owner.members();
+        for (index, name) in [(0, "make"), (1, "add")] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} is a supported selfless method: {check:?}");
+            };
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+        }
+        let check = methods[2].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("bad reports its tail error: {check:?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch),
+            "{diagnostics:?}"
         );
     }
 
