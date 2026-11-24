@@ -9207,14 +9207,19 @@ struct StrSelfMethodCallSiteInputs<'a, 'hir> {
 
 // The file-local data a sibling impl's signature table needs: every
 // impl descriptor, plus the same lowering inputs the current impl
-// uses (sibling impls in other files stay gated — their item tree is
-// not this file's). Tables are built on demand per record name.
+// uses; sibling impls in other files of the package lower under their
+// own file's `FileImplData` (prefetched by the caller). Tables are
+// built on demand per record name.
 struct SiblingImplIndex<'a, 'ctx, 'hir> {
     descriptors: &'a [TopLevelOwnerDescriptor],
     top_level_owner_index: &'a HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
     file: FileId,
     inputs: &'hir CurrentOwnerInputs,
     context: &'a HirLoweringContext<'ctx, 'hir>,
+    // `impl` blocks in other files of the package, prefetched by the
+    // caller: their record name and member signatures (owned strings
+    // only — no borrows cross this index's scope).
+    other_impls: &'a HashMap<OwnerId, (String, Vec<(String, StrSelfMethodCallSignature)>)>,
     def_paths: &'a Arc<DefPathInterner>,
     symbols: &'a Interner,
     tables:
@@ -9259,99 +9264,42 @@ impl<'a, 'ctx, 'hir> SiblingImplIndex<'a, 'ctx, 'hir> {
     ) -> Option<HashMap<String, StrSelfMethodCallSignature>> {
         let mut table = None;
         for descriptor in self.descriptors {
-            if descriptor.kind != TopLevelOwnerKind::Impl || descriptor.file != self.file {
+            if descriptor.kind != TopLevelOwnerKind::Impl {
                 continue;
             }
-            let Ok(parent_descriptor) = find_top_level_owner_descriptor(
+            // An impl in another file of the package comes from the
+            // caller's prefetched table — its members already lowered
+            // under that file's own inputs and scope.
+            if descriptor.file != self.file {
+                let Some((record, signatures)) = self.other_impls.get(&descriptor.owner) else {
+                    continue;
+                };
+                if record != record_name {
+                    continue;
+                }
+                let table = table.get_or_insert_with(HashMap::new);
+                for (name, signature) in signatures {
+                    table
+                        .entry(name.clone())
+                        .or_insert_with(|| signature.clone());
+                }
+                continue;
+            }
+            let Some((record, signatures)) = sibling_impl_member_signatures(
+                descriptor,
                 self.top_level_owner_index,
-                descriptor.owner,
-                descriptor.file,
-                descriptor.item_id,
-                descriptor.kind,
-            ) else {
-                continue;
-            };
-            if self.inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::Impl)
-            {
-                continue;
-            }
-            let Some(parent_entry) = self.inputs.filtered_item_tree.items.iter().find(|entry| {
-                entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::Impl
-            }) else {
-                continue;
-            };
-            let member_entries: Vec<&sai_hir::item_tree::ItemTreeEntry> = parent_entry
-                .children
-                .iter()
-                .filter(|entry| {
-                    matches!(entry.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn)
-                })
-                .collect();
-            let Ok(Some(expected_parent_path)) = self
-                .def_paths
-                .resolve_def_id(descriptor.owner.def_id.to_def_id())
-            else {
-                continue;
-            };
-            let Ok((parent_hir, _)) = lower_top_level_owner(
-                parent_descriptor,
-                &expected_parent_path,
-                &self.inputs.filtered_item_tree,
-                &self.inputs.retained_item_kinds,
-                self.context,
-            ) else {
-                continue;
-            };
-            let OwnerNode::Item(item) = parent_hir.node else {
-                continue;
-            };
-            let ItemKind::Impl {
-                generics,
-                kind: ImplKind::Inherent { self_ty },
-                items: parent_members,
-                ..
-            } = item.kind
-            else {
-                continue;
-            };
-            // Generic parameters and `where` predicates are outside the
-            // bounded walk — an impl carrying either stays unsigned.
-            if !generics.params.is_empty() || !generics.where_preds.is_empty() {
-                continue;
-            }
-            let TyKind::Path(path) = self_ty.kind else {
-                continue;
-            };
-            let Some(segment) = path.segments.last() else {
-                continue;
-            };
-            let Ok(spelling) = self.symbols.resolve(segment.name.sym) else {
-                continue;
-            };
-            if sai_syntax::normalize_identifier(
-                spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
-            )
-            .as_str()
-                != record_name
-            {
-                continue;
-            }
-            let sub_sites = StrSelfMethodCallSiteInputs {
-                entries: &member_entries,
-                owners: parent_members,
-                impl_item_id: descriptor.item_id,
-                context: self.context,
-                def_paths: self.def_paths,
-                sibling_impls: None,
-            };
-            // The first declaration of a duplicate method name wins.
-            let signatures = str_inherent_self_method_signatures(
-                &sub_sites,
-                &parent_hir,
                 self.inputs,
+                self.context,
+                self.def_paths,
                 self.symbols,
                 str_name_taken,
-            );
+            ) else {
+                continue;
+            };
+            if record != record_name {
+                continue;
+            }
+            // The first declaration of a duplicate method name wins.
             let table = table.get_or_insert_with(HashMap::new);
             for (name, signature) in signatures {
                 table.entry(name).or_insert(signature);
@@ -9359,6 +9307,94 @@ impl<'a, 'ctx, 'hir> SiblingImplIndex<'a, 'ctx, 'hir> {
         }
         table
     }
+}
+
+// One `impl` descriptor's record name plus its members' Str-walk
+// signatures, lowered under the given file's inputs and context —
+// shared by the same-file lazy path and the cross-file prefetch.
+fn sibling_impl_member_signatures<'hir>(
+    descriptor: &TopLevelOwnerDescriptor,
+    top_level_owner_index: &HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
+    inputs: &'hir CurrentOwnerInputs,
+    context: &HirLoweringContext<'_, 'hir>,
+    def_paths: &Arc<DefPathInterner>,
+    symbols: &Interner,
+    str_name_taken: bool,
+) -> Option<(String, Vec<(String, StrSelfMethodCallSignature)>)> {
+    let parent_descriptor = find_top_level_owner_descriptor(
+        top_level_owner_index,
+        descriptor.owner,
+        descriptor.file,
+        descriptor.item_id,
+        descriptor.kind,
+    )
+    .ok()?;
+    if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::Impl) {
+        return None;
+    }
+    let parent_entry = inputs
+        .filtered_item_tree
+        .items
+        .iter()
+        .find(|entry| entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::Impl)?;
+    let member_entries: Vec<&sai_hir::item_tree::ItemTreeEntry> = parent_entry
+        .children
+        .iter()
+        .filter(|entry| matches!(entry.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn))
+        .collect();
+    let expected_parent_path = def_paths
+        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+        .ok()??;
+    let (parent_hir, _) = lower_top_level_owner(
+        parent_descriptor,
+        &expected_parent_path,
+        &inputs.filtered_item_tree,
+        &inputs.retained_item_kinds,
+        context,
+    )
+    .ok()?;
+    let OwnerNode::Item(item) = parent_hir.node else {
+        return None;
+    };
+    let ItemKind::Impl {
+        generics,
+        kind: ImplKind::Inherent { self_ty },
+        items: parent_members,
+        ..
+    } = item.kind
+    else {
+        return None;
+    };
+    // Generic parameters and `where` predicates are outside the
+    // bounded walk — an impl carrying either stays unsigned.
+    if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+        return None;
+    }
+    let TyKind::Path(path) = self_ty.kind else {
+        return None;
+    };
+    let segment = path.segments.last()?;
+    let spelling = symbols.resolve(segment.name.sym).ok()?;
+    let record =
+        sai_syntax::normalize_identifier(spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()))
+            .as_str()
+            .to_owned();
+    let sub_sites = StrSelfMethodCallSiteInputs {
+        entries: &member_entries,
+        owners: parent_members,
+        impl_item_id: descriptor.item_id,
+        context,
+        def_paths,
+        sibling_impls: None,
+    };
+    let signatures = str_inherent_self_method_signatures(
+        &sub_sites,
+        &parent_hir,
+        inputs,
+        symbols,
+        str_name_taken,
+    );
+    Some((record, signatures.into_iter().collect()))
 }
 
 // A signature position type mapped to its family name by spelling —
@@ -45533,6 +45569,89 @@ impl RootDatabase {
                 }
             };
 
+            // `self.<record-field>.<method>(..)` calls inside this
+            // impl's members may resolve against `impl <record>`
+            // blocks in other files of the package — lower their
+            // member signatures eagerly under each impl file's own
+            // inputs and scope (the underlying queries are memoized);
+            // only owned strings cross into the analysis closure.
+            let mut sibling_impl_tables: HashMap<
+                OwnerId,
+                (String, Vec<(String, StrSelfMethodCallSignature)>),
+            > = HashMap::new();
+            for other in descriptors.iter() {
+                if other.kind != TopLevelOwnerKind::Impl
+                    || other.file == descriptor.file
+                    || sibling_impl_tables.contains_key(&other.owner)
+                {
+                    continue;
+                }
+                let Ok(other_inputs) =
+                    self.current_owner_inputs(snapshot, other.file, &collection.target_cfg)
+                else {
+                    continue;
+                };
+                let Some(other_def_paths) = self.def_paths.get(&other.owner.def_id.package())
+                else {
+                    continue;
+                };
+                let arena = HirArena::new();
+                let other_context = HirLoweringContext::new(
+                    &other_inputs.ast_ids,
+                    snapshot,
+                    &other_inputs.root,
+                    &arena,
+                    &self.symbols,
+                    other_def_paths,
+                );
+                // The impl file's own records, parsed like the
+                // same-file machinery does — a `type Str` among them
+                // shadows the prelude `Str` for that file's signature
+                // spellings, and a record named like the impl's self
+                // type means `impl X` binds to a *different* `X` than
+                // the receiver's (name-based resolution can't relate
+                // them) — such an impl is skipped rather than
+                // adopted.
+                let other_record_names: Vec<String> =
+                    ast::SourceFile::cast(other_inputs.root.clone())
+                        .map(|file| {
+                            file.items()
+                                .filter_map(|item| match item {
+                                    ast::Item::Type(decl) => {
+                                        parse_inherent_method_record(&decl, &other_inputs)
+                                    }
+                                    _ => None,
+                                })
+                                .map(|record| {
+                                    sai_syntax::normalize_identifier(
+                                        record
+                                            .type_name
+                                            .strip_prefix("r#")
+                                            .unwrap_or(&record.type_name),
+                                    )
+                                    .as_str()
+                                    .to_owned()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                let other_str_taken = other_record_names.iter().any(|name| name == "Str");
+                if let Some((record, signatures)) = sibling_impl_member_signatures(
+                    other,
+                    &top_level_owner_index,
+                    &other_inputs,
+                    &other_context,
+                    other_def_paths,
+                    &self.symbols,
+                    other_str_taken,
+                ) {
+                    if other_record_names.iter().any(|name| *name == record) {
+                        continue;
+                    }
+                    sibling_impl_tables.insert(other.owner, (record, signatures));
+                }
+            }
+
             let analysis: Result<
                 (Vec<TraitImplMemberTestOnlyResolution>, Vec<Diagnostic>),
                 OwnerControlFlowResolutionError,
@@ -45652,6 +45771,7 @@ impl RootDatabase {
                     file: descriptor.file,
                     inputs: &inputs,
                     context: &context,
+                    other_impls: &sibling_impl_tables,
                     def_paths,
                     symbols: &self.symbols,
                     tables: std::cell::RefCell::new(HashMap::new()),
