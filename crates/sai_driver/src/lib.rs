@@ -18911,6 +18911,52 @@ fn str_condition(
             fold(lhs, left_family, rhs, right_family),
             fold(rhs, right_family, lhs, left_family),
         );
+        // An unresolved literal variable against a concrete primitive
+        // operand pins to it like the checker's comparison inference —
+        // `let n = 5; let m: I8 = 3; assert n == m` resolves `n` to `I8`.
+        // A literal kind the pin cannot accept keeps its family and the
+        // mismatch below reports `expected <left>, found <right>`.
+        let pin = |expr: &HirExpr<'_>,
+                   own: &'static str,
+                   other: &'static str,
+                   diagnostics: &mut Vec<Diagnostic>|
+         -> Result<&'static str, OwnerControlFlowResolutionError> {
+            if own == other {
+                return Ok(own);
+            }
+            let Some((_, seed)) = str_leaf_literal_seed(expr, locals, str_bindings) else {
+                return Ok(own);
+            };
+            let Some(primitive) = str_family_prim(other) else {
+                return Ok(own);
+            };
+            match sai_ty::typeck::literal::check_primitive_literal(
+                primitive,
+                seed.literal,
+                symbols,
+                target_cfg.pointer_width(),
+            ) {
+                sai_ty::typeck::literal::PrimitiveLiteralResult::Match
+                | sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
+                    str_seed_resolve(
+                        owner,
+                        seed.as_ref(),
+                        other,
+                        diagnostics,
+                        inputs,
+                        snapshot,
+                        symbols,
+                        target_cfg,
+                    )?;
+                    Ok(other)
+                }
+                sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => Ok(own),
+            }
+        };
+        let (left_family, right_family) = (
+            pin(lhs, left_family, right_family, &mut operand_diagnostics)?,
+            pin(rhs, right_family, left_family, &mut operand_diagnostics)?,
+        );
         if left_family == right_family {
             let mut diagnostics = operand_diagnostics;
             for operand in [lhs, rhs] {
@@ -93766,6 +93812,8 @@ property "shared"() {}
             "pub fn str_lbl_diverge_diags() -> Str {\n    'l: loop { loop { assert 1 }\n    break \"a\" }\n}\n",
             "pub fn str_lbl_own_frame_mismatch() -> Str {\n    'l: loop { 'inner: loop { break 'inner \"a\"\n    break 1 }\n    break \"a\" }\n}\n",
             "pub fn str_lbl_bool_local(flag: Bool) -> Str {\n    'l: loop { loop { let ok = flag\n    assert ok\n    break 'l \"a\" } }\n}\n",
+            "pub fn str_lbl_seed_pin() -> Str {\n    'l: loop { loop { let n = 5\n    let m: I8 = 3\n    assert n == m }\n    break \"a\" }\n}\n",
+            "pub fn str_lbl_seed_pin_range() -> Str {\n    'l: loop { loop { let n = 5000000000\n    let m: I8 = 3\n    assert n == m }\n    break \"a\" }\n}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -93781,9 +93829,9 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 18);
+        assert_eq!(owners.len(), 20);
 
-        for index in [0, 1, 2, 3, 4, 5, 6, 9, 11, 12, 14, 17] {
+        for index in [0, 1, 2, 3, 4, 5, 6, 9, 11, 12, 14, 17, 18] {
             let check = owners[index]
                 .body_type_check()
                 .expect("a labeled Str break is checked");
@@ -93798,6 +93846,7 @@ property "shared"() {}
             (13, sai_diagnostics::Code::TypeMismatch),
             (15, sai_diagnostics::Code::TypeMismatch),
             (16, sai_diagnostics::Code::TypeMismatch),
+            (19, sai_diagnostics::Code::LiteralOutOfRange),
         ] {
             let check = owners[index]
                 .body_type_check()
