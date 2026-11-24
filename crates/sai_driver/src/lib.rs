@@ -11565,8 +11565,12 @@ fn str_shaped_local_init(
         // not scanned (a labeled `break 'outer` inside one is missed —
         // bounded, and the kernel still validates the body).
         ExprKind::Loop { body, source, .. } => {
-            source == LoopSource::Loop
-                && str_break_value_in_block(
+            // Descending into a nested `loop` body is the only
+            // scan that can multiply — same-frame `if`/`block`/
+            // `match` nests are linear and stay free.
+            source == LoopSource::Loop && *fuel > 0 && {
+                *fuel -= 1;
+                str_break_value_in_block(
                     body,
                     locals,
                     inputs,
@@ -11575,6 +11579,7 @@ fn str_shaped_local_init(
                     type_paths,
                     fuel,
                 )
+            }
         }
         _ => false,
     }
@@ -11592,12 +11597,6 @@ fn str_break_value_in_block(
     type_paths: Option<&TypeOwnerPathResolution>,
     fuel: &mut usize,
 ) -> bool {
-    // Bounded: every nested `loop` body scan costs one unit of
-    // `fuel`, so probes stay linear in the admitted slice.
-    if *fuel == 0 {
-        return false;
-    }
-    *fuel -= 1;
     // `let` statements inside the loop body seed the `Str` set the
     // `break` values resolve against (`let t = "x"` then `break t`).
     let mut inner = str_bindings.clone();
