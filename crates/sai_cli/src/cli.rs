@@ -2063,16 +2063,25 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     // no executable body) — a source of one or more top-level functions
     // whose bodies can each be checked.
     let mut saw_function = false;
-    let type_names: HashSet<String> = source_file
-        .items()
-        .filter_map(|item| match item {
-            sai_syntax::ast::Item::Type(type_decl) => type_decl
+    let mut type_names = HashSet::new();
+    let mut public_type_names = HashSet::new();
+    for item in source_file.items() {
+        if let sai_syntax::ast::Item::Type(type_decl) = item {
+            if let Some(name) = type_decl
                 .name()
                 .and_then(|name| name.token())
-                .map(|token| token.text().to_owned()),
-            _ => None,
-        })
-        .collect();
+                .map(|token| token.text().to_owned())
+            {
+                if is_public_visibility(type_decl.visibility()) {
+                    public_type_names.insert(name.clone());
+                }
+                type_names.insert(name);
+            }
+        }
+    }
+    if !check_type_decls_acyclic(&source_file, source, &type_names) {
+        return false;
+    }
     source_file.items().all(|item| match item {
         sai_syntax::ast::Item::Function(function) => {
             saw_function = true;
@@ -2091,7 +2100,12 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
                 // `path_resolution()` — deferred field-type misses and
                 // duplicate field names pass it silently. Only records
                 // whose fields are verifiable keep the source admissible.
-                && check_type_decl_primitive_fields(&type_decl, source, &type_names)
+                && check_type_decl_primitive_fields(
+                    &type_decl,
+                    source,
+                    &type_names,
+                    &public_type_names,
+                )
         }
         _ => false,
     }) && saw_function
@@ -2107,11 +2121,13 @@ fn strip_utf8_bom(source: &[u8]) -> &[u8] {
 // impl's record: every field named, attr-free, and primitive/`Str` or
 // another `type` declared in the file (record-typed receivers for
 // `self.<field>.<leaf>` projections). An empty record has nothing to
-// verify and is admissible.
+// verify and is admissible. `type_names`/`public_type_names` hold raw
+// declared spellings; comparisons normalize `r#` like the impl check.
 fn check_type_decl_primitive_fields(
     type_decl: &sai_syntax::ast::TypeDecl,
     source: &[u8],
     type_names: &HashSet<String>,
+    public_type_names: &HashSet<String>,
 ) -> bool {
     use sai_syntax::ast::AstNode as _;
 
@@ -2151,6 +2167,7 @@ fn check_type_decl_primitive_fields(
         };
         let normalized_field_name =
             sai_syntax::normalize_identifier(field_name.strip_prefix("r#").unwrap_or(&field_name));
+        let decl_is_public = is_public_visibility(type_decl.visibility());
         field_names.insert(normalized_field_name)
             && field.attrs().next().is_none()
             && field.ty().is_some_and(|ty| {
@@ -2177,9 +2194,107 @@ fn check_type_decl_primitive_fields(
                         | b"F32"
                         | b"F64"
                         | b"Str"
-                ) || type_names.iter().any(|name| name.as_bytes() == type_text)
+                ) || {
+                    let Ok(text) = std::str::from_utf8(type_text) else {
+                        return false;
+                    };
+                    let normalized = normalize_type_name(text);
+                    let declared = type_names
+                        .iter()
+                        .any(|name| normalize_type_name(name) == normalized);
+                    // A `pub` field on a public record exposing a
+                    // package-private type is PRIVATE_TYPE_IN_PUBLIC_API
+                    // upstream — the coverage gate cannot emit it, so
+                    // the source stays gated.
+                    declared
+                        && !(decl_is_public
+                            && field.pub_token().is_some()
+                            && !public_type_names
+                                .iter()
+                                .any(|name| normalize_type_name(name) == normalized))
+                }
             })
     })
+}
+
+// A declared `type` name normalized for comparison: `r#` stripped and
+// NFC, matching how binding names and method names are normalized.
+fn normalize_type_name(text: &str) -> String {
+    sai_syntax::normalize_identifier(text.strip_prefix("r#").unwrap_or(text))
+}
+
+// `type` decls whose record-typed fields point back through other decls
+// to themselves have no finite size (INFINITE_SIZE_TYPE upstream), so a
+// cyclic record graph keeps the whole source gated.
+fn check_type_decls_acyclic(
+    source_file: &sai_syntax::ast::SourceFile,
+    source: &[u8],
+    type_names: &HashSet<String>,
+) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    let normalized_names: HashSet<String> = type_names
+        .iter()
+        .map(|name| normalize_type_name(name))
+        .collect();
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+    for item in source_file.items() {
+        let sai_syntax::ast::Item::Type(type_decl) = item else {
+            continue;
+        };
+        let Some(name) = type_decl
+            .name()
+            .and_then(|name| name.token())
+            .map(|token| normalize_type_name(token.text()))
+        else {
+            continue;
+        };
+        let targets = type_decl
+            .struct_def()
+            .and_then(|definition| definition.fields())
+            .map(|fields| {
+                fields
+                    .fields()
+                    .filter_map(|field| {
+                        let ty = field.ty()?;
+                        let range = ty.syntax().text_range();
+                        let text = source.get(range.start().to_usize()..range.end().to_usize())?;
+                        let normalized = normalize_type_name(std::str::from_utf8(text).ok()?);
+                        normalized_names.contains(&normalized).then_some(normalized)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        edges.insert(name, targets);
+    }
+    let mut state: HashMap<String, u8> = HashMap::new();
+    for start in edges.keys() {
+        if state.contains_key(start.as_str()) {
+            continue;
+        }
+        let mut stack = vec![(start.clone(), false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                state.insert(node, 2);
+                continue;
+            }
+            match state.get(node.as_str()) {
+                Some(2) => continue,
+                Some(1) => return false,
+                _ => {}
+            }
+            state.insert(node.clone(), 1);
+            stack.push((node.clone(), true));
+            for target in edges.get(node.as_str()).into_iter().flatten() {
+                match state.get(target.as_str()) {
+                    Some(2) => {}
+                    Some(1) => return false,
+                    _ => stack.push((target.clone(), false)),
+                }
+            }
+        }
+    }
+    true
 }
 
 // An `impl` block usable in a mixed source: attr-free, safe, inherent on
@@ -2273,8 +2388,9 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
     let mut saw_function = false;
     let mut saw_impl = false;
     // Record-typed fields may name a `type` declared later in the file —
-    // the name set is collected before the field check runs.
+    // the name sets are collected before the field check runs.
     let mut type_names = HashSet::new();
+    let mut public_type_names = HashSet::new();
     for item in source_file.items() {
         if let sai_syntax::ast::Item::Type(type_decl) = item {
             let Some(name) = type_decl
@@ -2284,8 +2400,14 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
             else {
                 return false;
             };
+            if is_public_visibility(type_decl.visibility()) {
+                public_type_names.insert(name.clone());
+            }
             type_names.insert(name);
         }
+    }
+    if !check_type_decls_acyclic(&source_file, source, &type_names) {
+        return false;
     }
     let mut impls = Vec::new();
     for item in source_file.items() {
@@ -2301,7 +2423,12 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
                 saw_function = true;
             }
             sai_syntax::ast::Item::Type(type_decl) => {
-                if !check_type_decl_primitive_fields(&type_decl, source, &type_names) {
+                if !check_type_decl_primitive_fields(
+                    &type_decl,
+                    source,
+                    &type_names,
+                    &public_type_names,
+                ) {
                     return false;
                 }
             }
@@ -2364,11 +2491,18 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
     else {
         return false;
     };
+    let public_type_names = if is_public_visibility(type_decl.visibility()) {
+        HashSet::from([type_name.clone()])
+    } else {
+        HashSet::new()
+    };
     if items.next().is_some()
+        || !check_type_decls_acyclic(&source_file, source, &HashSet::from([type_name.clone()]))
         || !check_type_decl_primitive_fields(
             &type_decl,
             source,
             &HashSet::from([type_name.clone()]),
+            &public_type_names,
         )
         || impl_decl.attrs().next().is_some()
         || impl_decl

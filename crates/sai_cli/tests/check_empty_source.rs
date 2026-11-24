@@ -3584,6 +3584,70 @@ fn record_typed_fields_in_function_source_check() {
 }
 
 #[test]
+fn self_referential_record_type_stays_gated() {
+    // `type A { a: A }` has no finite size — INFINITE_SIZE_TYPE
+    // upstream — so the source stays gated (IR-1135 review).
+    let source = concat!(
+        "type A { a: A }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated(&run_check(source, "", &[], &[]), "self-referential record");
+}
+
+#[test]
+fn cyclic_record_types_stay_gated() {
+    // A mutual `A -> B -> A` field cycle is infinite-size too
+    // (IR-1135 review).
+    let source = concat!(
+        "type A { b: B }\n",
+        "type B { a: A }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated(&run_check(source, "", &[], &[]), "mutual record cycle");
+}
+
+#[test]
+fn public_field_naming_private_type_stays_gated() {
+    // A `pub` field on a `pub` record naming a package-private `type`
+    // is PRIVATE_TYPE_IN_PUBLIC_API upstream — the coverage gate cannot
+    // emit it, so the source stays gated (IR-1135 review).
+    let source = concat!(
+        "type Inner { v: I32 }\n",
+        "pub type Outer { pub inner: Inner }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated(
+        &run_check(source, "", &[], &[]),
+        "private type in pub field",
+    );
+}
+
+#[test]
+fn raw_ident_field_type_resolves_declared_type() {
+    // `r#`-spelling differences between the field type and the `type`
+    // decl resolve to the same record (IR-1135 review).
+    let source = concat!(
+        "type r#Point { x: I32 }\n",
+        "type Outer { p: Point }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(
+        output.status.success(),
+        "raw-ident field type resolves the declared type: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn mixed_function_type_and_impl_owners_report_body_diagnostics() {
     // Mixed coverage still reports each owner's diagnostics — the bad
     // method tail surfaces alongside a clean function.
