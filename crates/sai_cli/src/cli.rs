@@ -2070,6 +2070,11 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
                     .syntax()
                     .descendants()
                     .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+                // The coverage gate only checks the type owner's
+                // `path_resolution()` — deferred field-type misses and
+                // duplicate field names pass it silently. Only records
+                // whose fields are verifiable keep the source admissible.
+                && check_type_decl_primitive_fields(&type_decl, source)
         }
         _ => false,
     }) && saw_function
@@ -2077,10 +2082,7 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
 
 // A `type` declaration's field names and types usable as an inherent
 // impl's record: every field named, attr-free, and primitive/`Str`.
-fn check_type_decl_primitive_fields(
-    type_decl: &sai_syntax::ast::TypeDecl,
-    source: &[u8],
-) -> bool {
+fn check_type_decl_primitive_fields(type_decl: &sai_syntax::ast::TypeDecl, source: &[u8]) -> bool {
     use sai_syntax::ast::AstNode as _;
 
     let Some(struct_def) = type_decl.struct_def() else {
@@ -6490,8 +6492,7 @@ fn module_tree_workspace_check_diagnostics(
                 } else {
                     format!("{}/lib.sai", inputs[0].source_directory)
                 };
-                path == &root_source_path
-                    && check_source_is_mixed_public_items(source.as_ref())
+                path == &root_source_path && check_source_is_mixed_public_items(source.as_ref())
             });
     let mut public_primitive_const_set_covered = false;
     let mut single_public_function_body_covered = false;
@@ -7305,9 +7306,7 @@ fn module_tree_workspace_check_diagnostics(
                             module_tree,
                             &workspace_snapshot,
                         )
-                        .map_err(|error| {
-                            format!("function owner analysis failed: {error:?}")
-                        })?;
+                        .map_err(|error| format!("function owner analysis failed: {error:?}"))?;
                     let method_resolutions = database
                         .resolve_trait_impl_member_test_only_paths(
                             &collection,
@@ -7317,32 +7316,28 @@ fn module_tree_workspace_check_diagnostics(
                         .map_err(|error| {
                             format!("inherent method owner analysis failed: {error:?}")
                         })?;
-                    let type_resolutions = if collection
-                        .scopes()
-                        .top_level_owners
-                        .iter()
-                        .any(|owner| {
+                    let type_resolutions =
+                        if collection.scopes().top_level_owners.iter().any(|owner| {
                             !matches!(
                                 owner.kind,
                                 sai_driver::TopLevelOwnerKind::Function
                                     | sai_driver::TopLevelOwnerKind::Impl
                             )
-                        })
-                    {
-                        Some(
-                            database
-                                .resolve_type_owner_paths(
-                                    &collection,
-                                    module_tree,
-                                    &workspace_snapshot,
-                                )
-                                .map_err(|error| {
-                                    format!("type owner path query failed: {error:?}")
-                                })?,
-                        )
-                    } else {
-                        None
-                    };
+                        }) {
+                            Some(
+                                database
+                                    .resolve_type_owner_paths(
+                                        &collection,
+                                        module_tree,
+                                        &workspace_snapshot,
+                                    )
+                                    .map_err(|error| {
+                                        format!("type owner path query failed: {error:?}")
+                                    })?,
+                            )
+                        } else {
+                            None
+                        };
                     let mut body_diagnostics = Vec::new();
                     for owner in function_resolutions.owners() {
                         match owner.body_type_check() {

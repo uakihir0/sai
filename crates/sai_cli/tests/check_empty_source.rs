@@ -3364,6 +3364,39 @@ fn attribute_carrying_type_owner_stays_gated() {
 }
 
 #[test]
+fn unresolved_field_type_owner_stays_gated() {
+    // A record field typed with an unresolvable name passes the type
+    // owner's `path_resolution()` silently (the miss is deferred) — the
+    // source must stay gated rather than report success (IR-1132 review).
+    let source = concat!(
+        "type Bad { x: Missing }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(source, "", &[], &[]),
+        "unresolved field type",
+    );
+}
+
+#[test]
+fn duplicate_record_field_names_stay_gated() {
+    // Duplicate field names keep the record out of the verifiable
+    // slice — nothing downstream checks them (IR-1132 review).
+    let source = concat!(
+        "type Dup { x: I32, x: I32 }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(source, "", &[], &[]),
+        "duplicate record fields",
+    );
+}
+
+#[test]
 fn duplicate_inherent_method_names_stay_gated() {
     // Member-scope name duplicates are outside the checked slice — the
     // impl must not pass silently (IR-1131 review).
