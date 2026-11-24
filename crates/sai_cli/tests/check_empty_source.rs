@@ -3279,6 +3279,74 @@ fn direct_parameter_return_type_mismatch_suppresses_check_result() {
 }
 
 #[test]
+fn multiple_public_function_bodies_emit_check_result() {
+    let source = concat!(
+        "pub fn first() -> I32 {\n",
+        "    1\n",
+        "}\n",
+        "pub fn second(flag: Bool) -> I32 {\n",
+        "    if flag { 1 } else { 2 }\n",
+        "}\n",
+        "pub fn third() -> Str {\n",
+        "    \"text\"\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn multiple_public_function_bodies_report_each_body_diagnostic() {
+    let source = concat!(
+        "pub fn first() -> I32 {\n",
+        "    1\n",
+        "}\n",
+        "pub fn bad() -> I32 {\n",
+        "    \"x\"\n",
+        "}\n",
+        "pub fn gated() -> I32 {\n",
+        "    missing_fn()\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(&output, "multi-owner body diagnostics");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("TYPE_MISMATCH") && stdout.contains("expected `I32`"),
+        "multi-owner sources report each checked body's diagnostics: {stdout}"
+    );
+}
+
+#[test]
+fn multiple_public_inherent_methods_emit_check_result() {
+    let source = concat!(
+        "type Pair { a: I32, b: I32 }\n",
+        "impl Pair {\n",
+        "    pub fn sum(self: borrow Self) -> I32 {\n",
+        "        self.a + self.b\n",
+        "    }\n",
+        "    pub fn first(self: borrow Self) -> I32 {\n",
+        "        self.a\n",
+        "    }\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn mixed_function_and_type_owners_stay_gated() {
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(source, "", &[], &[]),
+        "mixed function and type owners",
+    );
+}
+
+#[test]
 fn public_inherent_method_body_emits_check_result() {
     let source = concat!(
         "type Counter { marker: I32 }\n",
@@ -10950,11 +11018,14 @@ fn public_non_bool_assert_condition_emits_type_mismatch() {
 fn unsupported_assert_statement_shapes_remain_gated() {
     for source in [
         "pub fn run(flag: Bool) -> I32 { assert flag, 1\n    1\n }\n",
-        "pub fn helper() -> Bool { true }\npub fn run(flag: Bool) -> I32 { assert helper()\n    1\n }\n",
         "pub fn run(flag: Bool) -> I32 { assert flag and missing\n    1\n }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
+    // A `Bool`-returning call as the assert condition checks cleanly
+    // alongside the callee (IR-1131).
+    let source = "pub fn helper() -> Bool { true }\npub fn run(flag: Bool) -> I32 { assert helper()\n    1\n }\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
 
 #[test]
@@ -11764,10 +11835,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
             "impl StrOwner {\n",
             "    fn string_identity(self: borrow Self) -> Str { \"text\" }\n",
             "}\n",
-        ),
-        concat!(
-            "pub fn first(value: I32) -> I32 { value }\n",
-            "pub fn second(value: I32) -> I32 { value }\n",
         ),
         concat!(
             "@target(\"wasm64-core\")\n",
@@ -19818,14 +19885,13 @@ fn primitive_const_success_stays_limited_to_the_default_unlocked_check() {
 }
 
 #[test]
-fn direct_function_calls_remain_behind_the_current_cli_stage_gate() {
+fn direct_function_calls_emit_check_result() {
     let source = concat!(
         "pub fn direct_call(value: I32) -> I32 { identity(value) }\n",
         "pub fn nested_direct_call(value: I32) -> I32 { identity(identity(value)) }\n",
         "pub fn identity(value: I32) -> I32 { value }\n",
     );
-    let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(&output, "direct and nested function calls");
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
 
 #[test]
@@ -20573,10 +20639,17 @@ fn primitive_literal_tails_remain_behind_the_stage_gate() {
         "pub fn str_tail() -> I32 { \"text\" }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "primitive literal tails at root and after locals",
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    // Every owner is checked: the three bad tails report their
+    // diagnostics and the check emits no gate diagnostic.
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "{stdout}"
     );
+    for code in ["TYPE_MISMATCH", "LITERAL_OUT_OF_RANGE"] {
+        assert!(stdout.contains(&format!("\"code\":\"{code}\"")), "{stdout}");
+    }
 }
 
 #[test]

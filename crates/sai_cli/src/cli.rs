@@ -2050,15 +2050,19 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     {
         return false;
     }
-    let mut items = source_file.items();
-    let Some(sai_syntax::ast::Item::Function(function)) = items.next() else {
-        return false;
-    };
-    items.next().is_none()
-        && function.attrs().next().is_none()
-        && function
-            .visibility()
-            .is_some_and(|visibility| visibility.pub_token().is_some())
+    // Every item must be an unattributed `pub fn` — a source of one
+    // or more top-level functions whose bodies can each be checked.
+    let mut saw_function = false;
+    source_file.items().all(|item| {
+        let sai_syntax::ast::Item::Function(function) = item else {
+            return false;
+        };
+        saw_function = true;
+        function.attrs().next().is_none()
+            && function
+                .visibility()
+                .is_some_and(|visibility| visibility.pub_token().is_some())
+    }) && saw_function
 }
 
 fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> bool {
@@ -2173,17 +2177,18 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
     let Some(associated_items) = impl_decl.items() else {
         return false;
     };
-    let mut functions = associated_items.functions();
-    let Some(method) = functions.next() else {
-        return false;
-    };
-    functions.next().is_none()
-        && associated_items.assoc_type_decls().next().is_none()
-        && method.attrs().next().is_none()
-        && method.body().is_some()
-        && method
-            .visibility()
-            .is_some_and(|visibility| visibility.pub_token().is_some())
+    // One or more unattributed `pub fn` methods, no associated types.
+    let mut saw_method = false;
+    associated_items.assoc_type_decls().next().is_none()
+        && associated_items.functions().all(|method| {
+            saw_method = true;
+            method.attrs().next().is_none()
+                && method.body().is_some()
+                && method
+                    .visibility()
+                    .is_some_and(|visibility| visibility.pub_token().is_some())
+        })
+        && saw_method
 }
 
 fn check_public_primitive_const_set_coverage(
@@ -2229,26 +2234,36 @@ fn check_public_function_body_coverage(
     if !source_is_candidate
         || scopes.modules.len() != 1
         || !scopes.modules[0].imports.is_empty()
-        || scopes.top_level_owners.len() != 1
-        || function_resolutions.owners().len() != 1
-        || scopes.top_level_owners[0].kind != sai_driver::TopLevelOwnerKind::Function
+        || scopes.top_level_owners.is_empty()
+        || scopes.top_level_owners.len() != function_resolutions.owners().len()
+        || scopes
+            .top_level_owners
+            .iter()
+            .any(|owner| owner.kind != sai_driver::TopLevelOwnerKind::Function)
     {
         return false;
     }
-    let owner = &function_resolutions.owners()[0];
-    if owner.owner() != scopes.top_level_owners[0].owner {
-        return false;
-    }
-    owner
-        .body_type_check()
-        .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
-        && owner
-            .local_resolution()
-            .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
-        && owner
-            .resolution()
-            .is_ok_and(|resolution| resolution.diagnostics.is_empty())
-        && owner.lowering_diagnostics().is_empty()
+    let resolved_owner_ids = function_resolutions
+        .owners()
+        .iter()
+        .map(|owner| owner.owner())
+        .collect::<HashSet<_>>();
+    scopes
+        .top_level_owners
+        .iter()
+        .all(|descriptor| resolved_owner_ids.contains(&descriptor.owner))
+        && function_resolutions.owners().iter().all(|owner| {
+            owner
+                .body_type_check()
+                .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
+                && owner
+                    .local_resolution()
+                    .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
+                && owner
+                    .resolution()
+                    .is_ok_and(|resolution| resolution.diagnostics.is_empty())
+                && owner.lowering_diagnostics().is_empty()
+        })
 }
 
 fn check_public_inherent_method_body_coverage(
@@ -2287,25 +2302,26 @@ fn check_public_inherent_method_body_coverage(
     if impl_owner.kind() != sai_driver::TopLevelOwnerKind::Impl
         || impl_owner.error().is_some()
         || !impl_owner.lowering_diagnostics().is_empty()
-        || impl_owner.members().len() != 1
+        || impl_owner.members().is_empty()
     {
         return false;
     }
 
-    let method = &impl_owner.members()[0];
-    method.parent_owner() == impl_owner.owner()
-        && method.kind() == sai_driver::TraitImplMemberKind::ImplMethod
-        && method
-            .body_type_check()
-            .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
-        && method
-            .local_resolution()
-            .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
-        && method.type_path_resolution().is_ok()
-        && method
-            .test_only_diagnostics()
-            .is_ok_and(|diagnostics| diagnostics.is_empty())
-        && method.lowering_diagnostics().is_empty()
+    impl_owner.members().iter().all(|method| {
+        method.parent_owner() == impl_owner.owner()
+            && method.kind() == sai_driver::TraitImplMemberKind::ImplMethod
+            && method
+                .body_type_check()
+                .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
+            && method
+                .local_resolution()
+                .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
+            && method.type_path_resolution().is_ok()
+            && method
+                .test_only_diagnostics()
+                .is_ok_and(|diagnostics| diagnostics.is_empty())
+            && method.lowering_diagnostics().is_empty()
+    })
 }
 
 fn active_public_name_diagnostics(
