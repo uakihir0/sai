@@ -3397,6 +3397,146 @@ fn duplicate_record_field_names_stay_gated() {
 }
 
 #[test]
+fn mixed_function_type_and_impl_owners_check() {
+    // `pub fn`s, `type` records, and inherent `impl`s in one source run
+    // their function/method/type resolution sets together (IR-1133).
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
+        "        let count = self.count\n",
+        "        count\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn mixed_function_type_and_impl_owners_report_body_diagnostics() {
+    // Mixed coverage still reports each owner's diagnostics — the bad
+    // method tail surfaces alongside a clean function.
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
+        "        true\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(
+        !output.status.success(),
+        "mixed owners with a bad method body must fail"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+        "expected the method's type mismatch: {stdout}"
+    );
+}
+
+#[test]
+fn attribute_carrying_impl_owner_stays_gated() {
+    // An attributed `impl` keeps the whole mixed source gated rather
+    // than checking the function alone (IR-1133).
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "@native\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
+        "        self.count\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(source, "", &[], &[]),
+        "attribute-carrying impl owner",
+    );
+}
+
+#[test]
+fn duplicate_method_names_across_impl_blocks_stay_gated() {
+    // The same method name in separate `impl` blocks of one type is a
+    // redefinition — per-block name checks alone miss it (IR-1132 review).
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn get(self: borrow Self) -> I32 { self.count }\n",
+        "}\n",
+        "impl Counter {\n",
+        "    pub fn get(self: borrow Self) -> I32 { 0 }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(source, "", &[], &[]),
+        "duplicate method names across impl blocks",
+    );
+}
+
+#[test]
+fn bom_prefixed_mixed_source_checks() {
+    // A UTF-8 BOM must not skew the byte slices used for field and
+    // impl-target type checks — the whole source stays covered.
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn get(self: borrow Self) -> I32 { self.count }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    let bom_source = format!("\u{FEFF}{source}");
+    assert_success_result(run_check(&bom_source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn empty_record_beside_function_checks() {
+    // An empty record has nothing to verify — it must not gate the
+    // functions beside it (IR-1132 review).
+    let source = concat!(
+        "type Empty { }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n"
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn impl_on_undeclared_type_stays_gated() {
+    // An `impl` on a name no file `type` declares keeps the mixed
+    // source gated (IR-1133).
+    let source = concat!(
+        "impl Missing {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        1\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(source, "", &[], &[]),
+        "impl on undeclared type",
+    );
+}
+
+#[test]
 fn duplicate_inherent_method_names_stay_gated() {
     // Member-scope name duplicates are outside the checked slice — the
     // impl must not pass silently (IR-1131 review).

@@ -2035,6 +2035,7 @@ fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize>
 fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     use sai_syntax::ast::AstNode as _;
 
+    let source = strip_utf8_bom(source);
     let Some(parsed) = sai_fmt::parse_source(source).ok() else {
         return false;
     };
@@ -2080,15 +2081,19 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     }) && saw_function
 }
 
+// Syntax-node text ranges are computed on the BOM-stripped text —
+// slice the same view when reading source bytes for a node.
+fn strip_utf8_bom(source: &[u8]) -> &[u8] {
+    source.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(source)
+}
+
 // A `type` declaration's field names and types usable as an inherent
 // impl's record: every field named, attr-free, and primitive/`Str`.
+// An empty record has nothing to verify and is admissible.
 fn check_type_decl_primitive_fields(type_decl: &sai_syntax::ast::TypeDecl, source: &[u8]) -> bool {
     use sai_syntax::ast::AstNode as _;
 
     let Some(struct_def) = type_decl.struct_def() else {
-        return false;
-    };
-    let Some(fields) = struct_def.fields() else {
         return false;
     };
     if type_decl.attrs().next().is_some()
@@ -2101,10 +2106,12 @@ fn check_type_decl_primitive_fields(type_decl: &sai_syntax::ast::TypeDecl, sourc
             .descendants()
             .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
         || struct_def.where_clause().is_some()
-        || fields.fields().next().is_none()
     {
         return false;
     }
+    let Some(fields) = struct_def.fields() else {
+        return true;
+    };
     let mut field_names = HashSet::new();
     fields.fields().all(|field| {
         let Some(field_name) = field
@@ -2154,6 +2161,7 @@ fn check_impl_decl_is_inherent_public_methods(
     impl_decl: &sai_syntax::ast::ImplDecl,
     type_names: &HashSet<String>,
     source: &[u8],
+    seen_methods: &mut HashSet<(String, String)>,
 ) -> bool {
     use sai_syntax::ast::AstNode as _;
 
@@ -2194,7 +2202,13 @@ fn check_impl_decl_is_inherent_public_methods(
                     let text = token.text();
                     sai_syntax::normalize_identifier(text.strip_prefix("r#").unwrap_or(text))
                 })
-                .is_some_and(|normalized| method_names.insert(normalized));
+                .is_some_and(|normalized| {
+                    method_names.insert(normalized.clone())
+                        // The same method name on the same type in a
+                        // separate `impl` block is a redefinition —
+                        // track it across impls too.
+                        && seen_methods.insert((type_text.to_owned(), normalized))
+                });
             name_is_distinct
                 && method.attrs().next().is_none()
                 && method.body().is_some()
@@ -2211,6 +2225,7 @@ fn check_impl_decl_is_inherent_public_methods(
 fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
     use sai_syntax::ast::AstNode as _;
 
+    let source = strip_utf8_bom(source);
     let Some(parsed) = sai_fmt::parse_source(source).ok() else {
         return false;
     };
@@ -2263,16 +2278,23 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
             _ => return false,
         }
     }
+    let mut seen_methods = HashSet::new();
     saw_function
         && saw_impl
         && impls.iter().all(|impl_decl| {
-            check_impl_decl_is_inherent_public_methods(impl_decl, &type_names, source)
+            check_impl_decl_is_inherent_public_methods(
+                impl_decl,
+                &type_names,
+                source,
+                &mut seen_methods,
+            )
         })
 }
 
 fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> bool {
     use sai_syntax::ast::AstNode as _;
 
+    let source = strip_utf8_bom(source);
     let Some(parsed) = sai_fmt::parse_source(source).ok() else {
         return false;
     };
