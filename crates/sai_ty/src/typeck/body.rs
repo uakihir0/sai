@@ -66,7 +66,17 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
 pub struct PrimitiveCallSignature {
     pub callee: HirId,
     pub parameters: Vec<PrimTy>,
-    pub output: PrimTy,
+    pub output: PrimitiveCallOutput,
+}
+
+/// What a direct call yields: a primitive literal family or `Str`.
+/// `Str` is not a `PrimTy`, so `-> Str` callees need their own output
+/// kind (parameters still project to `PrimTy` only — a callee taking
+/// `Str` stays outside this slice).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrimitiveCallOutput {
+    Primitive(PrimTy),
+    Str,
 }
 
 /// Result of checking a function body in the annotated-local slice.
@@ -2904,6 +2914,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
                 Ok(LocalType::Str)
             }
+            // `let s: Str = make_str()` — a `-> Str` call's output
+            // binds directly; a primitive output reports against
+            // `Str` like a scalar path.
+            ExprKind::Call { base: None, .. } => match self.check_direct_call(init, false)? {
+                found @ (LocalType::Str | LocalType::Error(_)) => Ok(found),
+                LocalType::Concrete(found) => {
+                    self.errors.push(PrimitiveBodyError {
+                        node: init.hir_id,
+                        kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                            expected: ScalarType::Str,
+                            found: ScalarType::Primitive(found),
+                        },
+                    });
+                    Ok(LocalType::Str)
+                }
+                LocalType::LiteralVariable(_) | LocalType::ErrorLiteralVariable(_) => Err(()),
+            },
             _ => match self.check_local_path(init)? {
                 LocalType::Str => Ok(LocalType::Str),
                 LocalType::Concrete(found) => {
@@ -5027,6 +5054,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     .copied(),
                 Some("`Str`")
             ),
+            // A `-> Str` call yields a `Str` local — the checker still
+            // validates the call's arity and arguments at its own site.
+            ExprKind::Call {
+                callee, base: None, ..
+            } => self
+                .input
+                .call_signatures
+                .and_then(|signatures| signatures.get(&init.hir_id))
+                .is_some_and(|signature| {
+                    signature.callee == callee.hir_id
+                        && signature.output == PrimitiveCallOutput::Str
+                }),
             ExprKind::Block(block) => self.str_branch_block_shaped_in(block, str_bindings, fuel),
             ExprKind::If { then, els, .. } => {
                 // A diverging branch is neutral — it never yields, so
@@ -6393,7 +6432,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 _ => return Err(()),
             }
         }
-        Ok(LocalType::Concrete(signature.output))
+        Ok(match signature.output {
+            PrimitiveCallOutput::Primitive(output) => LocalType::Concrete(output),
+            PrimitiveCallOutput::Str => LocalType::Str,
+        })
     }
 
     fn check_bitwise_not_path(
