@@ -9125,11 +9125,16 @@ impl<'a, 'ctx, 'hir> SiblingImplIndex<'a, 'ctx, 'hir> {
     // Find `impl <record_name>` among the file's impl blocks and lower
     // its members' signatures exactly like the current impl's — the
     // same `borrow Self`-receiver and family-spelling gates apply.
+    // Every impl block naming the record contributes (methods may be
+    // split across several `impl` blocks); impls with generic
+    // parameters or `where` predicates are skipped — condition
+    // checking is outside the walk.
     fn build_table(
         &self,
         record_name: &str,
         str_name_taken: bool,
     ) -> Option<HashMap<String, StrSelfMethodCallSignature>> {
+        let mut table = None;
         for descriptor in self.descriptors {
             if descriptor.kind != TopLevelOwnerKind::Impl || descriptor.file != self.file {
                 continue;
@@ -9178,6 +9183,7 @@ impl<'a, 'ctx, 'hir> SiblingImplIndex<'a, 'ctx, 'hir> {
                 continue;
             };
             let ItemKind::Impl {
+                generics,
                 kind: ImplKind::Inherent { self_ty },
                 items: parent_members,
                 ..
@@ -9185,6 +9191,11 @@ impl<'a, 'ctx, 'hir> SiblingImplIndex<'a, 'ctx, 'hir> {
             else {
                 continue;
             };
+            // Generic parameters and `where` predicates are outside the
+            // bounded walk — an impl carrying either stays unsigned.
+            if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                continue;
+            }
             let TyKind::Path(path) = self_ty.kind else {
                 continue;
             };
@@ -9210,15 +9221,17 @@ impl<'a, 'ctx, 'hir> SiblingImplIndex<'a, 'ctx, 'hir> {
                 def_paths: self.def_paths,
                 sibling_impls: None,
             };
-            return Some(str_inherent_self_method_signatures(
-                &sub_sites,
-                &parent_hir,
-                self.inputs,
-                self.symbols,
-                str_name_taken,
-            ));
+            table
+                .get_or_insert_with(HashMap::new)
+                .extend(str_inherent_self_method_signatures(
+                    &sub_sites,
+                    &parent_hir,
+                    self.inputs,
+                    self.symbols,
+                    str_name_taken,
+                ));
         }
-        None
+        table
     }
 }
 
@@ -105332,6 +105345,16 @@ property "shared"() {}
             "  pub fn unrecorded(self: borrow Self) -> I32 {\n",
             "    self.count.size()\n",
             "  }\n",
+            "  pub fn second_block(self: borrow Self) -> I32 {\n",
+            "    self.inner.extra()\n",
+            "  }\n",
+            "}\n",
+            "// Methods split across several `impl` blocks all resolve\n",
+            "// through the record's signature table.\n",
+            "impl Inner {\n",
+            "  pub fn extra(self: borrow Self) -> I32 {\n",
+            "    self.v\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -105352,12 +105375,18 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let methods = &results.owners()[1].members();
-        assert_eq!(methods.len(), 8);
+        assert_eq!(methods.len(), 9);
         // `self.<record-field>.<method>(..)` resolves the method on the
         // receiver record's own impl: prim tails, conditions, `Str`
         // arguments and `-> Str` outputs all check like `self.<method>`
         // calls against the current impl.
-        for (index, name) in [(0, "ok"), (1, "cond"), (2, "str_arg"), (3, "str_call")] {
+        for (index, name) in [
+            (0, "ok"),
+            (1, "cond"),
+            (2, "str_arg"),
+            (3, "str_call"),
+            (8, "second_block"),
+        ] {
             let check = methods[index].body_type_check().expect("body check runs");
             let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
                 panic!("{name} checks the receiver call: {check:?}");
