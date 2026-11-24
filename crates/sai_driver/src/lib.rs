@@ -8723,6 +8723,16 @@ fn inherent_method_primitive_field_types(
     }) else {
         return None;
     };
+    // Any record in the file named `Str` shadows the prelude string —
+    // a `Str`-spelled field then names that record, not core `Str`.
+    let str_name_taken = records.iter().any(|record| {
+        sai_syntax::normalize_identifier(
+            record
+                .type_name
+                .strip_prefix("r#")
+                .unwrap_or(&record.type_name),
+        ) == "Str"
+    });
     let mut nested = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if index == self_index {
@@ -8745,13 +8755,13 @@ fn inherent_method_primitive_field_types(
                 {
                     return None;
                 }
-            // `ty` spelled `Str` on a record named `Str` refers to the
-            // user type shadowing the prelude, not the core string.
-            } else if ty_text == "Str" && normalized_record_name != "Str" {
+            // `ty` spelled `Str` is the core string only while no record
+            // in the file is named `Str` — a user `type Str` shadows the
+            // prelude name, and a record-typed field inside a receiver
+            // record would take the chain two levels deep.
+            } else if ty_text == "Str" && !str_name_taken {
                 record_str_fields.insert(field_name.clone());
             } else {
-                // A record-typed field inside a receiver record would
-                // take the chain two levels deep — the impl stays gated.
                 return None;
             }
             record_candidates.push(spelling.clone());
@@ -8807,16 +8817,16 @@ fn inherent_method_primitive_field_types(
             if field_types.insert(field_name.clone(), field_type).is_some() {
                 return None;
             }
-        // `ty` spelled `Str` is the core string only while the file's
-        // own record is not itself named `Str` — a user `type Str`
-        // shadows the prelude name, and `text: Str` then points at it.
-        } else if ty_text == "Str" && normalized_self_name != "Str" {
-            str_field_types.insert(field_name.clone());
         } else {
             let normalized_ty =
                 sai_syntax::normalize_identifier(ty_text.strip_prefix("r#").unwrap_or(ty_text));
             if nested.contains_key(normalized_ty.as_str()) {
                 receiver_fields.insert(field_name.clone(), normalized_ty);
+            // `ty` spelled `Str` is the core string only while no record
+            // in the file is named `Str` — a user `type Str` shadows the
+            // prelude name, and `text: Str` then points at it.
+            } else if ty_text == "Str" && !str_name_taken {
+                str_field_types.insert(field_name.clone());
             } else {
                 return None;
             }
@@ -9201,6 +9211,16 @@ fn str_inherent_method_field_types(
     }) else {
         return None;
     };
+    // Any record in the file named `Str` shadows the prelude string —
+    // a `Str`-spelled field then names that record, not core `Str`.
+    let str_name_taken = records.iter().any(|record| {
+        sai_syntax::normalize_identifier(
+            record
+                .type_name
+                .strip_prefix("r#")
+                .unwrap_or(&record.type_name),
+        ) == "Str"
+    });
     let mut nested = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if index == self_index {
@@ -9215,9 +9235,10 @@ fn str_inherent_method_field_types(
         let mut record_fields_map = HashMap::new();
         let mut record_candidates = Vec::new();
         for (field_name, ty_text, spelling) in &record.fields {
-            // A field spelled `Str` on a record named `Str` refers to
-            // the user type shadowing the prelude, not the core string.
-            if ty_text == "Str" && normalized_record_name == "Str" {
+            // A field spelled `Str` while any record in the file is
+            // named `Str` names that record — a record-typed field
+            // inside a receiver record takes the chain two levels deep.
+            if ty_text == "Str" && str_name_taken {
                 return None;
             }
             let Some(field_family) = str_method_field_family(ty_text) else {
@@ -9284,7 +9305,11 @@ fn str_inherent_method_field_types(
         if ty_text == "Str" && normalized_self_name == "Str" {
             return None;
         }
-        if let Some(field_family) = str_method_field_family(ty_text) {
+        let normalized_ty =
+            sai_syntax::normalize_identifier(ty_text.strip_prefix("r#").unwrap_or(ty_text));
+        if nested.contains_key(normalized_ty.as_str()) {
+            receiver_fields.insert(field_name.clone(), normalized_ty);
+        } else if let Some(field_family) = str_method_field_family(ty_text) {
             if field_types
                 .insert(field_name.clone(), field_family)
                 .is_some()
@@ -9292,13 +9317,7 @@ fn str_inherent_method_field_types(
                 return None;
             }
         } else {
-            let normalized_ty =
-                sai_syntax::normalize_identifier(ty_text.strip_prefix("r#").unwrap_or(ty_text));
-            if nested.contains_key(normalized_ty.as_str()) {
-                receiver_fields.insert(field_name.clone(), normalized_ty);
-            } else {
-                return None;
-            }
+            return None;
         }
         candidate_names.push(spelling.clone());
     }
@@ -104632,6 +104651,12 @@ property "shared"() {}
             "  pub fn prim_str_call(self: borrow Self) -> Bool {\n",
             "    self.inner.label.is_empty()\n",
             "  }\n",
+            "  pub fn nested_call(self: borrow Self) -> Str {\n",
+            "    self.inner.nope(false)\n",
+            "  }\n",
+            "  pub fn paren_nested(self: borrow Self) -> Str {\n",
+            "    (self.inner.nope)(false)\n",
+            "  }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -104652,7 +104677,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let methods = &results.owners()[0].members();
-        assert_eq!(methods.len(), 7);
+        assert_eq!(methods.len(), 9);
         // `self.<record-field>.<leaf>` projects the leaf — `-> Str` and
         // `-> <prim>` bodies both type-check it.
         for (index, name) in [
@@ -104686,6 +104711,83 @@ property "shared"() {}
         assert!(
             matches!(check, FunctionBodyTypeCheck::Unsupported),
             "bare stays gated: {check:?}"
+        );
+        // `self.<record-field>.<name>(..)` is method-call syntax — the
+        // callee is not a field read, and the call stays gated while
+        // sibling signatures resolve `self` receivers only.
+        let check = methods[7].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "nested_call stays gated without a field error: {check:?}"
+        );
+        // `(self.<record-field>.<name>)(..)` reads the leaf as a value —
+        // an unknown name keeps its `UnknownField` diagnostic.
+        let check = methods[8].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("paren_nested reports its field error: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_user_str_shadows_prelude() {
+        let root = concat!(
+            "type Str { v: I32 }\n",
+            "type Outer { inner: Str, count: I32 }\n",
+            "impl Outer {\n",
+            "  pub fn leaf(self: borrow Self) -> I32 {\n",
+            "    self.inner.v\n",
+            "  }\n",
+            "  pub fn str_leaf(self: borrow Self) -> Str {\n",
+            "    self.inner.v\n",
+            "  }\n",
+            "  pub fn call(self: borrow Self) -> Str {\n",
+            "    self.inner.is_empty()\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("inherent methods collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let methods = &results.owners()[0].members();
+        assert_eq!(methods.len(), 3);
+        // `inner: Str` names the user record — `self.inner.v` projects
+        // its `I32` leaf instead of gate or core-`Str` semantics.
+        let check = methods[0].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("leaf projects through the user Str record: {check:?}");
+        };
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // `-> Str` names the user record too — a record return type is
+        // outside both walks, so the method stays gated rather than
+        // checking the body against core `Str` expectations.
+        let check = methods[1].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "record-returning method stays gated: {check:?}"
+        );
+        // `self.inner.is_empty()` would otherwise pass as a core `Str`
+        // builtin call — with the record receiver in place the method
+        // gates (the record `-> Str` return keeps it out of the walk).
+        let check = methods[2].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "call stays gated: {check:?}"
         );
     }
 
