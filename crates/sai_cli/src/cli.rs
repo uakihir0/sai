@@ -2450,8 +2450,12 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
         }
     }
     let mut seen_methods = HashSet::new();
-    saw_function
-        && saw_impl
+    // `type`+`impl`-only sources are covered too — an impl block
+    // cannot resolve without a declared `type`, and its methods are
+    // owners the checker analyzes like the mixed kind. Free functions
+    // are not required.
+    saw_impl
+        && (saw_function || !type_names.is_empty())
         && impls.iter().all(|impl_decl| {
             check_impl_decl_is_inherent_public_methods(
                 impl_decl,
@@ -6659,7 +6663,9 @@ fn module_tree_workspace_check_diagnostics(
                 } else {
                     format!("{}/lib.sai", inputs[0].source_directory)
                 };
-                path == &root_source_path && check_source_is_mixed_public_items(source.as_ref())
+                path == &root_source_path
+                    && !root_single_inherent_method_source_candidate
+                    && check_source_is_mixed_public_items(source.as_ref())
             });
     let mut public_primitive_const_set_covered = false;
     let mut single_public_function_body_covered = false;
