@@ -65,16 +65,25 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrimitiveCallSignature {
     pub callee: HirId,
-    pub parameters: Vec<PrimTy>,
+    pub parameters: Vec<PrimitiveCallParameter>,
     pub output: PrimitiveCallOutput,
 }
 
 /// What a direct call yields: a primitive literal family or `Str`.
 /// `Str` is not a `PrimTy`, so `-> Str` callees need their own output
-/// kind (parameters still project to `PrimTy` only — a callee taking
-/// `Str` stays outside this slice).
+/// kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrimitiveCallOutput {
+    Primitive(PrimTy),
+    Str,
+}
+
+/// What a direct call's explicit parameter accepts: a primitive literal
+/// family or `Str`. A `Str` parameter takes `Str` arguments —
+/// `take_str(s)` / `take_str("a")` — and rejects primitives the same
+/// way a `Str` annotation does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrimitiveCallParameter {
     Primitive(PrimTy),
     Str,
 }
@@ -3156,6 +3165,94 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(())
     }
 
+    /// Check a call argument's computed type against the callee's
+    /// parameter: `Primitive` parameters go through
+    /// `check_annotated_path`; `Str` parameters take `Str` (and error)
+    /// arguments and report like a `Str` annotation otherwise.
+    fn check_call_parameter(
+        &mut self,
+        source_type: LocalType,
+        expected: PrimitiveCallParameter,
+        node: HirId,
+    ) -> Result<(), ()> {
+        match expected {
+            PrimitiveCallParameter::Primitive(expected) => {
+                return self.check_annotated_path(source_type, expected, node);
+            }
+            PrimitiveCallParameter::Str => {}
+        }
+        match source_type {
+            LocalType::Str | LocalType::Error(_) => {}
+            LocalType::Concrete(found) => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                        expected: ScalarType::Str,
+                        found: ScalarType::Primitive(found),
+                    },
+                });
+            }
+            LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                let Some((resolved, kind)) = self
+                    .literal_variables
+                    .get(id)
+                    .map(|variable| (variable.resolved, variable.kind))
+                else {
+                    return Err(());
+                };
+                match resolved {
+                    Some(found) => self.errors.push(PrimitiveBodyError {
+                        node,
+                        kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                            expected: ScalarType::Str,
+                            found: ScalarType::Primitive(found),
+                        },
+                    }),
+                    None => self.errors.push(PrimitiveBodyError {
+                        node,
+                        kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                            expected: ScalarType::Str,
+                            found: ScalarLiteralKind::Primitive(kind),
+                        },
+                    }),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check a literal call argument against the callee's parameter:
+    /// `Primitive` parameters go through `check_annotated_literal`;
+    /// `Str` parameters take `Str` literals only.
+    fn check_call_parameter_literal(
+        &mut self,
+        expected: PrimitiveCallParameter,
+        literal: Lit<'hir>,
+        node: HirId,
+    ) {
+        match expected {
+            PrimitiveCallParameter::Primitive(expected) => {
+                let Some(found) = primitive_literal_kind(literal) else {
+                    return;
+                };
+                self.check_annotated_literal(expected, literal, found, node);
+            }
+            PrimitiveCallParameter::Str => {
+                if matches!(literal, Lit::Str(_)) {
+                    self.record_expression_type(node, LocalType::Str);
+                } else {
+                    self.errors.push(PrimitiveBodyError {
+                        node,
+                        kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                            expected: ScalarType::Str,
+                            found: scalar_literal_kind(literal),
+                        },
+                    });
+                }
+            }
+        }
+    }
+
     fn check_expr_stmt(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
         // Statement-position `if`/`match` expressions discard their result;
         // branches and arms admit only statement blocks so the discarded
@@ -6208,7 +6305,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     },
                 });
             }
-            let Some(expected) = signature.parameters.get(index) else {
+            let Some(expected) = signature.parameters.get(index).copied() else {
                 continue;
             };
             // Tainted argument trees (`bump(self.missing + 1)`) recover like
@@ -6228,19 +6325,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         LocalType::Error(self.known_error_tainted_result_type(argument.expr))
                     };
                 self.record_expression_type(argument.expr.hir_id, local_type);
-                self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 continue;
             }
             match argument.expr.kind {
                 ExprKind::Lit(literal) => {
-                    let Some(found) = primitive_literal_kind(literal) else {
+                    // A `Str` literal only fits a `Str` parameter; against a
+                    // primitive parameter a non-primitive literal gates like
+                    // before (no kind to check it against).
+                    if matches!(expected, PrimitiveCallParameter::Primitive(_))
+                        && primitive_literal_kind(literal).is_none()
+                    {
                         return Err(());
-                    };
-                    self.check_annotated_literal(*expected, literal, found, argument.expr.hir_id);
+                    }
+                    self.check_call_parameter_literal(expected, literal, argument.expr.hir_id);
                 }
                 ExprKind::Path(_) => {
                     let local_type = self.check_local_path(argument.expr)?;
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 // A known self field passes its declared type like a path
                 // argument; an unknown field recovers through the tainted
@@ -6260,12 +6362,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         return Err(());
                     };
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Call { .. } if !nested => {
                     let local_type = self.check_direct_call(argument.expr, true)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Binary(BinOp::Rem, left, right)
                     if is_supported_direct_call_remainder_operands(
@@ -6276,7 +6378,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 {
                     let local_type = self.check_remainder(left, right, argument.expr.hir_id)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Binary(
                     operator @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div),
@@ -6295,7 +6397,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         argument.expr.hir_id,
                     )?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Binary(
                     operator @ (BinOp::Eq
@@ -6314,7 +6416,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 {
                     let local_type = self.check_comparison(operator, left, right)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right)
                     if is_supported_direct_call_logical_operands(
@@ -6325,7 +6427,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 {
                     let local_type = self.check_direct_call_logical(operator, left, right)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Binary(operator @ (BinOp::Shl | BinOp::Shr), left, right)
                     if is_supported_direct_call_shift_operands(
@@ -6337,7 +6439,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let local_type =
                         self.check_shift(operator, left, right, argument.expr.hir_id, true)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Binary(
                     operator @ (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor),
@@ -6352,7 +6454,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let local_type =
                         self.check_bitwise(operator, left, right, argument.expr.hir_id)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Unary(UnOp::Not, operand)
                     if is_supported_direct_call_not_operand(
@@ -6362,7 +6464,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 {
                     let local_type = self.check_direct_call_logical_not(operand)?;
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Unary(UnOp::BitNot, operand)
                     if is_supported_direct_call_bitwise_not_operand(
@@ -6372,7 +6474,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 {
                     let local_type = match operand.kind {
                         ExprKind::Lit(Lit::Int { .. } | Lit::Byte(_)) => {
-                            self.check_direct_call_bitwise_not_literal(operand, *expected)?
+                            let expected = match expected {
+                                PrimitiveCallParameter::Primitive(expected) => expected,
+                                // `~lit` under a `Str` parameter checks the
+                                // literal against its own family first, then
+                                // the `Str` expectation reports the mismatch.
+                                PrimitiveCallParameter::Str => match operand.kind {
+                                    ExprKind::Lit(Lit::Int { .. }) => PrimTy::I64,
+                                    ExprKind::Lit(Lit::Byte(_)) => PrimTy::Byte,
+                                    _ => return Err(()),
+                                },
+                            };
+                            self.check_direct_call_bitwise_not_literal(operand, expected)?
                         }
                         // A field operand desugars to `let t = self.f`, so
                         // the operator check runs on the declared type
@@ -6385,7 +6498,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         _ => self.check_bitwise_not_path(operand, argument.expr.hir_id)?,
                     };
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 ExprKind::Unary(UnOp::Neg, operand)
                     if is_supported_direct_call_neg_operand(
@@ -6403,30 +6516,43 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         self.check_direct_call_neg_path(operand, argument.expr.hir_id)?
                     };
                     self.record_expression_type(argument.expr.hir_id, local_type);
-                    self.check_annotated_path(local_type, *expected, argument.expr.hir_id)?;
+                    self.check_call_parameter(local_type, expected, argument.expr.hir_id)?;
                 }
                 // `if`/`match` arguments check against the parameter type
                 // through the same branch join the tail position uses —
                 // `bump(if c { 1 } else { 2 })` behaves as `bump(1)` when
                 // the parameter is `I32`.
-                ExprKind::If { .. } | ExprKind::Match { .. } => {
-                    self.check_expr_expected(argument.expr, *expected)?;
-                    self.record_expression_type(
-                        argument.expr.hir_id,
-                        LocalType::Concrete(*expected),
-                    );
-                }
+                ExprKind::If { .. } | ExprKind::Match { .. } => match expected {
+                    PrimitiveCallParameter::Primitive(expected) => {
+                        self.check_expr_expected(argument.expr, expected)?;
+                        self.record_expression_type(
+                            argument.expr.hir_id,
+                            LocalType::Concrete(expected),
+                        );
+                    }
+                    // `take_str(if c { "a" } else { "b" })` — the `Str`
+                    // initializer walk checks condition, branches, and
+                    // arms like `let _: Str = if ..`.
+                    PrimitiveCallParameter::Str => {
+                        self.check_str_annotated_initializer(argument.expr)?;
+                    }
+                },
                 // A `{ ...; e }` argument checks its inner statements and
                 // tail against the parameter type like any other value
                 // block — `bump({ 1 })` behaves as `bump(1)`.
                 ExprKind::Block(block) => {
+                    let PrimitiveCallParameter::Primitive(expected) = expected else {
+                        // `{ .. }` arguments under a `Str` parameter stay
+                        // outside the slice.
+                        return Err(());
+                    };
                     if block.safety != Safety::Safe {
                         return Err(());
                     }
-                    self.check_block_expected(block, *expected)?;
+                    self.check_block_expected(block, expected)?;
                     self.record_expression_type(
                         argument.expr.hir_id,
-                        LocalType::Concrete(*expected),
+                        LocalType::Concrete(expected),
                     );
                 }
                 _ => return Err(()),

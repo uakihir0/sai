@@ -9526,6 +9526,19 @@ fn check_function_body_primitive_local_block(
     // `Str` parameters are admitted everywhere a preceding local is — the
     // kernel decides which operand positions still reject `LocalType::Str`.
     preceding_bindings.extend(str_admissions.locals.iter().copied());
+    // `let` annotations nested inside any admitted subexpression —
+    // call-argument `if`/`match` branches above all — must reach the
+    // kernel's `primitive_types`/`str_annotations` maps or the check
+    // aborts; entries in shapes that stay gated are simply unread.
+    collect_str_branch_block_annotations(
+        block,
+        locals,
+        inputs,
+        symbols,
+        type_paths,
+        &mut primitive_types,
+        &mut str_admissions,
+    );
     for stmt in block.stmts {
         if !primitive_let_statement_shape_is_supported(
             stmt,
@@ -11336,7 +11349,9 @@ fn collect_str_branch_let_annotations(
     str_admissions: &mut StrShapeAdmissions,
 ) {
     match init.kind {
-        ExprKind::Block(block) => {
+        ExprKind::Block(block)
+        | ExprKind::AsyncBlock { block, .. }
+        | ExprKind::Region { block, .. } => {
             collect_str_branch_block_annotations(
                 block,
                 locals,
@@ -11347,7 +11362,16 @@ fn collect_str_branch_let_annotations(
                 str_admissions,
             );
         }
-        ExprKind::If { then, els, .. } => {
+        ExprKind::If { cond, then, els } => {
+            collect_str_branch_let_annotations(
+                cond,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
             collect_str_branch_block_annotations(
                 then,
                 locals,
@@ -11370,9 +11394,32 @@ fn collect_str_branch_let_annotations(
             }
         }
         // `match` arm bodies carry their own annotated `let`s the
-        // same way `if` branches do.
-        ExprKind::Match { arms, .. } => {
+        // same way `if` branches do; the scrutinee and guards can
+        // hold calls whose `if`/`match` arguments do too.
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_str_branch_let_annotations(
+                scrutinee,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
             for arm in arms {
+                if let Some(guard) = arm.guard {
+                    collect_str_branch_let_annotations(
+                        guard,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        primitive_types,
+                        str_admissions,
+                    );
+                }
                 collect_str_branch_let_annotations(
                     arm.body,
                     locals,
@@ -11386,35 +11433,195 @@ fn collect_str_branch_let_annotations(
         }
         // `return`/`break` values can be blocks holding annotated
         // `let`s (`{ return { let n: I32 = 1\n "a" } }`).
-        ExprKind::Return(Some(value)) => {
-            collect_str_branch_let_annotations(
-                value,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                primitive_types,
-                str_admissions,
-            );
-        }
-        ExprKind::Break {
-            value: Some(value), ..
-        } => {
-            collect_str_branch_let_annotations(
-                value,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                primitive_types,
-                str_admissions,
-            );
+        ExprKind::Return(value) | ExprKind::Break { value, .. } => {
+            if let Some(value) = value {
+                collect_str_branch_let_annotations(
+                    value,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
         }
         // `loop` bodies are statement blocks — a `let` inside the
         // loop carries the same annotations.
         ExprKind::Loop { body, .. } => {
             collect_str_branch_block_annotations(
                 body,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        // Call arguments admit `if`/`match`/`block` operands whose
+        // branch blocks hold their own `let`s — a `let s: Str` inside
+        // `take_str(if c { let s: Str = "a" s } else { "b" })` still
+        // needs its annotation collected or the kernel rejects the
+        // whole call.
+        ExprKind::Call { callee, args, base } => {
+            collect_str_branch_let_annotations(
+                callee,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+            if let Some(base) = base {
+                collect_str_branch_let_annotations(
+                    base,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+            for arg in args {
+                collect_str_branch_let_annotations(
+                    arg.expr,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
+        ExprKind::ContractOld { args, base } => {
+            if let Some(base) = base {
+                collect_str_branch_let_annotations(
+                    base,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+            for arg in args {
+                collect_str_branch_let_annotations(
+                    arg.expr,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
+        ExprKind::Field { base, .. }
+        | ExprKind::TupleField { base, .. }
+        | ExprKind::Unary(_, base)
+        | ExprKind::Borrow(_, base)
+        | ExprKind::Try(base)
+        | ExprKind::Await(base)
+        | ExprKind::AsCast { operand: base, .. } => {
+            collect_str_branch_let_annotations(
+                base,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        ExprKind::Index(base, index) => {
+            collect_str_branch_let_annotations(
+                base,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+            collect_str_branch_let_annotations(
+                index,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        ExprKind::Binary(_, left, right) => {
+            collect_str_branch_let_annotations(
+                left,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+            collect_str_branch_let_annotations(
+                right,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        ExprKind::Range { start, end, .. } => {
+            for operand in [start, end].into_iter().flatten() {
+                collect_str_branch_let_annotations(
+                    operand,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
+        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+            for item in items {
+                collect_str_branch_let_annotations(
+                    item,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
+        ExprKind::FormatString(pieces) => {
+            for piece in pieces {
+                if let FmtPiece::Arg { expr, .. } = piece {
+                    collect_str_branch_let_annotations(
+                        expr,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        primitive_types,
+                        str_admissions,
+                    );
+                }
+            }
+        }
+        ExprKind::Closure(closure) => {
+            collect_str_branch_block_annotations(
+                closure.body,
                 locals,
                 inputs,
                 symbols,
@@ -11437,42 +11644,97 @@ fn collect_str_branch_block_annotations(
     str_admissions: &mut StrShapeAdmissions,
 ) {
     for stmt in block.stmts {
-        if let StmtKind::Let { ty, init, .. } = stmt.kind {
-            if let Some(ty) = ty {
-                match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
-                    Some(FunctionDirectType::Primitive(local_type)) => {
-                        primitive_types.insert(ty.hir_id, local_type);
+        match stmt.kind {
+            StmtKind::Let { ty, init, els, .. } => {
+                if let Some(ty) = ty {
+                    match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
+                        Some(FunctionDirectType::Primitive(local_type)) => {
+                            primitive_types.insert(ty.hir_id, local_type);
+                        }
+                        Some(FunctionDirectType::Str) => {
+                            str_admissions.annotations.insert(ty.hir_id);
+                        }
+                        _ => {}
                     }
-                    Some(FunctionDirectType::Str) => {
-                        str_admissions.annotations.insert(ty.hir_id);
-                    }
-                    _ => {}
+                }
+                // Nested block/`if` initializers can carry their own
+                // annotated `let`s; a `let-else` block can too.
+                collect_str_branch_let_annotations(
+                    init,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+                if let Some(els) = els {
+                    collect_str_branch_block_annotations(
+                        els,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        primitive_types,
+                        str_admissions,
+                    );
                 }
             }
-            // Nested block/`if` initializers can carry their own
-            // annotated `let`s.
-            collect_str_branch_let_annotations(
-                init,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                primitive_types,
-                str_admissions,
-            );
-        }
-        // `if`/`match`/`loop` statements inside the block can carry
-        // annotated `let`s of their own.
-        if let StmtKind::Expr(expression) = stmt.kind {
-            collect_str_branch_let_annotations(
-                expression,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                primitive_types,
-                str_admissions,
-            );
+            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                collect_str_branch_let_annotations(
+                    lhs,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+                collect_str_branch_let_annotations(
+                    rhs,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+            StmtKind::Assert { cond, msg, .. } => {
+                collect_str_branch_let_annotations(
+                    cond,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+                if let Some(msg) = msg {
+                    collect_str_branch_let_annotations(
+                        msg,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        primitive_types,
+                        str_admissions,
+                    );
+                }
+            }
+            // `if`/`match`/`loop` statements inside the block can carry
+            // annotated `let`s of their own.
+            StmtKind::Expr(expression) => {
+                collect_str_branch_let_annotations(
+                    expression,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
         }
     }
     if let Some(tail) = block.tail {
@@ -14306,7 +14568,7 @@ enum FunctionDirectType {
 #[derive(Clone, Debug)]
 struct PrimitiveFunctionCallSignature {
     owner: OwnerId,
-    parameters: Vec<sai_resolve::prelude::PrimTy>,
+    parameters: Vec<FunctionDirectType>,
     output: FunctionDirectType,
 }
 
@@ -14544,7 +14806,19 @@ fn direct_primitive_call_site(
             };
             Some(sai_ty::typeck::body::PrimitiveCallSignature {
                 callee: callee.hir_id,
-                parameters: signature.parameters.clone(),
+                parameters: signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| match parameter {
+                        FunctionDirectType::Primitive(primitive) => Some(
+                            sai_ty::typeck::body::PrimitiveCallParameter::Primitive(*primitive),
+                        ),
+                        FunctionDirectType::Str => {
+                            Some(sai_ty::typeck::body::PrimitiveCallParameter::Str)
+                        }
+                        FunctionDirectType::Unit => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?,
                 output,
             })
         })
@@ -16498,8 +16772,14 @@ fn str_expr_family(
                 let Some(parameters) = signature
                     .parameters
                     .iter()
-                    .map(|parameter| {
-                        str_prim_family_name(*parameter).map(|family| (family, Some(*parameter)))
+                    .map(|parameter| match parameter {
+                        sai_ty::typeck::body::PrimitiveCallParameter::Primitive(primitive) => {
+                            str_prim_family_name(*primitive)
+                                .map(|family| (family, Some(*primitive)))
+                        }
+                        // A `Str` parameter takes `Str`-family arguments
+                        // with no primitive expectation to forward.
+                        sai_ty::typeck::body::PrimitiveCallParameter::Str => Some(("`Str`", None)),
                     })
                     .collect::<Option<Vec<_>>>()
                 else {
@@ -21216,7 +21496,12 @@ fn str_pure_init_family(
                     signature
                         .parameters
                         .iter()
-                        .map(|parameter| str_prim_family_name(*parameter))
+                        .map(|parameter| match parameter {
+                            sai_ty::typeck::body::PrimitiveCallParameter::Primitive(primitive) => {
+                                str_prim_family_name(*primitive)
+                            }
+                            sai_ty::typeck::body::PrimitiveCallParameter::Str => Some("`Str`"),
+                        })
                         .collect::<Option<Vec<_>>>()?,
                     match signature.output {
                         sai_ty::typeck::body::PrimitiveCallOutput::Primitive(primitive) => {
@@ -33341,10 +33626,13 @@ impl RootDatabase {
                         Some(FunctionDirectType::Primitive(primitive))
                             if sai_ty::typeck::literal::supports_primitive_literal(primitive) =>
                         {
-                            Some(primitive)
+                            Some(FunctionDirectType::Primitive(primitive))
                         }
-                        Some(FunctionDirectType::Str | FunctionDirectType::Unit) | None => None,
-                        Some(FunctionDirectType::Primitive(_)) => None,
+                        // `s: Str` parameters project `Str` — `take_str(s)`
+                        // / `take_str("a")` bind like a `Str` annotation.
+                        Some(FunctionDirectType::Str) => Some(FunctionDirectType::Str),
+                        Some(FunctionDirectType::Unit | FunctionDirectType::Primitive(_))
+                        | None => None,
                     }
                 })
                 .collect::<Option<Vec<_>>>()
@@ -62082,6 +62370,16 @@ property "shared"() {}
             "pub fn str_call_if_tail_calls(flag: Bool) -> Str { if flag { str_call_make() } else { str_call_make() } }\n",
             "pub fn str_call_stmt_if_branch(flag: Bool) -> Bool { let s = if flag { { str_call_make()\n true } } else { false }\n    s }\n",
             "pub fn str_call_loop_if_tail_break(flag: Bool) -> Str { loop { if flag { break str_call_make() } } }\n",
+            "pub fn take_str_param(s: Str) -> USize { 0 }\n",
+            "pub fn str_call_str_param_local(flag: Bool) -> Bool { let s = \"a\"\n    take_str_param(s)\n    flag }\n",
+            "pub fn str_call_str_param_lit(flag: Bool) -> Bool { take_str_param(\"a\")\n    flag }\n",
+            "pub fn str_call_str_param_arg_call(flag: Bool) -> Bool { take_str_param(str_call_make())\n    flag }\n",
+            "pub fn str_call_str_param_if_arg(flag: Bool) -> Bool { take_str_param(if flag { \"a\" } else { \"b\" })\n    flag }\n",
+            "pub fn str_call_str_param_str_body(s: Str) -> Str { take_str_param(s)\n    s }\n",
+            "pub fn str_call_str_param_mismatch(flag: Bool) -> Bool { take_str_param(1)\n    flag }\n",
+            "pub fn str_call_str_param_path_mismatch(flag: Bool) -> Bool { let n = 1\n    take_str_param(n)\n    flag }\n",
+            "pub fn str_call_str_param_if_arg_let(flag: Bool) -> Bool { take_str_param(if flag { let s: Str = \"a\"\n    s } else { \"b\" })\n    flag }\n",
+            "pub fn str_call_str_param_if_arg_let_mismatch(flag: Bool) -> Bool { take_str_param(if flag { let n: I32 = \"x\"\n    \"a\" } else { \"b\" })\n    flag }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -62098,7 +62396,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 74);
+        assert_eq!(owners.len(), 84);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -62142,6 +62440,18 @@ property "shared"() {}
             // a statement `if`'s branch tail inside a `loop`.
             .chain(&owners[69..72])
             .chain(&owners[73..74])
+            // `Str` parameters: a `s: Str` callee and `Str`
+            // arguments — locals, literals, nested `-> Str`
+            // calls, `if` arguments — in primitive and `-> Str`
+            // bodies.
+            .chain(&owners[74..80])
+            // `str_call_id_str("a")` — the `s: Str` parameter now
+            // has a signature, so the call checks and yields `Str`.
+            .chain(&owners[67..68])
+            // An annotated `let` inside the `if` argument's branch
+            // block — the annotation collector descends call
+            // arguments so `let s: Str` reaches the kernel.
+            .chain(&owners[82..83])
         {
             assert!(matches!(
                 owner
@@ -62191,6 +62501,14 @@ property "shared"() {}
             (64, "expected `I32`, found `Str`"),
             (65, "expected `Str`, found `I32`"),
             (66, "expected `I32`, found `Str`"),
+            // `take_str(1)` and `take_str(n)` name the literal kind
+            // against `Str` — `n`'s literal variable is unresolved.
+            (80, "expected `Str`, found an integer literal"),
+            (81, "expected `Str`, found an integer literal"),
+            // `let n: I32 = "x"` inside the `if` argument's branch —
+            // the collected annotation reports the literal mismatch
+            // instead of dropping the whole body check.
+            (83, "expected `I32`, found `Str`"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
@@ -62233,11 +62551,10 @@ property "shared"() {}
         assert_eq!(diagnostics[1].code, sai_diagnostics::Code::TypeMismatch);
         assert_eq!(diagnostics[1].message, "expected `I64`, found `Str`");
         // Gated owners: `Str` arithmetic operands, a `Str` match
-        // scrutinee, a literal-variable `Str` assignment, a call
-        // to a callee whose parameter is `Str`, and a `Str`-callee
-        // arity mismatch (the walk's positional-prefix bound, like
-        // `s.len(1)`) stay outside the slice.
-        for owner in owners[25..28].iter().chain(&owners[67..69]) {
+        // scrutinee, a literal-variable `Str` assignment, and a
+        // `Str`-callee arity mismatch (the walk's positional-prefix
+        // bound, like `s.len(1)`) stay outside the slice.
+        for owner in owners[25..28].iter().chain(&owners[68..69]) {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -71192,6 +71509,9 @@ property "shared"() {}
             ],
         );
         let float_call = assert_supported(&database, "float_call", &[]);
+        // `text_fn("text")` — the `Str` parameter now has a call
+        // signature, so the call checks cleanly and publishes I32.
+        let str_call = assert_supported(&database, "str_call", &[]);
         let float_mismatch = assert_supported(
             &database,
             "float_mismatch",
@@ -71199,7 +71519,6 @@ property "shared"() {}
         );
         for name in [
             "generic_call",
-            "str_call",
             "shadowed_call",
             "deep_nested_call",
             "nested_shadowed_call",
@@ -71226,8 +71545,6 @@ property "shared"() {}
             "remainder_path_pair_deep_nested_unsupported",
             "remainder_generic_target_call_argument",
             "remainder_path_pair_generic_target_unsupported",
-            "remainder_unsupported_signature_call_argument",
-            "remainder_path_pair_unsupported_signature_unsupported",
             "remainder_literal_left_float_unsupported",
             "remainder_literal_left_computed_left_unsupported",
             "remainder_literal_left_computed_right_unsupported",
@@ -71236,7 +71553,6 @@ property "shared"() {}
             "remainder_literal_left_forward_rhs_unsupported",
             "remainder_literal_left_deep_nested_unsupported",
             "remainder_literal_left_generic_target_unsupported",
-            "remainder_literal_left_unsupported_signature",
             "remainder_literal_pair_float_left_unsupported",
             "remainder_literal_pair_float_right_unsupported",
             "remainder_literal_pair_byte_unsupported",
@@ -71246,7 +71562,6 @@ property "shared"() {}
             "remainder_literal_pair_computed_right_unsupported",
             "remainder_literal_pair_deep_nested_unsupported",
             "remainder_literal_pair_generic_target_unsupported",
-            "remainder_literal_pair_unsupported_signature",
             "logical_forward_local_paths_unsupported",
             "logical_integer_literal_operand_unsupported",
             "logical_character_literal_operand_unsupported",
@@ -71271,7 +71586,6 @@ property "shared"() {}
             "direct_neg_global_path_unsupported",
             "direct_neg_deep_nested_call_unsupported",
             "direct_neg_generic_target_unsupported",
-            "direct_neg_unsupported_signature_unsupported",
             "shift_computed_operand_unsupported",
             "shift_call_operand_unsupported",
             "shift_generic_target_unsupported",
@@ -71289,7 +71603,6 @@ property "shared"() {}
             "shift_byte_rhs_computed_right_unsupported",
             "shift_byte_rhs_deep_nested_unsupported",
             "shift_byte_rhs_generic_target_unsupported",
-            "shift_byte_rhs_unsupported_signature",
             "shift_byte_rhs_string_unsupported",
             "shift_byte_rhs_byte_string_unsupported",
             "shift_byte_literal_lhs_string_rhs_unsupported",
@@ -71299,7 +71612,6 @@ property "shared"() {}
             "shift_integer_literal_lhs_computed_path_rhs_unsupported",
             "shift_integer_literal_lhs_deep_nested_unsupported",
             "shift_integer_literal_lhs_generic_target_unsupported",
-            "shift_integer_literal_lhs_unsupported_signature",
             "shift_integer_literal_lhs_forward_path_unsupported",
             "shift_integer_literal_lhs_self_path_unsupported",
             "shift_integer_literal_lhs_global_path_unsupported",
@@ -71309,10 +71621,8 @@ property "shared"() {}
             "shift_byte_literal_lhs_forward_count_unsupported",
             "shift_byte_literal_lhs_deep_nested_unsupported",
             "shift_byte_literal_lhs_generic_target_unsupported",
-            "shift_byte_literal_lhs_unsupported_signature",
             "shift_integer_literal_rhs_deep_nested_unsupported",
             "shift_integer_literal_rhs_generic_target_unsupported",
-            "shift_integer_literal_rhs_unsupported_signature",
             "bitwise_literal_rhs_bool_unsupported",
             "bitwise_literal_rhs_byte_string_unsupported",
             "bitwise_literal_rhs_computed_unsupported",
@@ -71321,7 +71631,6 @@ property "shared"() {}
             "bitwise_literal_rhs_forward_path_unsupported",
             "bitwise_literal_rhs_deep_call_unsupported",
             "bitwise_literal_rhs_generic_target_unsupported",
-            "bitwise_literal_rhs_unsupported_signature",
             "bitwise_literal_rhs_char_unsupported",
             "bitwise_literal_rhs_float_unsupported",
             "bitwise_integer_literal_forward_left_unsupported",
@@ -71341,7 +71650,6 @@ property "shared"() {}
             "bitwise_byte_scalar_literal_rhs_nested_operator_unsupported",
             "bitwise_byte_scalar_literal_rhs_deep_call_unsupported",
             "bitwise_byte_scalar_literal_rhs_generic_target_unsupported",
-            "bitwise_byte_scalar_literal_rhs_unsupported_signature",
             "bitwise_byte_literal_rhs_byte_string_unsupported",
             "bitwise_byte_literal_rhs_computed_unsupported",
             "bitwise_byte_literal_rhs_nested_operator_unsupported",
@@ -71351,7 +71659,6 @@ property "shared"() {}
             "bitwise_byte_literal_rhs_forward_unsupported",
             "bitwise_byte_literal_deep_call_unsupported",
             "bitwise_byte_literal_generic_target_unsupported",
-            "bitwise_byte_literal_unsupported_signature",
             "bitwise_bool_literal_left_path_unsupported",
             "bitwise_char_literal_left_path_unsupported",
             "bitwise_float_literal_left_path_unsupported",
@@ -71362,13 +71669,11 @@ property "shared"() {}
             "bitwise_byte_integer_literal_nested_operator_unsupported",
             "bitwise_byte_integer_literal_deep_call_unsupported",
             "bitwise_byte_integer_literal_generic_target_unsupported",
-            "bitwise_byte_integer_literal_unsupported_signature",
             "bitwise_integer_byte_literal_pair_unsupported",
             "bitwise_byte_literal_pair_computed_unsupported",
             "bitwise_byte_literal_pair_nested_operator_unsupported",
             "bitwise_byte_literal_pair_deep_call_unsupported",
             "bitwise_byte_literal_pair_generic_target_unsupported",
-            "bitwise_byte_literal_pair_unsupported_signature",
             "bitwise_bool_literal_pair_unsupported",
             "bitwise_char_literal_pair_unsupported",
             "bitwise_float_literal_pair_unsupported",
@@ -71401,6 +71706,41 @@ property "shared"() {}
             "call_comparison_operand_unsupported",
             "deep_comparison_call_unsupported",
         ] {
+            // `text_fn(..)` now has a `Str` parameter signature, so
+            // non-`Str` arguments report a `Str` mismatch instead of
+            // gating behind an unknown signature.
+            for name in [
+                "remainder_unsupported_signature_call_argument",
+                "remainder_path_pair_unsupported_signature_unsupported",
+                "remainder_literal_left_unsupported_signature",
+                "remainder_literal_pair_unsupported_signature",
+                "direct_neg_unsupported_signature_unsupported",
+                "shift_byte_rhs_unsupported_signature",
+                "shift_integer_literal_lhs_unsupported_signature",
+                "shift_byte_literal_lhs_unsupported_signature",
+                "shift_integer_literal_rhs_unsupported_signature",
+                "bitwise_literal_rhs_unsupported_signature",
+                "bitwise_byte_scalar_literal_rhs_unsupported_signature",
+                "bitwise_byte_literal_unsupported_signature",
+                "bitwise_byte_integer_literal_unsupported_signature",
+                "bitwise_byte_literal_pair_unsupported_signature",
+            ] {
+                // `b'x'`/`b'a'` shift counts and byte-literal bitwise
+                // operands report their inner mismatch beside the
+                // `Str` parameter mismatch.
+                let expected = match name {
+                    "shift_byte_rhs_unsupported_signature"
+                    | "bitwise_byte_scalar_literal_rhs_unsupported_signature"
+                    | "bitwise_byte_integer_literal_unsupported_signature" => {
+                        vec![
+                            sai_diagnostics::Code::TypeMismatch,
+                            sai_diagnostics::Code::TypeMismatch,
+                        ]
+                    }
+                    _ => vec![sai_diagnostics::Code::TypeMismatch],
+                };
+                assert_supported(&database, name, &expected);
+            }
             assert!(
                 matches!(
                     owner_named(&database, &resolved, name)
@@ -83736,6 +84076,17 @@ property "shared"() {}
                 "float_fn(1.5)".len()
             ),
             Some(PrimTy::F32)
+        );
+        assert_eq!(
+            expression_type_at_range(
+                &mut database,
+                str_call,
+                "pub fn str_call",
+                "text_fn(\"text\")",
+                0,
+                "text_fn(\"text\")".len()
+            ),
+            Some(PrimTy::I32)
         );
         assert_eq!(
             expression_type_at_range(
