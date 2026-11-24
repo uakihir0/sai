@@ -9221,15 +9221,18 @@ impl<'a, 'ctx, 'hir> SiblingImplIndex<'a, 'ctx, 'hir> {
                 def_paths: self.def_paths,
                 sibling_impls: None,
             };
-            table
-                .get_or_insert_with(HashMap::new)
-                .extend(str_inherent_self_method_signatures(
-                    &sub_sites,
-                    &parent_hir,
-                    self.inputs,
-                    self.symbols,
-                    str_name_taken,
-                ));
+            // The first declaration of a duplicate method name wins.
+            let signatures = str_inherent_self_method_signatures(
+                &sub_sites,
+                &parent_hir,
+                self.inputs,
+                self.symbols,
+                str_name_taken,
+            );
+            let table = table.get_or_insert_with(HashMap::new);
+            for (name, signature) in signatures {
+                table.entry(name).or_insert(signature);
+            }
         }
         table
     }
@@ -105348,11 +105351,21 @@ property "shared"() {}
             "  pub fn second_block(self: borrow Self) -> I32 {\n",
             "    self.inner.extra()\n",
             "  }\n",
+            "  pub fn dup(self: borrow Self) -> I32 {\n",
+            "    self.inner.size()\n",
+            "  }\n",
+            "  pub fn dup_wrong(self: borrow Self) -> I32 {\n",
+            "    self.inner.size(true)\n",
+            "  }\n",
             "}\n",
             "// Methods split across several `impl` blocks all resolve\n",
-            "// through the record's signature table.\n",
+            "// through the record's signature table; a duplicate method\n",
+            "// name keeps the first declaration's signature.\n",
             "impl Inner {\n",
             "  pub fn extra(self: borrow Self) -> I32 {\n",
+            "    self.v\n",
+            "  }\n",
+            "  pub fn size(self: borrow Self, flag: Bool) -> I32 {\n",
             "    self.v\n",
             "  }\n",
             "}\n",
@@ -105375,7 +105388,7 @@ property "shared"() {}
             .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("associated owner analysis succeeds");
         let methods = &results.owners()[1].members();
-        assert_eq!(methods.len(), 9);
+        assert_eq!(methods.len(), 11);
         // `self.<record-field>.<method>(..)` resolves the method on the
         // receiver record's own impl: prim tails, conditions, `Str`
         // arguments and `-> Str` outputs all check like `self.<method>`
@@ -105386,6 +105399,7 @@ property "shared"() {}
             (2, "str_arg"),
             (3, "str_call"),
             (8, "second_block"),
+            (9, "dup"),
         ] {
             let check = methods[index].body_type_check().expect("body check runs");
             let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
@@ -105393,6 +105407,18 @@ property "shared"() {}
             };
             assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
         }
+        // `size` is declared twice across the `impl` blocks — the first
+        // declaration wins, so an argument reports the arity error.
+        let check = methods[10].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("dup_wrong reports: {check:?}");
+        };
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == sai_diagnostics::Code::WrongArgumentCount),
+            "{diagnostics:?}"
+        );
         let check = methods[4].body_type_check().expect("body check runs");
         let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
             panic!("arity reports: {check:?}");
