@@ -23490,7 +23490,7 @@ fn str_loop_level_expr(
             label,
             source: LoopSource::Loop,
         } => {
-            if let Some(diagnostics) = str_stmt_expr_unit(
+            let unit_diagnostics = str_stmt_expr_unit(
                 owner,
                 return_ty,
                 expr,
@@ -23504,20 +23504,19 @@ fn str_loop_level_expr(
                 target_cfg,
                 false,
                 StrStmtLoopFrame::Loop,
+                frame_label,
                 call_signatures,
-            )? {
-                return Ok(Some((false, false, diagnostics)));
-            }
+            )?;
             let Some(target) = frame_label else {
-                return Ok(None);
+                return Ok(unit_diagnostics.map(|diagnostics| (false, false, diagnostics)));
             };
             // A nested `loop` re-using the label shadows it — its
             // `break 'l`s bind to the inner `l`.
             if label.map(|label| label.name) == Some(target) {
-                return Ok(None);
+                return Ok(unit_diagnostics.map(|diagnostics| (false, false, diagnostics)));
             }
             let mut fuel = STR_LOOP_SCAN_FUEL;
-            let Some((clean, found, diagnostics)) = str_outer_breaks_in_block(
+            let Some((clean, found, mut break_diagnostics)) = str_outer_breaks_in_block(
                 owner,
                 return_ty,
                 body,
@@ -23533,11 +23532,15 @@ fn str_loop_level_expr(
                 call_signatures,
             )?
             else {
-                return Ok(None);
+                return Ok(unit_diagnostics.map(|diagnostics| (false, false, diagnostics)));
             };
             if !found {
-                return Ok(None);
+                return Ok(unit_diagnostics.map(|diagnostics| (false, false, diagnostics)));
             }
+            // The inner loop's own diagnostics stay reported — a
+            // `break 'l` reaching out does not hide them.
+            let mut diagnostics = unit_diagnostics.unwrap_or_default();
+            diagnostics.append(&mut break_diagnostics);
             Ok(Some((clean, true, diagnostics)))
         }
         ExprKind::Loop { .. } => Ok(str_stmt_expr_unit(
@@ -23554,6 +23557,7 @@ fn str_loop_level_expr(
             target_cfg,
             false,
             StrStmtLoopFrame::Loop,
+            frame_label,
             call_signatures,
         )?
         .map(|diagnostics| (false, false, diagnostics))),
@@ -23843,28 +23847,61 @@ fn str_outer_breaks_in_block(
     let mut found = false;
     let mut diagnostics = Vec::new();
     for stmt in block.stmts {
-        if let sai_hir::expressions::StmtKind::Expr(expr) = stmt.kind {
-            let Some((e_clean, e_found, mut e_diags)) = str_outer_breaks_in_expr(
-                owner,
-                return_ty,
-                expr,
-                &inner,
-                locals,
-                type_paths,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
-                target,
-                fuel,
-                call_signatures,
-            )?
-            else {
-                return Ok(None);
-            };
-            clean |= e_clean;
-            found |= e_found;
-            diagnostics.append(&mut e_diags);
+        match stmt.kind {
+            sai_hir::expressions::StmtKind::Expr(expr) => {
+                let Some((e_clean, e_found, mut e_diags)) = str_outer_breaks_in_expr(
+                    owner,
+                    return_ty,
+                    expr,
+                    &inner,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    target,
+                    fuel,
+                    call_signatures,
+                )?
+                else {
+                    return Ok(None);
+                };
+                clean |= e_clean;
+                found |= e_found;
+                diagnostics.append(&mut e_diags);
+            }
+            // Non-`break` statements are checked like the statement
+            // walk — a `break 'l` reaching out does not hide their
+            // diagnostics.
+            sai_hir::expressions::StmtKind::Assert { cond, msg, .. } => {
+                let Some(mut cond_diagnostics) = str_condition(
+                    owner,
+                    cond,
+                    locals,
+                    &inner,
+                    inputs,
+                    snapshot,
+                    symbols,
+                    target_cfg,
+                    return_ty,
+                    type_paths,
+                    call_signatures,
+                )?
+                else {
+                    return Ok(None);
+                };
+                if let Some(msg) = msg {
+                    let Some(mut msg_diagnostics) =
+                        str_assert_msg(owner, msg, locals, &inner, inputs, snapshot)?
+                    else {
+                        return Ok(None);
+                    };
+                    diagnostics.append(&mut msg_diagnostics);
+                }
+                diagnostics.append(&mut cond_diagnostics);
+            }
+            _ => {}
         }
     }
     if let Some(tail) = block.tail {
