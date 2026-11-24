@@ -4828,6 +4828,9 @@ fn primitive_bodies_admit_str_method_calls() {
         "pub fn str_len_arith(value: Str) -> USize { value.len() + 1 }\n",
         "pub fn str_len_let(value: Str) -> USize {\n    let n = value.len()\n    n\n}\n",
         "pub fn str_if_call_condition(value: Str) -> Bool {\n    if value.is_empty() { true } else { false }\n}\n",
+        "pub fn str_match_init(flag: Bool) -> USize {\n    let s = match flag { true => \"a\", _ => \"b\" }\n    s.len()\n}\n",
+        "pub fn str_match_arm_return(flag: Bool) -> USize {\n    let s: Str = match flag { true => \"a\", _ => { return 1 } }\n    s.len()\n}\n",
+        "pub fn str_match_arm_let(flag: Bool) -> USize {\n    let s: Str = match flag { true => { let n: I32 = 1\n        \"a\" }, _ => \"b\" }\n    s.len()\n}\n",
         "pub fn str_while_call_condition(value: Str) -> Bool {\n    while value.is_empty() { break }\n    true\n}\n",
         "pub fn str_assert_call_condition(value: Str) -> Bool {\n    assert value.is_empty()\n    true\n}\n",
         "pub fn str_len_trivia(value: Str) -> USize { value.len /* note */ () }\n",
@@ -4855,6 +4858,10 @@ fn primitive_body_str_method_call_mismatches_report_type_diagnostics() {
         (
             "pub fn str_is_empty_mismatch(value: Str) -> USize { value.is_empty() }\n",
             "expected `USize`, found `Bool`",
+        ),
+        (
+            "pub fn str_match_call_arm(flag: Bool, value: Str) -> USize {\n    let s = match flag { true => \"a\", _ => value.len() }\n    s.len()\n}\n",
+            "expected `Str`, found `USize`",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);

@@ -11365,6 +11365,47 @@ fn collect_str_branch_let_annotations(
                 );
             }
         }
+        // `match` arm bodies carry their own annotated `let`s the
+        // same way `if` branches do.
+        ExprKind::Match { arms, .. } => {
+            for arm in arms {
+                collect_str_branch_let_annotations(
+                    arm.body,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
+        // `return`/`break` values can be blocks holding annotated
+        // `let`s (`{ return { let n: I32 = 1\n "a" } }`).
+        ExprKind::Return(Some(value)) => {
+            collect_str_branch_let_annotations(
+                value,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        ExprKind::Break {
+            value: Some(value), ..
+        } => {
+            collect_str_branch_let_annotations(
+                value,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
         _ => {}
     }
 }
@@ -11439,23 +11480,70 @@ fn str_shaped_local_init(
         // `let t = self.text` aliases a `Str` field; a `match`
         // yields `Str` when every arm body is a `Str` binding.
         ExprKind::Field { .. } => str_self_field_projected_family(init, inputs) == Some("`Str`"),
+        // `let s = match c { true => "a", _ => 1 }` admits so the
+        // kernel diagnoses the non-`Str` arm instead of gating.
+        // Diverging arms are neutral — they never yield `Str`, so they
+        // neither admit nor disqualify the `match`.
         ExprKind::Match { arms, .. } => {
             !arms.is_empty()
-                && arms.iter().all(|arm| match arm.body.kind {
-                    ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
-                        .is_some_and(|source| str_bindings.contains(&source)),
-                    _ => false,
+                && arms.iter().any(|arm| {
+                    str_shaped_local_init(
+                        arm.body,
+                        locals,
+                        inputs,
+                        str_bindings,
+                        symbols,
+                        type_paths,
+                    )
                 })
         }
         // `let s = if c { "a" } else { "b" }` yields `Str` when both
-        // branches do (an `else if` chain recurses through `els`).
+        // branches do (an `else if` chain recurses through `els`); a
+        // diverging branch is neutral — it never yields. Each branch
+        // is evaluated once: a nested `if` chain must not re-scan it.
         ExprKind::If { then, els, .. } => {
-            str_shaped_branch_block(then, locals, inputs, str_bindings, symbols, type_paths)
-                && els.is_some_and(|els| {
-                    str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
-                })
+            let then_str =
+                str_shaped_branch_block(then, locals, inputs, str_bindings, symbols, type_paths);
+            let els_str = els.is_some_and(|els| {
+                str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
+            });
+            (then_str || els_str)
+                && (then_str || str_diverging_local_block(then))
+                && (els_str || els.is_some_and(|els| str_diverging_local_init(els)))
         }
         _ => false,
+    }
+}
+
+// Whether an expression position can never produce a value: a
+// `return`/`break`/`continue` expression, or a block/`if` whose own
+// value position diverges (a block ending in `return` diverges; one
+// with a diverging statement then a tail does not — its tail still
+// yields).
+fn str_diverging_local_init(init: &HirExpr<'_>) -> bool {
+    match init.kind {
+        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
+        ExprKind::Block(block) => str_diverging_local_block(block),
+        ExprKind::If { then, els, .. } => {
+            str_diverging_local_block(then) && els.is_some_and(|els| str_diverging_local_init(els))
+        }
+        _ => false,
+    }
+}
+
+fn str_diverging_local_block(block: &HirBlock<'_>) -> bool {
+    match block.tail {
+        Some(tail) => str_diverging_local_init(tail),
+        None => block.stmts.iter().any(|stmt| {
+            matches!(
+                stmt.kind,
+                StmtKind::Expr(expression)
+                    if matches!(
+                        expression.kind,
+                        ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
+                    )
+            )
+        }),
     }
 }
 
@@ -11496,6 +11584,13 @@ fn str_shaped_branch_block(
                 }
             }
             StmtKind::Assert { .. } => {}
+            // `return`/`break`/`continue` statements diverge — the
+            // kernel validates them like any other body statement.
+            StmtKind::Expr(expression)
+                if matches!(
+                    expression.kind,
+                    ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. }
+                ) => {}
             _ => return false,
         }
     }
@@ -61390,6 +61485,21 @@ property "shared"() {}
             "pub fn str_match_scrutinee(value: Str) -> I32 { match value { _ => 0 } }\n",
             "pub fn str_assign_to_primitive() -> I32 { var n = 1\n    n = \"a\"\n    0 }\n",
             "pub fn str_annotated_bytestring_init() -> I32 { let s: Str = b\"a\"\n    0 }\n",
+            "pub fn str_match_init(flag: Bool) -> USize { let s = match flag { true => \"a\", _ => \"b\" }\n    s.len() }\n",
+            "pub fn str_match_init_annotated(n: I32) -> USize { let s: Str = match n { 1 => \"a\", _ => \"b\" }\n    s.len() }\n",
+            "pub fn str_match_init_nested(flag: Bool, other: Bool) -> USize { let s = match flag { true => if other { \"a\" } else { \"c\" }, _ => \"b\" }\n    s.len() }\n",
+            "pub fn str_match_init_mismatch(n: I32) -> USize { let s = match n { 1 => \"a\", _ => 1 }\n    s.len() }\n",
+            "pub fn str_match_arm_let_annotation(flag: Bool) -> USize { let s: Str = match flag { true => { let n: I32 = 1\n        \"a\" }, _ => \"b\" }\n    s.len() }\n",
+            "pub fn str_match_arm_return(flag: Bool) -> USize { let s: Str = match flag { true => \"a\", _ => { return 1 } }\n    s.len() }\n",
+            "pub fn str_match_call_arm_mismatch(flag: Bool, value: Str) -> USize { let s = match flag { true => \"a\", _ => value.len() }\n    s.len() }\n",
+            "pub fn numeric_match_diverging_arm(flag: Bool) -> I32 { let s = match flag { true => { return 1 }, _ => 2 }\n    s }\n",
+            "pub fn str_match_return_block_let(flag: Bool) -> I32 { let s: Str = match flag { true => { return { let n: I32 = 1\n            2 } }, _ => \"b\" }\n    1 }\n",
+            "pub fn str_if_diverging_else(flag: Bool) -> USize { let s = if flag { \"a\" } else { return 1 }\n    s.len() }\n",
+            "pub fn numeric_if_diverging_else(flag: Bool) -> I32 { let s = if flag { 1 } else { return 2 }\n    s }\n",
+            "pub fn numeric_match_diverging_tail(flag: Bool) -> I32 { let s = match flag { true => { return 1\n            2 }, _ => 3 }\n    s }\n",
+            "pub fn all_diverging_match_init(flag: Bool) -> I32 { let s = match flag { _ => return 1 }\n    s }\n",
+            "pub fn numeric_match_let_then_return(flag: Bool) -> I32 { let s = match flag { true => { let n = 1\n            return 2 }, _ => 3 }\n    s }\n",
+            "pub fn never_condition(flag: Bool) -> I32 { let s = match flag { _ => return 1 }\n    if s { 1 } else { 2 } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61406,7 +61516,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 29);
+        assert_eq!(owners.len(), 44);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -61417,6 +61527,29 @@ property "shared"() {}
                 owner
                     .body_type_check()
                     .expect("Str local function body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        // `match` initializers yielding `Str` arm bodies — literal,
+        // annotated, and nested-`if` arm shapes — check cleanly too.
+        for owner in &owners[29..32] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("Str match-initializer function body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        // `match` arm bodies with annotated `let`s or diverging
+        // `return`s check like the other `Str` arms. Diverging arms
+        // stay neutral in joins: a numeric `match` with a `return`
+        // arm still literal-joins, and `return`-value blocks carry
+        // their own annotated `let`s.
+        for owner in owners[33..35].iter().chain(&owners[36..44]) {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("Str match-arm function body check succeeds"),
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
@@ -61441,6 +61574,12 @@ property "shared"() {}
             // `let s: Str = b"a"` — the `Str` annotation's literal
             // mismatch names the literal kind, not a gate.
             (28, "expected `Str`, found a byte string literal"),
+            // `let s = match n { 1 => "a", _ => 1 }` — the non-`Str`
+            // arm reports against `Str`, not a gate.
+            (32, "expected `Str`, found an integer literal"),
+            // `let s = match flag { true => "a", _ => value.len() }` —
+            // the call arm resolves `USize` and reports against `Str`.
+            (35, "expected `Str`, found `USize`"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
