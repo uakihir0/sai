@@ -1444,7 +1444,7 @@ def _validate_fmt_source_size_minimum(
         raise SmokeError("source at the minimum size limit was not accepted unchanged")
 
 
-def _validate_check_source_size_minimum(
+def _validate_check_minimum_acceptance(
     completed: subprocess.CompletedProcess,
     *,
     registered_codes: set[str],
@@ -1537,6 +1537,22 @@ def _tuple_at_minimum(minimum_elements: int) -> bytes:
     return source
 
 
+def _expression_nesting_at_minimum(minimum_depth: int) -> bytes:
+    if (
+        isinstance(minimum_depth, bool)
+        or not isinstance(minimum_depth, int)
+        or minimum_depth < 1
+    ):
+        raise SmokeError("expression nesting minimum must be a positive integer")
+    # check parses the initializer through one expr_bp entry; every `not` adds
+    # one recursive expr_bp entry. A flat prefix chain therefore reaches the
+    # expression-only portion of the combined nesting minimum exactly.
+    source = b"pub const NESTED: Bool = " + b"not " * (minimum_depth - 1) + b"true\n"
+    if source.count(b"not ") != minimum_depth - 1:
+        raise SmokeError("generated expression does not match its nesting minimum")
+    return source
+
+
 def _run_check_identifier_minimum(
     iut: Path,
     registered_codes: set[str],
@@ -1588,7 +1604,7 @@ def _run_check_identifier_minimum(
                 timeout,
                 state_root=sandbox_root,
             )
-        _validate_check_source_size_minimum(
+        _validate_check_minimum_acceptance(
             completed,
             registered_codes=registered_codes,
             subject="identifier at its minimum length",
@@ -1686,7 +1702,7 @@ def _run_check_tuple_minimum(
                 timeout,
                 state_root=sandbox_root,
             )
-        _validate_check_source_size_minimum(
+        _validate_check_minimum_acceptance(
             completed,
             registered_codes=registered_codes,
             subject="tuple type at its minimum element count",
@@ -1696,6 +1712,105 @@ def _run_check_tuple_minimum(
         output["failures"] = [str(error)]
     except Exception:
         output["failures"] = ["unexpected tuple-element smoke-runner failure"]
+    return output
+
+
+def _run_check_expression_nesting_minimum(
+    iut: Path,
+    registered_codes: set[str],
+    *,
+    minimum_depth: int,
+    timeout: float,
+) -> dict:
+    test = "generated/spec-01-introduction/expression-nesting-minimum-check"
+    output = {
+        "type": "test",
+        "test": test,
+        "mode": "partial-smoke",
+        "claim": False,
+        "configuration": {"target": None, "profile": None},
+        "compatibility_execution": {
+            "manifest_target": "wasm32-core",
+            "cli_target": "wasm32-core",
+            "cli_profile_default": "dev",
+        },
+        "outcome": "fail",
+        "deviations": [],
+        "failures": [],
+        "limit": "nesting depth of expressions, blocks, patterns, and types (combined)",
+        "minimum_depth": minimum_depth,
+        "nested_operator_count": minimum_depth - 1,
+        "canonical_source_verified": False,
+    }
+    try:
+        source = _expression_nesting_at_minimum(minimum_depth)
+        with tempfile.TemporaryDirectory(prefix="sai-stage0-expression-depth-") as temporary:
+            sandbox_root = Path(temporary)
+            package_root = sandbox_root / "package"
+            source_dir = package_root / "src"
+            source_dir.mkdir(parents=True)
+            (package_root / "sai.package").write_text(
+                PACKAGE_MANIFEST,
+                encoding="utf-8",
+                newline="\n",
+            )
+            (source_dir / "lib.sai").write_bytes(source)
+            formatter = _run_iut(
+                iut,
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "fmt",
+                    "--check",
+                    "--stdin-kind",
+                    "source",
+                    "-",
+                ],
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+                stdin_data=source,
+            )
+            _validate_fmt_check(
+                formatter,
+                input_bytes=source,
+                expected_output=source,
+                registered_codes=registered_codes,
+            )
+            try:
+                checked_source = (source_dir / "lib.sai").read_bytes()
+            except OSError as error:
+                raise SmokeError(
+                    "expression-nesting source disappeared after formatter preflight"
+                ) from error
+            if checked_source != source:
+                raise SmokeError(
+                    "formatter preflight modified the generated expression-nesting source"
+                )
+            output["canonical_source_verified"] = True
+            completed = _run_iut(
+                iut,
+                [
+                    "--format=json",
+                    "--max-errors=0",
+                    "check",
+                    "--target=wasm32-core",
+                    "--jobs=1",
+                ],
+                package_root,
+                timeout,
+                state_root=sandbox_root,
+            )
+        _validate_check_minimum_acceptance(
+            completed,
+            registered_codes=registered_codes,
+            subject="expression at its minimum nesting depth",
+        )
+        output["outcome"] = "pass"
+    except (SmokeError, ValueError, ndjson_stream.StreamError) as error:
+        output["failures"] = [str(error)]
+    except Exception:
+        output["failures"] = ["unexpected expression-nesting smoke-runner failure"]
     return output
 
 
@@ -1749,7 +1864,7 @@ def _run_check_source_size_minimum(
                 timeout,
                 state_root=sandbox_root,
             )
-        _validate_check_source_size_minimum(
+        _validate_check_minimum_acceptance(
             completed,
             registered_codes=registered_codes,
         )
@@ -2621,15 +2736,15 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
             "uses the generated package's wasm32-core/dev defaults for execution.",
             "The caller must supply this repository's reference sai binary; the runner "
             "cannot verify the identity of the executable passed with --iut.",
-            "A generated public-constant source file at the parsed §1.5.4 minimum "
-            "is also checked through the package file-read path with an explicit wasm32-core "
-            "target; the other §1.5.4 minimums are not "
+            "Generated public-constant package checks also exercise the source-size, "
+            "identifier-length, tuple-element, and expression-only nesting minima from "
+            "§1.5.4; the other §1.5.4 minimums are not "
             "covered. Formatter coverage is limited to single-file source fmt goldens and "
             "Stage 3 package fmt directory goldens, their "
             "fixed-point, 16 reference-lexer-derived deterministic layout variants, "
             "source-stdin, generated package-wide, and fmt --check with one explicit "
-            "path, refusal fixtures, and generated exact-minimum acceptance plus a "
-            "one-byte-above refusal smoke specific to the current reference "
+            "path, refusal fixtures, and the generated source-size minimum acceptance "
+            "plus a one-byte-above refusal smoke specific to the current reference "
             "implementation. The specification permits implementations to accept "
             "files above the minimum. "
             "workspaces, multi-source package checks, multiple explicit path arguments, "
@@ -2667,6 +2782,10 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
         tuple_element_minimum = resource_limits.count_minimum_for(
             limits, "elements of one tuple type"
         )
+        expression_nesting_minimum = resource_limits.count_minimum_for(
+            limits,
+            "nesting depth of expressions, blocks, patterns, and types (combined)",
+        )
         results = [
             _run_fixture(fixture, conformance_root, iut_path, codes,
                          timeout=timeout, docs_root=docs_root)
@@ -2687,6 +2806,14 @@ def run_suite(iut: os.PathLike | str, conformance_directory: os.PathLike | str,
                 iut_path,
                 codes,
                 minimum_elements=tuple_element_minimum,
+                timeout=timeout,
+            )
+        )
+        results.append(
+            _run_check_expression_nesting_minimum(
+                iut_path,
+                codes,
+                minimum_depth=expression_nesting_minimum,
                 timeout=timeout,
             )
         )

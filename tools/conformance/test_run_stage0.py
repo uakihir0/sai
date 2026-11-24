@@ -23,6 +23,7 @@ from run_stage0 import (
     _formatter_refusal_codes,
     _format_source_limit,
     _identifier_at_minimum_size,
+    _expression_nesting_at_minimum,
     _tuple_at_minimum,
     _resolve_spec_reference,
     _source_position,
@@ -192,6 +193,7 @@ class Stage0SmokeRunnerTests(unittest.TestCase):
         self.probe_limit = 64
         self.identifier_limit = 32
         self.tuple_element_limit = 8
+        self.expression_nesting_limit = 8
         self.source_file_minimum_patch = patch(
             "run_stage0.resource_limits.source_file_minimum_bytes",
             return_value=self.probe_limit,
@@ -206,7 +208,11 @@ class Stage0SmokeRunnerTests(unittest.TestCase):
         self.addCleanup(self.identifier_minimum_patch.stop)
         self.tuple_minimum_patch = patch(
             "run_stage0.resource_limits.count_minimum_for",
-            return_value=self.tuple_element_limit,
+            side_effect=lambda _limits, name: (
+                self.tuple_element_limit
+                if name == "elements of one tuple type"
+                else self.expression_nesting_limit
+            ),
         )
         self.tuple_minimum_patch.start()
         self.addCleanup(self.tuple_minimum_patch.stop)
@@ -258,6 +264,11 @@ EXPECTED_TUPLE_CHECK = (
     + b"\\n) = (\\n"
     + b"\\n".join([b"    true,"] * {self.tuple_element_limit})
     + b"\\n)\\n"
+)
+EXPECTED_EXPRESSION_CHECK = (
+    b"pub const NESTED: Bool = "
+    + b"not " * ({self.expression_nesting_limit} - 1)
+    + b"true\\n"
 )
 EXPECTED_MANIFEST = {PACKAGE_MANIFEST!r}
 SIZE_CHECK_ARGS = ["--format=json", "--max-errors=0", "check", "--target=wasm32-core", "--jobs=1"]
@@ -382,11 +393,22 @@ if is_stdin_check or is_package_check or is_path_check or is_package_manifest_ch
     is_tuple_minimum_formatter_probe = (
         args == stdin_check_args and formatter_input == EXPECTED_TUPLE_CHECK
     )
+    is_expression_nesting_formatter_probe = (
+        args == stdin_check_args and formatter_input == EXPECTED_EXPRESSION_CHECK
+    )
     if is_tuple_minimum_formatter_probe:
         receipt["tuple_minimum_formatter_probe"] = {{
             "argv":args,
             "input_length":len(formatter_input),
             "source_matches_generated":formatter_input == EXPECTED_TUPLE_CHECK,
+        }}
+    elif is_expression_nesting_formatter_probe:
+        receipt["expression_nesting_formatter_probe"] = {{
+            "argv":args,
+            "input_length":len(formatter_input),
+            "source_matches_generated":(
+                formatter_input == EXPECTED_EXPRESSION_CHECK
+            ),
         }}
     else:
         receipt.update({{
@@ -395,8 +417,11 @@ if is_stdin_check or is_package_check or is_path_check or is_package_manifest_ch
         }})
     is_fmt_fixture_check = (
         MODE == "fmt_fixture" or MODE.startswith("fmt_check_")
-    ) and not is_tuple_minimum_formatter_probe
-    if not is_tuple_minimum_formatter_probe:
+    ) and not (
+        is_tuple_minimum_formatter_probe
+        or is_expression_nesting_formatter_probe
+    )
+    if not (is_tuple_minimum_formatter_probe or is_expression_nesting_formatter_probe):
         receipt.setdefault("calls", []).append(
             "fmt-check" if is_fmt_fixture_check else "fmt"
         )
@@ -592,8 +617,14 @@ if is_stdin_check or is_package_check or is_path_check or is_package_manifest_ch
             summary_record["suppressed"]["cascade"] = 1
         print(line(summary_record).rstrip("\\n"))
         raise SystemExit(status)
-    if is_tuple_minimum_formatter_probe:
-        if MODE == "tuple_minimum_formatter_mutates_source":
+    if is_tuple_minimum_formatter_probe or is_expression_nesting_formatter_probe:
+        if (
+            is_tuple_minimum_formatter_probe
+            and MODE == "tuple_minimum_formatter_mutates_source"
+        ) or (
+            is_expression_nesting_formatter_probe
+            and MODE == "expression_nesting_formatter_mutates_source"
+        ):
             Path("src/lib.sai").write_bytes(b"pub const SMALLER: Bool = true\\n")
         print(line(header("fmt", None)).rstrip("\\n"))
         print(line({{"type":"result","kind":"fmt","data":{{
@@ -983,7 +1014,10 @@ if args == SIZE_CHECK_ARGS:
     is_source_size = source == EXPECTED_SIZE_CHECK
     is_identifier = source == EXPECTED_IDENTIFIER_CHECK
     is_tuple_minimum = source == EXPECTED_TUPLE_CHECK
-    if not is_source_size and not is_identifier and not is_tuple_minimum:
+    is_expression_nesting = source == EXPECTED_EXPRESSION_CHECK
+    if not (
+        is_source_size or is_identifier or is_tuple_minimum or is_expression_nesting
+    ):
         raise SystemExit("unexpected generated check source")
     try:
         receipt = json.loads(Path(RECEIPT).read_text(encoding="utf-8"))
@@ -1014,11 +1048,21 @@ if args == SIZE_CHECK_ARGS:
             "package_entries":sorted(path.name for path in root.iterdir()),
             "source_entries":sorted(path.name for path in (root / "src").iterdir()),
         }}
-    else:
+    elif is_tuple_minimum:
         receipt["tuple_minimum_check_probe"] = {{
             "argv":args,
             "element_count":{self.tuple_element_limit},
             "source_matches_generated":source == EXPECTED_TUPLE_CHECK,
+            "manifest":(root / "sai.package").read_text(encoding="utf-8"),
+            "package_entries":sorted(path.name for path in root.iterdir()),
+            "source_entries":sorted(path.name for path in (root / "src").iterdir()),
+        }}
+    else:
+        receipt["expression_nesting_check_probe"] = {{
+            "argv":args,
+            "minimum_depth":{self.expression_nesting_limit},
+            "nested_operator_count":{self.expression_nesting_limit - 1},
+            "source_matches_generated":source == EXPECTED_EXPRESSION_CHECK,
             "manifest":(root / "sai.package").read_text(encoding="utf-8"),
             "package_entries":sorted(path.name for path in root.iterdir()),
             "source_entries":sorted(path.name for path in (root / "src").iterdir()),
@@ -1030,16 +1074,22 @@ if args == SIZE_CHECK_ARGS:
         (is_source_size and MODE == "source_size_minimum_refuses")
         or (is_identifier and MODE == "identifier_minimum_refuses")
         or (is_tuple_minimum and MODE == "tuple_minimum_refuses")
+        or (
+            is_expression_nesting
+            and MODE == "expression_nesting_minimum_refuses"
+        )
     ):
         limit = (
             "size of a source file" if is_source_size
             else "length of an identifier" if is_identifier
-            else "elements of one tuple type"
+            else "elements of one tuple type" if is_tuple_minimum
+            else "nesting depth"
         )
         value = (
             len(source) if is_source_size
             else len(EXPECTED_IDENTIFIER_CHECK_NAME) if is_identifier
-            else {self.tuple_element_limit}
+            else {self.tuple_element_limit} if is_tuple_minimum
+            else {self.expression_nesting_limit}
         )
         diagnostic = {{
             "type":"diagnostic","code":"IMPLEMENTATION_LIMIT_EXCEEDED",
@@ -1065,6 +1115,10 @@ if args == SIZE_CHECK_ARGS:
         (is_source_size and MODE == "source_size_minimum_missing_result")
         or (is_identifier and MODE == "identifier_minimum_missing_result")
         or (is_tuple_minimum and MODE == "tuple_minimum_missing_result")
+        or (
+            is_expression_nesting
+            and MODE == "expression_nesting_minimum_missing_result"
+        )
     ):
         records.pop(1)
     if is_source_size and MODE == "source_size_minimum_unknown_header_members":
@@ -1758,7 +1812,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["tests"], 6 + len(USAGE_ERROR_CASES))
+        self.assertEqual(report["tests"], 7 + len(USAGE_ERROR_CASES))
         self.assertEqual(report["results"][-1]["test"],
                          "generated/impl-14-formatter/reference-source-size-refusal")
         self.assertEqual(report["results"][-1]["outcome"], "pass")
@@ -1801,7 +1855,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["tests"], 6 + len(USAGE_ERROR_CASES))
+        self.assertEqual(report["tests"], 7 + len(USAGE_ERROR_CASES))
         self.assertEqual(
             report["results"][-2]["test"],
             "generated/impl-14-formatter/source-size-minimum",
@@ -1840,15 +1894,15 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["tests"], 6 + len(USAGE_ERROR_CASES))
+        self.assertEqual(report["tests"], 7 + len(USAGE_ERROR_CASES))
         self.assertEqual(
-            report["results"][-5]["test"],
+            report["results"][-6]["test"],
             "generated/spec-01-introduction/source-size-minimum-check",
         )
-        self.assertEqual(report["results"][-5]["minimum_bytes"], self.probe_limit)
-        self.assertEqual(report["results"][-5]["outcome"], "pass")
+        self.assertEqual(report["results"][-6]["minimum_bytes"], self.probe_limit)
+        self.assertEqual(report["results"][-6]["outcome"], "pass")
         self.assertEqual(
-            report["results"][-5]["compatibility_execution"],
+            report["results"][-6]["compatibility_execution"],
             {
                 "manifest_target": "wasm32-core",
                 "cli_target": "wasm32-core",
@@ -1877,7 +1931,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-5]["failures"],
+            report["results"][-6]["failures"],
             ["source at the minimum size limit produced diagnostics"],
         )
 
@@ -1890,7 +1944,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-5]["failures"],
+            report["results"][-6]["failures"],
             ["successful check must have one result and match check-pass"],
         )
 
@@ -1902,7 +1956,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        self.assertEqual(report["results"][-5]["outcome"], "pass")
+        self.assertEqual(report["results"][-6]["outcome"], "pass")
 
     def test_check_source_size_minimum_rejects_reordered_known_result_members(self):
         self._fixture()
@@ -1913,7 +1967,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-5]["failures"],
+            report["results"][-6]["failures"],
             ["sai check returned an invalid result schema"],
         )
 
@@ -1926,7 +1980,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-5]["failures"],
+            report["results"][-6]["failures"],
             ["sai check returned an invalid result schema"],
         )
 
@@ -1938,7 +1992,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "fail")
-        self.assertTrue(report["results"][-5]["failures"])
+        self.assertTrue(report["results"][-6]["failures"])
 
     def test_identifier_generator_uses_exact_ascii_token_byte_length(self):
         identifier, source = _identifier_at_minimum_size(self.identifier_limit)
@@ -1954,7 +2008,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        result = report["results"][-4]
+        result = report["results"][-5]
         self.assertEqual(
             result["test"],
             "generated/spec-01-introduction/identifier-minimum-check",
@@ -1992,7 +2046,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-4]["failures"],
+            report["results"][-5]["failures"],
             ["identifier at its minimum length produced diagnostics"],
         )
 
@@ -2005,7 +2059,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-4]["failures"],
+            report["results"][-5]["failures"],
             ["successful check must have one result and match check-pass"],
         )
 
@@ -2044,7 +2098,7 @@ raise SystemExit(exit_code)
         report = self._run()
 
         self.assertEqual(report["outcome"], "pass", report)
-        result = report["results"][-3]
+        result = report["results"][-4]
         self.assertEqual(
             result["test"],
             "generated/spec-01-introduction/tuple-type-minimum-check",
@@ -2091,7 +2145,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-3]["failures"],
+            report["results"][-4]["failures"],
             ["tuple type at its minimum element count produced diagnostics"],
         )
 
@@ -2104,7 +2158,7 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-3]["failures"],
+            report["results"][-4]["failures"],
             ["successful check must have one result and match check-pass"],
         )
 
@@ -2117,11 +2171,113 @@ raise SystemExit(exit_code)
 
         self.assertEqual(report["outcome"], "fail")
         self.assertEqual(
-            report["results"][-3]["failures"],
+            report["results"][-4]["failures"],
             ["formatter preflight modified the generated tuple source"],
         )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertNotIn("tuple_minimum_check_probe", receipt)
+
+    def test_expression_nesting_generator_reaches_exact_combined_depth(self):
+        source = _expression_nesting_at_minimum(256)
+
+        self.assertEqual(source.count(b"not "), 255)
+        self.assertEqual(
+            source,
+            b"pub const NESTED: Bool = " + b"not " * 255 + b"true\n",
+        )
+        self.assertEqual(_expression_nesting_at_minimum(1), (
+            b"pub const NESTED: Bool = true\n"
+        ))
+        with self.assertRaisesRegex(SmokeError, "positive integer"):
+            _expression_nesting_at_minimum(0)
+        with self.assertRaisesRegex(SmokeError, "positive integer"):
+            _expression_nesting_at_minimum(True)
+
+    def test_check_expression_nesting_minimum_uses_exact_table_limit(self):
+        self._fixture()
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "pass", report)
+        result = report["results"][-3]
+        self.assertEqual(
+            result["test"],
+            "generated/spec-01-introduction/expression-nesting-minimum-check",
+        )
+        self.assertEqual(
+            result["limit"],
+            "nesting depth of expressions, blocks, patterns, and types (combined)",
+        )
+        self.assertEqual(result["minimum_depth"], self.expression_nesting_limit)
+        self.assertEqual(
+            result["nested_operator_count"],
+            self.expression_nesting_limit - 1,
+        )
+        self.assertEqual(result["outcome"], "pass")
+        self.assertIs(result["canonical_source_verified"], True)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        probe = receipt["expression_nesting_check_probe"]
+        formatter_probe = receipt["expression_nesting_formatter_probe"]
+        self.assertEqual(formatter_probe["argv"], [
+            "--format=json", "--max-errors=0", "fmt", "--check",
+            "--stdin-kind", "source", "-",
+        ])
+        self.assertEqual(
+            formatter_probe["input_length"],
+            len(_expression_nesting_at_minimum(self.expression_nesting_limit)),
+        )
+        self.assertIs(formatter_probe["source_matches_generated"], True)
+        self.assertEqual(probe["minimum_depth"], self.expression_nesting_limit)
+        self.assertEqual(
+            probe["nested_operator_count"],
+            self.expression_nesting_limit - 1,
+        )
+        self.assertIs(probe["source_matches_generated"], True)
+        self.assertEqual(probe["manifest"], PACKAGE_MANIFEST)
+        self.assertEqual(probe["package_entries"], ["sai.package", "src"])
+        self.assertEqual(probe["source_entries"], ["lib.sai"])
+
+    def test_check_expression_nesting_minimum_rejects_compiler_refusal(self):
+        self._fixture()
+        self.mode = "expression_nesting_minimum_refuses"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(
+            report["results"][-3]["failures"],
+            ["expression at its minimum nesting depth produced diagnostics"],
+        )
+
+    def test_check_expression_nesting_minimum_requires_a_check_result(self):
+        self._fixture()
+        self.mode = "expression_nesting_minimum_missing_result"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(
+            report["results"][-3]["failures"],
+            ["successful check must have one result and match check-pass"],
+        )
+
+    def test_check_expression_nesting_minimum_rejects_formatter_source_mutation(self):
+        self._fixture()
+        self.mode = "expression_nesting_formatter_mutates_source"
+        self._write_fake()
+
+        report = self._run()
+
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(
+            report["results"][-3]["failures"],
+            ["formatter preflight modified the generated expression-nesting source"],
+        )
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertNotIn("expression_nesting_check_probe", receipt)
 
     def test_usage_error_matrix_checks_required_cli_boundaries(self):
         self._fixture()

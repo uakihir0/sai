@@ -4,6 +4,15 @@
 
 ## Open for review
 
+### IR-1157 (2026-11-04): check the expression-nesting minimum
+
+- **Decision — review required:** Read the unitless combined nesting minimum from §1.5.4 and generate a temporary-package `sai check` probe with one public Bool constant whose initializer is a flat prefix chain containing one fewer `not` operator than the minimum.
+- **Reason:** §15.9.2 item 5 requires tests for every implementation-limit row. The existing Bool constant check path accepts the expression grammar needed to exercise 256 recursive parser entries without implementing unsupported blocks, patterns, or types.
+- **Boundary and judgment:** The initial initializer parse calls `expr_bp` once, and each prefix `not` recursively enters `expr_bp`; therefore 255 `not` operators plus that initial entry reach the current combined minimum of 256. The generated source is checked with `sai fmt --check --stdin-kind source -`, read back byte-for-byte from the temporary package, and passed to `sai check --target=wasm32-core --jobs=1`. This covers an expression-only path and does not test blocks, patterns, types, mixed nesting, or rejection above the minimum. The probe is partial smoke evidence only; it does not add the portable generated `cargo xtask spec-tests` case or substantiate conformance.
+- **Review required:** Verify that the parsed row remains unitless and unique; that the root initializer call counts as one nesting entry and exactly `minimum - 1` recursive prefix calls complete the depth; that no parenthesized or block expressions alter the generated count; formatter canonicality and source byte readback precede the check; compiler refusal, diagnostics, malformed output, or a missing result fail the probe; and the report remains `partial-smoke` with `claim: false`. Confirm that the evidence is not presented as coverage of the combined limit's other categories.
+- **Verification:** Pending implementation and review.
+- **Hostile review:** Pending code and documentation review.
+
 ### IR-1156 (2026-11-04): check the tuple-type element minimum
 
 - **Decision — review required:** Read the unitless `elements of one tuple type` minimum from the validated §1.5.4 table and generate a temporary-package `sai check` probe with a flat tuple type and value containing exactly that many elements.

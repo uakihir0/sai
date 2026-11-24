@@ -249,9 +249,13 @@ The generated minimum-limit probes read their values from the numeric table in
 through formatting and package-file checking, identifier-length minimum
 acceptance through a package check with a token of exactly the table's UTF-8
 byte length, and tuple-type minimum acceptance through a package check with a
-canonical flat tuple containing exactly the table's number of elements. The
+canonical flat tuple containing exactly the table's number of elements.
+Expression-only nesting minimum acceptance uses one public Bool constant with a
+flat chain of `not` expressions whose parser depth reaches the table minimum.
+The combined limit also covers blocks, patterns, and types; those shapes and
+mixed nesting are not exercised. The
 formatter's one-byte-over-source-size refusal is specific to the current
-reference implementation. The probes do not generate the remaining 9 limit
+reference implementation. The probes do not generate the remaining 8 limit
 cases or the full required portable test matrix. Formatter coverage is limited
 to single-file source and one package-manifest
 `fmt` fixture's byte comparisons, fixed-point checks, 16 deterministic layout
@@ -327,7 +331,7 @@ The inventory is intentionally report-only. It does not run the IUT, check the
 required-content matrix of §15.9.1, compare goldens with IUT output, verify
 code-specific diagnostic data shapes, or generate or check the complete
 §1.5.4 limit-test matrix. The smoke runner's source-size, identifier-length,
-and tuple-arity minimum-acceptance probes plus its formatter refusal probe do
+tuple-arity, and expression-only nesting minimum-acceptance probes plus its formatter refusal probe do
 not cover the other limits or compiler acceptance at those limits.
 The repository does not yet record its implemented stages, so coverage is not a
 CI merge gate.

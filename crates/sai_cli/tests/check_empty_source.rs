@@ -20607,6 +20607,19 @@ fn public_flat_tuple_const_literals_emit_check_results() {
 }
 
 #[test]
+fn expression_nesting_minimum_emits_check_result() {
+    const EXPRESSION_NESTING_MINIMUM: usize = 256;
+    let mut source = String::from("pub const NESTED: Bool = ");
+    // The initializer enters expr_bp once before its 255 recursive `not` operands.
+    for _ in 1..EXPRESSION_NESTING_MINIMUM {
+        source.push_str("not ");
+    }
+    source.push_str("true\n");
+
+    assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
 fn public_byte_string_flat_tuple_fields_emit_check_results() {
     let source = concat!(
         "pub const EMPTY: (Slice<Byte>,) = (b\"\",)\n",
