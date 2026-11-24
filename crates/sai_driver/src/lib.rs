@@ -8245,6 +8245,7 @@ fn check_inherent_method_body_type<'a>(
             self_method_call_site(
                 expression,
                 &field_types.record_fields,
+                &field_types.nested,
                 &method_signatures,
                 method_call_sites.and_then(|sites| sites.sibling_impls),
                 field_types.str_name_taken,
@@ -8383,6 +8384,7 @@ fn check_inherent_method_body_type<'a>(
         self_method_call_site(
             expression,
             &field_types.record_fields,
+            &field_types.nested,
             &method_signatures,
             method_call_sites.and_then(|sites| sites.sibling_impls),
             field_types.str_name_taken,
@@ -8529,6 +8531,9 @@ struct NestedRecordFields<T> {
     type_name_span: sai_diagnostics::Span,
     fields: HashMap<String, T>,
     str_fields: HashSet<String>,
+    // Fields whose type is another record in this file, by name —
+    // receivers continuing a `self.<a>.<b>.<c>` chain one level down.
+    record_fields: HashMap<String, String>,
     candidate_names: Vec<String>,
 }
 
@@ -8559,7 +8564,7 @@ fn collect_inherent_method_self_field(
 ) -> Result<bool, OwnerControlFlowResolutionError> {
     // `self.<record-field>` is a receiver — handled without a
     // projection, so a bare value use still gates.
-    if self_record_field_receiver(expression, &fields.record_fields, symbols) {
+    if self_record_field_receiver(expression, &fields.record_fields, &fields.nested, symbols) {
         return Ok(true);
     }
     let Some(field_lookup) = primitive_self_field_type(expression, &fields.fields, symbols) else {
@@ -8808,6 +8813,7 @@ fn inherent_method_primitive_field_types(
                 .unwrap_or(&record.type_name),
         );
         let mut record_fields_map = HashMap::new();
+        let mut record_record_fields = HashMap::new();
         let mut record_str_fields = HashSet::new();
         let mut record_candidates = Vec::new();
         for (field_name, ty_text, spelling) in &record.fields {
@@ -8820,12 +8826,30 @@ fn inherent_method_primitive_field_types(
                 }
             // `ty` spelled `Str` is the core string only while no record
             // in the file is named `Str` — a user `type Str` shadows the
-            // prelude name, and a record-typed field inside a receiver
-            // record would take the chain two levels deep.
+            // prelude name and makes the field record-typed instead.
             } else if ty_text == "Str" && !str_name_taken {
                 record_str_fields.insert(field_name.clone());
             } else {
-                return None;
+                let normalized_ty =
+                    sai_syntax::normalize_identifier(ty_text.strip_prefix("r#").unwrap_or(ty_text));
+                if records.iter().any(|other| {
+                    normalized_ty
+                        == sai_syntax::normalize_identifier(
+                            other
+                                .type_name
+                                .strip_prefix("r#")
+                                .unwrap_or(&other.type_name),
+                        )
+                }) {
+                    if record_record_fields
+                        .insert(field_name.clone(), normalized_ty)
+                        .is_some()
+                    {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
             }
             record_candidates.push(spelling.clone());
         }
@@ -8841,6 +8865,7 @@ fn inherent_method_primitive_field_types(
                     type_name_span: record.type_name_span,
                     fields: record_fields_map,
                     str_fields: record_str_fields,
+                    record_fields: record_record_fields,
                     candidate_names: record_candidates,
                 },
             )
@@ -8969,64 +8994,95 @@ fn primitive_self_field_type(
     Some(field_types.get(field_name.as_ref()).copied().ok_or(name))
 }
 
-// `self.<name>` whose field's type is another record in this file —
-// a receiver for `self.<name>.<leaf>` projections. Handled without a
-// projection so a bare `self.<name>` value still gates.
-fn self_record_field_receiver(
-    expression: &HirExpr<'_>,
-    record_fields: &HashMap<String, String>,
-    symbols: &Interner,
-) -> bool {
-    let ExprKind::Field {
-        base,
-        name,
-        args: None,
-    } = expression.kind
-    else {
-        return false;
-    };
-    is_direct_self_value_expression(base)
-        && symbols
-            .resolve(name.sym)
-            .ok()
-            .is_some_and(|field_name| record_fields.contains_key(field_name.as_ref()))
+// `self.<a>.<b>.<c>` — the resolved field names from `self` outward.
+// `None` when the expression is not a self-rooted `args: None` field
+// chain.
+fn self_field_chain(expression: &HirExpr<'_>, symbols: &Interner) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    let mut current = expression;
+    loop {
+        let ExprKind::Field {
+            base,
+            name,
+            args: None,
+        } = current.kind
+        else {
+            return None;
+        };
+        names.push(symbols.resolve(name.sym).ok()?.to_string());
+        if is_direct_self_value_expression(base) {
+            names.reverse();
+            return Some(names);
+        }
+        current = base;
+    }
 }
 
-// `self.<record-field>.<leaf>` — the leaf's type inside the receiver's
-// record: a scalar, a `Str` leaf (`len`/`is_empty` receiver), or an
-// unknown leaf reported against that record.
+// `names` as record-typed fields — the first name resolves through the
+// self record's field map, each next through the previous record's own
+// table — returning the record name and table the chain lands on.
+fn resolve_record_chain<'a, T>(
+    record_fields: &'a HashMap<String, String>,
+    nested: &'a HashMap<String, NestedRecordFields<T>>,
+    names: &[String],
+) -> Option<(&'a String, &'a NestedRecordFields<T>)> {
+    let mut record_name = record_fields.get(names.first()?.as_str())?;
+    let mut record = nested.get(record_name)?;
+    for name in &names[1..] {
+        record_name = record.record_fields.get(name.as_str())?;
+        record = nested.get(record_name)?;
+    }
+    Some((record_name, record))
+}
+
+// `self.<a>...<b>` where the last field's type is another record in
+// this file — a receiver for deeper projections. Handled without a
+// projection so a bare receiver value still gates.
+fn self_record_field_receiver<T>(
+    expression: &HirExpr<'_>,
+    record_fields: &HashMap<String, String>,
+    nested: &HashMap<String, NestedRecordFields<T>>,
+    symbols: &Interner,
+) -> bool {
+    let Some(names) = self_field_chain(expression, symbols) else {
+        return false;
+    };
+    let Some((last, prefix)) = names.split_last() else {
+        return false;
+    };
+    if prefix.is_empty() {
+        record_fields.contains_key(last.as_str())
+    } else {
+        resolve_record_chain(record_fields, nested, prefix)
+            .is_some_and(|(_, record)| record.record_fields.contains_key(last.as_str()))
+    }
+}
+
+// `self.<record-field>...<leaf>` — the leaf's type inside the record
+// the receiver chain lands on: a scalar, a `Str` leaf (`len`/`is_empty`
+// receiver), or an unknown leaf reported against that record.
 fn nested_self_field_type<'a>(
     expression: &HirExpr<'_>,
     fields: &'a InherentMethodPrimitiveFields,
     symbols: &Interner,
 ) -> Option<NestedSelfField<'a, sai_resolve::prelude::PrimTy>> {
-    let ExprKind::Field {
-        base,
-        name,
-        args: None,
-    } = expression.kind
-    else {
+    let ExprKind::Field { name, .. } = expression.kind else {
         return None;
     };
-    let ExprKind::Field {
-        base: inner_base,
-        name: inner_name,
-        args: None,
-    } = base.kind
-    else {
-        return None;
-    };
-    if !is_direct_self_value_expression(inner_base) {
+    let names = self_field_chain(expression, symbols)?;
+    if names.len() < 2 {
         return None;
     }
-    let inner = symbols.resolve(inner_name.sym).ok()?;
-    let record_name = fields.record_fields.get(inner.as_ref())?;
-    let record = fields.nested.get(record_name)?;
-    let leaf = symbols.resolve(name.sym).ok()?;
-    if let Some(field_type) = record.fields.get(leaf.as_ref()) {
+    let (_, record) = resolve_record_chain(
+        &fields.record_fields,
+        &fields.nested,
+        &names[..names.len() - 1],
+    )?;
+    let leaf = names.last()?.as_str();
+    if let Some(field_type) = record.fields.get(leaf) {
         return Some(NestedSelfField::Known(*field_type));
     }
-    if record.str_fields.contains(leaf.as_ref()) {
+    if record.str_fields.contains(leaf) {
         return Some(NestedSelfField::Str);
     }
     Some(NestedSelfField::Unknown { name, record })
@@ -9475,24 +9531,54 @@ fn str_inherent_method_field_types(
                 .unwrap_or(&record.type_name),
         );
         let mut record_fields_map = HashMap::new();
+        let mut record_record_fields = HashMap::new();
         let mut record_candidates = Vec::new();
         for (field_name, ty_text, spelling) in &record.fields {
             // A field spelled `Str` while any record in the file is
-            // named `Str` names that record — a record-typed field
-            // inside a receiver record takes the chain two levels deep.
+            // named `Str` names that record — it continues a
+            // `self.<a>.<b>` chain like any other record-typed field.
             if ty_text == "Str" && str_name_taken {
-                return None;
+                if record_record_fields
+                    .insert(field_name.clone(), "Str".to_owned())
+                    .is_some()
+                {
+                    return None;
+                }
+                record_candidates.push(spelling.clone());
+                continue;
             }
-            let Some(field_family) = str_method_field_family(ty_text, str_name_taken) else {
-                // A record-typed field inside a receiver record would
-                // take the chain two levels deep — the impl stays gated.
-                return None;
-            };
-            if record_fields_map
-                .insert(field_name.clone(), field_family)
-                .is_some()
-            {
-                return None;
+            match str_method_field_family(ty_text, str_name_taken) {
+                Some(field_family) => {
+                    if record_fields_map
+                        .insert(field_name.clone(), field_family)
+                        .is_some()
+                    {
+                        return None;
+                    }
+                }
+                None => {
+                    let normalized_ty = sai_syntax::normalize_identifier(
+                        ty_text.strip_prefix("r#").unwrap_or(ty_text),
+                    );
+                    if records.iter().any(|other| {
+                        normalized_ty
+                            == sai_syntax::normalize_identifier(
+                                other
+                                    .type_name
+                                    .strip_prefix("r#")
+                                    .unwrap_or(&other.type_name),
+                            )
+                    }) {
+                        if record_record_fields
+                            .insert(field_name.clone(), normalized_ty)
+                            .is_some()
+                        {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
             }
             record_candidates.push(spelling.clone());
         }
@@ -9508,6 +9594,7 @@ fn str_inherent_method_field_types(
                     type_name_span: record.type_name_span,
                     fields: record_fields_map,
                     str_fields: HashSet::new(),
+                    record_fields: record_record_fields,
                     candidate_names: record_candidates,
                 },
             )
@@ -9648,30 +9735,19 @@ fn nested_str_self_field_family<'a>(
     fields: &'a InherentMethodStrFields,
     symbols: &Interner,
 ) -> Option<NestedSelfField<'a, &'static str>> {
-    let ExprKind::Field {
-        base,
-        name,
-        args: None,
-    } = expression.kind
-    else {
+    let ExprKind::Field { name, .. } = expression.kind else {
         return None;
     };
-    let ExprKind::Field {
-        base: inner_base,
-        name: inner_name,
-        args: None,
-    } = base.kind
-    else {
-        return None;
-    };
-    if !is_direct_self_value_expression(inner_base) {
+    let names = self_field_chain(expression, symbols)?;
+    if names.len() < 2 {
         return None;
     }
-    let inner = symbols.resolve(inner_name.sym).ok()?;
-    let record_name = fields.record_fields.get(inner.as_ref())?;
-    let record = fields.nested.get(record_name)?;
-    let leaf = symbols.resolve(name.sym).ok()?;
-    if let Some(family) = record.fields.get(leaf.as_ref()) {
+    let (_, record) = resolve_record_chain(
+        &fields.record_fields,
+        &fields.nested,
+        &names[..names.len() - 1],
+    )?;
+    if let Some(family) = record.fields.get(names.last()?.as_str()) {
         return Some(NestedSelfField::Known(*family));
     }
     Some(NestedSelfField::Unknown { name, record })
@@ -9686,9 +9762,10 @@ fn nested_str_self_field_family<'a>(
 // (`(self.<name>)(..)`) IS a value read: HIR erases the parens, so the
 // source text after the callee's span decides — `(` means method-call
 // syntax, anything else (e.g. `)`) keeps the field read.
-fn self_method_call_site(
+fn self_method_call_site<T>(
     expression: &HirExpr<'_>,
     record_fields: &HashMap<String, String>,
+    nested: &HashMap<String, NestedRecordFields<T>>,
     method_signatures: &HashMap<String, StrSelfMethodCallSignature>,
     sibling_impls: Option<&SiblingImplIndex<'_, '_, '_>>,
     str_name_taken: bool,
@@ -9708,28 +9785,23 @@ fn self_method_call_site(
     {
         return;
     }
-    let (is_self_call_shape, is_receiver_call_shape) = match callee.kind {
-        ExprKind::Field { base, .. } if is_direct_self_value_expression(base) => (true, false),
-        ExprKind::Field { base, .. } => (
-            false,
-            matches!(
-                base.kind,
-                ExprKind::Field {
-                    base: inner_base,
-                    name: inner_name,
-                    args: None,
-                } if is_direct_self_value_expression(inner_base)
-                    && symbols
-                        .resolve(inner_name.sym)
-                        .ok()
-                        .is_some_and(|field_name| {
-                            record_fields.contains_key(field_name.as_ref())
-                        })
-            ),
-        ),
-        _ => (false, false),
+    // A receiver call is `self.<a>.<b>.<method>(..)` — the base chain
+    // must resolve fully to a receiver record, however deep it is.
+    let receiver_record = match callee.kind {
+        ExprKind::Field { base, .. } if !is_direct_self_value_expression(base) => {
+            self_field_chain(base, symbols).and_then(|names| {
+                if names.is_empty() {
+                    None
+                } else {
+                    resolve_record_chain(record_fields, nested, &names)
+                }
+            })
+        }
+        _ => None,
     };
-    if !is_self_call_shape && !is_receiver_call_shape {
+    let is_self_call_shape = matches!(callee.kind, ExprKind::Field { base, .. }
+        if is_direct_self_value_expression(base));
+    if !is_self_call_shape && receiver_record.is_none() {
         return;
     }
     call_callee_ids.insert(callee.hir_id);
@@ -9745,18 +9817,13 @@ fn self_method_call_site(
     {
         self_method_calls.insert(expression.hir_id, (callee.hir_id, signature.clone()));
     }
-    // `self.<record-field>.<method>(..)` resolves the method against
-    // the receiver record's own impl — the sibling table for that
-    // record lowers on demand; a missing impl or method leaves the
-    // call unsigned (it gates like any unresolved method call).
-    if is_receiver_call_shape
-        && let ExprKind::Field { base, name, .. } = callee.kind
-        && let ExprKind::Field {
-            name: inner_name, ..
-        } = base.kind
-        && let (Ok(inner), Ok(method)) =
-            (symbols.resolve(inner_name.sym), symbols.resolve(name.sym))
-        && let Some(record_name) = record_fields.get(inner.as_ref())
+    // `self.<a>.<b>.<method>(..)` resolves the method against the
+    // receiver record's own impl — the sibling table for that record
+    // lowers on demand; a missing impl or method leaves the call
+    // unsigned (it gates like any unresolved method call).
+    if let Some((record_name, _)) = receiver_record
+        && let ExprKind::Field { name, .. } = callee.kind
+        && let Ok(method) = symbols.resolve(name.sym)
         && let Some(signature) = sibling_impls.and_then(|index| {
             index.signature(
                 record_name,
@@ -9787,7 +9854,7 @@ fn collect_str_inherent_method_self_field(
 ) -> Result<bool, OwnerControlFlowResolutionError> {
     // `self.<record-field>` is a receiver — handled without a
     // projection, so a bare value use still gates.
-    if self_record_field_receiver(expression, &fields.record_fields, symbols) {
+    if self_record_field_receiver(expression, &fields.record_fields, &fields.nested, symbols) {
         return Ok(true);
     }
     let Some(field_lookup) = str_self_field_family(expression, &fields.fields, symbols) else {
@@ -105936,6 +106003,115 @@ property "shared"() {}
         };
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_deep_self_field_chains() {
+        let root = concat!(
+            "type Deep { d: I32, label: Str }\n",
+            "type Inner { deep: Deep, n: I32 }\n",
+            "type Outer { inner: Inner }\n",
+            "impl Deep {\n",
+            "  pub fn size(self: borrow Self) -> I32 {\n",
+            "    self.d\n",
+            "  }\n",
+            "}\n",
+            "impl Outer {\n",
+            "  pub fn deep_leaf(self: borrow Self) -> I32 {\n",
+            "    self.inner.deep.d\n",
+            "  }\n",
+            "  pub fn deep_str_leaf(self: borrow Self) -> Str {\n",
+            "    self.inner.deep.label\n",
+            "  }\n",
+            "  pub fn deep_str_call(self: borrow Self) -> Bool {\n",
+            "    self.inner.deep.label.is_empty()\n",
+            "  }\n",
+            "  pub fn deep_call(self: borrow Self) -> I32 {\n",
+            "    self.inner.deep.size()\n",
+            "  }\n",
+            "  pub fn deep_bare(self: borrow Self) -> I32 {\n",
+            "    self.inner.deep\n",
+            "  }\n",
+            "  pub fn deep_unknown(self: borrow Self) -> I32 {\n",
+            "    self.inner.deep.nope\n",
+            "  }\n",
+            "  pub fn deep_mid_unknown(self: borrow Self) -> I32 {\n",
+            "    self.inner.nope.d\n",
+            "  }\n",
+            "}\n",
+            "pub fn make() -> I32 {\n",
+            "    1\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("inherent methods collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let methods = results
+            .owners()
+            .iter()
+            .find(|owner| {
+                // `impl Outer`'s member list — `impl Deep` lowers too but
+                // the outer impl is the one with the deep chains.
+                owner
+                    .members()
+                    .iter()
+                    .any(|method| method.body_type_check().is_ok())
+                    && owner.members().len() == 7
+            })
+            .expect("impl Outer resolves")
+            .members();
+        assert_eq!(methods.len(), 7);
+        // `self.<a>.<b>.<leaf>` projects the leaf — scalar, `Str`, and
+        // `Str`-leaf calls all type-check.
+        for (index, name) in [
+            (0, "deep_leaf"),
+            (1, "deep_str_leaf"),
+            (2, "deep_str_call"),
+            (3, "deep_call"),
+        ] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} resolves the deep chain: {check:?}");
+            };
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+        }
+        // A bare record-typed receiver still gates — records are not
+        // scalar/`Str` values.
+        let check = methods[4].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "deep_bare stays gated: {check:?}"
+        );
+        // An unknown leaf at depth reports UnknownField on the record
+        // the chain lands on.
+        let check = methods[5].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("deep_unknown reports its field error: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
+        // A non-record mid-chain name keeps the whole projection gated —
+        // `self.inner.nope` reports its leaf error but the outer `.d`
+        // has no record to land on, so the body stays unsupported.
+        let check = methods[6].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "deep_mid_unknown stays gated: {check:?}"
+        );
     }
 
     #[test]

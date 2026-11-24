@@ -3501,6 +3501,174 @@ fn unsupported_const_initializer_in_mixed_source_stays_gated() {
 }
 
 #[test]
+fn mixed_record_typed_fields_check() {
+    // A `type` field typed by another `type` in the file stays
+    // admissible — record-typed receivers feed `self.<field>.<leaf>`
+    // projections (IR-1135).
+    let source = concat!(
+        "type Inner { v: I32 }\n",
+        "type Outer { inner: Inner }\n",
+        "impl Outer {\n",
+        "    pub fn leaf(self: borrow Self) -> I32 {\n",
+        "        let value = self.inner.v\n",
+        "        value\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn mixed_deep_self_field_chains_check() {
+    // `self.<a>.<b>.<leaf>` projections and `self.<a>.<method>(..)`
+    // calls across sibling impls stay inside the coverage set
+    // (IR-1135).
+    let source = concat!(
+        "type Deep { d: I32 }\n",
+        "type Inner { deep: Deep, v: I32 }\n",
+        "type Outer { inner: Inner }\n",
+        "impl Inner {\n",
+        "    pub fn v(self: borrow Self) -> I32 {\n",
+        "        self.v\n",
+        "    }\n",
+        "}\n",
+        "impl Outer {\n",
+        "    pub fn deep_leaf(self: borrow Self) -> I32 {\n",
+        "        let value = self.inner.deep.d\n",
+        "        value\n",
+        "    }\n",
+        "    pub fn deep_call(self: borrow Self) -> I32 {\n",
+        "        self.inner.v()\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn undeclared_record_field_type_stays_gated() {
+    // A field typed by a name that is not a `type` in the file keeps the
+    // source gated (IR-1135).
+    let source = concat!(
+        "type Outer { inner: Missing }\n",
+        "impl Outer {\n",
+        "    pub fn f(self: borrow Self) -> I32 {\n",
+        "        1\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated(&run_check(source, "", &[], &[]), "undeclared field type");
+}
+
+#[test]
+fn record_typed_fields_in_function_source_check() {
+    // The `pub fn` + `type` coverage path admits record-typed fields
+    // too — declared names are verifiable the same way (IR-1135).
+    let source = concat!(
+        "type Inner { v: I32 }\n",
+        "type Outer { inner: Inner }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn self_referential_record_type_stays_gated() {
+    // `type A { a: A }` has no finite size — INFINITE_SIZE_TYPE
+    // upstream — so the source stays gated (IR-1135 review).
+    let source = concat!(
+        "type A { a: A }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated(&run_check(source, "", &[], &[]), "self-referential record");
+}
+
+#[test]
+fn cyclic_record_types_stay_gated() {
+    // A mutual `A -> B -> A` field cycle is infinite-size too
+    // (IR-1135 review).
+    let source = concat!(
+        "type A { b: B }\n",
+        "type B { a: A }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated(&run_check(source, "", &[], &[]), "mutual record cycle");
+}
+
+#[test]
+fn public_field_naming_private_type_stays_gated() {
+    // A `pub` field on a `pub` record naming a package-private `type`
+    // is PRIVATE_TYPE_IN_PUBLIC_API upstream — the coverage gate cannot
+    // emit it, so the source stays gated (IR-1135 review).
+    let source = concat!(
+        "type Inner { v: I32 }\n",
+        "pub type Outer { pub inner: Inner }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated(
+        &run_check(source, "", &[], &[]),
+        "private type in pub field",
+    );
+}
+
+#[test]
+fn self_keyword_field_type_stays_gated() {
+    // `Self` is invalid outside `impl`/`trait` headers — a `type r#Self`
+    // decl must not let `s: Self` pass as a record name (IR-1135
+    // review).
+    let source = concat!(
+        "type r#Self { x: I32 }\n",
+        "type Outer { s: Self }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "a `Self` field type stays gated: {stdout}"
+    );
+}
+
+#[test]
+fn raw_ident_field_type_resolves_declared_type() {
+    // `r#`-spelling differences between the field type and the `type`
+    // decl resolve to the same record (IR-1135 review).
+    let source = concat!(
+        "type r#Point { x: I32 }\n",
+        "type Outer { p: Point }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(
+        output.status.success(),
+        "raw-ident field type resolves the declared type: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn mixed_function_type_and_impl_owners_report_body_diagnostics() {
     // Mixed coverage still reports each owner's diagnostics — the bad
     // method tail surfaces alongside a clean function.
