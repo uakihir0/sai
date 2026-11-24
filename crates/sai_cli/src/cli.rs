@@ -2156,6 +2156,13 @@ fn check_type_decl_primitive_fields(
     let Some(fields) = struct_def.fields() else {
         return true;
     };
+    // A declared `type Str` shadows the builtin — a field typed `Str`
+    // then names the record, so it falls under the declared-type arm
+    // (and its `pub`-field/private-type rule) instead of passing as a
+    // builtin.
+    let str_shadowed = type_names
+        .iter()
+        .any(|name| normalize_type_name(name) == "Str");
     let mut field_names = HashSet::new();
     fields.fields().all(|field| {
         let Some(field_name) = field
@@ -2193,31 +2200,31 @@ fn check_type_decl_primitive_fields(
                         | b"USize"
                         | b"F32"
                         | b"F64"
-                        | b"Str"
-                ) || {
-                    let Ok(text) = std::str::from_utf8(type_text) else {
-                        return false;
-                    };
-                    let normalized = normalize_type_name(text);
-                    // `Self` is invalid outside `impl`/`trait` headers —
-                    // a `type r#Self` decl must not let it pass as a
-                    // record name (upstream rejects it on type-path
-                    // resolution).
-                    let declared = !matches!(text, "Self" | "self" | "r#Self" | "r#self")
-                        && type_names
-                            .iter()
-                            .any(|name| normalize_type_name(name) == normalized);
-                    // A `pub` field on a public record exposing a
-                    // package-private type is PRIVATE_TYPE_IN_PUBLIC_API
-                    // upstream — the coverage gate cannot emit it, so
-                    // the source stays gated.
-                    declared
-                        && !(decl_is_public
-                            && field.pub_token().is_some()
-                            && !public_type_names
+                ) || (type_text == b"Str" && !str_shadowed)
+                    || {
+                        let Ok(text) = std::str::from_utf8(type_text) else {
+                            return false;
+                        };
+                        let normalized = normalize_type_name(text);
+                        // `Self` is invalid outside `impl`/`trait` headers —
+                        // a `type r#Self` decl must not let it pass as a
+                        // record name (upstream rejects it on type-path
+                        // resolution).
+                        let declared = !matches!(text, "Self" | "self" | "r#Self" | "r#self")
+                            && type_names
                                 .iter()
-                                .any(|name| normalize_type_name(name) == normalized))
-                }
+                                .any(|name| normalize_type_name(name) == normalized);
+                        // A `pub` field on a public record exposing a
+                        // package-private type is PRIVATE_TYPE_IN_PUBLIC_API
+                        // upstream — the coverage gate cannot emit it, so
+                        // the source stays gated.
+                        declared
+                            && !(decl_is_public
+                                && field.pub_token().is_some()
+                                && !public_type_names
+                                    .iter()
+                                    .any(|name| normalize_type_name(name) == normalized))
+                    }
             })
     })
 }
