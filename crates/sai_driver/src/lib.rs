@@ -11406,6 +11406,19 @@ fn collect_str_branch_let_annotations(
                 str_admissions,
             );
         }
+        // `loop` bodies are statement blocks — a `let` inside the
+        // loop carries the same annotations.
+        ExprKind::Loop { body, .. } => {
+            collect_str_branch_block_annotations(
+                body,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
         _ => {}
     }
 }
@@ -11436,6 +11449,19 @@ fn collect_str_branch_block_annotations(
             // annotated `let`s.
             collect_str_branch_let_annotations(
                 init,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        // `if`/`match`/`loop` statements inside the block can carry
+        // annotated `let`s of their own.
+        if let StmtKind::Expr(expression) = stmt.kind {
+            collect_str_branch_let_annotations(
+                expression,
                 locals,
                 inputs,
                 symbols,
