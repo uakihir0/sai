@@ -61619,6 +61619,8 @@ property "shared"() {}
             "pub fn str_loop_mismatch() -> USize { let s = loop { break \"a\"\n            break 1 }\n    s.len() }\n",
             "pub fn str_loop_bare() -> USize { let s = loop { break \"a\"\n            break }\n    s.len() }\n",
             "pub fn str_loop_break_after_literal() -> USize { let s = loop { break 1\n            break \"a\" }\n    s.len() }\n",
+            "pub fn str_loop_inner_lets(n: I32) -> USize { let s = loop { let n: I32 = 1\n            let text = \"a\"\n            break text }\n    s.len() }\n",
+            "pub fn str_loop_expr_break_mismatch(n: I32) -> USize { let s = loop { break \"a\"\n            break n + 1 }\n    s.len() }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -61635,7 +61637,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 52);
+        assert_eq!(owners.len(), 54);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -61664,7 +61666,11 @@ property "shared"() {}
         // stay neutral in joins: a numeric `match` with a `return`
         // arm still literal-joins, and `return`-value blocks carry
         // their own annotated `let`s.
-        for owner in owners[33..35].iter().chain(&owners[36..49]) {
+        for owner in owners[33..35]
+            .iter()
+            .chain(&owners[36..49])
+            .chain(&owners[52..53])
+        {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -61704,6 +61710,9 @@ property "shared"() {}
             // one names `β`'s `I64` default.
             (49, "expected `Str`, found an integer literal"),
             (51, "expected `I64`, found `Str`"),
+            // `break n + 1` under a `Str` `β` reports the resolved
+            // type, not a gate.
+            (53, "expected `Str`, found `I32`"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
