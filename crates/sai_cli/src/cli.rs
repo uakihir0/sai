@@ -2105,6 +2105,12 @@ fn check_type_decl_primitive_fields(type_decl: &sai_syntax::ast::TypeDecl, sourc
             .syntax()
             .descendants()
             .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+        || type_decl.syntax().descendants().any(|node| {
+            node.kind() == sai_syntax::SyntaxKind::ERROR
+                || node
+                    .children_with_tokens()
+                    .any(|element| element.as_token().is_some_and(|token| token.has_error()))
+        })
         || struct_def.where_clause().is_some()
     {
         return false;
@@ -2325,24 +2331,8 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
     else {
         return false;
     };
-    let Some(struct_def) = type_decl.struct_def() else {
-        return false;
-    };
-    let Some(fields) = struct_def.fields() else {
-        return false;
-    };
     if items.next().is_some()
-        || type_decl.attrs().next().is_some()
-        || type_decl
-            .syntax()
-            .children()
-            .any(|child| sai_syntax::ast::GenericParamList::can_cast(child.kind()))
-        || type_decl
-            .syntax()
-            .descendants()
-            .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
-        || struct_def.where_clause().is_some()
-        || fields.fields().next().is_none()
+        || !check_type_decl_primitive_fields(&type_decl, source)
         || impl_decl.attrs().next().is_some()
         || impl_decl
             .syntax()
@@ -2350,48 +2340,6 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
             .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
         || impl_decl.unsafe_token().is_some()
     {
-        return false;
-    }
-    let mut field_names = HashSet::new();
-    if !fields.fields().all(|field| {
-        let Some(field_name) = field
-            .name()
-            .and_then(|name| name.token())
-            .map(|token| token.text().to_owned())
-        else {
-            return false;
-        };
-        let normalized_field_name =
-            sai_syntax::normalize_identifier(field_name.strip_prefix("r#").unwrap_or(&field_name));
-        field_names.insert(normalized_field_name)
-            && field.attrs().next().is_none()
-            && field.ty().is_some_and(|ty| {
-                let range = ty.syntax().text_range();
-                let Some(type_text) = source.get(range.start().to_usize()..range.end().to_usize())
-                else {
-                    return false;
-                };
-                matches!(
-                    type_text,
-                    b"Bool"
-                        | b"Byte"
-                        | b"Char"
-                        | b"I8"
-                        | b"I16"
-                        | b"I32"
-                        | b"I64"
-                        | b"ISize"
-                        | b"U8"
-                        | b"U16"
-                        | b"U32"
-                        | b"U64"
-                        | b"USize"
-                        | b"F32"
-                        | b"F64"
-                        | b"Str"
-                )
-            })
-    }) {
         return false;
     }
     let Some(inherent_type) = impl_decl.inherent_type() else {
@@ -8168,6 +8116,28 @@ fn phase1_package_collection_order(
     Ok(order)
 }
 
+// Diagnostic spans count bytes of the decoded (BOM-stripped) text —
+// map them back to file bytes before locating against raw bytes.
+fn check_cli_location(
+    location: &sai_diagnostics::Location,
+    source_by_key: &HashMap<String, (String, Arc<[u8]>)>,
+    include_source_lines: bool,
+) -> CliLocation {
+    let (display_path, source) = source_by_key
+        .get(&location.file.path)
+        .cloned()
+        .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
+    let decoded_source = sai_vfs::SourceFile::decode(sai_vfs::FileId::new(0), &source).ok();
+    let range = decoded_source_range_to_original(
+        decoded_source.as_ref(),
+        location.span.range.start().to_usize()..location.span.range.end().to_usize(),
+    );
+    let mut source_index = CliSourceIndex::new(source);
+    let mut cli_location = source_index.location(&display_path, range, include_source_lines);
+    cli_location.package = location.file.package.clone();
+    cli_location
+}
+
 fn phase1_check_diagnostics(
     parsed: &[sai_diagnostics::Diagnostic],
     source_by_key: &HashMap<String, (String, Arc<[u8]>)>,
@@ -8179,20 +8149,9 @@ fn phase1_check_diagnostics(
     let mut warnings = 0usize;
     let mut infos = 0usize;
     for diagnostic in parsed {
-        let primary = diagnostic.primary().map(|location| {
-            let (display_path, source) = source_by_key
-                .get(&location.file.path)
-                .cloned()
-                .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
-            let mut source_index = CliSourceIndex::new(source);
-            let mut cli_location = source_index.location(
-                &display_path,
-                location.span.range.start().to_usize()..location.span.range.end().to_usize(),
-                include_source_lines,
-            );
-            cli_location.package = location.file.package.clone();
-            cli_location
-        });
+        let primary = diagnostic
+            .primary()
+            .map(|location| check_cli_location(location, source_by_key, include_source_lines));
         let mut cli_diagnostic = CliDiagnostic {
             code: diagnostic.code.as_str(),
             message: diagnostic.message.clone(),
@@ -8217,19 +8176,8 @@ fn phase1_check_diagnostics(
                 let sai_diagnostics::Related::DeclaredHere { location, what } = related else {
                     return None;
                 };
-                let (display_path, source) = source_by_key
-                    .get(&location.file.path)
-                    .cloned()
-                    .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
-                let mut source_index = CliSourceIndex::new(source);
-                let mut cli_location = source_index.location(
-                    &display_path,
-                    location.span.range.start().to_usize()..location.span.range.end().to_usize(),
-                    include_source_lines,
-                );
-                cli_location.package = location.file.package.clone();
                 Some(CheckRelated {
-                    location: cli_location,
+                    location: check_cli_location(location, source_by_key, include_source_lines),
                     what: what.clone(),
                 })
             })
@@ -8274,20 +8222,10 @@ fn check_additional_children(
             }
         })
         .map(|child| {
-            let location = child.location.as_ref().map(|location| {
-                let (display_path, source) = source_by_key
-                    .get(&location.file.path)
-                    .cloned()
-                    .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
-                let mut source_index = CliSourceIndex::new(source);
-                let mut cli_location = source_index.location(
-                    &display_path,
-                    location.span.range.start().to_usize()..location.span.range.end().to_usize(),
-                    include_source_lines,
-                );
-                cli_location.package = location.file.package.clone();
-                cli_location
-            });
+            let location = child
+                .location
+                .as_ref()
+                .map(|location| check_cli_location(location, source_by_key, include_source_lines));
             CheckChild {
                 kind: child.kind,
                 message: child.message.clone(),

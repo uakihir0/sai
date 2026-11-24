@@ -3517,6 +3517,63 @@ fn empty_record_beside_function_checks() {
 }
 
 #[test]
+fn empty_record_sibling_of_method_owner_checks() {
+    // An unrelated empty record beside the method's type carries no
+    // fields to verify and stays covered (IR-1132 review).
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "type Empty { }\n",
+        "impl Counter {\n",
+        "    pub fn get(self: borrow Self) -> I32 { self.count }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn malformed_empty_record_stays_gated() {
+    // `type Empty { , }` parses with error nodes — it is not an empty
+    // record and must keep the source gated (IR-1132 review).
+    let source = concat!(
+        "type Empty { , }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n"
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &run_check(source, "", &[], &[]),
+        "malformed empty record",
+    );
+}
+
+#[test]
+fn bom_diagnostic_positions_follow_file_bytes() {
+    // Diagnostic spans count bytes of the BOM-stripped text — emitted
+    // positions must be restored to raw file bytes (IR-1132 review).
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn get(self: borrow Self) -> I32 { true }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    let bom_source = format!("\u{FEFF}{source}");
+    let result = run_check(&bom_source, "", &[], &[]);
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    // `true` sits at byte 92..96 of the raw (BOM-prefixed) file.
+    assert!(
+        stdout.contains("\"byte\":92") && stdout.contains("\"line\":3"),
+        "BOM diagnostic must point into the raw file bytes: {stdout}"
+    );
+    assert!(stdout.contains("\"code\":\"TYPE_MISMATCH\""), "{stdout}");
+}
+
+#[test]
 fn impl_on_undeclared_type_stays_gated() {
     // An `impl` on a name no file `type` declares keeps the mixed
     // source gated (IR-1133).
