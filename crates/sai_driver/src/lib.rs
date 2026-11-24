@@ -9526,6 +9526,19 @@ fn check_function_body_primitive_local_block(
     // `Str` parameters are admitted everywhere a preceding local is — the
     // kernel decides which operand positions still reject `LocalType::Str`.
     preceding_bindings.extend(str_admissions.locals.iter().copied());
+    // `let` annotations nested inside any admitted subexpression —
+    // call-argument `if`/`match` branches above all — must reach the
+    // kernel's `primitive_types`/`str_annotations` maps or the check
+    // aborts; entries in shapes that stay gated are simply unread.
+    collect_str_branch_block_annotations(
+        block,
+        locals,
+        inputs,
+        symbols,
+        type_paths,
+        &mut primitive_types,
+        &mut str_admissions,
+    );
     for stmt in block.stmts {
         if !primitive_let_statement_shape_is_supported(
             stmt,
@@ -11336,7 +11349,9 @@ fn collect_str_branch_let_annotations(
     str_admissions: &mut StrShapeAdmissions,
 ) {
     match init.kind {
-        ExprKind::Block(block) => {
+        ExprKind::Block(block)
+        | ExprKind::AsyncBlock { block, .. }
+        | ExprKind::Region { block, .. } => {
             collect_str_branch_block_annotations(
                 block,
                 locals,
@@ -11347,7 +11362,16 @@ fn collect_str_branch_let_annotations(
                 str_admissions,
             );
         }
-        ExprKind::If { then, els, .. } => {
+        ExprKind::If { cond, then, els } => {
+            collect_str_branch_let_annotations(
+                cond,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
             collect_str_branch_block_annotations(
                 then,
                 locals,
@@ -11370,9 +11394,32 @@ fn collect_str_branch_let_annotations(
             }
         }
         // `match` arm bodies carry their own annotated `let`s the
-        // same way `if` branches do.
-        ExprKind::Match { arms, .. } => {
+        // same way `if` branches do; the scrutinee and guards can
+        // hold calls whose `if`/`match` arguments do too.
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_str_branch_let_annotations(
+                scrutinee,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
             for arm in arms {
+                if let Some(guard) = arm.guard {
+                    collect_str_branch_let_annotations(
+                        guard,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        primitive_types,
+                        str_admissions,
+                    );
+                }
                 collect_str_branch_let_annotations(
                     arm.body,
                     locals,
@@ -11386,35 +11433,195 @@ fn collect_str_branch_let_annotations(
         }
         // `return`/`break` values can be blocks holding annotated
         // `let`s (`{ return { let n: I32 = 1\n "a" } }`).
-        ExprKind::Return(Some(value)) => {
-            collect_str_branch_let_annotations(
-                value,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                primitive_types,
-                str_admissions,
-            );
-        }
-        ExprKind::Break {
-            value: Some(value), ..
-        } => {
-            collect_str_branch_let_annotations(
-                value,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                primitive_types,
-                str_admissions,
-            );
+        ExprKind::Return(value) | ExprKind::Break { value, .. } => {
+            if let Some(value) = value {
+                collect_str_branch_let_annotations(
+                    value,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
         }
         // `loop` bodies are statement blocks — a `let` inside the
         // loop carries the same annotations.
         ExprKind::Loop { body, .. } => {
             collect_str_branch_block_annotations(
                 body,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        // Call arguments admit `if`/`match`/`block` operands whose
+        // branch blocks hold their own `let`s — a `let s: Str` inside
+        // `take_str(if c { let s: Str = "a" s } else { "b" })` still
+        // needs its annotation collected or the kernel rejects the
+        // whole call.
+        ExprKind::Call { callee, args, base } => {
+            collect_str_branch_let_annotations(
+                callee,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+            if let Some(base) = base {
+                collect_str_branch_let_annotations(
+                    base,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+            for arg in args {
+                collect_str_branch_let_annotations(
+                    arg.expr,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
+        ExprKind::ContractOld { args, base } => {
+            if let Some(base) = base {
+                collect_str_branch_let_annotations(
+                    base,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+            for arg in args {
+                collect_str_branch_let_annotations(
+                    arg.expr,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
+        ExprKind::Field { base, .. }
+        | ExprKind::TupleField { base, .. }
+        | ExprKind::Unary(_, base)
+        | ExprKind::Borrow(_, base)
+        | ExprKind::Try(base)
+        | ExprKind::Await(base)
+        | ExprKind::AsCast { operand: base, .. } => {
+            collect_str_branch_let_annotations(
+                base,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        ExprKind::Index(base, index) => {
+            collect_str_branch_let_annotations(
+                base,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+            collect_str_branch_let_annotations(
+                index,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        ExprKind::Binary(_, left, right) => {
+            collect_str_branch_let_annotations(
+                left,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+            collect_str_branch_let_annotations(
+                right,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                primitive_types,
+                str_admissions,
+            );
+        }
+        ExprKind::Range { start, end, .. } => {
+            for operand in [start, end].into_iter().flatten() {
+                collect_str_branch_let_annotations(
+                    operand,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
+        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+            for item in items {
+                collect_str_branch_let_annotations(
+                    item,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+        }
+        ExprKind::FormatString(pieces) => {
+            for piece in pieces {
+                if let FmtPiece::Arg { expr, .. } = piece {
+                    collect_str_branch_let_annotations(
+                        expr,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        primitive_types,
+                        str_admissions,
+                    );
+                }
+            }
+        }
+        ExprKind::Closure(closure) => {
+            collect_str_branch_block_annotations(
+                closure.body,
                 locals,
                 inputs,
                 symbols,
@@ -11437,42 +11644,97 @@ fn collect_str_branch_block_annotations(
     str_admissions: &mut StrShapeAdmissions,
 ) {
     for stmt in block.stmts {
-        if let StmtKind::Let { ty, init, .. } = stmt.kind {
-            if let Some(ty) = ty {
-                match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
-                    Some(FunctionDirectType::Primitive(local_type)) => {
-                        primitive_types.insert(ty.hir_id, local_type);
+        match stmt.kind {
+            StmtKind::Let { ty, init, els, .. } => {
+                if let Some(ty) = ty {
+                    match resolve_function_direct_type(*ty, type_paths, symbols, inputs) {
+                        Some(FunctionDirectType::Primitive(local_type)) => {
+                            primitive_types.insert(ty.hir_id, local_type);
+                        }
+                        Some(FunctionDirectType::Str) => {
+                            str_admissions.annotations.insert(ty.hir_id);
+                        }
+                        _ => {}
                     }
-                    Some(FunctionDirectType::Str) => {
-                        str_admissions.annotations.insert(ty.hir_id);
-                    }
-                    _ => {}
+                }
+                // Nested block/`if` initializers can carry their own
+                // annotated `let`s; a `let-else` block can too.
+                collect_str_branch_let_annotations(
+                    init,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+                if let Some(els) = els {
+                    collect_str_branch_block_annotations(
+                        els,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        primitive_types,
+                        str_admissions,
+                    );
                 }
             }
-            // Nested block/`if` initializers can carry their own
-            // annotated `let`s.
-            collect_str_branch_let_annotations(
-                init,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                primitive_types,
-                str_admissions,
-            );
-        }
-        // `if`/`match`/`loop` statements inside the block can carry
-        // annotated `let`s of their own.
-        if let StmtKind::Expr(expression) = stmt.kind {
-            collect_str_branch_let_annotations(
-                expression,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                primitive_types,
-                str_admissions,
-            );
+            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                collect_str_branch_let_annotations(
+                    lhs,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+                collect_str_branch_let_annotations(
+                    rhs,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
+            StmtKind::Assert { cond, msg, .. } => {
+                collect_str_branch_let_annotations(
+                    cond,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+                if let Some(msg) = msg {
+                    collect_str_branch_let_annotations(
+                        msg,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        primitive_types,
+                        str_admissions,
+                    );
+                }
+            }
+            // `if`/`match`/`loop` statements inside the block can carry
+            // annotated `let`s of their own.
+            StmtKind::Expr(expression) => {
+                collect_str_branch_let_annotations(
+                    expression,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    primitive_types,
+                    str_admissions,
+                );
+            }
         }
     }
     if let Some(tail) = block.tail {
@@ -62116,6 +62378,8 @@ property "shared"() {}
             "pub fn str_call_str_param_str_body(s: Str) -> Str { take_str_param(s)\n    s }\n",
             "pub fn str_call_str_param_mismatch(flag: Bool) -> Bool { take_str_param(1)\n    flag }\n",
             "pub fn str_call_str_param_path_mismatch(flag: Bool) -> Bool { let n = 1\n    take_str_param(n)\n    flag }\n",
+            "pub fn str_call_str_param_if_arg_let(flag: Bool) -> Bool { take_str_param(if flag { let s: Str = \"a\"\n    s } else { \"b\" })\n    flag }\n",
+            "pub fn str_call_str_param_if_arg_let_mismatch(flag: Bool) -> Bool { take_str_param(if flag { let n: I32 = \"x\"\n    \"a\" } else { \"b\" })\n    flag }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -62132,7 +62396,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 82);
+        assert_eq!(owners.len(), 84);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -62184,6 +62448,10 @@ property "shared"() {}
             // `str_call_id_str("a")` — the `s: Str` parameter now
             // has a signature, so the call checks and yields `Str`.
             .chain(&owners[67..68])
+            // An annotated `let` inside the `if` argument's branch
+            // block — the annotation collector descends call
+            // arguments so `let s: Str` reaches the kernel.
+            .chain(&owners[82..83])
         {
             assert!(matches!(
                 owner
@@ -62237,6 +62505,10 @@ property "shared"() {}
             // against `Str` — `n`'s literal variable is unresolved.
             (80, "expected `Str`, found an integer literal"),
             (81, "expected `Str`, found an integer literal"),
+            // `let n: I32 = "x"` inside the `if` argument's branch —
+            // the collected annotation reports the literal mismatch
+            // instead of dropping the whole body check.
+            (83, "expected `I32`, found `Str`"),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
