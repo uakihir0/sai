@@ -8430,6 +8430,39 @@ struct InherentMethodPrimitiveFields {
     // valid `s.len()`/`s.is_empty()` receiver — tracked by name.
     str_fields: HashSet<String>,
     candidate_names: Vec<String>,
+    // `self.<name>` fields whose type is another record in this file,
+    // by field name → record name. Such a field is a receiver only:
+    // `self.<name>.<leaf>` projects while a bare `self.<name>` still
+    // gates (no projection is recorded for it).
+    record_fields: HashMap<String, String>,
+    // Field tables for each record-typed `self` field's record, keyed
+    // by record name. One level deep — a record-typed field inside a
+    // nested record keeps the impl gated.
+    nested: HashMap<String, NestedRecordFields<sai_resolve::prelude::PrimTy>>,
+}
+
+// The field table of a record-typed `self` field's own record —
+// scalar/`Str` leaves plus the candidate names an unknown-leaf
+// diagnostic lists. `str_fields` stays empty when `T` already encodes
+// `Str` (the `-> Str` family table keeps `Str` leaves in `fields`).
+struct NestedRecordFields<T> {
+    type_name: String,
+    type_name_span: sai_diagnostics::Span,
+    fields: HashMap<String, T>,
+    str_fields: HashSet<String>,
+    candidate_names: Vec<String>,
+}
+
+// What `self.<record-field>.<leaf>` resolves to inside a nested
+// record — a scalar leaf, a `Str` leaf (a `len`/`is_empty` receiver),
+// or an unknown leaf reported against the receiver's record.
+enum NestedSelfField<'a, T> {
+    Known(T),
+    Str,
+    Unknown {
+        name: Name,
+        record: &'a NestedRecordFields<T>,
+    },
 }
 
 fn collect_inherent_method_self_field(
@@ -8445,8 +8478,37 @@ fn collect_inherent_method_self_field(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<bool, OwnerControlFlowResolutionError> {
+    // `self.<record-field>` is a receiver — handled without a
+    // projection, so a bare value use still gates.
+    if self_record_field_receiver(expression, &fields.record_fields, symbols) {
+        return Ok(true);
+    }
     let Some(field_lookup) = primitive_self_field_type(expression, &fields.fields, symbols) else {
-        return Ok(false);
+        let Some(nested_lookup) = nested_self_field_type(expression, fields, symbols) else {
+            return Ok(false);
+        };
+        match nested_lookup {
+            NestedSelfField::Known(field_type) if collect_known_type => {
+                self_field_projections.insert(expression.hir_id, field_type);
+            }
+            NestedSelfField::Known(_) => {}
+            NestedSelfField::Str => {
+                str_field_projections.insert(expression.hir_id, "`Str`");
+            }
+            NestedSelfField::Unknown { name, record } => {
+                unknown_self_fields.insert(expression.hir_id);
+                diagnostics.push(unknown_self_field_diagnostic(
+                    owner,
+                    &record.type_name,
+                    record.type_name_span,
+                    &record.candidate_names,
+                    name,
+                    inputs,
+                    snapshot,
+                )?);
+            }
+        }
+        return Ok(true);
     };
     match field_lookup {
         Ok(field_type) if collect_known_type => {
@@ -8483,6 +8545,99 @@ fn collect_inherent_method_self_field(
     Ok(true)
 }
 
+// One record `type` decl's shape for the inherent-method walks: a
+// validated non-generic header, a non-empty field list, and every
+// field's type as its source text. Anything outside this shape gates
+// the impl.
+struct ParsedMethodRecord {
+    type_name: String,
+    type_name_span: sai_diagnostics::Span,
+    // (normalized field name, field type source text, source spelling)
+    fields: Vec<(String, String, String)>,
+}
+
+fn parse_inherent_method_record(
+    type_decl: &ast::TypeDecl,
+    inputs: &CurrentOwnerInputs,
+) -> Option<ParsedMethodRecord> {
+    let type_name_node = type_decl.name()?;
+    let type_name = type_name_node.token()?.text().to_owned();
+    let type_name_span =
+        sai_diagnostics::Span::new(inputs.source.id(), type_name_node.syntax().text_range());
+    let struct_def = type_decl.struct_def()?;
+    let fields = struct_def.fields()?;
+    if type_decl.attrs().next().is_some()
+        || type_decl
+            .syntax()
+            .children()
+            .any(|child| ast::GenericParamList::can_cast(child.kind()))
+        || type_decl
+            .syntax()
+            .descendants()
+            .any(|node| ast::Attribute::can_cast(node.kind()))
+        || struct_def.where_clause().is_some()
+        || fields.fields().next().is_none()
+    {
+        return None;
+    }
+    let mut parsed_fields = Vec::new();
+    for field in fields.fields() {
+        if field.attrs().next().is_some() {
+            return None;
+        }
+        let field_name_node = field.name()?;
+        let field_name = field_name_node.token()?.text().to_owned();
+        let field_spelling = field_name.strip_prefix("r#").unwrap_or(&field_name);
+        let normalized_field_name = sai_syntax::normalize_identifier(field_spelling);
+        let ty = field.ty()?;
+        let range = ty.syntax().text_range();
+        let ty_text = inputs
+            .source
+            .text()
+            .get(range.start().to_usize()..range.end().to_usize())?;
+        parsed_fields.push((
+            normalized_field_name,
+            ty_text.to_owned(),
+            field_spelling.to_owned(),
+        ));
+    }
+    Some(ParsedMethodRecord {
+        type_name,
+        type_name_span,
+        fields: parsed_fields,
+    })
+}
+
+// An `impl` decl's shape for the walks plus the record its inherent
+// type names, normalized — `None` keeps the impl gated.
+fn parse_inherent_method_impl(
+    impl_decl: &ast::ImplDecl,
+    inputs: &CurrentOwnerInputs,
+) -> Option<String> {
+    if impl_decl.attrs().next().is_some()
+        || impl_decl
+            .syntax()
+            .children()
+            .any(|child| ast::GenericParamList::can_cast(child.kind()))
+        || impl_decl
+            .syntax()
+            .descendants()
+            .any(|node| ast::Attribute::can_cast(node.kind()))
+        || impl_decl.unsafe_token().is_some()
+    {
+        return None;
+    }
+    let inherent_type = impl_decl.inherent_type()?;
+    let range = inherent_type.syntax().text_range();
+    let text = inputs
+        .source
+        .text()
+        .get(range.start().to_usize()..range.end().to_usize())?;
+    Some(sai_syntax::normalize_identifier(
+        text.strip_prefix("r#").unwrap_or(text),
+    ))
+}
+
 fn inherent_method_primitive_field_types(
     self_ty: Ty<'_>,
     symbols: &Interner,
@@ -8514,107 +8669,148 @@ fn inherent_method_primitive_field_types(
     // A method package holds the self type, its inherent `impl`, and any
     // free helper functions the body calls; other item shapes keep the
     // unsupported boundary.
-    let mut type_decl = None;
-    let mut impl_decl = None;
+    let mut type_decls = Vec::new();
+    let mut impl_decls = Vec::new();
     for item in source_file.items() {
         match item {
-            ast::Item::Type(decl) if type_decl.is_none() => type_decl = Some(decl),
-            ast::Item::Impl(decl) if impl_decl.is_none() => impl_decl = Some(decl),
+            ast::Item::Type(decl) => type_decls.push(decl),
+            ast::Item::Impl(decl) => impl_decls.push(decl),
             ast::Item::Function(_) => {}
             _ => return None,
         }
     }
-    let (Some(type_decl), Some(impl_decl)) = (type_decl, impl_decl) else {
+    if type_decls.is_empty() || impl_decls.is_empty() {
+        return None;
+    }
+    let mut records = Vec::new();
+    for type_decl in &type_decls {
+        records.push(parse_inherent_method_record(type_decl, inputs)?);
+    }
+    // The self record is the decl spelling the `self` type's name;
+    // every other record in the file is a receiver `self.<field>` may
+    // project through.
+    let Some(self_index) = records.iter().position(|record| {
+        sai_syntax::normalize_identifier(
+            record
+                .type_name
+                .strip_prefix("r#")
+                .unwrap_or(&record.type_name),
+        ) == target_name.as_ref()
+    }) else {
         return None;
     };
-    let type_name_node = type_decl.name()?;
-    let type_name = type_name_node.token()?.text().to_owned();
-    let type_name_span =
-        sai_diagnostics::Span::new(inputs.source.id(), type_name_node.syntax().text_range());
-    let struct_def = type_decl.struct_def()?;
-    let fields = struct_def.fields()?;
-    if type_decl.attrs().next().is_some()
-        || type_decl
-            .syntax()
-            .children()
-            .any(|child| ast::GenericParamList::can_cast(child.kind()))
-        || type_decl
-            .syntax()
-            .descendants()
-            .any(|node| ast::Attribute::can_cast(node.kind()))
-        || struct_def.where_clause().is_some()
-        || fields.fields().next().is_none()
-        || impl_decl.attrs().next().is_some()
-        || impl_decl
-            .syntax()
-            .children()
-            .any(|child| ast::GenericParamList::can_cast(child.kind()))
-        || impl_decl
-            .syntax()
-            .descendants()
-            .any(|node| ast::Attribute::can_cast(node.kind()))
-        || impl_decl.unsafe_token().is_some()
-    {
-        return None;
+    let mut nested = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if index == self_index {
+            continue;
+        }
+        let normalized_record_name = sai_syntax::normalize_identifier(
+            record
+                .type_name
+                .strip_prefix("r#")
+                .unwrap_or(&record.type_name),
+        );
+        let mut record_fields_map = HashMap::new();
+        let mut record_str_fields = HashSet::new();
+        let mut record_candidates = Vec::new();
+        for (field_name, ty_text, spelling) in &record.fields {
+            if let Some(field_type) = primitive_method_field_type(ty_text) {
+                if record_fields_map
+                    .insert(field_name.clone(), field_type)
+                    .is_some()
+                {
+                    return None;
+                }
+            // `ty` spelled `Str` on a record named `Str` refers to the
+            // user type shadowing the prelude, not the core string.
+            } else if ty_text == "Str" && normalized_record_name != "Str" {
+                record_str_fields.insert(field_name.clone());
+            } else {
+                // A record-typed field inside a receiver record would
+                // take the chain two levels deep — the impl stays gated.
+                return None;
+            }
+            record_candidates.push(spelling.clone());
+        }
+        if nested
+            .insert(
+                normalized_record_name,
+                NestedRecordFields {
+                    type_name: record
+                        .type_name
+                        .strip_prefix("r#")
+                        .unwrap_or(&record.type_name)
+                        .to_owned(),
+                    type_name_span: record.type_name_span,
+                    fields: record_fields_map,
+                    str_fields: record_str_fields,
+                    candidate_names: record_candidates,
+                },
+            )
+            .is_some()
+        {
+            return None;
+        }
     }
-    let normalized_type_name =
-        sai_syntax::normalize_identifier(type_name.strip_prefix("r#").unwrap_or(&type_name));
-    if normalized_type_name != target_name.as_ref() {
-        return None;
+    // Each `impl` must name a declared record — the self record's impl
+    // is required; the rest are receiver-record impls `self.<field>.m()`
+    // resolves through.
+    let self_record = &records[self_index];
+    let normalized_self_name = sai_syntax::normalize_identifier(
+        self_record
+            .type_name
+            .strip_prefix("r#")
+            .unwrap_or(&self_record.type_name),
+    );
+    let mut self_impl_found = false;
+    for impl_decl in &impl_decls {
+        let inherent_name = parse_inherent_method_impl(impl_decl, inputs)?;
+        if inherent_name == normalized_self_name {
+            self_impl_found = true;
+        } else if !nested.contains_key(inherent_name.as_str()) {
+            return None;
+        }
     }
-    let inherent_type = impl_decl.inherent_type()?;
-    let range = inherent_type.syntax().text_range();
-    if inputs
-        .source
-        .text()
-        .get(range.start().to_usize()..range.end().to_usize())
-        != Some(type_name.as_str())
-    {
+    if !self_impl_found {
         return None;
     }
     let mut field_types = HashMap::new();
     let mut str_field_types = HashSet::new();
+    let mut receiver_fields = HashMap::new();
     let mut candidate_names = Vec::new();
-    for field in fields.fields() {
-        if field.attrs().next().is_some() {
-            return None;
-        }
-        let field_name_node = field.name()?;
-        let field_name = field_name_node.token()?.text().to_owned();
-        let field_spelling = field_name.strip_prefix("r#").unwrap_or(&field_name);
-        let normalized_field_name = sai_syntax::normalize_identifier(field_spelling);
-        let ty = field.ty()?;
-        let range = ty.syntax().text_range();
-        let ty_text = inputs
-            .source
-            .text()
-            .get(range.start().to_usize()..range.end().to_usize())?;
+    for (field_name, ty_text, spelling) in &self_record.fields {
         if let Some(field_type) = primitive_method_field_type(ty_text) {
-            if field_types
-                .insert(normalized_field_name, field_type)
-                .is_some()
-            {
+            if field_types.insert(field_name.clone(), field_type).is_some() {
                 return None;
             }
         // `ty` spelled `Str` is the core string only while the file's
         // own record is not itself named `Str` — a user `type Str`
         // shadows the prelude name, and `text: Str` then points at it.
-        } else if ty_text == "Str" && normalized_type_name != "Str" {
-            str_field_types.insert(normalized_field_name);
+        } else if ty_text == "Str" && normalized_self_name != "Str" {
+            str_field_types.insert(field_name.clone());
         } else {
-            return None;
+            let normalized_ty =
+                sai_syntax::normalize_identifier(ty_text.strip_prefix("r#").unwrap_or(ty_text));
+            if nested.contains_key(normalized_ty.as_str()) {
+                receiver_fields.insert(field_name.clone(), normalized_ty);
+            } else {
+                return None;
+            }
         }
-        candidate_names.push(field_spelling.to_owned());
+        candidate_names.push(spelling.clone());
     }
     Some(InherentMethodPrimitiveFields {
-        type_name: type_name
+        type_name: self_record
+            .type_name
             .strip_prefix("r#")
-            .unwrap_or(&type_name)
+            .unwrap_or(&self_record.type_name)
             .to_owned(),
-        type_name_span,
+        type_name_span: self_record.type_name_span,
         fields: field_types,
         str_fields: str_field_types,
         candidate_names,
+        record_fields: receiver_fields,
+        nested,
     })
 }
 
@@ -8672,6 +8868,69 @@ fn primitive_self_field_type(
     Some(field_types.get(field_name.as_ref()).copied().ok_or(name))
 }
 
+// `self.<name>` whose field's type is another record in this file —
+// a receiver for `self.<name>.<leaf>` projections. Handled without a
+// projection so a bare `self.<name>` value still gates.
+fn self_record_field_receiver(
+    expression: &HirExpr<'_>,
+    record_fields: &HashMap<String, String>,
+    symbols: &Interner,
+) -> bool {
+    let ExprKind::Field {
+        base,
+        name,
+        args: None,
+    } = expression.kind
+    else {
+        return false;
+    };
+    is_direct_self_value_expression(base)
+        && symbols
+            .resolve(name.sym)
+            .ok()
+            .is_some_and(|field_name| record_fields.contains_key(field_name.as_ref()))
+}
+
+// `self.<record-field>.<leaf>` — the leaf's type inside the receiver's
+// record: a scalar, a `Str` leaf (`len`/`is_empty` receiver), or an
+// unknown leaf reported against that record.
+fn nested_self_field_type<'a>(
+    expression: &HirExpr<'_>,
+    fields: &'a InherentMethodPrimitiveFields,
+    symbols: &Interner,
+) -> Option<NestedSelfField<'a, sai_resolve::prelude::PrimTy>> {
+    let ExprKind::Field {
+        base,
+        name,
+        args: None,
+    } = expression.kind
+    else {
+        return None;
+    };
+    let ExprKind::Field {
+        base: inner_base,
+        name: inner_name,
+        args: None,
+    } = base.kind
+    else {
+        return None;
+    };
+    if !is_direct_self_value_expression(inner_base) {
+        return None;
+    }
+    let inner = symbols.resolve(inner_name.sym).ok()?;
+    let record_name = fields.record_fields.get(inner.as_ref())?;
+    let record = fields.nested.get(record_name)?;
+    let leaf = symbols.resolve(name.sym).ok()?;
+    if let Some(field_type) = record.fields.get(leaf.as_ref()) {
+        return Some(NestedSelfField::Known(*field_type));
+    }
+    if record.str_fields.contains(leaf.as_ref()) {
+        return Some(NestedSelfField::Str);
+    }
+    Some(NestedSelfField::Unknown { name, record })
+}
+
 // The `self.<field>` families a `-> Str` method may read — `Str`
 // fields map to `` `Str` ``, scalar fields to their literal-family
 // name. Mirrors `InherentMethodPrimitiveFields`.
@@ -8680,6 +8939,13 @@ struct InherentMethodStrFields {
     type_name_span: sai_diagnostics::Span,
     fields: HashMap<String, &'static str>,
     candidate_names: Vec<String>,
+    // `self.<name>` fields whose type is another record in this file,
+    // by field name → record name — receivers for nested projections
+    // (`self.<name>.<leaf>`), never `Str` leaves themselves.
+    record_fields: HashMap<String, String>,
+    // Family tables for each receiver's record, keyed by record name;
+    // `Str` leaves carry the `` `Str` `` family inside `fields`.
+    nested: HashMap<String, NestedRecordFields<&'static str>>,
 }
 
 // The family a record field type contributes to the Str walk: `Str`
@@ -8881,102 +9147,148 @@ fn str_inherent_method_field_types(
     {
         return None;
     }
-    let mut type_decl = None;
-    let mut impl_decl = None;
+    let mut type_decls = Vec::new();
+    let mut impl_decls = Vec::new();
     for item in source_file.items() {
         match item {
-            ast::Item::Type(decl) if type_decl.is_none() => type_decl = Some(decl),
-            ast::Item::Impl(decl) if impl_decl.is_none() => impl_decl = Some(decl),
+            ast::Item::Type(decl) => type_decls.push(decl),
+            ast::Item::Impl(decl) => impl_decls.push(decl),
             ast::Item::Function(_) => {}
             _ => return None,
         }
     }
-    let (Some(type_decl), Some(impl_decl)) = (type_decl, impl_decl) else {
+    if type_decls.is_empty() || impl_decls.is_empty() {
+        return None;
+    }
+    let mut records = Vec::new();
+    for type_decl in &type_decls {
+        records.push(parse_inherent_method_record(type_decl, inputs)?);
+    }
+    // The self record is the decl spelling the `self` type's name;
+    // every other record in the file is a receiver `self.<field>` may
+    // project through.
+    let Some(self_index) = records.iter().position(|record| {
+        sai_syntax::normalize_identifier(
+            record
+                .type_name
+                .strip_prefix("r#")
+                .unwrap_or(&record.type_name),
+        ) == target_name.as_ref()
+    }) else {
         return None;
     };
-    let type_name_node = type_decl.name()?;
-    let type_name = type_name_node.token()?.text().to_owned();
-    let type_name_span =
-        sai_diagnostics::Span::new(inputs.source.id(), type_name_node.syntax().text_range());
-    let struct_def = type_decl.struct_def()?;
-    let fields = struct_def.fields()?;
-    if type_decl.attrs().next().is_some()
-        || type_decl
-            .syntax()
-            .children()
-            .any(|child| ast::GenericParamList::can_cast(child.kind()))
-        || type_decl
-            .syntax()
-            .descendants()
-            .any(|node| ast::Attribute::can_cast(node.kind()))
-        || struct_def.where_clause().is_some()
-        || fields.fields().next().is_none()
-        || impl_decl.attrs().next().is_some()
-        || impl_decl
-            .syntax()
-            .children()
-            .any(|child| ast::GenericParamList::can_cast(child.kind()))
-        || impl_decl
-            .syntax()
-            .descendants()
-            .any(|node| ast::Attribute::can_cast(node.kind()))
-        || impl_decl.unsafe_token().is_some()
-    {
-        return None;
-    }
-    let normalized_type_name =
-        sai_syntax::normalize_identifier(type_name.strip_prefix("r#").unwrap_or(&type_name));
-    if normalized_type_name != target_name.as_ref() {
-        return None;
-    }
-    let inherent_type = impl_decl.inherent_type()?;
-    let range = inherent_type.syntax().text_range();
-    if inputs
-        .source
-        .text()
-        .get(range.start().to_usize()..range.end().to_usize())
-        != Some(type_name.as_str())
-    {
-        return None;
-    }
-    let mut field_types = HashMap::new();
-    let mut candidate_names = Vec::new();
-    for field in fields.fields() {
-        if field.attrs().next().is_some() {
-            return None;
+    let mut nested = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if index == self_index {
+            continue;
         }
-        let field_name_node = field.name()?;
-        let field_name = field_name_node.token()?.text().to_owned();
-        let field_spelling = field_name.strip_prefix("r#").unwrap_or(&field_name);
-        let normalized_field_name = sai_syntax::normalize_identifier(field_spelling);
-        let ty = field.ty()?;
-        let range = ty.syntax().text_range();
-        let ty_text = inputs
-            .source
-            .text()
-            .get(range.start().to_usize()..range.end().to_usize())?;
-        // A field spelled `Str` on a record itself named `Str` refers
-        // to the user type shadowing the prelude, not the core string.
-        if ty_text == "Str" && normalized_type_name == "Str" {
-            return None;
+        let normalized_record_name = sai_syntax::normalize_identifier(
+            record
+                .type_name
+                .strip_prefix("r#")
+                .unwrap_or(&record.type_name),
+        );
+        let mut record_fields_map = HashMap::new();
+        let mut record_candidates = Vec::new();
+        for (field_name, ty_text, spelling) in &record.fields {
+            // A field spelled `Str` on a record named `Str` refers to
+            // the user type shadowing the prelude, not the core string.
+            if ty_text == "Str" && normalized_record_name == "Str" {
+                return None;
+            }
+            let Some(field_family) = str_method_field_family(ty_text) else {
+                // A record-typed field inside a receiver record would
+                // take the chain two levels deep — the impl stays gated.
+                return None;
+            };
+            if record_fields_map
+                .insert(field_name.clone(), field_family)
+                .is_some()
+            {
+                return None;
+            }
+            record_candidates.push(spelling.clone());
         }
-        let field_family = str_method_field_family(ty_text)?;
-        if field_types
-            .insert(normalized_field_name, field_family)
+        if nested
+            .insert(
+                normalized_record_name,
+                NestedRecordFields {
+                    type_name: record
+                        .type_name
+                        .strip_prefix("r#")
+                        .unwrap_or(&record.type_name)
+                        .to_owned(),
+                    type_name_span: record.type_name_span,
+                    fields: record_fields_map,
+                    str_fields: HashSet::new(),
+                    candidate_names: record_candidates,
+                },
+            )
             .is_some()
         {
             return None;
         }
-        candidate_names.push(field_spelling.to_owned());
+    }
+    // Each `impl` must name a declared record — the self record's impl
+    // is required; the rest are receiver-record impls `self.<field>.m()`
+    // resolves through.
+    let self_record = &records[self_index];
+    let normalized_self_name = sai_syntax::normalize_identifier(
+        self_record
+            .type_name
+            .strip_prefix("r#")
+            .unwrap_or(&self_record.type_name),
+    );
+    let mut self_impl_found = false;
+    for impl_decl in &impl_decls {
+        let inherent_name = parse_inherent_method_impl(impl_decl, inputs)?;
+        if inherent_name == normalized_self_name {
+            self_impl_found = true;
+        } else if !nested.contains_key(inherent_name.as_str()) {
+            return None;
+        }
+    }
+    if !self_impl_found {
+        return None;
+    }
+    let mut field_types = HashMap::new();
+    let mut receiver_fields = HashMap::new();
+    let mut candidate_names = Vec::new();
+    for (field_name, ty_text, spelling) in &self_record.fields {
+        // A field spelled `Str` on a record itself named `Str` refers
+        // to the user type shadowing the prelude, not the core string.
+        if ty_text == "Str" && normalized_self_name == "Str" {
+            return None;
+        }
+        if let Some(field_family) = str_method_field_family(ty_text) {
+            if field_types
+                .insert(field_name.clone(), field_family)
+                .is_some()
+            {
+                return None;
+            }
+        } else {
+            let normalized_ty =
+                sai_syntax::normalize_identifier(ty_text.strip_prefix("r#").unwrap_or(ty_text));
+            if nested.contains_key(normalized_ty.as_str()) {
+                receiver_fields.insert(field_name.clone(), normalized_ty);
+            } else {
+                return None;
+            }
+        }
+        candidate_names.push(spelling.clone());
     }
     Some(InherentMethodStrFields {
-        type_name: type_name
+        type_name: self_record
+            .type_name
             .strip_prefix("r#")
-            .unwrap_or(&type_name)
+            .unwrap_or(&self_record.type_name)
             .to_owned(),
-        type_name_span,
+        type_name_span: self_record.type_name_span,
         fields: field_types,
         candidate_names,
+        record_fields: receiver_fields,
+        nested,
     })
 }
 
@@ -9042,6 +9354,43 @@ fn str_self_field_family(
     Some(field_types.get(field_name.as_ref()).copied().ok_or(name))
 }
 
+// `self.<record-field>.<leaf>` in a `-> Str` body — the leaf's family
+// inside the receiver's record (`Str` leaves carry the `` `Str` ``
+// family), or an unknown leaf reported against that record.
+fn nested_str_self_field_family<'a>(
+    expression: &HirExpr<'_>,
+    fields: &'a InherentMethodStrFields,
+    symbols: &Interner,
+) -> Option<NestedSelfField<'a, &'static str>> {
+    let ExprKind::Field {
+        base,
+        name,
+        args: None,
+    } = expression.kind
+    else {
+        return None;
+    };
+    let ExprKind::Field {
+        base: inner_base,
+        name: inner_name,
+        args: None,
+    } = base.kind
+    else {
+        return None;
+    };
+    if !is_direct_self_value_expression(inner_base) {
+        return None;
+    }
+    let inner = symbols.resolve(inner_name.sym).ok()?;
+    let record_name = fields.record_fields.get(inner.as_ref())?;
+    let record = fields.nested.get(record_name)?;
+    let leaf = symbols.resolve(name.sym).ok()?;
+    if let Some(family) = record.fields.get(leaf.as_ref()) {
+        return Some(NestedSelfField::Known(*family));
+    }
+    Some(NestedSelfField::Unknown { name, record })
+}
+
 // Collect `self.<field>` projections for a `-> Str` method body:
 // known fields record their family by HirId, unknown fields emit the
 // unknown-field diagnostic so the gate can still surface it.
@@ -9055,8 +9404,35 @@ fn collect_str_inherent_method_self_field(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<bool, OwnerControlFlowResolutionError> {
+    // `self.<record-field>` is a receiver — handled without a
+    // projection, so a bare value use still gates.
+    if self_record_field_receiver(expression, &fields.record_fields, symbols) {
+        return Ok(true);
+    }
     let Some(field_lookup) = str_self_field_family(expression, &fields.fields, symbols) else {
-        return Ok(false);
+        let Some(nested_lookup) = nested_str_self_field_family(expression, fields, symbols) else {
+            return Ok(false);
+        };
+        match nested_lookup {
+            NestedSelfField::Known(family) => {
+                self_field_projections.insert(expression.hir_id, family);
+            }
+            NestedSelfField::Str => {
+                self_field_projections.insert(expression.hir_id, "`Str`");
+            }
+            NestedSelfField::Unknown { name, record } => {
+                diagnostics.push(unknown_self_field_diagnostic(
+                    owner,
+                    &record.type_name,
+                    record.type_name_span,
+                    &record.candidate_names,
+                    name,
+                    inputs,
+                    snapshot,
+                )?);
+            }
+        }
+        return Ok(true);
     };
     match field_lookup {
         Ok(family) => {
@@ -104195,6 +104571,98 @@ property "shared"() {}
         };
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_nested_self_fields() {
+        let root = concat!(
+            "type Inner { n: I32, label: Str }\n",
+            "type Outer { inner: Inner, count: I32 }\n",
+            "impl Outer {\n",
+            "  pub fn leaf(self: borrow Self) -> Str {\n",
+            "    if self.inner.n == 1 {\n",
+            "      \"a\"\n",
+            "    } else {\n",
+            "      \"b\"\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn str_leaf(self: borrow Self) -> Str {\n",
+            "    self.inner.label\n",
+            "  }\n",
+            "  pub fn str_leaf_call(self: borrow Self) -> Str {\n",
+            "    if self.inner.label.is_empty() {\n",
+            "      \"a\"\n",
+            "    } else {\n",
+            "      \"b\"\n",
+            "    }\n",
+            "  }\n",
+            "  pub fn bad_leaf(self: borrow Self) -> Str {\n",
+            "    self.inner.nope\n",
+            "  }\n",
+            "  pub fn bare(self: borrow Self) -> Str {\n",
+            "    self.inner\n",
+            "  }\n",
+            "  pub fn prim_leaf(self: borrow Self) -> I32 {\n",
+            "    self.inner.n\n",
+            "  }\n",
+            "  pub fn prim_str_call(self: borrow Self) -> Bool {\n",
+            "    self.inner.label.is_empty()\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("inherent methods collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let methods = &results.owners()[0].members();
+        assert_eq!(methods.len(), 7);
+        // `self.<record-field>.<leaf>` projects the leaf — `-> Str` and
+        // `-> <prim>` bodies both type-check it.
+        for (index, name) in [
+            (0, "leaf"),
+            (1, "str_leaf"),
+            (5, "prim_leaf"),
+            (6, "prim_str_call"),
+        ] {
+            let check = methods[index].body_type_check().expect("body check runs");
+            let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+                panic!("{name} projects the nested leaf: {check:?}");
+            };
+            assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+        }
+        // A `Str` leaf is a `len`/`is_empty` receiver too.
+        let check = methods[2].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("str_leaf_call calls the leaf method: {check:?}");
+        };
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // An unknown leaf reports UnknownField on the receiver record.
+        let check = methods[3].body_type_check().expect("body check runs");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("bad_leaf reports its field error: {check:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
+        // A bare `self.<record-field>` stays gated — records are not
+        // scalar/`Str` values.
+        let check = methods[4].body_type_check().expect("body check runs");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Unsupported),
+            "bare stays gated: {check:?}"
+        );
     }
 
     #[test]
