@@ -3333,8 +3333,25 @@ fn multiple_public_inherent_methods_emit_check_result() {
 }
 
 #[test]
-fn mixed_function_and_type_owners_stay_gated() {
+fn mixed_function_and_type_owners_check() {
+    // Attribute-free `type` owners beside `pub fn`s resolve their type
+    // paths and count toward coverage — the slice is no longer gated by
+    // owner kind (IR-1132).
     let source = concat!(
+        "type Counter { count: I32 }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn attribute_carrying_type_owner_stays_gated() {
+    // An attribute-carrying `type` is still outside the covered slice —
+    // the whole source stays gated rather than passing partially.
+    let source = concat!(
+        "@native\n",
         "type Counter { count: I32 }\n",
         "pub fn make() -> I32 {\n",
         "    1\n",
@@ -3342,7 +3359,7 @@ fn mixed_function_and_type_owners_stay_gated() {
     );
     assert_check_stays_gated_without_syntax_errors(
         &run_check(source, "", &[], &[]),
-        "mixed function and type owners",
+        "attribute-carrying type owner",
     );
 }
 

@@ -2050,18 +2050,27 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     {
         return false;
     }
-    // Every item must be an unattributed `pub fn` — a source of one
-    // or more top-level functions whose bodies can each be checked.
+    // Every item must be an unattributed `pub fn` or an unattributed
+    // `type` declaration (records, aliases, enums, distinct types carry
+    // no executable body) — a source of one or more top-level functions
+    // whose bodies can each be checked.
     let mut saw_function = false;
-    source_file.items().all(|item| {
-        let sai_syntax::ast::Item::Function(function) = item else {
-            return false;
-        };
-        saw_function = true;
-        function.attrs().next().is_none()
-            && function
-                .visibility()
-                .is_some_and(|visibility| visibility.pub_token().is_some())
+    source_file.items().all(|item| match item {
+        sai_syntax::ast::Item::Function(function) => {
+            saw_function = true;
+            function.attrs().next().is_none()
+                && function
+                    .visibility()
+                    .is_some_and(|visibility| visibility.pub_token().is_some())
+        }
+        sai_syntax::ast::Item::Type(type_decl) => {
+            type_decl.attrs().next().is_none()
+                && !type_decl
+                    .syntax()
+                    .descendants()
+                    .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+        }
+        _ => false,
     }) && saw_function
 }
 
@@ -2242,16 +2251,28 @@ fn check_public_function_body_coverage(
     source_is_candidate: bool,
     scopes: &sai_driver::Phase1PackageScopes,
     function_resolutions: &sai_driver::FunctionOwnerResolutions,
+    type_resolutions: Option<&sai_driver::TypeOwnerResolutions>,
 ) -> bool {
     if !source_is_candidate
         || scopes.modules.len() != 1
         || !scopes.modules[0].imports.is_empty()
         || scopes.top_level_owners.is_empty()
-        || scopes.top_level_owners.len() != function_resolutions.owners().len()
         || scopes
             .top_level_owners
             .iter()
-            .any(|owner| owner.kind != sai_driver::TopLevelOwnerKind::Function)
+            .filter(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Function)
+            .count()
+            != function_resolutions.owners().len()
+        || scopes.top_level_owners.iter().any(|owner| {
+            !matches!(
+                owner.kind,
+                sai_driver::TopLevelOwnerKind::Function
+                    | sai_driver::TopLevelOwnerKind::Struct
+                    | sai_driver::TopLevelOwnerKind::Alias
+                    | sai_driver::TopLevelOwnerKind::Enum
+                    | sai_driver::TopLevelOwnerKind::Distinct
+            )
+        })
     {
         return false;
     }
@@ -2260,10 +2281,31 @@ fn check_public_function_body_coverage(
         .iter()
         .map(|owner| owner.owner())
         .collect::<HashSet<_>>();
+    let resolved_type_owner_ids = type_resolutions
+        .map(|resolutions| {
+            resolutions
+                .owners()
+                .iter()
+                .map(|owner| owner.owner())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
     scopes
         .top_level_owners
         .iter()
+        .filter(|descriptor| descriptor.kind == sai_driver::TopLevelOwnerKind::Function)
         .all(|descriptor| resolved_owner_ids.contains(&descriptor.owner))
+        && scopes
+            .top_level_owners
+            .iter()
+            .filter(|descriptor| descriptor.kind != sai_driver::TopLevelOwnerKind::Function)
+            .all(|descriptor| resolved_type_owner_ids.contains(&descriptor.owner))
+        && type_resolutions.is_none_or(|resolutions| {
+            resolutions
+                .owners()
+                .iter()
+                .all(|owner| owner.path_resolution().is_ok())
+        })
         && function_resolutions.owners().iter().all(|owner| {
             owner
                 .body_type_check()
@@ -6796,6 +6838,38 @@ fn module_tree_workspace_check_diagnostics(
                             }
                         }
                     }
+                    // Type owners admitted beside the functions carry no
+                    // body, but their own resolution diagnostics still
+                    // surface — `type Bad { x: Missing }` must not check
+                    // clean next to a good `pub fn`.
+                    let type_resolutions = if collection
+                        .scopes()
+                        .top_level_owners
+                        .iter()
+                        .any(|owner| owner.kind != sai_driver::TopLevelOwnerKind::Function)
+                    {
+                        Some(
+                            database
+                                .resolve_type_owner_paths(
+                                    &collection,
+                                    module_tree,
+                                    &workspace_snapshot,
+                                )
+                                .map_err(|error| {
+                                    format!("type owner path query failed: {error:?}")
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(type_resolutions) = &type_resolutions {
+                        for owner in type_resolutions.owners() {
+                            body_diagnostics.extend(owner.lowering_diagnostics().iter().cloned());
+                            if let Ok(diagnostics) = owner.module_path_diagnostics() {
+                                body_diagnostics.extend(diagnostics.iter().cloned());
+                            }
+                        }
+                    }
                     let (body_diagnostics, body_errors, body_warnings, body_infos) =
                         phase1_check_diagnostics(
                             &body_diagnostics,
@@ -6813,6 +6887,7 @@ fn module_tree_workspace_check_diagnostics(
                             true,
                             collection.scopes(),
                             &function_resolutions,
+                            type_resolutions.as_ref(),
                         )
                     {
                         single_public_function_body_covered = true;
