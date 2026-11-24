@@ -3501,6 +3501,89 @@ fn unsupported_const_initializer_in_mixed_source_stays_gated() {
 }
 
 #[test]
+fn mixed_record_typed_fields_check() {
+    // A `type` field typed by another `type` in the file stays
+    // admissible — record-typed receivers feed `self.<field>.<leaf>`
+    // projections (IR-1135).
+    let source = concat!(
+        "type Inner { v: I32 }\n",
+        "type Outer { inner: Inner }\n",
+        "impl Outer {\n",
+        "    pub fn leaf(self: borrow Self) -> I32 {\n",
+        "        let value = self.inner.v\n",
+        "        value\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn mixed_deep_self_field_chains_check() {
+    // `self.<a>.<b>.<leaf>` projections and `self.<a>.<method>(..)`
+    // calls across sibling impls stay inside the coverage set
+    // (IR-1135).
+    let source = concat!(
+        "type Deep { d: I32 }\n",
+        "type Inner { deep: Deep, v: I32 }\n",
+        "type Outer { inner: Inner }\n",
+        "impl Inner {\n",
+        "    pub fn v(self: borrow Self) -> I32 {\n",
+        "        self.v\n",
+        "    }\n",
+        "}\n",
+        "impl Outer {\n",
+        "    pub fn deep_leaf(self: borrow Self) -> I32 {\n",
+        "        let value = self.inner.deep.d\n",
+        "        value\n",
+        "    }\n",
+        "    pub fn deep_call(self: borrow Self) -> I32 {\n",
+        "        self.inner.v()\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn undeclared_record_field_type_stays_gated() {
+    // A field typed by a name that is not a `type` in the file keeps the
+    // source gated (IR-1135).
+    let source = concat!(
+        "type Outer { inner: Missing }\n",
+        "impl Outer {\n",
+        "    pub fn f(self: borrow Self) -> I32 {\n",
+        "        1\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated(&run_check(source, "", &[], &[]), "undeclared field type");
+}
+
+#[test]
+fn record_typed_fields_in_function_source_check() {
+    // The `pub fn` + `type` coverage path admits record-typed fields
+    // too — declared names are verifiable the same way (IR-1135).
+    let source = concat!(
+        "type Inner { v: I32 }\n",
+        "type Outer { inner: Inner }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
 fn mixed_function_type_and_impl_owners_report_body_diagnostics() {
     // Mixed coverage still reports each owner's diagnostics — the bad
     // method tail surfaces alongside a clean function.

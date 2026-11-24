@@ -2063,6 +2063,16 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     // no executable body) — a source of one or more top-level functions
     // whose bodies can each be checked.
     let mut saw_function = false;
+    let type_names: HashSet<String> = source_file
+        .items()
+        .filter_map(|item| match item {
+            sai_syntax::ast::Item::Type(type_decl) => type_decl
+                .name()
+                .and_then(|name| name.token())
+                .map(|token| token.text().to_owned()),
+            _ => None,
+        })
+        .collect();
     source_file.items().all(|item| match item {
         sai_syntax::ast::Item::Function(function) => {
             saw_function = true;
@@ -2081,7 +2091,7 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
                 // `path_resolution()` — deferred field-type misses and
                 // duplicate field names pass it silently. Only records
                 // whose fields are verifiable keep the source admissible.
-                && check_type_decl_primitive_fields(&type_decl, source)
+                && check_type_decl_primitive_fields(&type_decl, source, &type_names)
         }
         _ => false,
     }) && saw_function
@@ -2094,9 +2104,15 @@ fn strip_utf8_bom(source: &[u8]) -> &[u8] {
 }
 
 // A `type` declaration's field names and types usable as an inherent
-// impl's record: every field named, attr-free, and primitive/`Str`.
-// An empty record has nothing to verify and is admissible.
-fn check_type_decl_primitive_fields(type_decl: &sai_syntax::ast::TypeDecl, source: &[u8]) -> bool {
+// impl's record: every field named, attr-free, and primitive/`Str` or
+// another `type` declared in the file (record-typed receivers for
+// `self.<field>.<leaf>` projections). An empty record has nothing to
+// verify and is admissible.
+fn check_type_decl_primitive_fields(
+    type_decl: &sai_syntax::ast::TypeDecl,
+    source: &[u8],
+    type_names: &HashSet<String>,
+) -> bool {
     use sai_syntax::ast::AstNode as _;
 
     let Some(struct_def) = type_decl.struct_def() else {
@@ -2161,7 +2177,7 @@ fn check_type_decl_primitive_fields(type_decl: &sai_syntax::ast::TypeDecl, sourc
                         | b"F32"
                         | b"F64"
                         | b"Str"
-                )
+                ) || type_names.iter().any(|name| name.as_bytes() == type_text)
             })
     })
 }
@@ -2256,7 +2272,21 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
     }
     let mut saw_function = false;
     let mut saw_impl = false;
+    // Record-typed fields may name a `type` declared later in the file —
+    // the name set is collected before the field check runs.
     let mut type_names = HashSet::new();
+    for item in source_file.items() {
+        if let sai_syntax::ast::Item::Type(type_decl) = item {
+            let Some(name) = type_decl
+                .name()
+                .and_then(|name| name.token())
+                .map(|token| token.text().to_owned())
+            else {
+                return false;
+            };
+            type_names.insert(name);
+        }
+    }
     let mut impls = Vec::new();
     for item in source_file.items() {
         match item {
@@ -2271,17 +2301,9 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
                 saw_function = true;
             }
             sai_syntax::ast::Item::Type(type_decl) => {
-                let Some(name) = type_decl
-                    .name()
-                    .and_then(|name| name.token())
-                    .map(|token| token.text().to_owned())
-                else {
-                    return false;
-                };
-                if !check_type_decl_primitive_fields(&type_decl, source) {
+                if !check_type_decl_primitive_fields(&type_decl, source, &type_names) {
                     return false;
                 }
-                type_names.insert(name);
             }
             sai_syntax::ast::Item::Impl(impl_decl) => {
                 saw_impl = true;
@@ -2343,7 +2365,11 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
         return false;
     };
     if items.next().is_some()
-        || !check_type_decl_primitive_fields(&type_decl, source)
+        || !check_type_decl_primitive_fields(
+            &type_decl,
+            source,
+            &HashSet::from([type_name.clone()]),
+        )
         || impl_decl.attrs().next().is_some()
         || impl_decl
             .syntax()
