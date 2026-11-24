@@ -22749,6 +22749,10 @@ fn str_stmt_block_str_break(
             }
             _ => false,
         }
+    }) || block.tail.is_some_and(|tail| {
+        // A block's tail is discarded too — only `break` contributions
+        // count, exactly like statement-position expressions.
+        str_stmt_str_break(tail, locals, &bindings, inputs, call_signatures)
     })
 }
 
@@ -62077,6 +62081,7 @@ property "shared"() {}
             "pub fn str_call_match_call_arms(flag: Bool) -> USize { let s = match flag { true => str_call_make(), _ => str_call_make() }\n    s.len() }\n",
             "pub fn str_call_if_tail_calls(flag: Bool) -> Str { if flag { str_call_make() } else { str_call_make() } }\n",
             "pub fn str_call_stmt_if_branch(flag: Bool) -> Bool { let s = if flag { { str_call_make()\n true } } else { false }\n    s }\n",
+            "pub fn str_call_loop_if_tail_break(flag: Bool) -> Str { loop { if flag { break str_call_make() } } }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -62093,7 +62098,7 @@ property "shared"() {}
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 73);
+        assert_eq!(owners.len(), 74);
         // Clean supported owners: `Str` parameters, `Str` locals (literal,
         // annotated, aliased, block-initialized), `Str` comparisons (also
         // under `not`), a `var` `Str` place assignment, a `Str`-comparison
@@ -62132,9 +62137,11 @@ property "shared"() {}
             // branch, and a statement-position call all check.
             .chain(&owners[54..64])
             // `-> Str` calls as every branch yield: `if`/`match`
-            // initializers where every arm is a call, and a `-> Str`
-            // `if` tail with call branches.
+            // initializers where every arm is a call, a `-> Str`
+            // `if` tail with call branches, and a `break` call in
+            // a statement `if`'s branch tail inside a `loop`.
             .chain(&owners[69..72])
+            .chain(&owners[73..74])
         {
             assert!(matches!(
                 owner
