@@ -8762,7 +8762,7 @@ fn inherent_method_primitive_field_types(
         match item {
             ast::Item::Type(decl) => type_decls.push(decl),
             ast::Item::Impl(decl) => impl_decls.push(decl),
-            ast::Item::Function(_) => {}
+            ast::Item::Function(_) | ast::Item::Const(_) => {}
             _ => return None,
         }
     }
@@ -9429,7 +9429,7 @@ fn str_inherent_method_field_types(
         match item {
             ast::Item::Type(decl) => type_decls.push(decl),
             ast::Item::Impl(decl) => impl_decls.push(decl),
-            ast::Item::Function(_) => {}
+            ast::Item::Function(_) | ast::Item::Const(_) => {}
             _ => return None,
         }
     }

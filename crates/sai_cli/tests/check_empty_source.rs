@@ -3416,6 +3416,91 @@ fn mixed_function_type_and_impl_owners_check() {
 }
 
 #[test]
+fn mixed_public_const_owners_check() {
+    // A `pub const` beside `pub fn`/`type`/`impl` owners joins the mixed
+    // coverage set — the const literal itself is validated (IR-1134).
+    let source = concat!(
+        "pub const LIMIT: I32 = 10\n",
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
+        "        let count = self.count\n",
+        "        count\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn mixed_public_const_reports_literal_mismatch() {
+    // A bad const initializer inside a mixed source reports its own
+    // diagnostic instead of being swallowed (IR-1134).
+    let source = concat!(
+        "pub const LIMIT: I32 = true\n",
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
+        "        let count = self.count\n",
+        "        count\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "mismatched const must fail");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+        "expected TYPE_MISMATCH for the const initializer: {stdout}"
+    );
+}
+
+#[test]
+fn non_public_const_in_mixed_source_stays_gated() {
+    // Only `pub` consts with uppercase names join mixed coverage (IR-1134).
+    let source = concat!(
+        "const LIMIT: I32 = 10\n",
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
+        "        let count = self.count\n",
+        "        count\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated(&run_check(source, "", &[], &[]), "non-pub const");
+}
+
+#[test]
+fn unsupported_const_initializer_in_mixed_source_stays_gated() {
+    // A const whose initializer is outside the literal slice keeps the
+    // mixed source gated rather than passing silently (IR-1134).
+    let source = concat!(
+        "pub const LIMIT: I32 = make()\n",
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
+        "        let count = self.count\n",
+        "        count\n",
+        "    }\n",
+        "}\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    assert_check_stays_gated(&run_check(source, "", &[], &[]), "call const");
+}
+
+#[test]
 fn mixed_function_type_and_impl_owners_report_body_diagnostics() {
     // Mixed coverage still reports each owner's diagnostics — the bad
     // method tail surfaces alongside a clean function.
