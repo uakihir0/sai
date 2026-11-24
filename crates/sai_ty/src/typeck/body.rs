@@ -486,6 +486,11 @@ enum LoopBreakState {
     Str,
 }
 
+/// Bound on nested `loop`-body scans inside a single `Str`-shape
+/// probe: keeps `let a = loop { .. }` chains linear in the admitted
+/// slice instead of multiplying block scans.
+const STR_LOOP_SCAN_FUEL: usize = 64;
+
 impl<'a, 'hir> FnCtxt<'a, 'hir> {
     fn primitive_body_type_results(&self) -> PrimitiveBodyTypeResults {
         let owner = self.input.body.owner;
@@ -4942,6 +4947,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         &mut self,
         block: &Block<'hir>,
         str_bindings: &HashSet<BindingId>,
+        fuel: &mut usize,
     ) -> bool {
         if block.safety != Safety::Safe {
             return false;
@@ -4957,7 +4963,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     });
                     if let PatKind::Binding { binding, .. } = pat.kind {
                         if str_annotated
-                            || (ty.is_none() && self.str_shaped_initializer_in(init, &inner))
+                            || (ty.is_none() && self.str_shaped_initializer_in(init, &inner, fuel))
                         {
                             inner.insert(binding);
                         }
@@ -4977,7 +4983,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         block
             .tail
-            .is_some_and(|tail| self.str_shaped_initializer_in(tail, &inner))
+            .is_some_and(|tail| self.str_shaped_initializer_in(tail, &inner, fuel))
     }
 
     // Whether an unannotated initializer yields `Str`: a `Str` literal,
@@ -4986,9 +4992,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     // all yield a `Str` bound path. Mirrors the driver's
     // `str_shaped_local_init` so admitted bodies never gate inside.
     fn str_shaped_initializer(&mut self, init: &Expr<'hir>) -> bool {
+        // Each top-level probe gets a fresh scan budget so nested
+        // `loop` bodies multiply at most `STR_LOOP_SCAN_FUEL` block
+        // scans — deep `let a = loop { .. }` chains degrade to gated
+        // rather than unbounded work.
+        let mut fuel = STR_LOOP_SCAN_FUEL;
         match self.input.str_bindings {
-            Some(bindings) => self.str_shaped_initializer_in(init, bindings),
-            None => self.str_shaped_initializer_in(init, &HashSet::new()),
+            Some(bindings) => self.str_shaped_initializer_in(init, bindings, &mut fuel),
+            None => self.str_shaped_initializer_in(init, &HashSet::new(), &mut fuel),
         }
     }
 
@@ -4996,6 +5007,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         &mut self,
         init: &Expr<'hir>,
         str_bindings: &HashSet<BindingId>,
+        fuel: &mut usize,
     ) -> bool {
         match init.kind {
             ExprKind::Lit(Lit::Str(_)) => true,
@@ -5015,15 +5027,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     .copied(),
                 Some("`Str`")
             ),
-            ExprKind::Block(block) => self.str_branch_block_shaped_in(block, str_bindings),
+            ExprKind::Block(block) => self.str_branch_block_shaped_in(block, str_bindings, fuel),
             ExprKind::If { then, els, .. } => {
                 // A diverging branch is neutral — it never yields, so
                 // `if c { "a" } else { return 1 }` is `Str`-shaped. Each
                 // branch is evaluated once: a nested `if` chain must
                 // not re-scan it.
-                let then_str = self.str_branch_block_shaped_in(then, str_bindings);
+                let then_str = self.str_branch_block_shaped_in(then, str_bindings, fuel);
                 let els_str =
-                    els.is_some_and(|els| self.str_shaped_initializer_in(els, str_bindings));
+                    els.is_some_and(|els| self.str_shaped_initializer_in(els, str_bindings, fuel));
                 (then_str || els_str)
                     && (then_str || self.str_diverging_block_in(then))
                     && (els_str || els.is_some_and(|els| self.str_diverging_init_in(els)))
@@ -5036,7 +5048,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 !arms.is_empty()
                     && arms
                         .iter()
-                        .any(|arm| self.str_shaped_initializer_in(arm.body, str_bindings))
+                        .any(|arm| self.str_shaped_initializer_in(arm.body, str_bindings, fuel))
             }
             // `loop` is `Str`-shaped when some `break` belonging to it
             // carries a `Str`-shaped value. A nested `loop`'s `break`s
@@ -5044,7 +5056,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // scanned (a labeled `break 'outer` inside one is missed —
             // bounded, and the kernel still validates the body).
             ExprKind::Loop { body, source, .. } => {
-                source == LoopSource::Loop && self.str_break_value_in_block(body, str_bindings)
+                source == LoopSource::Loop
+                    && self.str_break_value_in_block(body, str_bindings, fuel)
             }
             _ => false,
         }
@@ -5057,7 +5070,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         &mut self,
         block: &Block<'hir>,
         str_bindings: &HashSet<BindingId>,
+        fuel: &mut usize,
     ) -> bool {
+        // Bounded: every nested `loop` body scan costs one unit of
+        // `fuel`, so probes stay linear in the admitted slice.
+        if *fuel == 0 {
+            return false;
+        }
+        *fuel -= 1;
         // `let` statements inside the loop body seed the `Str` set the
         // `break` values resolve against (`let t = "x"` then `break t`).
         let mut inner = str_bindings.clone();
@@ -5070,7 +5090,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             .is_some_and(|annotations| annotations.contains(&ty.hir_id))
                     });
                     if str_annotated
-                        || (ty.is_none() && self.str_shaped_initializer_in(init, &inner))
+                        || (ty.is_none() && self.str_shaped_initializer_in(init, &inner, fuel))
                     {
                         inner.insert(binding);
                     }
@@ -5078,34 +5098,35 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
         block.stmts.iter().any(|stmt| match stmt.kind {
-            StmtKind::Expr(expression) => self.str_break_value_in_expr(expression, &inner),
-            StmtKind::Let { init, .. } => self.str_break_value_in_expr(init, &inner),
+            StmtKind::Expr(expression) => self.str_break_value_in_expr(expression, &inner, fuel),
+            StmtKind::Let { init, .. } => self.str_break_value_in_expr(init, &inner, fuel),
             _ => false,
         }) || block
             .tail
-            .is_some_and(|tail| self.str_break_value_in_expr(tail, &inner))
+            .is_some_and(|tail| self.str_break_value_in_expr(tail, &inner, fuel))
     }
 
     fn str_break_value_in_expr(
         &mut self,
         expression: &Expr<'hir>,
         str_bindings: &HashSet<BindingId>,
+        fuel: &mut usize,
     ) -> bool {
         match expression.kind {
             ExprKind::Break {
                 value: Some(value), ..
             } => {
-                self.str_shaped_initializer_in(value, str_bindings)
-                    || self.str_break_value_in_expr(value, str_bindings)
+                self.str_shaped_initializer_in(value, str_bindings, fuel)
+                    || self.str_break_value_in_expr(value, str_bindings, fuel)
             }
-            ExprKind::Block(block) => self.str_break_value_in_block(block, str_bindings),
+            ExprKind::Block(block) => self.str_break_value_in_block(block, str_bindings, fuel),
             ExprKind::If { then, els, .. } => {
-                self.str_break_value_in_block(then, str_bindings)
-                    || els.is_some_and(|els| self.str_break_value_in_expr(els, str_bindings))
+                self.str_break_value_in_block(then, str_bindings, fuel)
+                    || els.is_some_and(|els| self.str_break_value_in_expr(els, str_bindings, fuel))
             }
             ExprKind::Match { arms, .. } => arms
                 .iter()
-                .any(|arm| self.str_break_value_in_expr(arm.body, str_bindings)),
+                .any(|arm| self.str_break_value_in_expr(arm.body, str_bindings, fuel)),
             _ => false,
         }
     }

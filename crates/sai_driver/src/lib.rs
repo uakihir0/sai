@@ -11267,6 +11267,7 @@ fn primitive_let_statement_shape_is_supported(
     // `let s: Str = ..` and unannotated `Str`-yielding initializers are
     // checked by the kernel's `Str` paths — the primitive shape mirror
     // would reject them before the kernel sees them.
+    let mut str_scan_fuel = STR_LOOP_SCAN_FUEL;
     let str_init = str_annotated
         || (ty.is_none()
             && str_shaped_local_init(
@@ -11276,6 +11277,7 @@ fn primitive_let_statement_shape_is_supported(
                 &str_admissions.locals,
                 symbols,
                 type_paths,
+                &mut str_scan_fuel,
             ));
     // Annotations on `let` statements inside `Str` branch blocks
     // belong to the same `primitive_types`/`annotations` maps the
@@ -11484,6 +11486,11 @@ fn collect_str_branch_block_annotations(
     }
 }
 
+/// Bound on nested `loop`-body scans inside a single `Str`-shape
+/// probe: keeps `let a = loop { .. }` chains linear in the admitted
+/// slice instead of multiplying block scans.
+const STR_LOOP_SCAN_FUEL: usize = 64;
+
 // Whether an unannotated `let` initializer yields a `Str`: a `Str`
 // literal, a path to an already-tracked `Str` binding, or a nested
 // block whose tail yields `Str` the same way. `str_bindings` carries
@@ -11495,11 +11502,18 @@ fn str_shaped_local_init(
     str_bindings: &HashSet<sai_hir::BindingId>,
     symbols: &Interner,
     type_paths: Option<&TypeOwnerPathResolution>,
+    fuel: &mut usize,
 ) -> bool {
     match init.kind {
-        ExprKind::Block(block) => {
-            str_shaped_branch_block(block, locals, inputs, str_bindings, symbols, type_paths)
-        }
+        ExprKind::Block(block) => str_shaped_branch_block(
+            block,
+            locals,
+            inputs,
+            str_bindings,
+            symbols,
+            type_paths,
+            fuel,
+        ),
         ExprKind::Lit(Lit::Str(_)) => true,
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|source| str_bindings.contains(&source)),
@@ -11520,6 +11534,7 @@ fn str_shaped_local_init(
                         str_bindings,
                         symbols,
                         type_paths,
+                        fuel,
                     )
                 })
         }
@@ -11528,10 +11543,17 @@ fn str_shaped_local_init(
         // diverging branch is neutral — it never yields. Each branch
         // is evaluated once: a nested `if` chain must not re-scan it.
         ExprKind::If { then, els, .. } => {
-            let then_str =
-                str_shaped_branch_block(then, locals, inputs, str_bindings, symbols, type_paths);
+            let then_str = str_shaped_branch_block(
+                then,
+                locals,
+                inputs,
+                str_bindings,
+                symbols,
+                type_paths,
+                fuel,
+            );
             let els_str = els.is_some_and(|els| {
-                str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths)
+                str_shaped_local_init(els, locals, inputs, str_bindings, symbols, type_paths, fuel)
             });
             (then_str || els_str)
                 && (then_str || str_diverging_local_block(then))
@@ -11544,7 +11566,15 @@ fn str_shaped_local_init(
         // bounded, and the kernel still validates the body).
         ExprKind::Loop { body, source, .. } => {
             source == LoopSource::Loop
-                && str_break_value_in_block(body, locals, inputs, str_bindings, symbols, type_paths)
+                && str_break_value_in_block(
+                    body,
+                    locals,
+                    inputs,
+                    str_bindings,
+                    symbols,
+                    type_paths,
+                    fuel,
+                )
         }
         _ => false,
     }
@@ -11560,7 +11590,14 @@ fn str_break_value_in_block(
     str_bindings: &HashSet<sai_hir::BindingId>,
     symbols: &Interner,
     type_paths: Option<&TypeOwnerPathResolution>,
+    fuel: &mut usize,
 ) -> bool {
+    // Bounded: every nested `loop` body scan costs one unit of
+    // `fuel`, so probes stay linear in the admitted slice.
+    if *fuel == 0 {
+        return false;
+    }
+    *fuel -= 1;
     // `let` statements inside the loop body seed the `Str` set the
     // `break` values resolve against (`let t = "x"` then `break t`).
     let mut inner = str_bindings.clone();
@@ -11575,7 +11612,9 @@ fn str_break_value_in_block(
             if let PatKind::Binding { binding, .. } = pat.kind {
                 if str_annotated
                     || (ty.is_none()
-                        && str_shaped_local_init(init, locals, inputs, &inner, symbols, type_paths))
+                        && str_shaped_local_init(
+                            init, locals, inputs, &inner, symbols, type_paths, fuel,
+                        ))
                 {
                     inner.insert(binding);
                 }
@@ -11583,15 +11622,15 @@ fn str_break_value_in_block(
         }
     }
     block.stmts.iter().any(|stmt| match stmt.kind {
-        StmtKind::Expr(expression) => {
-            str_break_value_in_expr(expression, locals, inputs, &inner, symbols, type_paths)
-        }
+        StmtKind::Expr(expression) => str_break_value_in_expr(
+            expression, locals, inputs, &inner, symbols, type_paths, fuel,
+        ),
         StmtKind::Let { init, .. } => {
-            str_break_value_in_expr(init, locals, inputs, &inner, symbols, type_paths)
+            str_break_value_in_expr(init, locals, inputs, &inner, symbols, type_paths, fuel)
         }
         _ => false,
     }) || block.tail.is_some_and(|tail| {
-        str_break_value_in_expr(tail, locals, inputs, &inner, symbols, type_paths)
+        str_break_value_in_expr(tail, locals, inputs, &inner, symbols, type_paths, fuel)
     })
 }
 
@@ -11602,25 +11641,70 @@ fn str_break_value_in_expr(
     str_bindings: &HashSet<sai_hir::BindingId>,
     symbols: &Interner,
     type_paths: Option<&TypeOwnerPathResolution>,
+    fuel: &mut usize,
 ) -> bool {
     match expression.kind {
         ExprKind::Break {
             value: Some(value), ..
         } => {
-            str_shaped_local_init(value, locals, inputs, str_bindings, symbols, type_paths)
-                || str_break_value_in_expr(value, locals, inputs, str_bindings, symbols, type_paths)
+            str_shaped_local_init(
+                value,
+                locals,
+                inputs,
+                str_bindings,
+                symbols,
+                type_paths,
+                fuel,
+            ) || str_break_value_in_expr(
+                value,
+                locals,
+                inputs,
+                str_bindings,
+                symbols,
+                type_paths,
+                fuel,
+            )
         }
-        ExprKind::Block(block) => {
-            str_break_value_in_block(block, locals, inputs, str_bindings, symbols, type_paths)
-        }
+        ExprKind::Block(block) => str_break_value_in_block(
+            block,
+            locals,
+            inputs,
+            str_bindings,
+            symbols,
+            type_paths,
+            fuel,
+        ),
         ExprKind::If { then, els, .. } => {
-            str_break_value_in_block(then, locals, inputs, str_bindings, symbols, type_paths)
-                || els.is_some_and(|els| {
-                    str_break_value_in_expr(els, locals, inputs, str_bindings, symbols, type_paths)
-                })
+            str_break_value_in_block(
+                then,
+                locals,
+                inputs,
+                str_bindings,
+                symbols,
+                type_paths,
+                fuel,
+            ) || els.is_some_and(|els| {
+                str_break_value_in_expr(
+                    els,
+                    locals,
+                    inputs,
+                    str_bindings,
+                    symbols,
+                    type_paths,
+                    fuel,
+                )
+            })
         }
         ExprKind::Match { arms, .. } => arms.iter().any(|arm| {
-            str_break_value_in_expr(arm.body, locals, inputs, str_bindings, symbols, type_paths)
+            str_break_value_in_expr(
+                arm.body,
+                locals,
+                inputs,
+                str_bindings,
+                symbols,
+                type_paths,
+                fuel,
+            )
         }),
         _ => false,
     }
@@ -11669,6 +11753,7 @@ fn str_shaped_branch_block(
     str_bindings: &HashSet<sai_hir::BindingId>,
     symbols: &Interner,
     type_paths: Option<&TypeOwnerPathResolution>,
+    fuel: &mut usize,
 ) -> bool {
     if block.safety != sai_hir::Safety::Safe {
         return false;
@@ -11687,7 +11772,7 @@ fn str_shaped_branch_block(
                     if str_annotated
                         || (ty.is_none()
                             && str_shaped_local_init(
-                                init, locals, inputs, &inner, symbols, type_paths,
+                                init, locals, inputs, &inner, symbols, type_paths, fuel,
                             ))
                     {
                         inner.insert(binding);
@@ -11706,7 +11791,7 @@ fn str_shaped_branch_block(
         }
     }
     block.tail.is_some_and(|tail| {
-        str_shaped_local_init(tail, locals, inputs, &inner, symbols, type_paths)
+        str_shaped_local_init(tail, locals, inputs, &inner, symbols, type_paths, fuel)
     })
 }
 
@@ -14469,10 +14554,17 @@ fn index_str_method_call_receivers(
                             Some(FunctionDirectType::Str)
                         )
                     });
+                    let mut str_scan_fuel = STR_LOOP_SCAN_FUEL;
                     if str_annotated
                         || (ty.is_none()
                             && str_shaped_local_init(
-                                init, locals, inputs, receivers, symbols, type_paths,
+                                init,
+                                locals,
+                                inputs,
+                                receivers,
+                                symbols,
+                                type_paths,
+                                &mut str_scan_fuel,
                             ))
                     {
                         receivers.insert(binding);
