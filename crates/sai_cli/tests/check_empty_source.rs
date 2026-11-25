@@ -22762,21 +22762,30 @@ fn reexported_function_calls_check_through_chains() {
 }
 
 #[test]
-fn nonconst_member_projection_match_scrutinee_stays_gated() {
-    // Only member expressions resolved to consts enter this slice;
-    // ordinary record-field scrutinees still stay outside it.
+fn self_field_match_scrutinee_checks() {
+    // Primitive `self` field projections — including nested record
+    // leaves already projected by the method walk — type `match`
+    // scrutinees by their declared field type.
     let source = concat!(
-        "type Wrap { n: I32 }\n",
+        "type Inner { n: I32 }\n",
+        "type Wrap { n: I32, inner: Inner }\n",
         "impl Wrap {\n",
-        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "    pub fn direct(self: borrow Self) -> I32 {\n",
         "        match self.n {\n",
         "            5 => 1,\n",
         "            _ => 2,\n",
         "        }\n",
         "    }\n",
+        "    pub fn nested(self: borrow Self) -> I32 {\n",
+        "        match self.inner.n {\n",
+        "            5 => { let x = 1 },\n",
+        "            _ => { let x = 2 },\n",
+        "        }\n",
+        "        0\n",
+        "    }\n",
         "}\n",
     );
-    assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
 
 #[test]

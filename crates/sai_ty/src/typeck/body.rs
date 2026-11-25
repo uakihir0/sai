@@ -3840,6 +3840,30 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
+    // Primitive `match` scrutinees are plain local/const paths, member
+    // consts, or record-field leaves whose primitive type the driver
+    // projected. Other receiver projections stay outside this slice.
+    fn check_primitive_match_scrutinee(&self, scrutinee: &Expr<'hir>) -> Result<PrimTy, ()> {
+        if let ExprKind::Field { .. } = scrutinee.kind
+            && let Some(primitive) = self
+                .input
+                .self_field_projections
+                .and_then(|fields| fields.get(&scrutinee.hir_id))
+        {
+            self.record_expression_type(scrutinee.hir_id, LocalType::Concrete(*primitive));
+            return Ok(*primitive);
+        }
+        if !matches!(scrutinee.kind, ExprKind::Path(_))
+            && self.const_path_local_type(scrutinee).is_none()
+        {
+            return Err(());
+        }
+        let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
+            return Err(());
+        };
+        Ok(scrutinee_type)
+    }
+
     /// Statement-position `match`: the same scrutinee, pattern, guard and
     /// exhaustiveness admission as `check_match_tail`, but arm bodies must
     /// be statement-only blocks.
@@ -3852,14 +3876,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if !matches!(source, MatchSource::Normal) {
             return Err(());
         }
-        if !matches!(scrutinee.kind, ExprKind::Path(_))
-            && self.const_path_local_type(scrutinee).is_none()
-        {
-            return Err(());
-        }
-        let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
-            return Err(());
-        };
+        let scrutinee_type = self.check_primitive_match_scrutinee(scrutinee)?;
         let mut catch_all = false;
         let mut bool_cover = (false, false);
         let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
@@ -5804,14 +5821,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if !matches!(source, MatchSource::Normal) {
             return Err(());
         }
-        if !matches!(scrutinee.kind, ExprKind::Path(_))
-            && self.const_path_local_type(scrutinee).is_none()
-        {
-            return Err(());
-        }
-        let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
-            return Err(());
-        };
+        let scrutinee_type = self.check_primitive_match_scrutinee(scrutinee)?;
         let mut catch_all = false;
         // Bool literal coverage: `match flag { true => …, false => … }` is
         // exhaustive without a catch-all (§6.22).
@@ -6078,14 +6088,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if !matches!(source, MatchSource::Normal) {
             return Err(());
         }
-        if !matches!(scrutinee.kind, ExprKind::Path(_))
-            && self.const_path_local_type(scrutinee).is_none()
-        {
-            return Err(());
-        }
-        let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
-            return Err(());
-        };
+        let scrutinee_type = self.check_primitive_match_scrutinee(scrutinee)?;
         let mut catch_all = false;
         let mut bool_cover = (false, false);
         let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;

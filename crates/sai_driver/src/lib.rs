@@ -10784,22 +10784,27 @@ fn resolved_plain_local_path_binding(
     }
 }
 
-// Match scrutinees admit local/const paths and member-access consts.
-// Other receiver projections stay outside this slice.
+// Match scrutinees admit local/const paths and primitive member leaves
+// (consts or record-field projections). Other receivers stay outside.
 fn primitive_match_scrutinee_shape_is_supported(
     scrutinee: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
 ) -> bool {
     match scrutinee.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
-        ExprKind::Field { .. } => inputs
-            .const_path_sites
-            .borrow()
-            .as_ref()
-            .is_some_and(|sites| sites.contains_key(&scrutinee.hir_id)),
+        ExprKind::Field { .. } => {
+            inputs
+                .const_path_sites
+                .borrow()
+                .as_ref()
+                .is_some_and(|sites| sites.contains_key(&scrutinee.hir_id))
+                || self_field_projections
+                    .is_some_and(|fields| fields.contains_key(&scrutinee.hir_id))
+        }
         _ => false,
     }
 }
@@ -13848,8 +13853,13 @@ fn primitive_match_tail_shape_is_supported(
     if !matches!(source, MatchSource::Normal) {
         return false;
     }
-    if !primitive_match_scrutinee_shape_is_supported(scrutinee, preceding_bindings, locals, inputs)
-    {
+    if !primitive_match_scrutinee_shape_is_supported(
+        scrutinee,
+        preceding_bindings,
+        locals,
+        inputs,
+        self_field_projections,
+    ) {
         return false;
     }
     let mut catch_all = false;
@@ -14305,8 +14315,13 @@ fn primitive_match_stmt_shape_is_supported(
     if !matches!(source, MatchSource::Normal) {
         return false;
     }
-    if !primitive_match_scrutinee_shape_is_supported(scrutinee, preceding_bindings, locals, inputs)
-    {
+    if !primitive_match_scrutinee_shape_is_supported(
+        scrutinee,
+        preceding_bindings,
+        locals,
+        inputs,
+        self_field_projections,
+    ) {
         return false;
     }
     let mut catch_all = false;
