@@ -7342,6 +7342,8 @@ pub enum ConstLiteralCheck {
     SupportedUnit { diagnostics: Vec<Diagnostic> },
     /// A flat tuple whose fields each have a supported direct scalar or unit literal.
     SupportedTuple { diagnostics: Vec<Diagnostic> },
+    /// An array whose elements use the supported const-constructor slice.
+    SupportedArray { diagnostics: Vec<Diagnostic> },
 }
 
 impl ConstLiteralCheck {
@@ -7352,6 +7354,7 @@ impl ConstLiteralCheck {
                 | Self::SupportedStr { .. }
                 | Self::SupportedUnit { .. }
                 | Self::SupportedTuple { .. }
+                | Self::SupportedArray { .. }
         )
     }
 
@@ -7360,7 +7363,8 @@ impl ConstLiteralCheck {
             Self::Supported { diagnostics, .. }
             | Self::SupportedStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
-            | Self::SupportedTuple { diagnostics } => diagnostics.is_empty(),
+            | Self::SupportedTuple { diagnostics }
+            | Self::SupportedArray { diagnostics } => diagnostics.is_empty(),
             Self::Unsupported => false,
         }
     }
@@ -7371,7 +7375,8 @@ impl ConstLiteralCheck {
             Self::Supported { diagnostics, .. }
             | Self::SupportedStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
-            | Self::SupportedTuple { diagnostics } => diagnostics,
+            | Self::SupportedTuple { diagnostics }
+            | Self::SupportedArray { diagnostics } => diagnostics,
         }
     }
 }
@@ -7481,6 +7486,34 @@ fn check_const_reference_expression(
     )?]))
 }
 
+fn const_constructor_kind_mismatch(
+    owner: &HirOwner<'_>,
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let constructor = if matches!(value.kind, ExprKind::Tuple(elements) if !elements.is_empty()) {
+        "a tuple"
+    } else if matches!(value.kind, ExprKind::Array(_)) {
+        "an array"
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(vec![const_literal_diagnostic(
+        owner.id,
+        inputs,
+        snapshot,
+        value.span,
+        sai_diagnostics::Code::TypeMismatch,
+        format!(
+            "expected `{}`, found {constructor}",
+            const_literal_type_display(literal_type)
+        ),
+        "type mismatch",
+    )?]))
+}
+
 fn check_const_literal_owner(
     owner: &HirOwner<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
@@ -7515,8 +7548,38 @@ fn check_const_literal_owner(
     let Some(body) = owner.body else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
+    if let Some((element, length)) =
+        resolve_const_array_type(*ty, type_paths, target_cfg.pointer_width())
+    {
+        let Some(diagnostics) = check_const_array_literal(
+            owner,
+            element,
+            length,
+            &body.value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references.as_ref(),
+        )?
+        else {
+            return Ok(ConstLiteralCheck::Unsupported);
+        };
+        return Ok(ConstLiteralCheck::SupportedArray { diagnostics });
+    }
+
     if let TyKind::Tuple(elements) = ty.kind {
         if elements.is_empty() {
+            if let Some(diagnostics) = const_constructor_kind_mismatch(
+                owner,
+                ConstLiteralType::Unit,
+                &body.value,
+                inputs,
+                snapshot,
+            )? {
+                return Ok(ConstLiteralCheck::SupportedUnit { diagnostics });
+            }
             let unit_references = check_const_reference_expression(
                 owner.id,
                 ConstLiteralType::Unit,
@@ -7580,6 +7643,19 @@ fn check_const_literal_owner(
     let Some(literal_type) = resolve_const_literal_type(*ty, type_paths, symbols, inputs) else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
+
+    if let Some(diagnostics) =
+        const_constructor_kind_mismatch(owner, literal_type, &body.value, inputs, snapshot)?
+    {
+        return Ok(match literal_type {
+            ConstLiteralType::Primitive(primitive) => ConstLiteralCheck::Supported {
+                primitive,
+                diagnostics,
+            },
+            ConstLiteralType::Str => ConstLiteralCheck::SupportedStr { diagnostics },
+            ConstLiteralType::Unit => ConstLiteralCheck::SupportedUnit { diagnostics },
+        });
+    }
 
     let reference_diagnostics = check_const_reference_expression(
         owner.id,
@@ -17453,7 +17529,7 @@ fn is_const_scalar_expression_shape(
     }
 }
 
-fn is_const_tuple_expression_shape(
+fn is_const_constructor_expression_shape(
     owner: OwnerId,
     value: &HirExpr<'_>,
     const_references: Option<&ConstReferenceContext<'_, '_>>,
@@ -17461,27 +17537,89 @@ fn is_const_tuple_expression_shape(
     if is_const_scalar_expression_shape(owner, value, const_references) {
         return true;
     }
-    let ExprKind::Tuple(elements) = value.kind else {
-        return false;
-    };
-    !elements.is_empty()
-        && elements
+    match value.kind {
+        ExprKind::Tuple(elements) => {
+            !elements.is_empty()
+                && elements.iter().all(|element| {
+                    is_const_constructor_expression_shape(owner, element, const_references)
+                })
+        }
+        ExprKind::Array(elements) => elements
             .iter()
-            .all(|element| is_const_tuple_expression_shape(owner, element, const_references))
+            .all(|element| is_const_constructor_expression_shape(owner, element, const_references)),
+        _ => false,
+    }
 }
 
-fn const_tuple_element_type_supported(
+fn resolve_const_array_type<'hir>(
+    ty: Ty<'hir>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    pointer_width: u8,
+) -> Option<(&'hir Ty<'hir>, u128)> {
+    let TyKind::Path(path) = ty.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 {
+        return None;
+    }
+    if !matches!(
+        type_paths?.paths().get(&path.hir_id),
+        Some(PathRes {
+            base: Res::PrimTy(sai_resolve::prelude::PrimTy::Array),
+            resolved_segments: 1,
+            segment_count: 1,
+        })
+    ) {
+        return None;
+    }
+    let args = path.segments[0].args?;
+    if args.args.len() != 2 {
+        return None;
+    }
+    let GenericArg::Type(element) = args.args[0] else {
+        return None;
+    };
+    let GenericArg::Const(sai_hir::types::ConstArg::Int {
+        value: Some(length),
+        negated: false,
+    }) = args.args[1]
+    else {
+        return None;
+    };
+    if length.bit_width() > pointer_width.into() {
+        return None;
+    }
+    Some((element, length))
+}
+
+fn const_constructor_element_type_supported(
     ty: Ty<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+    pointer_width: u8,
 ) -> bool {
     if let TyKind::Tuple(elements) = ty.kind
         && !elements.is_empty()
     {
         return elements.iter().all(|element| {
-            const_tuple_element_type_supported(*element, type_paths, symbols, inputs)
+            const_constructor_element_type_supported(
+                *element,
+                type_paths,
+                symbols,
+                inputs,
+                pointer_width,
+            )
         });
+    }
+    if let Some((element, _)) = resolve_const_array_type(ty, type_paths, pointer_width) {
+        return const_constructor_element_type_supported(
+            *element,
+            type_paths,
+            symbols,
+            inputs,
+            pointer_width,
+        );
     }
     resolve_const_literal_type(ty, type_paths, symbols, inputs).is_some()
 }
@@ -17497,17 +17635,33 @@ fn check_const_tuple_literal(
     target_cfg: &TargetCfg,
     const_references: Option<&ConstReferenceContext<'_, '_>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    if expected_elements
-        .iter()
-        .any(|ty| !const_tuple_element_type_supported(*ty, type_paths, symbols, inputs))
-    {
+    if expected_elements.iter().any(|ty| {
+        !const_constructor_element_type_supported(
+            *ty,
+            type_paths,
+            symbols,
+            inputs,
+            target_cfg.pointer_width(),
+        )
+    }) {
         return Ok(None);
     }
 
     let ExprKind::Tuple(values) = value.kind else {
         let ExprKind::Lit(literal) = value.kind else {
-            if !is_const_scalar_expression_shape(owner.id, value, const_references) {
+            if !is_const_constructor_expression_shape(owner.id, value, const_references) {
                 return Ok(None);
+            }
+            if matches!(value.kind, ExprKind::Array(_)) {
+                return Ok(Some(vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    value.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    "expected a tuple, found an array".to_string(),
+                    "type mismatch",
+                )?]));
             }
             let Some(found_type) = infer_const_scalar_expression_type(value, const_references)
             else {
@@ -17541,7 +17695,7 @@ fn check_const_tuple_literal(
     };
 
     if values.iter().any(|value| {
-        !is_const_tuple_expression_shape(owner.id, value, const_references)
+        !is_const_constructor_expression_shape(owner.id, value, const_references)
             && const_references
                 .is_none_or(|context| !const_reference_is_supported(owner.id, value, context))
     }) {
@@ -17565,7 +17719,7 @@ fn check_const_tuple_literal(
 
     let mut diagnostics = Vec::new();
     for (expected_ty, value) in expected_elements.iter().zip(values) {
-        let Some(mut field_diagnostics) = check_const_tuple_field(
+        let Some(mut field_diagnostics) = check_const_constructor_field(
             owner,
             *expected_ty,
             value,
@@ -17584,7 +17738,107 @@ fn check_const_tuple_literal(
     Ok(Some(diagnostics))
 }
 
-fn check_const_tuple_field(
+fn check_const_array_literal(
+    owner: &HirOwner<'_>,
+    expected_element: &Ty<'_>,
+    expected_length: u128,
+    value: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if !const_constructor_element_type_supported(
+        *expected_element,
+        type_paths,
+        symbols,
+        inputs,
+        target_cfg.pointer_width(),
+    ) {
+        return Ok(None);
+    }
+
+    let ExprKind::Array(values) = value.kind else {
+        if !is_const_constructor_expression_shape(owner.id, value, const_references) {
+            return Ok(None);
+        }
+        if matches!(value.kind, ExprKind::Tuple(elements) if !elements.is_empty()) {
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected an array, found a tuple".to_string(),
+                "type mismatch",
+            )?]));
+        }
+        let found_type = match value.kind {
+            ExprKind::Lit(literal) => Some(const_literal_found_type(literal).to_string()),
+            _ => infer_const_scalar_expression_type(value, const_references)
+                .map(|ty| format!("`{}`", const_literal_type_display(ty))),
+        };
+        let Some(found_type) = found_type else {
+            return Ok(None);
+        };
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected an array, found {found_type}"),
+            "type mismatch",
+        )?]));
+    };
+
+    if values.iter().any(|value| {
+        !is_const_constructor_expression_shape(owner.id, value, const_references)
+            && const_references
+                .is_none_or(|context| !const_reference_is_supported(owner.id, value, context))
+    }) {
+        return Ok(None);
+    }
+    if values.len() as u128 != expected_length {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::ArrayLengthMismatch,
+            format!(
+                "expected array length {}, found {}",
+                expected_length,
+                values.len()
+            ),
+            "array length mismatch",
+        )?]));
+    }
+
+    let mut diagnostics = Vec::new();
+    for value in values {
+        let Some(mut element_diagnostics) = check_const_constructor_field(
+            owner,
+            *expected_element,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut element_diagnostics);
+    }
+    Ok(Some(diagnostics))
+}
+
+fn check_const_constructor_field(
     owner: &HirOwner<'_>,
     expected_ty: Ty<'_>,
     value: &HirExpr<'_>,
@@ -17610,10 +17864,40 @@ fn check_const_tuple_field(
             const_references,
         );
     }
+    if let Some((element, length)) =
+        resolve_const_array_type(expected_ty, type_paths, target_cfg.pointer_width())
+    {
+        return check_const_array_literal(
+            owner,
+            element,
+            length,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        );
+    }
     let Some(expected_type) = resolve_const_literal_type(expected_ty, type_paths, symbols, inputs)
     else {
         return Ok(None);
     };
+    if matches!(value.kind, ExprKind::Array(_)) {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found an array",
+                const_literal_type_display(expected_type)
+            ),
+            "type mismatch",
+        )?]));
+    }
     if matches!(value.kind, ExprKind::Tuple(elements) if !elements.is_empty()) {
         return Ok(Some(vec![const_literal_diagnostic(
             owner.id,
@@ -101036,7 +101320,7 @@ property "shared"() {}
                 "direct unit literal at owner index {index} is supported"
             );
         }
-        for index in [2, 3, 4] {
+        for index in [2, 3, 4, 5] {
             let ConstLiteralCheck::SupportedUnit { diagnostics } = checks[index] else {
                 panic!("unit type mismatch at owner index {index} should be diagnosed");
             };
@@ -101049,7 +101333,7 @@ property "shared"() {}
             assert!(diagnostics[0].has_workspace_snapshot());
             assert!(diagnostics[0].primary().is_some());
         }
-        for index in [5, 6, 7] {
+        for index in [6, 7] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
@@ -101170,16 +101454,16 @@ property "shared"() {}
         };
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
-        assert_eq!(
-            checks[13],
-            &ConstLiteralCheck::Unsupported,
-            "nonempty tuple values against unit remain gated without tuple inference"
-        );
-        assert_eq!(
-            checks[14],
-            &ConstLiteralCheck::Unsupported,
-            "nonempty tuple values against scalar types remain gated"
-        );
+        let ConstLiteralCheck::SupportedUnit { diagnostics } = checks[13] else {
+            panic!("nonempty tuple values against unit should be diagnosed");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        let ConstLiteralCheck::Supported { diagnostics, .. } = checks[14] else {
+            panic!("nonempty tuple values against scalar types should be diagnosed");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
         let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[15] else {
             panic!("multiple supported tuple field errors should be collected");
         };
@@ -101202,11 +101486,18 @@ property "shared"() {}
             },
             "nested tuple constructor at owner index 8 is supported"
         );
-        for index in [9, 10, 11] {
+        assert_eq!(
+            checks[9],
+            &ConstLiteralCheck::SupportedArray {
+                diagnostics: Vec::new(),
+            },
+            "array constructor at owner index 9 is supported"
+        );
+        for index in [10, 11] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "array, block, or alias form at owner index {index} stays gated"
+                "block or alias form at owner index {index} stays gated"
             );
         }
     }
