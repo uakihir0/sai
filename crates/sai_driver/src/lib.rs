@@ -7520,6 +7520,7 @@ fn check_function_body_type(
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    const_path_types: Option<&HashMap<HirId, FunctionDirectType>>,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -7564,6 +7565,7 @@ fn check_function_body_type(
         locals,
         type_paths,
         direct_call_signatures,
+        const_path_types,
         semantic_types,
         symbols,
         inputs,
@@ -7584,6 +7586,7 @@ fn check_function_body_shape_dispatch(
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    const_path_types: Option<&HashMap<HirId, FunctionDirectType>>,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -7599,6 +7602,7 @@ fn check_function_body_shape_dispatch(
             locals,
             type_paths,
             direct_call_signatures,
+            const_path_types,
             semantic_types,
             symbols,
             None,
@@ -8110,6 +8114,7 @@ fn check_inherent_method_body_type<'a>(
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    const_path_types: Option<&HashMap<HirId, FunctionDirectType>>,
     method_call_sites: Option<&StrSelfMethodCallSiteInputs<'a, 'a>>,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
@@ -8198,6 +8203,7 @@ fn check_inherent_method_body_type<'a>(
             locals,
             type_paths,
             direct_call_signatures,
+            const_path_types,
             semantic_types,
             symbols,
             inputs,
@@ -8542,6 +8548,7 @@ fn check_inherent_method_body_type<'a>(
         locals,
         type_paths,
         Some(&prim_calls),
+        const_path_types,
         semantic_types,
         symbols,
         Some(&self_field_projections),
@@ -10172,6 +10179,7 @@ fn check_function_body_primitive_local_block(
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    const_path_types: Option<&HashMap<HirId, FunctionDirectType>>,
     semantic_types: &sai_ty::ty::TyInterner,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
@@ -10187,6 +10195,28 @@ fn check_function_body_primitive_local_block(
     )>,
     OwnerControlFlowResolutionError,
 > {
+    *inputs.const_path_sites.borrow_mut() = const_path_types.cloned();
+    // Member-access consts (`helper.LIMIT`) desugar to the same leaves
+    // `self.<field>` projections use: merge the const sites into the
+    // projection maps so every existing Field-leaf admission accepts
+    // them and the kernel reads the same type it would for a field.
+    let mut merged_fields = self_field_projections.cloned().unwrap_or_default();
+    let mut merged_str_fields = str_self_field_projections.cloned().unwrap_or_default();
+    if let Some(types) = const_path_types {
+        for (hir_id, ty) in types {
+            match ty {
+                FunctionDirectType::Primitive(primitive) => {
+                    merged_fields.entry(*hir_id).or_insert(*primitive);
+                }
+                FunctionDirectType::Str => {
+                    merged_str_fields.entry(*hir_id).or_insert("`Str`");
+                }
+                FunctionDirectType::Unit => {}
+            }
+        }
+    }
+    let self_field_projections = Some(&merged_fields);
+    let str_self_field_projections = Some(&merged_str_fields);
     let mut initial_bindings = HashMap::new();
     let mut str_admissions = StrShapeAdmissions::default();
     if sig.params.len() != body.params.len() {
@@ -10308,6 +10338,7 @@ fn check_function_body_primitive_local_block(
     // binding in the body precedes the tail.
     let mut primitive_types = HashMap::new();
     let mut block_bindings = initial_bindings.keys().copied().collect::<HashSet<_>>();
+    block_bindings.insert(const_path_sentinel_binding());
     for stmt in block.stmts {
         if let StmtKind::Let { pat, .. } = stmt.kind {
             if let PatKind::Binding { binding, .. } = pat.kind {
@@ -10391,6 +10422,7 @@ fn check_function_body_primitive_local_block(
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
+        && tail_binding.is_none()
         && !is_supported_field_tail
         && !is_supported_call_tail
         && !is_supported_unary_tail
@@ -10461,6 +10493,7 @@ fn check_function_body_primitive_local_block(
     // `Str` parameters are admitted everywhere a preceding local is — the
     // kernel decides which operand positions still reject `LocalType::Str`.
     preceding_bindings.extend(str_admissions.locals.iter().copied());
+    preceding_bindings.insert(const_path_sentinel_binding());
     // `let` annotations nested inside any admitted subexpression —
     // call-argument `if`/`match` branches above all — must reach the
     // kernel's `primitive_types`/`str_annotations` maps or the check
@@ -10617,6 +10650,25 @@ fn check_function_body_primitive_local_block(
             _ => None,
         })
         .collect::<HashMap<_, _>>();
+    let const_path_types = const_path_types.map(|types| {
+        types
+            .iter()
+            .map(|(hir_id, ty)| {
+                (
+                    *hir_id,
+                    match ty {
+                        FunctionDirectType::Primitive(primitive) => {
+                            sai_ty::typeck::body::ConstPathType::Primitive(*primitive)
+                        }
+                        FunctionDirectType::Str => sai_ty::typeck::body::ConstPathType::Str,
+                        FunctionDirectType::Unit => {
+                            unreachable!("unit consts are not indexed")
+                        }
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    });
     let check = sai_ty::typeck::body::check_primitive_local_block_body(
         sai_ty::typeck::body::PrimitiveBodyInput {
             body,
@@ -10628,6 +10680,7 @@ fn check_function_body_primitive_local_block(
             self_field_projections,
             str_self_field_projections,
             unknown_self_fields,
+            const_path_types: const_path_types.as_ref(),
             local_paths: &local_paths,
             call_signatures: direct_call_signatures,
             mutable_params: Some(&mutable_params),
@@ -10682,6 +10735,17 @@ fn is_function_primitive_local_comparison_operator(operator: BinOp) -> bool {
     )
 }
 
+// Sentinel binding returned for `Path` expressions that resolve to a
+// checked `const` item (`LIMIT`, `use .{LIMIT}`). Consts carry no real
+// `BindingId`, but every leaf admission mirrors "known local binding"
+// via a `preceding_bindings`/`block_bindings` membership test — seeding
+// this sentinel into those sets admits the const leaf wherever a local
+// would pass. The kernel reads the recorded site type before it ever
+// reaches the binding, so the sentinel only exists driver-side.
+fn const_path_sentinel_binding() -> sai_hir::BindingId {
+    sai_intern::Idx::from_raw(u32::MAX)
+}
+
 fn resolved_plain_local_path_binding(
     path: HirPath<'_>,
     locals: &LocalResolution,
@@ -10700,6 +10764,14 @@ fn resolved_plain_local_path_binding(
             resolved_segments: 1,
             segment_count: 1,
         }) => Some(*binding),
+        _ if inputs
+            .const_path_sites
+            .borrow()
+            .as_ref()
+            .is_some_and(|sites| sites.contains_key(&path.hir_id)) =>
+        {
+            Some(const_path_sentinel_binding())
+        }
         _ => None,
     }
 }
@@ -15640,6 +15712,82 @@ fn direct_primitive_call_sites(
         &mut calls,
     );
     calls
+}
+
+/// Const-reference sites in one body: `LIMIT`-style paths that resolve
+/// to `Res::Def(DefKind::Const)` and `helper2.LIMIT` member accesses on
+/// a module alias. Each maps the expression's `HirId` to the const's
+/// declared type so the kernel can stand the reference in as a value.
+fn const_literal_path_sites(
+    body: &sai_hir::body::Body<'_>,
+    module_paths: &ModuleResolution,
+    const_types: &HashMap<DefId, FunctionDirectType>,
+    requesting_package: PackageId,
+    members: &ModuleMemberIndex<'_>,
+) -> HashMap<HirId, FunctionDirectType> {
+    let mut sites = HashMap::new();
+    if module_paths.owner != body.owner {
+        return sites;
+    }
+    visit_expression_tree(&body.value, &mut |expression| {
+        let const_type = match expression.kind {
+            ExprKind::Path(path) => {
+                if path.root != PathRoot::Plain
+                    || path.segments.len() != 1
+                    || path.segments[0].args.is_some()
+                {
+                    None
+                } else {
+                    match module_paths.paths.get(&path.hir_id) {
+                        Some(PathRes {
+                            base: Res::Def(DefKind::Const, def),
+                            resolved_segments: 1,
+                            segment_count: 1,
+                        }) => const_types.get(def).copied(),
+                        _ => None,
+                    }
+                }
+            }
+            ExprKind::Field {
+                base,
+                name,
+                args: None,
+            } => {
+                let ExprKind::Path(base_path) = base.kind else {
+                    return;
+                };
+                if base_path.root != PathRoot::Plain
+                    || base_path.segments.len() != 1
+                    || base_path.segments[0].args.is_some()
+                {
+                    return;
+                }
+                let Some(PathRes {
+                    base: base_res,
+                    resolved_segments: 1,
+                    segment_count: 1,
+                }) = module_paths.paths.get(&base_path.hir_id)
+                else {
+                    return;
+                };
+                match members.lookup(*base_res, name.sym, requesting_package) {
+                    ModuleMemberLookup::Found(binding) => match binding.res {
+                        Res::Def(DefKind::Const, def) => const_types.get(&def).copied(),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(const_type) = const_type {
+            sites.insert(expression.hir_id, const_type);
+            if let ExprKind::Path(path) = expression.kind {
+                sites.insert(path.hir_id, const_type);
+            }
+        }
+    });
+    sites
 }
 
 // Visit every expression node in a body, pre-order, including nested
@@ -27636,6 +27784,10 @@ struct CurrentOwnerInputs {
     // `self.<method>(..)` call signatures for the same window — keyed
     // by the call's `HirId`, holding parameter and output families.
     str_self_method_calls: std::cell::RefCell<Option<HashMap<HirId, StrSelfMethodCallSignature>>>,
+    // Const-reference leaf sites (`LIMIT`, `use .{LIMIT}`, `helper.LIMIT`)
+    // for the body currently walking the primitive path — keyed by the
+    // reference expression's `HirId`, `None` outside a checked owner.
+    const_path_sites: std::cell::RefCell<Option<HashMap<HirId, FunctionDirectType>>>,
 }
 
 fn index_top_level_owner_descriptors(
@@ -35018,6 +35170,7 @@ impl RootDatabase {
             source_ref,
             str_self_field_projections: std::cell::RefCell::new(None),
             str_self_method_calls: std::cell::RefCell::new(None),
+            const_path_sites: std::cell::RefCell::new(None),
         })
     }
 
@@ -35572,6 +35725,143 @@ impl RootDatabase {
         signatures
     }
 
+    /// Package-wide `pub const` declared-type table for const references
+    /// (`LIMIT`, `helper2.LIMIT`) in primitive bodies. Only consts whose
+    /// annotation resolves to a supported primitive family or `Str` are
+    /// indexed; duplicate definitions drop the name like the fn index.
+    fn index_const_literal_types(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        snapshot: &WorkspaceSnapshot,
+        top_level_owner_index: &HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
+        module_members: &ModuleMemberIndex<'_>,
+        source_graph_packages: &HashSet<PackageId>,
+    ) -> HashMap<DefId, FunctionDirectType> {
+        let Ok(primitive_prelude) = self.primitive_prelude.clone() else {
+            return HashMap::new();
+        };
+        let mut const_types = HashMap::new();
+        let mut ambiguous_definitions = HashSet::new();
+        let mut owner_inputs_by_file = HashMap::<FileId, Option<CurrentOwnerInputs>>::new();
+
+        for descriptor in &collection.scopes.top_level_owners {
+            if descriptor.kind != TopLevelOwnerKind::Const {
+                continue;
+            }
+            let def_id = descriptor.owner.def_id.to_def_id();
+            if descriptor.owner.def_id.package() != collection.module_tree.package
+                || def_id.package != collection.module_tree.package
+            {
+                continue;
+            }
+            if !owner_inputs_by_file.contains_key(&descriptor.file) {
+                owner_inputs_by_file.insert(
+                    descriptor.file,
+                    self.current_owner_inputs(snapshot, descriptor.file, &collection.target_cfg)
+                        .ok(),
+                );
+            }
+            let Some(Some(inputs)) = owner_inputs_by_file.get(&descriptor.file) else {
+                continue;
+            };
+            let Ok(module_scope) =
+                module_scope_for_file(collection, &collection.module_tree, descriptor.file)
+            else {
+                continue;
+            };
+            let Ok(owner_descriptor) = find_top_level_owner_descriptor(
+                top_level_owner_index,
+                descriptor.owner,
+                descriptor.file,
+                descriptor.item_id,
+                TopLevelOwnerKind::Const,
+            ) else {
+                continue;
+            };
+            let Some(def_paths) = self.def_paths.get(&descriptor.owner.def_id.package()) else {
+                continue;
+            };
+            let Ok(Some(expected_path)) = def_paths.resolve_def_id(def_id) else {
+                continue;
+            };
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &inputs.ast_ids,
+                snapshot,
+                &inputs.root,
+                &arena,
+                &self.symbols,
+                def_paths,
+            );
+            let Ok((hir_owner, _source_map)) = lower_top_level_owner(
+                owner_descriptor,
+                &expected_path,
+                &inputs.filtered_item_tree,
+                &inputs.retained_item_kinds,
+                &context,
+            ) else {
+                continue;
+            };
+            if !hir_owner.raw_attrs.is_empty() || hir_owner.id != descriptor.owner {
+                continue;
+            }
+            let OwnerNode::Item(item) = hir_owner.node else {
+                continue;
+            };
+            let ItemKind::Const { ty } = item.kind else {
+                continue;
+            };
+            if item.vis != Visibility::Pub {
+                continue;
+            }
+            let Ok(name) = self.symbols.resolve(item.name.sym) else {
+                continue;
+            };
+            let Some(written_name) = inputs.source.text().get(
+                item.name.span.range.start().to_usize()..item.name.span.range.end().to_usize(),
+            ) else {
+                continue;
+            };
+            if !is_supported_const_name_convention(&name, written_name) {
+                continue;
+            }
+            let type_path_candidates = owner_test_only_path_candidates(&hir_owner);
+            let type_paths = resolve_type_owner_module_paths(
+                descriptor.owner,
+                &type_path_candidates,
+                &HashMap::new(),
+                &primitive_prelude,
+                &HashSet::new(),
+                module_scope,
+                Some(module_members),
+                descriptor.owner.def_id.package(),
+                Some(source_graph_packages),
+            );
+            let Some(const_type) =
+                (match resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs) {
+                    Some(ConstLiteralType::Primitive(primitive))
+                        if sai_ty::typeck::literal::supports_primitive_literal(primitive) =>
+                    {
+                        Some(FunctionDirectType::Primitive(primitive))
+                    }
+                    Some(ConstLiteralType::Str) => Some(FunctionDirectType::Str),
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            if ambiguous_definitions.contains(&def_id) {
+                continue;
+            }
+            if const_types.insert(def_id, const_type).is_some() {
+                const_types.remove(&def_id);
+                ambiguous_definitions.insert(def_id);
+            }
+        }
+
+        const_types
+    }
+
     /// Resolves loop labels, lexical locals, module paths, and local
     /// qualified type prefixes for each current top-level function owner.
     /// Unqualified module scopes are taken from the exact scope associated
@@ -35774,6 +36064,13 @@ impl RootDatabase {
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let primitive_function_call_signatures = self.index_direct_primitive_function_signatures(
+            collection,
+            snapshot,
+            &top_level_owner_index,
+            &module_members,
+            source_graph_packages,
+        );
+        let const_literal_types = self.index_const_literal_types(
             collection,
             snapshot,
             &top_level_owner_index,
@@ -36120,12 +36417,23 @@ impl RootDatabase {
                                                 &module_members,
                                             )
                                         });
+                                    let const_path_sites =
+                                        module_paths.as_ref().ok().map(|module_paths| {
+                                            const_literal_path_sites(
+                                                body,
+                                                module_paths,
+                                                &const_literal_types,
+                                                collection.module_tree.package,
+                                                &module_members,
+                                            )
+                                        });
                                     body_type_check = Some(check_function_body_type(
                                         &hir_owner,
                                         body,
                                         &locals,
                                         resolved_type_paths,
                                         direct_call_signatures.as_ref(),
+                                        const_path_sites.as_ref(),
                                         &self.semantic_types,
                                         &self.symbols,
                                         &inputs,
@@ -45609,6 +45917,13 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
         );
+        let const_literal_types = self.index_const_literal_types(
+            collection,
+            snapshot,
+            &top_level_owner_index,
+            &module_members,
+            source_graph_packages,
+        );
         let mut owners = Vec::with_capacity(descriptors.len());
 
         for descriptor in descriptors.iter().copied() {
@@ -45996,6 +46311,13 @@ impl RootDatabase {
                                         &inputs,
                                         &module_members,
                                     );
+                                    let const_path_sites = const_literal_path_sites(
+                                        body,
+                                        &module,
+                                        &const_literal_types,
+                                        collection.module_tree.package,
+                                        &module_members,
+                                    );
                                     let str_use_shadow =
                                         use_shadows_str(module_scope, &self.symbols);
                                     body_type_check = if descriptor.kind == TopLevelOwnerKind::Impl
@@ -46007,6 +46329,7 @@ impl RootDatabase {
                                             &locals,
                                             resolved_type_paths,
                                             Some(&direct_call_signatures),
+                                            Some(&const_path_sites),
                                             Some(&method_call_sites),
                                             &self.semantic_types,
                                             &self.symbols,
@@ -66811,6 +67134,7 @@ property "shared"() {}
                 self_field_projections: None,
                 unknown_self_fields: None,
                 str_self_field_projections: None,
+                const_path_types: None,
                 local_paths: &diagnostic_order_local_paths,
                 call_signatures: None,
                 mutable_params: None,
@@ -93914,7 +94238,15 @@ property "shared"() {}
                 .expect("a Bool literal operand in a conjunction is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [3, 5, 7, 11, 12] {
+        assert!(matches!(
+            owners[11]
+                .body_type_check()
+                .expect("a bare parameter path tail is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        for index in [3, 5, 7, 12] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()

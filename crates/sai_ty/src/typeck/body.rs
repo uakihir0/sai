@@ -49,6 +49,11 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// typed `Str` — outside `PrimTy`). A `let` binding initialized from
     /// one becomes a `Str` local.
     pub str_self_field_projections: Option<&'a HashMap<HirId, &'static str>>,
+    /// Path and module-member expressions the owner-aware driver resolved
+    /// to a `const` item (`LIMIT`, `helper2.LIMIT`): the const's declared
+    /// type stands in for the value position. `Str` is not a `PrimTy`,
+    /// so the map carries its own kind.
+    pub const_path_types: Option<&'a HashMap<HirId, ConstPathType>>,
     pub local_paths: &'a HashMap<HirId, BindingId>,
     /// Direct, supported function signatures resolved for call expressions
     /// in this owner's simple block.
@@ -84,6 +89,14 @@ pub enum PrimitiveCallOutput {
 /// way a `Str` annotation does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrimitiveCallParameter {
+    Primitive(PrimTy),
+    Str,
+}
+
+/// The declared type of a const reference the driver resolved: a
+/// primitive literal family or `Str`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConstPathType {
     Primitive(PrimTy),
     Str,
 }
@@ -4030,7 +4043,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             match expression.kind {
                 ExprKind::Call { .. } => self.check_direct_call(expression, false)?,
                 ExprKind::Field { .. } => {
-                    if let Some(primitive) = self
+                    if let Some(local_type) = self.const_path_local_type(expression) {
+                        local_type
+                    } else if let Some(primitive) = self
                         .input
                         .self_field_projections
                         .and_then(|fields| fields.get(&expression.hir_id))
@@ -4967,7 +4982,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         .and_then(|fields| fields.get(&expression.hir_id))
                         .copied(),
                     Some("`Str`")
-                ) =>
+                ) || self.const_path_local_type(expression) == Some(LocalType::Str) =>
             {
                 self.record_expression_type(expression.hir_id, LocalType::Str);
                 Ok(())
@@ -5023,7 +5038,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .and_then(|fields| fields.get(&expression.hir_id))
             {
                 Some(primitive) => LocalType::Concrete(*primitive),
-                None => return Err(()),
+                None => self.const_path_local_type(expression).ok_or(())?,
             },
             // Any other resolvable expression (operand trees) still
             // reports the `Str` mismatch with its resolved type
@@ -5308,6 +5323,26 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     ) -> Result<InitializerCheck, ()> {
         let mut deferred_neg_result = false;
         let mut deferred_bitnot_result = false;
+        if let Some(local_type) = self.const_path_local_type(init) {
+            // A const initializer (`let x = LIMIT`, `let x = helper2.LIMIT`)
+            // binds its declared type and still unifies with the
+            // annotation — `let b: Bool = LIMIT` reports TypeMismatch.
+            // On a mismatch the binding takes the annotation so the
+            // error stays at the initializer instead of echoing at
+            // every later use.
+            self.record_expression_type(init.hir_id, local_type);
+            let local_type = if let Some(expected) = annotation {
+                self.check_annotated_path(local_type, expected, init.hir_id)?;
+                LocalType::Concrete(expected)
+            } else {
+                local_type
+            };
+            return Ok(InitializerCheck {
+                local_type,
+                deferred_neg_result,
+                deferred_bitnot_result,
+            });
+        }
         let local_type = if self.expression_has_unknown_field_error(init) {
             self.check_error_tainted_expression(init)?;
             if let Some(id) = self.error_tainted_literal_variable(init) {
@@ -6584,12 +6619,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         expression: HirId,
     ) -> Result<LocalType, ()> {
         let source_type = self.check_local_path(operand)?;
-        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
-        if self
-            .deferred_bitnot_result_bindings
-            .contains(&source_binding)
-        {
-            return Err(());
+        if self.const_path_local_type(operand).is_none() {
+            let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+            if self
+                .deferred_bitnot_result_bindings
+                .contains(&source_binding)
+            {
+                return Err(());
+            }
         }
         if let LocalType::LiteralVariable(id) = source_type {
             let is_eligible_literal_source = self.is_eligible_unannotated_literal_path(operand);
@@ -6655,9 +6692,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         expression: HirId,
     ) -> Result<LocalType, ()> {
         let source_type = self.check_local_path(operand)?;
-        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
-        if self.deferred_neg_result_bindings.contains(&source_binding) {
-            return Err(());
+        if self.const_path_local_type(operand).is_none() {
+            let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+            if self.deferred_neg_result_bindings.contains(&source_binding) {
+                return Err(());
+            }
         }
         if let LocalType::LiteralVariable(id) = source_type {
             let is_eligible_literal_source = self.is_eligible_unannotated_literal_path(operand);
@@ -6732,9 +6771,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Ok((LocalType::Concrete(operand_type), false));
         }
         let source_type = self.check_local_path(operand)?;
-        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
-        if self.deferred_neg_result_bindings.contains(&source_binding) {
-            return Err(());
+        if self.const_path_local_type(operand).is_none() {
+            let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+            if self.deferred_neg_result_bindings.contains(&source_binding) {
+                return Err(());
+            }
         }
         if let LocalType::LiteralVariable(id) = source_type {
             let eligible_literal_path = self.is_eligible_unannotated_literal_path(operand);
@@ -6802,12 +6843,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Ok((LocalType::Concrete(operand_type), false));
         }
         let source_type = self.check_local_path(operand)?;
-        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
-        if self
-            .deferred_bitnot_result_bindings
-            .contains(&source_binding)
-        {
-            return Err(());
+        if self.const_path_local_type(operand).is_none() {
+            let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+            if self
+                .deferred_bitnot_result_bindings
+                .contains(&source_binding)
+            {
+                return Err(());
+            }
         }
         if let LocalType::LiteralVariable(id) = source_type {
             let eligible_literal_path = self.is_eligible_unannotated_literal_path(operand);
@@ -8338,7 +8381,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
+    // A path or member expression the driver resolved to a `const`
+    // item (`LIMIT`, `helper2.LIMIT`) stands in for its declared type.
+    fn const_path_local_type(&self, expression: &Expr<'hir>) -> Option<LocalType> {
+        self.input
+            .const_path_types
+            .and_then(|types| types.get(&expression.hir_id))
+            .map(|ty| match ty {
+                ConstPathType::Primitive(primitive) => LocalType::Concrete(*primitive),
+                ConstPathType::Str => LocalType::Str,
+            })
+    }
+
     fn check_local_path(&self, expression: &Expr<'hir>) -> Result<LocalType, ()> {
+        if let Some(local_type) = self.const_path_local_type(expression) {
+            self.record_expression_type(expression.hir_id, local_type);
+            return Ok(local_type);
+        }
         let local_type = self.resolve_local_path(expression)?;
         let binding = self.plain_local_path_binding(expression).ok_or(())?;
         if self.trusted_bindings.contains(&binding) {
@@ -8358,6 +8417,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match self.check_local_path(expression) {
             Ok(local_type) => Ok(local_type),
             Err(()) => {
+                // A member const (`helper2.LIMIT`) is a `Field` operand —
+                // its driver-resolved type stands in directly.
+                if let Some(local_type) = self.const_path_local_type(expression) {
+                    self.record_expression_type(expression.hir_id, local_type);
+                    return Ok(local_type);
+                }
                 // A nested operand can be reached through several operand
                 // checks (e.g. once per comparison loop iteration); reuse
                 // the recorded type so a literal group created by the first

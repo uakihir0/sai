@@ -5168,15 +5168,6 @@ fn unsupported_inherent_method_shapes_remain_gated() {
             ),
         ),
         (
-            "body without a local block",
-            concat!(
-                "type Counter { marker: I32 }\n",
-                "impl Counter {\n",
-                "    pub fn identity(self: borrow Self, value: I32) -> I32 { value }\n",
-                "}\n",
-            ),
-        ),
-        (
             "unresolved nominal field type",
             concat!(
                 "type Counter { marker: Missing }\n",
@@ -5243,6 +5234,17 @@ fn unsupported_inherent_method_shapes_remain_gated() {
     for (shape, source) in cases {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), shape);
     }
+
+    // A bare parameter path tail (`{ value }`) type-checks like an
+    // annotated one — the method body diagnoses `TypeMismatch` rather
+    // than gating (IR-1144).
+    let source = concat!(
+        "type Counter { marker: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn identity(self: borrow Self, value: I32) -> I32 { value }\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
 
 #[test]
@@ -6254,20 +6256,22 @@ fn unsupported_flat_unannotated_primitive_local_forms_remain_gated() {
 
     let source = concat!(
         "use acme:empty/values as values\n",
+        "pub const LOCAL: I32 = 0\n",
         "pub fn qualified_path() -> I32 {\n",
         "    let source = 1\n",
         "    let copied = values.VALUE\n",
         "    copied\n",
         "}\n",
     );
-    assert_check_stays_gated(
-        &run_check(
+    assert_success_result(
+        run_check(
             source,
             "",
             &[("src/values.sai", "pub const VALUE: I32 = 42\n")],
             &[],
         ),
-        source,
+        "wasm32-core",
+        "dev",
     );
 }
 
@@ -10384,16 +10388,17 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
 
     for (function, operator) in [("sub", "-"), ("mul", "*"), ("div", "/")] {
         let source = format!(
-            "use acme:empty/values as values\npub fn {function}(right: I32) -> I32 {{\n    let result = values.VALUE {operator} right\n    result\n}}\n"
+            "use acme:empty/values as values\npub const LOCAL: I32 = 0\npub fn {function}(right: I32) -> I32 {{\n    let result = values.VALUE {operator} right\n    result\n}}\n"
         );
-        assert_check_stays_gated(
-            &run_check(
+        assert_success_result(
+            run_check(
                 &source,
                 "",
                 &[("src/values.sai", "pub const VALUE: I32 = 42\n")],
                 &[],
             ),
-            &source,
+            "wasm32-core",
+            "dev",
         );
     }
 }
@@ -10473,15 +10478,16 @@ fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
     let source = "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n";
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 
-    let source = "use acme:empty/values as values\npub fn add(right: I32) -> I32 {\n    let sum = values.VALUE + right\n    sum\n}\n";
-    assert_check_stays_gated(
-        &run_check(
+    let source = "use acme:empty/values as values\npub const LOCAL: I32 = 0\npub fn add(right: I32) -> I32 {\n    let sum = values.VALUE + right\n    sum\n}\n";
+    assert_success_result(
+        run_check(
             source,
             "",
             &[("src/values.sai", "pub const VALUE: I32 = 42\n")],
             &[],
         ),
-        source,
+        "wasm32-core",
+        "dev",
     );
 }
 
@@ -10589,15 +10595,16 @@ fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 
-    let source = "use acme:empty/values as values\npub fn compare(right: I32) -> Bool {\n    let result = values.VALUE == right\n    result\n}\n";
-    assert_check_stays_gated(
-        &run_check(
+    let source = "use acme:empty/values as values\npub const LOCAL: I32 = 0\npub fn compare(right: I32) -> Bool {\n    let result = values.VALUE == right\n    result\n}\n";
+    assert_success_result(
+        run_check(
             source,
             "",
             &[("src/values.sai", "pub const VALUE: I32 = 42\n")],
             &[],
         ),
-        source,
+        "wasm32-core",
+        "dev",
     );
 }
 
@@ -10858,19 +10865,21 @@ fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
 
     let qualified = concat!(
         "use acme:empty/values as values\n",
+        "pub const LOCAL: I32 = 0\n",
         "pub fn compare(value: I32) -> Bool {\n",
         "    let result = values.LIMIT < value\n",
         "    result\n",
         "}\n",
     );
-    assert_check_stays_gated(
-        &run_check(
+    assert_success_result(
+        run_check(
             qualified,
             "",
             &[("src/values.sai", "pub const LIMIT: I32 = 10\n")],
             &[],
         ),
-        qualified,
+        "wasm32-core",
+        "dev",
     );
 }
 
@@ -10994,19 +11003,21 @@ fn unsupported_primitive_logical_local_initializer_shapes_remain_gated() {
 
     let source = concat!(
         "use acme:empty/values as values\n",
+        "pub const LOCAL: I32 = 0\n",
         "pub fn logical(flag: Bool) -> Bool {\n",
         "    let result = values.FLAG and flag\n",
         "    result\n",
         "}\n",
     );
-    assert_check_stays_gated(
-        &run_check(
+    assert_success_result(
+        run_check(
             source,
             "",
             &[("src/values.sai", "pub const FLAG: Bool = true\n")],
             &[],
         ),
-        source,
+        "wasm32-core",
+        "dev",
     );
 }
 
@@ -11172,19 +11183,21 @@ fn unsupported_primitive_local_not_shapes_remain_gated() {
 
     let source = concat!(
         "use acme:empty/values as values\n",
+        "pub const LOCAL: I32 = 0\n",
         "pub fn logical(flag: Bool) -> Bool {\n",
         "    let result = not values.READY\n",
         "    result\n",
         "}\n",
     );
-    assert_check_stays_gated(
-        &run_check(
+    assert_success_result(
+        run_check(
             source,
             "",
             &[("src/values.sai", "pub const READY: Bool = true\n")],
             &[],
         ),
-        source,
+        "wasm32-core",
+        "dev",
     );
 }
 
@@ -12463,7 +12476,6 @@ fn target_filtered_public_name_does_not_report_a_name_error() {
 #[test]
 fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     for source in [
-        "pub fn local(value: I32) -> I32 { let next = value; next }\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",
@@ -12476,7 +12488,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet r#value = 42\nr#value\n}\n",
         "pub fn local() -> I32 {\nlet value = 42\nr#value\n}\n",
         "const ONE: I32 = 1\npub fn local() -> I32 {\nlet value = 42\nONE\n}\n",
-        "pub fn str_param_to_integer(value: Str) -> I32 { value }\n",
         "pub fn str_param_to_unit(value: Str) -> () { value }\n",
         "pub fn str_param_without_return(value: Str) { value }\n",
         "pub fn self_str_identity(self: Str) -> Str { self }\n",
@@ -12528,6 +12539,24 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         assert_check_stays_gated(
             &run_check(source, "", &[], &[]),
             "function body outside the direct parameter slice",
+        );
+    }
+
+    // A bare parameter path tail checks like an annotated one: a
+    // matching copy is clean, a `Str` tail under `-> I32` reports
+    // `expected `I32`, found `Str`` instead of gating (IR-1144).
+    let source = "pub fn local(value: I32) -> I32 { let next = value\n next }\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    {
+        let source = "pub fn str_param_to_integer(value: Str) -> I32 { value }\n";
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && stdout.contains("expected `I32`, found `Str`")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "a bare `Str` parameter tail reports its mismatch:\n{stdout}"
         );
     }
 
@@ -22393,4 +22422,136 @@ fn multi_file_source_with_unresolved_str_import_does_not_also_gate() {
         !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
         "an unresolved import must not add a feature gate: {stdout}"
     );
+}
+
+#[test]
+fn multi_file_source_with_use_member_const_checks() {
+    // `use pkg/module.{CONST}` imports bind const references —
+    // `LIMIT` reads like a local scalar (IR-1144).
+    let root_source = concat!(
+        "use acme:empty/values.{LIMIT}\n",
+        "\n",
+        "pub const LOCAL: I32 = 3\n",
+        "pub fn compute() -> I32 {\n",
+        "    let sum = LIMIT + LOCAL\n",
+        "    sum\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/values.sai", "pub const LIMIT: I32 = 7\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn multi_file_source_with_module_alias_const_checks() {
+    // `use pkg/module` + `module.CONST` reads resolve through the
+    // module member namespace (IR-1144).
+    let root_source = concat!(
+        "use acme:empty/values\n",
+        "\n",
+        "pub const LOCAL: I32 = 0\n",
+        "pub fn compute(right: I32) -> I32 {\n",
+        "    let sum = values.VALUE + right\n",
+        "    sum\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/values.sai", "pub const VALUE: I32 = 42\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn multi_file_source_with_renamed_module_alias_const_checks() {
+    // `use pkg/module as alias` + `alias.CONST` (IR-1144).
+    let root_source = concat!(
+        "use acme:empty/values as v\n",
+        "\n",
+        "pub const LOCAL: I32 = 0\n",
+        "pub fn compute() -> I32 {\n",
+        "    v.VALUE + 1\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/values.sai", "pub const VALUE: I32 = 42\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn same_file_pub_const_references_check() {
+    // A same-file `pub const` reads as a typed scalar in tail,
+    // initializer, and operand positions (IR-1144).
+    let root_source = concat!(
+        "pub const LIMIT: I64 = 7\n",
+        "pub fn tail() -> I64 {\n",
+        "    LIMIT\n",
+        "}\n",
+        "pub fn compute() -> I64 {\n",
+        "    let sum = LIMIT + 1\n",
+        "    sum\n",
+        "}\n",
+    );
+    assert_success_result(run_check(root_source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn const_reference_type_mismatch_reports() {
+    // Const leaves carry their declared type — a wrong annotation
+    // reports TYPE_MISMATCH instead of gating (IR-1144).
+    let root_source = concat!(
+        "use acme:empty/values.{LIMIT}\n",
+        "\n",
+        "pub const LOCAL: I32 = 0\n",
+        "pub fn bad() -> I64 {\n",
+        "    let s: Str = LIMIT\n",
+        "    1\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/values.sai", "pub const LIMIT: I64 = 7\n")],
+        &[],
+    );
+    assert!(!output.status.success(), "const type mismatch must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+        "const type mismatches report type errors: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "const type mismatches are diagnosed, not gated: {stdout}"
+    );
+}
+
+#[test]
+fn const_reference_in_str_body_stays_gated() {
+    // `-> Str` bodies do not admit const leaves yet (IR-1144 bound).
+    let root_source = concat!(
+        "use acme:empty/values.{NAME}\n",
+        "\n",
+        "pub const LOCAL: I32 = 0\n",
+        "pub fn name() -> Str {\n",
+        "    NAME\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/values.sai", "pub const NAME: Str = \"x\"\n")],
+        &[],
+    );
+    assert_check_stays_gated(&output, "const in -> Str body");
 }
