@@ -22745,6 +22745,91 @@ fn imported_const_patterns_in_primitive_match_check() {
 }
 
 #[test]
+fn const_range_endpoints_in_primitive_match_check() {
+    // Scalar const paths can close both ends of a primitive range
+    // pattern, including module-member paths. Their values remain opaque
+    // to emptiness and exhaustiveness analysis in this slice.
+    let root_source = concat!(
+        "use acme:empty/values.{HIGH}
+",
+        "pub const LOW: I32 = 1
+",
+        "pub fn pick(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        LOW..=HIGH => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn stmt(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        LOW..=HIGH => { let inside = 1 },
+",
+        "        _ => { let inside = 2 },
+",
+        "    }
+",
+        "    0
+",
+        "}
+",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/values.sai",
+            "pub const HIGH: I32 = 9
+",
+        )],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn const_range_endpoint_type_mismatch_reports() {
+    // Every const range endpoint must have the scrutinee type.
+    let source = concat!(
+        "pub const LOW: I32 = 1
+",
+        "pub const TEXT: Str = \"x\"
+",
+        "pub fn pick(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        LOW..=TEXT => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(
+        !output.status.success(),
+        "mismatched range endpoint must fail"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `I32`, found `Str`")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "const range endpoint mismatch is diagnosed, not gated: {stdout}"
+    );
+}
+
+#[test]
 fn const_pattern_type_mismatch_reports() {
     // A const pattern must have the scrutinee's type; a `Str` const in an
     // `I32` match is diagnosed rather than gated.
