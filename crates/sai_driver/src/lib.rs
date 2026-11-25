@@ -27547,40 +27547,48 @@ fn const_initializer_reference_target(
 }
 
 fn const_reference_cycle_members(references: &HashMap<DefId, Vec<DefId>>) -> HashSet<DefId> {
-    fn visit(
-        node: DefId,
-        references: &HashMap<DefId, Vec<DefId>>,
-        states: &mut HashMap<DefId, u8>,
-        stack: &mut Vec<DefId>,
-        cyclic: &mut HashSet<DefId>,
-    ) {
-        match states.get(&node).copied() {
-            Some(2) => return,
-            Some(1) => {
-                if let Some(position) = stack.iter().position(|entry| *entry == node) {
-                    cyclic.extend(stack[position..].iter().copied());
+    let mut states = HashMap::<DefId, u8>::new();
+    let mut cyclic = HashSet::new();
+
+    for start in references.keys() {
+        if states.contains_key(start) {
+            continue;
+        }
+        states.insert(*start, 1);
+        let mut calls = vec![(*start, 0usize)];
+        let mut path = vec![*start];
+        while let Some((node, next_target)) = calls.last_mut() {
+            let target_count = references.get(node).map_or(0, Vec::len);
+            if *next_target == target_count {
+                states.insert(*node, 2);
+                calls.pop();
+                path.pop();
+                continue;
+            }
+            let target = references
+                .get(node)
+                .and_then(|targets| targets.get(*next_target))
+                .copied();
+            *next_target += 1;
+            let Some(target) = target else {
+                continue;
+            };
+            match states.get(&target).copied() {
+                Some(2) => {}
+                Some(1) => {
+                    if let Some(position) = path.iter().position(|entry| *entry == target) {
+                        cyclic.extend(path[position..].iter().copied());
+                    }
                 }
-                return;
-            }
-            _ => {}
-        }
-        states.insert(node, 1);
-        stack.push(node);
-        if let Some(targets) = references.get(&node) {
-            for target in targets {
-                visit(*target, references, states, stack, cyclic);
+                _ => {
+                    states.insert(target, 1);
+                    calls.push((target, 0));
+                    path.push(target);
+                }
             }
         }
-        stack.pop();
-        states.insert(node, 2);
     }
 
-    let mut states = HashMap::new();
-    let mut stack = Vec::new();
-    let mut cyclic = HashSet::new();
-    for node in references.keys() {
-        visit(*node, references, &mut states, &mut stack, &mut cyclic);
-    }
     cyclic
 }
 
