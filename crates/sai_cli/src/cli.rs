@@ -2350,14 +2350,14 @@ fn const_arg_is_supported_array_length(argument: &sai_syntax::ast::ConstArg) -> 
     if value.kind() != sai_syntax::SyntaxKind::INT {
         return false;
     }
-    let digits = value.text().replace('_', "");
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+    use sai_syntax::ast::AstToken as _;
+
+    let Some(length) =
+        sai_syntax::ast::IntLit::cast(value.clone()).and_then(|literal| literal.value())
+    else {
         return false;
-    }
-    if argument.minus_token().is_some() && !digits.bytes().all(|byte| byte == b'0') {
-        return false;
-    }
-    digits.parse::<u128>().is_ok()
+    };
+    argument.minus_token().is_none() || length == 0
 }
 
 fn type_has_supported_const_constructor_shape(ty: &sai_syntax::ast::Type) -> bool {

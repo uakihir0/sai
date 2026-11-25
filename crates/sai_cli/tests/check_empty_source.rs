@@ -13354,6 +13354,10 @@ fn nominal_const_constructors_check() {
             "pub const ROOT: UserId = UserId(1)\n",
             "pub fn zero() -> I32 { 0 }\n",
         ),
+        concat!(
+            "pub distinct Pair = Array<I32, 0x2>\n",
+            "pub const ROOT: Pair = Pair([1, 2])\n",
+        ),
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
