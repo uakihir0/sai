@@ -23619,6 +23619,12 @@ pub const SECOND: I32 = FIRST + 1
             "const depends on itself",
         ),
         (
+            "pub const LOOP: Bool = LOOP == true
+",
+            "CONST_CYCLE",
+            "const depends on itself",
+        ),
+        (
             "pub const VALUE: Bool = true + false
 ",
             "OPERATOR_NOT_SUPPORTED",

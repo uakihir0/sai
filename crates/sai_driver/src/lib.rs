@@ -29670,7 +29670,6 @@ fn infer_const_scalar_expression_type(
             context.module_members,
             context.requesting_package,
         )
-        && !context.cyclic.contains(&target)
     {
         return context
             .types
