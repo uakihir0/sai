@@ -16784,12 +16784,16 @@ fn str_binding_path(
     expression: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> bool {
     let ExprKind::Path(path) = expression.kind else {
         return false;
     };
     if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
         return false;
+    }
+    if str_const_entry(path.hir_id, inputs).is_some_and(|entry| entry.family == "`Str`") {
+        return true;
     }
     matches!(
         locals.paths.get(&path.hir_id),
@@ -19285,7 +19289,7 @@ fn str_condition_operand(
     inputs: &CurrentOwnerInputs,
 ) -> bool {
     matches!(expr.kind, ExprKind::Lit(Lit::Str(_)))
-        || str_binding_path(expr, locals, str_bindings)
+        || str_binding_path(expr, locals, str_bindings, inputs)
         || str_self_field_projected_family(expr, inputs) == Some("`Str`")
 }
 
@@ -22198,7 +22202,9 @@ fn str_stmt_expr_unit(
                                 target_cfg,
                             )
                         }
-                        _ if str_binding_path(value, locals, str_bindings) => Ok(Some(Vec::new())),
+                        _ if str_binding_path(value, locals, str_bindings, inputs) => {
+                            Ok(Some(Vec::new()))
+                        }
                         _ => match str_expr_family(
                             owner,
                             return_ty,
@@ -25289,7 +25295,7 @@ fn str_clean_expr(
             !loop_level
                 && str_clean_block(body, locals, str_bindings, true, inputs, call_signatures)
         }
-        _ => str_binding_path(expr, locals, str_bindings),
+        _ => str_binding_path(expr, locals, str_bindings, inputs),
     }
 }
 
@@ -25471,7 +25477,7 @@ fn check_function_str_match(
     let mut diagnostics = Vec::new();
     // The scrutinee walks like the checker's: locals and literals first,
     // then the general expression walk so calls and operand trees resolve.
-    let scrutinee_family = if str_binding_path(scrutinee, locals, str_bindings) {
+    let scrutinee_family = if str_binding_path(scrutinee, locals, str_bindings, inputs) {
         Some("`Str`")
     } else if let Some(family) = str_self_field_projected_family(scrutinee, inputs)
         .or_else(|| str_binding_family(scrutinee, locals, str_bindings, inputs))
