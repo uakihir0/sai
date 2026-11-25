@@ -22537,14 +22537,27 @@ fn const_reference_type_mismatch_reports() {
 }
 
 #[test]
-fn const_reference_in_str_body_stays_gated() {
-    // `-> Str` bodies do not admit const leaves yet (IR-1144 bound).
+fn const_reference_in_str_body_checks() {
+    // `-> Str` tails, lets, and `if` branches admit const leaves with
+    // their declared types (IR-1145).
     let root_source = concat!(
         "use acme:empty/values.{NAME}\n",
         "\n",
         "pub const LOCAL: I32 = 0\n",
         "pub fn name() -> Str {\n",
         "    NAME\n",
+        "}\n",
+        "pub fn name2(flag: Bool) -> Str {\n",
+        "    let t = NAME\n",
+        "    if flag {\n",
+        "        t\n",
+        "    } else {\n",
+        "        \"b\"\n",
+        "    }\n",
+        "}\n",
+        "pub fn count(s: Str) -> USize {\n",
+        "    let t = NAME\n",
+        "    t.len()\n",
         "}\n",
     );
     let output = run_check(
@@ -22553,5 +22566,29 @@ fn const_reference_in_str_body_stays_gated() {
         &[("src/values.sai", "pub const NAME: Str = \"x\"\n")],
         &[],
     );
-    assert_check_stays_gated(&output, "const in -> Str body");
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn const_reference_in_str_body_mismatch_reports() {
+    // A primitive const under a `-> Str` return type reports
+    // TYPE_MISMATCH like a scalar local.
+    let root_source = concat!(
+        "pub const LOCAL: I32 = 0\n",
+        "pub fn bad() -> Str {\n",
+        "    LOCAL\n",
+        "}\n",
+    );
+    let output = run_check(root_source, "", &[], &[]);
+    assert!(!output.status.success(), "const type mismatch must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `Str`, found `I32`"),
+        "const type mismatches report type errors: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "const type mismatches are diagnosed, not gated: {stdout}"
+    );
 }
