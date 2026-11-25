@@ -22207,6 +22207,117 @@ fn multi_file_source_with_use_import_checks() {
 }
 
 #[test]
+fn cross_file_impl_receiver_checks() {
+    // `use pkg/mod.{Type}` makes an `impl` on an imported record
+    // checkable — the record's fields come from the declaring file
+    // (IR-1146).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "impl Rec {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.n\n",
+        "    }\n",
+        "    pub fn deep(self: borrow Self) -> Str {\n",
+        "        self.inner.deep.text\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            concat!(
+                "type Deep { text: Str }\n",
+                "type Inner { deep: Deep }\n",
+                "type Rec { inner: Inner, n: I32 }\n",
+            ),
+        )],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn cross_file_impl_receiver_reports_unknown_field() {
+    // Unknown fields on an imported record still diagnose, and the
+    // nested record's name is taken from the declaring file (IR-1146).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "impl Rec {\n",
+        "    pub fn bad(self: borrow Self) -> I32 {\n",
+        "        self.inner.missing\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            "type Inner { n: I32 }\ntype Rec { inner: Inner }\n",
+        )],
+        &[],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"code\":\"UNKNOWN_FIELD\""),
+        "expected UNKNOWN_FIELD: {stdout}"
+    );
+    assert!(
+        stdout.contains("has no field"),
+        "expected the field diagnostic message: {stdout}"
+    );
+}
+
+#[test]
+fn cross_file_impl_receiver_alias_checks() {
+    // `.{Type as Alias}` binds the alias — `impl Alias` resolves the
+    // same foreign record (IR-1146).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec as R}\n",
+        "impl R {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/types.sai", "type Rec { n: I32 }\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn impl_on_unresolved_name_stays_gated() {
+    // An `impl` head that resolves to no record still gates — no
+    // import and no local `type` declaration (IR-1146).
+    let root_source = concat!(
+        "impl Rec {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/types.sai", "type Rec { n: I32 }\n")],
+        &[],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "expected the unsupported gate: {stdout}"
+    );
+}
+
+#[test]
 fn multi_file_source_with_use_item_alias_checks() {
     // `.{item as alias}` binds the alias — `plus(1)` resolves to the
     // sibling file's `add` (IR-1142).

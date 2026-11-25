@@ -2312,6 +2312,7 @@ fn check_type_decls_acyclic(
 fn check_impl_decl_is_inherent_public_methods(
     impl_decl: &sai_syntax::ast::ImplDecl,
     type_names: &HashSet<String>,
+    imported_names: &HashSet<String>,
     source: &[u8],
     seen_methods: &mut HashSet<(String, String)>,
 ) -> bool {
@@ -2336,7 +2337,7 @@ fn check_impl_decl_is_inherent_public_methods(
     let Ok(type_text) = std::str::from_utf8(type_text) else {
         return false;
     };
-    if !type_names.contains(type_text) {
+    if !type_names.contains(type_text) && !imported_names.contains(type_text) {
         return false;
     }
     let Some(associated_items) = impl_decl.items() else {
@@ -2421,9 +2422,33 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
     if !check_type_decls_acyclic(&source_file, source, &type_names) {
         return (false, false, false, false);
     }
+    // `use pkg/mod.{item}` member imports bind names an `impl` head
+    // may spell — gather the bound spelling (`alias` wins, else the
+    // member name) so an `impl` on an imported record stays a
+    // candidate. The driver decides whether the name really resolves.
+    let mut imported_names = HashSet::new();
     let mut impls = Vec::new();
     for item in source_file.items() {
         match item {
+            sai_syntax::ast::Item::Use(use_decl) => {
+                if let Some(use_items) = use_decl.items() {
+                    for use_item in use_items.items() {
+                        let bound = use_item
+                            .alias()
+                            .map(|alias| alias.syntax().text_range())
+                            .or_else(|| use_item.name().map(|name| name.syntax().text_range()))
+                            .and_then(|range| {
+                                source
+                                    .get(range.start().to_usize()..range.end().to_usize())
+                                    .and_then(|text| std::str::from_utf8(text).ok())
+                                    .map(str::to_owned)
+                            });
+                        if let Some(name) = bound {
+                            imported_names.insert(name);
+                        }
+                    }
+                }
+            }
             sai_syntax::ast::Item::Function(function) => {
                 if function.attrs().next().is_some()
                     || !function
@@ -2454,7 +2479,6 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
                 }
                 saw_const = true;
             }
-            sai_syntax::ast::Item::Use(_) => {}
             _ => return (false, false, false, false),
         }
     }
@@ -2463,6 +2487,7 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
         check_impl_decl_is_inherent_public_methods(
             impl_decl,
             &type_names,
+            &imported_names,
             source,
             &mut seen_methods,
         )
