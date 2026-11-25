@@ -1998,15 +1998,14 @@ fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize>
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
-        || source_file
-            .syntax()
-            .children()
-            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
     {
         return None;
     }
     let mut const_count = 0usize;
     for item in source_file.items() {
+        if matches!(item, sai_syntax::ast::Item::Use(_)) {
+            continue;
+        }
         let sai_syntax::ast::Item::Const(constant) = item else {
             return None;
         };
@@ -2051,10 +2050,6 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
-        || source_file
-            .syntax()
-            .children()
-            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
     {
         return false;
     }
@@ -2107,6 +2102,7 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
                     &public_type_names,
                 )
         }
+        sai_syntax::ast::Item::Use(_) => true,
         _ => false,
     }) && saw_function
 }
@@ -2390,10 +2386,6 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
-        || source_file
-            .syntax()
-            .children()
-            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
     {
         return false;
     }
@@ -2453,6 +2445,7 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
                     return false;
                 }
             }
+            sai_syntax::ast::Item::Use(_) => {}
             _ => return false,
         }
     }
@@ -2494,10 +2487,6 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool) {
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
-        || source_file
-            .syntax()
-            .children()
-            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
     {
         return (false, false);
     }
@@ -2553,6 +2542,7 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool) {
                     return (false, false);
                 }
             }
+            sai_syntax::ast::Item::Use(_) => {}
             _ => return (false, false),
         }
     }
@@ -2581,14 +2571,12 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
-        || source_file
-            .syntax()
-            .children()
-            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
     {
         return false;
     }
-    let mut items = source_file.items();
+    let mut items = source_file
+        .items()
+        .filter(|item| !matches!(item, sai_syntax::ast::Item::Use(_)));
     let Some(sai_syntax::ast::Item::Type(type_decl)) = items.next() else {
         return false;
     };
@@ -2666,10 +2654,6 @@ fn check_public_primitive_const_set_coverage(
     const_resolutions: &sai_driver::ConstOwnerResolutions,
 ) -> bool {
     if scopes.modules.is_empty()
-        || scopes
-            .modules
-            .iter()
-            .any(|module| !module.imports.is_empty())
         || scopes.top_level_owners.len() != source_count
         || const_resolutions.owners().len() != source_count
     {
@@ -2706,10 +2690,6 @@ fn check_public_function_body_coverage(
 ) -> bool {
     if !source_is_candidate
         || scopes.modules.is_empty()
-        || scopes
-            .modules
-            .iter()
-            .any(|module| !module.imports.is_empty())
         || scopes.top_level_owners.is_empty()
         || scopes
             .top_level_owners
@@ -2781,10 +2761,6 @@ fn check_public_inherent_method_body_coverage(
 ) -> bool {
     if !source_is_candidate
         || scopes.modules.is_empty()
-        || scopes
-            .modules
-            .iter()
-            .any(|module| !module.imports.is_empty())
         || scopes.top_level_owners.len() != 2
         || method_resolutions.owners().len() != 1
         || scopes
@@ -2849,10 +2825,6 @@ fn check_mixed_public_item_coverage(
 ) -> bool {
     if !source_is_candidate
         || scopes.modules.is_empty()
-        || scopes
-            .modules
-            .iter()
-            .any(|module| !module.imports.is_empty())
         || scopes.top_level_owners.is_empty()
         || scopes.top_level_owners.iter().any(|owner| {
             !matches!(

@@ -8810,10 +8810,6 @@ fn inherent_method_primitive_field_types(
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
-        || source_file
-            .syntax()
-            .children()
-            .any(|child| ast::UseDecl::can_cast(child.kind()))
     {
         return None;
     }
@@ -8826,7 +8822,7 @@ fn inherent_method_primitive_field_types(
         match item {
             ast::Item::Type(decl) => type_decls.push(decl),
             ast::Item::Impl(decl) => impl_decls.push(decl),
-            ast::Item::Function(_) | ast::Item::Const(_) => {}
+            ast::Item::Function(_) | ast::Item::Const(_) | ast::Item::Use(_) => {}
             _ => return None,
         }
     }
@@ -9567,10 +9563,6 @@ fn str_inherent_method_field_types(
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
-        || source_file
-            .syntax()
-            .children()
-            .any(|child| ast::UseDecl::can_cast(child.kind()))
     {
         return None;
     }
@@ -9580,7 +9572,7 @@ fn str_inherent_method_field_types(
         match item {
             ast::Item::Type(decl) => type_decls.push(decl),
             ast::Item::Impl(decl) => impl_decls.push(decl),
-            ast::Item::Function(_) | ast::Item::Const(_) => {}
+            ast::Item::Function(_) | ast::Item::Const(_) | ast::Item::Use(_) => {}
             _ => return None,
         }
     }
