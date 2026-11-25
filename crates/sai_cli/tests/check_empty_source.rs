@@ -22864,6 +22864,75 @@ fn bool_const_range_pattern_reports_type_mismatch() {
 }
 
 #[test]
+fn const_patterns_in_str_body_matches_check() {
+    // `Str` and primitive matches inside `-> Str` bodies accept scalar
+    // const patterns, including or-pattern alternatives.
+    let source = concat!(
+        "pub const TEXT: Str = \"x\"
+",
+        "pub const CAP: I32 = 1
+",
+        "pub fn text(s: Str) -> Str {
+",
+        "    match s {
+",
+        "        TEXT => \"y\",
+",
+        "        _ => \"z\",
+",
+        "    }
+",
+        "}
+",
+        "pub fn number(n: I32) -> Str {
+",
+        "    match n {
+",
+        "        CAP | 2 => \"y\",
+",
+        "        _ => \"z\",
+",
+        "    }
+",
+        "}
+",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn str_match_const_pattern_type_mismatch_reports() {
+    let source = concat!(
+        "pub const CAP: I32 = 1
+",
+        "pub fn text(s: Str) -> Str {
+",
+        "    match s {
+",
+        "        CAP => \"y\",
+",
+        "        _ => \"z\",
+",
+        "    }
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(
+        !output.status.success(),
+        "mismatched const pattern must fail"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `Str`, found `I32`")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "Str-match const mismatch is diagnosed, not gated: {stdout}"
+    );
+}
+
+#[test]
 fn const_pattern_type_mismatch_reports() {
     // A const pattern must have the scrutinee's type; a `Str` const in an
     // `I32` match is diagnosed rather than gated.
