@@ -13252,6 +13252,18 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
             "TYPE_MISMATCH",
         ),
         (
+            "pub const BASE: I32 = 1\npub const REFERENCE_FOR_TUPLE: ((I32,),) = (BASE,)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const OPERATOR_FOR_TUPLE: ((I32,),) = (1 + 2,)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const TUPLE_FOR_SCALAR: (I32,) = ((1,),)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
             "pub const ARITY_NESTED_VALUES: (I32,) = ((1,), (2,))\n",
             "TYPE_MISMATCH",
         ),

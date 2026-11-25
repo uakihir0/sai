@@ -17506,7 +17506,22 @@ fn check_const_tuple_literal(
 
     let ExprKind::Tuple(values) = value.kind else {
         let ExprKind::Lit(literal) = value.kind else {
-            return Ok(None);
+            let Some(found_type) = infer_const_scalar_expression_type(value, const_references)
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected a tuple, found `{}`",
+                    const_literal_type_display(found_type)
+                ),
+                "type mismatch",
+            )?]));
         };
         return Ok(Some(vec![const_literal_diagnostic(
             owner.id,
@@ -17596,6 +17611,20 @@ fn check_const_tuple_field(
     else {
         return Ok(None);
     };
+    if matches!(value.kind, ExprKind::Tuple(elements) if !elements.is_empty()) {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found a tuple",
+                const_literal_type_display(expected_type)
+            ),
+            "type mismatch",
+        )?]));
+    }
     let leaf_diagnostics = match check_const_reference_expression(
         owner.id,
         expected_type,
