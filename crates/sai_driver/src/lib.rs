@@ -16334,8 +16334,11 @@ fn str_method_call_receiver_is_str(
     inputs: &CurrentOwnerInputs,
 ) -> bool {
     match expression.kind {
-        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
-            .is_some_and(|binding| receivers.contains(&binding)),
+        ExprKind::Path(path) => {
+            resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| receivers.contains(&binding))
+                || str_const_entry(path.hir_id, inputs).is_some_and(|entry| entry.family == "`Str`")
+        }
         ExprKind::Lit(Lit::Str(_)) => true,
         ExprKind::Field { .. } => {
             str_self_field_projected_family(expression, inputs) == Some("`Str`")
