@@ -13175,6 +13175,8 @@ fn public_flat_tuple_const_literals_emit_check_results() {
         "pub const MIXED: (F32, Str, ()) = (1.25, \"text\", ())\n",
         "pub const OPERATORS: (I32, Bool, I8) = (1 + 2, true and not false, 1 << 2)\n",
         "pub const COMPARISON: (Bool, Bool) = (1 < 2, () == ())\n",
+        "pub const NESTED: ((I32,), Bool) = ((1 + 2,), true)\n",
+        "pub const DEEP: (((U8,),),) = (((255,),),)\n",
         "pub const BASE: I32 = 7\n",
         "pub const TRUTH: Bool = true\n",
         "pub const NOTHING: () = ()\n",
@@ -13242,6 +13244,18 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
             "CONST_EVAL_PANIC",
         ),
         (
+            "pub const NESTED_OVERFLOW: ((I8,),) = ((127 + 1,),)\n",
+            "CONST_EVAL_PANIC",
+        ),
+        (
+            "pub const NESTED_ARITY: ((I32, Bool),) = ((1,),)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const ARITY_NESTED_VALUES: (I32,) = ((1,), (2,))\n",
+            "TYPE_MISMATCH",
+        ),
+        (
             "pub const FIELD_COMPARISON_MISMATCH: (I32,) = (1 < 2,)\n",
             "TYPE_MISMATCH",
         ),
@@ -13273,8 +13287,6 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
 #[test]
 fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
-        "pub const NESTED: ((I32,),) = ((1,),)\n",
-        "pub const ARITY_UNSUPPORTED: (I32,) = ((1,), (2,))\n",
         "pub const TUPLE_TARGET: (I32,) = (1,)\npub const ARITY_UNSUPPORTED_TARGET: (I32,) = (TUPLE_TARGET, TUPLE_TARGET)\n",
         "pub const ARRAY: Array<I32, 1> = [1]\n",
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",

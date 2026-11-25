@@ -17453,6 +17453,23 @@ fn is_const_scalar_expression_shape(
     }
 }
 
+fn is_const_tuple_expression_shape(
+    owner: OwnerId,
+    value: &HirExpr<'_>,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> bool {
+    if is_const_scalar_expression_shape(owner, value, const_references) {
+        return true;
+    }
+    let ExprKind::Tuple(elements) = value.kind else {
+        return false;
+    };
+    !elements.is_empty()
+        && elements
+            .iter()
+            .all(|element| is_const_tuple_expression_shape(owner, element, const_references))
+}
+
 fn check_const_tuple_literal(
     owner: &HirOwner<'_>,
     expected_elements: &[Ty<'_>],
@@ -17464,14 +17481,6 @@ fn check_const_tuple_literal(
     target_cfg: &TargetCfg,
     const_references: Option<&ConstReferenceContext<'_, '_>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    let Some(expected_types) = expected_elements
-        .iter()
-        .map(|ty| resolve_const_literal_type(*ty, type_paths, symbols, inputs))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Ok(None);
-    };
-
     let ExprKind::Tuple(values) = value.kind else {
         let ExprKind::Lit(literal) = value.kind else {
             return Ok(None);
@@ -17491,7 +17500,7 @@ fn check_const_tuple_literal(
     };
 
     if values.iter().any(|value| {
-        !is_const_scalar_expression_shape(owner.id, value, const_references)
+        !is_const_tuple_expression_shape(owner.id, value, const_references)
             && const_references
                 .is_none_or(|context| !const_reference_is_supported(owner.id, value, context))
     }) {
@@ -17514,51 +17523,89 @@ fn check_const_tuple_literal(
     }
 
     let mut diagnostics = Vec::new();
-    for ((expected_ty, expected_type), value) in
-        expected_elements.iter().zip(&expected_types).zip(values)
-    {
-        let leaf_diagnostics = match check_const_reference_expression(
-            owner.id,
-            *expected_type,
+    for (expected_ty, value) in expected_elements.iter().zip(values) {
+        let Some(mut field_diagnostics) = check_const_tuple_field(
+            owner,
+            *expected_ty,
             value,
-            const_references,
+            type_paths,
+            symbols,
             inputs,
             snapshot,
-        )? {
-            Some(diagnostics) => Some(diagnostics),
-            None => check_const_literal_leaf(
-                owner,
-                *expected_ty,
-                value,
-                type_paths,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
-            )?,
-        };
-        let mut field_diagnostics = match leaf_diagnostics {
-            Some(diagnostics) => diagnostics,
-            None => {
-                let Some(diagnostics) = check_const_operator_expression_against_type(
-                    owner.id,
-                    *expected_type,
-                    value,
-                    symbols,
-                    inputs,
-                    snapshot,
-                    target_cfg,
-                    const_references,
-                )?
-                else {
-                    return Ok(None);
-                };
-                diagnostics
-            }
+            target_cfg,
+            const_references,
+        )?
+        else {
+            return Ok(None);
         };
         diagnostics.append(&mut field_diagnostics);
     }
     Ok(Some(diagnostics))
+}
+
+fn check_const_tuple_field(
+    owner: &HirOwner<'_>,
+    expected_ty: Ty<'_>,
+    value: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if let TyKind::Tuple(elements) = expected_ty.kind
+        && !elements.is_empty()
+    {
+        return check_const_tuple_literal(
+            owner,
+            elements,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        );
+    }
+    let Some(expected_type) = resolve_const_literal_type(expected_ty, type_paths, symbols, inputs)
+    else {
+        return Ok(None);
+    };
+    let leaf_diagnostics = match check_const_reference_expression(
+        owner.id,
+        expected_type,
+        value,
+        const_references,
+        inputs,
+        snapshot,
+    )? {
+        Some(diagnostics) => Some(diagnostics),
+        None => check_const_literal_leaf(
+            owner,
+            expected_ty,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?,
+    };
+    match leaf_diagnostics {
+        Some(diagnostics) => Ok(Some(diagnostics)),
+        None => check_const_operator_expression_against_type(
+            owner.id,
+            expected_type,
+            value,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        ),
+    }
 }
 
 /// A binding's contribution in the `Str` local group: the family an
@@ -100907,7 +100954,7 @@ property "shared"() {}
     }
 
     #[test]
-    fn const_flat_tuple_literal_check_accepts_only_supported_direct_fields() {
+    fn const_tuple_literal_check_accepts_supported_nested_fields() {
         let root = concat!(
             "pub const PAIR: (I32, Bool) = (1, true)\n",
             "pub const SINGLE: (U8,) = (255,)\n",
@@ -101043,11 +101090,18 @@ property "shared"() {}
         );
         assert_primary_literal_span(&diagnostics[0], "pub const MULTIPLE_FIELD_ERRORS:", "128");
         assert_primary_literal_span(&diagnostics[1], "pub const MULTIPLE_FIELD_ERRORS:", "1");
-        for index in [8, 9, 10, 11] {
+        assert_eq!(
+            checks[8],
+            &ConstLiteralCheck::SupportedTuple {
+                diagnostics: Vec::new(),
+            },
+            "nested tuple constructor at owner index 8 is supported"
+        );
+        for index in [9, 10, 11] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "nested, array, expression, or alias form at owner index {index} stays gated"
+                "array, block, or alias form at owner index {index} stays gated"
             );
         }
     }
