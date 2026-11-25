@@ -7380,6 +7380,7 @@ struct ConstReferenceContext<'a, 'm> {
     module_scope: &'a Phase1ModuleScopes,
     module_members: &'a ModuleMemberIndex<'m>,
     types: &'a HashMap<DefId, FunctionDirectType>,
+    values: &'a HashMap<DefId, ConstScalarValue>,
     cyclic: &'a HashSet<DefId>,
     requesting_package: PackageId,
 }
@@ -7548,6 +7549,7 @@ fn check_const_literal_owner(
                         inputs,
                         snapshot,
                         target_cfg,
+                        const_references.as_ref(),
                     )?
                     else {
                         return Ok(ConstLiteralCheck::Unsupported);
@@ -7611,6 +7613,7 @@ fn check_const_literal_owner(
                     inputs,
                     snapshot,
                     target_cfg,
+                    const_references.as_ref(),
                 )?
                 else {
                     return Ok(ConstLiteralCheck::Unsupported);
@@ -17404,12 +17407,19 @@ fn index_str_method_call_sites(
     });
 }
 
-fn is_const_scalar_expression_shape(value: &HirExpr<'_>) -> bool {
+fn is_const_scalar_expression_shape(
+    owner: OwnerId,
+    value: &HirExpr<'_>,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> bool {
+    if const_references.is_some_and(|context| const_reference_is_supported(owner, value, context)) {
+        return true;
+    }
     match value.kind {
         ExprKind::Lit(_) => true,
         ExprKind::Tuple(elements) => elements.is_empty(),
         ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand) => {
-            is_const_scalar_expression_shape(operand)
+            is_const_scalar_expression_shape(owner, operand, const_references)
         }
         ExprKind::Binary(
             BinOp::And
@@ -17435,7 +17445,10 @@ fn is_const_scalar_expression_shape(value: &HirExpr<'_>) -> bool {
             | BinOp::Shr,
             left,
             right,
-        ) => is_const_scalar_expression_shape(left) && is_const_scalar_expression_shape(right),
+        ) => {
+            is_const_scalar_expression_shape(owner, left, const_references)
+                && is_const_scalar_expression_shape(owner, right, const_references)
+        }
         _ => false,
     }
 }
@@ -17478,7 +17491,7 @@ fn check_const_tuple_literal(
     };
 
     if values.iter().any(|value| {
-        !is_const_scalar_expression_shape(value)
+        !is_const_scalar_expression_shape(owner.id, value, const_references)
             && const_references
                 .is_none_or(|context| !const_reference_is_supported(owner.id, value, context))
     }) {
@@ -17535,6 +17548,7 @@ fn check_const_tuple_literal(
                     inputs,
                     snapshot,
                     target_cfg,
+                    const_references,
                 )?
                 else {
                     return Ok(None);
@@ -28737,20 +28751,41 @@ fn const_initializer_reference_targets(
     {
         return vec![target];
     }
-    let ExprKind::Tuple(elements) = value.kind else {
-        return Vec::new();
-    };
-    elements
-        .iter()
-        .filter_map(|element| {
-            const_initializer_reference_target(
-                element,
+    match value.kind {
+        ExprKind::Tuple(elements) => elements
+            .iter()
+            .flat_map(|element| {
+                const_initializer_reference_targets(
+                    element,
+                    module_scope,
+                    module_members,
+                    requesting_package,
+                )
+            })
+            .collect(),
+        ExprKind::Unary(_, operand) => const_initializer_reference_targets(
+            operand,
+            module_scope,
+            module_members,
+            requesting_package,
+        ),
+        ExprKind::Binary(_, left, right) => {
+            let mut targets = const_initializer_reference_targets(
+                left,
                 module_scope,
                 module_members,
                 requesting_package,
-            )
-        })
-        .collect()
+            );
+            targets.extend(const_initializer_reference_targets(
+                right,
+                module_scope,
+                module_members,
+                requesting_package,
+            ));
+            targets
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn const_reference_cycle_members(references: &HashMap<DefId, Vec<DefId>>) -> HashSet<DefId> {
@@ -28845,6 +28880,7 @@ fn check_const_operator_expression_against_type(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let Some(evaluation) = check_const_scalar_expression(
         owner,
@@ -28854,6 +28890,7 @@ fn check_const_operator_expression_against_type(
         inputs,
         snapshot,
         target_cfg,
+        const_references,
     )?
     else {
         return Ok(None);
@@ -28869,6 +28906,7 @@ fn check_const_scalar_expression(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
 ) -> Result<Option<ConstScalarExpressionEvaluation>, OwnerControlFlowResolutionError> {
     if matches!(value.kind, ExprKind::Lit(_))
         || matches!(value.kind, ExprKind::Tuple(elements) if elements.is_empty())
@@ -28894,11 +28932,76 @@ fn check_const_scalar_expression(
         }));
     }
 
+    if let Some(context) = const_references
+        && let Some(target) = const_initializer_reference_target(
+            value,
+            context.module_scope,
+            context.module_members,
+            context.requesting_package,
+        )
+    {
+        if context.cyclic.contains(&owner.def_id.to_def_id()) {
+            return Ok(Some(ConstScalarExpressionEvaluation {
+                diagnostics: vec![const_literal_diagnostic(
+                    owner,
+                    inputs,
+                    snapshot,
+                    value.span,
+                    sai_diagnostics::Code::ConstCycle,
+                    "const depends on itself".to_string(),
+                    "cyclic const reference",
+                )?],
+                value: None,
+            }));
+        }
+        if context.cyclic.contains(&target) {
+            return Ok(None);
+        }
+        let Some(referenced_type) = context.types.get(&target).copied() else {
+            return Ok(None);
+        };
+        let Some(referenced_literal_type) = const_reference_literal_type(referenced_type) else {
+            return Ok(None);
+        };
+        if referenced_literal_type != literal_type {
+            return Ok(Some(ConstScalarExpressionEvaluation {
+                diagnostics: vec![const_literal_diagnostic(
+                    owner,
+                    inputs,
+                    snapshot,
+                    value.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found `{}`",
+                        const_literal_type_display(literal_type),
+                        function_direct_type_name(referenced_type)
+                    ),
+                    "type mismatch",
+                )?],
+                value: None,
+            }));
+        }
+        let Some(value) = context.values.get(&target).copied() else {
+            return Ok(None);
+        };
+        return Ok(Some(ConstScalarExpressionEvaluation {
+            diagnostics: Vec::new(),
+            value: Some(value),
+        }));
+    }
+
     match value.kind {
         ExprKind::Unary(UnOp::Not, operand) => {
             let bool_type = ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool);
             let Some(mut operand_evaluation) = check_const_scalar_expression(
-                owner, bool_type, operand, symbols, inputs, snapshot, target_cfg,
+                owner,
+                bool_type,
+                operand,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
@@ -28941,6 +29044,7 @@ fn check_const_scalar_expression(
                 inputs,
                 snapshot,
                 target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
@@ -29037,6 +29141,7 @@ fn check_const_scalar_expression(
                 inputs,
                 snapshot,
                 target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
@@ -29108,6 +29213,7 @@ fn check_const_scalar_expression(
                 inputs,
                 snapshot,
                 target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
@@ -29120,6 +29226,7 @@ fn check_const_scalar_expression(
                 inputs,
                 snapshot,
                 target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
@@ -29203,6 +29310,7 @@ fn check_const_scalar_expression(
                 inputs,
                 snapshot,
                 target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
@@ -29215,6 +29323,7 @@ fn check_const_scalar_expression(
                 inputs,
                 snapshot,
                 target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
@@ -29277,7 +29386,8 @@ fn check_const_scalar_expression(
             left,
             right,
         ) => {
-            let Some(operand_type) = infer_const_scalar_expression_type(left) else {
+            let Some(operand_type) = infer_const_scalar_expression_type(left, const_references)
+            else {
                 return Ok(None);
             };
             let Some(mut left_evaluation) = check_const_scalar_expression(
@@ -29288,11 +29398,12 @@ fn check_const_scalar_expression(
                 inputs,
                 snapshot,
                 target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
             };
-            let inferred_right_type = infer_const_scalar_expression_type(right);
+            let inferred_right_type = infer_const_scalar_expression_type(right, const_references);
             let composite_right = !matches!(right.kind, ExprKind::Lit(_))
                 && !matches!(right.kind, ExprKind::Tuple(elements) if elements.is_empty());
             let mismatched_composite_right = composite_right
@@ -29310,6 +29421,7 @@ fn check_const_scalar_expression(
                 inputs,
                 snapshot,
                 target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
@@ -29380,7 +29492,14 @@ fn check_const_scalar_expression(
         ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right) => {
             let bool_type = ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool);
             let Some(mut left_evaluation) = check_const_scalar_expression(
-                owner, bool_type, left, symbols, inputs, snapshot, target_cfg,
+                owner,
+                bool_type,
+                left,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
@@ -29393,7 +29512,14 @@ fn check_const_scalar_expression(
                             || (operator == BinOp::Or && left_value)
                 );
             let Some(mut right_evaluation) = check_const_scalar_expression(
-                owner, bool_type, right, symbols, inputs, snapshot, target_cfg,
+                owner,
+                bool_type,
+                right,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                const_references,
             )?
             else {
                 return Ok(None);
@@ -29533,7 +29659,25 @@ fn const_integer_literal_value(
     }
 }
 
-fn infer_const_scalar_expression_type(value: &HirExpr<'_>) -> Option<ConstLiteralType> {
+fn infer_const_scalar_expression_type(
+    value: &HirExpr<'_>,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Option<ConstLiteralType> {
+    if let Some(context) = const_references
+        && let Some(target) = const_initializer_reference_target(
+            value,
+            context.module_scope,
+            context.module_members,
+            context.requesting_package,
+        )
+        && !context.cyclic.contains(&target)
+    {
+        return context
+            .types
+            .get(&target)
+            .copied()
+            .and_then(const_reference_literal_type);
+    }
     match value.kind {
         ExprKind::Lit(Lit::Int { .. }) => Some(ConstLiteralType::Primitive(
             sai_resolve::prelude::PrimTy::I64,
@@ -29556,7 +29700,7 @@ fn infer_const_scalar_expression_type(value: &HirExpr<'_>) -> Option<ConstLitera
             sai_resolve::prelude::PrimTy::Bool,
         )),
         ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand) => {
-            infer_const_scalar_expression_type(operand)
+            infer_const_scalar_expression_type(operand, const_references)
         }
         ExprKind::Binary(
             BinOp::And
@@ -29588,7 +29732,7 @@ fn infer_const_scalar_expression_type(value: &HirExpr<'_>) -> Option<ConstLitera
             | BinOp::Shr,
             left,
             _,
-        ) => infer_const_scalar_expression_type(left),
+        ) => infer_const_scalar_expression_type(left, const_references),
         _ => None,
     }
 }
@@ -38584,12 +38728,17 @@ impl RootDatabase {
         top_level_owner_index: &HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
         module_members: &ModuleMemberIndex<'_>,
         source_graph_packages: &HashSet<PackageId>,
-    ) -> (HashMap<DefId, FunctionDirectType>, HashSet<DefId>) {
-        let empty = || (HashMap::new(), HashSet::new());
+    ) -> (
+        HashMap<DefId, FunctionDirectType>,
+        HashMap<DefId, ConstScalarValue>,
+        HashSet<DefId>,
+    ) {
+        let empty = || (HashMap::new(), HashMap::new(), HashSet::new());
         let Ok(primitive_prelude) = self.primitive_prelude.clone() else {
             return empty();
         };
         let mut const_types = HashMap::new();
+        let mut const_values = HashMap::new();
         let mut const_references = HashMap::<DefId, Vec<DefId>>::new();
         let mut ambiguous_definitions = HashSet::new();
         let mut owner_inputs_by_file = HashMap::<FileId, Option<CurrentOwnerInputs>>::new();
@@ -38709,6 +38858,24 @@ impl RootDatabase {
             else {
                 continue;
             };
+            if let Some(body) = hir_owner.body
+                && let Some(literal_type) =
+                    resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs)
+                && let Ok(Some(evaluation)) = check_const_scalar_expression(
+                    descriptor.owner,
+                    literal_type,
+                    &body.value,
+                    &self.symbols,
+                    inputs,
+                    snapshot,
+                    &collection.target_cfg,
+                    None,
+                )
+                && evaluation.diagnostics.is_empty()
+                && let Some(value) = evaluation.value
+            {
+                const_values.insert(def_id, value);
+            }
             if ambiguous_definitions.contains(&def_id) {
                 continue;
             }
@@ -38719,7 +38886,7 @@ impl RootDatabase {
         }
 
         let cyclic = const_reference_cycle_members(&const_references);
-        (const_types, cyclic)
+        (const_types, const_values, cyclic)
     }
 
     /// Resolves loop labels, lexical locals, module paths, and local
@@ -38930,7 +39097,7 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
         );
-        let (const_literal_types, _) = self.index_const_literal_types(
+        let (const_literal_types, _, _) = self.index_const_literal_types(
             collection,
             snapshot,
             &top_level_owner_index,
@@ -39596,13 +39763,14 @@ impl RootDatabase {
             .map(|scopes| &scopes.source_graph_packages)
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
-        let (const_literal_types, cyclic_const_references) = self.index_const_literal_types(
-            collection,
-            snapshot,
-            &top_level_owner_index,
-            &module_members,
-            source_graph_packages,
-        );
+        let (const_literal_types, const_literal_values, cyclic_const_references) = self
+            .index_const_literal_types(
+                collection,
+                snapshot,
+                &top_level_owner_index,
+                &module_members,
+                source_graph_packages,
+            );
         let descriptors = collection
             .scopes
             .top_level_owners
@@ -39754,6 +39922,7 @@ impl RootDatabase {
                             module_scope,
                             module_members: &module_members,
                             types: &const_literal_types,
+                            values: &const_literal_values,
                             cyclic: &cyclic_const_references,
                             requesting_package: collection.module_tree.package,
                         }),
@@ -48803,7 +48972,7 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
         );
-        let (const_literal_types, _) = self.index_const_literal_types(
+        let (const_literal_types, _, _) = self.index_const_literal_types(
             collection,
             snapshot,
             &top_level_owner_index,

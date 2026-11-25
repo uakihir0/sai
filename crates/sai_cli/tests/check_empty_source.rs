@@ -13278,7 +13278,6 @@ fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
         "pub const TUPLE_TARGET: (I32,) = (1,)\npub const ARITY_UNSUPPORTED_TARGET: (I32,) = (TUPLE_TARGET, TUPLE_TARGET)\n",
         "pub const ARRAY: Array<I32, 1> = [1]\n",
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
-        "pub const BASE: I32 = 1\npub const OPERATOR_REFERENCE_FIELD: (I32,) = (BASE + 1,)\n",
         "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
         "pub const SCALAR_TUPLE_MISMATCH: I32 = (1,)\n",
         "pub type Number = I32\npub const ALIAS_FIELD: (Number,) = (1,)\n",
@@ -23548,6 +23547,18 @@ pub fn ready() -> Bool {
 ",
         "pub const VALUE: Bool = true or (1 / 0 == 0)
 ",
+        "pub const BASE: I8 = 100
+pub const VALUE: I8 = BASE + 27
+",
+        "pub const BASE: I8 = 100
+pub const VALUE: Bool = BASE < 127
+",
+        "pub const BASE: I64 = 7
+pub const VALUE: Bool = 1 < BASE
+",
+        "pub const BASE: I8 = 100
+pub const VALUE: (I8, Bool) = (BASE + 1, BASE < 127)
+",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -23585,6 +23596,27 @@ fn primitive_const_expression_errors_are_checked() {
 ",
             "TYPE_MISMATCH",
             "expected `I32`, found a Bool literal",
+        ),
+        (
+            "pub const BASE: I8 = 100
+pub const VALUE: I8 = BASE + 28
+",
+            "CONST_EVAL_PANIC",
+            "integer overflow in addition",
+        ),
+        (
+            "pub const TRUTH: Bool = true
+pub const VALUE: I32 = TRUTH + 1
+",
+            "TYPE_MISMATCH",
+            "expected `I32`, found `Bool`",
+        ),
+        (
+            "pub const FIRST: I32 = SECOND + 1
+pub const SECOND: I32 = FIRST + 1
+",
+            "CONST_CYCLE",
+            "const depends on itself",
         ),
         (
             "pub const VALUE: Bool = true + false
