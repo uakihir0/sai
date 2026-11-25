@@ -22699,6 +22699,69 @@ fn reexported_const_type_mismatch_reports() {
 }
 
 #[test]
+fn member_const_reference_in_if_condition_checks() {
+    // Bool member consts are ordinary concrete conditions in primitive
+    // and `-> Str` branch shapes.
+    let root_source = concat!(
+        "use acme:empty/values\n",
+        "\n",
+        "pub fn primitive() -> I32 {\n",
+        "    if values.FLAG { 1 } else { 2 }\n",
+        "}\n",
+        "pub fn text() -> Str {\n",
+        "    if values.FLAG { \"a\" } else { \"b\" }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/values.sai", "pub const FLAG: Bool = true\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn reexported_function_calls_check_through_chains() {
+    // Function re-exports also retain the original callee identity for
+    // direct imports, module-member calls, aliases, and chains.
+    let root_source = concat!(
+        "use acme:empty/reexport.{plus}\n",
+        "use acme:empty/reexport\n",
+        "\n",
+        "pub fn direct() -> I32 {\n",
+        "    plus(1)\n",
+        "}\n",
+        "pub fn member() -> I32 {\n",
+        "    reexport.plus(1)\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/helper.sai", "pub fn add(x: I32) -> I32 { x + 1 }\n"),
+            ("src/middle.sai", "pub use acme:empty/helper.{add}\n"),
+            (
+                "src/reexport.sai",
+                "pub use acme:empty/middle.{add as plus}\n",
+            ),
+            (
+                "src/types.sai",
+                concat!(
+                    "type Wrap { n: I32 }\n",
+                    "impl Wrap {\n",
+                    "    pub fn get(self: borrow Self) -> I32 { self.n }\n",
+                    "}\n",
+                ),
+            ),
+        ],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
 fn nonconst_member_projection_match_scrutinee_stays_gated() {
     // Only member expressions resolved to consts enter this slice;
     // ordinary record-field scrutinees still stay outside it.
