@@ -17822,8 +17822,15 @@ fn is_const_constructor_expression_shape(
         ExprKind::Array(elements) => elements
             .iter()
             .all(|element| is_const_constructor_expression_shape(owner, element, const_references)),
-        ExprKind::Call { callee, .. } => const_references
-            .is_some_and(|context| const_constructor_target(callee, context, None).is_some()),
+        ExprKind::Call { callee, .. } => const_references.is_some_and(|context| {
+            const_constructor_target(callee, context, None).is_some()
+                || matches!(callee.kind, ExprKind::ImplicitMember(_))
+                || direct_enum_variant_type_head(callee).is_some()
+        }),
+        ExprKind::ImplicitMember(_) => const_references.is_some(),
+        ExprKind::Path(_) | ExprKind::Field { .. } => {
+            const_references.is_some() && direct_enum_variant_type_head(value).is_some()
+        }
         _ => false,
     }
 }
@@ -17872,6 +17879,38 @@ fn find_const_variant<'a>(
         .find(|variant| variant.name == name)
 }
 
+fn const_explicit_variant_parts(
+    expression: &HirExpr<'_>,
+    context: &ConstReferenceContext<'_, '_>,
+) -> Option<(DefId, Symbol, sai_hir::Span)> {
+    let (_path, segments) = direct_enum_variant_type_head(expression)?;
+    if segments.len() < 2 || segments.iter().any(|segment| segment.args.is_some()) {
+        return None;
+    }
+    let first = segments.first()?;
+    let binding = context.module_scope.scope.get(&first.name.sym)?;
+    let variant_segment = segments.last()?;
+    let head_segments = &segments[1..segments.len() - 1];
+    let prefix = resolve_module_prefix(
+        binding.res,
+        head_segments,
+        context.requesting_package,
+        context.module_members,
+    )
+    .ok()?;
+    if prefix.consumed_segments != head_segments.len() {
+        return None;
+    }
+    let Res::Def(DefKind::Enum, enum_def) = prefix.base else {
+        return None;
+    };
+    Some((
+        enum_def,
+        variant_segment.name.sym,
+        variant_segment.name.span,
+    ))
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ConstConstructorTarget {
     Record { def_id: DefId },
@@ -17889,26 +17928,10 @@ fn const_variant_target(
         let variant = find_const_variant(enum_def, name.sym, context.constructors)?;
         return Some((enum_def, variant.def_id));
     }
-    if let Some((_path, segments)) = direct_enum_variant_type_head(expression)
-        && segments.len() >= 2
-        && segments.iter().all(|segment| segment.args.is_none())
-        && let Some(first) = segments.first()
-        && let Some(binding) = context.module_scope.scope.get(&first.name.sym)
+    if let Some((enum_def, variant_name, _span)) = const_explicit_variant_parts(expression, context)
+        && let Some(variant) = find_const_variant(enum_def, variant_name, context.constructors)
     {
-        let variant_segment = segments.last()?;
-        let head_segments = &segments[1..segments.len() - 1];
-        if let Ok(prefix) = resolve_module_prefix(
-            binding.res,
-            head_segments,
-            context.requesting_package,
-            context.module_members,
-        ) && prefix.consumed_segments == head_segments.len()
-            && let Res::Def(DefKind::Enum, enum_def) = prefix.base
-            && let Some(variant) =
-                find_const_variant(enum_def, variant_segment.name.sym, context.constructors)
-        {
-            return Some((enum_def, variant.def_id));
-        }
+        return Some((enum_def, variant.def_id));
     }
     if let ExprKind::Path(path) = expression.kind
         && path.root == PathRoot::Plain
@@ -18659,6 +18682,33 @@ fn check_const_nominal_constructor(
 
     if let ExprKind::Call { callee, args, base } = value.kind {
         let Some(target) = const_constructor_target(callee, context, Some(expected.def_id)) else {
+            let unknown_variant = if let ExprKind::ImplicitMember(name) = callee.kind {
+                (context.constructors.enums.contains_key(&expected.def_id)
+                    && find_const_variant(expected.def_id, name.sym, context.constructors)
+                        .is_none())
+                .then_some((name.sym, name.span))
+            } else {
+                const_explicit_variant_parts(callee, context).and_then(
+                    |(enum_def, variant_name, span)| {
+                        (enum_def == expected.def_id
+                            && context.constructors.enums.contains_key(&enum_def)
+                            && find_const_variant(enum_def, variant_name, context.constructors)
+                                .is_none())
+                        .then_some((variant_name, span))
+                    },
+                )
+            };
+            if let Some((_name, span)) = unknown_variant {
+                return Ok(Some(vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::UnknownVariant,
+                    "unknown enum variant".to_string(),
+                    "unknown variant",
+                )?]));
+            }
             return Ok(None);
         };
         let output_type = const_constructor_target_output(target, context.constructors);
