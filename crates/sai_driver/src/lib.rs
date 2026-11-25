@@ -15732,7 +15732,10 @@ fn const_literal_path_sites(
     visit_expression_tree(&body.value, &mut |expression| {
         let const_type = match expression.kind {
             ExprKind::Path(path) => {
-                if path.root != PathRoot::Plain || path.segments.len() != 1 {
+                if path.root != PathRoot::Plain
+                    || path.segments.len() != 1
+                    || path.segments[0].args.is_some()
+                {
                     None
                 } else {
                     match module_paths.paths.get(&path.hir_id) {
@@ -15753,7 +15756,10 @@ fn const_literal_path_sites(
                 let ExprKind::Path(base_path) = base.kind else {
                     return;
                 };
-                if base_path.root != PathRoot::Plain || base_path.segments.len() != 1 {
+                if base_path.root != PathRoot::Plain
+                    || base_path.segments.len() != 1
+                    || base_path.segments[0].args.is_some()
+                {
                     return;
                 }
                 let Some(PathRes {
