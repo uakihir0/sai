@@ -13374,6 +13374,11 @@ fn array_const_constructor_errors_are_checked() {
             "TYPE_MISMATCH",
             "expected `()`, found a tuple",
         ),
+        (
+            "pub const LOOP: Array<I32, 1> = [LOOP]\n",
+            "CONST_CYCLE",
+            "const depends on itself",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8_lossy(&output.stdout);

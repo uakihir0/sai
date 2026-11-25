@@ -29141,7 +29141,7 @@ fn const_initializer_reference_targets(
         return vec![target];
     }
     match value.kind {
-        ExprKind::Tuple(elements) => elements
+        ExprKind::Tuple(elements) | ExprKind::Array(elements) => elements
             .iter()
             .flat_map(|element| {
                 const_initializer_reference_targets(
