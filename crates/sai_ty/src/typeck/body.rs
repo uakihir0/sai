@@ -199,6 +199,9 @@ pub enum PrimitiveBodyErrorKind {
     ConstPatternType {
         found: ScalarType,
     },
+    RangePatternType {
+        found: PrimTy,
+    },
     /// `expected <type>, found <type>` where either side may be `Str` —
     /// `Str` is not a `PrimTy`, so `TypeMismatch` cannot name it.
     ScalarTypeMismatch {
@@ -6016,6 +6019,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 end,
                 inclusive,
             } => {
+                if !(crate::typeck::literal::is_integer_primitive(scrutinee_type)
+                    || matches!(scrutinee_type, PrimTy::Char | PrimTy::Byte))
+                {
+                    self.errors.push(PrimitiveBodyError {
+                        node: arm.pat.hir_id,
+                        kind: PrimitiveBodyErrorKind::RangePatternType {
+                            found: scrutinee_type,
+                        },
+                    });
+                    return Ok(());
+                }
                 for bound in [start, end] {
                     match bound {
                         Some(PatRangeEnd::Lit(literal)) => {

@@ -15055,6 +15055,18 @@ fn primitive_body_errors_to_diagnostics(
                 ),
                 "invalid const pattern type",
             )?,
+            PrimitiveBodyErrorKind::RangePatternType { found } => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "range pattern scrutinee must be an integer, Char or Byte, found `{}`",
+                    const_primitive_name(found)
+                ),
+                "type mismatch",
+            )?,
             PrimitiveBodyErrorKind::ScalarTypeMismatch { expected, found } => {
                 const_literal_diagnostic(
                     owner.id,
