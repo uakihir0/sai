@@ -8124,6 +8124,7 @@ fn check_inherent_method_body_type<'a>(
     str_use_shadow: bool,
     module_scope: &Phase1ModuleScopes,
     foreign_records: &HashMap<DefId, ParsedMethodRecord>,
+    foreign_impl_names: &HashMap<DefId, HashMap<FileId, HashSet<String>>>,
     primitive_type_results: &mut Option<sai_ty::typeck::body::PrimitiveBodyTypeResults>,
 ) -> Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError> {
     if !impl_owner.raw_attrs.is_empty()
@@ -8158,6 +8159,35 @@ fn check_inherent_method_body_type<'a>(
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     }
+    // The impl head must resolve to a record before any member body is
+    // admitted. Selfless methods otherwise bypass the receiver-field
+    // admission and `impl` on a use-bound const/function/module could
+    // pass as an ordinary function body.
+    let impl_head_def_id = {
+        let TyKind::Path(path) = self_ty.kind else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        let resolution = symbols
+            .resolve(path.segments[0].name.sym)
+            .ok()
+            .and_then(|spelling| {
+                symbols
+                    .intern(&sai_syntax::normalize_identifier(
+                        spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+                    ))
+                    .ok()
+            })
+            .and_then(|symbol| module_scope.scope.get(&symbol))
+            .and_then(|binding| match binding.res {
+                Res::Def(DefKind::Struct, def_id) => Some((def_id, binding.origin)),
+                _ => None,
+            });
+        match resolution {
+            Some((def_id, BindingOrigin::Decl)) => Some(def_id),
+            Some((def_id, _)) if foreign_records.contains_key(&def_id) => Some(def_id),
+            _ => return Ok(FunctionBodyTypeCheck::Unsupported),
+        }
+    };
 
     let OwnerNode::ImplItem(method) = method_owner.node else {
         return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8187,6 +8217,26 @@ fn check_inherent_method_body_type<'a>(
         || !generics.where_preds.is_empty()
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+    // A method duplicate in another file is an upstream redefinition
+    // error the coverage gate cannot represent. Name resolution uses
+    // the impl target's DefId, so aliases of the same record collide;
+    // same-file duplicates are already rejected by the fragment gate.
+    if let Some(def_id) = impl_head_def_id {
+        let method_name = symbols.resolve(method.name.sym).ok().map(|spelling| {
+            sai_syntax::normalize_identifier(
+                spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+            )
+        });
+        if method_name.is_some_and(|method_name| {
+            foreign_impl_names.get(&def_id).is_some_and(|by_file| {
+                by_file.iter().any(|(file, methods)| {
+                    *file != inputs.source.id() && methods.contains(method_name.as_str())
+                })
+            })
+        }) {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
     }
 
     // A method without a `self` receiver is an associated function —
@@ -8815,6 +8865,64 @@ fn parse_inherent_method_impl(
     ))
 }
 
+fn parsed_method_record_normalized_name(record: &ParsedMethodRecord) -> String {
+    sai_syntax::normalize_identifier(
+        record
+            .type_name
+            .strip_prefix("r#")
+            .unwrap_or(&record.type_name),
+    )
+}
+
+// A record-typed field inside a foreign record resolves in that
+// record's declaring file, not in the impl file. The projection tables
+// are still keyed by spelling, so adopt such a field only when the
+// spelling names exactly one same-file foreign record and no impl-file
+// or other-file record can capture the key. Imported types inside the
+// foreign file are outside this slice and reject conservatively.
+fn foreign_record_field_target_is_admissible(
+    owner_record: &ParsedMethodRecord,
+    normalized_ty: &str,
+    impl_file_records: &[ParsedMethodRecord],
+    foreign_records: &HashMap<DefId, ParsedMethodRecord>,
+) -> bool {
+    let mut same_file_matches = 0usize;
+    let mut other_file_match = false;
+    for record in foreign_records.values() {
+        if parsed_method_record_normalized_name(record) == normalized_ty {
+            if record.type_name_span.file == owner_record.type_name_span.file {
+                same_file_matches += 1;
+            } else {
+                other_file_match = true;
+            }
+        }
+    }
+    same_file_matches == 1
+        && !other_file_match
+        && !impl_file_records
+            .iter()
+            .any(|record| parsed_method_record_normalized_name(record) == normalized_ty)
+}
+
+// Whether a foreign record's own spelling can occupy the string-keyed
+// projection table deterministically.
+fn foreign_record_name_is_unambiguous(
+    record: &ParsedMethodRecord,
+    normalized_name: &str,
+    impl_file_records: &[ParsedMethodRecord],
+    foreign_records: &HashMap<DefId, ParsedMethodRecord>,
+) -> bool {
+    foreign_records
+        .values()
+        .filter(|other| parsed_method_record_normalized_name(other) == normalized_name)
+        .count()
+        == 1
+        && !impl_file_records
+            .iter()
+            .any(|local| parsed_method_record_normalized_name(local) == normalized_name)
+        && parsed_method_record_normalized_name(record) == normalized_name
+}
+
 // `Str` bound by a `use` item that resolved to a real definition
 // shadows the prelude string the same way a file-local `type Str`
 // does — a `Str`-spelled field type then names that def, not core
@@ -8897,8 +9005,8 @@ fn inherent_method_primitive_field_types(
                 .unwrap_or(&record.type_name),
         ) == target_name.as_ref()
     });
-    let self_record: &ParsedMethodRecord = match self_index {
-        Some(index) => &records[index],
+    let (self_record, self_is_foreign): (&ParsedMethodRecord, bool) = match self_index {
+        Some(index) => (&records[index], false),
         None => {
             let foreign_def_id = symbols
                 .intern(normalized_target_name.as_ref())
@@ -8908,7 +9016,7 @@ fn inherent_method_primitive_field_types(
                     Res::Def(_, def_id) => Some(def_id),
                     _ => None,
                 })?;
-            foreign_records.get(&foreign_def_id)?
+            (foreign_records.get(&foreign_def_id)?, true)
         }
     };
     let normalized_self_name = sai_syntax::normalize_identifier(
@@ -9012,18 +9120,20 @@ fn inherent_method_primitive_field_types(
             return None;
         }
     }
-    // Foreign records join the projection table by name — fields
-    // follow the same admission rules, with the combined record set
-    // standing in for "declared record".
+    // Foreign records join the projection table by spelling. Their
+    // record-typed fields are restricted to unambiguous same-file
+    // records: a same-named impl-file or other-file record would make
+    // the string key resolve to the wrong declaration.
     for record in foreign_records.values() {
-        let normalized_record_name = sai_syntax::normalize_identifier(
-            record
-                .type_name
-                .strip_prefix("r#")
-                .unwrap_or(&record.type_name),
-        );
+        let normalized_record_name = parsed_method_record_normalized_name(record);
         if normalized_record_name == normalized_self_name
             || nested.contains_key(&normalized_record_name)
+            || !foreign_record_name_is_unambiguous(
+                record,
+                &normalized_record_name,
+                &records,
+                foreign_records,
+            )
         {
             continue;
         }
@@ -9041,17 +9151,23 @@ fn inherent_method_primitive_field_types(
                     admissible = false;
                     break;
                 }
-            } else if ty_text == "Str" && !str_name_taken {
+            } else if ty_text == "Str" {
+                // Foreign files declaring or importing `Str` are not
+                // included in `foreign_records`, so this spelling is
+                // the core string regardless of the impl file's scope.
                 record_str_fields.insert(field_name.clone());
             } else {
                 let normalized_ty =
                     sai_syntax::normalize_identifier(ty_text.strip_prefix("r#").unwrap_or(ty_text));
-                if known_record_name(normalized_ty.as_ref())
-                    && record_record_fields
-                        .insert(field_name.clone(), normalized_ty)
-                        .is_none()
+                if !(foreign_record_field_target_is_admissible(
+                    record,
+                    &normalized_ty,
+                    &records,
+                    foreign_records,
+                ) && record_record_fields
+                    .insert(field_name.clone(), normalized_ty)
+                    .is_none())
                 {
-                } else {
                     admissible = false;
                     break;
                 }
@@ -9105,7 +9221,17 @@ fn inherent_method_primitive_field_types(
         } else {
             let normalized_ty =
                 sai_syntax::normalize_identifier(ty_text.strip_prefix("r#").unwrap_or(ty_text));
-            if nested.contains_key(normalized_ty.as_str()) {
+            if self_is_foreign && ty_text == "Str" {
+                str_field_types.insert(field_name.clone());
+            } else if nested.contains_key(normalized_ty.as_str())
+                && (!self_is_foreign
+                    || foreign_record_field_target_is_admissible(
+                        self_record,
+                        &normalized_ty,
+                        &records,
+                        foreign_records,
+                    ))
+            {
                 receiver_fields.insert(field_name.clone(), normalized_ty);
             // `ty` spelled `Str` is the core string only while no record
             // in the file is named `Str` — a user `type Str` shadows the
@@ -9117,6 +9243,9 @@ fn inherent_method_primitive_field_types(
             }
         }
         candidate_names.push(spelling.clone());
+    }
+    if !record_projection_edges_acyclic(&normalized_self_name, &receiver_fields, &nested) {
+        return None;
     }
     Some(InherentMethodPrimitiveFields {
         type_name: self_record
@@ -9746,8 +9875,8 @@ fn str_inherent_method_field_types(
                 .unwrap_or(&record.type_name),
         ) == target_name.as_ref()
     });
-    let self_record: &ParsedMethodRecord = match self_index {
-        Some(index) => &records[index],
+    let (self_record, self_is_foreign): (&ParsedMethodRecord, bool) = match self_index {
+        Some(index) => (&records[index], false),
         None => {
             let foreign_def_id = symbols
                 .intern(normalized_target_name.as_ref())
@@ -9757,7 +9886,7 @@ fn str_inherent_method_field_types(
                     Res::Def(_, def_id) => Some(def_id),
                     _ => None,
                 })?;
-            foreign_records.get(&foreign_def_id)?
+            (foreign_records.get(&foreign_def_id)?, true)
         }
     };
     let normalized_self_name = sai_syntax::normalize_identifier(
@@ -9872,18 +10001,20 @@ fn str_inherent_method_field_types(
             return None;
         }
     }
-    // Foreign records join the projection table by name — fields
-    // follow the same admission rules, with the combined record set
-    // standing in for "declared record".
+    // Foreign records join the projection table by spelling. Their
+    // record-typed fields are restricted to unambiguous same-file
+    // records: a same-named impl-file or other-file record would make
+    // the string key resolve to the wrong declaration.
     for record in foreign_records.values() {
-        let normalized_record_name = sai_syntax::normalize_identifier(
-            record
-                .type_name
-                .strip_prefix("r#")
-                .unwrap_or(&record.type_name),
-        );
+        let normalized_record_name = parsed_method_record_normalized_name(record);
         if normalized_record_name == normalized_self_name
             || nested.contains_key(&normalized_record_name)
+            || !foreign_record_name_is_unambiguous(
+                record,
+                &normalized_record_name,
+                &records,
+                foreign_records,
+            )
         {
             continue;
         }
@@ -9892,18 +10023,10 @@ fn str_inherent_method_field_types(
         let mut record_candidates = Vec::new();
         let mut admissible = true;
         for (field_name, ty_text, spelling) in &record.fields {
-            if ty_text == "Str" && str_name_taken {
-                if record_record_fields
-                    .insert(field_name.clone(), "Str".to_owned())
-                    .is_some()
-                {
-                    admissible = false;
-                    break;
-                }
-                record_candidates.push(spelling.clone());
-                continue;
-            }
-            match str_method_field_family(ty_text, str_name_taken) {
+            // Foreign files declaring or importing `Str` are excluded,
+            // so `Str` here is the core string regardless of the impl
+            // file's scope.
+            match str_method_field_family(ty_text, false) {
                 Some(field_family) => {
                     if record_fields_map
                         .insert(field_name.clone(), field_family)
@@ -9917,10 +10040,14 @@ fn str_inherent_method_field_types(
                     let normalized_ty = sai_syntax::normalize_identifier(
                         ty_text.strip_prefix("r#").unwrap_or(ty_text),
                     );
-                    if !(known_record_name(normalized_ty.as_ref())
-                        && record_record_fields
-                            .insert(field_name.clone(), normalized_ty)
-                            .is_none())
+                    if !(foreign_record_field_target_is_admissible(
+                        record,
+                        &normalized_ty,
+                        &records,
+                        foreign_records,
+                    ) && record_record_fields
+                        .insert(field_name.clone(), normalized_ty)
+                        .is_none())
                     {
                         admissible = false;
                         break;
@@ -9975,7 +10102,19 @@ fn str_inherent_method_field_types(
         }
         let normalized_ty =
             sai_syntax::normalize_identifier(ty_text.strip_prefix("r#").unwrap_or(ty_text));
-        if nested.contains_key(normalized_ty.as_str()) {
+        if self_is_foreign && ty_text == "Str" {
+            if field_types.insert(field_name.clone(), "`Str`").is_some() {
+                return None;
+            }
+        } else if nested.contains_key(normalized_ty.as_str())
+            && (!self_is_foreign
+                || foreign_record_field_target_is_admissible(
+                    self_record,
+                    &normalized_ty,
+                    &records,
+                    foreign_records,
+                ))
+        {
             receiver_fields.insert(field_name.clone(), normalized_ty);
         } else if let Some(field_family) = str_method_field_family(ty_text, str_name_taken) {
             if field_types
@@ -9988,6 +10127,9 @@ fn str_inherent_method_field_types(
             return None;
         }
         candidate_names.push(spelling.clone());
+    }
+    if !record_projection_edges_acyclic(&normalized_self_name, &receiver_fields, &nested) {
+        return None;
     }
     Some(InherentMethodStrFields {
         type_name: self_record
@@ -10002,6 +10144,57 @@ fn str_inherent_method_field_types(
         nested,
         str_name_taken,
     })
+}
+
+// A `use` import can close a record cycle the CLI's file-local
+// acyclic check cannot see — `type A { b: B }` locally where foreign
+// `B { a: A }` points back is INFINITE_SIZE_TYPE upstream. Follow the
+// record-typed edges reachable from the self record over the combined
+// local+foreign projection table; a back-edge keeps bodies gated.
+fn record_projection_edges_acyclic<T>(
+    self_name: &str,
+    self_record_edges: &HashMap<String, String>,
+    nested: &HashMap<String, NestedRecordFields<T>>,
+) -> bool {
+    fn visit<T>(
+        name: &str,
+        self_name: &str,
+        self_record_edges: &HashMap<String, String>,
+        nested: &HashMap<String, NestedRecordFields<T>>,
+        on_path: &mut HashSet<String>,
+        done: &mut HashSet<String>,
+    ) -> bool {
+        if done.contains(name) {
+            return true;
+        }
+        if !on_path.insert(name.to_owned()) {
+            return false;
+        }
+        let edges: Vec<String> = if name == self_name {
+            self_record_edges.values().cloned().collect()
+        } else {
+            nested
+                .get(name)
+                .map(|record| record.record_fields.values().cloned().collect())
+                .unwrap_or_default()
+        };
+        for target in &edges {
+            if !visit(target, self_name, self_record_edges, nested, on_path, done) {
+                return false;
+            }
+        }
+        on_path.remove(name);
+        done.insert(name.to_owned());
+        true
+    }
+    visit(
+        self_name,
+        self_name,
+        self_record_edges,
+        nested,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+    )
 }
 
 // Whether the token after `offset` in `text` is `(` — the method-call
@@ -46272,6 +46465,12 @@ impl RootDatabase {
         // fields name that record, and name-based analysis cannot
         // relate the two scopes.
         let mut foreign_records: HashMap<DefId, ParsedMethodRecord> = HashMap::new();
+        // Inherent impl method names by resolved record DefId and file.
+        // Cross-file duplicates are upstream redefinition errors the
+        // coverage gate cannot emit, so method admission consults this
+        // table and stays unsupported when another file defines the name.
+        let mut foreign_impl_names: HashMap<DefId, HashMap<FileId, HashSet<String>>> =
+            HashMap::new();
         {
             let mut file_str_shadow: HashMap<FileId, bool> = HashMap::new();
             for type_descriptor in
@@ -46302,7 +46501,7 @@ impl RootDatabase {
                     *file_str_shadow
                         .entry(type_descriptor.file)
                         .or_insert_with(|| {
-                            ast::SourceFile::cast(type_inputs.root.clone())
+                            let declares_str = ast::SourceFile::cast(type_inputs.root.clone())
                                 .map(|file| {
                                     file.items().any(|item| match item {
                                         ast::Item::Type(decl) => decl
@@ -46318,7 +46517,14 @@ impl RootDatabase {
                                         _ => false,
                                     })
                                 })
-                                .unwrap_or(true)
+                                .unwrap_or(true);
+                            let imports_str = module_tree
+                                .modules
+                                .iter()
+                                .position(|module| module.file == type_descriptor.file)
+                                .and_then(|index| collection.scopes.modules.get(index))
+                                .is_some_and(|scope| use_shadows_str(scope, &symbols));
+                            declares_str || imports_str
                         });
                 if has_str_record {
                     continue;
@@ -46335,6 +46541,69 @@ impl RootDatabase {
                 };
                 if let Some(record) = parse_inherent_method_record(&decl, &type_inputs) {
                     foreign_records.insert(type_descriptor.owner.def_id.to_def_id(), record);
+                }
+            }
+        }
+        for impl_descriptor in collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Impl)
+        {
+            let Ok(impl_inputs) =
+                self.current_owner_inputs(snapshot, impl_descriptor.file, &collection.target_cfg)
+            else {
+                continue;
+            };
+            let Some(impl_node) = impl_inputs
+                .ast_ids
+                .pointer(impl_descriptor.item_id)
+                .and_then(|pointer| pointer.resolve(impl_descriptor.file, &impl_inputs.root))
+            else {
+                continue;
+            };
+            let Some(impl_decl) = ast::ImplDecl::cast(impl_node) else {
+                continue;
+            };
+            let Some(impl_name) = parse_inherent_method_impl(&impl_decl, &impl_inputs) else {
+                continue;
+            };
+            let Some(module_scope) = module_tree
+                .modules
+                .iter()
+                .position(|module| module.file == impl_descriptor.file)
+                .and_then(|index| collection.scopes.modules.get(index))
+            else {
+                continue;
+            };
+            let Ok(impl_symbol) = symbols.intern(impl_name.as_str()) else {
+                continue;
+            };
+            let Some(def_id) =
+                module_scope
+                    .scope
+                    .get(&impl_symbol)
+                    .and_then(|binding| match binding.res {
+                        Res::Def(DefKind::Struct, def_id) => Some(def_id),
+                        _ => None,
+                    })
+            else {
+                continue;
+            };
+            let methods = foreign_impl_names
+                .entry(def_id)
+                .or_default()
+                .entry(impl_descriptor.file)
+                .or_default();
+            if let Some(items) = impl_decl.items() {
+                for method in items.functions() {
+                    if let Some(text) = method.name().and_then(|name| name.token()) {
+                        let text = text.text();
+                        methods.insert(sai_syntax::normalize_identifier(
+                            text.strip_prefix("r#").unwrap_or(text),
+                        ));
+                    }
                 }
             }
         }
@@ -46753,6 +47022,7 @@ impl RootDatabase {
                                             str_use_shadow,
                                             module_scope,
                                             &foreign_records,
+                                            &foreign_impl_names,
                                             &mut primitive_body_type_results,
                                         )
                                     } else {

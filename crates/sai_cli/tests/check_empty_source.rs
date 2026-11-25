@@ -22318,6 +22318,146 @@ fn impl_on_unresolved_name_stays_gated() {
 }
 
 #[test]
+fn impl_on_imported_const_stays_gated() {
+    // A use-bound const is not a record even when the selfless method
+    // body would type-check as an ordinary function (IR-1146 review).
+    let root_source = concat!(
+        "use acme:empty/types.{LIMIT}\n",
+        "impl LIMIT {\n",
+        "    pub fn f() -> I32 {\n",
+        "        1\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            "pub const LIMIT: I32 = 5\ntype Rec { n: I32 }\n",
+        )],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cross_file_impl_duplicate_method_stays_gated() {
+    // The same method name on the same imported record in another file
+    // is an upstream redefinition, not covered method bodies (IR-1146
+    // review).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "impl Rec {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/types.sai", "type Rec { n: I32 }\n"),
+            (
+                "src/extra.sai",
+                concat!(
+                    "use acme:empty/types.{Rec}\n",
+                    "impl Rec {\n",
+                    "    pub fn get(self: borrow Self) -> I32 {\n",
+                    "        self.n\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn foreign_record_same_name_nested_type_stays_gated() {
+    // `Inner` inside the foreign `Rec` declaration must not resolve to
+    // the impl file's same-named record (IR-1146 review).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "type Inner { n: I32 }\n",
+        "impl Rec {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.inner.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            "type Inner { n: Bool }\ntype Rec { inner: Inner }\n",
+        )],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn foreign_declaration_file_imported_str_stays_gated() {
+    // `Str` in the foreign declaration file may itself be an imported
+    // record; the impl file's lack of a `Str` shadow must not make it
+    // a string field (IR-1146 review).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "impl Rec {\n",
+        "    pub fn empty(self: borrow Self) -> Bool {\n",
+        "        self.text.is_empty()\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/labels.sai", "type Label { n: I32 }\n"),
+            (
+                "src/types.sai",
+                concat!(
+                    "use acme:empty/labels.{Label as Str}\n",
+                    "type Rec { text: Str }\n",
+                ),
+            ),
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn imported_record_field_type_checks() {
+    // A local record may use an imported record as a field type and
+    // project through it in an inherent method (IR-1146 follow-up).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "type Wrap { r: Rec, k: I32 }\n",
+        "impl Wrap {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.r.n\n",
+        "    }\n",
+        "    pub fn key(self: borrow Self) -> I32 {\n",
+        "        self.k\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/types.sai", "type Rec { n: I32 }\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
 fn multi_file_source_with_use_item_alias_checks() {
     // `.{item as alias}` binds the alias — `plus(1)` resolves to the
     // sibling file's `add` (IR-1142).
