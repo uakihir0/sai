@@ -3852,9 +3852,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if !matches!(source, MatchSource::Normal) {
             return Err(());
         }
-        let ExprKind::Path(_) = scrutinee.kind else {
+        if !matches!(scrutinee.kind, ExprKind::Path(_))
+            && self.const_path_local_type(scrutinee).is_none()
+        {
             return Err(());
-        };
+        }
         let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
             return Err(());
         };
@@ -5802,9 +5804,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if !matches!(source, MatchSource::Normal) {
             return Err(());
         }
-        let ExprKind::Path(_) = scrutinee.kind else {
+        if !matches!(scrutinee.kind, ExprKind::Path(_))
+            && self.const_path_local_type(scrutinee).is_none()
+        {
             return Err(());
-        };
+        }
         let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
             return Err(());
         };
@@ -6074,9 +6078,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if !matches!(source, MatchSource::Normal) {
             return Err(());
         }
-        let ExprKind::Path(_) = scrutinee.kind else {
+        if !matches!(scrutinee.kind, ExprKind::Path(_))
+            && self.const_path_local_type(scrutinee).is_none()
+        {
             return Err(());
-        };
+        }
         let LocalType::Concrete(scrutinee_type) = self.check_local_path(scrutinee)? else {
             return Err(());
         };

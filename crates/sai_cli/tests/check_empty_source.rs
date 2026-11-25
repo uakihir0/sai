@@ -22601,6 +22601,61 @@ fn member_const_reference_in_str_body_checks() {
 }
 
 #[test]
+fn member_const_reference_in_match_scrutinee_checks() {
+    // `mod.CONST` member reads type primitive `match` scrutinees in
+    // tail, statement, and shared-literal initializer positions.
+    let root_source = concat!(
+        "use acme:empty/values\n",
+        "\n",
+        "pub fn tail() -> I32 {\n",
+        "    match values.LIMIT {\n",
+        "        5 => 1,\n",
+        "        _ => 2,\n",
+        "    }\n",
+        "}\n",
+        "pub fn stmt() -> I32 {\n",
+        "    match values.LIMIT {\n",
+        "        5 => { let x = 1 },\n",
+        "        _ => { let x = 2 },\n",
+        "    }\n",
+        "    0\n",
+        "}\n",
+        "pub fn joined() -> I32 {\n",
+        "    let value = match values.LIMIT {\n",
+        "        5 => 1,\n",
+        "        _ => 2,\n",
+        "    }\n",
+        "    value\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/values.sai", "pub const LIMIT: I32 = 5\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn nonconst_member_projection_match_scrutinee_stays_gated() {
+    // Only member expressions resolved to consts enter this slice;
+    // ordinary record-field scrutinees still stay outside it.
+    let source = concat!(
+        "type Wrap { n: I32 }\n",
+        "impl Wrap {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        match self.n {\n",
+        "            5 => 1,\n",
+        "            _ => 2,\n",
+        "        }\n",
+        "    }\n",
+        "}\n",
+    );
+    assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+}
+
+#[test]
 fn const_reference_in_str_body_mismatch_reports() {
     // A primitive const under a `-> Str` return type reports
     // TYPE_MISMATCH like a scalar local.
