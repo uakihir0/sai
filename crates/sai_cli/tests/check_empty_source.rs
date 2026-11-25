@@ -13313,6 +13313,7 @@ fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
 fn array_const_constructors_check() {
     for source in [
         "pub const EMPTY: Array<I32, 0> = []\n",
+        "pub const NEGATED_ZERO: Array<I32, -0> = []\n",
         "pub const ARRAY: Array<I32, 2> = [1 + 2, 3]\n",
         "pub const TEXT: Array<Str, 1> = [\"text\"]\n",
         "pub const UNITS: Array<(), 2> = [(), ()]\n",

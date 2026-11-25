@@ -17581,11 +17581,14 @@ fn resolve_const_array_type<'hir>(
     };
     let GenericArg::Const(sai_hir::types::ConstArg::Int {
         value: Some(length),
-        negated: false,
+        negated,
     }) = args.args[1]
     else {
         return None;
     };
+    if negated && length != 0 {
+        return None;
+    }
     if length.bit_width() > pointer_width.into() {
         return None;
     }
