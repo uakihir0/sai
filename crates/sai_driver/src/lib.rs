@@ -28628,6 +28628,676 @@ fn const_reference_cycle_members(references: &HashMap<DefId, Vec<DefId>>) -> Has
     cyclic
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ConstScalarValue {
+    Bool(bool),
+    SignedInt(i128),
+    UnsignedInt(u128),
+    Float32(f32),
+    Float64(f64),
+}
+
+struct ConstScalarExpressionEvaluation {
+    diagnostics: Vec<Diagnostic>,
+    value: Option<ConstScalarValue>,
+}
+
+fn check_const_operator_expression_against_type(
+    owner: OwnerId,
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(evaluation) = check_const_scalar_expression(
+        owner,
+        literal_type,
+        value,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(evaluation.diagnostics))
+}
+
+fn check_const_scalar_expression(
+    owner: OwnerId,
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<ConstScalarExpressionEvaluation>, OwnerControlFlowResolutionError> {
+    if matches!(value.kind, ExprKind::Lit(_))
+        || matches!(value.kind, ExprKind::Tuple(elements) if elements.is_empty())
+    {
+        let Some(diagnostics) = check_const_literal_against_type(
+            owner,
+            literal_type,
+            value,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        let scalar = diagnostics
+            .is_empty()
+            .then(|| const_scalar_literal_value(literal_type, value, symbols));
+        return Ok(Some(ConstScalarExpressionEvaluation {
+            diagnostics,
+            value: scalar.flatten(),
+        }));
+    }
+
+    match value.kind {
+        ExprKind::Unary(UnOp::Not, operand)
+            if literal_type == ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool) =>
+        {
+            let Some(mut operand_evaluation) = check_const_scalar_expression(
+                owner,
+                literal_type,
+                operand,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            let result = if operand_evaluation.diagnostics.is_empty() {
+                match operand_evaluation.value {
+                    Some(ConstScalarValue::Bool(value)) => Some(ConstScalarValue::Bool(!value)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            operand_evaluation.value = result;
+            Ok(Some(operand_evaluation))
+        }
+        ExprKind::Unary(UnOp::Neg, operand)
+            if matches!(literal_type, ConstLiteralType::Primitive(_)) =>
+        {
+            let Some(mut operand_evaluation) = check_const_scalar_expression(
+                owner,
+                literal_type,
+                operand,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            let ConstLiteralType::Primitive(primitive) = literal_type else {
+                return Ok(None);
+            };
+            let supported = matches!(
+                primitive,
+                sai_resolve::prelude::PrimTy::I8
+                    | sai_resolve::prelude::PrimTy::I16
+                    | sai_resolve::prelude::PrimTy::I32
+                    | sai_resolve::prelude::PrimTy::I64
+                    | sai_resolve::prelude::PrimTy::ISize
+                    | sai_resolve::prelude::PrimTy::F32
+                    | sai_resolve::prelude::PrimTy::F64
+            );
+            if !supported {
+                operand_evaluation
+                    .diagnostics
+                    .push(const_literal_diagnostic(
+                        owner,
+                        inputs,
+                        snapshot,
+                        value.span,
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        format!(
+                            "operator `-` has no `Neg` implementation for `{}`",
+                            const_primitive_name(primitive)
+                        ),
+                        "operator not supported",
+                    )?);
+                operand_evaluation.value = None;
+                return Ok(Some(operand_evaluation));
+            }
+            let result = if operand_evaluation.diagnostics.is_empty() {
+                match operand_evaluation.value {
+                    Some(ConstScalarValue::SignedInt(number)) => match number.checked_neg() {
+                        Some(negated)
+                            if primitive_integer_range(primitive, target_cfg.pointer_width())
+                                .is_some_and(|(minimum, maximum)| {
+                                    negated >= minimum && negated <= maximum
+                                }) =>
+                        {
+                            Some(ConstScalarValue::SignedInt(negated))
+                        }
+                        Some(_) => {
+                            operand_evaluation
+                                .diagnostics
+                                .push(const_eval_panic_diagnostic(
+                                    owner,
+                                    inputs,
+                                    snapshot,
+                                    value.span,
+                                    "integer overflow in negation",
+                                )?);
+                            None
+                        }
+                        None => {
+                            operand_evaluation
+                                .diagnostics
+                                .push(const_eval_panic_diagnostic(
+                                    owner,
+                                    inputs,
+                                    snapshot,
+                                    value.span,
+                                    "integer overflow in negation",
+                                )?);
+                            None
+                        }
+                    },
+                    Some(ConstScalarValue::Float32(number)) => {
+                        Some(ConstScalarValue::Float32(-number))
+                    }
+                    Some(ConstScalarValue::Float64(number)) => {
+                        Some(ConstScalarValue::Float64(-number))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            operand_evaluation.value = result;
+            Ok(Some(operand_evaluation))
+        }
+        ExprKind::Binary(
+            operator @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem),
+            left,
+            right,
+        ) if matches!(literal_type, ConstLiteralType::Primitive(_)) => {
+            let ConstLiteralType::Primitive(primitive) = literal_type else {
+                return Ok(None);
+            };
+            let Some(mut left_evaluation) = check_const_scalar_expression(
+                owner,
+                literal_type,
+                left,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(right_evaluation) = check_const_scalar_expression(
+                owner,
+                literal_type,
+                right,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            left_evaluation
+                .diagnostics
+                .extend(right_evaluation.diagnostics);
+            let supported = const_arithmetic_operator_supported(operator, primitive);
+            if !supported {
+                left_evaluation.diagnostics.push(const_literal_diagnostic(
+                    owner,
+                    inputs,
+                    snapshot,
+                    value.span,
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    format!(
+                        "operator `{}` has no `{}` implementation for `{}`",
+                        const_binary_operator_text(operator),
+                        const_arithmetic_trait_name(operator),
+                        const_primitive_name(primitive)
+                    ),
+                    "operator not supported",
+                )?);
+                left_evaluation.value = None;
+                return Ok(Some(left_evaluation));
+            }
+            let result = if left_evaluation.diagnostics.is_empty() {
+                match (left_evaluation.value, right_evaluation.value) {
+                    (Some(left_value), Some(right_value)) => {
+                        match evaluate_const_arithmetic(
+                            operator,
+                            primitive,
+                            left_value,
+                            right_value,
+                            target_cfg.pointer_width(),
+                        ) {
+                            Ok(value) => Some(value),
+                            Err(panic_message) => {
+                                left_evaluation
+                                    .diagnostics
+                                    .push(const_eval_panic_diagnostic(
+                                        owner,
+                                        inputs,
+                                        snapshot,
+                                        value.span,
+                                        panic_message,
+                                    )?);
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            left_evaluation.value = result;
+            Ok(Some(left_evaluation))
+        }
+        ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right)
+            if literal_type == ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool) =>
+        {
+            let Some(mut left_evaluation) = check_const_scalar_expression(
+                owner,
+                literal_type,
+                left,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(right_evaluation) = check_const_scalar_expression(
+                owner,
+                literal_type,
+                right,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            left_evaluation
+                .diagnostics
+                .extend(right_evaluation.diagnostics);
+            let result = if left_evaluation.diagnostics.is_empty() {
+                match (left_evaluation.value, right_evaluation.value) {
+                    (Some(ConstScalarValue::Bool(left)), Some(ConstScalarValue::Bool(right))) => {
+                        Some(ConstScalarValue::Bool(if operator == BinOp::And {
+                            left && right
+                        } else {
+                            left || right
+                        }))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            left_evaluation.value = result;
+            Ok(Some(left_evaluation))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn const_scalar_literal_value(
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    symbols: &Interner,
+) -> Option<ConstScalarValue> {
+    let ExprKind::Lit(literal) = value.kind else {
+        return None;
+    };
+    match (literal_type, literal) {
+        (ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool), Lit::Bool(value)) => {
+            Some(ConstScalarValue::Bool(value))
+        }
+        (ConstLiteralType::Primitive(primitive), Lit::Int { value, negated })
+            if matches!(
+                primitive,
+                sai_resolve::prelude::PrimTy::I8
+                    | sai_resolve::prelude::PrimTy::I16
+                    | sai_resolve::prelude::PrimTy::I32
+                    | sai_resolve::prelude::PrimTy::I64
+                    | sai_resolve::prelude::PrimTy::ISize
+                    | sai_resolve::prelude::PrimTy::U8
+                    | sai_resolve::prelude::PrimTy::U16
+                    | sai_resolve::prelude::PrimTy::U32
+                    | sai_resolve::prelude::PrimTy::U64
+                    | sai_resolve::prelude::PrimTy::USize
+            ) =>
+        {
+            const_integer_literal_value(primitive, value?, negated)
+        }
+        (
+            ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::F32),
+            Lit::Float { text, negated },
+        ) => {
+            let mut number = symbols.resolve(text).ok()?.parse::<f32>().ok()?;
+            if negated {
+                number = -number;
+            }
+            Some(ConstScalarValue::Float32(number))
+        }
+        (
+            ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::F64),
+            Lit::Float { text, negated },
+        ) => {
+            let mut number = symbols.resolve(text).ok()?.parse::<f64>().ok()?;
+            if negated {
+                number = -number;
+            }
+            Some(ConstScalarValue::Float64(number))
+        }
+        _ => None,
+    }
+}
+
+fn const_integer_literal_value(
+    primitive: sai_resolve::prelude::PrimTy,
+    magnitude: u128,
+    negated: bool,
+) -> Option<ConstScalarValue> {
+    match primitive {
+        sai_resolve::prelude::PrimTy::I8
+        | sai_resolve::prelude::PrimTy::I16
+        | sai_resolve::prelude::PrimTy::I32
+        | sai_resolve::prelude::PrimTy::I64
+        | sai_resolve::prelude::PrimTy::ISize => {
+            let magnitude = i128::try_from(magnitude).ok()?;
+            Some(ConstScalarValue::SignedInt(if negated {
+                -magnitude
+            } else {
+                magnitude
+            }))
+        }
+        sai_resolve::prelude::PrimTy::U8
+        | sai_resolve::prelude::PrimTy::U16
+        | sai_resolve::prelude::PrimTy::U32
+        | sai_resolve::prelude::PrimTy::U64
+        | sai_resolve::prelude::PrimTy::USize => Some(ConstScalarValue::UnsignedInt(magnitude)),
+        _ => None,
+    }
+}
+
+fn primitive_integer_width(
+    primitive: sai_resolve::prelude::PrimTy,
+    pointer_width: u8,
+) -> Option<u8> {
+    match primitive {
+        sai_resolve::prelude::PrimTy::I8 | sai_resolve::prelude::PrimTy::U8 => Some(8),
+        sai_resolve::prelude::PrimTy::I16 | sai_resolve::prelude::PrimTy::U16 => Some(16),
+        sai_resolve::prelude::PrimTy::I32 | sai_resolve::prelude::PrimTy::U32 => Some(32),
+        sai_resolve::prelude::PrimTy::I64 | sai_resolve::prelude::PrimTy::U64 => Some(64),
+        sai_resolve::prelude::PrimTy::ISize | sai_resolve::prelude::PrimTy::USize => {
+            Some(pointer_width)
+        }
+        _ => None,
+    }
+}
+
+fn primitive_integer_range(
+    primitive: sai_resolve::prelude::PrimTy,
+    pointer_width: u8,
+) -> Option<(i128, i128)> {
+    let width = primitive_integer_width(primitive, pointer_width)?;
+    if !matches!(
+        primitive,
+        sai_resolve::prelude::PrimTy::I8
+            | sai_resolve::prelude::PrimTy::I16
+            | sai_resolve::prelude::PrimTy::I32
+            | sai_resolve::prelude::PrimTy::I64
+            | sai_resolve::prelude::PrimTy::ISize
+    ) {
+        return None;
+    }
+    Some((-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1))
+}
+
+fn primitive_unsigned_maximum(
+    primitive: sai_resolve::prelude::PrimTy,
+    pointer_width: u8,
+) -> Option<u128> {
+    let width = primitive_integer_width(primitive, pointer_width)?;
+    if !matches!(
+        primitive,
+        sai_resolve::prelude::PrimTy::U8
+            | sai_resolve::prelude::PrimTy::U16
+            | sai_resolve::prelude::PrimTy::U32
+            | sai_resolve::prelude::PrimTy::U64
+            | sai_resolve::prelude::PrimTy::USize
+    ) {
+        return None;
+    }
+    Some((1u128 << width) - 1)
+}
+
+fn const_arithmetic_operator_supported(
+    operator: BinOp,
+    primitive: sai_resolve::prelude::PrimTy,
+) -> bool {
+    use sai_resolve::prelude::PrimTy;
+    match operator {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => matches!(
+            primitive,
+            PrimTy::I8
+                | PrimTy::I16
+                | PrimTy::I32
+                | PrimTy::I64
+                | PrimTy::ISize
+                | PrimTy::U8
+                | PrimTy::U16
+                | PrimTy::U32
+                | PrimTy::U64
+                | PrimTy::USize
+                | PrimTy::F32
+                | PrimTy::F64
+        ),
+        BinOp::Rem => matches!(
+            primitive,
+            PrimTy::I8
+                | PrimTy::I16
+                | PrimTy::I32
+                | PrimTy::I64
+                | PrimTy::ISize
+                | PrimTy::U8
+                | PrimTy::U16
+                | PrimTy::U32
+                | PrimTy::U64
+                | PrimTy::USize
+        ),
+        _ => false,
+    }
+}
+
+fn const_binary_operator_text(operator: BinOp) -> &'static str {
+    match operator {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Rem => "%",
+        _ => "operator",
+    }
+}
+
+fn const_arithmetic_trait_name(operator: BinOp) -> &'static str {
+    match operator {
+        BinOp::Add => "Add",
+        BinOp::Sub => "Sub",
+        BinOp::Mul => "Mul",
+        BinOp::Div => "Div",
+        BinOp::Rem => "Rem",
+        _ => "operator",
+    }
+}
+
+fn evaluate_const_arithmetic(
+    operator: BinOp,
+    primitive: sai_resolve::prelude::PrimTy,
+    left: ConstScalarValue,
+    right: ConstScalarValue,
+    pointer_width: u8,
+) -> Result<ConstScalarValue, &'static str> {
+    match (left, right) {
+        (ConstScalarValue::SignedInt(left), ConstScalarValue::SignedInt(right)) => {
+            evaluate_const_signed_arithmetic(operator, primitive, left, right, pointer_width)
+        }
+        (ConstScalarValue::UnsignedInt(left), ConstScalarValue::UnsignedInt(right)) => {
+            evaluate_const_unsigned_arithmetic(operator, primitive, left, right, pointer_width)
+        }
+        (ConstScalarValue::Float32(left), ConstScalarValue::Float32(right)) => {
+            let value = match operator {
+                BinOp::Add => left + right,
+                BinOp::Sub => left - right,
+                BinOp::Mul => left * right,
+                BinOp::Div => left / right,
+                _ => return Err("operator not supported"),
+            };
+            Ok(ConstScalarValue::Float32(value))
+        }
+        (ConstScalarValue::Float64(left), ConstScalarValue::Float64(right)) => {
+            let value = match operator {
+                BinOp::Add => left + right,
+                BinOp::Sub => left - right,
+                BinOp::Mul => left * right,
+                BinOp::Div => left / right,
+                _ => return Err("operator not supported"),
+            };
+            Ok(ConstScalarValue::Float64(value))
+        }
+        _ => Err("type mismatch"),
+    }
+}
+
+fn evaluate_const_signed_arithmetic(
+    operator: BinOp,
+    primitive: sai_resolve::prelude::PrimTy,
+    left: i128,
+    right: i128,
+    pointer_width: u8,
+) -> Result<ConstScalarValue, &'static str> {
+    let overflow_message = match operator {
+        BinOp::Add => "integer overflow in addition",
+        BinOp::Sub => "integer overflow in subtraction",
+        BinOp::Mul => "integer overflow in multiplication",
+        BinOp::Div => "integer overflow in division",
+        _ => "integer overflow",
+    };
+    let value = match operator {
+        BinOp::Add => left.checked_add(right).ok_or(overflow_message)?,
+        BinOp::Sub => left.checked_sub(right).ok_or(overflow_message)?,
+        BinOp::Mul => left.checked_mul(right).ok_or(overflow_message)?,
+        BinOp::Div => {
+            if right == 0 {
+                return Err("division by zero");
+            }
+            let (minimum, _) = primitive_integer_range(primitive, pointer_width)
+                .ok_or("integer overflow in division")?;
+            if left == minimum && right == -1 {
+                return Err("integer overflow in division");
+            }
+            left / right
+        }
+        BinOp::Rem => {
+            if right == 0 {
+                return Err("remainder by zero");
+            }
+            let (minimum, _) = primitive_integer_range(primitive, pointer_width)
+                .ok_or("integer overflow in division")?;
+            if left == minimum && right == -1 {
+                0
+            } else {
+                left % right
+            }
+        }
+        _ => return Err("operator not supported"),
+    };
+    let (minimum, maximum) =
+        primitive_integer_range(primitive, pointer_width).ok_or("integer overflow")?;
+    if !(minimum..=maximum).contains(&value) {
+        return Err(overflow_message);
+    }
+    Ok(ConstScalarValue::SignedInt(value))
+}
+
+fn evaluate_const_unsigned_arithmetic(
+    operator: BinOp,
+    primitive: sai_resolve::prelude::PrimTy,
+    left: u128,
+    right: u128,
+    pointer_width: u8,
+) -> Result<ConstScalarValue, &'static str> {
+    let overflow_message = match operator {
+        BinOp::Add => "integer overflow in addition",
+        BinOp::Sub => "integer overflow in subtraction",
+        BinOp::Mul => "integer overflow in multiplication",
+        BinOp::Div => "integer overflow in division",
+        _ => "integer overflow",
+    };
+    let value = match operator {
+        BinOp::Add => left.checked_add(right).ok_or(overflow_message)?,
+        BinOp::Sub => left.checked_sub(right).ok_or(overflow_message)?,
+        BinOp::Mul => left.checked_mul(right).ok_or(overflow_message)?,
+        BinOp::Div => {
+            if right == 0 {
+                return Err("division by zero");
+            }
+            left / right
+        }
+        BinOp::Rem => {
+            if right == 0 {
+                return Err("remainder by zero");
+            }
+            left % right
+        }
+        _ => return Err("operator not supported"),
+    };
+    let maximum = primitive_unsigned_maximum(primitive, pointer_width).ok_or("integer overflow")?;
+    if value > maximum {
+        return Err(overflow_message);
+    }
+    Ok(ConstScalarValue::UnsignedInt(value))
+}
+
+fn const_eval_panic_diagnostic(
+    owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    span: sai_hir::Span,
+    message: &'static str,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    const_literal_diagnostic(
+        owner,
+        inputs,
+        snapshot,
+        span,
+        sai_diagnostics::Code::ConstEvalPanic,
+        message.to_string(),
+        "const evaluation panics",
+    )
+}
+
 fn check_const_literal_against_type(
     owner: OwnerId,
     literal_type: ConstLiteralType,
@@ -28640,6 +29310,17 @@ fn check_const_literal_against_type(
     let literal = match value.kind {
         ExprKind::Lit(literal) => Some(literal),
         ExprKind::Tuple(elements) if elements.is_empty() => None,
+        ExprKind::Unary(..) | ExprKind::Binary(..) => {
+            return check_const_operator_expression_against_type(
+                owner,
+                literal_type,
+                value,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            );
+        }
         _ => return Ok(None),
     };
 

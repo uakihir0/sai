@@ -13359,7 +13359,6 @@ fn duplicate_public_primitive_const_names_report_a_duplicate_without_a_result() 
 #[test]
 fn const_forms_outside_literal_slice_remain_gated() {
     for source in [
-        "pub const EXPRESSION: I8 = 1 + 2\n",
         "pub const ALIAS: MyInt = 1\n",
         "pub const BORROWED: &Bool = &true\n",
         "use missing;\npub const VALUE: I8 = 1\n",
@@ -23377,6 +23376,94 @@ fn const_range_endpoints_in_primitive_match_check() {
         &[],
     );
     assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_const_arithmetic_and_logical_expressions_check() {
+    for source in [
+        "pub const VALUE: I32 = 1 + 2 * 3
+pub fn get() -> I32 {
+    VALUE
+}
+",
+        "pub const VALUE: U8 = 10 - (2 * 3)
+",
+        "pub const VALUE: I16 = -(1 + 2) / 2
+",
+        "pub const VALUE: F64 = (1.5 + 2.0) * 3.0
+",
+        "pub const READY: Bool = true and not false
+pub fn ready() -> Bool {
+    READY
+}
+",
+        "pub const READY: Bool = false or (true and true)
+",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_const_expression_errors_are_checked() {
+    for (source, code, message) in [
+        (
+            "pub const VALUE: I8 = 127 + 1
+",
+            "CONST_EVAL_PANIC",
+            "integer overflow in addition",
+        ),
+        (
+            "pub const VALUE: I32 = 1 / 0
+",
+            "CONST_EVAL_PANIC",
+            "division by zero",
+        ),
+        (
+            "pub const VALUE: U8 = 1 % 0
+",
+            "CONST_EVAL_PANIC",
+            "remainder by zero",
+        ),
+        (
+            "pub const VALUE: I8 = -(-128)
+",
+            "CONST_EVAL_PANIC",
+            "integer overflow in negation",
+        ),
+        (
+            "pub const VALUE: I32 = 1 + true
+",
+            "TYPE_MISMATCH",
+            "expected `I32`, found a Bool literal",
+        ),
+        (
+            "pub const VALUE: Bool = true + false
+",
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `+` has no `Add` implementation for `Bool`",
+        ),
+        (
+            "pub const VALUE: F64 = 1.0 % 2.0
+",
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `%` has no `Rem` implementation for `F64`",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\"")) && stdout.contains(message),
+            "expected {code} with {message:?}:
+{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "supported invalid const expression must not be gated:
+{stdout}"
+        );
+    }
 }
 
 #[test]
