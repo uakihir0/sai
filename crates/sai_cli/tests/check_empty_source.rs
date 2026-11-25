@@ -3721,6 +3721,17 @@ fn branching_tuple_const_reference_cycle_reports_const_cycle() {
 }
 
 #[test]
+fn converging_const_references_are_not_cyclic() {
+    let source = concat!(
+        "pub const LEAF: I32 = 1\n",
+        "pub const LEFT: I32 = LEAF\n",
+        "pub const RIGHT: I32 = LEAF\n",
+        "pub const ROOT: (I32, I32) = (LEFT, RIGHT)\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
 fn mixed_record_typed_fields_check() {
     // A `type` field typed by another `type` in the file stays
     // admissible — record-typed receivers feed `self.<field>.<leaf>`

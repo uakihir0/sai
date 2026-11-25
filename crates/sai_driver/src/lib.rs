@@ -28754,40 +28754,69 @@ fn const_initializer_reference_targets(
 }
 
 fn const_reference_cycle_members(references: &HashMap<DefId, Vec<DefId>>) -> HashSet<DefId> {
-    let mut cyclic = HashSet::new();
+    let mut nodes = HashSet::new();
     for (node, targets) in references {
-        if targets.iter().any(|target| {
-            *target == *node
-                || const_reference_reaches(references, *target, *node, &mut HashSet::new())
-        }) {
-            cyclic.insert(*node);
+        nodes.insert(*node);
+        nodes.extend(targets.iter().copied());
+    }
+
+    let mut forward_visited = HashSet::new();
+    let mut finish_order = Vec::new();
+    for start in nodes.iter().copied() {
+        if forward_visited.contains(&start) {
+            continue;
+        }
+        forward_visited.insert(start);
+        let mut calls = vec![(start, 0usize)];
+        while let Some((node, next_target)) = calls.last_mut() {
+            let targets = references.get(node).map_or(&[][..], Vec::as_slice);
+            if *next_target == targets.len() {
+                finish_order.push(*node);
+                calls.pop();
+                continue;
+            }
+            let target = targets[*next_target];
+            *next_target += 1;
+            if forward_visited.insert(target) {
+                calls.push((target, 0));
+            }
+        }
+    }
+
+    let mut reversed = HashMap::<DefId, Vec<DefId>>::new();
+    for (node, targets) in references {
+        for target in targets {
+            reversed.entry(*target).or_default().push(*node);
+        }
+    }
+
+    let mut reverse_visited = HashSet::new();
+    let mut cyclic = HashSet::new();
+    for start in finish_order.iter().rev().copied() {
+        if !reverse_visited.insert(start) {
+            continue;
+        }
+        let mut component = vec![start];
+        let mut walk = vec![start];
+        while let Some(node) = walk.pop() {
+            for target in reversed.get(&node).map_or(&[][..], Vec::as_slice) {
+                if reverse_visited.insert(*target) {
+                    component.push(*target);
+                    walk.push(*target);
+                }
+            }
+        }
+        if component.len() > 1
+            || component.iter().any(|node| {
+                references
+                    .get(node)
+                    .is_some_and(|targets| targets.contains(node))
+            })
+        {
+            cyclic.extend(component);
         }
     }
     cyclic
-}
-
-fn const_reference_reaches(
-    references: &HashMap<DefId, Vec<DefId>>,
-    from: DefId,
-    to: DefId,
-    visited: &mut HashSet<DefId>,
-) -> bool {
-    if from == to {
-        return true;
-    }
-    if !visited.insert(from) {
-        return false;
-    }
-    let Some(targets) = references.get(&from) else {
-        return false;
-    };
-    for target in targets {
-        if const_reference_reaches(references, *target, to, visited) {
-            return true;
-        }
-    }
-    visited.remove(&from);
-    false
 }
 
 #[derive(Clone, Copy, Debug)]
