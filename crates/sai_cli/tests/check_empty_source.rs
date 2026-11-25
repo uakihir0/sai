@@ -22031,3 +22031,121 @@ fn unsupported_return_forms_remain_gated() {
         "unbound return values stay behind the existing gate:\n{stdout}"
     );
 }
+
+#[test]
+fn multi_file_mixed_source_checks() {
+    // Sources spanning several `.sai` files check when every file is
+    // mixed-shaped and no module imports (IR-1141).
+    let root_source = concat!(
+        "type Outer { inner: Inner }\n",
+        "type Inner { s: Str }\n",
+        "impl Outer {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.inner.s\n",
+        "    }\n",
+        "}\n",
+    );
+    let other_source = concat!(
+        "type Solo { n: I32 }\n",
+        "impl Solo {\n",
+        "    pub fn get_n(self: borrow Self) -> I32 {\n",
+        "        self.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(root_source, "", &[("src/other.sai", other_source)], &[]);
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn multi_file_source_reports_other_file_diagnostics() {
+    // Diagnostics from non-`lib.sai` files report their own file.
+    let root_source = concat!(
+        "type Outer { inner: Inner }\n",
+        "type Inner { s: Str }\n",
+        "impl Outer {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.inner.s\n",
+        "    }\n",
+        "}\n",
+    );
+    let other_source = concat!(
+        "type Solo { n: I32 }\n",
+        "impl Solo {\n",
+        "    pub fn get_n(self: borrow Self) -> I32 {\n",
+        "        self.missing\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(root_source, "", &[("src/other.sai", other_source)], &[]);
+    assert!(!output.status.success(), "unknown field must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"UNKNOWN_FIELD\""),
+        "expected UNKNOWN_FIELD from the second file: {stdout}"
+    );
+    assert!(
+        stdout.contains("src/other.sai"),
+        "diagnostic must point at the second file: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "multi-file sources must not gate: {stdout}"
+    );
+}
+
+#[test]
+fn multi_file_source_with_fragment_files_checks() {
+    // fn-only / type-only / const-only sibling files join the covered
+    // set — every file just needs checked item kinds, and the package
+    // needs at least one impl owner overall (IR-1141).
+    let root_source = concat!(
+        "type Inner { s: Str }\n",
+        "impl Inner {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.s\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/fnonly.sai", "pub fn helper() -> I32 {\n    1\n}\n"),
+            ("src/tyonly.sai", "type Extra { v: I32 }\n"),
+            ("src/consts.sai", "pub const LIMIT: I32 = 5\n"),
+        ],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn multi_file_source_with_impl_only_file_stays_gated() {
+    // An `impl` whose record is not declared in the same file cannot
+    // resolve its self type (cross-file impls need `use`), so the
+    // package stays gated (IR-1141 bound).
+    let root_source = concat!(
+        "type Inner { s: Str }\n",
+        "impl Inner {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.s\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/implonly.sai",
+            "impl Inner {\n    pub fn other(self: borrow Self) -> Str {\n        self.s\n    }\n}\n",
+        )],
+        &[],
+    );
+    assert!(!output.status.success(), "impl-only file must gate");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "impl-only files stay behind the existing gate: {stdout}"
+    );
+}
