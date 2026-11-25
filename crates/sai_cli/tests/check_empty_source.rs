@@ -3583,12 +3583,6 @@ fn imported_const_reference_initializers_check() {
 ",
         "pub const MEMBER: I32 = values.LIMIT
 ",
-        "pub fn make() -> I32 {
-",
-        "    DIRECT
-",
-        "}
-",
     );
     let output = run_check(
         source,
