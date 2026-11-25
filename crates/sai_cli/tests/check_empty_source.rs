@@ -3548,6 +3548,149 @@ fn unsupported_const_initializer_in_mixed_source_stays_gated() {
 }
 
 #[test]
+fn const_reference_initializers_check() {
+    // Public const initializers can reference earlier or later consts in
+    // the same module when their declared types match.
+    let source = concat!(
+        "pub const LIMIT: I32 = 10
+",
+        "pub const ALIAS: I32 = LIMIT
+",
+        "pub const FORWARD: I32 = LATER
+",
+        "pub const LATER: I32 = 20
+",
+        "pub fn make() -> I32 {
+",
+        "    ALIAS
+",
+        "}
+",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn imported_const_reference_initializers_check() {
+    // Imported consts keep their declared type in direct, member, aliased,
+    // and re-exported reference positions.
+    let source = concat!(
+        "use acme:empty/middle.{CAP}
+",
+        "use acme:empty/values
+",
+        "pub const DIRECT: I32 = CAP
+",
+        "pub const MEMBER: I32 = values.LIMIT
+",
+    );
+    let output = run_check(
+        source,
+        "",
+        &[
+            (
+                "src/values.sai",
+                "pub const LIMIT: I32 = 10
+",
+            ),
+            (
+                "src/middle.sai",
+                "pub use acme:empty/values.{LIMIT as CAP}
+",
+            ),
+        ],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn cross_file_record_cycle_through_str_alias_stays_gated() {
+    // A const-only package does not claim record coverage: importing the
+    // two records as `Str` hides their cross-file value-cycle from the
+    // file-local record scan, so this shape must remain gated.
+    let root_source = concat!(
+        "use acme:empty/other.{B as Str}
+",
+        "pub const A_VALUE: I32 = 1
+",
+        "type A { b: Str }
+",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/other.sai",
+            concat!(
+                "use acme:empty.{A as Str}
+",
+                "pub const B_VALUE: I32 = 1
+",
+                "type B { a: Str }
+",
+            ),
+        )],
+        &[],
+    );
+    assert_check_stays_gated(&output, "cross-file record cycle");
+}
+
+#[test]
+fn const_reference_initializer_reports_type_mismatch() {
+    // The referenced const contributes its declared type rather than
+    // silently adopting the referencing const's annotation.
+    let source = concat!(
+        "pub const LIMIT: I32 = 10
+",
+        "pub const ALIAS: I64 = LIMIT
+",
+        "pub fn make() -> I32 {
+",
+        "    0
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(
+        !output.status.success(),
+        "mismatched const reference must fail"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `I64`, found `I32`"),
+        "expected the referenced const type mismatch: {stdout}"
+    );
+}
+
+#[test]
+fn cyclic_const_reference_initializers_report_const_cycle() {
+    // Direct and indirect const cycles are compile errors rather than
+    // silently admitted by the order-independent type table.
+    let source = concat!(
+        "pub const FIRST: I32 = SECOND
+",
+        "pub const SECOND: I32 = FIRST
+",
+        "pub fn make() -> I32 {
+",
+        "    0
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "cyclic consts must fail");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"code\":\"CONST_CYCLE\""),
+        "expected CONST_CYCLE: {stdout}"
+    );
+}
+
+#[test]
 fn mixed_record_typed_fields_check() {
     // A `type` field typed by another `type` in the file stays
     // admissible — record-typed receivers feed `self.<field>.<leaf>`
@@ -22203,6 +22346,458 @@ fn multi_file_source_with_use_import_checks() {
         &[],
     );
     assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn cross_file_impl_receiver_checks() {
+    // `use pkg/mod.{Type}` makes an `impl` on an imported record
+    // checkable — the record's fields come from the declaring file
+    // (IR-1146).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "impl Rec {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.n\n",
+        "    }\n",
+        "    pub fn deep(self: borrow Self) -> Str {\n",
+        "        self.inner.deep.text\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            concat!(
+                "type Deep { text: Str }\n",
+                "type Inner { deep: Deep }\n",
+                "type Rec { inner: Inner, n: I32 }\n",
+            ),
+        )],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn cross_file_impl_receiver_reports_unknown_field() {
+    // Unknown fields on an imported record still diagnose, and the
+    // nested record's name is taken from the declaring file (IR-1146).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "impl Rec {\n",
+        "    pub fn bad(self: borrow Self) -> I32 {\n",
+        "        self.inner.missing\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            "type Inner { n: I32 }\ntype Rec { inner: Inner }\n",
+        )],
+        &[],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"code\":\"UNKNOWN_FIELD\""),
+        "expected UNKNOWN_FIELD: {stdout}"
+    );
+    assert!(
+        stdout.contains("has no field"),
+        "expected the field diagnostic message: {stdout}"
+    );
+}
+
+#[test]
+fn cross_file_impl_receiver_alias_checks() {
+    // `.{Type as Alias}` binds the alias — `impl Alias` resolves the
+    // same foreign record (IR-1146).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec as R}\n",
+        "impl R {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/types.sai", "type Rec { n: I32 }\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn impl_on_unresolved_name_stays_gated() {
+    // An `impl` head that resolves to no record still gates — no
+    // import and no local `type` declaration (IR-1146).
+    let root_source = concat!(
+        "impl Rec {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/types.sai", "type Rec { n: I32 }\n")],
+        &[],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "expected the unsupported gate: {stdout}"
+    );
+}
+
+#[test]
+fn impl_on_imported_const_stays_gated() {
+    // A use-bound const is not a record even when the selfless method
+    // body would type-check as an ordinary function (IR-1146 review).
+    let root_source = concat!(
+        "use acme:empty/types.{LIMIT}\n",
+        "impl LIMIT {\n",
+        "    pub fn f() -> I32 {\n",
+        "        1\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            "pub const LIMIT: I32 = 5\ntype Rec { n: I32 }\n",
+        )],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cross_file_impl_duplicate_method_stays_gated() {
+    // The same method name on the same imported record in another file
+    // is an upstream redefinition, not covered method bodies (IR-1146
+    // review).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "impl Rec {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/types.sai", "type Rec { n: I32 }\n"),
+            (
+                "src/extra.sai",
+                concat!(
+                    "use acme:empty/types.{Rec}\n",
+                    "impl Rec {\n",
+                    "    pub fn get(self: borrow Self) -> I32 {\n",
+                    "        self.n\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn foreign_record_same_name_nested_type_stays_gated() {
+    // `Inner` inside the foreign `Rec` declaration must not resolve to
+    // the impl file's same-named record (IR-1146 review).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "type Inner { n: I32 }\n",
+        "impl Rec {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.inner.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            "type Inner { n: Bool }\ntype Rec { inner: Inner }\n",
+        )],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn foreign_declaration_file_imported_str_stays_gated() {
+    // `Str` in the foreign declaration file may itself be an imported
+    // record; the impl file's lack of a `Str` shadow must not make it
+    // a string field (IR-1146 review).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "impl Rec {\n",
+        "    pub fn empty(self: borrow Self) -> Bool {\n",
+        "        self.text.is_empty()\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/labels.sai", "type Label { n: I32 }\n"),
+            (
+                "src/types.sai",
+                concat!(
+                    "use acme:empty/labels.{Label as Str}\n",
+                    "type Rec { text: Str }\n",
+                ),
+            ),
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn imported_record_field_type_checks() {
+    // A local record may use an imported record as a field type and
+    // project through it in an inherent method (IR-1146 follow-up).
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "type Wrap { r: Rec, k: I32 }\n",
+        "impl Wrap {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.r.n\n",
+        "    }\n",
+        "    pub fn key(self: borrow Self) -> I32 {\n",
+        "        self.k\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/types.sai", "type Rec { n: I32 }\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn imported_alias_field_type_does_not_capture_same_named_record() {
+    // `R` binds the foreign `Rec`; an unrelated foreign record that is
+    // itself named `R` must not become the projection target.
+    let root_source = concat!(
+        "use acme:empty/types.{Rec as R}\n",
+        "type Wrap { r: R }\n",
+        "impl Wrap {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.r.n\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/types.sai", "type Rec { n: Bool }\n"),
+            ("src/other.sai", "type R { n: I32 }\n"),
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn foreign_record_method_in_declaring_file_checks() {
+    // The receiver record's own `impl` in its declaring file remains
+    // available when the impl head denotes that same record exactly.
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "type Wrap { r: Rec }\n",
+        "impl Wrap {\n",
+        "    pub fn get(self: borrow Self) -> Str {\n",
+        "        self.r.name()\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            concat!(
+                "type Rec { text: Str }\n",
+                "impl Rec {\n",
+                "    pub fn name(self: borrow Self) -> Str {\n",
+                "        self.text\n",
+                "    }\n",
+                "}\n",
+            ),
+        )],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn str_shadowing_local_record_does_not_use_same_named_foreign_impl() {
+    // The local `Inner` wins the string-keyed receiver table. The
+    // foreign `Inner::value` impl must not be adopted merely because
+    // the `Str` shadow keeps the local record out of `foreign_records`.
+    let root_source = concat!(
+        "type Str { n: I32 }\n",
+        "type Inner { n: I32 }\n",
+        "type Wrap { inner: Inner }\n",
+        "impl Wrap {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.inner.value()\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            concat!(
+                "type Inner { n: I32 }\n",
+                "impl Inner {\n",
+                "    pub fn value(self: borrow Self) -> I32 {\n",
+                "        self.n\n",
+                "    }\n",
+                "}\n",
+            ),
+        )],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn aliased_foreign_impl_does_not_provide_methods_for_receiver() {
+    // `impl Rec` in `impls.sai` is an impl of `Dummy` through an
+    // alias, not of the receiver record `types.Rec`.
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "type Wrap { r: Rec }\n",
+        "impl Wrap {\n",
+        "    pub fn get(self: borrow Self) -> Str {\n",
+        "        self.r.name()\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/types.sai", "type Rec { text: Str }\n"),
+            ("src/dummy.sai", "type Dummy { text: Str }\n"),
+            (
+                "src/impls.sai",
+                concat!(
+                    "use acme:empty/dummy.{Dummy as Rec}\n",
+                    "impl Rec {\n",
+                    "    pub fn name(self: borrow Self) -> Str {\n",
+                    "        self.text\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn public_field_with_imported_type_stays_gated() {
+    // The file-local CLI gate cannot know the imported type's
+    // visibility, so a public field exposing it remains outside the
+    // covered slice.
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "pub type Wrap { pub r: Rec }\n",
+        "pub fn make() -> I32 {\n",
+        "    1\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/types.sai", "type Rec { n: I32 }\n")],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cross_file_record_cycle_with_selfless_impl_stays_gated() {
+    // `Wrap` and `Rec` contain each other through imports. Even a
+    // selfless associated function cannot be covered because the type
+    // cycle is an upstream infinite-size error.
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "type Wrap { r: Rec }\n",
+        "impl Wrap {\n",
+        "    pub fn make() -> I32 {\n",
+        "        1\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            "use acme:empty.{Wrap}\ntype Rec { w: Wrap }\n",
+        )],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn same_file_alias_impl_duplicate_method_stays_gated() {
+    // Both impl heads resolve to the same record DefId despite their
+    // different spellings, so `make` is a duplicate inherent method.
+    let root_source = concat!(
+        "use acme:empty/types.{Rec}\n",
+        "use acme:empty/types.{Rec as R}\n",
+        "impl Rec {\n",
+        "    pub fn make() -> I32 {\n",
+        "        1\n",
+        "    }\n",
+        "}\n",
+        "impl R {\n",
+        "    pub fn make() -> I32 {\n",
+        "        2\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/types.sai", "type Rec { n: I32 }\n")],
+        &[],
+    );
+    assert!(!output.status.success());
 }
 
 #[test]
