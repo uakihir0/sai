@@ -7385,6 +7385,7 @@ struct ConstReferenceContext<'a, 'm> {
     module_scope: &'a Phase1ModuleScopes,
     module_members: &'a ModuleMemberIndex<'m>,
     types: &'a HashMap<DefId, FunctionDirectType>,
+    aggregate_types: &'a HashMap<DefId, ConstConstructorType>,
     values: &'a HashMap<DefId, ConstScalarValue>,
     cyclic: &'a HashSet<DefId>,
     requesting_package: PackageId,
@@ -16587,6 +16588,77 @@ enum FunctionDirectType {
     Unit,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConstConstructorType {
+    Scalar(FunctionDirectType),
+    Tuple(Vec<ConstConstructorType>),
+    Array(Box<ConstConstructorType>, u128),
+}
+
+fn resolve_const_constructor_type(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    pointer_width: u8,
+) -> Option<ConstConstructorType> {
+    if let TyKind::Tuple(elements) = ty.kind
+        && !elements.is_empty()
+    {
+        let elements = elements
+            .iter()
+            .map(|element| {
+                resolve_const_constructor_type(*element, type_paths, symbols, inputs, pointer_width)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return Some(ConstConstructorType::Tuple(elements));
+    }
+    if let Some((element, length)) = resolve_const_array_type(ty, type_paths, pointer_width) {
+        let element =
+            resolve_const_constructor_type(*element, type_paths, symbols, inputs, pointer_width)?;
+        return Some(ConstConstructorType::Array(Box::new(element), length));
+    }
+    resolve_const_literal_type(ty, type_paths, symbols, inputs).map(|literal_type| {
+        ConstConstructorType::Scalar(match literal_type {
+            ConstLiteralType::Primitive(primitive) => FunctionDirectType::Primitive(primitive),
+            ConstLiteralType::Str => FunctionDirectType::Str,
+            ConstLiteralType::Unit => FunctionDirectType::Unit,
+        })
+    })
+}
+
+fn const_constructor_type_name(ty: &ConstConstructorType) -> String {
+    match ty {
+        ConstConstructorType::Scalar(FunctionDirectType::Primitive(primitive)) => {
+            const_primitive_name(*primitive).to_string()
+        }
+        ConstConstructorType::Scalar(FunctionDirectType::Str) => "Str".to_string(),
+        ConstConstructorType::Scalar(FunctionDirectType::Unit) => "()".to_string(),
+        ConstConstructorType::Tuple(elements) => {
+            let mut display = elements
+                .iter()
+                .map(const_constructor_type_name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if elements.len() == 1 {
+                display.push(',');
+            }
+            format!("({display})")
+        }
+        ConstConstructorType::Array(element, length) => {
+            format!(
+                "Array<{}, {}>",
+                const_constructor_type_name(element),
+                length
+            )
+        }
+    }
+}
+
+fn const_constructor_type_display(ty: &ConstConstructorType) -> String {
+    format!("`{}`", const_constructor_type_name(ty))
+}
+
 #[derive(Clone, Debug)]
 struct PrimitiveFunctionCallSignature {
     owner: OwnerId,
@@ -17529,11 +17601,38 @@ fn is_const_scalar_expression_shape(
     }
 }
 
+fn const_constructor_reference_is_supported(
+    owner: OwnerId,
+    value: &HirExpr<'_>,
+    context: &ConstReferenceContext<'_, '_>,
+) -> bool {
+    if const_reference_is_supported(owner, value, context) {
+        return true;
+    }
+    let Some(target) = const_initializer_reference_target(
+        value,
+        context.module_scope,
+        context.module_members,
+        context.requesting_package,
+    ) else {
+        return false;
+    };
+    context.cyclic.contains(&owner.def_id.to_def_id())
+        || (!context.cyclic.contains(&target)
+            && (context.types.contains_key(&target)
+                || context.aggregate_types.contains_key(&target)))
+}
+
 fn is_const_constructor_expression_shape(
     owner: OwnerId,
     value: &HirExpr<'_>,
     const_references: Option<&ConstReferenceContext<'_, '_>>,
 ) -> bool {
+    if const_references
+        .is_some_and(|context| const_constructor_reference_is_supported(owner, value, context))
+    {
+        return true;
+    }
     if is_const_scalar_expression_shape(owner, value, const_references) {
         return true;
     }
@@ -17595,36 +17694,68 @@ fn resolve_const_array_type<'hir>(
     Some((element, length))
 }
 
-fn const_constructor_element_type_supported(
-    ty: Ty<'_>,
-    type_paths: Option<&TypeOwnerPathResolution>,
-    symbols: &Interner,
+fn const_reference_constructor_type(
+    target: DefId,
+    context: &ConstReferenceContext<'_, '_>,
+) -> Option<ConstConstructorType> {
+    if let Some(direct_type) = context.types.get(&target).copied() {
+        return Some(ConstConstructorType::Scalar(direct_type));
+    }
+    context.aggregate_types.get(&target).cloned()
+}
+
+fn check_const_constructor_reference(
+    owner: OwnerId,
+    expected_type: &ConstConstructorType,
+    value: &HirExpr<'_>,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
     inputs: &CurrentOwnerInputs,
-    pointer_width: u8,
-) -> bool {
-    if let TyKind::Tuple(elements) = ty.kind
-        && !elements.is_empty()
-    {
-        return elements.iter().all(|element| {
-            const_constructor_element_type_supported(
-                *element,
-                type_paths,
-                symbols,
-                inputs,
-                pointer_width,
-            )
-        });
-    }
-    if let Some((element, _)) = resolve_const_array_type(ty, type_paths, pointer_width) {
-        return const_constructor_element_type_supported(
-            *element,
-            type_paths,
-            symbols,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(context) = const_references else {
+        return Ok(None);
+    };
+    let Some(target) = const_initializer_reference_target(
+        value,
+        context.module_scope,
+        context.module_members,
+        context.requesting_package,
+    ) else {
+        return Ok(None);
+    };
+    if context.cyclic.contains(&owner.def_id.to_def_id()) {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner,
             inputs,
-            pointer_width,
-        );
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::ConstCycle,
+            "const depends on itself".to_string(),
+            "cyclic const reference",
+        )?]));
     }
-    resolve_const_literal_type(ty, type_paths, symbols, inputs).is_some()
+    if context.cyclic.contains(&target) {
+        return Ok(None);
+    }
+    let Some(found_type) = const_reference_constructor_type(target, context) else {
+        return Ok(None);
+    };
+    if found_type == *expected_type {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(Some(vec![const_literal_diagnostic(
+        owner,
+        inputs,
+        snapshot,
+        value.span,
+        sai_diagnostics::Code::TypeMismatch,
+        format!(
+            "expected {}, found {}",
+            const_constructor_type_display(expected_type),
+            const_constructor_type_display(&found_type)
+        ),
+        "type mismatch",
+    )?]))
 }
 
 fn check_const_tuple_literal(
@@ -17638,20 +17769,35 @@ fn check_const_tuple_literal(
     target_cfg: &TargetCfg,
     const_references: Option<&ConstReferenceContext<'_, '_>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    if expected_elements.iter().any(|ty| {
-        !const_constructor_element_type_supported(
-            *ty,
-            type_paths,
-            symbols,
-            inputs,
-            target_cfg.pointer_width(),
-        )
-    }) {
+    let Some(expected_element_types) = expected_elements
+        .iter()
+        .map(|ty| {
+            resolve_const_constructor_type(
+                *ty,
+                type_paths,
+                symbols,
+                inputs,
+                target_cfg.pointer_width(),
+            )
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
         return Ok(None);
-    }
+    };
+    let expected_type = ConstConstructorType::Tuple(expected_element_types);
 
     let ExprKind::Tuple(values) = value.kind else {
         let ExprKind::Lit(literal) = value.kind else {
+            if let Some(diagnostics) = check_const_constructor_reference(
+                owner.id,
+                &expected_type,
+                value,
+                const_references,
+                inputs,
+                snapshot,
+            )? {
+                return Ok(Some(diagnostics));
+            }
             if !is_const_constructor_expression_shape(owner.id, value, const_references) {
                 return Ok(None);
             }
@@ -17753,17 +17899,29 @@ fn check_const_array_literal(
     target_cfg: &TargetCfg,
     const_references: Option<&ConstReferenceContext<'_, '_>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    if !const_constructor_element_type_supported(
+    let Some(expected_element_type) = resolve_const_constructor_type(
         *expected_element,
         type_paths,
         symbols,
         inputs,
         target_cfg.pointer_width(),
-    ) {
+    ) else {
         return Ok(None);
-    }
+    };
+    let expected_type =
+        ConstConstructorType::Array(Box::new(expected_element_type), expected_length);
 
     let ExprKind::Array(values) = value.kind else {
+        if let Some(diagnostics) = check_const_constructor_reference(
+            owner.id,
+            &expected_type,
+            value,
+            const_references,
+            inputs,
+            snapshot,
+        )? {
+            return Ok(Some(diagnostics));
+        }
         if !is_const_constructor_expression_shape(owner.id, value, const_references) {
             return Ok(None);
         }
@@ -39118,14 +39276,23 @@ impl RootDatabase {
         source_graph_packages: &HashSet<PackageId>,
     ) -> (
         HashMap<DefId, FunctionDirectType>,
+        HashMap<DefId, ConstConstructorType>,
         HashMap<DefId, ConstScalarValue>,
         HashSet<DefId>,
     ) {
-        let empty = || (HashMap::new(), HashMap::new(), HashSet::new());
+        let empty = || {
+            (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashSet::new(),
+            )
+        };
         let Ok(primitive_prelude) = self.primitive_prelude.clone() else {
             return empty();
         };
         let mut const_types = HashMap::new();
+        let mut const_aggregate_types = HashMap::new();
         let mut const_values = HashMap::new();
         let mut const_references = HashMap::<DefId, Vec<DefId>>::new();
         let mut const_descriptors = HashMap::new();
@@ -39233,6 +39400,18 @@ impl RootDatabase {
                 if !targets.is_empty() {
                     const_references.entry(def_id).or_default().extend(targets);
                 }
+            }
+            if let Some(
+                constructor_type @ (ConstConstructorType::Tuple(_)
+                | ConstConstructorType::Array(_, _)),
+            ) = resolve_const_constructor_type(
+                *ty,
+                Some(&type_paths),
+                &self.symbols,
+                inputs,
+                collection.target_cfg.pointer_width(),
+            ) {
+                const_aggregate_types.insert(def_id, constructor_type);
             }
             let Some(const_type) =
                 (match resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs) {
@@ -39400,6 +39579,7 @@ impl RootDatabase {
                 module_scope,
                 module_members,
                 types: &const_types,
+                aggregate_types: &const_aggregate_types,
                 values: &const_values,
                 cyclic: &cyclic,
                 requesting_package: collection.module_tree.package,
@@ -39420,7 +39600,7 @@ impl RootDatabase {
             }
         }
 
-        (const_types, const_values, cyclic)
+        (const_types, const_aggregate_types, const_values, cyclic)
     }
 
     /// Resolves loop labels, lexical locals, module paths, and local
@@ -39631,7 +39811,7 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
         );
-        let (const_literal_types, _, _) = self.index_const_literal_types(
+        let (const_literal_types, _, _, _) = self.index_const_literal_types(
             collection,
             snapshot,
             &top_level_owner_index,
@@ -40297,14 +40477,18 @@ impl RootDatabase {
             .map(|scopes| &scopes.source_graph_packages)
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
-        let (const_literal_types, const_literal_values, cyclic_const_references) = self
-            .index_const_literal_types(
-                collection,
-                snapshot,
-                &top_level_owner_index,
-                &module_members,
-                source_graph_packages,
-            );
+        let (
+            const_literal_types,
+            const_aggregate_literal_types,
+            const_literal_values,
+            cyclic_const_references,
+        ) = self.index_const_literal_types(
+            collection,
+            snapshot,
+            &top_level_owner_index,
+            &module_members,
+            source_graph_packages,
+        );
         let descriptors = collection
             .scopes
             .top_level_owners
@@ -40456,6 +40640,7 @@ impl RootDatabase {
                             module_scope,
                             module_members: &module_members,
                             types: &const_literal_types,
+                            aggregate_types: &const_aggregate_literal_types,
                             values: &const_literal_values,
                             cyclic: &cyclic_const_references,
                             requesting_package: collection.module_tree.package,
@@ -49506,7 +49691,7 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
         );
-        let (const_literal_types, _, _) = self.index_const_literal_types(
+        let (const_literal_types, _, _, _) = self.index_const_literal_types(
             collection,
             snapshot,
             &top_level_owner_index,

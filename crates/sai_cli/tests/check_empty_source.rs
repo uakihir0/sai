@@ -13298,7 +13298,6 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
 #[test]
 fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
-        "pub const TUPLE_TARGET: (I32,) = (1,)\npub const ARITY_UNSUPPORTED_TARGET: (I32,) = (TUPLE_TARGET, TUPLE_TARGET)\n",
         "pub const LEFT: (I32,) = (1,)\npub const RIGHT: (I32,) = (2,)\npub const COMPARISON_FOR_TUPLE: (Bool,) = LEFT == RIGHT\n",
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
         "pub type Number = I32\npub const ALIAS_FIELD: (Number,) = (1,)\n",
@@ -13323,6 +13322,73 @@ fn array_const_constructors_check() {
         "pub const BASE: I8 = 100\npub const REFERENCES: Array<I8, 2> = [BASE, BASE + 27]\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn aggregate_const_references_check() {
+    for source in [
+        "pub const POINT: (I32, Bool) = (1, true)
+pub const ALIAS: (I32, Bool) = POINT
+",
+        "pub const NESTED: ((I32,), Str) = ((1,), \"text\")
+pub const ALIAS: ((I32,), Str) = NESTED
+",
+        "pub const VALUES: Array<I32, 2> = [1, 2]
+pub const ALIAS: Array<I32, 2> = VALUES
+",
+        "pub const NESTED_ARRAY: Array<Array<I32, 1>, 1> = [[1]]
+pub const ARRAY_ALIAS: Array<Array<I32, 1>, 1> = NESTED_ARRAY
+",
+        "pub const POINT: (I32, Bool) = (1, true)
+pub const WRAPPER: ((I32, Bool),) = (POINT,)
+",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn aggregate_const_reference_errors_are_checked() {
+    for (source, message) in [
+        (
+            "pub const TUPLE_TARGET: (I32,) = (1,)
+pub const ARITY_MISMATCH: (I32,) = (TUPLE_TARGET, TUPLE_TARGET)
+",
+            "expected a tuple with 1 elements, found 2",
+        ),
+        (
+            "pub const POINT: (I32, Bool) = (1, true)
+pub const ALIAS: (I32, I32) = POINT
+",
+            "expected `(I32, I32)`, found `(I32, Bool)`",
+        ),
+        (
+            "pub const VALUES: Array<I32, 2> = [1, 2]
+pub const ALIAS: Array<I32, 3> = VALUES
+",
+            "expected `Array<I32, 3>`, found `Array<I32, 2>`",
+        ),
+        (
+            "pub const POINT: (I32, Bool) = (1, true)
+pub const ALIAS: Array<I32, 2> = POINT
+",
+            "expected `Array<I32, 2>`, found `(I32, Bool)`",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"") && stdout.contains(message),
+            "expected aggregate reference mismatch {message:?}:
+{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "supported aggregate reference must not be gated:
+{stdout}"
+        );
     }
 }
 
