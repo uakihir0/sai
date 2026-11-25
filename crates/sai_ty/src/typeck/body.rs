@@ -6030,23 +6030,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     });
                     return Ok(());
                 }
-                for bound in [start, end] {
+                if start.is_none() && end.is_none() {
+                    return Err(());
+                }
+                for bound in [start, end].into_iter().flatten() {
                     match bound {
-                        Some(PatRangeEnd::Lit(literal)) => {
+                        PatRangeEnd::Lit(literal) => {
                             self.check_match_literal_pattern(
                                 literal,
                                 arm.pat.hir_id,
                                 scrutinee_type,
                             )?;
                         }
-                        Some(PatRangeEnd::Path(path)) => {
+                        PatRangeEnd::Path(path) => {
                             self.check_match_const_pattern(
                                 path.hir_id,
                                 arm.pat.hir_id,
                                 scrutinee_type,
                             )?;
                         }
-                        None => return Err(()),
                     }
                 }
                 // §6.21.3: `a ≤ b` for `..=`, `a < b` for `..` — an empty

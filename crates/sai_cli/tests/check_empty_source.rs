@@ -11592,7 +11592,6 @@ fn match_exhaustiveness_and_unreachable_arms_reach_cli_diagnostics() {
 #[test]
 fn unsupported_match_tail_shapes_remain_gated() {
     for source in [
-        "pub fn choose(value: I32) -> I32 { match value { 1.. => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 0 | n => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match 0 { 0 => 1, _ => 2 } }\n",
         "pub fn choose(value: I32) -> Bool { match value { 0 => 1, _ => 2 }\n true }\n",
@@ -23387,6 +23386,149 @@ fn const_range_endpoints_in_primitive_match_check() {
         &[],
     );
     assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn open_range_endpoints_in_primitive_match_check() {
+    // One-sided ranges admit literal or scalar const endpoints in
+    // primitive matches and in scalar matches inside `-> Str` bodies.
+    let source = concat!(
+        "pub const LOW: I32 = 1
+",
+        "pub const HIGH: I32 = 9
+",
+        "pub fn low(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        LOW.. => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn high(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        ..=HIGH => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn lit_low(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        1.. => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn lit_high(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        ..=9 => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn text(x: I32) -> Str {
+",
+        "    match x {
+",
+        "        LOW.. => \"a\",
+",
+        "        _ => \"b\",
+",
+        "    }
+",
+        "}
+",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn pinned_str_match_scrutinee_checks_open_range_const_type() {
+    // A guard in a preceding arm can pin the scrutinee literal variable.
+    // Later one-sided range const endpoints must compare with that pinned
+    // type rather than the provisional `I64` family.
+    let source = concat!(
+        "pub const SMALL: U8 = 1
+",
+        "pub fn pick(flag: Bool) -> Str {
+",
+        "    let n = 5
+",
+        "    let u: U8 = 1
+",
+        "    let r = match n {
+",
+        "        x if n == u => \"a\",
+",
+        "        SMALL.. => \"y\",
+",
+        "        _ => \"z\",
+",
+        "    }
+",
+        "    r
+",
+        "}
+",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn pinned_str_match_scrutinee_range_literals_use_pinned_type() {
+    // The same dynamic scrutinee type applies to literal endpoints:
+    // 300 is in range for provisional I64 but out of range after the
+    // guard pins the scrutinee to U8.
+    let source = concat!(
+        "pub fn pick(flag: Bool) -> Str {
+",
+        "    let n = 5
+",
+        "    let u: U8 = 1
+",
+        "    let r = match n {
+",
+        "        x if n == u => \"a\",
+",
+        "        300.. => \"y\",
+",
+        "        _ => \"z\",
+",
+        "    }
+",
+        "    r
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "out-of-range endpoint must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && stdout.contains("integer literal is out of range for `U8`")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "pinned endpoint range is diagnosed, not gated: {stdout}"
+    );
 }
 
 #[test]

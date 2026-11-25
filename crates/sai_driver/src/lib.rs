@@ -14511,7 +14511,7 @@ fn primitive_const_range_end_shape_is_supported(
             .borrow()
             .as_ref()
             .is_some_and(|sites| sites.contains_key(&path.hir_id)),
-        None => false,
+        None => true,
     }
 }
 
@@ -14605,9 +14605,10 @@ fn primitive_match_tail_shape_is_supported(
             // ranges and non-literal bounds stay gated, matching the
             // checker's arm-pattern admission.
             PatKind::Range { start, end, .. } => {
-                if ![start, end]
-                    .iter()
-                    .all(|bound| primitive_const_range_end_shape_is_supported(bound, inputs))
+                if (start.is_none() && end.is_none())
+                    || ![start, end]
+                        .iter()
+                        .all(|bound| primitive_const_range_end_shape_is_supported(bound, inputs))
                 {
                     return false;
                 }
@@ -15054,9 +15055,10 @@ fn primitive_match_stmt_shape_is_supported(
                     }
                 }
                 PatKind::Range { start, end, .. } => {
-                    if ![start, end]
-                        .iter()
-                        .all(|bound| primitive_const_range_end_shape_is_supported(bound, inputs))
+                    if (start.is_none() && end.is_none())
+                        || ![start, end].iter().all(|bound| {
+                            primitive_const_range_end_shape_is_supported(bound, inputs)
+                        })
                     {
                         return false;
                     }
@@ -19174,13 +19176,23 @@ fn str_match_arm_pattern(
     diagnostics: &mut Vec<Diagnostic>,
     bool_cover: &mut (bool, bool),
 ) -> Result<Option<Option<sai_hir::BindingId>>, OwnerControlFlowResolutionError> {
+    // A guard in an earlier arm can resolve the scrutinee literal
+    // variable after this match's provisional family was computed.
+    // Read the current resolution for every pattern rather than using
+    // that stale family.
+    let current_scrutinee_prim = || {
+        scrutinee_seed
+            .and_then(|seed| str_seed_resolved(seed))
+            .and_then(str_family_prim)
+            .or(scrutinee_prim)
+    };
     // One literal pattern, checked like `check_match_literal_pattern`
     // against the scrutinee primitive — `Str` scrutinee patterns keep
     // the family-name comparison.
     let mut check_pattern_literal = |literal: Lit<'_>,
                                      diagnostics: &mut Vec<Diagnostic>|
      -> Result<Option<()>, OwnerControlFlowResolutionError> {
-        match scrutinee_prim {
+        match current_scrutinee_prim() {
             Some(primitive) => {
                 if is_unguarded && let Lit::Bool(value) = literal {
                     if value {
@@ -19333,6 +19345,7 @@ fn str_match_arm_pattern(
                 return Ok(Some(()));
             }
         }
+        let scrutinee_prim = current_scrutinee_prim();
         let mismatch = match (scrutinee_prim, const_type) {
             (Some(expected), FunctionDirectType::Primitive(found)) => expected != found,
             (Some(_), FunctionDirectType::Str) => true,
@@ -19402,7 +19415,8 @@ fn str_match_arm_pattern(
             end,
             inclusive,
         } if scrutinee_prim.is_some() => {
-            let primitive = scrutinee_prim.expect("range guard keeps a primitive scrutinee");
+            let primitive =
+                current_scrutinee_prim().expect("range guard keeps a primitive scrutinee");
             if !(sai_ty::typeck::literal::is_integer_primitive(primitive)
                 || matches!(
                     primitive,
@@ -19423,19 +19437,21 @@ fn str_match_arm_pattern(
                 )?);
                 return Ok(Some(None));
             }
-            for bound in [start, end] {
+            if start.is_none() && end.is_none() {
+                return Ok(None);
+            }
+            for bound in [start, end].into_iter().flatten() {
                 match bound {
-                    Some(PatRangeEnd::Lit(literal)) => {
+                    PatRangeEnd::Lit(literal) => {
                         if check_pattern_literal(literal, diagnostics)?.is_none() {
                             return Ok(None);
                         }
                     }
-                    Some(PatRangeEnd::Path(path)) => {
+                    PatRangeEnd::Path(path) => {
                         if check_const_pattern(path.hir_id, pat.span, diagnostics)?.is_none() {
                             return Ok(None);
                         }
                     }
-                    None => return Ok(None),
                 }
             }
             if sai_ty::typeck::body::literal_range_is_empty(&start, &end, inclusive) == Some(true) {
@@ -24380,10 +24396,13 @@ fn str_pure_match_family(
                     }
                 }
                 PatKind::Range { start, end, .. } if scrutinee_prim.is_some() => {
-                    for bound in [start, end] {
+                    if start.is_none() && end.is_none() {
+                        return None;
+                    }
+                    for bound in [start, end].into_iter().flatten() {
                         match bound {
-                            Some(PatRangeEnd::Lit(literal)) if admit_literal(literal) => {}
-                            Some(PatRangeEnd::Path(path)) if admit_const(path.hir_id) => {}
+                            PatRangeEnd::Lit(literal) if admit_literal(literal) => {}
+                            PatRangeEnd::Path(path) if admit_const(path.hir_id) => {}
                             _ => return None,
                         }
                     }
@@ -96631,7 +96650,7 @@ property "shared"() {}
         assert_eq!(owners.len(), 42);
 
         for index in [
-            0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 26, 29, 31, 32, 33, 39, 40,
+            0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 23, 26, 29, 31, 32, 33, 39, 40,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -96687,7 +96706,7 @@ property "shared"() {}
         ));
         // `stmt_match` stays gated: statement-position `match` discards its
         // arm values, so unifying them with the return type would be wrong.
-        for index in [15, 18, 19, 21, 23, 34, 35, 41] {
+        for index in [15, 18, 19, 21, 34, 35, 41] {
             let check = owners[index]
                 .body_type_check()
                 .expect("match shapes outside the slice are gated");
