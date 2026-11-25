@@ -22259,10 +22259,10 @@ fn multi_file_source_with_unresolved_import_reports() {
 }
 
 #[test]
-fn multi_file_source_with_module_alias_call_stays_gated() {
-    // `use pkg/module` binds a module alias, but `module.item(..)`
-    // path calls are not yet resolved in bodies — stays gated
-    // (IR-1142 bound).
+fn multi_file_source_with_module_alias_call_checks() {
+    // `use pkg/module` binds a module alias; `module.item(..)` calls
+    // resolve through the module's member namespace into the
+    // direct-call signature table (IR-1143).
     let root_source = concat!(
         "use acme:empty/helper\n",
         "\n",
@@ -22282,11 +22282,49 @@ fn multi_file_source_with_module_alias_call_stays_gated() {
         &[("src/helper.sai", "pub fn add(x: I32) -> I32 {\n    x\n}\n")],
         &[],
     );
-    assert!(!output.status.success(), "module-alias calls must gate");
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert!(
-        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
-        "module-alias path calls stay behind the existing gate: {stdout}"
+        output.status.success(),
+        "module-alias calls to primitive-signature fns check: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "module-alias path calls leave the gate: {stdout}"
+    );
+}
+
+#[test]
+fn multi_file_source_with_module_alias_call_reports_arg_mismatches() {
+    // Member calls through a module alias feed argument types into
+    // the callee's declared parameters like direct calls (IR-1143).
+    let root_source = concat!(
+        "use acme:empty/helper\n",
+        "\n",
+        "type Inner { s: Str }\n",
+        "impl Inner {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.s\n",
+        "    }\n",
+        "}\n",
+        "pub fn caller() -> I32 {\n",
+        "    helper.add(true)\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/helper.sai", "pub fn add(x: I32) -> I32 {\n    x\n}\n")],
+        &[],
+    );
+    assert!(!output.status.success(), "mismatched args must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+        "module-alias call arg mismatches report type errors: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "module-alias call arg mismatches are diagnosed, not gated: {stdout}"
     );
 }
 
