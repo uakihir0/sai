@@ -8370,6 +8370,7 @@ fn check_inherent_method_body_type<'a>(
             );
         }
         *inputs.str_self_field_projections.borrow_mut() = Some(self_field_projections);
+        *inputs.const_path_sites.borrow_mut() = const_path_types.cloned();
         *inputs.str_self_method_calls.borrow_mut() = Some(
             self_method_calls
                 .into_iter()
@@ -8401,6 +8402,7 @@ fn check_inherent_method_body_type<'a>(
             augmented_str_calls.as_ref().or(direct_call_signatures),
         );
         *inputs.str_self_field_projections.borrow_mut() = None;
+        *inputs.const_path_sites.borrow_mut() = None;
         *inputs.str_self_method_calls.borrow_mut() = None;
         let diagnostics = match walk? {
             Some(diagnostics) => {
@@ -10029,12 +10031,18 @@ fn str_self_field_projected_family(
     if !matches!(expression.kind, ExprKind::Field { .. }) {
         return None;
     }
-    inputs
+    if let Some(family) = inputs
         .str_self_field_projections
         .borrow()
-        .as_ref()?
-        .get(&expression.hir_id)
-        .copied()
+        .as_ref()
+        .and_then(|projections| projections.get(&expression.hir_id).copied())
+    {
+        return Some(family);
+    }
+    // A member const read (`helper.LIMIT`) is a resolved const-path
+    // site and binds like a `let` of its declared type — the same
+    // fold the prim walk does via `merged_str_fields`.
+    str_const_entry(expression.hir_id, inputs).map(|entry| entry.family)
 }
 
 fn name_node_id_for_span(root: &SyntaxNode, span: sai_hir::Span) -> Option<String> {
@@ -12820,8 +12828,11 @@ fn str_shaped_local_init(
             fuel,
         ),
         ExprKind::Lit(Lit::Str(_)) => true,
-        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
-            .is_some_and(|source| str_bindings.contains(&source)),
+        ExprKind::Path(path) => {
+            resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|source| str_bindings.contains(&source))
+                || str_const_entry(path.hir_id, inputs).is_some_and(|entry| entry.family == "`Str`")
+        }
         // `let t = self.text` aliases a `Str` field; a `match`
         // yields `Str` when every arm body is a `Str` binding.
         ExprKind::Field { .. } => str_self_field_projected_family(init, inputs) == Some("`Str`"),
@@ -16323,8 +16334,11 @@ fn str_method_call_receiver_is_str(
     inputs: &CurrentOwnerInputs,
 ) -> bool {
     match expression.kind {
-        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
-            .is_some_and(|binding| receivers.contains(&binding)),
+        ExprKind::Path(path) => {
+            resolved_plain_local_path_binding(path, locals, inputs)
+                .is_some_and(|binding| receivers.contains(&binding))
+                || str_const_entry(path.hir_id, inputs).is_some_and(|entry| entry.family == "`Str`")
+        }
         ExprKind::Lit(Lit::Str(_)) => true,
         ExprKind::Field { .. } => {
             str_self_field_projected_family(expression, inputs) == Some("`Str`")
@@ -16626,6 +16640,7 @@ fn str_assign_op_rhs_literal_var(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> Option<Option<bool>> {
     match expr.kind {
         ExprKind::Lit(Lit::Int { .. }) => Some(Some(false)),
@@ -16633,7 +16648,7 @@ fn str_assign_op_rhs_literal_var(
         ExprKind::Unary(
             sai_hir::expressions::UnOp::Neg | sai_hir::expressions::UnOp::BitNot,
             operand,
-        ) => str_assign_op_rhs_literal_var(operand, locals, str_bindings),
+        ) => str_assign_op_rhs_literal_var(operand, locals, str_bindings, inputs),
         ExprKind::Binary(operator, left, right)
             if matches!(
                 operator,
@@ -16653,15 +16668,15 @@ fn str_assign_op_rhs_literal_var(
             ) =>
         {
             match (
-                str_assign_op_rhs_literal_var(left, locals, str_bindings),
-                str_assign_op_rhs_literal_var(right, locals, str_bindings),
+                str_assign_op_rhs_literal_var(left, locals, str_bindings, inputs),
+                str_assign_op_rhs_literal_var(right, locals, str_bindings, inputs),
             ) {
                 (Some(left), Some(right)) => Some(if left == right { left } else { None }),
                 // A concrete leaf anywhere makes the tree concrete.
                 _ => None,
             }
         }
-        ExprKind::Path(_) => str_binding_entry(expr, locals, str_bindings)
+        ExprKind::Path(_) => str_binding_entry(expr, locals, str_bindings, inputs)
             .and_then(|entry| entry.literal)
             .filter(|seed| str_seed_resolved(seed).is_none())
             .map(|seed| Some(matches!(seed.literal, Lit::Float { .. }))),
@@ -16708,6 +16723,7 @@ fn str_let_entry(
     pinned: Option<&'static str>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> StrLocalEntry {
     if let Some(pinned) = pinned {
         return StrLocalEntry {
@@ -16726,7 +16742,7 @@ fn str_let_entry(
             }
         }
         ExprKind::Path(_) => {
-            str_binding_entry(init, locals, str_bindings)
+            str_binding_entry(init, locals, str_bindings, inputs)
                 .map(|entry| StrLocalEntry {
                     family: entry.family,
                     // `let m = n` binds into the same literal-variable
@@ -16751,7 +16767,7 @@ fn str_let_entry(
             // all-literal join is itself a fresh literal variable —
             // `let k = if flag { 1 } else { 2 }` stays provisional until
             // a comparison pins it.
-            let literal = str_init_deferred_seed(init, locals, str_bindings)
+            let literal = str_init_deferred_seed(init, locals, str_bindings, inputs)
                 .filter(|(var_family, _)| *var_family == family)
                 .map(|(_, seed)| (*seed).clone())
                 .or_else(|| str_init_literal_join_seed(init));
@@ -16768,12 +16784,16 @@ fn str_binding_path(
     expression: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> bool {
     let ExprKind::Path(path) = expression.kind else {
         return false;
     };
     if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
         return false;
+    }
+    if str_const_entry(path.hir_id, inputs).is_some_and(|entry| entry.family == "`Str`") {
+        return true;
     }
     matches!(
         locals.paths.get(&path.hir_id),
@@ -16791,8 +16811,9 @@ fn str_binding_family(
     expression: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> Option<&'static str> {
-    str_binding_entry(expression, locals, str_bindings).map(|entry| {
+    str_binding_entry(expression, locals, str_bindings, inputs).map(|entry| {
         entry
             .literal
             .as_ref()
@@ -16805,6 +16826,7 @@ fn str_binding_entry(
     expression: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> Option<StrLocalEntry> {
     let ExprKind::Path(path) = expression.kind else {
         return None;
@@ -16818,8 +16840,28 @@ fn str_binding_entry(
             resolved_segments: 1,
             segment_count: 1,
         }) => str_bindings.get(binding).cloned(),
-        _ => None,
+        // A const reference binds like a `let` of its declared type:
+        // `let s = NAME` sees `Str`, `let n = LIMIT` the primitive.
+        _ => str_const_entry(path.hir_id, inputs),
     }
+}
+
+// The `Str` local entry a same-package/cross-module const reference
+// carries, when `hir_id` is a resolved const-path site: `Str` consts
+// act like `Str` bindings and primitive consts like concrete
+// literals. `Record`-typed consts stay gated here.
+fn str_const_entry(hir_id: sai_hir::HirId, inputs: &CurrentOwnerInputs) -> Option<StrLocalEntry> {
+    let sites = inputs.const_path_sites.borrow();
+    let sites = sites.as_ref()?;
+    let family = match sites.get(&hir_id)? {
+        FunctionDirectType::Str => "`Str`",
+        FunctionDirectType::Primitive(primitive) => str_prim_family_name(*primitive)?,
+        _ => return None,
+    };
+    Some(StrLocalEntry {
+        family,
+        literal: None,
+    })
 }
 
 // The resolution cells bound before a block walk: seeds created inside
@@ -17064,7 +17106,7 @@ fn str_literal_family_init(
     if let Some(family) = str_self_field_projected_family(init, inputs) {
         return Ok(Some((family, Vec::new())));
     }
-    let Some(entry) = str_binding_entry(init, locals, str_bindings) else {
+    let Some(entry) = str_binding_entry(init, locals, str_bindings, inputs) else {
         return Ok(None);
     };
     // A literal-variable path resolves to the demanded primitive like
@@ -17142,7 +17184,7 @@ fn str_condition_operand_family(
         ExprKind::Lit(Lit::Str(_)) => Some("`Str`"),
         ExprKind::Lit(literal) => str_scalar_family_name(literal),
         ExprKind::Field { .. } => str_self_field_projected_family(expr, inputs),
-        _ => str_binding_family(expr, locals, str_bindings),
+        _ => str_binding_family(expr, locals, str_bindings, inputs),
     }
 }
 
@@ -17363,12 +17405,14 @@ fn str_expr_family(
                 });
             let operand_is_literalish = |operand: &HirExpr<'_>| {
                 matches!(operand.kind, ExprKind::Lit(_))
-                    || str_binding_entry(operand, locals, str_bindings).is_some_and(|entry| {
-                        entry
-                            .literal
-                            .as_ref()
-                            .is_some_and(|seed| seed.resolved.get().is_none())
-                    })
+                    || str_binding_entry(operand, locals, str_bindings, inputs).is_some_and(
+                        |entry| {
+                            entry
+                                .literal
+                                .as_ref()
+                                .is_some_and(|seed| seed.resolved.get().is_none())
+                        },
+                    )
             };
             let operands_share_literal_kind =
                 operand_is_literalish(lhs) && operand_is_literalish(rhs);
@@ -17468,7 +17512,7 @@ fn str_expr_family(
                         _ => return Ok(None),
                     },
                     ExprKind::Path(_) => {
-                        match str_binding_entry(lhs, locals, str_bindings) {
+                        match str_binding_entry(lhs, locals, str_bindings, inputs) {
                             Some(entry) => {
                                 match entry
                                     .literal
@@ -17551,8 +17595,8 @@ fn str_expr_family(
                         diagnostics.append(&mut count_diagnostics);
                     }
                     _ => {
-                        let count_seed =
-                            str_binding_entry(rhs, locals, str_bindings).and_then(|entry| {
+                        let count_seed = str_binding_entry(rhs, locals, str_bindings, inputs)
+                            .and_then(|entry| {
                                 entry
                                     .literal
                                     .filter(|seed| str_seed_resolved(seed).is_none())
@@ -18353,8 +18397,9 @@ fn str_scrutinee_arm_entry(
     scrutinee_family: &'static str,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> StrLocalEntry {
-    str_binding_entry(scrutinee, locals, str_bindings).unwrap_or(StrLocalEntry {
+    str_binding_entry(scrutinee, locals, str_bindings, inputs).unwrap_or(StrLocalEntry {
         family: scrutinee_family,
         literal: None,
     })
@@ -18393,7 +18438,7 @@ fn str_match_family(
     let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
         Some("`Str`")
     } else if let Some(family) = str_self_field_projected_family(scrutinee, inputs)
-        .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
+        .or_else(|| str_binding_family(scrutinee, locals, str_bindings, inputs))
     {
         Some(family)
     } else {
@@ -18444,7 +18489,7 @@ fn str_match_family(
     };
     // A literal-variable scrutinee's group: pattern literals join it as
     // deferred sites and a binding arm shares the seed.
-    let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings)
+    let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings, inputs)
         .and_then(|entry| entry.literal)
         .map(|seed| str_seed_root(&seed));
     // A scalar annotation seeds the arm join like the checker's β — a
@@ -18479,7 +18524,13 @@ fn str_match_family(
             {
                 arm_bindings.insert(
                     binding,
-                    str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
+                    str_scrutinee_arm_entry(
+                        scrutinee,
+                        scrutinee_family,
+                        locals,
+                        str_bindings,
+                        inputs,
+                    ),
                 );
             }
         } else {
@@ -18504,7 +18555,13 @@ fn str_match_family(
             if let Some(binding) = binding {
                 arm_bindings.insert(
                     binding,
-                    str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
+                    str_scrutinee_arm_entry(
+                        scrutinee,
+                        scrutinee_family,
+                        locals,
+                        str_bindings,
+                        inputs,
+                    ),
                 );
             }
             // Guards evaluate like `check_if_condition` — the pattern
@@ -18888,12 +18945,13 @@ fn str_leaf_literal_seed(
     expr: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> Option<(&'static str, std::rc::Rc<StrLiteralSeed>)> {
     let leaf = match expr.kind {
         ExprKind::Block(block) => block.tail?,
         _ => expr,
     };
-    let entry = str_binding_entry(leaf, locals, str_bindings)?;
+    let entry = str_binding_entry(leaf, locals, str_bindings, inputs)?;
     let seed = entry.literal?;
     (str_seed_resolved(&seed).is_none()).then(|| (entry.family, str_seed_root(&seed)))
 }
@@ -18939,6 +18997,7 @@ fn str_init_deferred_seed(
     init: &HirExpr<'_>,
     locals: &LocalResolution,
     str_bindings: &StrLocalBindings,
+    inputs: &CurrentOwnerInputs,
 ) -> Option<(&'static str, std::rc::Rc<StrLiteralSeed>)> {
     let mut leaves = Vec::new();
     if !str_yield_seed_leaves(init, &mut leaves) {
@@ -18949,7 +19008,8 @@ fn str_init_deferred_seed(
         if str_literal_contribution(Some(leaf)).is_some() {
             continue;
         }
-        let Some((var_family, seed)) = str_leaf_literal_seed(leaf, locals, str_bindings) else {
+        let Some((var_family, seed)) = str_leaf_literal_seed(leaf, locals, str_bindings, inputs)
+        else {
             return None;
         };
         match &group {
@@ -19095,7 +19155,7 @@ fn str_fold_literal_contributions(
     // 18446744073709551615 }` resolves `big` at `U64`, so the literal
     // is in range).
     let literal_var_seed = |value: Option<&HirExpr<'_>>| -> Option<std::rc::Rc<StrLiteralSeed>> {
-        str_leaf_literal_seed(value?, locals, str_bindings).map(|(_, seed)| seed)
+        str_leaf_literal_seed(value?, locals, str_bindings, inputs).map(|(_, seed)| seed)
     };
     let mut prims = contributions
         .iter()
@@ -19229,7 +19289,7 @@ fn str_condition_operand(
     inputs: &CurrentOwnerInputs,
 ) -> bool {
     matches!(expr.kind, ExprKind::Lit(Lit::Str(_)))
-        || str_binding_path(expr, locals, str_bindings)
+        || str_binding_path(expr, locals, str_bindings, inputs)
         || str_self_field_projected_family(expr, inputs) == Some("`Str`")
 }
 
@@ -19267,7 +19327,7 @@ fn str_assert_msg(
     if matches!(msg.kind, ExprKind::Lit(Lit::Str(_))) {
         return Ok(Some(Vec::new()));
     }
-    if let Some(family) = str_binding_family(msg, locals, str_bindings) {
+    if let Some(family) = str_binding_family(msg, locals, str_bindings, inputs) {
         // `!` (a `let n = loop {}` binding) unifies with every type.
         if family == "`Str`" || family == "`!`" {
             return Ok(Some(Vec::new()));
@@ -19424,7 +19484,7 @@ fn str_condition(
                    other: &'static str,
                    diagnostics: &mut Vec<Diagnostic>|
          -> Result<&'static str, OwnerControlFlowResolutionError> {
-            let Some((_, seed)) = str_leaf_literal_seed(expr, locals, str_bindings) else {
+            let Some((_, seed)) = str_leaf_literal_seed(expr, locals, str_bindings, inputs) else {
                 return Ok(own);
             };
             // A literal operand records a constraint site on the seed
@@ -19447,7 +19507,9 @@ fn str_condition(
             // than pins — `n == k` merges both into one provisional
             // group like the checker's unification, so whichever
             // comparison first pins the group constrains every member.
-            if let Some((_, other_seed)) = str_leaf_literal_seed(other_expr, locals, str_bindings) {
+            if let Some((_, other_seed)) =
+                str_leaf_literal_seed(other_expr, locals, str_bindings, inputs)
+            {
                 str_seed_merge(seed.as_ref(), other_seed.as_ref());
                 return Ok(own);
             }
@@ -19552,7 +19614,7 @@ fn str_condition(
         )?]));
     }
     if let Some(family) = str_self_field_projected_family(cond, inputs)
-        .or_else(|| str_binding_family(cond, locals, str_bindings))
+        .or_else(|| str_binding_family(cond, locals, str_bindings, inputs))
     {
         if family == "`Bool`" || family == "`!`" {
             return Ok(Some(Vec::new()));
@@ -19875,7 +19937,7 @@ fn check_function_str_local_block(
                 let place_resolved = place_seed.as_ref().and_then(|seed| str_seed_resolved(seed));
                 let expected_family = place_resolved.unwrap_or(entry.family);
                 let rhs_entry = if let ExprKind::Path(_) = rhs.kind {
-                    str_binding_entry(rhs, locals, str_bindings)
+                    str_binding_entry(rhs, locals, str_bindings, inputs)
                 } else {
                     None
                 };
@@ -20318,7 +20380,7 @@ fn check_function_str_local_block(
                     }
                     // A non-literal right side evaluates first and can
                     // resolve the place itself (`x += x + 1`).
-                    let rhs_entry = str_binding_entry(rhs, locals, str_bindings);
+                    let rhs_entry = str_binding_entry(rhs, locals, str_bindings, inputs);
                     let rhs_family = if let ExprKind::Path(_) = rhs.kind {
                         let Some(rhs_entry) = rhs_entry.clone() else {
                             return Ok(None);
@@ -20376,7 +20438,12 @@ fn check_function_str_local_block(
                                 // `x <<= 1 + 2` binds the count's
                                 // literal variable and resolves it to
                                 // `U32` — evaluate the count pinned.
-                                match str_assign_op_rhs_literal_var(rhs, locals, str_bindings) {
+                                match str_assign_op_rhs_literal_var(
+                                    rhs,
+                                    locals,
+                                    str_bindings,
+                                    inputs,
+                                ) {
                                     Some(Some(false)) => {
                                         match str_expr_family(
                                             owner,
@@ -20788,7 +20855,8 @@ fn check_function_str_local_block(
                         // checks like `check_arithmetic`/`check_bitwise`/
                         // `check_shift`, then the operator-level place
                         // check runs.
-                        let Some(rhs_entry) = str_binding_entry(rhs, locals, str_bindings) else {
+                        let Some(rhs_entry) = str_binding_entry(rhs, locals, str_bindings, inputs)
+                        else {
                             return Ok(None);
                         };
                         let demanded = demanded_family(op, place_family);
@@ -21045,56 +21113,36 @@ fn check_function_str_local_block(
                         // `check_assign_op_rhs_local_type` demands the
                         // right-operand type and then checks the place.
                         let demanded = demanded_family(op, place_family);
-                        let rhs_family =
-                            match str_assign_op_rhs_literal_var(rhs, locals, str_bindings) {
-                                Some(Some(float)) => {
-                                    // `1 + 2` binds an unresolved literal
-                                    // variable which the demanded type
-                                    // resolves when the operator admits its
-                                    // kind.
-                                    let joinable = arithmetic || !float;
-                                    if !joinable
-                                        || !(if float {
-                                            matches!(demanded, "`F32`" | "`F64`")
-                                        } else {
-                                            str_family_prim(demanded).is_some_and(
-                                                sai_ty::typeck::literal::is_integer_primitive,
-                                            )
-                                        })
-                                    {
-                                        return Ok(None);
-                                    }
-                                    match str_expr_family(
-                                        owner,
-                                        return_ty,
-                                        rhs,
-                                        locals,
-                                        str_bindings,
-                                        str_family_prim(demanded),
-                                        type_paths,
-                                        symbols,
-                                        inputs,
-                                        snapshot,
-                                        target_cfg,
-                                        call_signatures,
-                                    )? {
-                                        Some((rhs_family, mut rhs_diagnostics)) => {
-                                            diagnostics.append(&mut rhs_diagnostics);
-                                            rhs_family
-                                        }
-                                        None => return Ok(None),
-                                    }
+                        let rhs_family = match str_assign_op_rhs_literal_var(
+                            rhs,
+                            locals,
+                            str_bindings,
+                            inputs,
+                        ) {
+                            Some(Some(float)) => {
+                                // `1 + 2` binds an unresolved literal
+                                // variable which the demanded type
+                                // resolves when the operator admits its
+                                // kind.
+                                let joinable = arithmetic || !float;
+                                if !joinable
+                                    || !(if float {
+                                        matches!(demanded, "`F32`" | "`F64`")
+                                    } else {
+                                        str_family_prim(demanded).is_some_and(
+                                            sai_ty::typeck::literal::is_integer_primitive,
+                                        )
+                                    })
+                                {
+                                    return Ok(None);
                                 }
-                                // Literal kinds that disagree fail the
-                                // initializer's constraint.
-                                Some(None) => return Ok(None),
-                                None => match str_expr_family(
+                                match str_expr_family(
                                     owner,
                                     return_ty,
                                     rhs,
                                     locals,
                                     str_bindings,
-                                    None,
+                                    str_family_prim(demanded),
                                     type_paths,
                                     symbols,
                                     inputs,
@@ -21107,8 +21155,32 @@ fn check_function_str_local_block(
                                         rhs_family
                                     }
                                     None => return Ok(None),
-                                },
-                            };
+                                }
+                            }
+                            // Literal kinds that disagree fail the
+                            // initializer's constraint.
+                            Some(None) => return Ok(None),
+                            None => match str_expr_family(
+                                owner,
+                                return_ty,
+                                rhs,
+                                locals,
+                                str_bindings,
+                                None,
+                                type_paths,
+                                symbols,
+                                inputs,
+                                snapshot,
+                                target_cfg,
+                                call_signatures,
+                            )? {
+                                Some((rhs_family, mut rhs_diagnostics)) => {
+                                    diagnostics.append(&mut rhs_diagnostics);
+                                    rhs_family
+                                }
+                                None => return Ok(None),
+                            },
+                        };
                         if str_family_prim(rhs_family).is_none() {
                             return Ok(None);
                         }
@@ -21242,7 +21314,7 @@ fn check_function_str_local_block(
             diagnostics.append(&mut init_diagnostics);
             str_bindings.insert(
                 binding,
-                str_let_entry(init, family, pinned, locals, str_bindings),
+                str_let_entry(init, family, pinned, locals, str_bindings, inputs),
             );
             continue;
         }
@@ -21300,7 +21372,7 @@ fn check_function_str_local_block(
             diagnostics.append(&mut init_diagnostics);
             str_bindings.insert(
                 binding,
-                str_let_entry(init, family, pinned, locals, str_bindings),
+                str_let_entry(init, family, pinned, locals, str_bindings, inputs),
             );
             continue;
         }
@@ -21376,7 +21448,7 @@ fn check_function_str_local_block(
                 diagnostics.append(&mut init_diagnostics);
                 str_bindings.insert(
                     binding,
-                    str_let_entry(init, family, pinned, locals, str_bindings),
+                    str_let_entry(init, family, pinned, locals, str_bindings, inputs),
                 );
                 continue;
             }
@@ -22130,7 +22202,9 @@ fn str_stmt_expr_unit(
                                 target_cfg,
                             )
                         }
-                        _ if str_binding_path(value, locals, str_bindings) => Ok(Some(Vec::new())),
+                        _ if str_binding_path(value, locals, str_bindings, inputs) => {
+                            Ok(Some(Vec::new()))
+                        }
                         _ => match str_expr_family(
                             owner,
                             return_ty,
@@ -22198,7 +22272,7 @@ fn str_stmt_expr_unit(
                 return Ok(None);
             }
             let Some(scrutinee_family) = str_self_field_projected_family(scrutinee, inputs)
-                .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
+                .or_else(|| str_binding_family(scrutinee, locals, str_bindings, inputs))
             else {
                 return Ok(None);
             };
@@ -22219,7 +22293,7 @@ fn str_stmt_expr_unit(
             // A literal-variable scrutinee's group: pattern literals
             // join it as deferred sites and a binding arm shares the
             // seed.
-            let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings)
+            let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings, inputs)
                 .and_then(|entry| entry.literal)
                 .map(|seed| str_seed_root(&seed));
             let mut diagnostics = Vec::new();
@@ -22258,6 +22332,7 @@ fn str_stmt_expr_unit(
                                 scrutinee_family,
                                 locals,
                                 str_bindings,
+                                inputs,
                             ),
                         );
                     }
@@ -22286,6 +22361,7 @@ fn str_stmt_expr_unit(
                                 scrutinee_family,
                                 locals,
                                 str_bindings,
+                                inputs,
                             ),
                         );
                     }
@@ -22441,7 +22517,7 @@ fn str_stmt_break_family(
         // only in the pure scan: the diagnostic walk's contributions
         // carry pin-adjusted families from `str_break_value` instead.
         _ => str_self_field_projected_family(value, inputs).or_else(|| {
-            str_binding_family(value, locals, str_bindings).or_else(|| {
+            str_binding_family(value, locals, str_bindings, inputs).or_else(|| {
                 pure.then(|| {
                     str_pure_init_family(
                         value,
@@ -23105,7 +23181,7 @@ fn str_pure_init_family(
             call_signatures,
         ),
         _ => str_self_field_projected_family(init, inputs)
-            .or_else(|| str_binding_family(init, locals, str_bindings)),
+            .or_else(|| str_binding_family(init, locals, str_bindings, inputs)),
     }
 }
 
@@ -23129,7 +23205,7 @@ fn str_pure_match_family(
     let scrutinee_family = if matches!(scrutinee.kind, ExprKind::Lit(Lit::Str(_))) {
         Some("`Str`")
     } else if let Some(family) = str_self_field_projected_family(scrutinee, inputs)
-        .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
+        .or_else(|| str_binding_family(scrutinee, locals, str_bindings, inputs))
     {
         Some(family)
     } else {
@@ -23178,7 +23254,13 @@ fn str_pure_match_family(
             {
                 arm_bindings.insert(
                     binding,
-                    str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
+                    str_scrutinee_arm_entry(
+                        scrutinee,
+                        scrutinee_family,
+                        locals,
+                        str_bindings,
+                        inputs,
+                    ),
                 );
             }
         } else {
@@ -23223,7 +23305,13 @@ fn str_pure_match_family(
                     catch_all = arm.guard.is_none();
                     arm_bindings.insert(
                         binding,
-                        str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
+                        str_scrutinee_arm_entry(
+                            scrutinee,
+                            scrutinee_family,
+                            locals,
+                            str_bindings,
+                            inputs,
+                        ),
                     );
                 }
                 _ => return None,
@@ -23482,7 +23570,7 @@ fn str_stmt_break_families_expr<'h>(
                 Some("`Str`")
             } else {
                 str_self_field_projected_family(scrutinee, inputs)
-                    .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
+                    .or_else(|| str_binding_family(scrutinee, locals, str_bindings, inputs))
             };
             for arm in arms {
                 let mut arm_bindings = str_bindings.clone();
@@ -23497,7 +23585,7 @@ fn str_stmt_break_families_expr<'h>(
                 {
                     arm_bindings.insert(
                         binding,
-                        str_binding_entry(scrutinee, locals, str_bindings).unwrap_or(
+                        str_binding_entry(scrutinee, locals, str_bindings, inputs).unwrap_or(
                             StrLocalEntry {
                                 family,
                                 literal: None,
@@ -23780,7 +23868,7 @@ fn str_stmt_block_unit(
                 diagnostics.append(&mut init_diagnostics);
                 inner_bindings.insert(
                     binding,
-                    str_let_entry(init, family, pinned, locals, &inner_bindings),
+                    str_let_entry(init, family, pinned, locals, &inner_bindings, inputs),
                 );
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
@@ -24001,7 +24089,7 @@ fn str_loop_level_block(
                 diagnostics.append(&mut init_diagnostics);
                 str_bindings.insert(
                     binding,
-                    str_let_entry(init, family, pinned, locals, str_bindings),
+                    str_let_entry(init, family, pinned, locals, str_bindings, inputs),
                 );
             }
             sai_hir::expressions::StmtKind::Expr(expr) => {
@@ -24326,7 +24414,7 @@ fn str_loop_level_expr(
                 Some("`Str`")
             } else {
                 str_self_field_projected_family(scrutinee, inputs)
-                    .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
+                    .or_else(|| str_binding_family(scrutinee, locals, str_bindings, inputs))
             };
             let Some(scrutinee_family) = scrutinee_family else {
                 return Ok(None);
@@ -24342,7 +24430,7 @@ fn str_loop_level_expr(
             // A literal-variable scrutinee's group: pattern literals
             // join it as deferred sites and a binding arm shares the
             // seed.
-            let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings)
+            let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings, inputs)
                 .and_then(|entry| entry.literal)
                 .map(|seed| str_seed_root(&seed));
             let mut diagnostics = Vec::new();
@@ -24388,6 +24476,7 @@ fn str_loop_level_expr(
                                 scrutinee_family,
                                 locals,
                                 str_bindings,
+                                inputs,
                             ),
                         );
                     }
@@ -24534,7 +24623,7 @@ fn str_outer_breaks_in_block(
                 let seeded_family = if str_annotated {
                     Some("`Str`")
                 } else if ty.is_none() {
-                    str_binding_family(init, locals, &inner)
+                    str_binding_family(init, locals, &inner, inputs)
                         .or_else(|| str_condition_operand_family(init, locals, &inner, inputs))
                         .or_else(|| str_init_literal_join_family(init))
                         .or_else(|| {
@@ -24557,7 +24646,10 @@ fn str_outer_breaks_in_block(
                     None
                 };
                 if let Some(family) = seeded_family {
-                    inner.insert(binding, str_let_entry(init, family, None, locals, &inner));
+                    inner.insert(
+                        binding,
+                        str_let_entry(init, family, None, locals, &inner, inputs),
+                    );
                 }
             }
         }
@@ -24769,7 +24861,8 @@ fn str_outer_breaks_in_expr(
                 Some("`Str`")
             } else {
                 str_self_field_projected_family(scrutinee, inputs).or_else(|| {
-                    str_binding_entry(scrutinee, locals, str_bindings).map(|entry| entry.family)
+                    str_binding_entry(scrutinee, locals, str_bindings, inputs)
+                        .map(|entry| entry.family)
                 })
             };
             let mut clean = false;
@@ -24784,7 +24877,13 @@ fn str_outer_breaks_in_expr(
                 {
                     arm_bindings.insert(
                         binding,
-                        str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
+                        str_scrutinee_arm_entry(
+                            scrutinee,
+                            scrutinee_family,
+                            locals,
+                            str_bindings,
+                            inputs,
+                        ),
                     );
                 }
                 let Some((a_clean, a_found, mut a_diags)) = str_outer_breaks_in_expr(
@@ -25156,7 +25255,7 @@ fn str_clean_expr(
                 {
                     bindings.insert(
                         binding,
-                        str_binding_entry(scrutinee, locals, str_bindings).unwrap_or(
+                        str_binding_entry(scrutinee, locals, str_bindings, inputs).unwrap_or(
                             StrLocalEntry {
                                 family: "`Str`",
                                 literal: None,
@@ -25196,7 +25295,7 @@ fn str_clean_expr(
             !loop_level
                 && str_clean_block(body, locals, str_bindings, true, inputs, call_signatures)
         }
-        _ => str_binding_path(expr, locals, str_bindings),
+        _ => str_binding_path(expr, locals, str_bindings, inputs),
     }
 }
 
@@ -25218,7 +25317,7 @@ fn str_break_value(
         return Ok(Some((true, Vec::new())));
     }
     if let Some(family) = str_self_field_projected_family(value, inputs)
-        .or_else(|| str_binding_family(value, locals, str_bindings))
+        .or_else(|| str_binding_family(value, locals, str_bindings, inputs))
     {
         if family == "`Str`" || family == "`!`" {
             return Ok(Some((true, Vec::new())));
@@ -25378,10 +25477,10 @@ fn check_function_str_match(
     let mut diagnostics = Vec::new();
     // The scrutinee walks like the checker's: locals and literals first,
     // then the general expression walk so calls and operand trees resolve.
-    let scrutinee_family = if str_binding_path(scrutinee, locals, str_bindings) {
+    let scrutinee_family = if str_binding_path(scrutinee, locals, str_bindings, inputs) {
         Some("`Str`")
     } else if let Some(family) = str_self_field_projected_family(scrutinee, inputs)
-        .or_else(|| str_binding_family(scrutinee, locals, str_bindings))
+        .or_else(|| str_binding_family(scrutinee, locals, str_bindings, inputs))
     {
         Some(family)
     } else {
@@ -25427,7 +25526,7 @@ fn check_function_str_match(
     };
     // A literal-variable scrutinee's group: pattern literals join it as
     // deferred sites and a binding arm shares the seed.
-    let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings)
+    let scrutinee_seed = str_binding_entry(scrutinee, locals, str_bindings, inputs)
         .and_then(|entry| entry.literal)
         .map(|seed| str_seed_root(&seed));
     let mut catch_all = false;
@@ -25447,7 +25546,7 @@ fn check_function_str_match(
         {
             arm_bindings.insert(
                 binding,
-                str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
+                str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings, inputs),
             );
         }
         if let Some(guard) = arm.guard {
@@ -25489,7 +25588,13 @@ fn check_function_str_match(
             {
                 arm_bindings.insert(
                     binding,
-                    str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
+                    str_scrutinee_arm_entry(
+                        scrutinee,
+                        scrutinee_family,
+                        locals,
+                        str_bindings,
+                        inputs,
+                    ),
                 );
             }
         } else {
@@ -25513,7 +25618,13 @@ fn check_function_str_match(
             if let Some(binding) = binding {
                 arm_bindings.insert(
                     binding,
-                    str_scrutinee_arm_entry(scrutinee, scrutinee_family, locals, str_bindings),
+                    str_scrutinee_arm_entry(
+                        scrutinee,
+                        scrutinee_family,
+                        locals,
+                        str_bindings,
+                        inputs,
+                    ),
                 );
             }
         }
@@ -25591,7 +25702,7 @@ fn check_function_str_tail(
     call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if let Some(family) = str_self_field_projected_family(tail, inputs)
-        .or_else(|| str_binding_family(tail, locals, str_bindings))
+        .or_else(|| str_binding_family(tail, locals, str_bindings, inputs))
     {
         if family == "`Str`" || family == "`!`" {
             return Ok(Some(Vec::new()));
@@ -25862,7 +25973,8 @@ fn check_function_str_tail(
                     (StrStmtLoopFrame::Loop, Some(value)) => match value.kind {
                         ExprKind::Lit(_) => Ok(Some(Vec::new())),
                         _ if str_self_field_projected_family(value, inputs).is_some()
-                            || str_binding_family(value, locals, str_bindings).is_some() =>
+                            || str_binding_family(value, locals, str_bindings, inputs)
+                                .is_some() =>
                         {
                             Ok(Some(Vec::new()))
                         }
