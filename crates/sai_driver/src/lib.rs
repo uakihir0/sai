@@ -38841,6 +38841,7 @@ impl RootDatabase {
         let mut const_types = HashMap::new();
         let mut const_values = HashMap::new();
         let mut const_references = HashMap::<DefId, Vec<DefId>>::new();
+        let mut direct_const_references = HashMap::new();
         let mut ambiguous_definitions = HashSet::new();
         let mut owner_inputs_by_file = HashMap::<FileId, Option<CurrentOwnerInputs>>::new();
 
@@ -38944,6 +38945,14 @@ impl RootDatabase {
                 if !targets.is_empty() {
                     const_references.entry(def_id).or_default().extend(targets);
                 }
+                if let Some(target) = const_initializer_reference_target(
+                    &body.value,
+                    module_scope,
+                    module_members,
+                    collection.module_tree.package,
+                ) {
+                    direct_const_references.insert(def_id, target);
+                }
             }
             let Some(const_type) =
                 (match resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs) {
@@ -38983,6 +38992,40 @@ impl RootDatabase {
             if const_types.insert(def_id, const_type).is_some() {
                 const_types.remove(&def_id);
                 ambiguous_definitions.insert(def_id);
+            }
+        }
+
+        let mut direct_values = const_values
+            .iter()
+            .map(|(def_id, value)| (*def_id, Some(*value)))
+            .collect::<HashMap<_, _>>();
+        for start in direct_const_references.keys().copied() {
+            if direct_values.contains_key(&start) {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut path_members = HashSet::new();
+            let mut current = start;
+            let terminal = loop {
+                if let Some(value) = direct_values.get(&current).copied() {
+                    break value;
+                }
+                if !path_members.insert(current) {
+                    break None;
+                }
+                path.push(current);
+                let Some(next) = direct_const_references.get(&current).copied() else {
+                    break None;
+                };
+                current = next;
+            };
+            for def_id in path {
+                direct_values.insert(def_id, terminal);
+            }
+        }
+        for (def_id, value) in direct_values {
+            if let Some(value) = value {
+                const_values.insert(def_id, value);
             }
         }
 

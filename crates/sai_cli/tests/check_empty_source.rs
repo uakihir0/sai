@@ -23577,6 +23577,10 @@ pub fn ready() -> Bool {
 pub const VALUE: I8 = BASE + 27
 ",
         "pub const BASE: I8 = 100
+pub const ALIAS: I8 = BASE
+pub const VALUE: I8 = ALIAS + 27
+",
+        "pub const BASE: I8 = 100
 pub const VALUE: Bool = BASE < 127
 ",
         "pub const BASE: I64 = 7
@@ -23626,6 +23630,14 @@ fn primitive_const_expression_errors_are_checked() {
         (
             "pub const BASE: I8 = 100
 pub const VALUE: I8 = BASE + 28
+",
+            "CONST_EVAL_PANIC",
+            "integer overflow in addition",
+        ),
+        (
+            "pub const BASE: I8 = 100
+pub const ALIAS: I8 = BASE
+pub const VALUE: I8 = ALIAS + 28
 ",
             "CONST_EVAL_PANIC",
             "integer overflow in addition",
