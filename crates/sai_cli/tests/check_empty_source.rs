@@ -13387,6 +13387,54 @@ fn cross_file_nominal_const_constructors_check() {
 }
 
 #[test]
+fn cross_file_module_qualified_nominal_payload_checks() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types\n",
+            "use acme:empty/types.{Point}\n",
+            "pub enum Status { Ready(types.Point) }\n",
+            "pub const STATUS: Status = Status.Ready(Point(x: 1))\n",
+            "pub const QUALIFIED: Status = Status.Ready(types.Point(x: 2))\n",
+            "pub const REMOTE: types.Remote = types.Remote.Ready(types.Point(x: 3))\n",
+            "pub const ID: types.UserId = types.UserId(4)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[(
+            "src/types.sai",
+            concat!(
+                "pub type Point { x: I32 }\n",
+                "pub enum Remote { Ready(Point) }\n",
+                "pub distinct UserId = U64\n",
+            ),
+        )],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn missing_module_qualified_nominal_payload_stays_outside_const_constructor_slice() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types\n",
+            "pub enum Status { Ready(types.Missing) }\n",
+            "pub const ONE: I32 = 1\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[("src/types.sai", "pub type Point { x: I32 }\n")],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, "missing module member");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "missing module-qualified nominal payload stays gated:\n{stdout}"
+    );
+}
+
+#[test]
 fn nominal_const_constructor_errors_are_checked() {
     for (source, code, message) in [
         (
