@@ -3605,6 +3605,38 @@ fn imported_const_reference_initializers_check() {
 }
 
 #[test]
+fn cross_file_record_cycle_through_str_alias_stays_gated() {
+    // A const-only package does not claim record coverage: importing the
+    // two records as `Str` hides their cross-file value-cycle from the
+    // file-local record scan, so this shape must remain gated.
+    let root_source = concat!(
+        "use acme:empty/other.{B as Str}
+",
+        "pub const A_VALUE: I32 = 1
+",
+        "type A { b: Str }
+",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/other.sai",
+            concat!(
+                "use acme:empty.{A as Str}
+",
+                "pub const B_VALUE: I32 = 1
+",
+                "type B { a: Str }
+",
+            ),
+        )],
+        &[],
+    );
+    assert_check_stays_gated(&output, "cross-file record cycle");
+}
+
+#[test]
 fn const_reference_initializer_reports_type_mismatch() {
     // The referenced const contributes its declared type rather than
     // silently adopting the referencing const's annotation.
