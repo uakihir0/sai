@@ -7344,6 +7344,9 @@ pub enum ConstLiteralCheck {
     SupportedTuple { diagnostics: Vec<Diagnostic> },
     /// An array whose elements use the supported const-constructor slice.
     SupportedArray { diagnostics: Vec<Diagnostic> },
+    /// A nominal record, enum, or distinct type construction in the
+    /// supported const-constructor slice.
+    SupportedNominal { diagnostics: Vec<Diagnostic> },
 }
 
 impl ConstLiteralCheck {
@@ -7355,6 +7358,7 @@ impl ConstLiteralCheck {
                 | Self::SupportedUnit { .. }
                 | Self::SupportedTuple { .. }
                 | Self::SupportedArray { .. }
+                | Self::SupportedNominal { .. }
         )
     }
 
@@ -7364,7 +7368,8 @@ impl ConstLiteralCheck {
             | Self::SupportedStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
             | Self::SupportedTuple { diagnostics }
-            | Self::SupportedArray { diagnostics } => diagnostics.is_empty(),
+            | Self::SupportedArray { diagnostics }
+            | Self::SupportedNominal { diagnostics } => diagnostics.is_empty(),
             Self::Unsupported => false,
         }
     }
@@ -7376,7 +7381,8 @@ impl ConstLiteralCheck {
             | Self::SupportedStr { diagnostics }
             | Self::SupportedUnit { diagnostics }
             | Self::SupportedTuple { diagnostics }
-            | Self::SupportedArray { diagnostics } => diagnostics,
+            | Self::SupportedArray { diagnostics }
+            | Self::SupportedNominal { diagnostics } => diagnostics,
         }
     }
 }
@@ -7386,6 +7392,7 @@ struct ConstReferenceContext<'a, 'm> {
     module_members: &'a ModuleMemberIndex<'m>,
     types: &'a HashMap<DefId, FunctionDirectType>,
     aggregate_types: &'a HashMap<DefId, ConstConstructorType>,
+    constructors: &'a ConstTypeConstructorIndex,
     values: &'a HashMap<DefId, ConstScalarValue>,
     cyclic: &'a HashSet<DefId>,
     requesting_package: PackageId,
@@ -7549,6 +7556,26 @@ fn check_const_literal_owner(
     let Some(body) = owner.body else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
+    if let Some(constructor_type @ ConstConstructorType::Nominal(_)) =
+        resolve_const_constructor_type(*ty, type_paths, symbols, inputs, target_cfg.pointer_width())
+    {
+        let Some(diagnostics) = check_const_constructor_value(
+            owner,
+            &constructor_type,
+            &body.value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references.as_ref(),
+        )?
+        else {
+            return Ok(ConstLiteralCheck::Unsupported);
+        };
+        return Ok(ConstLiteralCheck::SupportedNominal { diagnostics });
+    }
+
     if let Some((element, length)) =
         resolve_const_array_type(*ty, type_paths, target_cfg.pointer_width())
     {
@@ -7648,6 +7675,32 @@ fn check_const_literal_owner(
     if let Some(diagnostics) =
         const_constructor_kind_mismatch(owner, literal_type, &body.value, inputs, snapshot)?
     {
+        return Ok(match literal_type {
+            ConstLiteralType::Primitive(primitive) => ConstLiteralCheck::Supported {
+                primitive,
+                diagnostics,
+            },
+            ConstLiteralType::Str => ConstLiteralCheck::SupportedStr { diagnostics },
+            ConstLiteralType::Unit => ConstLiteralCheck::SupportedUnit { diagnostics },
+        });
+    }
+
+    if let Some(context) = const_references.as_ref()
+        && let Some(found_type) = infer_const_nominal_expression_type(&body.value, context)
+    {
+        let diagnostics = vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            body.value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found {}",
+                const_literal_type_display(literal_type),
+                const_constructor_type_display(&found_type)
+            ),
+            "type mismatch",
+        )?];
         return Ok(match literal_type {
             ConstLiteralType::Primitive(primitive) => ConstLiteralCheck::Supported {
                 primitive,
@@ -16588,11 +16641,78 @@ enum FunctionDirectType {
     Unit,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum ConstConstructorType {
     Scalar(FunctionDirectType),
     Tuple(Vec<ConstConstructorType>),
     Array(Box<ConstConstructorType>, u128),
+    Nominal(ConstNominalType),
+}
+
+#[derive(Clone, Debug)]
+struct ConstNominalType {
+    def_id: DefId,
+    name: String,
+}
+
+impl PartialEq for ConstConstructorType {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Scalar(left), Self::Scalar(right)) => left == right,
+            (Self::Tuple(left), Self::Tuple(right)) => left == right,
+            (Self::Array(left_element, left_length), Self::Array(right_element, right_length)) => {
+                left_element == right_element && left_length == right_length
+            }
+            (Self::Nominal(left), Self::Nominal(right)) => left.def_id == right.def_id,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ConstConstructorType {}
+
+#[derive(Clone, Debug, Default)]
+struct ConstTypeConstructorIndex {
+    records: HashMap<DefId, ConstRecordConstructor>,
+    enums: HashMap<DefId, ConstEnumConstructor>,
+    distincts: HashMap<DefId, ConstDistinctConstructor>,
+    variant_owners: HashMap<DefId, DefId>,
+    type_names: HashMap<DefId, String>,
+}
+
+#[derive(Clone, Debug)]
+struct ConstRecordConstructor {
+    fields: Vec<ConstNamedFieldConstructor>,
+}
+
+#[derive(Clone, Debug)]
+struct ConstNamedFieldConstructor {
+    name: Symbol,
+    ty: ConstConstructorType,
+}
+
+#[derive(Clone, Debug)]
+struct ConstEnumConstructor {
+    variants: Vec<ConstVariantConstructor>,
+}
+
+#[derive(Clone, Debug)]
+struct ConstVariantConstructor {
+    def_id: DefId,
+    name: Symbol,
+    shape: ConstVariantConstructorShape,
+}
+
+#[derive(Clone, Debug)]
+enum ConstVariantConstructorShape {
+    Unit,
+    Tuple(Vec<ConstConstructorType>),
+    Record(Vec<ConstNamedFieldConstructor>),
+}
+
+#[derive(Clone, Debug)]
+struct ConstDistinctConstructor {
+    base: ConstConstructorType,
 }
 
 fn resolve_const_constructor_type(
@@ -16618,13 +16738,44 @@ fn resolve_const_constructor_type(
             resolve_const_constructor_type(*element, type_paths, symbols, inputs, pointer_width)?;
         return Some(ConstConstructorType::Array(Box::new(element), length));
     }
-    resolve_const_literal_type(ty, type_paths, symbols, inputs).map(|literal_type| {
-        ConstConstructorType::Scalar(match literal_type {
+    if let Some(literal_type) = resolve_const_literal_type(ty, type_paths, symbols, inputs) {
+        return Some(ConstConstructorType::Scalar(match literal_type {
             ConstLiteralType::Primitive(primitive) => FunctionDirectType::Primitive(primitive),
             ConstLiteralType::Str => FunctionDirectType::Str,
             ConstLiteralType::Unit => FunctionDirectType::Unit,
-        })
-    })
+        }));
+    }
+    let TyKind::Path(path) = ty.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain
+        || path.segments.is_empty()
+        || path.segments.iter().any(|segment| segment.args.is_some())
+    {
+        return None;
+    }
+    let segment_count = u32::try_from(path.segments.len()).ok()?;
+    let Some(PathRes {
+        base: Res::Def(DefKind::Struct | DefKind::Enum | DefKind::Distinct, def_id),
+        resolved_segments,
+        segment_count: resolved_segment_count,
+    }) = type_paths?.paths().get(&path.hir_id).copied()
+    else {
+        return None;
+    };
+    if resolved_segments != segment_count || resolved_segment_count != segment_count {
+        return None;
+    }
+    let name = path
+        .segments
+        .last()
+        .and_then(|segment| symbols.resolve(segment.name.sym).ok())
+        .unwrap_or_else(|| "type".into())
+        .to_string();
+    Some(ConstConstructorType::Nominal(ConstNominalType {
+        def_id,
+        name,
+    }))
 }
 
 fn const_constructor_type_name(ty: &ConstConstructorType) -> String {
@@ -16652,6 +16803,7 @@ fn const_constructor_type_name(ty: &ConstConstructorType) -> String {
                 length
             )
         }
+        ConstConstructorType::Nominal(nominal) => nominal.name.clone(),
     }
 }
 
@@ -17646,8 +17798,1125 @@ fn is_const_constructor_expression_shape(
         ExprKind::Array(elements) => elements
             .iter()
             .all(|element| is_const_constructor_expression_shape(owner, element, const_references)),
+        ExprKind::Call { callee, .. } => const_references
+            .is_some_and(|context| const_constructor_target(callee, context, None).is_some()),
         _ => false,
     }
+}
+
+fn const_literal_type_from_direct_type(direct_type: FunctionDirectType) -> ConstLiteralType {
+    match direct_type {
+        FunctionDirectType::Primitive(primitive) => ConstLiteralType::Primitive(primitive),
+        FunctionDirectType::Str => ConstLiteralType::Str,
+        FunctionDirectType::Unit => ConstLiteralType::Unit,
+    }
+}
+
+fn const_constructor_path_resolution(
+    expression: &HirExpr<'_>,
+    context: &ConstReferenceContext<'_, '_>,
+) -> Option<Res> {
+    let (_path, segments) = direct_enum_variant_type_head(expression)?;
+    if segments.is_empty() || segments.iter().any(|segment| segment.args.is_some()) {
+        return None;
+    }
+    let first = segments.first()?;
+    let binding = context.module_scope.scope.get(&first.name.sym)?;
+    let prefix = resolve_module_prefix(
+        binding.res,
+        &segments[1..],
+        context.requesting_package,
+        context.module_members,
+    )
+    .ok()?;
+    if prefix.consumed_segments + 1 != segments.len() || matches!(prefix.base, Res::Err) {
+        return None;
+    }
+    Some(prefix.base)
+}
+
+fn find_const_variant<'a>(
+    enum_def: DefId,
+    name: Symbol,
+    constructors: &'a ConstTypeConstructorIndex,
+) -> Option<&'a ConstVariantConstructor> {
+    constructors
+        .enums
+        .get(&enum_def)?
+        .variants
+        .iter()
+        .find(|variant| variant.name == name)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConstConstructorTarget {
+    Record { def_id: DefId },
+    Distinct { def_id: DefId },
+    Variant { enum_def: DefId, variant: DefId },
+}
+
+fn const_variant_target(
+    expression: &HirExpr<'_>,
+    context: &ConstReferenceContext<'_, '_>,
+    expected_enum: Option<DefId>,
+) -> Option<(DefId, DefId)> {
+    if let ExprKind::ImplicitMember(name) = expression.kind {
+        let enum_def = expected_enum?;
+        let variant = find_const_variant(enum_def, name.sym, context.constructors)?;
+        return Some((enum_def, variant.def_id));
+    }
+    if let Some((_path, segments)) = direct_enum_variant_type_head(expression)
+        && segments.len() >= 2
+        && segments.iter().all(|segment| segment.args.is_none())
+        && let Some(first) = segments.first()
+        && let Some(binding) = context.module_scope.scope.get(&first.name.sym)
+    {
+        let variant_segment = segments.last()?;
+        let head_segments = &segments[1..segments.len() - 1];
+        if let Ok(prefix) = resolve_module_prefix(
+            binding.res,
+            head_segments,
+            context.requesting_package,
+            context.module_members,
+        ) && prefix.consumed_segments == head_segments.len()
+            && let Res::Def(DefKind::Enum, enum_def) = prefix.base
+            && let Some(variant) =
+                find_const_variant(enum_def, variant_segment.name.sym, context.constructors)
+        {
+            return Some((enum_def, variant.def_id));
+        }
+    }
+    if let ExprKind::Path(path) = expression.kind
+        && path.root == PathRoot::Plain
+        && path.segments.len() == 1
+        && path.segments[0].args.is_none()
+        && let Some(binding) = context.module_scope.scope.get(&path.segments[0].name.sym)
+        && let Res::Def(DefKind::Variant, variant_def) = binding.res
+        && let Some(enum_def) = context
+            .constructors
+            .variant_owners
+            .get(&variant_def)
+            .copied()
+    {
+        return Some((enum_def, variant_def));
+    }
+    None
+}
+
+fn const_constructor_target(
+    callee: &HirExpr<'_>,
+    context: &ConstReferenceContext<'_, '_>,
+    expected_enum: Option<DefId>,
+) -> Option<ConstConstructorTarget> {
+    if let Some((enum_def, variant)) = const_variant_target(callee, context, expected_enum) {
+        return Some(ConstConstructorTarget::Variant { enum_def, variant });
+    }
+    match const_constructor_path_resolution(callee, context)? {
+        Res::Def(DefKind::Struct, def_id) if context.constructors.records.contains_key(&def_id) => {
+            Some(ConstConstructorTarget::Record { def_id })
+        }
+        Res::Def(DefKind::Distinct, def_id)
+            if context.constructors.distincts.contains_key(&def_id) =>
+        {
+            Some(ConstConstructorTarget::Distinct { def_id })
+        }
+        _ => None,
+    }
+}
+
+fn const_constructor_nominal_type(
+    def_id: DefId,
+    constructors: &ConstTypeConstructorIndex,
+) -> ConstConstructorType {
+    ConstConstructorType::Nominal(ConstNominalType {
+        def_id,
+        name: constructors
+            .type_names
+            .get(&def_id)
+            .cloned()
+            .unwrap_or_else(|| "type".to_string()),
+    })
+}
+
+fn const_constructor_target_output(
+    target: ConstConstructorTarget,
+    constructors: &ConstTypeConstructorIndex,
+) -> ConstConstructorType {
+    let def_id = match target {
+        ConstConstructorTarget::Record { def_id }
+        | ConstConstructorTarget::Distinct { def_id }
+        | ConstConstructorTarget::Variant {
+            enum_def: def_id, ..
+        } => def_id,
+    };
+    const_constructor_nominal_type(def_id, constructors)
+}
+
+fn infer_const_nominal_expression_type(
+    value: &HirExpr<'_>,
+    context: &ConstReferenceContext<'_, '_>,
+) -> Option<ConstConstructorType> {
+    if let ExprKind::Call { callee, .. } = value.kind {
+        let target = const_constructor_target(callee, context, None)?;
+        return Some(const_constructor_target_output(
+            target,
+            context.constructors,
+        ));
+    }
+    if let Some((enum_def, _)) = const_variant_target(value, context, None) {
+        return Some(const_constructor_nominal_type(
+            enum_def,
+            context.constructors,
+        ));
+    }
+    None
+}
+
+fn const_constructor_type_mismatch(
+    owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    span: sai_hir::Span,
+    expected: &ConstConstructorType,
+    found: &ConstConstructorType,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    const_literal_diagnostic(
+        owner,
+        inputs,
+        snapshot,
+        span,
+        sai_diagnostics::Code::TypeMismatch,
+        format!(
+            "expected {}, found {}",
+            const_constructor_type_display(expected),
+            const_constructor_type_display(found)
+        ),
+        "type mismatch",
+    )
+}
+
+fn const_constructor_value_supported(
+    owner: OwnerId,
+    value: &HirExpr<'_>,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> bool {
+    if is_const_constructor_expression_shape(owner, value, const_references) {
+        return true;
+    }
+    let Some(context) = const_references else {
+        return false;
+    };
+    matches!(value.kind, ExprKind::Call { .. })
+        && const_constructor_target(
+            match value.kind {
+                ExprKind::Call { callee, .. } => callee,
+                _ => value,
+            },
+            context,
+            None,
+        )
+        .is_some()
+}
+
+fn check_const_constructor_value(
+    owner: &HirOwner<'_>,
+    expected_type: &ConstConstructorType,
+    value: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    match expected_type {
+        ConstConstructorType::Scalar(direct_type) => check_const_scalar_constructor_value(
+            owner,
+            *direct_type,
+            value,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        ),
+        ConstConstructorType::Tuple(elements) => check_const_tuple_constructor_value(
+            owner,
+            elements,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        ),
+        ConstConstructorType::Array(element, length) => check_const_array_constructor_value(
+            owner,
+            element,
+            *length,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        ),
+        ConstConstructorType::Nominal(nominal) => check_const_nominal_constructor(
+            owner,
+            nominal,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        ),
+    }
+}
+
+fn check_const_scalar_constructor_value(
+    owner: &HirOwner<'_>,
+    expected_direct_type: FunctionDirectType,
+    value: &HirExpr<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let expected_type = const_literal_type_from_direct_type(expected_direct_type);
+    if const_references.is_some_and(|context| {
+        const_initializer_reference_target(
+            value,
+            context.module_scope,
+            context.module_members,
+            context.requesting_package,
+        )
+        .is_some_and(|target| context.aggregate_types.contains_key(&target))
+    }) {
+        return check_const_constructor_reference(
+            owner.id,
+            &ConstConstructorType::Scalar(expected_direct_type),
+            value,
+            const_references,
+            inputs,
+            snapshot,
+        );
+    }
+    if matches!(value.kind, ExprKind::Array(_)) {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found an array",
+                const_literal_type_display(expected_type)
+            ),
+            "type mismatch",
+        )?]));
+    }
+    if matches!(value.kind, ExprKind::Tuple(elements) if !elements.is_empty()) {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found a tuple",
+                const_literal_type_display(expected_type)
+            ),
+            "type mismatch",
+        )?]));
+    }
+    if let Some(context) = const_references
+        && let Some(found_type) = infer_const_nominal_expression_type(value, context)
+    {
+        return Ok(Some(vec![const_constructor_type_mismatch(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            &ConstConstructorType::Scalar(expected_direct_type),
+            &found_type,
+        )?]));
+    }
+    let leaf_diagnostics = match check_const_reference_expression(
+        owner.id,
+        expected_type,
+        value,
+        const_references,
+        inputs,
+        snapshot,
+    )? {
+        Some(diagnostics) => Some(diagnostics),
+        None => check_const_literal_against_type(
+            owner.id,
+            expected_type,
+            value,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?,
+    };
+    match leaf_diagnostics {
+        Some(diagnostics) => Ok(Some(diagnostics)),
+        None => check_const_operator_expression_against_type(
+            owner.id,
+            expected_type,
+            value,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        ),
+    }
+}
+
+fn check_const_tuple_constructor_value(
+    owner: &HirOwner<'_>,
+    expected_element_types: &[ConstConstructorType],
+    value: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let expected_type = ConstConstructorType::Tuple(expected_element_types.to_vec());
+    let ExprKind::Tuple(values) = value.kind else {
+        if let Some(diagnostics) = check_const_constructor_reference(
+            owner.id,
+            &expected_type,
+            value,
+            const_references,
+            inputs,
+            snapshot,
+        )? {
+            return Ok(Some(diagnostics));
+        }
+        if !const_constructor_value_supported(owner.id, value, const_references) {
+            return Ok(None);
+        }
+        if matches!(value.kind, ExprKind::Array(_)) {
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected a tuple, found an array".to_string(),
+                "type mismatch",
+            )?]));
+        }
+        if let Some(context) = const_references
+            && let Some(found_type) = infer_const_nominal_expression_type(value, context)
+        {
+            return Ok(Some(vec![const_constructor_type_mismatch(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                &expected_type,
+                &found_type,
+            )?]));
+        }
+        let found_type = match value.kind {
+            ExprKind::Lit(literal) => Some(const_literal_found_type(literal).to_string()),
+            _ => infer_const_scalar_expression_type(value, const_references)
+                .map(|ty| format!("`{}`", const_literal_type_display(ty))),
+        };
+        let Some(found_type) = found_type else {
+            return Ok(None);
+        };
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected a tuple, found {found_type}"),
+            "type mismatch",
+        )?]));
+    };
+
+    if values.iter().any(|value| {
+        !const_constructor_value_supported(owner.id, value, const_references)
+            && const_references
+                .is_none_or(|context| !const_reference_is_supported(owner.id, value, context))
+    }) {
+        return Ok(None);
+    }
+    if values.len() != expected_element_types.len() {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected a tuple with {} elements, found {}",
+                expected_element_types.len(),
+                values.len()
+            ),
+            "type mismatch",
+        )?]));
+    }
+
+    let mut diagnostics = Vec::new();
+    for (expected_type, value) in expected_element_types.iter().zip(values) {
+        let Some(mut field_diagnostics) = check_const_constructor_value(
+            owner,
+            expected_type,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut field_diagnostics);
+    }
+    Ok(Some(diagnostics))
+}
+
+fn check_const_array_constructor_value(
+    owner: &HirOwner<'_>,
+    expected_element_type: &ConstConstructorType,
+    expected_length: u128,
+    value: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let expected_type =
+        ConstConstructorType::Array(Box::new(expected_element_type.clone()), expected_length);
+    let ExprKind::Array(values) = value.kind else {
+        if let Some(diagnostics) = check_const_constructor_reference(
+            owner.id,
+            &expected_type,
+            value,
+            const_references,
+            inputs,
+            snapshot,
+        )? {
+            return Ok(Some(diagnostics));
+        }
+        if !const_constructor_value_supported(owner.id, value, const_references) {
+            return Ok(None);
+        }
+        if matches!(value.kind, ExprKind::Tuple(elements) if !elements.is_empty()) {
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected an array, found a tuple".to_string(),
+                "type mismatch",
+            )?]));
+        }
+        if let Some(context) = const_references
+            && let Some(found_type) = infer_const_nominal_expression_type(value, context)
+        {
+            return Ok(Some(vec![const_constructor_type_mismatch(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                &expected_type,
+                &found_type,
+            )?]));
+        }
+        let found_type = match value.kind {
+            ExprKind::Lit(literal) => Some(const_literal_found_type(literal).to_string()),
+            _ => infer_const_scalar_expression_type(value, const_references)
+                .map(|ty| format!("`{}`", const_literal_type_display(ty))),
+        };
+        let Some(found_type) = found_type else {
+            return Ok(None);
+        };
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected an array, found {found_type}"),
+            "type mismatch",
+        )?]));
+    };
+
+    if values.iter().any(|value| {
+        !const_constructor_value_supported(owner.id, value, const_references)
+            && const_references
+                .is_none_or(|context| !const_reference_is_supported(owner.id, value, context))
+    }) {
+        return Ok(None);
+    }
+    if values.len() as u128 != expected_length {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::ArrayLengthMismatch,
+            format!(
+                "expected array length {}, found {}",
+                expected_length,
+                values.len()
+            ),
+            "array length mismatch",
+        )?]));
+    }
+
+    let mut diagnostics = Vec::new();
+    for value in values {
+        let Some(mut element_diagnostics) = check_const_constructor_value(
+            owner,
+            expected_element_type,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut element_diagnostics);
+    }
+    Ok(Some(diagnostics))
+}
+
+fn const_record_argument_field(argument: &HirArg<'_>) -> (Option<Symbol>, sai_hir::Span) {
+    if let Some(name) = argument.name {
+        return (Some(name.sym), name.span);
+    }
+    if let ExprKind::Path(path) = argument.expr.kind
+        && path.root == PathRoot::Plain
+        && path.segments.len() == 1
+        && path.segments[0].args.is_none()
+    {
+        return (Some(path.segments[0].name.sym), path.segments[0].name.span);
+    }
+    (None, argument.expr.span)
+}
+
+fn check_const_record_constructor_arguments(
+    owner: &HirOwner<'_>,
+    constructed_type: &ConstConstructorType,
+    fields: &[ConstNamedFieldConstructor],
+    args: &[HirArg<'_>],
+    base: Option<&HirExpr<'_>>,
+    call: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let mut diagnostics = Vec::new();
+    let mut seen = HashSet::new();
+    let mut initialized = HashSet::new();
+    for argument in args {
+        let (field_name, field_span) = const_record_argument_field(argument);
+        let Some(field_name) = field_name else {
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                argument.expr.span,
+                sai_diagnostics::Code::RecordFieldNeedsName,
+                "record constructor arguments must name a field".to_string(),
+                "record field needs a name",
+            )?);
+            continue;
+        };
+        if !seen.insert(field_name) {
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                field_span,
+                sai_diagnostics::Code::DuplicateField,
+                "field is initialized more than once".to_string(),
+                "duplicate field",
+            )?);
+        }
+        let Some(field) = fields.iter().find(|field| field.name == field_name) else {
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                field_span,
+                sai_diagnostics::Code::UnknownField,
+                "unknown record field".to_string(),
+                "unknown field",
+            )?);
+            continue;
+        };
+        initialized.insert(field_name);
+        let Some(mut field_diagnostics) = check_const_constructor_value(
+            owner,
+            &field.ty,
+            &argument.expr,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut field_diagnostics);
+    }
+
+    if let Some(base) = base {
+        let Some(mut base_diagnostics) = check_const_constructor_value(
+            owner,
+            constructed_type,
+            base,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut base_diagnostics);
+    } else {
+        let missing = fields
+            .iter()
+            .filter(|field| !initialized.contains(&field.name))
+            .map(|field| {
+                symbols
+                    .resolve(field.name)
+                    .map(|name| format!("`{name}`"))
+                    .unwrap_or_else(|_| "`?`".to_string())
+            })
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                call.span,
+                sai_diagnostics::Code::MissingField,
+                format!("missing fields {}", missing.join(", ")),
+                "missing record field",
+            )?);
+        }
+    }
+    Ok(Some(diagnostics))
+}
+
+fn check_const_positional_constructor_arguments(
+    owner: &HirOwner<'_>,
+    expected_types: &[ConstConstructorType],
+    args: &[HirArg<'_>],
+    base: Option<&HirExpr<'_>>,
+    call: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let mut diagnostics = Vec::new();
+    for argument in args {
+        if argument.name.is_some() {
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                argument.expr.span,
+                sai_diagnostics::Code::NamedArgumentOnFunction,
+                "named arguments are not allowed here".to_string(),
+                "named argument on function",
+            )?);
+        }
+    }
+    if let Some(base) = base {
+        diagnostics.push(const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            base.span,
+            sai_diagnostics::Code::FunctionalUpdateOutsideRecord,
+            "functional update base is only valid in record construction".to_string(),
+            "functional update outside record",
+        )?);
+    }
+    if args.len() != expected_types.len() {
+        diagnostics.push(const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            call.span,
+            sai_diagnostics::Code::WrongArgumentCount,
+            format!(
+                "constructor expects {} arguments, found {}",
+                expected_types.len(),
+                args.len()
+            ),
+            "wrong argument count",
+        )?);
+    }
+    for (argument, expected_type) in args.iter().zip(expected_types) {
+        let Some(mut argument_diagnostics) = check_const_constructor_value(
+            owner,
+            expected_type,
+            &argument.expr,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+            const_references,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut argument_diagnostics);
+    }
+    Ok(Some(diagnostics))
+}
+
+fn check_const_nominal_constructor(
+    owner: &HirOwner<'_>,
+    expected: &ConstNominalType,
+    value: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let expected_type = ConstConstructorType::Nominal(expected.clone());
+    if let Some(diagnostics) = check_const_constructor_reference(
+        owner.id,
+        &expected_type,
+        value,
+        const_references,
+        inputs,
+        snapshot,
+    )? {
+        return Ok(Some(diagnostics));
+    }
+    let Some(context) = const_references else {
+        return Ok(None);
+    };
+
+    if let ExprKind::Call { callee, args, base } = value.kind {
+        let Some(target) = const_constructor_target(callee, context, Some(expected.def_id)) else {
+            return Ok(None);
+        };
+        let output_type = const_constructor_target_output(target, context.constructors);
+        if output_type != expected_type {
+            return Ok(Some(vec![const_constructor_type_mismatch(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                &expected_type,
+                &output_type,
+            )?]));
+        }
+        return match target {
+            ConstConstructorTarget::Record { def_id } => {
+                let Some(record) = context.constructors.records.get(&def_id) else {
+                    return Ok(None);
+                };
+                check_const_record_constructor_arguments(
+                    owner,
+                    &expected_type,
+                    &record.fields,
+                    args,
+                    base,
+                    value,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    const_references,
+                )
+            }
+            ConstConstructorTarget::Distinct { def_id } => {
+                let Some(distinct) = context.constructors.distincts.get(&def_id) else {
+                    return Ok(None);
+                };
+                check_const_positional_constructor_arguments(
+                    owner,
+                    std::slice::from_ref(&distinct.base),
+                    args,
+                    base,
+                    value,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                    const_references,
+                )
+            }
+            ConstConstructorTarget::Variant { enum_def, variant } => {
+                let Some(enum_constructor) = context.constructors.enums.get(&enum_def) else {
+                    return Ok(None);
+                };
+                let Some(variant) = enum_constructor
+                    .variants
+                    .iter()
+                    .find(|candidate| candidate.def_id == variant)
+                else {
+                    return Ok(None);
+                };
+                match &variant.shape {
+                    ConstVariantConstructorShape::Unit => Ok(Some(vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        value.span,
+                        sai_diagnostics::Code::WrongArgumentCount,
+                        "unit variant calls do not accept an argument list".to_string(),
+                        "unit variant cannot be called",
+                    )?])),
+                    ConstVariantConstructorShape::Tuple(types) => {
+                        check_const_positional_constructor_arguments(
+                            owner,
+                            types,
+                            args,
+                            base,
+                            value,
+                            type_paths,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                            const_references,
+                        )
+                    }
+                    ConstVariantConstructorShape::Record(fields) => {
+                        check_const_record_constructor_arguments(
+                            owner,
+                            &expected_type,
+                            fields,
+                            args,
+                            base,
+                            value,
+                            type_paths,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                            const_references,
+                        )
+                    }
+                }
+            }
+        };
+    }
+
+    if let ExprKind::ImplicitMember(name) = value.kind
+        && context.constructors.enums.contains_key(&expected.def_id)
+        && find_const_variant(expected.def_id, name.sym, context.constructors).is_none()
+    {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            name.span,
+            sai_diagnostics::Code::UnknownVariant,
+            "unknown enum variant".to_string(),
+            "unknown variant",
+        )?]));
+    }
+
+    if let Some((enum_def, variant_def)) =
+        const_variant_target(value, context, Some(expected.def_id))
+    {
+        let output_type = const_constructor_nominal_type(enum_def, context.constructors);
+        if output_type != expected_type {
+            return Ok(Some(vec![const_constructor_type_mismatch(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                &expected_type,
+                &output_type,
+            )?]));
+        }
+        let Some(enum_constructor) = context.constructors.enums.get(&enum_def) else {
+            return Ok(None);
+        };
+        let Some(variant) = enum_constructor
+            .variants
+            .iter()
+            .find(|candidate| candidate.def_id == variant_def)
+        else {
+            return Ok(None);
+        };
+        return match variant.shape {
+            ConstVariantConstructorShape::Unit => Ok(Some(Vec::new())),
+            ConstVariantConstructorShape::Tuple(_) => Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::NotConstExpression,
+                "constructor function items are not constant expressions".to_string(),
+                "not a constant expression",
+            )?])),
+            ConstVariantConstructorShape::Record(_) => Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::RecordConstructorAsValue,
+                "record constructors cannot be used as values".to_string(),
+                "record constructor as value",
+            )?])),
+        };
+    }
+
+    if let Some((_path, segments)) = direct_enum_variant_type_head(value)
+        && segments.len() >= 2
+        && segments.iter().all(|segment| segment.args.is_none())
+        && let Some(first) = segments.first()
+        && let Some(binding) = context.module_scope.scope.get(&first.name.sym)
+    {
+        let variant_segment = segments.last().expect("len checked above");
+        let head_segments = &segments[1..segments.len() - 1];
+        if let Ok(prefix) = resolve_module_prefix(
+            binding.res,
+            head_segments,
+            context.requesting_package,
+            context.module_members,
+        ) && prefix.consumed_segments == head_segments.len()
+            && let Res::Def(DefKind::Enum, enum_def) = prefix.base
+            && enum_def == expected.def_id
+            && context.constructors.enums.contains_key(&enum_def)
+            && find_const_variant(enum_def, variant_segment.name.sym, context.constructors)
+                .is_none()
+        {
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                variant_segment.name.span,
+                sai_diagnostics::Code::UnknownVariant,
+                "unknown enum variant".to_string(),
+                "unknown variant",
+            )?]));
+        }
+    }
+
+    if let Some(resolution) = const_constructor_path_resolution(value, context) {
+        match resolution {
+            Res::Def(DefKind::Struct, def_id)
+                if context.constructors.records.contains_key(&def_id) =>
+            {
+                return Ok(Some(vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    value.span,
+                    sai_diagnostics::Code::RecordConstructorAsValue,
+                    "record constructors cannot be used as values".to_string(),
+                    "record constructor as value",
+                )?]));
+            }
+            Res::Def(DefKind::Distinct, def_id)
+                if context.constructors.distincts.contains_key(&def_id) =>
+            {
+                return Ok(Some(vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    value.span,
+                    sai_diagnostics::Code::NotConstExpression,
+                    "constructor function items are not constant expressions".to_string(),
+                    "not a constant expression",
+                )?]));
+            }
+            _ => {}
+        }
+    }
+
+    if matches!(value.kind, ExprKind::Array(_)) {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected {}, found an array",
+                const_constructor_type_display(&expected_type)
+            ),
+            "type mismatch",
+        )?]));
+    }
+    if matches!(value.kind, ExprKind::Tuple(elements) if !elements.is_empty()) {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected {}, found a tuple",
+                const_constructor_type_display(&expected_type)
+            ),
+            "type mismatch",
+        )?]));
+    }
+    let found_type = match value.kind {
+        ExprKind::Lit(literal) => Some(const_literal_found_type(literal).to_string()),
+        _ => infer_const_scalar_expression_type(value, const_references)
+            .map(|ty| format!("`{}`", const_literal_type_display(ty))),
+    };
+    let Some(found_type) = found_type else {
+        return Ok(None);
+    };
+    Ok(Some(vec![const_literal_diagnostic(
+        owner.id,
+        inputs,
+        snapshot,
+        value.span,
+        sai_diagnostics::Code::TypeMismatch,
+        format!(
+            "expected {}, found {found_type}",
+            const_constructor_type_display(&expected_type)
+        ),
+        "type mismatch",
+    )?]))
 }
 
 fn resolve_const_array_type<'hir>(
@@ -17784,107 +19053,17 @@ fn check_const_tuple_literal(
     else {
         return Ok(None);
     };
-    let expected_type = ConstConstructorType::Tuple(expected_element_types);
-
-    let ExprKind::Tuple(values) = value.kind else {
-        let ExprKind::Lit(literal) = value.kind else {
-            if let Some(diagnostics) = check_const_constructor_reference(
-                owner.id,
-                &expected_type,
-                value,
-                const_references,
-                inputs,
-                snapshot,
-            )? {
-                return Ok(Some(diagnostics));
-            }
-            if !is_const_constructor_expression_shape(owner.id, value, const_references) {
-                return Ok(None);
-            }
-            if matches!(value.kind, ExprKind::Array(_)) {
-                return Ok(Some(vec![const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    value.span,
-                    sai_diagnostics::Code::TypeMismatch,
-                    "expected a tuple, found an array".to_string(),
-                    "type mismatch",
-                )?]));
-            }
-            let Some(found_type) = infer_const_scalar_expression_type(value, const_references)
-            else {
-                return Ok(None);
-            };
-            return Ok(Some(vec![const_literal_diagnostic(
-                owner.id,
-                inputs,
-                snapshot,
-                value.span,
-                sai_diagnostics::Code::TypeMismatch,
-                format!(
-                    "expected a tuple, found `{}`",
-                    const_literal_type_display(found_type)
-                ),
-                "type mismatch",
-            )?]));
-        };
-        return Ok(Some(vec![const_literal_diagnostic(
-            owner.id,
-            inputs,
-            snapshot,
-            value.span,
-            sai_diagnostics::Code::TypeMismatch,
-            format!(
-                "expected a tuple, found {}",
-                const_literal_found_type(literal)
-            ),
-            "type mismatch",
-        )?]));
-    };
-
-    if values.iter().any(|value| {
-        !is_const_constructor_expression_shape(owner.id, value, const_references)
-            && const_references
-                .is_none_or(|context| !const_reference_is_supported(owner.id, value, context))
-    }) {
-        return Ok(None);
-    }
-    if values.len() != expected_elements.len() {
-        return Ok(Some(vec![const_literal_diagnostic(
-            owner.id,
-            inputs,
-            snapshot,
-            value.span,
-            sai_diagnostics::Code::TypeMismatch,
-            format!(
-                "expected a tuple with {} elements, found {}",
-                expected_elements.len(),
-                values.len()
-            ),
-            "type mismatch",
-        )?]));
-    }
-
-    let mut diagnostics = Vec::new();
-    for (expected_ty, value) in expected_elements.iter().zip(values) {
-        let Some(mut field_diagnostics) = check_const_constructor_field(
-            owner,
-            *expected_ty,
-            value,
-            type_paths,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-            const_references,
-        )?
-        else {
-            return Ok(None);
-        };
-        diagnostics.append(&mut field_diagnostics);
-    }
-    Ok(Some(diagnostics))
+    check_const_tuple_constructor_value(
+        owner,
+        &expected_element_types,
+        value,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+        const_references,
+    )
 }
 
 fn check_const_array_literal(
@@ -17908,226 +19087,18 @@ fn check_const_array_literal(
     ) else {
         return Ok(None);
     };
-    let expected_type =
-        ConstConstructorType::Array(Box::new(expected_element_type), expected_length);
-
-    let ExprKind::Array(values) = value.kind else {
-        if let Some(diagnostics) = check_const_constructor_reference(
-            owner.id,
-            &expected_type,
-            value,
-            const_references,
-            inputs,
-            snapshot,
-        )? {
-            return Ok(Some(diagnostics));
-        }
-        if !is_const_constructor_expression_shape(owner.id, value, const_references) {
-            return Ok(None);
-        }
-        if matches!(value.kind, ExprKind::Tuple(elements) if !elements.is_empty()) {
-            return Ok(Some(vec![const_literal_diagnostic(
-                owner.id,
-                inputs,
-                snapshot,
-                value.span,
-                sai_diagnostics::Code::TypeMismatch,
-                "expected an array, found a tuple".to_string(),
-                "type mismatch",
-            )?]));
-        }
-        let found_type = match value.kind {
-            ExprKind::Lit(literal) => Some(const_literal_found_type(literal).to_string()),
-            _ => infer_const_scalar_expression_type(value, const_references)
-                .map(|ty| format!("`{}`", const_literal_type_display(ty))),
-        };
-        let Some(found_type) = found_type else {
-            return Ok(None);
-        };
-        return Ok(Some(vec![const_literal_diagnostic(
-            owner.id,
-            inputs,
-            snapshot,
-            value.span,
-            sai_diagnostics::Code::TypeMismatch,
-            format!("expected an array, found {found_type}"),
-            "type mismatch",
-        )?]));
-    };
-
-    if values.iter().any(|value| {
-        !is_const_constructor_expression_shape(owner.id, value, const_references)
-            && const_references
-                .is_none_or(|context| !const_reference_is_supported(owner.id, value, context))
-    }) {
-        return Ok(None);
-    }
-    if values.len() as u128 != expected_length {
-        return Ok(Some(vec![const_literal_diagnostic(
-            owner.id,
-            inputs,
-            snapshot,
-            value.span,
-            sai_diagnostics::Code::ArrayLengthMismatch,
-            format!(
-                "expected array length {}, found {}",
-                expected_length,
-                values.len()
-            ),
-            "array length mismatch",
-        )?]));
-    }
-
-    let mut diagnostics = Vec::new();
-    for value in values {
-        let Some(mut element_diagnostics) = check_const_constructor_field(
-            owner,
-            *expected_element,
-            value,
-            type_paths,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-            const_references,
-        )?
-        else {
-            return Ok(None);
-        };
-        diagnostics.append(&mut element_diagnostics);
-    }
-    Ok(Some(diagnostics))
-}
-
-fn check_const_constructor_field(
-    owner: &HirOwner<'_>,
-    expected_ty: Ty<'_>,
-    value: &HirExpr<'_>,
-    type_paths: Option<&TypeOwnerPathResolution>,
-    symbols: &Interner,
-    inputs: &CurrentOwnerInputs,
-    snapshot: &WorkspaceSnapshot,
-    target_cfg: &TargetCfg,
-    const_references: Option<&ConstReferenceContext<'_, '_>>,
-) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    if let TyKind::Tuple(elements) = expected_ty.kind
-        && !elements.is_empty()
-    {
-        return check_const_tuple_literal(
-            owner,
-            elements,
-            value,
-            type_paths,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-            const_references,
-        );
-    }
-    if let Some((element, length)) =
-        resolve_const_array_type(expected_ty, type_paths, target_cfg.pointer_width())
-    {
-        return check_const_array_literal(
-            owner,
-            element,
-            length,
-            value,
-            type_paths,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-            const_references,
-        );
-    }
-    let Some(expected_type) = resolve_const_literal_type(expected_ty, type_paths, symbols, inputs)
-    else {
-        return Ok(None);
-    };
-    if const_references.is_some_and(|context| {
-        const_initializer_reference_target(
-            value,
-            context.module_scope,
-            context.module_members,
-            context.requesting_package,
-        )
-        .is_some_and(|target| context.aggregate_types.contains_key(&target))
-    }) {
-        return check_const_constructor_reference(
-            owner.id,
-            &ConstConstructorType::Scalar(match expected_type {
-                ConstLiteralType::Primitive(primitive) => FunctionDirectType::Primitive(primitive),
-                ConstLiteralType::Str => FunctionDirectType::Str,
-                ConstLiteralType::Unit => FunctionDirectType::Unit,
-            }),
-            value,
-            const_references,
-            inputs,
-            snapshot,
-        );
-    }
-    if matches!(value.kind, ExprKind::Array(_)) {
-        return Ok(Some(vec![const_literal_diagnostic(
-            owner.id,
-            inputs,
-            snapshot,
-            value.span,
-            sai_diagnostics::Code::TypeMismatch,
-            format!(
-                "expected `{}`, found an array",
-                const_literal_type_display(expected_type)
-            ),
-            "type mismatch",
-        )?]));
-    }
-    if matches!(value.kind, ExprKind::Tuple(elements) if !elements.is_empty()) {
-        return Ok(Some(vec![const_literal_diagnostic(
-            owner.id,
-            inputs,
-            snapshot,
-            value.span,
-            sai_diagnostics::Code::TypeMismatch,
-            format!(
-                "expected `{}`, found a tuple",
-                const_literal_type_display(expected_type)
-            ),
-            "type mismatch",
-        )?]));
-    }
-    let leaf_diagnostics = match check_const_reference_expression(
-        owner.id,
-        expected_type,
+    check_const_array_constructor_value(
+        owner,
+        &expected_element_type,
+        expected_length,
         value,
-        const_references,
+        type_paths,
+        symbols,
         inputs,
         snapshot,
-    )? {
-        Some(diagnostics) => Some(diagnostics),
-        None => check_const_literal_leaf(
-            owner,
-            expected_ty,
-            value,
-            type_paths,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-        )?,
-    };
-    match leaf_diagnostics {
-        Some(diagnostics) => Ok(Some(diagnostics)),
-        None => check_const_operator_expression_against_type(
-            owner.id,
-            expected_type,
-            value,
-            symbols,
-            inputs,
-            snapshot,
-            target_cfg,
-            const_references,
-        ),
-    }
+        target_cfg,
+        const_references,
+    )
 }
 
 /// A binding's contribution in the `Str` local group: the family an
@@ -29332,6 +30303,28 @@ fn const_initializer_reference_targets(
                 )
             })
             .collect(),
+        ExprKind::Call { args, base, .. } => {
+            let mut targets = args
+                .iter()
+                .flat_map(|argument| {
+                    const_initializer_reference_targets(
+                        &argument.expr,
+                        module_scope,
+                        module_members,
+                        requesting_package,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Some(base) = base {
+                targets.extend(const_initializer_reference_targets(
+                    base,
+                    module_scope,
+                    module_members,
+                    requesting_package,
+                ));
+            }
+            targets
+        }
         ExprKind::Unary(_, operand) => const_initializer_reference_targets(
             operand,
             module_scope,
@@ -39285,6 +40278,227 @@ impl RootDatabase {
         signatures
     }
 
+    /// Package-local nominal constructor metadata used by the bounded const
+    /// constructor checker. Field and payload types are retained in the
+    /// const-constructor type projection rather than the semantic type kernel
+    /// so `Str` and literal-length arrays use the same slice as const
+    /// declarations. Generic, refined, attributed, and recovered nominal
+    /// definitions stay outside this slice.
+    fn index_const_type_constructors(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        snapshot: &WorkspaceSnapshot,
+        top_level_owner_index: &HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
+        module_members: &ModuleMemberIndex<'_>,
+        source_graph_packages: &HashSet<PackageId>,
+    ) -> ConstTypeConstructorIndex {
+        let mut constructors = ConstTypeConstructorIndex::default();
+        let Ok(primitive_prelude) = self.primitive_prelude.clone() else {
+            return constructors;
+        };
+        let package = collection.module_tree.package;
+        let mut owner_inputs_by_file = HashMap::<FileId, Option<CurrentOwnerInputs>>::new();
+
+        for descriptor in &collection.scopes.top_level_owners {
+            if !matches!(
+                descriptor.kind,
+                TopLevelOwnerKind::Struct | TopLevelOwnerKind::Enum | TopLevelOwnerKind::Distinct
+            ) || descriptor.owner.def_id.package() != package
+            {
+                continue;
+            }
+            let def_id = descriptor.owner.def_id.to_def_id();
+            if def_id.package != package {
+                continue;
+            }
+            if !owner_inputs_by_file.contains_key(&descriptor.file) {
+                owner_inputs_by_file.insert(
+                    descriptor.file,
+                    self.current_owner_inputs(snapshot, descriptor.file, &collection.target_cfg)
+                        .ok(),
+                );
+            }
+            let Some(Some(inputs)) = owner_inputs_by_file.get(&descriptor.file) else {
+                continue;
+            };
+            let Ok(module_scope) =
+                module_scope_for_file(collection, &collection.module_tree, descriptor.file)
+            else {
+                continue;
+            };
+            let Ok(owner_descriptor) = find_top_level_owner_descriptor(
+                top_level_owner_index,
+                descriptor.owner,
+                descriptor.file,
+                descriptor.item_id,
+                descriptor.kind,
+            ) else {
+                continue;
+            };
+            let Some(def_paths) = self.def_paths.get(&descriptor.owner.def_id.package()) else {
+                continue;
+            };
+            let Ok(Some(expected_path)) = def_paths.resolve_def_id(def_id) else {
+                continue;
+            };
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &inputs.ast_ids,
+                snapshot,
+                &inputs.root,
+                &arena,
+                &self.symbols,
+                def_paths,
+            );
+            let Ok((hir_owner, _source_map)) = lower_top_level_owner(
+                owner_descriptor,
+                &expected_path,
+                &inputs.filtered_item_tree,
+                &inputs.retained_item_kinds,
+                &context,
+            ) else {
+                continue;
+            };
+            if hir_owner.id != descriptor.owner || !hir_owner.raw_attrs.is_empty() {
+                continue;
+            }
+            let OwnerNode::Item(item) = hir_owner.node else {
+                continue;
+            };
+            let path_candidates = owner_test_only_path_candidates(&hir_owner);
+            let type_paths = resolve_type_owner_module_paths(
+                descriptor.owner,
+                &path_candidates,
+                &HashMap::new(),
+                &primitive_prelude,
+                &HashSet::new(),
+                module_scope,
+                Some(module_members),
+                package,
+                Some(source_graph_packages),
+            );
+            let convert_type = |ty: &Ty<'_>| {
+                resolve_const_constructor_type(
+                    *ty,
+                    Some(&type_paths),
+                    &self.symbols,
+                    &inputs,
+                    collection.target_cfg.pointer_width(),
+                )
+            };
+            let convert_fields = |fields: &[sai_hir::items::FieldDef<'_>]| {
+                let mut converted = Vec::with_capacity(fields.len());
+                let mut names = HashSet::new();
+                for field in fields {
+                    if !names.insert(field.name.sym) {
+                        return None;
+                    }
+                    converted.push(ConstNamedFieldConstructor {
+                        name: field.name.sym,
+                        ty: convert_type(field.ty)?,
+                    });
+                }
+                Some(converted)
+            };
+
+            match item.kind {
+                ItemKind::Struct { generics, fields } => {
+                    if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                        continue;
+                    }
+                    let Some(fields) = convert_fields(fields) else {
+                        continue;
+                    };
+                    constructors
+                        .records
+                        .insert(def_id, ConstRecordConstructor { fields });
+                }
+                ItemKind::Enum { generics, variants } => {
+                    if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                        continue;
+                    }
+                    let mut converted_variants = Vec::with_capacity(variants.len());
+                    let mut variant_names = HashSet::new();
+                    let mut variants_are_supported = true;
+                    for variant in variants {
+                        if variant.has_explicit_discriminant
+                            || !variant_names.insert(variant.name.sym)
+                        {
+                            variants_are_supported = false;
+                            break;
+                        }
+                        let shape = match variant.shape {
+                            VariantShape::Unit => ConstVariantConstructorShape::Unit,
+                            VariantShape::Tuple(types) => {
+                                let Some(types) = types
+                                    .iter()
+                                    .map(|ty| convert_type(ty))
+                                    .collect::<Option<Vec<_>>>()
+                                else {
+                                    variants_are_supported = false;
+                                    break;
+                                };
+                                ConstVariantConstructorShape::Tuple(types)
+                            }
+                            VariantShape::Record(fields) => {
+                                let Some(fields) = convert_fields(fields) else {
+                                    variants_are_supported = false;
+                                    break;
+                                };
+                                ConstVariantConstructorShape::Record(fields)
+                            }
+                        };
+                        let variant_def_id = variant.def_id.to_def_id();
+                        converted_variants.push(ConstVariantConstructor {
+                            def_id: variant_def_id,
+                            name: variant.name.sym,
+                            shape,
+                        });
+                        constructors.variant_owners.insert(variant_def_id, def_id);
+                    }
+                    if !variants_are_supported {
+                        for variant in variants {
+                            constructors
+                                .variant_owners
+                                .remove(&variant.def_id.to_def_id());
+                        }
+                        continue;
+                    }
+                    constructors.enums.insert(
+                        def_id,
+                        ConstEnumConstructor {
+                            variants: converted_variants,
+                        },
+                    );
+                }
+                ItemKind::Distinct {
+                    generics,
+                    base,
+                    has_predicate,
+                    ..
+                } => {
+                    if !generics.params.is_empty()
+                        || !generics.where_preds.is_empty()
+                        || has_predicate
+                    {
+                        continue;
+                    }
+                    let Some(base) = convert_type(base) else {
+                        continue;
+                    };
+                    constructors
+                        .distincts
+                        .insert(def_id, ConstDistinctConstructor { base });
+                }
+                _ => continue,
+            }
+            if let Ok(name) = self.symbols.resolve(item.name.sym) {
+                constructors.type_names.insert(def_id, name.to_string());
+            }
+        }
+        constructors
+    }
+
     /// Package-wide const declared-type table for const references
     /// (`LIMIT`, `helper2.LIMIT`) in primitive bodies. Only consts whose
     /// annotation resolves to a supported primitive family or `Str` are
@@ -39296,6 +40510,7 @@ impl RootDatabase {
         top_level_owner_index: &HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
         module_members: &ModuleMemberIndex<'_>,
         source_graph_packages: &HashSet<PackageId>,
+        const_type_constructors: &ConstTypeConstructorIndex,
     ) -> (
         HashMap<DefId, FunctionDirectType>,
         HashMap<DefId, ConstConstructorType>,
@@ -39425,7 +40640,8 @@ impl RootDatabase {
             }
             if let Some(
                 constructor_type @ (ConstConstructorType::Tuple(_)
-                | ConstConstructorType::Array(_, _)),
+                | ConstConstructorType::Array(_, _)
+                | ConstConstructorType::Nominal(_)),
             ) = resolve_const_constructor_type(
                 *ty,
                 Some(&type_paths),
@@ -39602,6 +40818,7 @@ impl RootDatabase {
                 module_members,
                 types: &const_types,
                 aggregate_types: &const_aggregate_types,
+                constructors: const_type_constructors,
                 values: &const_values,
                 cyclic: &cyclic,
                 requesting_package: collection.module_tree.package,
@@ -39839,6 +41056,7 @@ impl RootDatabase {
             &top_level_owner_index,
             &module_members,
             source_graph_packages,
+            &ConstTypeConstructorIndex::default(),
         );
         let const_literal_types = const_literal_types
             .into_iter()
@@ -40499,6 +41717,13 @@ impl RootDatabase {
             .map(|scopes| &scopes.source_graph_packages)
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let const_type_constructors = self.index_const_type_constructors(
+            collection,
+            snapshot,
+            &top_level_owner_index,
+            &module_members,
+            source_graph_packages,
+        );
         let (
             const_literal_types,
             const_aggregate_literal_types,
@@ -40510,6 +41735,7 @@ impl RootDatabase {
             &top_level_owner_index,
             &module_members,
             source_graph_packages,
+            &const_type_constructors,
         );
         let descriptors = collection
             .scopes
@@ -40663,6 +41889,7 @@ impl RootDatabase {
                             module_members: &module_members,
                             types: &const_literal_types,
                             aggregate_types: &const_aggregate_literal_types,
+                            constructors: &const_type_constructors,
                             values: &const_literal_values,
                             cyclic: &cyclic_const_references,
                             requesting_package: collection.module_tree.package,
@@ -49719,6 +50946,7 @@ impl RootDatabase {
             &top_level_owner_index,
             &module_members,
             source_graph_packages,
+            &ConstTypeConstructorIndex::default(),
         );
         let const_literal_types = const_literal_types
             .into_iter()

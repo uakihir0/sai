@@ -13309,6 +13309,267 @@ fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
 }
 
 #[test]
+fn nominal_const_constructors_check() {
+    for source in [
+        concat!(
+            "type Point { x: I32, y: I32 }\n",
+            "pub const ORIGIN: Point = Point(x: 0, y: 1 + 1)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        concat!(
+            "type Point { x: I32, y: I32 }\n",
+            "pub const ORIGIN: Point = Point(x: 0, y: 0)\n",
+            "pub const MOVED: Point = Point(x: 1, ..ORIGIN)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        concat!(
+            "type Inner { n: I32 }\n",
+            "type Outer { inner: Inner }\n",
+            "pub const OUTER: Outer = Outer(inner: Inner(n: 1))\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        concat!(
+            "type Point { x: I32, y: I32 }\n",
+            "pub const ORIGIN: Point = Point(x: 0, y: 0)\n",
+            "pub const ALIAS: Point = ORIGIN\n",
+            "pub const WRAPPED: (Point,) = (ALIAS,)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        concat!(
+            "enum Status { Ready, Busy(I32), Failed(code: I32) }\n",
+            "pub const READY: Status = Status.Ready\n",
+            "pub const IMPLICIT: Status = .Ready\n",
+            "pub const BUSY: Status = Status.Busy(3)\n",
+            "pub const IMPLICIT_BUSY: Status = .Busy(3)\n",
+            "pub const FAILED: Status = Status.Failed(code: 4)\n",
+            "pub const IMPLICIT_FAILED: Status = .Failed(code: 4)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        concat!(
+            "distinct UserId = U64\n",
+            "pub const ROOT: UserId = UserId(1)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn cross_file_nominal_const_constructors_check() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types.{Point, Status}\n",
+            "pub const ORIGIN: Point = Point(x: 0, y: 0)\n",
+            "pub const READY: Status = Status.Ready\n",
+            "pub const BUSY: Status = Status.Busy(2)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[(
+            "src/types.sai",
+            concat!(
+                "type Point { x: I32, y: I32 }\n",
+                "enum Status { Ready, Busy(I32) }\n",
+            ),
+        )],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn nominal_const_constructor_errors_are_checked() {
+    for (source, code, message) in [
+        (
+            concat!(
+                "type Point { x: I32, y: I32 }\n",
+                "pub const ORIGIN: Point = Point(x: 0)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "MISSING_FIELD",
+            "missing fields `y`",
+        ),
+        (
+            concat!(
+                "type Point { x: I32, y: I32 }\n",
+                "pub const ORIGIN: Point = Point(x: 0, z: 1)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "UNKNOWN_FIELD",
+            "unknown record field",
+        ),
+        (
+            concat!(
+                "type Point { x: I32, y: I32 }\n",
+                "pub const ORIGIN: Point = Point(x: 0, y: 1, x: 2)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "DUPLICATE_FIELD",
+            "field is initialized more than once",
+        ),
+        (
+            concat!(
+                "type Point { x: I32, y: I32 }\n",
+                "pub const ORIGIN: Point = Point(x: true, y: 1)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `I32`, found a Bool literal",
+        ),
+        (
+            concat!(
+                "type Point { x: I32 }\n",
+                "pub const X: I32 = Point(x: 1)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `I32`, found `Point`",
+        ),
+        (
+            concat!(
+                "type Point { x: I32 }\n",
+                "pub const X: (I32,) = (Point(x: 1),)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `I32`, found `Point`",
+        ),
+        (
+            concat!(
+                "type Point { x: I32, y: I32 }\n",
+                "pub const CTOR: Point = Point\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "RECORD_CONSTRUCTOR_AS_VALUE",
+            "record constructors cannot be used as values",
+        ),
+        (
+            concat!(
+                "type Point { x: I32, y: I32 }\n",
+                "pub const POINT: Point = Point(x: 0, ..POINT)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "CONST_CYCLE",
+            "const depends on itself",
+        ),
+        (
+            concat!(
+                "enum Status { Ready, Busy(I32) }\n",
+                "pub const BUSY: Status = Status.Busy(true)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `I32`, found a Bool literal",
+        ),
+        (
+            concat!(
+                "enum Status { Ready, Busy(I32) }\n",
+                "pub const BUSY: Status = Status.Busy(1, 2)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "WRONG_ARGUMENT_COUNT",
+            "constructor expects 1 arguments, found 2",
+        ),
+        (
+            concat!(
+                "enum Status { Ready, Busy(I32) }\n",
+                "pub const READY: Status = Status.Ready()\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "WRONG_ARGUMENT_COUNT",
+            "unit variant calls do not accept an argument list",
+        ),
+        (
+            concat!(
+                "enum Status { Ready, Busy(I32) }\n",
+                "pub const MISSING: Status = Status.Missing\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "UNKNOWN_VARIANT",
+            "unknown enum variant",
+        ),
+        (
+            concat!(
+                "enum Status { Ready, Busy(I32) }\n",
+                "pub const CTOR: Status = Status.Busy\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "NOT_CONST_EXPRESSION",
+            "constructor function items are not constant expressions",
+        ),
+        (
+            concat!(
+                "distinct UserId = U64\n",
+                "pub const ROOT: UserId = UserId(true)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "TYPE_MISMATCH",
+            "expected `U64`, found a Bool literal",
+        ),
+        (
+            concat!(
+                "distinct UserId = U64\n",
+                "pub const ROOT: UserId = UserId(1, 2)\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "WRONG_ARGUMENT_COUNT",
+            "constructor expects 1 arguments, found 2",
+        ),
+        (
+            concat!(
+                "distinct UserId = U64\n",
+                "pub const CTOR: UserId = UserId\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "NOT_CONST_EXPRESSION",
+            "constructor function items are not constant expressions",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\"")) && stdout.contains(message),
+            "expected {code} with {message:?}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "supported invalid nominal constructor must not be gated:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn nominal_const_constructor_forms_outside_the_slice_remain_gated() {
+    for source in [
+        concat!(
+            "type Boxed<T> { value: T }\n",
+            "pub const BOXED: Boxed<I32> = Boxed(value: 1)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        concat!(
+            "enum Maybe<T> { Some(T) }\n",
+            "pub const VALUE: Maybe<I32> = Maybe.Some(1)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        concat!(
+            "enum Status { Ready = 1 }\n",
+            "pub const READY: Status = Status.Ready\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        concat!(
+            "distinct Age = U8\nwhere self <= 150\n",
+            "pub const AGE: Age = Age(1)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
 fn array_const_constructors_check() {
     for source in [
         "pub const EMPTY: Array<I32, 0> = []\n",

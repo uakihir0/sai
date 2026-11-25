@@ -2292,32 +2292,86 @@ fn check_type_decls_acyclic(
         .collect();
     let mut edges: HashMap<String, Vec<String>> = HashMap::new();
     for item in source_file.items() {
-        let sai_syntax::ast::Item::Type(type_decl) = item else {
-            continue;
-        };
-        let Some(name) = type_decl
-            .name()
-            .and_then(|name| name.token())
-            .map(|token| normalize_type_name(token.text()))
-        else {
-            continue;
-        };
-        let targets = type_decl
-            .struct_def()
-            .and_then(|definition| definition.fields())
-            .map(|fields| {
-                fields
-                    .fields()
-                    .filter_map(|field| {
-                        let ty = field.ty()?;
-                        let range = ty.syntax().text_range();
-                        let text = source.get(range.start().to_usize()..range.end().to_usize())?;
-                        let normalized = normalize_type_name(std::str::from_utf8(text).ok()?);
-                        normalized_names.contains(&normalized).then_some(normalized)
-                    })
-                    .collect()
+        let type_texts = |ty: Option<sai_syntax::ast::Type>| {
+            ty.and_then(|ty| {
+                let range = ty.syntax().text_range();
+                let text = source.get(range.start().to_usize()..range.end().to_usize())?;
+                let normalized = normalize_type_name(std::str::from_utf8(text).ok()?);
+                normalized_names.contains(&normalized).then_some(normalized)
             })
-            .unwrap_or_default();
+        };
+        let (name, targets) = match item {
+            sai_syntax::ast::Item::Type(type_decl) => {
+                let Some(name) = type_decl
+                    .name()
+                    .and_then(|name| name.token())
+                    .map(|token| normalize_type_name(token.text()))
+                else {
+                    continue;
+                };
+                let targets = type_decl
+                    .struct_def()
+                    .and_then(|definition| definition.fields())
+                    .map(|fields| {
+                        fields
+                            .fields()
+                            .filter_map(|field| type_texts(field.ty()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (name, targets)
+            }
+            sai_syntax::ast::Item::Enum(enumeration) => {
+                let Some(name) = enumeration
+                    .name()
+                    .and_then(|name| name.token())
+                    .map(|token| normalize_type_name(token.text()))
+                else {
+                    continue;
+                };
+                let targets = enumeration
+                    .variants()
+                    .map(|variants| {
+                        variants
+                            .variants()
+                            .flat_map(|variant| {
+                                let tuple_types = variant
+                                    .tuple_shape()
+                                    .map(|shape| shape.types().collect::<Vec<_>>())
+                                    .unwrap_or_default();
+                                let record_types = variant
+                                    .record_shape()
+                                    .map(|shape| {
+                                        shape
+                                            .fields()
+                                            .filter_map(|field| field.ty())
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                tuple_types
+                                    .into_iter()
+                                    .chain(record_types)
+                                    .filter_map(|ty| type_texts(Some(ty)))
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (name, targets)
+            }
+            sai_syntax::ast::Item::Distinct(distinct) => {
+                let Some(name) = distinct
+                    .name()
+                    .and_then(|name| name.token())
+                    .map(|token| normalize_type_name(token.text()))
+                else {
+                    continue;
+                };
+                let targets = type_texts(distinct.base_type()).into_iter().collect();
+                (name, targets)
+            }
+            _ => continue,
+        };
         edges.insert(name, targets);
     }
     let mut state: HashMap<String, u8> = HashMap::new();
@@ -2450,20 +2504,38 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
     let mut type_names = HashSet::new();
     let mut public_type_names = HashSet::new();
     for item in source_file.items() {
-        if let sai_syntax::ast::Item::Type(type_decl) = item {
-            let Some(name) = type_decl
-                .name()
-                .and_then(|name| name.token())
-                .map(|token| token.text().to_owned())
-            else {
-                return (false, false, false, false, false);
-            };
-            if is_public_visibility(type_decl.visibility()) {
-                public_type_names.insert(name.clone());
-            }
-            type_names.insert(name);
-            saw_type = true;
+        let (name, visibility) = match item {
+            sai_syntax::ast::Item::Type(type_decl) => (
+                type_decl
+                    .name()
+                    .and_then(|name| name.token())
+                    .map(|token| token.text().to_owned()),
+                type_decl.visibility(),
+            ),
+            sai_syntax::ast::Item::Enum(enumeration) => (
+                enumeration
+                    .name()
+                    .and_then(|name| name.token())
+                    .map(|token| token.text().to_owned()),
+                enumeration.visibility(),
+            ),
+            sai_syntax::ast::Item::Distinct(distinct) => (
+                distinct
+                    .name()
+                    .and_then(|name| name.token())
+                    .map(|token| token.text().to_owned()),
+                distinct.visibility(),
+            ),
+            _ => continue,
+        };
+        let Some(name) = name else {
+            return (false, false, false, false, false);
+        };
+        if is_public_visibility(visibility) {
+            public_type_names.insert(name.clone());
         }
+        type_names.insert(name);
+        saw_type = true;
     }
     if !check_type_decls_acyclic(&source_file, source, &type_names) {
         return (false, false, false, false, false);
@@ -2513,6 +2585,55 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
                     &public_type_names,
                     &use_item_bound_names(&source_file, source),
                 ) {
+                    return (false, false, false, false, false);
+                }
+            }
+            sai_syntax::ast::Item::Enum(enumeration) => {
+                let has_error = enumeration.syntax().descendants().any(|node| {
+                    node.kind() == sai_syntax::SyntaxKind::ERROR
+                        || node.children_with_tokens().any(|element| {
+                            element.as_token().is_some_and(|token| token.has_error())
+                        })
+                });
+                let variants_are_supported = enumeration.variants().is_some_and(|variants| {
+                    variants.variants().all(|variant| {
+                        variant.attrs().next().is_none()
+                            && variant.discriminant().is_none()
+                            && variant.record_shape().is_none_or(|shape| {
+                                shape.fields().all(|field| field.attrs().next().is_none())
+                            })
+                    })
+                });
+                if enumeration.attrs().next().is_some()
+                    || enumeration.generic_params().is_some()
+                    || enumeration.where_clause().is_some()
+                    || enumeration
+                        .syntax()
+                        .descendants()
+                        .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+                    || has_error
+                    || !variants_are_supported
+                {
+                    return (false, false, false, false, false);
+                }
+            }
+            sai_syntax::ast::Item::Distinct(distinct) => {
+                let has_error = distinct.syntax().descendants().any(|node| {
+                    node.kind() == sai_syntax::SyntaxKind::ERROR
+                        || node.children_with_tokens().any(|element| {
+                            element.as_token().is_some_and(|token| token.has_error())
+                        })
+                });
+                if distinct.attrs().next().is_some()
+                    || distinct.generic_params().is_some()
+                    || distinct.refinement().is_some()
+                    || distinct
+                        .syntax()
+                        .descendants()
+                        .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+                    || has_error
+                    || distinct.base_type().is_none()
+                {
                     return (false, false, false, false, false);
                 }
             }
