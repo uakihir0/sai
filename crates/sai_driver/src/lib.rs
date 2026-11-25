@@ -7396,8 +7396,88 @@ fn const_reference_literal_type(direct_type: FunctionDirectType) -> Option<Const
     match direct_type {
         FunctionDirectType::Primitive(primitive) => Some(ConstLiteralType::Primitive(primitive)),
         FunctionDirectType::Str => Some(ConstLiteralType::Str),
-        FunctionDirectType::Unit => None,
+        FunctionDirectType::Unit => Some(ConstLiteralType::Unit),
     }
+}
+
+fn const_reference_is_supported(
+    owner: OwnerId,
+    value: &HirExpr<'_>,
+    context: &ConstReferenceContext<'_, '_>,
+) -> bool {
+    let Some(target) = const_initializer_reference_target(
+        value,
+        context.module_scope,
+        context.module_members,
+        context.requesting_package,
+    ) else {
+        return false;
+    };
+    context.cyclic.contains(&owner.def_id.to_def_id())
+        || (!context.cyclic.contains(&target)
+            && context
+                .types
+                .get(&target)
+                .copied()
+                .and_then(const_reference_literal_type)
+                .is_some())
+}
+
+fn check_const_reference_expression(
+    owner: OwnerId,
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(context) = const_references else {
+        return Ok(None);
+    };
+    let Some(target) = const_initializer_reference_target(
+        value,
+        context.module_scope,
+        context.module_members,
+        context.requesting_package,
+    ) else {
+        return Ok(None);
+    };
+    if context.cyclic.contains(&owner.def_id.to_def_id()) {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::ConstCycle,
+            "const depends on itself".to_string(),
+            "cyclic const reference",
+        )?]));
+    }
+    if context.cyclic.contains(&target) {
+        return Ok(None);
+    }
+    let Some(referenced_type) = context.types.get(&target).copied() else {
+        return Ok(None);
+    };
+    let Some(referenced_literal_type) = const_reference_literal_type(referenced_type) else {
+        return Ok(None);
+    };
+    if referenced_literal_type == literal_type {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(Some(vec![const_literal_diagnostic(
+        owner,
+        inputs,
+        snapshot,
+        value.span,
+        sai_diagnostics::Code::TypeMismatch,
+        format!(
+            "expected `{}`, found `{}`",
+            const_literal_type_display(literal_type),
+            function_direct_type_name(referenced_type)
+        ),
+        "type mismatch",
+    )?]))
 }
 
 fn check_const_literal_owner(
@@ -7436,16 +7516,28 @@ fn check_const_literal_owner(
     };
     if let TyKind::Tuple(elements) = ty.kind {
         if elements.is_empty() {
-            let diagnostics = match check_const_literal_leaf(
-                owner,
-                *ty,
+            let unit_references = check_const_reference_expression(
+                owner.id,
+                ConstLiteralType::Unit,
                 &body.value,
-                type_paths,
-                symbols,
+                const_references.as_ref(),
                 inputs,
                 snapshot,
-                target_cfg,
-            )? {
+            )?;
+            let leaf_diagnostics = match unit_references {
+                Some(diagnostics) => Some(diagnostics),
+                None => check_const_literal_leaf(
+                    owner,
+                    *ty,
+                    &body.value,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?,
+            };
+            let diagnostics = match leaf_diagnostics {
                 Some(diagnostics) => diagnostics,
                 None => {
                     let Some(diagnostics) = check_const_operator_expression_against_type(
@@ -7475,6 +7567,7 @@ fn check_const_literal_owner(
             inputs,
             snapshot,
             target_cfg,
+            const_references.as_ref(),
         )?
         else {
             return Ok(ConstLiteralCheck::Unsupported);
@@ -7486,48 +7579,14 @@ fn check_const_literal_owner(
         return Ok(ConstLiteralCheck::Unsupported);
     };
 
-    let mut reference_diagnostics = None;
-    if let Some(context) = const_references
-        && let Some(target) = const_initializer_reference_target(
-            &body.value,
-            context.module_scope,
-            context.module_members,
-            context.requesting_package,
-        )
-    {
-        if context.cyclic.contains(&owner.id.def_id.to_def_id()) {
-            reference_diagnostics = Some(vec![const_literal_diagnostic(
-                owner.id,
-                inputs,
-                snapshot,
-                body.value.span,
-                sai_diagnostics::Code::ConstCycle,
-                "const depends on itself".to_string(),
-                "cyclic const reference",
-            )?]);
-        } else if !context.cyclic.contains(&target)
-            && let Some(referenced_type) = context.types.get(&target).copied()
-            && let Some(referenced_literal_type) = const_reference_literal_type(referenced_type)
-        {
-            if referenced_literal_type == literal_type {
-                reference_diagnostics = Some(Vec::new());
-            } else {
-                reference_diagnostics = Some(vec![const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    body.value.span,
-                    sai_diagnostics::Code::TypeMismatch,
-                    format!(
-                        "expected `{}`, found `{}`",
-                        const_literal_type_display(literal_type),
-                        function_direct_type_name(referenced_type)
-                    ),
-                    "type mismatch",
-                )?]);
-            }
-        }
-    }
+    let reference_diagnostics = check_const_reference_expression(
+        owner.id,
+        literal_type,
+        &body.value,
+        const_references.as_ref(),
+        inputs,
+        snapshot,
+    )?;
 
     let diagnostics = if let Some(diagnostics) = reference_diagnostics {
         diagnostics
@@ -17390,6 +17449,7 @@ fn check_const_tuple_literal(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let Some(expected_types) = expected_elements
         .iter()
@@ -17417,10 +17477,11 @@ fn check_const_tuple_literal(
         )?]));
     };
 
-    if values
-        .iter()
-        .any(|value| !is_const_scalar_expression_shape(value))
-    {
+    if values.iter().any(|value| {
+        !is_const_scalar_expression_shape(value)
+            && const_references
+                .is_none_or(|context| !const_reference_is_supported(owner.id, value, context))
+    }) {
         return Ok(None);
     }
     if values.len() != expected_elements.len() {
@@ -17443,16 +17504,27 @@ fn check_const_tuple_literal(
     for ((expected_ty, expected_type), value) in
         expected_elements.iter().zip(&expected_types).zip(values)
     {
-        let mut field_diagnostics = match check_const_literal_leaf(
-            owner,
-            *expected_ty,
+        let leaf_diagnostics = match check_const_reference_expression(
+            owner.id,
+            *expected_type,
             value,
-            type_paths,
-            symbols,
+            const_references,
             inputs,
             snapshot,
-            target_cfg,
         )? {
+            Some(diagnostics) => Some(diagnostics),
+            None => check_const_literal_leaf(
+                owner,
+                *expected_ty,
+                value,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?,
+        };
+        let mut field_diagnostics = match leaf_diagnostics {
             Some(diagnostics) => diagnostics,
             None => {
                 let Some(diagnostics) = check_const_operator_expression_against_type(
@@ -28654,6 +28726,33 @@ fn const_initializer_reference_target(
     }
 }
 
+fn const_initializer_reference_targets(
+    value: &HirExpr<'_>,
+    module_scope: &Phase1ModuleScopes,
+    module_members: &ModuleMemberIndex<'_>,
+    requesting_package: PackageId,
+) -> Vec<DefId> {
+    if let Some(target) =
+        const_initializer_reference_target(value, module_scope, module_members, requesting_package)
+    {
+        return vec![target];
+    }
+    let ExprKind::Tuple(elements) = value.kind else {
+        return Vec::new();
+    };
+    elements
+        .iter()
+        .filter_map(|element| {
+            const_initializer_reference_target(
+                element,
+                module_scope,
+                module_members,
+                requesting_package,
+            )
+        })
+        .collect()
+}
+
 fn const_reference_cycle_members(references: &HashMap<DefId, Vec<DefId>>) -> HashSet<DefId> {
     let mut states = HashMap::<DefId, u8>::new();
     let mut cyclic = HashSet::new();
@@ -38565,15 +38664,16 @@ impl RootDatabase {
                 descriptor.owner.def_id.package(),
                 Some(source_graph_packages),
             );
-            if let Some(body) = hir_owner.body
-                && let Some(target) = const_initializer_reference_target(
+            if let Some(body) = hir_owner.body {
+                let targets = const_initializer_reference_targets(
                     &body.value,
                     module_scope,
                     module_members,
                     collection.module_tree.package,
-                )
-            {
-                const_references.entry(def_id).or_default().push(target);
+                );
+                if !targets.is_empty() {
+                    const_references.entry(def_id).or_default().extend(targets);
+                }
             }
             let Some(const_type) =
                 (match resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs) {
@@ -38583,6 +38683,7 @@ impl RootDatabase {
                         Some(FunctionDirectType::Primitive(primitive))
                     }
                     Some(ConstLiteralType::Str) => Some(FunctionDirectType::Str),
+                    Some(ConstLiteralType::Unit) => Some(FunctionDirectType::Unit),
                     _ => None,
                 })
             else {

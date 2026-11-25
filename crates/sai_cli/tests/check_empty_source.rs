@@ -13135,8 +13135,29 @@ fn public_flat_tuple_const_literals_emit_check_results() {
         "pub const MIXED: (F32, Str, ()) = (1.25, \"text\", ())\n",
         "pub const OPERATORS: (I32, Bool, I8) = (1 + 2, true and not false, 1 << 2)\n",
         "pub const COMPARISON: (Bool, Bool) = (1 < 2, () == ())\n",
+        "pub const BASE: I32 = 7\n",
+        "pub const TRUTH: Bool = true\n",
+        "pub const NOTHING: () = ()\n",
+        "pub const REFS: (I32, Bool, ()) = (BASE, TRUTH, NOTHING)\n",
+        "pub const EMPTY_ALIAS: () = NOTHING\n",
     );
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn imported_const_reference_tuple_fields_check() {
+    let source = concat!(
+        "use acme:empty/values.{LIMIT}\n",
+        "use acme:empty/values\n",
+        "pub const PAIR: (I32, I32) = (LIMIT, values.LIMIT)\n",
+    );
+    let output = run_check(
+        source,
+        "",
+        &[("src/values.sai", "pub const LIMIT: I32 = 10\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
@@ -13184,6 +13205,14 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
             "pub const FIELD_COMPARISON_MISMATCH: (I32,) = (1 < 2,)\n",
             "TYPE_MISMATCH",
         ),
+        (
+            "pub const TRUTH: Bool = true\npub const FIELD_REFERENCE_MISMATCH: (I32,) = (TRUTH,)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const FIRST: (I32,) = (SECOND,)\npub const SECOND: (I32,) = (FIRST,)\n",
+            "CONST_CYCLE",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
@@ -13206,8 +13235,10 @@ fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
         "pub const NESTED: ((I32,),) = ((1,),)\n",
         "pub const ARITY_UNSUPPORTED: (I32,) = ((1,), (2,))\n",
+        "pub const TUPLE_TARGET: (I32,) = (1,)\npub const ARITY_UNSUPPORTED_TARGET: (I32,) = (TUPLE_TARGET, TUPLE_TARGET)\n",
         "pub const ARRAY: Array<I32, 1> = [1]\n",
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
+        "pub const BASE: I32 = 1\npub const OPERATOR_REFERENCE_FIELD: (I32,) = (BASE + 1,)\n",
         "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
         "pub const SCALAR_TUPLE_MISMATCH: I32 = (1,)\n",
         "pub type Number = I32\npub const ALIAS_FIELD: (Number,) = (1,)\n",
