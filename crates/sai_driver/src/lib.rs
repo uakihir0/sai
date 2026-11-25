@@ -17470,6 +17470,22 @@ fn is_const_tuple_expression_shape(
             .all(|element| is_const_tuple_expression_shape(owner, element, const_references))
 }
 
+fn const_tuple_element_type_supported(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    if let TyKind::Tuple(elements) = ty.kind
+        && !elements.is_empty()
+    {
+        return elements.iter().all(|element| {
+            const_tuple_element_type_supported(*element, type_paths, symbols, inputs)
+        });
+    }
+    resolve_const_literal_type(ty, type_paths, symbols, inputs).is_some()
+}
+
 fn check_const_tuple_literal(
     owner: &HirOwner<'_>,
     expected_elements: &[Ty<'_>],
@@ -17481,6 +17497,13 @@ fn check_const_tuple_literal(
     target_cfg: &TargetCfg,
     const_references: Option<&ConstReferenceContext<'_, '_>>,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if expected_elements
+        .iter()
+        .any(|ty| !const_tuple_element_type_supported(*ty, type_paths, symbols, inputs))
+    {
+        return Ok(None);
+    }
+
     let ExprKind::Tuple(values) = value.kind else {
         let ExprKind::Lit(literal) = value.kind else {
             return Ok(None);

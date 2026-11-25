@@ -13293,6 +13293,7 @@ fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
         "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
         "pub const SCALAR_TUPLE_MISMATCH: I32 = (1,)\n",
         "pub type Number = I32\npub const ALIAS_FIELD: (Number,) = (1,)\n",
+        "pub type Number = I32\npub const ALIAS_ARITY: (Number,) = (1, 2)\n",
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);
