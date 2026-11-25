@@ -29406,9 +29406,32 @@ fn infer_const_scalar_expression_type(value: &HirExpr<'_>) -> Option<ConstLitera
 }
 
 fn const_comparison_operator_supported(operator: BinOp, operand_type: ConstLiteralType) -> bool {
-    match operator {
-        BinOp::Eq | BinOp::Ne => true,
-        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => operand_type != ConstLiteralType::Unit,
+    if !matches!(
+        operator,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+    ) {
+        return false;
+    }
+    match operand_type {
+        ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::I8
+            | sai_resolve::prelude::PrimTy::I16
+            | sai_resolve::prelude::PrimTy::I32
+            | sai_resolve::prelude::PrimTy::I64
+            | sai_resolve::prelude::PrimTy::ISize
+            | sai_resolve::prelude::PrimTy::U8
+            | sai_resolve::prelude::PrimTy::U16
+            | sai_resolve::prelude::PrimTy::U32
+            | sai_resolve::prelude::PrimTy::U64
+            | sai_resolve::prelude::PrimTy::USize
+            | sai_resolve::prelude::PrimTy::F32
+            | sai_resolve::prelude::PrimTy::F64
+            | sai_resolve::prelude::PrimTy::Bool
+            | sai_resolve::prelude::PrimTy::Byte
+            | sai_resolve::prelude::PrimTy::Char,
+        )
+        | ConstLiteralType::Str
+        | ConstLiteralType::Unit => true,
         _ => false,
     }
 }

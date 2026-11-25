@@ -23453,6 +23453,10 @@ pub fn ready() -> Bool {
 ",
         "pub const VALUE: Bool = () == ()
 ",
+        "pub const VALUE: Bool = () <= ()
+",
+        "pub const VALUE: Bool = () < ()
+",
         "pub const VALUE: Bool = (1 << 3) == 8
 ",
         "pub const VALUE: Bool = false and (1 / 0 == 0)
@@ -23598,12 +23602,6 @@ fn primitive_const_expression_errors_are_checked() {
 ",
             "TYPE_MISMATCH",
             "expected `I64`, found a Bool literal",
-        ),
-        (
-            "pub const VALUE: Bool = () < ()
-",
-            "OPERATOR_NOT_SUPPORTED",
-            "operator `<` has no `PartialOrd` implementation for `()`",
         ),
         (
             "pub const VALUE: Bool = 18446744073709551616 < 0
