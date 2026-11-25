@@ -23053,6 +23053,194 @@ fn member_const_reference_in_str_body_checks() {
 }
 
 #[test]
+fn member_const_reference_in_match_scrutinee_checks() {
+    // `mod.CONST` member reads type primitive `match` scrutinees in
+    // tail, statement, and shared-literal initializer positions.
+    let root_source = concat!(
+        "use acme:empty/values\n",
+        "\n",
+        "pub fn tail() -> I32 {\n",
+        "    match values.LIMIT {\n",
+        "        5 => 1,\n",
+        "        _ => 2,\n",
+        "    }\n",
+        "}\n",
+        "pub fn stmt() -> I32 {\n",
+        "    match values.LIMIT {\n",
+        "        5 => { let x = 1 },\n",
+        "        _ => { let x = 2 },\n",
+        "    }\n",
+        "    0\n",
+        "}\n",
+        "pub fn joined() -> I32 {\n",
+        "    let value = match values.LIMIT {\n",
+        "        5 => 1,\n",
+        "        _ => 2,\n",
+        "    }\n",
+        "    value\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/values.sai", "pub const LIMIT: I32 = 5\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn reexported_const_reference_checks() {
+    // `pub use` keeps the original const identity through direct
+    // imports, module-member reads, aliases, and re-export chains.
+    let root_source = concat!(
+        "use acme:empty/reexport.{LIMIT}\n",
+        "use acme:empty/aliased\n",
+        "\n",
+        "pub fn direct() -> I32 {\n",
+        "    LIMIT\n",
+        "}\n",
+        "pub fn member() -> I32 {\n",
+        "    aliased.CAP\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/values.sai", "pub const LIMIT: I32 = 5\n"),
+            ("src/middle.sai", "pub use acme:empty/values.{LIMIT}\n"),
+            ("src/reexport.sai", "pub use acme:empty/middle.{LIMIT}\n"),
+            (
+                "src/aliased.sai",
+                "pub use acme:empty/values.{LIMIT as CAP}\n",
+            ),
+        ],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn reexported_const_type_mismatch_reports() {
+    // The re-exported const retains its declared type through a chain.
+    let root_source = concat!(
+        "use acme:empty/reexport.{LIMIT}\n",
+        "\n",
+        "pub fn bad() -> I32 {\n",
+        "    LIMIT\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/values.sai", "pub const LIMIT: I64 = 5\n"),
+            ("src/reexport.sai", "pub use acme:empty/values.{LIMIT}\n"),
+        ],
+        &[],
+    );
+    assert!(!output.status.success(), "const type mismatch must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `I32`, found `I64`")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "re-exported const mismatches are diagnosed, not gated: {stdout}"
+    );
+}
+
+#[test]
+fn member_const_reference_in_if_condition_checks() {
+    // Bool member consts are ordinary concrete conditions in primitive
+    // and `-> Str` branch shapes.
+    let root_source = concat!(
+        "use acme:empty/values\n",
+        "\n",
+        "pub fn primitive() -> I32 {\n",
+        "    if values.FLAG { 1 } else { 2 }\n",
+        "}\n",
+        "pub fn text() -> Str {\n",
+        "    if values.FLAG { \"a\" } else { \"b\" }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/values.sai", "pub const FLAG: Bool = true\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn reexported_function_calls_check_through_chains() {
+    // Function re-exports also retain the original callee identity for
+    // direct imports, module-member calls, aliases, and chains.
+    let root_source = concat!(
+        "use acme:empty/reexport.{plus}\n",
+        "use acme:empty/reexport\n",
+        "\n",
+        "pub fn direct() -> I32 {\n",
+        "    plus(1)\n",
+        "}\n",
+        "pub fn member() -> I32 {\n",
+        "    reexport.plus(1)\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/helper.sai", "pub fn add(x: I32) -> I32 { x + 1 }\n"),
+            ("src/middle.sai", "pub use acme:empty/helper.{add}\n"),
+            (
+                "src/reexport.sai",
+                "pub use acme:empty/middle.{add as plus}\n",
+            ),
+            (
+                "src/types.sai",
+                concat!(
+                    "type Wrap { n: I32 }\n",
+                    "impl Wrap {\n",
+                    "    pub fn get(self: borrow Self) -> I32 { self.n }\n",
+                    "}\n",
+                ),
+            ),
+        ],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn self_field_match_scrutinee_checks() {
+    // Primitive `self` field projections — including nested record
+    // leaves already projected by the method walk — type `match`
+    // scrutinees by their declared field type.
+    let source = concat!(
+        "type Inner { n: I32 }\n",
+        "type Wrap { n: I32, inner: Inner }\n",
+        "impl Wrap {\n",
+        "    pub fn direct(self: borrow Self) -> I32 {\n",
+        "        match self.n {\n",
+        "            5 => 1,\n",
+        "            _ => 2,\n",
+        "        }\n",
+        "    }\n",
+        "    pub fn nested(self: borrow Self) -> I32 {\n",
+        "        match self.inner.n {\n",
+        "            5 => { let x = 1 },\n",
+        "            _ => { let x = 2 },\n",
+        "        }\n",
+        "        0\n",
+        "    }\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
 fn const_reference_in_str_body_mismatch_reports() {
     // A primitive const under a `-> Str` return type reports
     // TYPE_MISMATCH like a scalar local.
