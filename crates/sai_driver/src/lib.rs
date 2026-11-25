@@ -7559,7 +7559,7 @@ fn check_const_literal_owner(
     if let Some(constructor_type @ ConstConstructorType::Nominal(_)) =
         resolve_const_constructor_type(*ty, type_paths, symbols, inputs, target_cfg.pointer_width())
     {
-        let Some(diagnostics) = check_const_constructor_value(
+        let Some(mut diagnostics) = check_const_constructor_value(
             owner,
             &constructor_type,
             &body.value,
@@ -7573,6 +7573,29 @@ fn check_const_literal_owner(
         else {
             return Ok(ConstLiteralCheck::Unsupported);
         };
+        if matches!(item.vis, Visibility::Pub | Visibility::Export)
+            && let ConstConstructorType::Nominal(nominal) = &constructor_type
+            && let Some(type_visibility) = const_references
+                .as_ref()
+                .and_then(|context| context.constructors.type_visibilities.get(&nominal.def_id))
+            && matches!(type_visibility, Visibility::Private)
+        {
+            diagnostics.insert(
+                0,
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    ty.span,
+                    sai_diagnostics::Code::PrivateTypeInPublicApi,
+                    format!(
+                        "public const `{}` uses private type `{}` in its public interface",
+                        name, nominal.name
+                    ),
+                    "private type in public API",
+                )?,
+            );
+        }
         return Ok(ConstLiteralCheck::SupportedNominal { diagnostics });
     }
 
@@ -16678,6 +16701,7 @@ struct ConstTypeConstructorIndex {
     distincts: HashMap<DefId, ConstDistinctConstructor>,
     variant_owners: HashMap<DefId, DefId>,
     type_names: HashMap<DefId, String>,
+    type_visibilities: HashMap<DefId, Visibility>,
 }
 
 #[derive(Clone, Debug)]
@@ -40492,6 +40516,7 @@ impl RootDatabase {
                 }
                 _ => continue,
             }
+            constructors.type_visibilities.insert(def_id, item.vis);
             if let Ok(name) = self.symbols.resolve(item.name.sym) {
                 constructors.type_names.insert(def_id, name.to_string());
             }
