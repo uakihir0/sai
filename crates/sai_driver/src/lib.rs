@@ -18546,17 +18546,24 @@ fn str_match_arm_pattern(
                 // primitive at pin/default time instead of the
                 // provisional family now (`let n = 5; if let 300 = n {};
                 // let u: U8 = n` reports `300` out of range for `U8`).
-                if let Some(root) = scrutinee_seed
+                if let Some(seed) = scrutinee_seed
                     && let Some(literal) = str_static_literal(literal)
                     && matches!(literal, Lit::Int { .. } | Lit::Float { .. })
-                    && str_seed_resolved(&root).is_none()
-                    && str_seed_same_kind(literal, root.literal)
                 {
-                    let mut sites = root.sites.borrow_mut();
-                    if !sites.iter().any(|(l, s)| *l == literal && *s == pat.span) {
-                        sites.push((literal, pat.span));
+                    // Guards in earlier arms may merge the scrutinee's
+                    // literal-variable group. Re-follow the merge link
+                    // for every pattern so deferred sites land on the
+                    // group that later resolution actually checks.
+                    let root = str_seed_root(seed);
+                    if str_seed_resolved(&root).is_none()
+                        && str_seed_same_kind(literal, root.literal)
+                    {
+                        let mut sites = root.sites.borrow_mut();
+                        if !sites.iter().any(|(l, s)| *l == literal && *s == pat.span) {
+                            sites.push((literal, pat.span));
+                        }
+                        return Ok(Some(()));
                     }
-                    return Ok(Some(()));
                 }
                 match sai_ty::typeck::literal::check_primitive_literal(
                     primitive,
@@ -18659,17 +18666,21 @@ fn str_match_arm_pattern(
             )?);
             return Ok(Some(()));
         }
-        if let Some(root) = scrutinee_seed
-            && str_seed_resolved(root).is_none()
-        {
-            let mut sites = root.const_sites.borrow_mut();
-            if !sites
-                .iter()
-                .any(|(ty, site_span)| *ty == const_type && *site_span == span)
-            {
-                sites.push((const_type, span));
+        if let Some(seed) = scrutinee_seed {
+            // Like literal sites, const-pattern checks must follow a
+            // merge triggered by an earlier arm's guard before choosing
+            // the group that receives this deferred constraint.
+            let root = str_seed_root(seed);
+            if str_seed_resolved(&root).is_none() {
+                let mut sites = root.const_sites.borrow_mut();
+                if !sites
+                    .iter()
+                    .any(|(ty, site_span)| *ty == const_type && *site_span == span)
+                {
+                    sites.push((const_type, span));
+                }
+                return Ok(Some(()));
             }
-            return Ok(Some(()));
         }
         let mismatch = match (scrutinee_prim, const_type) {
             (Some(expected), FunctionDirectType::Primitive(found)) => expected != found,

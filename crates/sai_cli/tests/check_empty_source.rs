@@ -23003,6 +23003,48 @@ fn deferred_str_match_const_pattern_mismatch_reports() {
 }
 
 #[test]
+fn merged_literal_group_still_checks_deferred_const_pattern() {
+    // A guard in a preceding arm can merge the scrutinee's literal
+    // variable into another group. A later const pattern must be
+    // deferred onto the merged root, not the stale pre-merge group.
+    let source = concat!(
+        "pub const BIG: I64 = 1
+",
+        "pub fn pick(flag: Bool) -> Str {
+",
+        "    let n = 5
+",
+        "    let m = 6
+",
+        "    let r = match n {
+",
+        "        x if n == m => \"a\",
+",
+        "        BIG => \"y\",
+",
+        "        _ => \"z\",
+",
+        "    }
+",
+        "    let u: U8 = n
+",
+        "    r
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "merged-group mismatch must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `U8`, found `I64`")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "merged-group const mismatch is diagnosed, not gated: {stdout}"
+    );
+}
+
+#[test]
 fn const_pattern_type_mismatch_reports() {
     // A const pattern must have the scrutinee's type; a `Str` const in an
     // `I32` match is diagnosed rather than gated.
