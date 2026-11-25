@@ -23471,6 +23471,24 @@ fn primitive_const_expression_errors_are_checked() {
             "OPERATOR_NOT_SUPPORTED",
             "operator `%` has no `Rem` implementation for `F64`",
         ),
+        (
+            "pub const VALUE: I32 = not false
+",
+            "TYPE_MISMATCH",
+            "expected `I32`, found `Bool`",
+        ),
+        (
+            "pub const VALUE: I32 = true and false
+",
+            "TYPE_MISMATCH",
+            "expected `I32`, found `Bool`",
+        ),
+        (
+            "pub const VALUE: Str = false or true
+",
+            "TYPE_MISMATCH",
+            "expected `Str`, found `Bool`",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8_lossy(&output.stdout);

@@ -28714,17 +28714,10 @@ fn check_const_scalar_expression(
     }
 
     match value.kind {
-        ExprKind::Unary(UnOp::Not, operand)
-            if literal_type == ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool) =>
-        {
+        ExprKind::Unary(UnOp::Not, operand) => {
+            let bool_type = ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool);
             let Some(mut operand_evaluation) = check_const_scalar_expression(
-                owner,
-                literal_type,
-                operand,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
+                owner, bool_type, operand, symbols, inputs, snapshot, target_cfg,
             )?
             else {
                 return Ok(None);
@@ -28738,6 +28731,22 @@ fn check_const_scalar_expression(
                 None
             };
             operand_evaluation.value = result;
+            if literal_type != bool_type {
+                operand_evaluation
+                    .diagnostics
+                    .push(const_literal_diagnostic(
+                        owner,
+                        inputs,
+                        snapshot,
+                        value.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!(
+                            "expected `{}`, found `Bool`",
+                            const_literal_type_display(literal_type)
+                        ),
+                        "type mismatch",
+                    )?);
+            }
             Ok(Some(operand_evaluation))
         }
         ExprKind::Unary(UnOp::Neg, operand)
@@ -28923,29 +28932,16 @@ fn check_const_scalar_expression(
             left_evaluation.value = result;
             Ok(Some(left_evaluation))
         }
-        ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right)
-            if literal_type == ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool) =>
-        {
+        ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right) => {
+            let bool_type = ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool);
             let Some(mut left_evaluation) = check_const_scalar_expression(
-                owner,
-                literal_type,
-                left,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
+                owner, bool_type, left, symbols, inputs, snapshot, target_cfg,
             )?
             else {
                 return Ok(None);
             };
             let Some(right_evaluation) = check_const_scalar_expression(
-                owner,
-                literal_type,
-                right,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
+                owner, bool_type, right, symbols, inputs, snapshot, target_cfg,
             )?
             else {
                 return Ok(None);
@@ -28968,6 +28964,20 @@ fn check_const_scalar_expression(
                 None
             };
             left_evaluation.value = result;
+            if literal_type != bool_type {
+                left_evaluation.diagnostics.push(const_literal_diagnostic(
+                    owner,
+                    inputs,
+                    snapshot,
+                    value.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found `Bool`",
+                        const_literal_type_display(literal_type)
+                    ),
+                    "type mismatch",
+                )?);
+            }
             Ok(Some(left_evaluation))
         }
         _ => Ok(None),
