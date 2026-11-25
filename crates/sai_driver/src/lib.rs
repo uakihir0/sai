@@ -98,8 +98,8 @@ use sai_package::mvs_diagnostics::{
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
 pub use sai_resolve::PackageWitNames;
-use sai_resolve::module_member_lookup::ModuleMemberIndex;
 use sai_resolve::module_member_lookup::ModuleTarget;
+use sai_resolve::module_member_lookup::{ModuleMemberIndex, ModuleMemberLookup};
 use sai_resolve::module_path::{ModulePathError, resolve_module_prefix};
 use sai_resolve::owner::{
     BindingKind, DeferredPath, LabelResolution, LabelResolutionError, LocalResolution,
@@ -15621,6 +15621,7 @@ fn direct_primitive_call_sites(
     signatures: &HashMap<DefId, PrimitiveFunctionCallSignature>,
     requesting_package: PackageId,
     inputs: &CurrentOwnerInputs,
+    members: &ModuleMemberIndex<'_>,
 ) -> HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature> {
     let mut calls = HashMap::new();
     if module_paths.owner != body.owner {
@@ -15635,6 +15636,7 @@ fn direct_primitive_call_sites(
         signatures,
         requesting_package,
         inputs,
+        members,
         &mut calls,
     );
     calls
@@ -15766,6 +15768,7 @@ fn index_direct_call_sites_in_block(
     signatures: &HashMap<DefId, PrimitiveFunctionCallSignature>,
     requesting_package: PackageId,
     inputs: &CurrentOwnerInputs,
+    members: &ModuleMemberIndex<'_>,
     calls: &mut HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>,
 ) {
     visit_block_expressions(block, &mut |expression| {
@@ -15775,6 +15778,7 @@ fn index_direct_call_sites_in_block(
             signatures,
             requesting_package,
             inputs,
+            members,
         ) {
             calls.insert(expression.hir_id, signature);
         }
@@ -15787,6 +15791,7 @@ fn direct_primitive_call_site(
     signatures: &HashMap<DefId, PrimitiveFunctionCallSignature>,
     requesting_package: PackageId,
     inputs: &CurrentOwnerInputs,
+    members: &ModuleMemberIndex<'_>,
 ) -> Option<sai_ty::typeck::body::PrimitiveCallSignature> {
     let ExprKind::Call {
         callee, base: None, ..
@@ -15794,29 +15799,68 @@ fn direct_primitive_call_site(
     else {
         return None;
     };
-    let ExprKind::Path(path) = callee.kind else {
-        return None;
-    };
-    if path.root != PathRoot::Plain
-        || path.segments.len() != 1
-        || path.segments[0].args.is_some()
-        || !is_plain_ascii_identifier(path.segments[0].name, inputs)
-    {
-        return None;
-    }
-    let Some(PathRes {
-        base: Res::Def(DefKind::Fn, target),
-        resolved_segments: 1,
-        segment_count: 1,
-    }) = module_paths.paths.get(&path.hir_id)
-    else {
-        return None;
+    let target = match callee.kind {
+        ExprKind::Path(path) => {
+            if path.root != PathRoot::Plain
+                || path.segments.len() != 1
+                || path.segments[0].args.is_some()
+                || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+            {
+                return None;
+            }
+            let Some(PathRes {
+                base: Res::Def(DefKind::Fn, target),
+                resolved_segments: 1,
+                segment_count: 1,
+            }) = module_paths.paths.get(&path.hir_id)
+            else {
+                return None;
+            };
+            *target
+        }
+        // `helper.add(..)` — a use-bound module alias followed by a
+        // member name. The alias's base path resolves to the module
+        // and its member namespace holds the callee.
+        ExprKind::Field {
+            base,
+            name,
+            args: None,
+        } => {
+            let ExprKind::Path(base_path) = base.kind else {
+                return None;
+            };
+            if base_path.root != PathRoot::Plain
+                || base_path.segments.len() != 1
+                || base_path.segments[0].args.is_some()
+                || !is_plain_ascii_identifier(base_path.segments[0].name, inputs)
+            {
+                return None;
+            }
+            let Some(PathRes {
+                base: base_res,
+                resolved_segments: 1,
+                segment_count: 1,
+            }) = module_paths.paths.get(&base_path.hir_id)
+            else {
+                return None;
+            };
+            let ModuleMemberLookup::Found(binding) =
+                members.lookup(*base_res, name.sym, requesting_package)
+            else {
+                return None;
+            };
+            let Res::Def(DefKind::Fn, target) = binding.res else {
+                return None;
+            };
+            target
+        }
+        _ => return None,
     };
     if target.package != requesting_package {
         return None;
     }
-    let signature = signatures.get(target)?;
-    (signature.owner.def_id.to_def_id() == *target
+    let signature = signatures.get(&target)?;
+    (signature.owner.def_id.to_def_id() == target
         && signature.owner.def_id.package() == requesting_package)
         .then(|| {
             let output = match signature.output {
@@ -36073,6 +36117,7 @@ impl RootDatabase {
                                                 &primitive_function_call_signatures,
                                                 collection.module_tree.package,
                                                 &inputs,
+                                                &module_members,
                                             )
                                         });
                                     body_type_check = Some(check_function_body_type(
@@ -45949,6 +45994,7 @@ impl RootDatabase {
                                         &primitive_function_call_signatures,
                                         collection.module_tree.package,
                                         &inputs,
+                                        &module_members,
                                     );
                                     let str_use_shadow =
                                         use_shadows_str(module_scope, &self.symbols);
