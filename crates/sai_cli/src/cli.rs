@@ -2276,16 +2276,140 @@ fn normalize_type_name(text: &str) -> String {
     sai_syntax::normalize_identifier(text.strip_prefix("r#").unwrap_or(text))
 }
 
+fn type_identifier_names(ty: &sai_syntax::ast::Type) -> Vec<String> {
+    use sai_syntax::ast::AstNode as _;
+
+    let mut names = Vec::new();
+    let mut work = ty
+        .syntax()
+        .children_with_tokens()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    while let Some(element) = work.pop() {
+        match element {
+            sai_syntax::SyntaxElement::Token(token) => {
+                if matches!(
+                    token.kind(),
+                    sai_syntax::SyntaxKind::UIDENT | sai_syntax::SyntaxKind::LIDENT
+                ) {
+                    names.push(normalize_type_name(token.text()));
+                }
+            }
+            sai_syntax::SyntaxElement::Node(node) => work.extend(
+                node.children_with_tokens()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            ),
+        }
+    }
+    names
+}
+
+fn type_uses_known_names(
+    ty: &sai_syntax::ast::Type,
+    type_names: &HashSet<String>,
+    imported_names: &HashSet<String>,
+) -> bool {
+    type_identifier_names(ty).into_iter().all(|name| {
+        matches!(
+            name.as_str(),
+            "Bool"
+                | "Byte"
+                | "Char"
+                | "I8"
+                | "I16"
+                | "I32"
+                | "I64"
+                | "ISize"
+                | "U8"
+                | "U16"
+                | "U32"
+                | "U64"
+                | "USize"
+                | "F32"
+                | "F64"
+                | "Str"
+                | "Array"
+        ) || (!matches!(name.as_str(), "Self" | "self")
+            && (type_names
+                .iter()
+                .any(|candidate| normalize_type_name(candidate) == name)
+                || imported_names
+                    .iter()
+                    .any(|candidate| normalize_type_name(candidate) == name)))
+    })
+}
+
+fn type_uses_imported_name(ty: &sai_syntax::ast::Type, imported_names: &HashSet<String>) -> bool {
+    type_identifier_names(ty).into_iter().any(|name| {
+        imported_names
+            .iter()
+            .any(|candidate| normalize_type_name(candidate) == name)
+    })
+}
+
+fn item_type_uses_imported_names(
+    item: &sai_syntax::ast::Item,
+    imported_names: &HashSet<String>,
+) -> bool {
+    let any_type = |types: Vec<sai_syntax::ast::Type>| {
+        types
+            .iter()
+            .any(|ty| type_uses_imported_name(ty, imported_names))
+    };
+    match item {
+        sai_syntax::ast::Item::Type(type_decl) => type_decl
+            .struct_def()
+            .and_then(|definition| definition.fields())
+            .is_some_and(|fields| {
+                any_type(fields.fields().filter_map(|field| field.ty()).collect())
+            }),
+        sai_syntax::ast::Item::Enum(enumeration) => {
+            enumeration.variants().is_some_and(|variants| {
+                any_type(
+                    variants
+                        .variants()
+                        .flat_map(|variant| {
+                            let tuple_types = variant
+                                .tuple_shape()
+                                .map(|shape| shape.types().collect::<Vec<_>>())
+                                .unwrap_or_default();
+                            let record_types = variant
+                                .record_shape()
+                                .map(|shape| {
+                                    shape
+                                        .fields()
+                                        .filter_map(|field| field.ty())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            tuple_types
+                                .into_iter()
+                                .chain(record_types)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect(),
+                )
+            })
+        }
+        sai_syntax::ast::Item::Distinct(distinct) => distinct
+            .base_type()
+            .is_some_and(|ty| type_uses_imported_name(&ty, imported_names)),
+        _ => false,
+    }
+}
+
 // `type` decls whose record-typed fields point back through other decls
 // to themselves have no finite size (INFINITE_SIZE_TYPE upstream), so a
 // cyclic record graph keeps the whole source gated.
 fn check_type_decls_acyclic(
     source_file: &sai_syntax::ast::SourceFile,
-    source: &[u8],
+    _source: &[u8],
     type_names: &HashSet<String>,
 ) -> bool {
-    use sai_syntax::ast::AstNode as _;
-
     let normalized_names: HashSet<String> = type_names
         .iter()
         .map(|name| normalize_type_name(name))
@@ -2293,12 +2417,13 @@ fn check_type_decls_acyclic(
     let mut edges: HashMap<String, Vec<String>> = HashMap::new();
     for item in source_file.items() {
         let type_texts = |ty: Option<sai_syntax::ast::Type>| {
-            ty.and_then(|ty| {
-                let range = ty.syntax().text_range();
-                let text = source.get(range.start().to_usize()..range.end().to_usize())?;
-                let normalized = normalize_type_name(std::str::from_utf8(text).ok()?);
-                normalized_names.contains(&normalized).then_some(normalized)
+            ty.map(|ty| {
+                type_identifier_names(&ty)
+                    .into_iter()
+                    .filter(|name| normalized_names.contains(name))
+                    .collect::<Vec<_>>()
             })
+            .unwrap_or_default()
         };
         let (name, targets) = match item {
             sai_syntax::ast::Item::Type(type_decl) => {
@@ -2315,7 +2440,7 @@ fn check_type_decls_acyclic(
                     .map(|fields| {
                         fields
                             .fields()
-                            .filter_map(|field| type_texts(field.ty()))
+                            .flat_map(|field| type_texts(field.ty()))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -2351,7 +2476,7 @@ fn check_type_decls_acyclic(
                                 tuple_types
                                     .into_iter()
                                     .chain(record_types)
-                                    .filter_map(|ty| type_texts(Some(ty)))
+                                    .flat_map(|ty| type_texts(Some(ty)))
                                     .collect::<Vec<_>>()
                             })
                             .collect()
@@ -2367,7 +2492,7 @@ fn check_type_decls_acyclic(
                 else {
                     continue;
                 };
-                let targets = type_texts(distinct.base_type()).into_iter().collect();
+                let targets = type_texts(distinct.base_type());
                 (name, targets)
             }
             _ => continue,
@@ -2500,7 +2625,6 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
     let mut saw_impl = false;
     let mut saw_fn = false;
     let mut saw_const = false;
-    let mut saw_type = false;
     let mut type_names = HashSet::new();
     let mut public_type_names = HashSet::new();
     for item in source_file.items() {
@@ -2535,7 +2659,6 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
             public_type_names.insert(name.clone());
         }
         type_names.insert(name);
-        saw_type = true;
     }
     if !check_type_decls_acyclic(&source_file, source, &type_names) {
         return (false, false, false, false, false);
@@ -2545,8 +2668,11 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
     // member name) so an `impl` on an imported record stays a
     // candidate. The driver decides whether the name really resolves.
     let mut imported_names = HashSet::new();
+    let bound_names = use_item_bound_names(&source_file, source);
+    let mut type_uses_imported = false;
     let mut impls = Vec::new();
     for item in source_file.items() {
+        type_uses_imported |= item_type_uses_imported_names(&item, &bound_names);
         match item {
             sai_syntax::ast::Item::Use(use_decl) => {
                 if let Some(use_items) = use_decl.items() {
@@ -2599,8 +2725,18 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
                     variants.variants().all(|variant| {
                         variant.attrs().next().is_none()
                             && variant.discriminant().is_none()
+                            && variant.tuple_shape().is_none_or(|shape| {
+                                shape
+                                    .types()
+                                    .all(|ty| type_uses_known_names(&ty, &type_names, &bound_names))
+                            })
                             && variant.record_shape().is_none_or(|shape| {
-                                shape.fields().all(|field| field.attrs().next().is_none())
+                                shape.fields().all(|field| {
+                                    field.attrs().next().is_none()
+                                        && field.ty().is_some_and(|ty| {
+                                            type_uses_known_names(&ty, &type_names, &bound_names)
+                                        })
+                                })
                             })
                     })
                 });
@@ -2632,7 +2768,9 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
                         .descendants()
                         .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
                     || has_error
-                    || distinct.base_type().is_none()
+                    || distinct
+                        .base_type()
+                        .is_none_or(|ty| !type_uses_known_names(&ty, &type_names, &bound_names))
                 {
                     return (false, false, false, false, false);
                 }
@@ -2660,7 +2798,7 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
             &mut seen_methods,
         )
     });
-    (ok, saw_impl, saw_fn, saw_const, saw_type)
+    (ok, saw_impl, saw_fn, saw_const, type_uses_imported)
 }
 
 fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> bool {
@@ -6873,25 +7011,27 @@ fn module_tree_workspace_check_diagnostics(
             let mut package_saw_impl = false;
             let mut package_saw_fn = false;
             let mut package_saw_const = false;
-            let mut package_saw_type = false;
+            let mut package_type_uses_imported = false;
             let all_fragments = inputs[0].source_inputs.iter().all(|(_, _, source)| {
-                let (ok, file_saw_impl, file_saw_fn, file_saw_const, file_saw_type) =
+                let (ok, file_saw_impl, file_saw_fn, file_saw_const, type_uses_imported) =
                     check_source_is_mixed_public_items_fragment(source.as_ref());
                 package_saw_impl |= file_saw_impl;
                 package_saw_fn |= file_saw_fn;
                 package_saw_const |= file_saw_const;
-                package_saw_type |= file_saw_type;
+                package_type_uses_imported |= type_uses_imported;
                 ok
             });
             // The mixed coverage gate requires at least one impl owner
-            // package-wide, a `pub fn`+`pub const` mix, or a const-only
-            // package. Record-containing const packages still need the
-            // established fn/impl coverage because cross-file record-field
-            // type resolution is outside the file-local cycle scan.
+            // package-wide, a `pub fn`+`pub const` mix, or const items.
+            // Nominal type declarations are admissible with consts because
+            // their constructor slice is checked directly. A type declaration
+            // that itself references an imported nominal type still needs the
+            // established fn/impl coverage: the file-local cycle scan cannot
+            // prove that cross-file type graph finite.
             all_fragments
                 && (package_saw_impl
                     || (package_saw_fn && package_saw_const)
-                    || (package_saw_const && !package_saw_type))
+                    || (package_saw_const && !package_type_uses_imported))
         };
     let mut public_primitive_const_set_covered = false;
     let mut single_public_function_body_covered = false;

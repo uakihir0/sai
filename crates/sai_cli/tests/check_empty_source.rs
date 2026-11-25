@@ -13312,41 +13312,45 @@ fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
 fn nominal_const_constructors_check() {
     for source in [
         concat!(
-            "type Point { x: I32, y: I32 }\n",
+            "pub type Point { x: I32, y: I32 }\n",
             "pub const ORIGIN: Point = Point(x: 0, y: 1 + 1)\n",
             "pub fn zero() -> I32 { 0 }\n",
         ),
         concat!(
-            "type Point { x: I32, y: I32 }\n",
+            "pub type Point { x: I32, y: I32 }\n",
             "pub const ORIGIN: Point = Point(x: 0, y: 0)\n",
             "pub const MOVED: Point = Point(x: 1, ..ORIGIN)\n",
             "pub fn zero() -> I32 { 0 }\n",
         ),
         concat!(
-            "type Inner { n: I32 }\n",
-            "type Outer { inner: Inner }\n",
+            "pub type Inner { n: I32 }\n",
+            "pub type Outer { inner: Inner }\n",
             "pub const OUTER: Outer = Outer(inner: Inner(n: 1))\n",
             "pub fn zero() -> I32 { 0 }\n",
         ),
         concat!(
-            "type Point { x: I32, y: I32 }\n",
+            "pub type Point { x: I32, y: I32 }\n",
             "pub const ORIGIN: Point = Point(x: 0, y: 0)\n",
             "pub const ALIAS: Point = ORIGIN\n",
             "pub const WRAPPED: (Point,) = (ALIAS,)\n",
             "pub fn zero() -> I32 { 0 }\n",
         ),
         concat!(
-            "enum Status { Ready, Busy(I32), Failed(code: I32) }\n",
+            "pub enum Status { Ready, Busy(I32), Failed(code: I32) }\n",
             "pub const READY: Status = Status.Ready\n",
             "pub const IMPLICIT: Status = .Ready\n",
             "pub const BUSY: Status = Status.Busy(3)\n",
             "pub const IMPLICIT_BUSY: Status = .Busy(3)\n",
             "pub const FAILED: Status = Status.Failed(code: 4)\n",
             "pub const IMPLICIT_FAILED: Status = .Failed(code: 4)\n",
-            "pub fn zero() -> I32 { 0 }\n",
         ),
         concat!(
-            "distinct UserId = U64\n",
+            "pub enum Status { Ready, Busy(I32) }\n",
+            "pub const STATUSES: (Status, Status) = (Status.Ready, .Busy(2))\n",
+            "pub const STATUS_ARRAY: Array<Status, 2> = [Status.Ready, .Busy(3)]\n",
+        ),
+        concat!(
+            "pub distinct UserId = U64\n",
             "pub const ROOT: UserId = UserId(1)\n",
             "pub fn zero() -> I32 { 0 }\n",
         ),
@@ -13369,8 +13373,8 @@ fn cross_file_nominal_const_constructors_check() {
         &[(
             "src/types.sai",
             concat!(
-                "type Point { x: I32, y: I32 }\n",
-                "enum Status { Ready, Busy(I32) }\n",
+                "pub type Point { x: I32, y: I32 }\n",
+                "pub enum Status { Ready, Busy(I32) }\n",
             ),
         )],
         &[],
@@ -13383,7 +13387,7 @@ fn nominal_const_constructor_errors_are_checked() {
     for (source, code, message) in [
         (
             concat!(
-                "type Point { x: I32, y: I32 }\n",
+                "pub type Point { x: I32, y: I32 }\n",
                 "pub const ORIGIN: Point = Point(x: 0)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13392,7 +13396,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "type Point { x: I32, y: I32 }\n",
+                "pub type Point { x: I32, y: I32 }\n",
                 "pub const ORIGIN: Point = Point(x: 0, z: 1)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13401,7 +13405,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "type Point { x: I32, y: I32 }\n",
+                "pub type Point { x: I32, y: I32 }\n",
                 "pub const ORIGIN: Point = Point(x: 0, y: 1, x: 2)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13410,7 +13414,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "type Point { x: I32, y: I32 }\n",
+                "pub type Point { x: I32, y: I32 }\n",
                 "pub const ORIGIN: Point = Point(x: true, y: 1)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13419,7 +13423,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "type Point { x: I32 }\n",
+                "pub type Point { x: I32 }\n",
                 "pub const X: I32 = Point(x: 1)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13428,7 +13432,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "type Point { x: I32 }\n",
+                "pub type Point { x: I32 }\n",
                 "pub const X: (I32,) = (Point(x: 1),)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13437,7 +13441,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "type Point { x: I32, y: I32 }\n",
+                "pub type Point { x: I32, y: I32 }\n",
                 "pub const CTOR: Point = Point\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13446,7 +13450,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "type Point { x: I32, y: I32 }\n",
+                "pub type Point { x: I32, y: I32 }\n",
                 "pub const POINT: Point = Point(x: 0, ..POINT)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13455,7 +13459,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "enum Status { Ready, Busy(I32) }\n",
+                "pub enum Status { Ready, Busy(I32) }\n",
                 "pub const BUSY: Status = Status.Busy(true)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13464,7 +13468,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "enum Status { Ready, Busy(I32) }\n",
+                "pub enum Status { Ready, Busy(I32) }\n",
                 "pub const BUSY: Status = Status.Busy(1, 2)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13473,7 +13477,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "enum Status { Ready, Busy(I32) }\n",
+                "pub enum Status { Ready, Busy(I32) }\n",
                 "pub const READY: Status = Status.Ready()\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13482,7 +13486,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "enum Status { Ready, Busy(I32) }\n",
+                "pub enum Status { Ready, Busy(I32) }\n",
                 "pub const MISSING: Status = Status.Missing\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13491,7 +13495,31 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "enum Status { Ready, Busy(I32) }\n",
+                "pub enum Status { Ready, Busy(I32) }\n",
+                "pub const MISSING: Status = Status.Missing(1)\n",
+            ),
+            "UNKNOWN_VARIANT",
+            "unknown enum variant",
+        ),
+        (
+            concat!(
+                "pub enum Status { Ready, Busy(I32) }\n",
+                "pub const MISSING: Status = .Missing(1)\n",
+            ),
+            "UNKNOWN_VARIANT",
+            "unknown enum variant",
+        ),
+        (
+            concat!(
+                "type Point { x: I32 }\n",
+                "pub const ORIGIN: Point = Point(x: 1)\n",
+            ),
+            "PRIVATE_TYPE_IN_PUBLIC_API",
+            "public const `ORIGIN` uses private type `Point`",
+        ),
+        (
+            concat!(
+                "pub enum Status { Ready, Busy(I32) }\n",
                 "pub const CTOR: Status = Status.Busy\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13500,7 +13528,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "distinct UserId = U64\n",
+                "pub distinct UserId = U64\n",
                 "pub const ROOT: UserId = UserId(true)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13509,7 +13537,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "distinct UserId = U64\n",
+                "pub distinct UserId = U64\n",
                 "pub const ROOT: UserId = UserId(1, 2)\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13518,7 +13546,7 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
-                "distinct UserId = U64\n",
+                "pub distinct UserId = U64\n",
                 "pub const CTOR: UserId = UserId\n",
                 "pub fn zero() -> I32 { 0 }\n",
             ),
@@ -13544,24 +13572,32 @@ fn nominal_const_constructor_errors_are_checked() {
 fn nominal_const_constructor_forms_outside_the_slice_remain_gated() {
     for source in [
         concat!(
-            "type Boxed<T> { value: T }\n",
+            "pub type Boxed<T> { value: T }\n",
             "pub const BOXED: Boxed<I32> = Boxed(value: 1)\n",
             "pub fn zero() -> I32 { 0 }\n",
         ),
         concat!(
-            "enum Maybe<T> { Some(T) }\n",
+            "pub enum Maybe<T> { Some(T) }\n",
             "pub const VALUE: Maybe<I32> = Maybe.Some(1)\n",
             "pub fn zero() -> I32 { 0 }\n",
         ),
         concat!(
-            "enum Status { Ready = 1 }\n",
+            "pub enum Status { Ready = 1 }\n",
             "pub const READY: Status = Status.Ready\n",
             "pub fn zero() -> I32 { 0 }\n",
         ),
         concat!(
-            "distinct Age = U8\nwhere self <= 150\n",
+            "pub distinct Age = U8\nwhere self <= 150\n",
             "pub const AGE: Age = Age(1)\n",
             "pub fn zero() -> I32 { 0 }\n",
+        ),
+        concat!(
+            "pub enum Recursive { Leaf, Node((Recursive, I32)) }\n",
+            "pub const LEAF: Recursive = Recursive.Leaf\n",
+        ),
+        concat!(
+            "pub distinct UserId = Missing\n",
+            "pub const ROOT: UserId = UserId(1)\n",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);
