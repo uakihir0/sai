@@ -13519,6 +13519,14 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
+                "type Point { x: I32 }\n",
+                "pub const WRAPPED: (Point,) = (Point(x: 1),)\n",
+            ),
+            "PRIVATE_TYPE_IN_PUBLIC_API",
+            "public const `WRAPPED` uses private type `Point`",
+        ),
+        (
+            concat!(
                 "pub enum Status { Ready, Busy(I32) }\n",
                 "pub const CTOR: Status = Status.Busy\n",
                 "pub fn zero() -> I32 { 0 }\n",

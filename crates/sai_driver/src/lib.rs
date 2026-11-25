@@ -7556,6 +7556,32 @@ fn check_const_literal_owner(
     let Some(body) = owner.body else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
+    let mut public_api_diagnostic = None;
+    if matches!(item.vis, Visibility::Pub | Visibility::Export)
+        && let Some(surface_type) = resolve_const_constructor_type(
+            *ty,
+            type_paths,
+            symbols,
+            inputs,
+            target_cfg.pointer_width(),
+        )
+        && let Some(nominal) = const_references.as_ref().and_then(|context| {
+            const_constructor_private_nominal(&surface_type, context.constructors)
+        })
+    {
+        public_api_diagnostic = Some(const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            ty.span,
+            sai_diagnostics::Code::PrivateTypeInPublicApi,
+            format!(
+                "public const `{}` uses private type `{}` in its public interface",
+                name, nominal.name
+            ),
+            "private type in public API",
+        )?);
+    }
     if let Some(constructor_type @ ConstConstructorType::Nominal(_)) =
         resolve_const_constructor_type(*ty, type_paths, symbols, inputs, target_cfg.pointer_width())
     {
@@ -7573,28 +7599,8 @@ fn check_const_literal_owner(
         else {
             return Ok(ConstLiteralCheck::Unsupported);
         };
-        if matches!(item.vis, Visibility::Pub | Visibility::Export)
-            && let ConstConstructorType::Nominal(nominal) = &constructor_type
-            && let Some(type_visibility) = const_references
-                .as_ref()
-                .and_then(|context| context.constructors.type_visibilities.get(&nominal.def_id))
-            && matches!(type_visibility, Visibility::Private)
-        {
-            diagnostics.insert(
-                0,
-                const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    ty.span,
-                    sai_diagnostics::Code::PrivateTypeInPublicApi,
-                    format!(
-                        "public const `{}` uses private type `{}` in its public interface",
-                        name, nominal.name
-                    ),
-                    "private type in public API",
-                )?,
-            );
+        if let Some(diagnostic) = public_api_diagnostic.take() {
+            diagnostics.insert(0, diagnostic);
         }
         return Ok(ConstLiteralCheck::SupportedNominal { diagnostics });
     }
@@ -7602,7 +7608,7 @@ fn check_const_literal_owner(
     if let Some((element, length)) =
         resolve_const_array_type(*ty, type_paths, target_cfg.pointer_width())
     {
-        let Some(diagnostics) = check_const_array_literal(
+        let Some(mut diagnostics) = check_const_array_literal(
             owner,
             element,
             length,
@@ -7617,6 +7623,9 @@ fn check_const_literal_owner(
         else {
             return Ok(ConstLiteralCheck::Unsupported);
         };
+        if let Some(diagnostic) = public_api_diagnostic.take() {
+            diagnostics.insert(0, diagnostic);
+        }
         return Ok(ConstLiteralCheck::SupportedArray { diagnostics });
     }
 
@@ -7674,7 +7683,7 @@ fn check_const_literal_owner(
             return Ok(ConstLiteralCheck::SupportedUnit { diagnostics });
         }
 
-        let Some(diagnostics) = check_const_tuple_literal(
+        let Some(mut diagnostics) = check_const_tuple_literal(
             owner,
             elements,
             &body.value,
@@ -7688,6 +7697,9 @@ fn check_const_literal_owner(
         else {
             return Ok(ConstLiteralCheck::Unsupported);
         };
+        if let Some(diagnostic) = public_api_diagnostic.take() {
+            diagnostics.insert(0, diagnostic);
+        }
         return Ok(ConstLiteralCheck::SupportedTuple { diagnostics });
     }
 
@@ -16737,6 +16749,26 @@ enum ConstVariantConstructorShape {
 #[derive(Clone, Debug)]
 struct ConstDistinctConstructor {
     base: ConstConstructorType,
+}
+
+fn const_constructor_private_nominal<'a>(
+    ty: &'a ConstConstructorType,
+    constructors: &'a ConstTypeConstructorIndex,
+) -> Option<&'a ConstNominalType> {
+    match ty {
+        ConstConstructorType::Scalar(_) => None,
+        ConstConstructorType::Tuple(elements) => elements
+            .iter()
+            .find_map(|element| const_constructor_private_nominal(element, constructors)),
+        ConstConstructorType::Array(element, _) => {
+            const_constructor_private_nominal(element, constructors)
+        }
+        ConstConstructorType::Nominal(nominal) => constructors
+            .type_visibilities
+            .get(&nominal.def_id)
+            .is_some_and(|visibility| matches!(visibility, Visibility::Private))
+            .then_some(nominal),
+    }
 }
 
 fn resolve_const_constructor_type(
