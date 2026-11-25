@@ -23662,6 +23662,14 @@ pub const ALIAS: I8 = BASE
 pub const VALUE: I8 = ALIAS + 27
 ",
         "pub const BASE: I8 = 100
+pub const OFFSET: I8 = BASE + 1
+pub const VALUE: I8 = OFFSET + 26
+",
+        "pub const VALUE: I8 = OFFSET + 26
+pub const OFFSET: I8 = BASE + 1
+pub const BASE: I8 = 100
+",
+        "pub const BASE: I8 = 100
 pub const VALUE: Bool = BASE < 127
 ",
         "pub const BASE: I64 = 7
@@ -23719,6 +23727,14 @@ pub const VALUE: I8 = BASE + 28
             "pub const BASE: I8 = 100
 pub const ALIAS: I8 = BASE
 pub const VALUE: I8 = ALIAS + 28
+",
+            "CONST_EVAL_PANIC",
+            "integer overflow in addition",
+        ),
+        (
+            "pub const BASE: I8 = 100
+pub const OFFSET: I8 = BASE + 27
+pub const VALUE: I8 = OFFSET + 1
 ",
             "CONST_EVAL_PANIC",
             "integer overflow in addition",

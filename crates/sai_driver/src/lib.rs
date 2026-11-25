@@ -39128,7 +39128,7 @@ impl RootDatabase {
         let mut const_types = HashMap::new();
         let mut const_values = HashMap::new();
         let mut const_references = HashMap::<DefId, Vec<DefId>>::new();
-        let mut direct_const_references = HashMap::new();
+        let mut const_descriptors = HashMap::new();
         let mut ambiguous_definitions = HashSet::new();
         let mut owner_inputs_by_file = HashMap::<FileId, Option<CurrentOwnerInputs>>::new();
 
@@ -39142,6 +39142,7 @@ impl RootDatabase {
             {
                 continue;
             }
+            const_descriptors.insert(def_id, *descriptor);
             if !owner_inputs_by_file.contains_key(&descriptor.file) {
                 owner_inputs_by_file.insert(
                     descriptor.file,
@@ -39232,14 +39233,6 @@ impl RootDatabase {
                 if !targets.is_empty() {
                     const_references.entry(def_id).or_default().extend(targets);
                 }
-                if let Some(target) = const_initializer_reference_target(
-                    &body.value,
-                    module_scope,
-                    module_members,
-                    collection.module_tree.package,
-                ) {
-                    direct_const_references.insert(def_id, target);
-                }
             }
             let Some(const_type) =
                 (match resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs) {
@@ -39255,7 +39248,14 @@ impl RootDatabase {
             else {
                 continue;
             };
-            if let Some(body) = hir_owner.body
+            if ambiguous_definitions.contains(&def_id) {
+                continue;
+            }
+            if const_types.insert(def_id, const_type).is_some() {
+                const_types.remove(&def_id);
+                ambiguous_definitions.insert(def_id);
+            } else if !const_references.contains_key(&def_id)
+                && let Some(body) = hir_owner.body
                 && let Some(literal_type) =
                     resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs)
                 && let Ok(Some(evaluation)) = check_const_scalar_expression(
@@ -39273,57 +39273,153 @@ impl RootDatabase {
             {
                 const_values.insert(def_id, value);
             }
-            if ambiguous_definitions.contains(&def_id) {
+        }
+
+        let cyclic = const_reference_cycle_members(&const_references);
+        let nodes = const_types
+            .keys()
+            .copied()
+            .filter(|def_id| !cyclic.contains(def_id))
+            .collect::<HashSet<_>>();
+        let mut dependency_counts = HashMap::<DefId, usize>::new();
+        let mut dependents = HashMap::<DefId, Vec<DefId>>::new();
+        for node in nodes.iter().copied() {
+            let dependencies = const_references
+                .get(&node)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .copied()
+                .filter(|target| nodes.contains(target))
+                .collect::<HashSet<_>>();
+            dependency_counts.insert(node, dependencies.len());
+            for dependency in dependencies {
+                dependents.entry(dependency).or_default().push(node);
+            }
+        }
+        let mut ready = nodes
+            .iter()
+            .copied()
+            .filter(|node| dependency_counts.get(node).is_some_and(|count| *count == 0))
+            .collect::<Vec<_>>();
+        let mut emitted = HashSet::new();
+        let mut evaluation_order = Vec::new();
+        while let Some(node) = ready.pop() {
+            if !emitted.insert(node) {
                 continue;
             }
-            if const_types.insert(def_id, const_type).is_some() {
-                const_types.remove(&def_id);
-                ambiguous_definitions.insert(def_id);
+            evaluation_order.push(node);
+            for dependent in dependents.get(&node).map_or(&[][..], Vec::as_slice) {
+                let Some(count) = dependency_counts.get_mut(dependent) else {
+                    continue;
+                };
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    ready.push(*dependent);
+                }
             }
         }
 
-        let mut direct_values = const_values
-            .iter()
-            .map(|(def_id, value)| (*def_id, Some(*value)))
-            .collect::<HashMap<_, _>>();
-        for start in direct_const_references.keys().copied() {
-            if direct_values.contains_key(&start) {
+        for def_id in evaluation_order {
+            if const_values.contains_key(&def_id) {
                 continue;
             }
-            let mut path = Vec::new();
-            let mut path_members = HashSet::new();
-            let mut current = start;
-            let terminal = loop {
-                if let Some(value) = direct_values.get(&current).copied() {
-                    break value;
-                }
-                if !path_members.insert(current) {
-                    break None;
-                }
-                path.push(current);
-                let Some(next) = direct_const_references.get(&current).copied() else {
-                    break None;
-                };
-                let types_match = match (const_types.get(&current), const_types.get(&next)) {
-                    (Some(current_type), Some(next_type)) => current_type == next_type,
-                    _ => false,
-                };
-                if !types_match {
-                    break None;
-                }
-                current = next;
+            let Some(descriptor) = const_descriptors.get(&def_id) else {
+                continue;
             };
-            for def_id in path {
-                direct_values.insert(def_id, terminal);
+            let Some(Some(inputs)) = owner_inputs_by_file.get(&descriptor.file) else {
+                continue;
+            };
+            let Ok(module_scope) =
+                module_scope_for_file(collection, &collection.module_tree, descriptor.file)
+            else {
+                continue;
+            };
+            let Ok(owner_descriptor) = find_top_level_owner_descriptor(
+                top_level_owner_index,
+                descriptor.owner,
+                descriptor.file,
+                descriptor.item_id,
+                TopLevelOwnerKind::Const,
+            ) else {
+                continue;
+            };
+            let Some(def_paths) = self.def_paths.get(&descriptor.owner.def_id.package()) else {
+                continue;
+            };
+            let Ok(Some(expected_path)) = def_paths.resolve_def_id(def_id) else {
+                continue;
+            };
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &inputs.ast_ids,
+                snapshot,
+                &inputs.root,
+                &arena,
+                &self.symbols,
+                def_paths,
+            );
+            let Ok((hir_owner, _source_map)) = lower_top_level_owner(
+                owner_descriptor,
+                &expected_path,
+                &inputs.filtered_item_tree,
+                &inputs.retained_item_kinds,
+                &context,
+            ) else {
+                continue;
+            };
+            if hir_owner.id != descriptor.owner {
+                continue;
             }
-        }
-        for (def_id, value) in direct_values {
-            if let Some(value) = value {
+            let OwnerNode::Item(item) = hir_owner.node else {
+                continue;
+            };
+            let ItemKind::Const { ty } = item.kind else {
+                continue;
+            };
+            let type_path_candidates = owner_test_only_path_candidates(&hir_owner);
+            let type_paths = resolve_type_owner_module_paths(
+                descriptor.owner,
+                &type_path_candidates,
+                &HashMap::new(),
+                &primitive_prelude,
+                &HashSet::new(),
+                module_scope,
+                Some(module_members),
+                descriptor.owner.def_id.package(),
+                Some(source_graph_packages),
+            );
+            let Some(body) = hir_owner.body else {
+                continue;
+            };
+            let Some(literal_type) =
+                resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs)
+            else {
+                continue;
+            };
+            let reference_context = ConstReferenceContext {
+                module_scope,
+                module_members,
+                types: &const_types,
+                values: &const_values,
+                cyclic: &cyclic,
+                requesting_package: collection.module_tree.package,
+            };
+            if let Ok(Some(evaluation)) = check_const_scalar_expression(
+                descriptor.owner,
+                literal_type,
+                &body.value,
+                &self.symbols,
+                inputs,
+                snapshot,
+                &collection.target_cfg,
+                Some(&reference_context),
+            ) && evaluation.diagnostics.is_empty()
+                && let Some(value) = evaluation.value
+            {
                 const_values.insert(def_id, value);
             }
         }
 
-        let cyclic = const_reference_cycle_members(&const_references);
         (const_types, const_values, cyclic)
     }
 
