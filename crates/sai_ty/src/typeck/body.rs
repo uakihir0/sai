@@ -6619,12 +6619,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         expression: HirId,
     ) -> Result<LocalType, ()> {
         let source_type = self.check_local_path(operand)?;
-        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
-        if self
-            .deferred_bitnot_result_bindings
-            .contains(&source_binding)
-        {
-            return Err(());
+        if self.const_path_local_type(operand).is_none() {
+            let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+            if self
+                .deferred_bitnot_result_bindings
+                .contains(&source_binding)
+            {
+                return Err(());
+            }
         }
         if let LocalType::LiteralVariable(id) = source_type {
             let is_eligible_literal_source = self.is_eligible_unannotated_literal_path(operand);
@@ -6690,9 +6692,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         expression: HirId,
     ) -> Result<LocalType, ()> {
         let source_type = self.check_local_path(operand)?;
-        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
-        if self.deferred_neg_result_bindings.contains(&source_binding) {
-            return Err(());
+        if self.const_path_local_type(operand).is_none() {
+            let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+            if self.deferred_neg_result_bindings.contains(&source_binding) {
+                return Err(());
+            }
         }
         if let LocalType::LiteralVariable(id) = source_type {
             let is_eligible_literal_source = self.is_eligible_unannotated_literal_path(operand);
@@ -6767,9 +6771,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Ok((LocalType::Concrete(operand_type), false));
         }
         let source_type = self.check_local_path(operand)?;
-        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
-        if self.deferred_neg_result_bindings.contains(&source_binding) {
-            return Err(());
+        if self.const_path_local_type(operand).is_none() {
+            let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+            if self.deferred_neg_result_bindings.contains(&source_binding) {
+                return Err(());
+            }
         }
         if let LocalType::LiteralVariable(id) = source_type {
             let eligible_literal_path = self.is_eligible_unannotated_literal_path(operand);
@@ -6837,12 +6843,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Ok((LocalType::Concrete(operand_type), false));
         }
         let source_type = self.check_local_path(operand)?;
-        let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
-        if self
-            .deferred_bitnot_result_bindings
-            .contains(&source_binding)
-        {
-            return Err(());
+        if self.const_path_local_type(operand).is_none() {
+            let source_binding = self.plain_local_path_binding(operand).ok_or(())?;
+            if self
+                .deferred_bitnot_result_bindings
+                .contains(&source_binding)
+            {
+                return Err(());
+            }
         }
         if let LocalType::LiteralVariable(id) = source_type {
             let eligible_literal_path = self.is_eligible_unannotated_literal_path(operand);
