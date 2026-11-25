@@ -7392,14 +7392,6 @@ fn const_literal_type_display(literal_type: ConstLiteralType) -> &'static str {
     }
 }
 
-fn function_direct_type_display(direct_type: FunctionDirectType) -> &'static str {
-    match direct_type {
-        FunctionDirectType::Primitive(primitive) => const_primitive_name(primitive),
-        FunctionDirectType::Str => "Str",
-        FunctionDirectType::Unit => "()",
-    }
-}
-
 fn const_reference_literal_type(direct_type: FunctionDirectType) -> Option<ConstLiteralType> {
     match direct_type {
         FunctionDirectType::Primitive(primitive) => Some(ConstLiteralType::Primitive(primitive)),
@@ -7518,7 +7510,7 @@ fn check_const_literal_owner(
                     format!(
                         "expected `{}`, found `{}`",
                         const_literal_type_display(literal_type),
-                        function_direct_type_display(referenced_type)
+                        function_direct_type_name(referenced_type)
                     ),
                     "type mismatch",
                 )?]);
