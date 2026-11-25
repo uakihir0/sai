@@ -199,6 +199,9 @@ pub enum PrimitiveBodyErrorKind {
     ConstPatternType {
         found: ScalarType,
     },
+    RangePatternType {
+        found: PrimTy,
+    },
     /// `expected <type>, found <type>` where either side may be `Str` —
     /// `Str` is not a `PrimTy`, so `TypeMismatch` cannot name it.
     ScalarTypeMismatch {
@@ -6007,8 +6010,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                 }
             }
-            // `l1..=l2` bounds must both be literals — open ranges and
-            // non-literal bounds stay gated. Diagnosing at the arm
+            // Range bounds must both be literals or scalar const paths —
+            // open bounds stay gated. Diagnosing at the arm
             // pattern's node keeps the taint walk keyed on
             // `arm.pat.hir_id` correct.
             PatKind::Range {
@@ -6016,11 +6019,35 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 end,
                 inclusive,
             } => {
+                if !(crate::typeck::literal::is_integer_primitive(scrutinee_type)
+                    || matches!(scrutinee_type, PrimTy::Char | PrimTy::Byte))
+                {
+                    self.errors.push(PrimitiveBodyError {
+                        node: arm.pat.hir_id,
+                        kind: PrimitiveBodyErrorKind::RangePatternType {
+                            found: scrutinee_type,
+                        },
+                    });
+                    return Ok(());
+                }
                 for bound in [start, end] {
-                    let Some(PatRangeEnd::Lit(literal)) = bound else {
-                        return Err(());
-                    };
-                    self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?;
+                    match bound {
+                        Some(PatRangeEnd::Lit(literal)) => {
+                            self.check_match_literal_pattern(
+                                literal,
+                                arm.pat.hir_id,
+                                scrutinee_type,
+                            )?;
+                        }
+                        Some(PatRangeEnd::Path(path)) => {
+                            self.check_match_const_pattern(
+                                path.hir_id,
+                                arm.pat.hir_id,
+                                scrutinee_type,
+                            )?;
+                        }
+                        None => return Err(()),
+                    }
                 }
                 // §6.21.3: `a ≤ b` for `..=`, `a < b` for `..` — an empty
                 // range is `EMPTY_RANGE_PATTERN`.

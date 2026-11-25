@@ -14500,6 +14500,21 @@ fn primitive_const_pattern_shape_is_supported(
         .is_some_and(|sites| sites.contains_key(&hir_id))
 }
 
+fn primitive_const_range_end_shape_is_supported(
+    bound: &Option<sai_hir::patterns::PatRangeEnd<'_>>,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    match bound {
+        Some(sai_hir::patterns::PatRangeEnd::Lit(_)) => true,
+        Some(sai_hir::patterns::PatRangeEnd::Path(path)) => inputs
+            .const_path_sites
+            .borrow()
+            .as_ref()
+            .is_some_and(|sites| sites.contains_key(&path.hir_id)),
+        None => false,
+    }
+}
+
 /// `match` tails: a preceding-binding path scrutinee, literal / wildcard /
 /// plain-binding patterns, a required catch-all arm, no guards, and no arms
 /// after the catch-all — the bounded exhaustiveness rule the checker mirrors.
@@ -14592,7 +14607,7 @@ fn primitive_match_tail_shape_is_supported(
             PatKind::Range { start, end, .. } => {
                 if ![start, end]
                     .iter()
-                    .all(|bound| matches!(bound, Some(sai_hir::patterns::PatRangeEnd::Lit(_))))
+                    .all(|bound| primitive_const_range_end_shape_is_supported(bound, inputs))
                 {
                     return false;
                 }
@@ -15041,7 +15056,7 @@ fn primitive_match_stmt_shape_is_supported(
                 PatKind::Range { start, end, .. } => {
                     if ![start, end]
                         .iter()
-                        .all(|bound| matches!(bound, Some(sai_hir::patterns::PatRangeEnd::Lit(_))))
+                        .all(|bound| primitive_const_range_end_shape_is_supported(bound, inputs))
                     {
                         return false;
                     }
@@ -15690,6 +15705,18 @@ fn primitive_body_errors_to_diagnostics(
                     scalar_name(found)
                 ),
                 "invalid const pattern type",
+            )?,
+            PrimitiveBodyErrorKind::RangePatternType { found } => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "range pattern scrutinee must be an integer, Char or Byte, found `{}`",
+                    const_primitive_name(found)
+                ),
+                "type mismatch",
             )?,
             PrimitiveBodyErrorKind::ScalarTypeMismatch { expected, found } => {
                 const_literal_diagnostic(
@@ -16524,6 +16551,21 @@ fn record_const_pattern_sites(
             members,
             sites,
         ),
+        PatKind::Range { start, end, .. } => {
+            for bound in [start, end] {
+                if let Some(sai_hir::patterns::PatRangeEnd::Path(path)) = bound
+                    && let Some(const_type) = const_pattern_path_type(
+                        path,
+                        module_scope,
+                        const_types,
+                        requesting_package,
+                        members,
+                    )
+                {
+                    sites.insert(path.hir_id, const_type);
+                }
+            }
+        }
         PatKind::Tuple(patterns) | PatKind::Or(patterns) => {
             for pattern in patterns {
                 record_const_pattern_sites(
