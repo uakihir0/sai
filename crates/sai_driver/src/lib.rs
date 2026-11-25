@@ -7518,7 +7518,7 @@ fn check_const_literal_owner(
     let diagnostics = if let Some(diagnostics) = reference_diagnostics {
         diagnostics
     } else {
-        let Some(diagnostics) = check_const_literal_leaf(
+        let diagnostics = match check_const_literal_leaf(
             owner,
             *ty,
             &body.value,
@@ -7527,9 +7527,23 @@ fn check_const_literal_owner(
             inputs,
             snapshot,
             target_cfg,
-        )?
-        else {
-            return Ok(ConstLiteralCheck::Unsupported);
+        )? {
+            Some(diagnostics) => diagnostics,
+            None => {
+                let Some(diagnostics) = check_const_operator_expression_against_type(
+                    owner.id,
+                    literal_type,
+                    &body.value,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(ConstLiteralCheck::Unsupported);
+                };
+                diagnostics
+            }
         };
         diagnostics
     };
@@ -29310,17 +29324,6 @@ fn check_const_literal_against_type(
     let literal = match value.kind {
         ExprKind::Lit(literal) => Some(literal),
         ExprKind::Tuple(elements) if elements.is_empty() => None,
-        ExprKind::Unary(..) | ExprKind::Binary(..) => {
-            return check_const_operator_expression_against_type(
-                owner,
-                literal_type,
-                value,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
-            );
-        }
         _ => return Ok(None),
     };
 

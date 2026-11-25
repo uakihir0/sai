@@ -23379,6 +23379,28 @@ fn const_range_endpoints_in_primitive_match_check() {
 }
 
 #[test]
+fn runtime_enum_constructor_arithmetic_is_not_const_evaluated() {
+    let source = concat!(
+        "enum Payload { Pair(U8, Bool) }
+",
+        "pub fn make() -> Payload {
+",
+        "    Payload.Pair(255 + 1, true)
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_check_stays_gated(&output, "runtime enum constructor arithmetic");
+    assert!(
+        !stdout.contains("\"code\":\"CONST_EVAL_PANIC\""),
+        "runtime arithmetic must not be evaluated as a const initializer:
+{stdout}"
+    );
+}
+
+#[test]
 fn primitive_const_arithmetic_and_logical_expressions_check() {
     for source in [
         "pub const VALUE: I32 = 1 + 2 * 3
