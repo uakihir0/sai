@@ -17431,6 +17431,10 @@ struct StrLiteralSeed {
     // (assignment right sides) — each checks against the resolved
     // primitive like the checker's recorded literal constraints.
     sites: std::rc::Rc<std::cell::RefCell<Vec<(Lit<'static>, sai_hir::Span)>>>,
+    // Const-pattern types joined into the variable after the seed —
+    // like literal sites, each checks once the variable resolves to a
+    // concrete primitive.
+    const_sites: std::rc::Rc<std::cell::RefCell<Vec<(FunctionDirectType, sai_hir::Span)>>>,
     // The origin literal of every variable merged into this group —
     // each checks once when the group resolves.
     // `checked` marks a member literal the join's own fold already
@@ -17448,6 +17452,7 @@ fn str_seed_new(literal: Lit<'static>, origin: sai_hir::Span) -> StrLiteralSeed 
         origin,
         resolved: std::rc::Rc::new(std::cell::Cell::new(None)),
         sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        const_sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         members: std::rc::Rc::new(std::cell::RefCell::new(vec![(literal, origin, false)])),
         merged_into: std::rc::Rc::new(std::cell::RefCell::new(None)),
     }
@@ -17539,6 +17544,10 @@ fn str_seed_merge(place: &StrLiteralSeed, rhs: &StrLiteralSeed) {
     {
         let mut sites = rhs_root.sites.borrow_mut();
         place_root.sites.borrow_mut().append(&mut sites);
+    }
+    {
+        let mut const_sites = rhs_root.const_sites.borrow_mut();
+        place_root.const_sites.borrow_mut().append(&mut const_sites);
     }
     *rhs_root.merged_into.borrow_mut() = Some(place_root);
 }
@@ -17910,6 +17919,28 @@ fn str_seed_resolve(
     let Some(primitive) = str_family_prim(resolved) else {
         return Ok(());
     };
+    for (const_type, span) in root.const_sites.borrow().iter().copied() {
+        let found_name = match const_type {
+            FunctionDirectType::Primitive(found) => const_primitive_name(found),
+            FunctionDirectType::Str => "Str",
+            FunctionDirectType::Unit => continue,
+        };
+        let matches_type = matches!(
+            const_type,
+            FunctionDirectType::Primitive(found) if found == primitive
+        );
+        if !matches_type {
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected {resolved}, found `{found_name}`"),
+                "type mismatch",
+            )?);
+        }
+    }
     for (literal, span) in root
         .members
         .borrow()
@@ -19166,17 +19197,24 @@ fn str_match_arm_pattern(
                 // primitive at pin/default time instead of the
                 // provisional family now (`let n = 5; if let 300 = n {};
                 // let u: U8 = n` reports `300` out of range for `U8`).
-                if let Some(root) = scrutinee_seed
+                if let Some(seed) = scrutinee_seed
                     && let Some(literal) = str_static_literal(literal)
                     && matches!(literal, Lit::Int { .. } | Lit::Float { .. })
-                    && str_seed_resolved(&root).is_none()
-                    && str_seed_same_kind(literal, root.literal)
                 {
-                    let mut sites = root.sites.borrow_mut();
-                    if !sites.iter().any(|(l, s)| *l == literal && *s == pat.span) {
-                        sites.push((literal, pat.span));
+                    // Guards in earlier arms may merge the scrutinee's
+                    // literal-variable group. Re-follow the merge link
+                    // for every pattern so deferred sites land on the
+                    // group that later resolution actually checks.
+                    let root = str_seed_root(seed);
+                    if str_seed_resolved(&root).is_none()
+                        && str_seed_same_kind(literal, root.literal)
+                    {
+                        let mut sites = root.sites.borrow_mut();
+                        if !sites.iter().any(|(l, s)| *l == literal && *s == pat.span) {
+                            sites.push((literal, pat.span));
+                        }
+                        return Ok(Some(()));
                     }
-                    return Ok(Some(()));
                 }
                 match sai_ty::typeck::literal::check_primitive_literal(
                     primitive,
@@ -19243,8 +19281,89 @@ fn str_match_arm_pattern(
             },
         }
     };
+    let check_const_pattern = |hir_id: HirId,
+                               span: sai_hir::Span,
+                               diagnostics: &mut Vec<Diagnostic>|
+     -> Result<Option<()>, OwnerControlFlowResolutionError> {
+        let const_type = inputs
+            .const_path_sites
+            .borrow()
+            .as_ref()
+            .and_then(|sites| sites.get(&hir_id).copied());
+        let Some(const_type) = const_type else {
+            return Ok(None);
+        };
+        let found_name = match const_type {
+            FunctionDirectType::Primitive(primitive) => const_primitive_name(primitive),
+            FunctionDirectType::Str => "Str",
+            FunctionDirectType::Unit => return Ok(None),
+        };
+        if matches!(
+            const_type,
+            FunctionDirectType::Primitive(
+                sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64
+            )
+        ) {
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::ConstPatternType,
+                format!(
+                    "const pattern type `{found_name}` is not an integer, Bool, Char, Byte or Str"
+                ),
+                "invalid const pattern type",
+            )?);
+            return Ok(Some(()));
+        }
+        if let Some(seed) = scrutinee_seed {
+            // Like literal sites, const-pattern checks must follow a
+            // merge triggered by an earlier arm's guard before choosing
+            // the group that receives this deferred constraint.
+            let root = str_seed_root(seed);
+            if str_seed_resolved(&root).is_none() {
+                let mut sites = root.const_sites.borrow_mut();
+                if !sites
+                    .iter()
+                    .any(|(ty, site_span)| *ty == const_type && *site_span == span)
+                {
+                    sites.push((const_type, span));
+                }
+                return Ok(Some(()));
+            }
+        }
+        let mismatch = match (scrutinee_prim, const_type) {
+            (Some(expected), FunctionDirectType::Primitive(found)) => expected != found,
+            (Some(_), FunctionDirectType::Str) => true,
+            (None, FunctionDirectType::Str) => false,
+            (None, FunctionDirectType::Primitive(_)) => true,
+            (_, FunctionDirectType::Unit) => return Ok(None),
+        };
+        if mismatch {
+            let expected_name = scrutinee_prim.map(const_primitive_name).unwrap_or("Str");
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `{expected_name}`, found `{found_name}`"),
+                "type mismatch",
+            )?);
+        }
+        Ok(Some(()))
+    };
     match pat.kind {
         PatKind::Lit(literal) => match check_pattern_literal(literal, diagnostics)? {
+            Some(()) => Ok(Some(None)),
+            None => Ok(None),
+        },
+        PatKind::Ctor {
+            args: None,
+            has_rest: false,
+            ..
+        } => match check_const_pattern(pat.hir_id, pat.span, diagnostics)? {
             Some(()) => Ok(Some(None)),
             None => Ok(None),
         },
@@ -19253,11 +19372,24 @@ fn str_match_arm_pattern(
                 return Ok(None);
             }
             for alternative in alternatives {
-                let PatKind::Lit(literal) = alternative.kind else {
-                    return Ok(None);
-                };
-                if check_pattern_literal(literal, diagnostics)?.is_none() {
-                    return Ok(None);
+                match alternative.kind {
+                    PatKind::Lit(literal) => {
+                        if check_pattern_literal(literal, diagnostics)?.is_none() {
+                            return Ok(None);
+                        }
+                    }
+                    PatKind::Ctor {
+                        args: None,
+                        has_rest: false,
+                        ..
+                    } => {
+                        if check_const_pattern(alternative.hir_id, alternative.span, diagnostics)?
+                            .is_none()
+                        {
+                            return Ok(None);
+                        }
+                    }
+                    _ => return Ok(None),
                 }
             }
             Ok(Some(None))
@@ -19270,12 +19402,40 @@ fn str_match_arm_pattern(
             end,
             inclusive,
         } if scrutinee_prim.is_some() => {
+            let primitive = scrutinee_prim.expect("range guard keeps a primitive scrutinee");
+            if !(sai_ty::typeck::literal::is_integer_primitive(primitive)
+                || matches!(
+                    primitive,
+                    sai_resolve::prelude::PrimTy::Char | sai_resolve::prelude::PrimTy::Byte
+                ))
+            {
+                diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    pat.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "range pattern scrutinee must be an integer, Char or Byte, found `{}`",
+                        const_primitive_name(primitive)
+                    ),
+                    "type mismatch",
+                )?);
+                return Ok(Some(None));
+            }
             for bound in [start, end] {
-                let Some(PatRangeEnd::Lit(literal)) = bound else {
-                    return Ok(None);
-                };
-                if check_pattern_literal(literal, diagnostics)?.is_none() {
-                    return Ok(None);
+                match bound {
+                    Some(PatRangeEnd::Lit(literal)) => {
+                        if check_pattern_literal(literal, diagnostics)?.is_none() {
+                            return Ok(None);
+                        }
+                    }
+                    Some(PatRangeEnd::Path(path)) => {
+                        if check_const_pattern(path.hir_id, pat.span, diagnostics)?.is_none() {
+                            return Ok(None);
+                        }
+                    }
+                    None => return Ok(None),
                 }
             }
             if sai_ty::typeck::body::literal_range_is_empty(&start, &end, inclusive) == Some(true) {
@@ -23682,6 +23842,9 @@ fn str_shadow_str_bindings(str_bindings: &StrLocalBindings) -> StrLocalBindings 
                             sites: std::rc::Rc::new(std::cell::RefCell::new(
                                 root.sites.borrow().clone(),
                             )),
+                            const_sites: std::rc::Rc::new(std::cell::RefCell::new(
+                                root.const_sites.borrow().clone(),
+                            )),
                             members: std::rc::Rc::new(std::cell::RefCell::new(
                                 root.members.borrow().clone(),
                             )),
@@ -24186,8 +24349,20 @@ fn str_pure_match_family(
                     }
                 }
             };
+            let admit_const = |hir_id: HirId| -> bool {
+                inputs
+                    .const_path_sites
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|sites| sites.contains_key(&hir_id))
+            };
             match arm.pat.kind {
                 PatKind::Lit(literal) if admit_literal(literal) => {}
+                PatKind::Ctor {
+                    args: None,
+                    has_rest: false,
+                    ..
+                } if admit_const(arm.pat.hir_id) => {}
                 PatKind::Or(alternatives) => {
                     if alternatives.is_empty() {
                         return None;
@@ -24195,6 +24370,11 @@ fn str_pure_match_family(
                     for alternative in alternatives {
                         match alternative.kind {
                             PatKind::Lit(literal) if admit_literal(literal) => {}
+                            PatKind::Ctor {
+                                args: None,
+                                has_rest: false,
+                                ..
+                            } if admit_const(alternative.hir_id) => {}
                             _ => return None,
                         }
                     }
@@ -24203,6 +24383,7 @@ fn str_pure_match_family(
                     for bound in [start, end] {
                         match bound {
                             Some(PatRangeEnd::Lit(literal)) if admit_literal(literal) => {}
+                            Some(PatRangeEnd::Path(path)) if admit_const(path.hir_id) => {}
                             _ => return None,
                         }
                     }

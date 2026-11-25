@@ -10691,3 +10691,10 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** probes and CLI fixtures cover same-file plus imported endpoints in tail and statement matches and `TYPE_MISMATCH` for a `Str` endpoint under an `I32` scrutinee. Driver 795 / CLI 471.
 - **Remaining scope:** literal-value-aware const-pattern semantics, open range endpoints, `Str` scrutinee const/range patterns, `Str`-typed const arithmetic/format joins, imported `type` names in signatures, and `for` loops (deferred — iterator calls outside the walk).
 
+### IR-1151 (2026-11-25): const patterns in `-> Str` match walks
+- **Decision:** the parallel `Str`-family match walk admits the same scalar const-pattern shapes as the primitive kernel: standalone const patterns, const alternatives in or-patterns, and const endpoints in closed scalar ranges. Const type mismatches are diagnosed (`TYPE_MISMATCH`), float const patterns report `CONST_PATTERN_TYPE`, and the `Str` walk now also rejects range patterns whose scalar scrutinee is not an integer, `Char` or `Byte`.
+- **Reason:** `match s { TEXT => .., _ => .. }` and scalar `match n { CAP | 2 => .., _ => .. }` inside `-> Str` bodies still gated even though the const type table and `Str` literal-match machinery already existed.
+- **Failure boundary:** const values remain opaque to exhaustiveness/reachability and cross-endpoint range emptiness; structured patterns, open ranges, unsupported/non-scalar/non-public consts, and format-string interpolation joins stay gated.
+- **Verification:** probes and CLI fixtures cover `Str` scrutinees, primitive scrutinees in `-> Str`, or-pattern alternatives, and `TYPE_MISMATCH` for an `I32` const under a `Str` scrutinee. Driver 795 / CLI 474.
+- **Remaining scope:** literal-value-aware const-pattern semantics, open range endpoints, `Str`-typed const arithmetic/format joins, imported `type` names in signatures, and `for` loops (deferred — iterator calls outside the walk).
+
