@@ -10029,12 +10029,18 @@ fn str_self_field_projected_family(
     if !matches!(expression.kind, ExprKind::Field { .. }) {
         return None;
     }
-    inputs
+    if let Some(family) = inputs
         .str_self_field_projections
         .borrow()
-        .as_ref()?
-        .get(&expression.hir_id)
-        .copied()
+        .as_ref()
+        .and_then(|projections| projections.get(&expression.hir_id).copied())
+    {
+        return Some(family);
+    }
+    // A member const read (`helper.LIMIT`) is a resolved const-path
+    // site and binds like a `let` of its declared type — the same
+    // fold the prim walk does via `merged_str_fields`.
+    str_const_entry(expression.hir_id, inputs).map(|entry| entry.family)
 }
 
 fn name_node_id_for_span(root: &SyntaxNode, span: sai_hir::Span) -> Option<String> {

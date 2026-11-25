@@ -22570,6 +22570,37 @@ fn const_reference_in_str_body_checks() {
 }
 
 #[test]
+fn member_const_reference_in_str_body_checks() {
+    // `mod.CONST` member reads admit in `-> Str` tails, lets, and
+    // builtin `Str` receivers (IR-1145).
+    let root_source = concat!(
+        "use acme:empty/values\n",
+        "\n",
+        "pub const LOCAL: I32 = 0\n",
+        "pub fn name() -> Str {\n",
+        "    values.TEXT\n",
+        "}\n",
+        "pub fn name2(s: Str) -> Str {\n",
+        "    let t = values.TEXT\n",
+        "    t\n",
+        "}\n",
+        "pub fn count() -> USize {\n",
+        "    values.TEXT.len()\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/values.sai",
+            "pub const TEXT: Str = \"x\"\npub const LIMIT: I32 = 5\n",
+        )],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
 fn const_reference_in_str_body_mismatch_reports() {
     // A primitive const under a `-> Str` return type reports
     // TYPE_MISMATCH like a scalar local.
