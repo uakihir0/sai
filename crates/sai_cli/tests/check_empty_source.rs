@@ -13511,6 +13511,15 @@ fn nominal_const_constructor_errors_are_checked() {
         ),
         (
             concat!(
+                "pub enum Status { Ready }\n",
+                "pub enum Other { OtherReady }\n",
+                "pub const MISSING: Other = Status.Missing(1)\n",
+            ),
+            "UNKNOWN_VARIANT",
+            "unknown enum variant",
+        ),
+        (
+            concat!(
                 "type Point { x: I32 }\n",
                 "pub const ORIGIN: Point = Point(x: 1)\n",
             ),
@@ -13606,6 +13615,18 @@ fn nominal_const_constructor_forms_outside_the_slice_remain_gated() {
         concat!(
             "pub distinct UserId = Missing\n",
             "pub const ROOT: UserId = UserId(1)\n",
+        ),
+        concat!(
+            "pub enum Duplicated { Ready, Ready }\n",
+            "pub const ONE: I32 = 1\n",
+        ),
+        concat!(
+            "pub distinct NegativeArray = Array<I32, -1>\n",
+            "pub const ONE: I32 = 1\n",
+        ),
+        concat!(
+            "pub enum Status { Ready }\n",
+            "pub const VALUE: Status = Status.make(1)\n",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);

@@ -2343,6 +2343,70 @@ fn type_uses_known_names(
     })
 }
 
+fn const_arg_is_supported_array_length(argument: &sai_syntax::ast::ConstArg) -> bool {
+    let Some(value) = argument.value_token() else {
+        return false;
+    };
+    if value.kind() != sai_syntax::SyntaxKind::INT {
+        return false;
+    }
+    let digits = value.text().replace('_', "");
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    if argument.minus_token().is_some() && !digits.bytes().all(|byte| byte == b'0') {
+        return false;
+    }
+    digits.parse::<u128>().is_ok()
+}
+
+fn type_has_supported_const_constructor_shape(ty: &sai_syntax::ast::Type) -> bool {
+    match ty {
+        sai_syntax::ast::Type::PathType(path) => path.segments().all(|segment| {
+            let Some(arguments) = segment.generic_args() else {
+                return true;
+            };
+            let is_array = segment.name().is_some_and(|name| {
+                use sai_syntax::ast::AstNode as _;
+
+                name.syntax()
+                    .children_with_tokens()
+                    .filter_map(|element| match element {
+                        sai_syntax::SyntaxElement::Token(token)
+                            if matches!(
+                                token.kind(),
+                                sai_syntax::SyntaxKind::UIDENT | sai_syntax::SyntaxKind::LIDENT
+                            ) =>
+                        {
+                            Some(normalize_type_name(token.text()))
+                        }
+                        _ => None,
+                    })
+                    .next()
+                    .is_some_and(|name| name == "Array")
+            });
+            if !is_array || arguments.assoc_type_bindings().next().is_some() {
+                return false;
+            }
+            let type_args = arguments.type_args().collect::<Vec<_>>();
+            let const_args = arguments.const_args().collect::<Vec<_>>();
+            type_args.len() == 1
+                && const_args.len() == 1
+                && type_args[0]
+                    .ty()
+                    .is_some_and(|ty| type_has_supported_const_constructor_shape(&ty))
+                && const_arg_is_supported_array_length(&const_args[0])
+        }),
+        sai_syntax::ast::Type::TupleType(tuple) => tuple
+            .elements()
+            .all(|element| type_has_supported_const_constructor_shape(&element)),
+        sai_syntax::ast::Type::ParenType(paren) => paren
+            .ty()
+            .is_some_and(|ty| type_has_supported_const_constructor_shape(&ty)),
+        _ => false,
+    }
+}
+
 fn type_uses_imported_name(ty: &sai_syntax::ast::Type, imported_names: &HashSet<String>) -> bool {
     type_identifier_names(ty).into_iter().any(|name| {
         imported_names
@@ -2722,19 +2786,30 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
                         })
                 });
                 let variants_are_supported = enumeration.variants().is_some_and(|variants| {
+                    let mut variant_names = HashSet::new();
                     variants.variants().all(|variant| {
-                        variant.attrs().next().is_none()
+                        let Some(variant_name) = variant
+                            .name()
+                            .and_then(|name| name.token())
+                            .map(|token| normalize_type_name(token.text()))
+                        else {
+                            return false;
+                        };
+                        variant_names.insert(variant_name)
+                            && variant.attrs().next().is_none()
                             && variant.discriminant().is_none()
                             && variant.tuple_shape().is_none_or(|shape| {
-                                shape
-                                    .types()
-                                    .all(|ty| type_uses_known_names(&ty, &type_names, &bound_names))
+                                shape.types().all(|ty| {
+                                    type_uses_known_names(&ty, &type_names, &bound_names)
+                                        && type_has_supported_const_constructor_shape(&ty)
+                                })
                             })
                             && variant.record_shape().is_none_or(|shape| {
                                 shape.fields().all(|field| {
                                     field.attrs().next().is_none()
                                         && field.ty().is_some_and(|ty| {
                                             type_uses_known_names(&ty, &type_names, &bound_names)
+                                                && type_has_supported_const_constructor_shape(&ty)
                                         })
                                 })
                             })
@@ -2768,9 +2843,10 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
                         .descendants()
                         .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
                     || has_error
-                    || distinct
-                        .base_type()
-                        .is_none_or(|ty| !type_uses_known_names(&ty, &type_names, &bound_names))
+                    || distinct.base_type().is_none_or(|ty| {
+                        !type_uses_known_names(&ty, &type_names, &bound_names)
+                            || !type_has_supported_const_constructor_shape(&ty)
+                    })
                 {
                     return (false, false, false, false, false);
                 }
