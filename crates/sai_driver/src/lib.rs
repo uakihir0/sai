@@ -28659,6 +28659,7 @@ fn const_reference_cycle_members(references: &HashMap<DefId, Vec<DefId>>) -> Has
 #[derive(Clone, Copy, Debug)]
 enum ConstScalarValue {
     Bool(bool),
+    Byte(u8),
     SignedInt(i128),
     UnsignedInt(u128),
     Float32(f32),
@@ -28859,8 +28860,74 @@ fn check_const_scalar_expression(
             operand_evaluation.value = result;
             Ok(Some(operand_evaluation))
         }
+        ExprKind::Unary(UnOp::BitNot, operand)
+            if matches!(literal_type, ConstLiteralType::Primitive(_)) =>
+        {
+            let Some(mut operand_evaluation) = check_const_scalar_expression(
+                owner,
+                literal_type,
+                operand,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            let ConstLiteralType::Primitive(primitive) = literal_type else {
+                return Ok(None);
+            };
+            if !const_bitwise_type_supported(primitive) {
+                operand_evaluation
+                    .diagnostics
+                    .push(const_literal_diagnostic(
+                        owner,
+                        inputs,
+                        snapshot,
+                        value.span,
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        format!(
+                            "operator `~` has no `BitNot` implementation for `{}`",
+                            const_primitive_name(primitive)
+                        ),
+                        "operator not supported",
+                    )?);
+                operand_evaluation.value = None;
+                return Ok(Some(operand_evaluation));
+            }
+            let width = primitive_integer_width(primitive, target_cfg.pointer_width());
+            let result = if operand_evaluation.diagnostics.is_empty() {
+                match (operand_evaluation.value, width) {
+                    (Some(ConstScalarValue::SignedInt(number)), Some(width)) => Some(
+                        ConstScalarValue::SignedInt(const_bitnot_signed(number, width)),
+                    ),
+                    (Some(ConstScalarValue::UnsignedInt(number)), Some(width)) => Some(
+                        ConstScalarValue::UnsignedInt(const_bitnot_unsigned(number, width)),
+                    ),
+                    (Some(ConstScalarValue::Byte(number)), Some(_)) => {
+                        Some(ConstScalarValue::Byte(!number))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            operand_evaluation.value = result;
+            Ok(Some(operand_evaluation))
+        }
         ExprKind::Binary(
-            operator @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem),
+            operator @ (BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::WrapAdd
+            | BinOp::WrapSub
+            | BinOp::WrapMul
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor),
             left,
             right,
         ) if matches!(literal_type, ConstLiteralType::Primitive(_)) => {
@@ -28896,6 +28963,100 @@ fn check_const_scalar_expression(
                 .extend(right_evaluation.diagnostics);
             let supported = const_arithmetic_operator_supported(operator, primitive);
             if !supported {
+                let message =
+                    if matches!(operator, BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul) {
+                        format!(
+                            "operator `{}` is not defined for `{}`",
+                            const_binary_operator_text(operator),
+                            const_primitive_name(primitive)
+                        )
+                    } else {
+                        format!(
+                            "operator `{}` has no `{}` implementation for `{}`",
+                            const_binary_operator_text(operator),
+                            const_arithmetic_trait_name(operator),
+                            const_primitive_name(primitive)
+                        )
+                    };
+                left_evaluation.diagnostics.push(const_literal_diagnostic(
+                    owner,
+                    inputs,
+                    snapshot,
+                    value.span,
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    message,
+                    "operator not supported",
+                )?);
+                left_evaluation.value = None;
+                return Ok(Some(left_evaluation));
+            }
+            let result = if left_evaluation.diagnostics.is_empty() {
+                match (left_evaluation.value, right_evaluation.value) {
+                    (Some(left_value), Some(right_value)) => {
+                        match evaluate_const_arithmetic(
+                            operator,
+                            primitive,
+                            left_value,
+                            right_value,
+                            target_cfg.pointer_width(),
+                        ) {
+                            Ok(value) => Some(value),
+                            Err(panic_message) => {
+                                left_evaluation
+                                    .diagnostics
+                                    .push(const_eval_panic_diagnostic(
+                                        owner,
+                                        inputs,
+                                        snapshot,
+                                        value.span,
+                                        panic_message,
+                                    )?);
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            left_evaluation.value = result;
+            Ok(Some(left_evaluation))
+        }
+        ExprKind::Binary(operator @ (BinOp::Shl | BinOp::Shr), left, right)
+            if matches!(literal_type, ConstLiteralType::Primitive(_)) =>
+        {
+            let ConstLiteralType::Primitive(primitive) = literal_type else {
+                return Ok(None);
+            };
+            let Some(mut left_evaluation) = check_const_scalar_expression(
+                owner,
+                literal_type,
+                left,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(right_evaluation) = check_const_scalar_expression(
+                owner,
+                ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::U32),
+                right,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            left_evaluation
+                .diagnostics
+                .extend(right_evaluation.diagnostics);
+            if !const_bitwise_type_supported(primitive) {
                 left_evaluation.diagnostics.push(const_literal_diagnostic(
                     owner,
                     inputs,
@@ -28903,9 +29064,8 @@ fn check_const_scalar_expression(
                     value.span,
                     sai_diagnostics::Code::OperatorNotSupported,
                     format!(
-                        "operator `{}` has no `{}` implementation for `{}`",
+                        "operator `{}` is not defined for `{}`",
                         const_binary_operator_text(operator),
-                        const_arithmetic_trait_name(operator),
                         const_primitive_name(primitive)
                     ),
                     "operator not supported",
@@ -28916,7 +29076,7 @@ fn check_const_scalar_expression(
             let result = if left_evaluation.diagnostics.is_empty() {
                 match (left_evaluation.value, right_evaluation.value) {
                     (Some(left_value), Some(right_value)) => {
-                        match evaluate_const_arithmetic(
+                        match evaluate_const_shift(
                             operator,
                             primitive,
                             left_value,
@@ -29010,6 +29170,9 @@ fn const_scalar_literal_value(
         (ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool), Lit::Bool(value)) => {
             Some(ConstScalarValue::Bool(value))
         }
+        (ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Byte), Lit::Byte(value)) => {
+            Some(ConstScalarValue::Byte(value))
+        }
         (ConstLiteralType::Primitive(primitive), Lit::Int { value, negated })
             if matches!(
                 primitive,
@@ -29083,7 +29246,9 @@ fn primitive_integer_width(
     pointer_width: u8,
 ) -> Option<u8> {
     match primitive {
-        sai_resolve::prelude::PrimTy::I8 | sai_resolve::prelude::PrimTy::U8 => Some(8),
+        sai_resolve::prelude::PrimTy::I8
+        | sai_resolve::prelude::PrimTy::U8
+        | sai_resolve::prelude::PrimTy::Byte => Some(8),
         sai_resolve::prelude::PrimTy::I16 | sai_resolve::prelude::PrimTy::U16 => Some(16),
         sai_resolve::prelude::PrimTy::I32 | sai_resolve::prelude::PrimTy::U32 => Some(32),
         sai_resolve::prelude::PrimTy::I64 | sai_resolve::prelude::PrimTy::U64 => Some(64),
@@ -29151,7 +29316,7 @@ fn const_arithmetic_operator_supported(
                 | PrimTy::F32
                 | PrimTy::F64
         ),
-        BinOp::Rem => matches!(
+        BinOp::Rem | BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => matches!(
             primitive,
             PrimTy::I8
                 | PrimTy::I16
@@ -29164,8 +29329,27 @@ fn const_arithmetic_operator_supported(
                 | PrimTy::U64
                 | PrimTy::USize
         ),
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => const_bitwise_type_supported(primitive),
         _ => false,
     }
+}
+
+fn const_bitwise_type_supported(primitive: sai_resolve::prelude::PrimTy) -> bool {
+    use sai_resolve::prelude::PrimTy;
+    matches!(
+        primitive,
+        PrimTy::I8
+            | PrimTy::I16
+            | PrimTy::I32
+            | PrimTy::I64
+            | PrimTy::ISize
+            | PrimTy::U8
+            | PrimTy::U16
+            | PrimTy::U32
+            | PrimTy::U64
+            | PrimTy::USize
+            | PrimTy::Byte
+    )
 }
 
 fn const_binary_operator_text(operator: BinOp) -> &'static str {
@@ -29175,6 +29359,14 @@ fn const_binary_operator_text(operator: BinOp) -> &'static str {
         BinOp::Mul => "*",
         BinOp::Div => "/",
         BinOp::Rem => "%",
+        BinOp::WrapAdd => "+%",
+        BinOp::WrapSub => "-%",
+        BinOp::WrapMul => "*%",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
         _ => "operator",
     }
 }
@@ -29186,8 +29378,48 @@ fn const_arithmetic_trait_name(operator: BinOp) -> &'static str {
         BinOp::Mul => "Mul",
         BinOp::Div => "Div",
         BinOp::Rem => "Rem",
+        BinOp::BitAnd => "BitAnd",
+        BinOp::BitOr => "BitOr",
+        BinOp::BitXor => "BitXor",
         _ => "operator",
     }
+}
+
+fn const_integer_mask(width: u8) -> u128 {
+    (1u128 << width) - 1
+}
+
+fn const_signed_to_bits(value: i128, width: u8) -> u128 {
+    value.rem_euclid(1i128 << width) as u128
+}
+
+fn const_bits_to_signed(bits: u128, width: u8) -> i128 {
+    let bits = bits as i128;
+    let sign = 1i128 << (width - 1);
+    if bits & sign == 0 {
+        bits
+    } else {
+        bits - (1i128 << width)
+    }
+}
+
+fn const_wrap_signed(value: i128, width: u8) -> i128 {
+    const_bits_to_signed(value.rem_euclid(1i128 << width) as u128, width)
+}
+
+fn const_wrap_unsigned(value: u128, width: u8) -> u128 {
+    value & const_integer_mask(width)
+}
+
+fn const_bitnot_signed(value: i128, width: u8) -> i128 {
+    const_bits_to_signed(
+        !const_signed_to_bits(value, width) & const_integer_mask(width),
+        width,
+    )
+}
+
+fn const_bitnot_unsigned(value: u128, width: u8) -> u128 {
+    !value & const_integer_mask(width)
 }
 
 fn evaluate_const_arithmetic(
@@ -29203,6 +29435,15 @@ fn evaluate_const_arithmetic(
         }
         (ConstScalarValue::UnsignedInt(left), ConstScalarValue::UnsignedInt(right)) => {
             evaluate_const_unsigned_arithmetic(operator, primitive, left, right, pointer_width)
+        }
+        (ConstScalarValue::Byte(left), ConstScalarValue::Byte(right)) => {
+            let value = match operator {
+                BinOp::BitAnd => left & right,
+                BinOp::BitOr => left | right,
+                BinOp::BitXor => left ^ right,
+                _ => return Err("operator not supported"),
+            };
+            Ok(ConstScalarValue::Byte(value))
         }
         (ConstScalarValue::Float32(left), ConstScalarValue::Float32(right)) => {
             let value = match operator {
@@ -29235,6 +29476,42 @@ fn evaluate_const_signed_arithmetic(
     right: i128,
     pointer_width: u8,
 ) -> Result<ConstScalarValue, &'static str> {
+    if let Some(width) = primitive_integer_width(primitive, pointer_width) {
+        match operator {
+            BinOp::WrapAdd => {
+                return Ok(ConstScalarValue::SignedInt(const_wrap_signed(
+                    left + right,
+                    width,
+                )));
+            }
+            BinOp::WrapSub => {
+                return Ok(ConstScalarValue::SignedInt(const_wrap_signed(
+                    left - right,
+                    width,
+                )));
+            }
+            BinOp::WrapMul => {
+                return Ok(ConstScalarValue::SignedInt(const_wrap_signed(
+                    left * right,
+                    width,
+                )));
+            }
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                let left = const_signed_to_bits(left, width);
+                let right = const_signed_to_bits(right, width);
+                let bits = match operator {
+                    BinOp::BitAnd => left & right,
+                    BinOp::BitOr => left | right,
+                    BinOp::BitXor => left ^ right,
+                    _ => unreachable!(),
+                };
+                return Ok(ConstScalarValue::SignedInt(const_bits_to_signed(
+                    bits, width,
+                )));
+            }
+            _ => {}
+        }
+    }
     let overflow_message = match operator {
         BinOp::Add => "integer overflow in addition",
         BinOp::Sub => "integer overflow in subtraction",
@@ -29286,6 +29563,38 @@ fn evaluate_const_unsigned_arithmetic(
     right: u128,
     pointer_width: u8,
 ) -> Result<ConstScalarValue, &'static str> {
+    if let Some(width) = primitive_integer_width(primitive, pointer_width) {
+        match operator {
+            BinOp::WrapAdd => {
+                return Ok(ConstScalarValue::UnsignedInt(const_wrap_unsigned(
+                    left.wrapping_add(right),
+                    width,
+                )));
+            }
+            BinOp::WrapSub => {
+                return Ok(ConstScalarValue::UnsignedInt(const_wrap_unsigned(
+                    left.wrapping_sub(right),
+                    width,
+                )));
+            }
+            BinOp::WrapMul => {
+                return Ok(ConstScalarValue::UnsignedInt(const_wrap_unsigned(
+                    left.wrapping_mul(right),
+                    width,
+                )));
+            }
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                let value = match operator {
+                    BinOp::BitAnd => left & right,
+                    BinOp::BitOr => left | right,
+                    BinOp::BitXor => left ^ right,
+                    _ => unreachable!(),
+                };
+                return Ok(ConstScalarValue::UnsignedInt(value));
+            }
+            _ => {}
+        }
+    }
     let overflow_message = match operator {
         BinOp::Add => "integer overflow in addition",
         BinOp::Sub => "integer overflow in subtraction",
@@ -29316,6 +29625,53 @@ fn evaluate_const_unsigned_arithmetic(
         return Err(overflow_message);
     }
     Ok(ConstScalarValue::UnsignedInt(value))
+}
+
+fn evaluate_const_shift(
+    operator: BinOp,
+    primitive: sai_resolve::prelude::PrimTy,
+    left: ConstScalarValue,
+    right: ConstScalarValue,
+    pointer_width: u8,
+) -> Result<ConstScalarValue, &'static str> {
+    let width =
+        primitive_integer_width(primitive, pointer_width).ok_or("operator not supported")?;
+    let ConstScalarValue::UnsignedInt(amount) = right else {
+        return Err("type mismatch");
+    };
+    if amount >= u128::from(width) {
+        return Err("shift amount out of range");
+    }
+    let amount = amount as u32;
+    match left {
+        ConstScalarValue::SignedInt(value) => {
+            let result = if operator == BinOp::Shl {
+                let bits =
+                    (const_signed_to_bits(value, width) << amount) & const_integer_mask(width);
+                const_bits_to_signed(bits, width)
+            } else {
+                value >> amount
+            };
+            Ok(ConstScalarValue::SignedInt(result))
+        }
+        ConstScalarValue::UnsignedInt(value) => {
+            let result = if operator == BinOp::Shl {
+                (value << amount) & const_integer_mask(width)
+            } else {
+                value >> amount
+            };
+            Ok(ConstScalarValue::UnsignedInt(result))
+        }
+        ConstScalarValue::Byte(value) => {
+            let result = if operator == BinOp::Shl {
+                (value << amount) & (u8::MAX >> (8 - width))
+            } else {
+                value >> amount
+            };
+            Ok(ConstScalarValue::Byte(result))
+        }
+        _ => Err("type mismatch"),
+    }
 }
 
 fn const_eval_panic_diagnostic(

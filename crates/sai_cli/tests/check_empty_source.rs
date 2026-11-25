@@ -23421,6 +23421,22 @@ pub fn ready() -> Bool {
 ",
         "pub const READY: Bool = false or (true and true)
 ",
+        "pub const VALUE: I32 = (1 << 3) | 2
+",
+        "pub const VALUE: U8 = 255 & (15 ^ 3)
+",
+        "pub const VALUE: I8 = 127 +% 1
+",
+        "pub const VALUE: U8 = 0 -% 1
+",
+        "pub const VALUE: I8 = -128 >> 1
+",
+        "pub const VALUE: I8 = (-128 >> 1) * 2
+",
+        "pub const VALUE: I8 = (~0) + 1
+",
+        "pub const VALUE: Byte = ~(b'\\x0f' << 1) | b'\\x01'
+",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -23494,6 +23510,60 @@ fn primitive_const_expression_errors_are_checked() {
 ",
             "TYPE_MISMATCH",
             "expected `()`, found `Bool`",
+        ),
+        (
+            "pub const VALUE: I8 = 1 << 8
+",
+            "CONST_EVAL_PANIC",
+            "shift amount out of range",
+        ),
+        (
+            "pub const VALUE: I32 = 1 << true
+",
+            "TYPE_MISMATCH",
+            "expected `U32`, found a Bool literal",
+        ),
+        (
+            "pub const VALUE: Bool = true & false
+",
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `&` has no `BitAnd` implementation for `Bool`",
+        ),
+        (
+            "pub const VALUE: F32 = 1.0 << 1
+",
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `<<` is not defined for `F32`",
+        ),
+        (
+            "pub const VALUE: Byte = b'x' + b'y'
+",
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `+` has no `Add` implementation for `Byte`",
+        ),
+        (
+            "pub const VALUE: Byte = b'x' +% b'y'
+",
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `+%` is not defined for `Byte`",
+        ),
+        (
+            "pub const VALUE: I8 = (127 +% 1) - 1
+",
+            "CONST_EVAL_PANIC",
+            "integer overflow in subtraction",
+        ),
+        (
+            "pub const VALUE: U8 = (0 -% 1) + 1
+",
+            "CONST_EVAL_PANIC",
+            "integer overflow in addition",
+        ),
+        (
+            "pub const VALUE: I8 = (1 << 7) - 1
+",
+            "CONST_EVAL_PANIC",
+            "integer overflow in subtraction",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);
