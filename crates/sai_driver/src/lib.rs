@@ -7376,6 +7376,30 @@ impl ConstLiteralCheck {
     }
 }
 
+struct ConstReferenceContext<'a, 'm> {
+    module_scope: &'a Phase1ModuleScopes,
+    module_members: &'a ModuleMemberIndex<'m>,
+    types: &'a HashMap<DefId, FunctionDirectType>,
+    cyclic: &'a HashSet<DefId>,
+    requesting_package: PackageId,
+}
+
+fn const_literal_type_display(literal_type: ConstLiteralType) -> &'static str {
+    match literal_type {
+        ConstLiteralType::Primitive(primitive) => const_primitive_name(primitive),
+        ConstLiteralType::Str => "Str",
+        ConstLiteralType::Unit => "()",
+    }
+}
+
+fn const_reference_literal_type(direct_type: FunctionDirectType) -> Option<ConstLiteralType> {
+    match direct_type {
+        FunctionDirectType::Primitive(primitive) => Some(ConstLiteralType::Primitive(primitive)),
+        FunctionDirectType::Str => Some(ConstLiteralType::Str),
+        FunctionDirectType::Unit => None,
+    }
+}
+
 fn check_const_literal_owner(
     owner: &HirOwner<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
@@ -7383,6 +7407,7 @@ fn check_const_literal_owner(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    const_references: Option<ConstReferenceContext<'_, '_>>,
 ) -> Result<ConstLiteralCheck, OwnerControlFlowResolutionError> {
     if !owner.raw_attrs.is_empty() {
         return Ok(ConstLiteralCheck::Unsupported);
@@ -7449,18 +7474,67 @@ fn check_const_literal_owner(
     let Some(literal_type) = resolve_const_literal_type(*ty, type_paths, symbols, inputs) else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
-    let Some(diagnostics) = check_const_literal_leaf(
-        owner,
-        *ty,
-        &body.value,
-        type_paths,
-        symbols,
-        inputs,
-        snapshot,
-        target_cfg,
-    )?
-    else {
-        return Ok(ConstLiteralCheck::Unsupported);
+
+    let mut reference_diagnostics = None;
+    if let Some(context) = const_references
+        && let Some(target) = const_initializer_reference_target(
+            &body.value,
+            context.module_scope,
+            context.module_members,
+            context.requesting_package,
+        )
+    {
+        if context.cyclic.contains(&owner.id.def_id.to_def_id()) {
+            reference_diagnostics = Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                body.value.span,
+                sai_diagnostics::Code::ConstCycle,
+                "const depends on itself".to_string(),
+                "cyclic const reference",
+            )?]);
+        } else if !context.cyclic.contains(&target)
+            && let Some(referenced_type) = context.types.get(&target).copied()
+            && let Some(referenced_literal_type) = const_reference_literal_type(referenced_type)
+        {
+            if referenced_literal_type == literal_type {
+                reference_diagnostics = Some(Vec::new());
+            } else {
+                reference_diagnostics = Some(vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    body.value.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found `{}`",
+                        const_literal_type_display(literal_type),
+                        function_direct_type_name(referenced_type)
+                    ),
+                    "type mismatch",
+                )?]);
+            }
+        }
+    }
+
+    let diagnostics = if let Some(diagnostics) = reference_diagnostics {
+        diagnostics
+    } else {
+        let Some(diagnostics) = check_const_literal_leaf(
+            owner,
+            *ty,
+            &body.value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(ConstLiteralCheck::Unsupported);
+        };
+        diagnostics
     };
 
     Ok(match literal_type {
@@ -28449,6 +28523,95 @@ fn check_local_enum_variant_literal_argument(
     Ok(diagnostics)
 }
 
+fn const_initializer_reference_target(
+    value: &HirExpr<'_>,
+    module_scope: &Phase1ModuleScopes,
+    module_members: &ModuleMemberIndex<'_>,
+    requesting_package: PackageId,
+) -> Option<DefId> {
+    match value.kind {
+        ExprKind::Path(path) => {
+            if path.root != PathRoot::Plain
+                || path.segments.len() != 1
+                || path.segments[0].args.is_some()
+            {
+                return None;
+            }
+            match module_scope.scope.get(&path.segments[0].name.sym)?.res {
+                Res::Def(DefKind::Const, def_id) => Some(def_id),
+                _ => None,
+            }
+        }
+        ExprKind::Field { base, name, args } if args.is_none() => {
+            let ExprKind::Path(path) = base.kind else {
+                return None;
+            };
+            if path.root != PathRoot::Plain
+                || path.segments.len() != 1
+                || path.segments[0].args.is_some()
+            {
+                return None;
+            }
+            let module = module_scope.scope.get(&path.segments[0].name.sym)?;
+            match module_members.lookup(module.res, name.sym, requesting_package) {
+                ModuleMemberLookup::Found(binding) => match binding.res {
+                    Res::Def(DefKind::Const, def_id) => Some(def_id),
+                    _ => None,
+                },
+                ModuleMemberLookup::WitMember(Res::Def(DefKind::Const, def_id)) => Some(def_id),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn const_reference_cycle_members(references: &HashMap<DefId, Vec<DefId>>) -> HashSet<DefId> {
+    let mut states = HashMap::<DefId, u8>::new();
+    let mut cyclic = HashSet::new();
+
+    for start in references.keys() {
+        if states.contains_key(start) {
+            continue;
+        }
+        states.insert(*start, 1);
+        let mut calls = vec![(*start, 0usize)];
+        let mut path = vec![*start];
+        while let Some((node, next_target)) = calls.last_mut() {
+            let target_count = references.get(node).map_or(0, Vec::len);
+            if *next_target == target_count {
+                states.insert(*node, 2);
+                calls.pop();
+                path.pop();
+                continue;
+            }
+            let target = references
+                .get(node)
+                .and_then(|targets| targets.get(*next_target))
+                .copied();
+            *next_target += 1;
+            let Some(target) = target else {
+                continue;
+            };
+            match states.get(&target).copied() {
+                Some(2) => {}
+                Some(1) => {
+                    if let Some(position) = path.iter().position(|entry| *entry == target) {
+                        cyclic.extend(path[position..].iter().copied());
+                    }
+                }
+                _ => {
+                    states.insert(target, 1);
+                    calls.push((target, 0));
+                    path.push(target);
+                }
+            }
+        }
+    }
+
+    cyclic
+}
+
 fn check_const_literal_against_type(
     owner: OwnerId,
     literal_type: ConstLiteralType,
@@ -36868,11 +37031,13 @@ impl RootDatabase {
         top_level_owner_index: &HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
         module_members: &ModuleMemberIndex<'_>,
         source_graph_packages: &HashSet<PackageId>,
-    ) -> HashMap<DefId, FunctionDirectType> {
+    ) -> (HashMap<DefId, FunctionDirectType>, HashSet<DefId>) {
+        let empty = || (HashMap::new(), HashSet::new());
         let Ok(primitive_prelude) = self.primitive_prelude.clone() else {
-            return HashMap::new();
+            return empty();
         };
         let mut const_types = HashMap::new();
+        let mut const_references = HashMap::<DefId, Vec<DefId>>::new();
         let mut ambiguous_definitions = HashSet::new();
         let mut owner_inputs_by_file = HashMap::<FileId, Option<CurrentOwnerInputs>>::new();
 
@@ -36969,6 +37134,16 @@ impl RootDatabase {
                 descriptor.owner.def_id.package(),
                 Some(source_graph_packages),
             );
+            if let Some(body) = hir_owner.body
+                && let Some(target) = const_initializer_reference_target(
+                    &body.value,
+                    module_scope,
+                    module_members,
+                    collection.module_tree.package,
+                )
+            {
+                const_references.entry(def_id).or_default().push(target);
+            }
             let Some(const_type) =
                 (match resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs) {
                     Some(ConstLiteralType::Primitive(primitive))
@@ -36991,7 +37166,8 @@ impl RootDatabase {
             }
         }
 
-        const_types
+        let cyclic = const_reference_cycle_members(&const_references);
+        (const_types, cyclic)
     }
 
     /// Resolves loop labels, lexical locals, module paths, and local
@@ -37202,7 +37378,7 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
         );
-        let const_literal_types = self.index_const_literal_types(
+        let (const_literal_types, _) = self.index_const_literal_types(
             collection,
             snapshot,
             &top_level_owner_index,
@@ -37864,6 +38040,13 @@ impl RootDatabase {
             .map(|scopes| &scopes.source_graph_packages)
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let (const_literal_types, cyclic_const_references) = self.index_const_literal_types(
+            collection,
+            snapshot,
+            &top_level_owner_index,
+            &module_members,
+            source_graph_packages,
+        );
         let descriptors = collection
             .scopes
             .top_level_owners
@@ -38010,6 +38193,16 @@ impl RootDatabase {
                             ),
                             (_, _, Err(error)) => Err(error),
                         };
+                    let const_reference_context = match &module_scope {
+                        Ok(module_scope) => Some(ConstReferenceContext {
+                            module_scope,
+                            module_members: &module_members,
+                            types: &const_literal_types,
+                            cyclic: &cyclic_const_references,
+                            requesting_package: collection.module_tree.package,
+                        }),
+                        Err(_) => None,
+                    };
                     let literal_check = check_const_literal_owner(
                         &hir_owner,
                         type_path_resolution
@@ -38020,6 +38213,7 @@ impl RootDatabase {
                         &inputs,
                         snapshot,
                         &collection.target_cfg,
+                        const_reference_context,
                     );
                     module_path_diagnostics = match (member_scopes, type_path_resolution.as_ref()) {
                         (Some(member_scopes), Ok(Some(path_resolution))) => Some(
@@ -47053,7 +47247,7 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
         );
-        let const_literal_types = self.index_const_literal_types(
+        let (const_literal_types, _) = self.index_const_literal_types(
             collection,
             snapshot,
             &top_level_owner_index,
