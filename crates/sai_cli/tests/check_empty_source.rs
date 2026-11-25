@@ -23489,6 +23489,12 @@ fn primitive_const_expression_errors_are_checked() {
             "TYPE_MISMATCH",
             "expected `Str`, found `Bool`",
         ),
+        (
+            "pub const VALUE: () = not false
+",
+            "TYPE_MISMATCH",
+            "expected `()`, found `Bool`",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8_lossy(&output.stdout);

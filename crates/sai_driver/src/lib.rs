@@ -7436,7 +7436,7 @@ fn check_const_literal_owner(
     };
     if let TyKind::Tuple(elements) = ty.kind {
         if elements.is_empty() {
-            let Some(diagnostics) = check_const_literal_leaf(
+            let diagnostics = match check_const_literal_leaf(
                 owner,
                 *ty,
                 &body.value,
@@ -7445,9 +7445,23 @@ fn check_const_literal_owner(
                 inputs,
                 snapshot,
                 target_cfg,
-            )?
-            else {
-                return Ok(ConstLiteralCheck::Unsupported);
+            )? {
+                Some(diagnostics) => diagnostics,
+                None => {
+                    let Some(diagnostics) = check_const_operator_expression_against_type(
+                        owner.id,
+                        ConstLiteralType::Unit,
+                        &body.value,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )?
+                    else {
+                        return Ok(ConstLiteralCheck::Unsupported);
+                    };
+                    diagnostics
+                }
             };
             return Ok(ConstLiteralCheck::SupportedUnit { diagnostics });
         }
