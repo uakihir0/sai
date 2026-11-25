@@ -22515,6 +22515,40 @@ fn foreign_record_method_in_declaring_file_checks() {
 }
 
 #[test]
+fn str_shadowing_local_record_does_not_use_same_named_foreign_impl() {
+    // The local `Inner` wins the string-keyed receiver table. The
+    // foreign `Inner::value` impl must not be adopted merely because
+    // the `Str` shadow keeps the local record out of `foreign_records`.
+    let root_source = concat!(
+        "type Str { n: I32 }\n",
+        "type Inner { n: I32 }\n",
+        "type Wrap { inner: Inner }\n",
+        "impl Wrap {\n",
+        "    pub fn get(self: borrow Self) -> I32 {\n",
+        "        self.inner.value()\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[(
+            "src/types.sai",
+            concat!(
+                "type Inner { n: I32 }\n",
+                "impl Inner {\n",
+                "    pub fn value(self: borrow Self) -> I32 {\n",
+                "        self.n\n",
+                "    }\n",
+                "}\n",
+            ),
+        )],
+        &[],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
 fn aliased_foreign_impl_does_not_provide_methods_for_receiver() {
     // `impl Rec` in `impls.sai` is an impl of `Dummy` through an
     // alias, not of the receiver record `types.Rec`.

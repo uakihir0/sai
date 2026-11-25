@@ -46809,6 +46809,25 @@ impl RootDatabase {
             // member signatures eagerly under each impl file's own
             // inputs and scope (the underlying queries are memoized);
             // only owned strings cross into the analysis closure.
+            // A record declared in the impl's own file wins the
+            // string-keyed receiver table, so a foreign impl of a
+            // merely same-named record must not contribute methods.
+            let current_record_names: Vec<String> = ast::SourceFile::cast(inputs.root.clone())
+                .map(|file| {
+                    file.items()
+                        .filter_map(|item| match item {
+                            ast::Item::Type(decl) => decl.name().and_then(|name| name.token()),
+                            _ => None,
+                        })
+                        .map(|token| {
+                            let text = token.text();
+                            sai_syntax::normalize_identifier(
+                                text.strip_prefix("r#").unwrap_or(text),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut sibling_impl_tables: HashMap<
                 OwnerId,
                 (String, Vec<(String, StrSelfMethodCallSignature)>),
@@ -46892,7 +46911,7 @@ impl RootDatabase {
                                 &foreign_records,
                             )
                         });
-                    if !head_is_exact {
+                    if !head_is_exact || current_record_names.iter().any(|name| *name == record) {
                         continue;
                     }
                     sibling_impl_tables.insert(other.owner, (record, signatures));
