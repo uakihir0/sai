@@ -5327,10 +5327,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // A const initializer (`let x = LIMIT`, `let x = helper2.LIMIT`)
             // binds its declared type and still unifies with the
             // annotation — `let b: Bool = LIMIT` reports TypeMismatch.
+            // On a mismatch the binding takes the annotation so the
+            // error stays at the initializer instead of echoing at
+            // every later use.
             self.record_expression_type(init.hir_id, local_type);
-            if let Some(expected) = annotation {
+            let local_type = if let Some(expected) = annotation {
                 self.check_annotated_path(local_type, expected, init.hir_id)?;
-            }
+                LocalType::Concrete(expected)
+            } else {
+                local_type
+            };
             return Ok(InitializerCheck {
                 local_type,
                 deferred_neg_result,
