@@ -2253,18 +2253,21 @@ fn check_type_decl_primitive_fields(
                             .iter()
                             .any(|name| normalize_type_name(name) == normalized);
                         // A `pub` field on a public record exposing a
-                        // package-private local type is
+                        // package-private type is
                         // PRIVATE_TYPE_IN_PUBLIC_API upstream — the
                         // coverage gate cannot emit it, so the source
-                        // stays gated. Imported visibility is resolved
-                        // by the driver instead.
+                        // stays gated. Imported visibility is not
+                        // representable in this file-local gate, so an
+                        // imported field type in that position stays
+                        // gated whether or not its declaration is pub.
                         (declared || imported)
-                            && !(declared
-                                && decl_is_public
+                            && !(decl_is_public
                                 && field.pub_token().is_some()
-                                && !public_type_names
-                                    .iter()
-                                    .any(|name| normalize_type_name(name) == normalized))
+                                && (imported
+                                    || (declared
+                                        && !public_type_names
+                                            .iter()
+                                            .any(|name| normalize_type_name(name) == normalized))))
                     }
             })
     })
