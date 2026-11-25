@@ -6677,19 +6677,21 @@ fn module_tree_workspace_check_diagnostics(
         })
         && {
             let mut package_saw_impl = false;
-            let mut package_saw_fn_and_const = false;
+            let mut package_saw_fn = false;
+            let mut package_saw_const = false;
             let all_fragments = inputs[0].source_inputs.iter().all(|(_, _, source)| {
                 let (ok, file_saw_impl, file_saw_fn, file_saw_const) =
                     check_source_is_mixed_public_items_fragment(source.as_ref());
                 package_saw_impl |= file_saw_impl;
-                package_saw_fn_and_const |= file_saw_fn && file_saw_const;
+                package_saw_fn |= file_saw_fn;
+                package_saw_const |= file_saw_const;
                 ok
             });
             // The mixed coverage gate requires at least one impl owner
             // package-wide, or a `pub fn`+`pub const` mix — every file
             // may otherwise hold any subset of the checked item kinds
             // (fn-only, type-only, const-only — including `lib.sai`).
-            all_fragments && (package_saw_impl || package_saw_fn_and_const)
+            all_fragments && (package_saw_impl || (package_saw_fn && package_saw_const))
         };
     let mut public_primitive_const_set_covered = false;
     let mut single_public_function_body_covered = false;
