@@ -16780,6 +16780,10 @@ struct StrLiteralSeed {
     // (assignment right sides) — each checks against the resolved
     // primitive like the checker's recorded literal constraints.
     sites: std::rc::Rc<std::cell::RefCell<Vec<(Lit<'static>, sai_hir::Span)>>>,
+    // Const-pattern types joined into the variable after the seed —
+    // like literal sites, each checks once the variable resolves to a
+    // concrete primitive.
+    const_sites: std::rc::Rc<std::cell::RefCell<Vec<(FunctionDirectType, sai_hir::Span)>>>,
     // The origin literal of every variable merged into this group —
     // each checks once when the group resolves.
     // `checked` marks a member literal the join's own fold already
@@ -16797,6 +16801,7 @@ fn str_seed_new(literal: Lit<'static>, origin: sai_hir::Span) -> StrLiteralSeed 
         origin,
         resolved: std::rc::Rc::new(std::cell::Cell::new(None)),
         sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        const_sites: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         members: std::rc::Rc::new(std::cell::RefCell::new(vec![(literal, origin, false)])),
         merged_into: std::rc::Rc::new(std::cell::RefCell::new(None)),
     }
@@ -16888,6 +16893,10 @@ fn str_seed_merge(place: &StrLiteralSeed, rhs: &StrLiteralSeed) {
     {
         let mut sites = rhs_root.sites.borrow_mut();
         place_root.sites.borrow_mut().append(&mut sites);
+    }
+    {
+        let mut const_sites = rhs_root.const_sites.borrow_mut();
+        place_root.const_sites.borrow_mut().append(&mut const_sites);
     }
     *rhs_root.merged_into.borrow_mut() = Some(place_root);
 }
@@ -17259,6 +17268,28 @@ fn str_seed_resolve(
     let Some(primitive) = str_family_prim(resolved) else {
         return Ok(());
     };
+    for (const_type, span) in root.const_sites.borrow().iter().copied() {
+        let found_name = match const_type {
+            FunctionDirectType::Primitive(found) => const_primitive_name(found),
+            FunctionDirectType::Str => "Str",
+            FunctionDirectType::Unit => continue,
+        };
+        let matches_type = matches!(
+            const_type,
+            FunctionDirectType::Primitive(found) if found == primitive
+        );
+        if !matches_type {
+            diagnostics.push(const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected {resolved}, found `{found_name}`"),
+                "type mismatch",
+            )?);
+        }
+    }
     for (literal, span) in root
         .members
         .borrow()
@@ -18626,6 +18657,18 @@ fn str_match_arm_pattern(
                 ),
                 "invalid const pattern type",
             )?);
+            return Ok(Some(()));
+        }
+        if let Some(root) = scrutinee_seed
+            && str_seed_resolved(root).is_none()
+        {
+            let mut sites = root.const_sites.borrow_mut();
+            if !sites
+                .iter()
+                .any(|(ty, site_span)| *ty == const_type && *site_span == span)
+            {
+                sites.push((const_type, span));
+            }
             return Ok(Some(()));
         }
         let mismatch = match (scrutinee_prim, const_type) {
@@ -23136,6 +23179,9 @@ fn str_shadow_str_bindings(str_bindings: &StrLocalBindings) -> StrLocalBindings 
                             resolved: std::rc::Rc::new(std::cell::Cell::new(root.resolved.get())),
                             sites: std::rc::Rc::new(std::cell::RefCell::new(
                                 root.sites.borrow().clone(),
+                            )),
+                            const_sites: std::rc::Rc::new(std::cell::RefCell::new(
+                                root.const_sites.borrow().clone(),
                             )),
                             members: std::rc::Rc::new(std::cell::RefCell::new(
                                 root.members.borrow().clone(),
