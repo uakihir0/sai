@@ -7415,9 +7415,6 @@ fn check_const_literal_owner(
     let OwnerNode::Item(item) = owner.node else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
-    if item.vis != Visibility::Pub {
-        return Ok(ConstLiteralCheck::Unsupported);
-    }
     let ItemKind::Const { ty } = item.kind else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
@@ -37039,7 +37036,7 @@ impl RootDatabase {
         signatures
     }
 
-    /// Package-wide `pub const` declared-type table for const references
+    /// Package-wide const declared-type table for const references
     /// (`LIMIT`, `helper2.LIMIT`) in primitive bodies. Only consts whose
     /// annotation resolves to a supported primitive family or `Str` are
     /// indexed; duplicate definitions drop the name like the fn index.
@@ -37127,9 +37124,6 @@ impl RootDatabase {
             let ItemKind::Const { ty } = item.kind else {
                 continue;
             };
-            if item.vis != Visibility::Pub {
-                continue;
-            }
             let Ok(name) = self.symbols.resolve(item.name.sym) else {
                 continue;
             };
@@ -68365,7 +68359,6 @@ property "shared"() {}
             "negated_result_later_constraint",
             "negated_result_alias_later_constraint",
             "forward_source",
-            "global_source",
         ] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
@@ -68928,7 +68921,6 @@ property "shared"() {}
             "computed_literal_source",
             "direct_call_operand",
             "compound_operand",
-            "global_source",
             "forward_source",
         ] {
             let owner = owner_named(&database, &resolved, name);
@@ -75498,7 +75490,6 @@ property "shared"() {}
             "direct_neg_unresolved_path_unsupported",
             "direct_neg_self_path_unsupported",
             "direct_neg_forward_path_unsupported",
-            "direct_neg_global_path_unsupported",
             "direct_neg_deep_nested_call_unsupported",
             "direct_neg_generic_target_unsupported",
             "shift_computed_operand_unsupported",
@@ -75529,7 +75520,6 @@ property "shared"() {}
             "shift_integer_literal_lhs_generic_target_unsupported",
             "shift_integer_literal_lhs_forward_path_unsupported",
             "shift_integer_literal_lhs_self_path_unsupported",
-            "shift_integer_literal_lhs_global_path_unsupported",
             "shift_byte_literal_lhs_computed_rhs_unsupported",
             "shift_byte_literal_lhs_computed_left_unsupported",
             "shift_byte_literal_lhs_self_count_unsupported",
@@ -89192,7 +89182,6 @@ property "shared"() {}
             "excluded_computed",
             "excluded_call",
             "excluded_double",
-            "excluded_global",
             "excluded_self",
             "excluded_forward",
             "excluded_unresolved",
@@ -95212,6 +95201,17 @@ property "shared"() {}
 
         assert_eq!(resolved.owners().len(), 14);
         for (index, owner) in resolved.owners().iter().enumerate() {
+            if matches!(index, 4 | 8) {
+                // Package-private consts are visible package-wide, so
+                // annotated and unannotated copies from ONE are checked.
+                assert!(matches!(
+                    owner
+                        .body_type_check()
+                        .expect("const copy is checked"),
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ));
+                continue;
+            }
             if index == 5 {
                 // `{ value }` is a statement-free nested block tail whose
                 // inner path tail resolves the annotated `value` binding.
@@ -95485,15 +95485,15 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
-        for index in [4, 6, 8] {
+        for index in [3, 4, 6, 8] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
-                    .expect("multi-parameter and literal conditions are checked"),
+                    .expect("const, multi-parameter and literal conditions are checked"),
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [2, 3, 5, 7, 9] {
+        for index in [2, 5, 7, 9] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -95640,7 +95640,7 @@ property "shared"() {}
                 .expect("a negated literal-parameter comparison is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [20, 21, 23, 24, 29] {
+        for index in [19, 20, 21, 23, 24, 29] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -95654,7 +95654,7 @@ property "shared"() {}
                 .expect("a `Str` parameter comparison against a literal is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [19, 26, 28, 30] {
+        for index in [26, 28, 30] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -95695,7 +95695,7 @@ property "shared"() {}
         let owners = resolved.owners();
         assert_eq!(owners.len(), 9);
 
-        for index in [0, 1, 6, 7, 8] {
+        for index in [0, 1, 2, 6, 7, 8] {
             let check = owners[index]
                 .body_type_check()
                 .expect("not conditions over admitted operand shapes are supported");
@@ -95718,7 +95718,7 @@ property "shared"() {}
                 .expect("a Bool literal operand in a conjunction is checked"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [2, 4] {
+        for index in [4] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -95763,7 +95763,7 @@ property "shared"() {}
         let owners = resolved.owners();
         assert_eq!(owners.len(), 13);
 
-        for index in [0, 1, 6] {
+        for index in [0, 1, 3, 6] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -95801,7 +95801,7 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
-        for index in [3, 5, 7, 12] {
+        for index in [5, 7, 12] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -97037,7 +97037,7 @@ property "shared"() {}
                 "function owner {index} unexpectedly failed the supported comparison slice: {check:?}"
             );
         }
-        for index in [28, 29, 31, 32, 38, 40, 45] {
+        for index in [28, 29, 31, 32, 38, 39, 40, 45] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -97081,7 +97081,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [27, 39, 44, 46] {
+        for index in [27, 44, 46] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -98730,7 +98730,7 @@ property "shared"() {}
             })
             .collect::<Vec<_>>();
         assert_eq!(checks.len(), 25);
-        for index in [0, 1, 2, 3, 6, 8, 13, 19, 20] {
+        for index in [0, 1, 2, 3, 6, 8, 13, 18, 19, 20] {
             assert!(
                 checks[index].is_valid(),
                 "const at owner index {index} is a supported valid literal: {:?}",
@@ -98788,11 +98788,11 @@ property "shared"() {}
                 "owner index {index} diagnostic points to the literal"
             );
         }
-        for index in [16, 17, 18, 23, 24] {
+        for index in [16, 17, 23, 24] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "aliases, non-literal expressions, private consts, raw identifiers and names outside the supported ASCII UPPER_SNAKE_CASE convention remain gated"
+                "aliases, non-literal expressions, raw identifiers and names outside the supported ASCII UPPER_SNAKE_CASE convention remain gated"
             );
         }
     }

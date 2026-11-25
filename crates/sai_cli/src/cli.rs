@@ -1990,7 +1990,7 @@ fn check_manifest_supports_empty_root_success(
     })
 }
 
-fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize> {
+fn check_source_is_unattributed_const_set(source: &[u8]) -> Option<usize> {
     use sai_syntax::ast::AstNode as _;
 
     let parsed = sai_fmt::parse_source(source).ok()?;
@@ -2009,7 +2009,7 @@ fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize>
         let sai_syntax::ast::Item::Const(constant) = item else {
             return None;
         };
-        if !check_public_const_decl(&constant) {
+        if !check_const_decl(&constant) {
             return None;
         }
         const_count = const_count.checked_add(1)?;
@@ -2017,14 +2017,11 @@ fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize>
     (const_count > 0).then_some(const_count)
 }
 
-// An unattributed `pub const` with an uppercase name — the shape the const
-// coverage slices accept.
-fn check_public_const_decl(constant: &sai_syntax::ast::ConstDecl) -> bool {
-    if constant.attrs().next().is_some()
-        || !constant
-            .visibility()
-            .is_some_and(|visibility| visibility.pub_token().is_some())
-    {
+// An unattributed const with an uppercase name — the shape the const
+// coverage slices accept. Package-private consts are visible throughout
+// their package (D-MOD-02), so they are in the same slice as `pub` ones.
+fn check_const_decl(constant: &sai_syntax::ast::ConstDecl) -> bool {
+    if constant.attrs().next().is_some() {
         return false;
     }
     let Some(name_token) = constant.name().and_then(|name| name.token()) else {
@@ -2524,7 +2521,7 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
                 impls.push(impl_decl);
             }
             sai_syntax::ast::Item::Const(constant) => {
-                if !check_public_const_decl(&constant) {
+                if !check_const_decl(&constant) {
                     return (false, false, false, false, false);
                 }
                 saw_const = true;
@@ -6695,7 +6692,7 @@ fn module_tree_workspace_check_diagnostics(
             .first()
             .and_then(|(path, _, source)| {
                 (path == &root_source_path)
-                    .then(|| check_source_is_unattributed_public_const_set(source.as_ref()))
+                    .then(|| check_source_is_unattributed_const_set(source.as_ref()))
                     .flatten()
             })
     } else {

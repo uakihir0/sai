@@ -3509,8 +3509,9 @@ fn mixed_public_const_reports_literal_mismatch() {
 }
 
 #[test]
-fn non_public_const_in_mixed_source_stays_gated() {
-    // Only `pub` consts with uppercase names join mixed coverage (IR-1134).
+fn package_private_const_in_mixed_source_checks() {
+    // Package-private consts join mixed coverage because every module in
+    // the package can name them (D-MOD-02).
     let source = concat!(
         "const LIMIT: I32 = 10\n",
         "type Counter { count: I32 }\n",
@@ -3524,7 +3525,7 @@ fn non_public_const_in_mixed_source_stays_gated() {
         "    1\n",
         "}\n",
     );
-    assert_check_stays_gated(&run_check(source, "", &[], &[]), "non-pub const");
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
 
 #[test]
@@ -5911,7 +5912,6 @@ fn unannotated_copy_of_annotated_primitive_local_reports_semantic_errors() {
 fn unsupported_unannotated_copy_local_forms_remain_gated() {
     for source in [
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = r#source\n    copied\n}\n",
-        "const SOURCE: I32 = 42\npub fn copy() -> I32 {\n    let copied = SOURCE\n    copied\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -6196,7 +6196,6 @@ fn unannotated_literal_copy_reports_semantic_errors_at_the_source_and_tail() {
 fn unsupported_unannotated_literal_copy_forms_remain_gated() {
     for source in [
         "pub fn copy() -> I32 {\n    let source = 42\n    let copied = r#source\n    copied\n}\n",
-        "const SOURCE: I32 = 42\npub fn copy() -> I32 {\n    let source = 7\n    let copied = SOURCE\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let var source = 42\n    let copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source = 42\n    let var copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let (source, other) = (42, 7)\n    let copied = source\n    copied\n}\n",
@@ -10994,7 +10993,6 @@ fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
         "pub fn compare(value: I32) -> Bool {\n    let result = value < missing\n    result\n}\n",
         "type IntegerAlias = I32\npub fn compare(value: IntegerAlias) -> Bool {\n    let result = value < 1\n    result\n}\n",
         "pub fn compare(value: ()) -> Bool {\n    let result = value == ()\n    result\n}\n",
-        "const LIMIT: I32 = 10\npub fn compare(value: I32) -> Bool {\n    let result = value < LIMIT\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -11139,7 +11137,6 @@ fn unsupported_primitive_logical_local_initializer_shapes_remain_gated() {
         "pub fn logical(right: Bool) -> Bool {\n    let result = result and right\n    result\n}\n",
         "pub fn logical(right: Bool) -> Bool {\n    let result = missing and right\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let result = values.FLAG and flag\n    result\n}\n",
-        "const READY: Bool = true\npub fn logical(flag: Bool) -> Bool {\n    let result = READY and flag\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -11319,7 +11316,6 @@ fn unsupported_primitive_local_not_shapes_remain_gated() {
         "pub fn logical(flag: Bool) -> Bool {\n    let result = not later\n    let later: Bool = flag\n    result\n}\n",
         "pub fn logical(flag: Bool) -> Bool {\n    let result = not result\n    result\n}\n",
         "type Flag = Bool\npub fn logical(flag: Flag) -> Bool {\n    let result = not flag\n    result\n}\n",
-        "const READY: Bool = true\npub fn logical(flag: Bool) -> Bool {\n    let result = not READY\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -12037,8 +12033,6 @@ fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
         "dev",
     );
     for source in [
-        "const LIMIT: I8 = 10\npub fn choose(value: I8) -> I32 { if value < LIMIT { 1 } else { 2 } }\n",
-        "const LIMIT: I8 = 10\npub fn choose(value: I8) -> I32 { if LIMIT < value { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < 11 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < other { 1 } else { 2 } }\n",
         "type I8Alias = I8\npub fn choose(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
@@ -12622,14 +12616,12 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = value\nvalue\n}\n",
-        "const ONE: I32 = 1\npub fn local() -> I32 {\nlet copy: I32 = ONE\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet valueName: I32 = 42\nvalueName\n}\n",
         "pub fn local() -> I32 {\nlet r#value: I32 = 42\nr#value\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nr#value\n}\n",
         "pub fn local() -> I32 {\nlet valueName = 42\nvalueName\n}\n",
         "pub fn local() -> I32 {\nlet r#value = 42\nr#value\n}\n",
         "pub fn local() -> I32 {\nlet value = 42\nr#value\n}\n",
-        "const ONE: I32 = 1\npub fn local() -> I32 {\nlet value = 42\nONE\n}\n",
         "pub fn str_param_to_unit(value: Str) -> () { value }\n",
         "pub fn str_param_without_return(value: Str) { value }\n",
         "pub fn self_str_identity(self: Str) -> Str { self }\n",
@@ -13367,7 +13359,6 @@ fn duplicate_public_primitive_const_names_report_a_duplicate_without_a_result() 
 #[test]
 fn const_forms_outside_literal_slice_remain_gated() {
     for source in [
-        "const PRIVATE: I8 = 1\n",
         "pub const EXPRESSION: I8 = 1 + 2\n",
         "pub const ALIAS: MyInt = 1\n",
         "pub const BORROWED: &Bool = &true\n",
@@ -23386,6 +23377,69 @@ fn const_range_endpoints_in_primitive_match_check() {
         &[],
     );
     assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn package_private_consts_check_in_primitive_bodies() {
+    // Package-private consts are visible throughout their package
+    // (D-MOD-02): direct references and const patterns do not require
+    // a `pub` marker.
+    let source = concat!(
+        "const LIMIT: I32 = 1
+",
+        "pub fn get() -> I32 {
+",
+        "    LIMIT
+",
+        "}
+",
+        "pub fn pick(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        LIMIT => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn package_private_consts_check_across_modules() {
+    // The same package-wide visibility applies through direct imports,
+    // aliases, and module-member paths.
+    let source = concat!(
+        "use acme:empty/values.{LIMIT}
+",
+        "use acme:empty/values as values
+",
+        "pub fn get() -> I32 {
+",
+        "    LIMIT + values.OTHER
+",
+        "}
+",
+    );
+    assert_success_result(
+        run_check(
+            source,
+            "",
+            &[(
+                "src/values.sai",
+                "const LIMIT: I32 = 1
+const OTHER: I32 = 2
+",
+            )],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
 }
 
 #[test]
