@@ -22867,6 +22867,76 @@ fn open_range_endpoints_in_primitive_match_check() {
 }
 
 #[test]
+fn pinned_str_match_scrutinee_checks_open_range_const_type() {
+    // A guard in a preceding arm can pin the scrutinee literal variable.
+    // Later one-sided range const endpoints must compare with that pinned
+    // type rather than the provisional `I64` family.
+    let source = concat!(
+        "pub const SMALL: U8 = 1
+",
+        "pub fn pick(flag: Bool) -> Str {
+",
+        "    let n = 5
+",
+        "    let u: U8 = 1
+",
+        "    let r = match n {
+",
+        "        x if n == u => \"a\",
+",
+        "        SMALL.. => \"y\",
+",
+        "        _ => \"z\",
+",
+        "    }
+",
+        "    r
+",
+        "}
+",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn pinned_str_match_scrutinee_range_literals_use_pinned_type() {
+    // The same dynamic scrutinee type applies to literal endpoints:
+    // 300 is in range for provisional I64 but out of range after the
+    // guard pins the scrutinee to U8.
+    let source = concat!(
+        "pub fn pick(flag: Bool) -> Str {
+",
+        "    let n = 5
+",
+        "    let u: U8 = 1
+",
+        "    let r = match n {
+",
+        "        x if n == u => \"a\",
+",
+        "        300.. => \"y\",
+",
+        "        _ => \"z\",
+",
+        "    }
+",
+        "    r
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "out-of-range endpoint must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && stdout.contains("integer literal is out of range for `U8`")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "pinned endpoint range is diagnosed, not gated: {stdout}"
+    );
+}
+
+#[test]
 fn const_range_endpoint_type_mismatch_reports() {
     // Every const range endpoint must have the scrutinee type.
     let source = concat!(

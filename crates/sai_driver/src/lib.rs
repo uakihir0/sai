@@ -18525,13 +18525,23 @@ fn str_match_arm_pattern(
     diagnostics: &mut Vec<Diagnostic>,
     bool_cover: &mut (bool, bool),
 ) -> Result<Option<Option<sai_hir::BindingId>>, OwnerControlFlowResolutionError> {
+    // A guard in an earlier arm can resolve the scrutinee literal
+    // variable after this match's provisional family was computed.
+    // Read the current resolution for every pattern rather than using
+    // that stale family.
+    let current_scrutinee_prim = || {
+        scrutinee_seed
+            .and_then(|seed| str_seed_resolved(seed))
+            .and_then(str_family_prim)
+            .or(scrutinee_prim)
+    };
     // One literal pattern, checked like `check_match_literal_pattern`
     // against the scrutinee primitive — `Str` scrutinee patterns keep
     // the family-name comparison.
     let mut check_pattern_literal = |literal: Lit<'_>,
                                      diagnostics: &mut Vec<Diagnostic>|
      -> Result<Option<()>, OwnerControlFlowResolutionError> {
-        match scrutinee_prim {
+        match current_scrutinee_prim() {
             Some(primitive) => {
                 if is_unguarded && let Lit::Bool(value) = literal {
                     if value {
@@ -18684,6 +18694,7 @@ fn str_match_arm_pattern(
                 return Ok(Some(()));
             }
         }
+        let scrutinee_prim = current_scrutinee_prim();
         let mismatch = match (scrutinee_prim, const_type) {
             (Some(expected), FunctionDirectType::Primitive(found)) => expected != found,
             (Some(_), FunctionDirectType::Str) => true,
@@ -18753,7 +18764,8 @@ fn str_match_arm_pattern(
             end,
             inclusive,
         } if scrutinee_prim.is_some() => {
-            let primitive = scrutinee_prim.expect("range guard keeps a primitive scrutinee");
+            let primitive =
+                current_scrutinee_prim().expect("range guard keeps a primitive scrutinee");
             if !(sai_ty::typeck::literal::is_integer_primitive(primitive)
                 || matches!(
                     primitive,
