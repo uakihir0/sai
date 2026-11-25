@@ -13375,6 +13375,12 @@ pub const ALIAS: Array<I32, 2> = POINT
 ",
             "expected `Array<I32, 2>`, found `(I32, Bool)`",
         ),
+        (
+            "pub const POINT: (I32,) = (1,)
+pub const SCALAR_ELEMENT: (I32,) = (POINT,)
+",
+            "expected `I32`, found `(I32,)`",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8_lossy(&output.stdout);

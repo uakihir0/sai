@@ -18045,6 +18045,28 @@ fn check_const_constructor_field(
     else {
         return Ok(None);
     };
+    if const_references.is_some_and(|context| {
+        const_initializer_reference_target(
+            value,
+            context.module_scope,
+            context.module_members,
+            context.requesting_package,
+        )
+        .is_some_and(|target| context.aggregate_types.contains_key(&target))
+    }) {
+        return check_const_constructor_reference(
+            owner.id,
+            &ConstConstructorType::Scalar(match expected_type {
+                ConstLiteralType::Primitive(primitive) => FunctionDirectType::Primitive(primitive),
+                ConstLiteralType::Str => FunctionDirectType::Str,
+                ConstLiteralType::Unit => FunctionDirectType::Unit,
+            }),
+            value,
+            const_references,
+            inputs,
+            snapshot,
+        );
+    }
     if matches!(value.kind, ExprKind::Array(_)) {
         return Ok(Some(vec![const_literal_diagnostic(
             owner.id,
