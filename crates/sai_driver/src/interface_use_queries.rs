@@ -7224,6 +7224,7 @@ fn current_owner_inputs_from_prepared(input: &OwnedPhase1ModuleInput) -> Current
         source_ref: input.source_ref.clone(),
         str_self_field_projections: std::cell::RefCell::new(None),
         str_self_method_calls: std::cell::RefCell::new(None),
+        const_path_sites: std::cell::RefCell::new(None),
     }
 }
 

@@ -2374,99 +2374,6 @@ fn check_impl_decl_is_inherent_public_methods(
 // A source of attr-free `pub fn`s plus attr-free `type` declarations and
 // attr-free `impl` blocks inherent on those types — the mixed kind the
 // combined coverage gate checks (IR-1133).
-fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
-    use sai_syntax::ast::AstNode as _;
-
-    let source = strip_utf8_bom(source);
-    let Some(parsed) = sai_fmt::parse_source(source).ok() else {
-        return false;
-    };
-    let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
-        return false;
-    };
-    if source_file.module_header().is_some()
-        || source_file.test_decls().next().is_some()
-        || source_file.property_decls().next().is_some()
-    {
-        return false;
-    }
-    let mut saw_function = false;
-    let mut saw_impl = false;
-    // Record-typed fields may name a `type` declared later in the file —
-    // the name sets are collected before the field check runs.
-    let mut type_names = HashSet::new();
-    let mut public_type_names = HashSet::new();
-    for item in source_file.items() {
-        if let sai_syntax::ast::Item::Type(type_decl) = item {
-            let Some(name) = type_decl
-                .name()
-                .and_then(|name| name.token())
-                .map(|token| token.text().to_owned())
-            else {
-                return false;
-            };
-            if is_public_visibility(type_decl.visibility()) {
-                public_type_names.insert(name.clone());
-            }
-            type_names.insert(name);
-        }
-    }
-    if !check_type_decls_acyclic(&source_file, source, &type_names) {
-        return false;
-    }
-    let mut impls = Vec::new();
-    for item in source_file.items() {
-        match item {
-            sai_syntax::ast::Item::Function(function) => {
-                if function.attrs().next().is_some()
-                    || !function
-                        .visibility()
-                        .is_some_and(|visibility| visibility.pub_token().is_some())
-                {
-                    return false;
-                }
-                saw_function = true;
-            }
-            sai_syntax::ast::Item::Type(type_decl) => {
-                if !check_type_decl_primitive_fields(
-                    &type_decl,
-                    source,
-                    &type_names,
-                    &public_type_names,
-                ) {
-                    return false;
-                }
-            }
-            sai_syntax::ast::Item::Impl(impl_decl) => {
-                saw_impl = true;
-                impls.push(impl_decl);
-            }
-            sai_syntax::ast::Item::Const(constant) => {
-                if !check_public_const_decl(&constant) {
-                    return false;
-                }
-            }
-            sai_syntax::ast::Item::Use(_) => {}
-            _ => return false,
-        }
-    }
-    let mut seen_methods = HashSet::new();
-    // `type`+`impl`-only sources are covered too — an impl block
-    // cannot resolve without a declared `type`, and its methods are
-    // owners the checker analyzes like the mixed kind. Free functions
-    // are not required.
-    saw_impl
-        && (saw_function || !type_names.is_empty())
-        && impls.iter().all(|impl_decl| {
-            check_impl_decl_is_inherent_public_methods(
-                impl_decl,
-                &type_names,
-                source,
-                &mut seen_methods,
-            )
-        })
-}
-
 // Like `check_source_is_mixed_public_items` but without the
 // package-level shape requirement: the file may hold any subset of the
 // allowed item kinds (attr-free `pub fn`s, `type`s, inherent `impl`s,
@@ -2475,23 +2382,25 @@ fn check_source_is_mixed_public_items(source: &[u8]) -> bool {
 // Method-name duplicates are checked per file; without `use`, impls
 // in different files bind to file-local types, so cross-file
 // duplicates cannot alias.
-fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool) {
+fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bool, bool) {
     use sai_syntax::ast::AstNode as _;
 
     let source = strip_utf8_bom(source);
     let Some(parsed) = sai_fmt::parse_source(source).ok() else {
-        return (false, false);
+        return (false, false, false, false);
     };
     let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
-        return (false, false);
+        return (false, false, false, false);
     };
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
     {
-        return (false, false);
+        return (false, false, false, false);
     }
     let mut saw_impl = false;
+    let mut saw_fn = false;
+    let mut saw_const = false;
     let mut type_names = HashSet::new();
     let mut public_type_names = HashSet::new();
     for item in source_file.items() {
@@ -2501,7 +2410,7 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool) {
                 .and_then(|name| name.token())
                 .map(|token| token.text().to_owned())
             else {
-                return (false, false);
+                return (false, false, false, false);
             };
             if is_public_visibility(type_decl.visibility()) {
                 public_type_names.insert(name.clone());
@@ -2510,7 +2419,7 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool) {
         }
     }
     if !check_type_decls_acyclic(&source_file, source, &type_names) {
-        return (false, false);
+        return (false, false, false, false);
     }
     let mut impls = Vec::new();
     for item in source_file.items() {
@@ -2521,8 +2430,9 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool) {
                         .visibility()
                         .is_some_and(|visibility| visibility.pub_token().is_some())
                 {
-                    return (false, false);
+                    return (false, false, false, false);
                 }
+                saw_fn = true;
             }
             sai_syntax::ast::Item::Type(type_decl) => {
                 if !check_type_decl_primitive_fields(
@@ -2531,7 +2441,7 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool) {
                     &type_names,
                     &public_type_names,
                 ) {
-                    return (false, false);
+                    return (false, false, false, false);
                 }
             }
             sai_syntax::ast::Item::Impl(impl_decl) => {
@@ -2540,11 +2450,12 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool) {
             }
             sai_syntax::ast::Item::Const(constant) => {
                 if !check_public_const_decl(&constant) {
-                    return (false, false);
+                    return (false, false, false, false);
                 }
+                saw_const = true;
             }
             sai_syntax::ast::Item::Use(_) => {}
-            _ => return (false, false),
+            _ => return (false, false, false, false),
         }
     }
     let mut seen_methods = HashSet::new();
@@ -2556,7 +2467,7 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool) {
             &mut seen_methods,
         )
     });
-    (ok, saw_impl)
+    (ok, saw_impl, saw_fn, saw_const)
 }
 
 fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> bool {
@@ -2857,7 +2768,7 @@ fn check_mixed_public_item_coverage(
             .filter(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Const)
             .count()
             != const_resolutions.owners().len()
-        || method_resolutions.owners().is_empty()
+        || (method_resolutions.owners().is_empty() && const_resolutions.owners().is_empty())
     {
         return false;
     }
@@ -6766,17 +6677,19 @@ fn module_tree_workspace_check_diagnostics(
         })
         && {
             let mut package_saw_impl = false;
+            let mut package_saw_fn_and_const = false;
             let all_fragments = inputs[0].source_inputs.iter().all(|(_, _, source)| {
-                let (ok, file_saw_impl) =
+                let (ok, file_saw_impl, file_saw_fn, file_saw_const) =
                     check_source_is_mixed_public_items_fragment(source.as_ref());
                 package_saw_impl |= file_saw_impl;
+                package_saw_fn_and_const |= file_saw_fn && file_saw_const;
                 ok
             });
             // The mixed coverage gate requires at least one impl owner
-            // package-wide; every file may otherwise hold any subset of
-            // the checked item kinds (fn-only, type-only, const-only —
-            // including `lib.sai` itself).
-            all_fragments && package_saw_impl
+            // package-wide, or a `pub fn`+`pub const` mix — every file
+            // may otherwise hold any subset of the checked item kinds
+            // (fn-only, type-only, const-only — including `lib.sai`).
+            all_fragments && (package_saw_impl || package_saw_fn_and_const)
         };
     let mut public_primitive_const_set_covered = false;
     let mut single_public_function_body_covered = false;
