@@ -3692,6 +3692,18 @@ fn cyclic_const_reference_initializers_report_const_cycle() {
 }
 
 #[test]
+fn unit_const_comparison_in_function_body_stays_gated() {
+    let source = concat!(
+        "pub const NOTHING: () = ()\n",
+        "pub fn f() -> Bool {\n",
+        "    NOTHING == ()\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated(&output, "unit const comparison in a function body");
+}
+
+#[test]
 fn mixed_record_typed_fields_check() {
     // A `type` field typed by another `type` in the file stays
     // admissible — record-typed receivers feed `self.<field>.<leaf>`

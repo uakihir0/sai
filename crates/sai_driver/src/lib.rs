@@ -38917,6 +38917,10 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
         );
+        let const_literal_types = const_literal_types
+            .into_iter()
+            .filter(|(_, direct_type)| *direct_type != FunctionDirectType::Unit)
+            .collect();
         let local_type_owners = self.resolve_type_owner_paths_inner(
             collection,
             module_tree,
@@ -48786,6 +48790,10 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
         );
+        let const_literal_types = const_literal_types
+            .into_iter()
+            .filter(|(_, direct_type)| *direct_type != FunctionDirectType::Unit)
+            .collect();
         // Record declarations in other package files an `impl` head may
         // reach through a `use` import — parsed like same-file records.
         // A file declaring `type Str` is skipped: its `Str`-spelled
