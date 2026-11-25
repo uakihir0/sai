@@ -8370,6 +8370,7 @@ fn check_inherent_method_body_type<'a>(
             );
         }
         *inputs.str_self_field_projections.borrow_mut() = Some(self_field_projections);
+        *inputs.const_path_sites.borrow_mut() = const_path_types.cloned();
         *inputs.str_self_method_calls.borrow_mut() = Some(
             self_method_calls
                 .into_iter()
@@ -8401,6 +8402,7 @@ fn check_inherent_method_body_type<'a>(
             augmented_str_calls.as_ref().or(direct_call_signatures),
         );
         *inputs.str_self_field_projections.borrow_mut() = None;
+        *inputs.const_path_sites.borrow_mut() = None;
         *inputs.str_self_method_calls.borrow_mut() = None;
         let diagnostics = match walk? {
             Some(diagnostics) => {
