@@ -15028,6 +15028,18 @@ fn primitive_body_errors_to_diagnostics(
                 ),
                 "type mismatch",
             )?,
+            PrimitiveBodyErrorKind::ConstPatternType { found } => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::ConstPatternType,
+                format!(
+                    "const pattern type `{}` is not an integer, Bool, Char, Byte or Str",
+                    scalar_name(found)
+                ),
+                "invalid const pattern type",
+            )?,
             PrimitiveBodyErrorKind::ScalarTypeMismatch { expected, found } => {
                 const_literal_diagnostic(
                     owner.id,

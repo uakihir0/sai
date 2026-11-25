@@ -22779,6 +22779,37 @@ fn const_pattern_type_mismatch_reports() {
 }
 
 #[test]
+fn float_const_pattern_reports_const_pattern_type() {
+    // Float consts are valid scalar consts, but float patterns are not:
+    // using one in a match reports CONST_PATTERN_TYPE rather than passing
+    // merely because the scrutinee has the same float type.
+    let source = concat!(
+        "pub const RATIO: F32 = 1.0
+",
+        "pub fn pick(x: F32) -> I32 {
+",
+        "    match x {
+",
+        "        RATIO => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "float const pattern must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"CONST_PATTERN_TYPE\"")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "float const patterns are diagnosed, not gated or accepted: {stdout}"
+    );
+}
+
+#[test]
 fn const_pattern_does_not_exhaust_primitive_match() {
     // Const values are not evaluated in this slice, so a const pattern is
     // opaque to exhaustiveness and cannot replace a wildcard or binding.

@@ -196,6 +196,9 @@ pub enum PrimitiveBodyErrorKind {
         expected: PrimTy,
         found: PrimTy,
     },
+    ConstPatternType {
+        found: ScalarType,
+    },
     /// `expected <type>, found <type>` where either side may be `Str` —
     /// `Str` is not a `PrimTy`, so `TypeMismatch` cannot name it.
     ScalarTypeMismatch {
@@ -5918,6 +5921,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ConstPathType::Primitive(primitive) => ScalarType::Primitive(*primitive),
             ConstPathType::Str => ScalarType::Str,
         };
+        if matches!(found, ScalarType::Primitive(PrimTy::F32 | PrimTy::F64)) {
+            self.errors.push(PrimitiveBodyError {
+                node: diagnostic_node,
+                kind: PrimitiveBodyErrorKind::ConstPatternType { found },
+            });
+            return Ok(());
+        }
         let expected = ScalarType::Primitive(scrutinee_type);
         if found != expected {
             self.errors.push(PrimitiveBodyError {
