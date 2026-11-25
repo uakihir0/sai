@@ -17355,7 +17355,7 @@ fn check_const_tuple_literal(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    let Some(_expected_types) = expected_elements
+    let Some(expected_types) = expected_elements
         .iter()
         .map(|ty| resolve_const_literal_type(*ty, type_paths, symbols, inputs))
         .collect::<Option<Vec<_>>>()
@@ -17381,12 +17381,6 @@ fn check_const_tuple_literal(
         )?]));
     };
 
-    if values
-        .iter()
-        .any(|value| !is_direct_const_literal_or_unit(value))
-    {
-        return Ok(None);
-    }
     if values.len() != expected_elements.len() {
         return Ok(Some(vec![const_literal_diagnostic(
             owner.id,
@@ -17404,8 +17398,10 @@ fn check_const_tuple_literal(
     }
 
     let mut diagnostics = Vec::new();
-    for (expected_ty, value) in expected_elements.iter().zip(values) {
-        let Some(mut field_diagnostics) = check_const_literal_leaf(
+    for ((expected_ty, expected_type), value) in
+        expected_elements.iter().zip(&expected_types).zip(values)
+    {
+        let mut field_diagnostics = match check_const_literal_leaf(
             owner,
             *expected_ty,
             value,
@@ -17414,21 +17410,27 @@ fn check_const_tuple_literal(
             inputs,
             snapshot,
             target_cfg,
-        )?
-        else {
-            return Ok(None);
+        )? {
+            Some(diagnostics) => diagnostics,
+            None => {
+                let Some(diagnostics) = check_const_operator_expression_against_type(
+                    owner.id,
+                    *expected_type,
+                    value,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(None);
+                };
+                diagnostics
+            }
         };
         diagnostics.append(&mut field_diagnostics);
     }
     Ok(Some(diagnostics))
-}
-
-fn is_direct_const_literal_or_unit(value: &HirExpr<'_>) -> bool {
-    match value.kind {
-        ExprKind::Lit(_) => true,
-        ExprKind::Tuple(elements) => elements.is_empty(),
-        _ => false,
-    }
 }
 
 /// A binding's contribution in the `Str` local group: the family an

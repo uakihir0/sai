@@ -13133,6 +13133,8 @@ fn public_flat_tuple_const_literals_emit_check_results() {
         "pub const PAIR: (I32, Bool) = (1, true)\n",
         "pub const SINGLE: (U8,) = (255,)\n",
         "pub const MIXED: (F32, Str, ()) = (1.25, \"text\", ())\n",
+        "pub const OPERATORS: (I32, Bool, I8) = (1 + 2, true and not false, 1 << 2)\n",
+        "pub const COMPARISON: (Bool, Bool) = (1 < 2, () == ())\n",
     );
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
@@ -13170,6 +13172,14 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
             "pub const FIRST: (I32,) = (1,)\npub const SECOND: (I32,) = (true,)\n",
             "TYPE_MISMATCH",
         ),
+        (
+            "pub const FIELD_OVERFLOW: (I8,) = (127 + 1,)\n",
+            "CONST_EVAL_PANIC",
+        ),
+        (
+            "pub const FIELD_COMPARISON_MISMATCH: (I32,) = (1 < 2,)\n",
+            "TYPE_MISMATCH",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
@@ -13193,7 +13203,6 @@ fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
         "pub const NESTED: ((I32,),) = ((1,),)\n",
         "pub const ARRAY: Array<I32, 1> = [1]\n",
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
-        "pub const EXPRESSION_FIELD: (I32,) = (1 + 2,)\n",
         "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
         "pub const SCALAR_TUPLE_MISMATCH: I32 = (1,)\n",
         "pub type Number = I32\npub const ALIAS_FIELD: (Number,) = (1,)\n",
