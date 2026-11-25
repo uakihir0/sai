@@ -13158,6 +13158,10 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
             "pub const ARITY_LONG: (I32,) = (1, true)\n",
             "TYPE_MISMATCH",
         ),
+        (
+            "pub const ARITY_EXPRESSIONS: (I32,) = (1 + 2, 3 + 4)\n",
+            "TYPE_MISMATCH",
+        ),
         ("pub const ARITY_ZERO: (I32,) = ()\n", "TYPE_MISMATCH"),
         ("pub const GROUPED_SCALAR: (I32,) = (1)\n", "TYPE_MISMATCH"),
         (
@@ -13201,6 +13205,7 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
 fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
         "pub const NESTED: ((I32,),) = ((1,),)\n",
+        "pub const ARITY_UNSUPPORTED: (I32,) = ((1,), (2,))\n",
         "pub const ARRAY: Array<I32, 1> = [1]\n",
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
         "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",

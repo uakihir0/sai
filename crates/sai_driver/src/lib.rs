@@ -17345,6 +17345,42 @@ fn index_str_method_call_sites(
     });
 }
 
+fn is_const_scalar_expression_shape(value: &HirExpr<'_>) -> bool {
+    match value.kind {
+        ExprKind::Lit(_) => true,
+        ExprKind::Tuple(elements) => elements.is_empty(),
+        ExprKind::Unary(UnOp::Not | UnOp::Neg | UnOp::BitNot, operand) => {
+            is_const_scalar_expression_shape(operand)
+        }
+        ExprKind::Binary(
+            BinOp::And
+            | BinOp::Or
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::WrapAdd
+            | BinOp::WrapSub
+            | BinOp::WrapMul
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr,
+            left,
+            right,
+        ) => is_const_scalar_expression_shape(left) && is_const_scalar_expression_shape(right),
+        _ => false,
+    }
+}
+
 fn check_const_tuple_literal(
     owner: &HirOwner<'_>,
     expected_elements: &[Ty<'_>],
@@ -17381,6 +17417,12 @@ fn check_const_tuple_literal(
         )?]));
     };
 
+    if values
+        .iter()
+        .any(|value| !is_const_scalar_expression_shape(value))
+    {
+        return Ok(None);
+    }
     if values.len() != expected_elements.len() {
         return Ok(Some(vec![const_literal_diagnostic(
             owner.id,
