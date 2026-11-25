@@ -5897,6 +5897,37 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
+    /// Primitive const patterns carry their declared type through the
+    /// driver's const-site table. Their values are opaque to this bounded
+    /// exhaustiveness implementation, so they neither cover a Bool domain
+    /// nor count as a catch-all.
+    fn check_match_const_pattern(
+        &mut self,
+        pattern_node: HirId,
+        diagnostic_node: HirId,
+        scrutinee_type: PrimTy,
+    ) -> Result<(), ()> {
+        let Some(const_type) = self
+            .input
+            .const_path_types
+            .and_then(|types| types.get(&pattern_node))
+        else {
+            return Err(());
+        };
+        let found = match const_type {
+            ConstPathType::Primitive(primitive) => ScalarType::Primitive(*primitive),
+            ConstPathType::Str => ScalarType::Str,
+        };
+        let expected = ScalarType::Primitive(scrutinee_type);
+        if found != expected {
+            self.errors.push(PrimitiveBodyError {
+                node: diagnostic_node,
+                kind: PrimitiveBodyErrorKind::ScalarTypeMismatch { expected, found },
+            });
+        }
+        Ok(())
+    }
+
     /// Validates one arm's pattern under the bounded exhaustiveness rule:
     /// literal patterns check against the scrutinee type, wildcard and plain
     /// `binding` patterns mark the catch-all (with the binding installed at
@@ -5934,19 +5965,36 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     return Err(());
                 }
                 for alternative in alternatives {
-                    let PatKind::Lit(literal) = alternative.kind else {
-                        return Err(());
-                    };
-                    if arm.guard.is_none() {
-                        if let Lit::Bool(value) = literal {
-                            if value {
-                                bool_cover.0 = true;
-                            } else {
-                                bool_cover.1 = true;
+                    match alternative.kind {
+                        PatKind::Lit(literal) => {
+                            if arm.guard.is_none() {
+                                if let Lit::Bool(value) = literal {
+                                    if value {
+                                        bool_cover.0 = true;
+                                    } else {
+                                        bool_cover.1 = true;
+                                    }
+                                }
                             }
+                            self.check_match_literal_pattern(
+                                literal,
+                                arm.pat.hir_id,
+                                scrutinee_type,
+                            )?;
                         }
+                        PatKind::Ctor {
+                            args: None,
+                            has_rest: false,
+                            ..
+                        } => {
+                            self.check_match_const_pattern(
+                                alternative.hir_id,
+                                arm.pat.hir_id,
+                                scrutinee_type,
+                            )?;
+                        }
+                        _ => return Err(()),
                     }
-                    self.check_match_literal_pattern(literal, arm.pat.hir_id, scrutinee_type)?;
                 }
             }
             // `l1..=l2` bounds must both be literals — open ranges and
@@ -5972,6 +6020,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         kind: PrimitiveBodyErrorKind::EmptyRangePattern,
                     });
                 }
+            }
+            PatKind::Ctor {
+                args: None,
+                has_rest: false,
+                ..
+            } => {
+                self.check_match_const_pattern(arm.pat.hir_id, arm.pat.hir_id, scrutinee_type)?;
             }
             PatKind::Wild => *catch_all = arm.guard.is_none(),
             PatKind::Binding {
