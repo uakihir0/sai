@@ -3548,6 +3548,123 @@ fn unsupported_const_initializer_in_mixed_source_stays_gated() {
 }
 
 #[test]
+fn const_reference_initializers_check() {
+    // Public const initializers can reference earlier or later consts in
+    // the same module when their declared types match.
+    let source = concat!(
+        "pub const LIMIT: I32 = 10
+",
+        "pub const ALIAS: I32 = LIMIT
+",
+        "pub const FORWARD: I32 = LATER
+",
+        "pub const LATER: I32 = 20
+",
+        "pub fn make() -> I32 {
+",
+        "    ALIAS
+",
+        "}
+",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn imported_const_reference_initializers_check() {
+    // Imported consts keep their declared type in direct, member, aliased,
+    // and re-exported reference positions.
+    let source = concat!(
+        "use acme:empty/middle.{CAP}
+",
+        "use acme:empty/values
+",
+        "pub const DIRECT: I32 = CAP
+",
+        "pub const MEMBER: I32 = values.LIMIT
+",
+        "pub fn make() -> I32 {
+",
+        "    DIRECT
+",
+        "}
+",
+    );
+    let output = run_check(
+        source,
+        "",
+        &[
+            (
+                "src/values.sai",
+                "pub const LIMIT: I32 = 10
+",
+            ),
+            (
+                "src/middle.sai",
+                "pub use acme:empty/values.{LIMIT as CAP}
+",
+            ),
+        ],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn const_reference_initializer_reports_type_mismatch() {
+    // The referenced const contributes its declared type rather than
+    // silently adopting the referencing const's annotation.
+    let source = concat!(
+        "pub const LIMIT: I32 = 10
+",
+        "pub const ALIAS: I64 = LIMIT
+",
+        "pub fn make() -> I32 {
+",
+        "    0
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(
+        !output.status.success(),
+        "mismatched const reference must fail"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `I64`, found `I32`"),
+        "expected the referenced const type mismatch: {stdout}"
+    );
+}
+
+#[test]
+fn cyclic_const_reference_initializers_report_const_cycle() {
+    // Direct and indirect const cycles are compile errors rather than
+    // silently admitted by the order-independent type table.
+    let source = concat!(
+        "pub const FIRST: I32 = SECOND
+",
+        "pub const SECOND: I32 = FIRST
+",
+        "pub fn make() -> I32 {
+",
+        "    0
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "cyclic consts must fail");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"code\":\"CONST_CYCLE\""),
+        "expected CONST_CYCLE: {stdout}"
+    );
+}
+
+#[test]
 fn mixed_record_typed_fields_check() {
     // A `type` field typed by another `type` in the file stays
     // admissible — record-typed receivers feed `self.<field>.<leaf>`
