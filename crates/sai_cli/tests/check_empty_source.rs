@@ -22322,3 +22322,37 @@ fn multi_file_source_with_str_import_stays_gated() {
         "imported `Str` record fields stay behind the existing gate: {stdout}"
     );
 }
+
+#[test]
+fn multi_file_source_with_unresolved_str_import_does_not_also_gate() {
+    // An unresolved `use pkg/mod.{Str}` reports UNRESOLVED_IMPORT
+    // only — without a resolved `Str` def in scope the name keeps
+    // the builtin treatment, so no extra feature gate is emitted
+    // (IR-1142 review fix).
+    let root_source = concat!(
+        "use acme:empty/helper.{Str}\n",
+        "\n",
+        "type T { s: Str }\n",
+        "impl T {\n",
+        "    pub fn m(self: borrow Self) -> Bool {\n",
+        "        self.s.is_empty()\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/helper.sai", "pub fn add(x: I32) -> I32 {\n    x\n}\n")],
+        &[],
+    );
+    assert!(!output.status.success(), "unresolved import must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"UNRESOLVED_IMPORT\""),
+        "expected UNRESOLVED_IMPORT: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "an unresolved import must not add a feature gate: {stdout}"
+    );
+}

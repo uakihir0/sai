@@ -8116,6 +8116,7 @@ fn check_inherent_method_body_type<'a>(
     inputs: &'a CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    str_use_shadow: bool,
     primitive_type_results: &mut Option<sai_ty::typeck::body::PrimitiveBodyTypeResults>,
 ) -> Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError> {
     if !impl_owner.raw_attrs.is_empty()
@@ -8258,7 +8259,9 @@ fn check_inherent_method_body_type<'a>(
         // `self.<field>` reads project the field's family —
         // `Str`/`scalar` fields only; other field types keep the
         // whole impl gated.
-        let Some(field_types) = str_inherent_method_field_types(*self_ty, symbols, inputs) else {
+        let Some(field_types) =
+            str_inherent_method_field_types(*self_ty, symbols, inputs, str_use_shadow)
+        else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
         // `self.<method>(..)` calls resolve through the impl's sibling
@@ -8407,7 +8410,9 @@ fn check_inherent_method_body_type<'a>(
         };
         return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
     }
-    let Some(field_types) = inherent_method_primitive_field_types(*self_ty, symbols, inputs) else {
+    let Some(field_types) =
+        inherent_method_primitive_field_types(*self_ty, symbols, inputs, str_use_shadow)
+    else {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
     let mut self_field_projections = HashMap::new();
@@ -8789,56 +8794,28 @@ fn parse_inherent_method_impl(
     ))
 }
 
-// A `use` decl binds names into module scope — an imported `Str`
+// `Str` bound by a `use` item that resolved to a real definition
 // shadows the prelude string the same way a file-local `type Str`
-// does, so `Str`-spelled field types must not pass as builtin.
-fn source_file_use_binds_str(source_file: &ast::SourceFile, source_text: &str) -> bool {
-    fn binds_str(text: &str) -> bool {
-        sai_syntax::normalize_identifier(text.strip_prefix("r#").unwrap_or(text)) == "Str"
-    }
-    use sai_syntax::ast::{AstNode as _, AstToken as _};
-    let text_of = |node: &sai_syntax::SyntaxNode| -> Option<String> {
-        let range = node.text_range();
-        source_text
-            .get(range.start().to_usize()..range.end().to_usize())
-            .map(str::to_owned)
+// does — a `Str`-spelled field type then names that def, not core
+// `Str`. Unresolved or target-filtered imports leave no `Str` def
+// in the module scope, so they keep the builtin treatment.
+fn use_shadows_str(module_scope: &Phase1ModuleScopes, symbols: &Interner) -> bool {
+    let Ok(str_symbol) = symbols.intern("Str") else {
+        return false;
     };
-    source_file
-        .syntax()
-        .children()
-        .filter_map(ast::UseDecl::cast)
-        .any(|use_decl| {
-            if let Some(items) = use_decl.items() {
-                items.items().any(|item| {
-                    item.alias()
-                        .and_then(|alias| text_of(alias.syntax()))
-                        .or_else(|| item.name().and_then(|name| text_of(name.syntax())))
-                        .is_some_and(|text| binds_str(&text))
-                })
-            } else {
-                use_decl
-                    .alias()
-                    .and_then(|alias| alias.name())
-                    .and_then(|name| text_of(name.syntax()))
-                    .or_else(|| {
-                        use_decl.package().map(|path| {
-                            path.syntax()
-                                .text()
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or_default()
-                                .to_owned()
-                        })
-                    })
-                    .is_some_and(|text| binds_str(&text))
-            }
-        })
+    module_scope.scope.get(&str_symbol).is_some_and(|binding| {
+        matches!(
+            binding.origin,
+            BindingOrigin::Use { .. } | BindingOrigin::PubUse { .. }
+        ) && matches!(binding.res, Res::Def(_, _))
+    })
 }
 
 fn inherent_method_primitive_field_types(
     self_ty: Ty<'_>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+    str_use_shadow: bool,
 ) -> Option<InherentMethodPrimitiveFields> {
     use sai_syntax::ast::AstNode as _;
 
@@ -8901,7 +8878,7 @@ fn inherent_method_primitive_field_types(
                 .strip_prefix("r#")
                 .unwrap_or(&record.type_name),
         ) == "Str"
-    }) || source_file_use_binds_str(&source_file, inputs.source.text());
+    }) || str_use_shadow;
     let mut nested = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if index == self_index {
@@ -9592,6 +9569,7 @@ fn str_inherent_method_field_types(
     self_ty: Ty<'_>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+    str_use_shadow: bool,
 ) -> Option<InherentMethodStrFields> {
     use sai_syntax::ast::AstNode as _;
 
@@ -9651,7 +9629,7 @@ fn str_inherent_method_field_types(
                 .strip_prefix("r#")
                 .unwrap_or(&record.type_name),
         ) == "Str"
-    }) || source_file_use_binds_str(&source_file, inputs.source.text());
+    }) || str_use_shadow;
     let mut nested = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if index == self_index {
@@ -45972,6 +45950,8 @@ impl RootDatabase {
                                         collection.module_tree.package,
                                         &inputs,
                                     );
+                                    let str_use_shadow =
+                                        use_shadows_str(module_scope, &self.symbols);
                                     body_type_check = if descriptor.kind == TopLevelOwnerKind::Impl
                                     {
                                         check_inherent_method_body_type(
@@ -45987,6 +45967,7 @@ impl RootDatabase {
                                             &inputs,
                                             snapshot,
                                             &collection.target_cfg,
+                                            str_use_shadow,
                                             &mut primitive_body_type_results,
                                         )
                                     } else {
