@@ -2119,6 +2119,55 @@ fn strip_utf8_bom(source: &[u8]) -> &[u8] {
 // `self.<field>.<leaf>` projections). An empty record has nothing to
 // verify and is admissible. `type_names`/`public_type_names` hold raw
 // declared spellings; comparisons normalize `r#` like the impl check.
+
+// Names a `use` decl binds into module scope — `use pkg/mod.{item}`,
+// `{item as alias}` (binds the alias), and `use pkg/mod`/`use pkg/mod
+// as alias` (binds the last path segment or the alias). A bound `Str`
+// shadows the prelude string the same way a file-local `type Str` does.
+fn source_use_binds_str(source_file: &sai_syntax::ast::SourceFile, source: &[u8]) -> bool {
+    use sai_syntax::ast::{AstNode as _, AstToken as _};
+    fn binds_str(text: &str) -> bool {
+        normalize_type_name(text.strip_prefix("r#").unwrap_or(text)) == "Str"
+    }
+    let text_of = |node: &sai_syntax::SyntaxNode| -> Option<String> {
+        let range = node.text_range();
+        source
+            .get(range.start().to_usize()..range.end().to_usize())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(str::to_owned)
+    };
+    source_file
+        .syntax()
+        .children()
+        .filter_map(sai_syntax::ast::UseDecl::cast)
+        .any(|use_decl| {
+            if let Some(items) = use_decl.items() {
+                items.items().any(|item| {
+                    item.alias()
+                        .and_then(|alias| text_of(alias.syntax()))
+                        .or_else(|| item.name().and_then(|name| text_of(name.syntax())))
+                        .is_some_and(|text| binds_str(text.as_str()))
+                })
+            } else {
+                use_decl
+                    .alias()
+                    .and_then(|alias| alias.name())
+                    .and_then(|name| text_of(name.syntax()))
+                    .or_else(|| {
+                        use_decl.package().map(|path| {
+                            path.syntax()
+                                .text()
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or_default()
+                                .to_owned()
+                        })
+                    })
+                    .is_some_and(|text| binds_str(text.as_str()))
+            }
+        })
+}
+
 fn check_type_decl_primitive_fields(
     type_decl: &sai_syntax::ast::TypeDecl,
     source: &[u8],
@@ -2158,7 +2207,11 @@ fn check_type_decl_primitive_fields(
     // builtin.
     let str_shadowed = type_names
         .iter()
-        .any(|name| normalize_type_name(name) == "Str");
+        .any(|name| normalize_type_name(name) == "Str")
+        || sai_fmt::parse_source(source)
+            .ok()
+            .and_then(|parsed| sai_syntax::ast::SourceFile::cast(parsed.root().clone()))
+            .is_some_and(|file| source_use_binds_str(&file, source));
     let mut field_names = HashSet::new();
     fields.fields().all(|field| {
         let Some(field_name) = field

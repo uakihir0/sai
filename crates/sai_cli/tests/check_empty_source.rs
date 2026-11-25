@@ -22289,3 +22289,36 @@ fn multi_file_source_with_module_alias_call_stays_gated() {
         "module-alias path calls stay behind the existing gate: {stdout}"
     );
 }
+
+#[test]
+fn multi_file_source_with_str_import_stays_gated() {
+    // `use pkg/mod.{Str}` imports a record named `Str` — a field
+    // typed `Str` then names that record, not the builtin, so
+    // `self.s.is_empty()` must gate rather than wrongly pass as a
+    // builtin Str method call (IR-1142 review fix).
+    let root_source = concat!(
+        "use acme:empty/helper.{Str}\n",
+        "\n",
+        "type T { s: Str }\n",
+        "impl T {\n",
+        "    pub fn m(self: borrow Self) -> Bool {\n",
+        "        self.s.is_empty()\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/helper.sai", "type Str { v: Bool }\n")],
+        &[],
+    );
+    assert!(
+        !output.status.success(),
+        "imported Str must not pass as builtin"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "imported `Str` record fields stay behind the existing gate: {stdout}"
+    );
+}

@@ -8789,6 +8789,52 @@ fn parse_inherent_method_impl(
     ))
 }
 
+// A `use` decl binds names into module scope — an imported `Str`
+// shadows the prelude string the same way a file-local `type Str`
+// does, so `Str`-spelled field types must not pass as builtin.
+fn source_file_use_binds_str(source_file: &ast::SourceFile, source_text: &str) -> bool {
+    fn binds_str(text: &str) -> bool {
+        sai_syntax::normalize_identifier(text.strip_prefix("r#").unwrap_or(text)) == "Str"
+    }
+    use sai_syntax::ast::{AstNode as _, AstToken as _};
+    let text_of = |node: &sai_syntax::SyntaxNode| -> Option<String> {
+        let range = node.text_range();
+        source_text
+            .get(range.start().to_usize()..range.end().to_usize())
+            .map(str::to_owned)
+    };
+    source_file
+        .syntax()
+        .children()
+        .filter_map(ast::UseDecl::cast)
+        .any(|use_decl| {
+            if let Some(items) = use_decl.items() {
+                items.items().any(|item| {
+                    item.alias()
+                        .and_then(|alias| text_of(alias.syntax()))
+                        .or_else(|| item.name().and_then(|name| text_of(name.syntax())))
+                        .is_some_and(|text| binds_str(&text))
+                })
+            } else {
+                use_decl
+                    .alias()
+                    .and_then(|alias| alias.name())
+                    .and_then(|name| text_of(name.syntax()))
+                    .or_else(|| {
+                        use_decl.package().map(|path| {
+                            path.syntax()
+                                .text()
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or_default()
+                                .to_owned()
+                        })
+                    })
+                    .is_some_and(|text| binds_str(&text))
+            }
+        })
+}
+
 fn inherent_method_primitive_field_types(
     self_ty: Ty<'_>,
     symbols: &Interner,
@@ -8855,7 +8901,7 @@ fn inherent_method_primitive_field_types(
                 .strip_prefix("r#")
                 .unwrap_or(&record.type_name),
         ) == "Str"
-    });
+    }) || source_file_use_binds_str(&source_file, inputs.source.text());
     let mut nested = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if index == self_index {
@@ -9605,7 +9651,7 @@ fn str_inherent_method_field_types(
                 .strip_prefix("r#")
                 .unwrap_or(&record.type_name),
         ) == "Str"
-    });
+    }) || source_file_use_binds_str(&source_file, inputs.source.text());
     let mut nested = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if index == self_index {
