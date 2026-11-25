@@ -11449,7 +11449,6 @@ fn match_exhaustiveness_and_unreachable_arms_reach_cli_diagnostics() {
 #[test]
 fn unsupported_match_tail_shapes_remain_gated() {
     for source in [
-        "pub fn choose(value: I32) -> I32 { match value { 1.. => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match value { 0 | n => 1, _ => 0 } }\n",
         "pub fn choose(value: I32) -> I32 { match 0 { 0 => 1, _ => 2 } }\n",
         "pub fn choose(value: I32) -> Bool { match value { 0 => 1, _ => 2 }\n true }\n",
@@ -22792,6 +22791,79 @@ fn const_range_endpoints_in_primitive_match_check() {
         &[],
     );
     assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn open_range_endpoints_in_primitive_match_check() {
+    // One-sided ranges admit literal or scalar const endpoints in
+    // primitive matches and in scalar matches inside `-> Str` bodies.
+    let source = concat!(
+        "pub const LOW: I32 = 1
+",
+        "pub const HIGH: I32 = 9
+",
+        "pub fn low(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        LOW.. => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn high(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        ..=HIGH => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn lit_low(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        1.. => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn lit_high(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        ..=9 => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn text(x: I32) -> Str {
+",
+        "    match x {
+",
+        "        LOW.. => \"a\",
+",
+        "        _ => \"b\",
+",
+        "    }
+",
+        "}
+",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
 
 #[test]
