@@ -22638,6 +22638,67 @@ fn member_const_reference_in_match_scrutinee_checks() {
 }
 
 #[test]
+fn reexported_const_reference_checks() {
+    // `pub use` keeps the original const identity through direct
+    // imports, module-member reads, aliases, and re-export chains.
+    let root_source = concat!(
+        "use acme:empty/reexport.{LIMIT}\n",
+        "use acme:empty/aliased\n",
+        "\n",
+        "pub fn direct() -> I32 {\n",
+        "    LIMIT\n",
+        "}\n",
+        "pub fn member() -> I32 {\n",
+        "    aliased.CAP\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/values.sai", "pub const LIMIT: I32 = 5\n"),
+            ("src/middle.sai", "pub use acme:empty/values.{LIMIT}\n"),
+            ("src/reexport.sai", "pub use acme:empty/middle.{LIMIT}\n"),
+            (
+                "src/aliased.sai",
+                "pub use acme:empty/values.{LIMIT as CAP}\n",
+            ),
+        ],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn reexported_const_type_mismatch_reports() {
+    // The re-exported const retains its declared type through a chain.
+    let root_source = concat!(
+        "use acme:empty/reexport.{LIMIT}\n",
+        "\n",
+        "pub fn bad() -> I32 {\n",
+        "    LIMIT\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            ("src/values.sai", "pub const LIMIT: I64 = 5\n"),
+            ("src/reexport.sai", "pub use acme:empty/values.{LIMIT}\n"),
+        ],
+        &[],
+    );
+    assert!(!output.status.success(), "const type mismatch must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `I32`, found `I64`")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "re-exported const mismatches are diagnosed, not gated: {stdout}"
+    );
+}
+
+#[test]
 fn nonconst_member_projection_match_scrutinee_stays_gated() {
     // Only member expressions resolved to consts enter this slice;
     // ordinary record-field scrutinees still stay outside it.
