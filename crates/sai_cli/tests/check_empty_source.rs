@@ -13637,6 +13637,10 @@ fn nominal_const_constructor_forms_outside_the_slice_remain_gated() {
             "pub const ONE: I32 = 1\n",
         ),
         concat!(
+            "pub distinct HugeArray = Array<I32, 0x1_0000_0000>\n",
+            "pub const ONE: I32 = 1\n",
+        ),
+        concat!(
             "pub enum Status { Ready }\n",
             "pub const VALUE: Status = Status.make(1)\n",
         ),

@@ -2357,7 +2357,7 @@ fn const_arg_is_supported_array_length(argument: &sai_syntax::ast::ConstArg) -> 
     else {
         return false;
     };
-    argument.minus_token().is_none() || length == 0
+    length <= u128::from(u32::MAX) && (argument.minus_token().is_none() || length == 0)
 }
 
 fn type_has_supported_const_constructor_shape(ty: &sai_syntax::ast::Type) -> bool {
