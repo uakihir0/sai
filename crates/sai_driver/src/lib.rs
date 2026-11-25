@@ -28754,49 +28754,40 @@ fn const_initializer_reference_targets(
 }
 
 fn const_reference_cycle_members(references: &HashMap<DefId, Vec<DefId>>) -> HashSet<DefId> {
-    let mut states = HashMap::<DefId, u8>::new();
     let mut cyclic = HashSet::new();
-
-    for start in references.keys() {
-        if states.contains_key(start) {
-            continue;
-        }
-        states.insert(*start, 1);
-        let mut calls = vec![(*start, 0usize)];
-        let mut path = vec![*start];
-        while let Some((node, next_target)) = calls.last_mut() {
-            let target_count = references.get(node).map_or(0, Vec::len);
-            if *next_target == target_count {
-                states.insert(*node, 2);
-                calls.pop();
-                path.pop();
-                continue;
-            }
-            let target = references
-                .get(node)
-                .and_then(|targets| targets.get(*next_target))
-                .copied();
-            *next_target += 1;
-            let Some(target) = target else {
-                continue;
-            };
-            match states.get(&target).copied() {
-                Some(2) => {}
-                Some(1) => {
-                    if let Some(position) = path.iter().position(|entry| *entry == target) {
-                        cyclic.extend(path[position..].iter().copied());
-                    }
-                }
-                _ => {
-                    states.insert(target, 1);
-                    calls.push((target, 0));
-                    path.push(target);
-                }
-            }
+    for (node, targets) in references {
+        if targets.iter().any(|target| {
+            *target == *node
+                || const_reference_reaches(references, *target, *node, &mut HashSet::new())
+        }) {
+            cyclic.insert(*node);
         }
     }
-
     cyclic
+}
+
+fn const_reference_reaches(
+    references: &HashMap<DefId, Vec<DefId>>,
+    from: DefId,
+    to: DefId,
+    visited: &mut HashSet<DefId>,
+) -> bool {
+    if from == to {
+        return true;
+    }
+    if !visited.insert(from) {
+        return false;
+    }
+    let Some(targets) = references.get(&from) else {
+        return false;
+    };
+    for target in targets {
+        if const_reference_reaches(references, *target, to, visited) {
+            return true;
+        }
+    }
+    visited.remove(&from);
+    false
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -3704,6 +3704,23 @@ fn unit_const_comparison_in_function_body_stays_gated() {
 }
 
 #[test]
+fn branching_tuple_const_reference_cycle_reports_const_cycle() {
+    let source = concat!(
+        "pub const FIRST: (I32, I32) = (SECOND, THIRD)\n",
+        "pub const SECOND: (I32,) = (FIRST,)\n",
+        "pub const THIRD: (I32,) = (SECOND,)\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "cyclic tuple consts must fail");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"code\":\"CONST_CYCLE\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "expected CONST_CYCLE without a feature gate: {stdout}"
+    );
+}
+
+#[test]
 fn mixed_record_typed_fields_check() {
     // A `type` field typed by another `type` in the file stays
     // admissible — record-typed receivers feed `self.<field>.<leaf>`
