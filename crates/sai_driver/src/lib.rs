@@ -17982,6 +17982,14 @@ fn const_variant_target(
     None
 }
 
+fn const_variant_like_name(symbols: &Interner, name: Symbol) -> bool {
+    symbols
+        .resolve(name)
+        .ok()
+        .and_then(|name| name.chars().next())
+        .is_none_or(|first| first.is_uppercase())
+}
+
 fn const_constructor_target(
     callee: &HirExpr<'_>,
     context: &ConstReferenceContext<'_, '_>,
@@ -18716,14 +18724,15 @@ fn check_const_nominal_constructor(
         let Some(target) = const_constructor_target(callee, context, Some(expected.def_id)) else {
             let unknown_variant = if let ExprKind::ImplicitMember(name) = callee.kind {
                 (context.constructors.enums.contains_key(&expected.def_id)
+                    && const_variant_like_name(symbols, name.sym)
                     && find_const_variant(expected.def_id, name.sym, context.constructors)
                         .is_none())
                 .then_some((name.sym, name.span))
             } else {
                 const_explicit_variant_parts(callee, context).and_then(
                     |(enum_def, variant_name, span)| {
-                        (enum_def == expected.def_id
-                            && context.constructors.enums.contains_key(&enum_def)
+                        (context.constructors.enums.contains_key(&enum_def)
+                            && const_variant_like_name(symbols, variant_name)
                             && find_const_variant(enum_def, variant_name, context.constructors)
                                 .is_none())
                         .then_some((variant_name, span))
@@ -18851,6 +18860,7 @@ fn check_const_nominal_constructor(
 
     if let ExprKind::ImplicitMember(name) = value.kind
         && context.constructors.enums.contains_key(&expected.def_id)
+        && const_variant_like_name(symbols, name.sym)
         && find_const_variant(expected.def_id, name.sym, context.constructors).is_none()
     {
         return Ok(Some(vec![const_literal_diagnostic(
@@ -18926,8 +18936,8 @@ fn check_const_nominal_constructor(
             context.module_members,
         ) && prefix.consumed_segments == head_segments.len()
             && let Res::Def(DefKind::Enum, enum_def) = prefix.base
-            && enum_def == expected.def_id
             && context.constructors.enums.contains_key(&enum_def)
+            && const_variant_like_name(symbols, variant_segment.name.sym)
             && find_const_variant(enum_def, variant_segment.name.sym, context.constructors)
                 .is_none()
         {
