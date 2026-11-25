@@ -13516,6 +13516,14 @@ fn nominal_const_constructor_errors_are_checked() {
         (
             concat!(
                 "pub enum Status { Ready }\n",
+                "pub const MISSING: Status = ._Missing\n",
+            ),
+            "UNKNOWN_VARIANT",
+            "unknown enum variant",
+        ),
+        (
+            concat!(
+                "pub enum Status { Ready }\n",
                 "pub enum Other { OtherReady }\n",
                 "pub const MISSING: Other = Status.Missing(1)\n",
             ),

@@ -17986,8 +17986,10 @@ fn const_variant_like_name(symbols: &Interner, name: Symbol) -> bool {
     symbols
         .resolve(name)
         .ok()
-        .and_then(|name| name.chars().next())
-        .is_none_or(|first| first.is_uppercase())
+        .map(|name| {
+            sai_syntax::identifier_case_kind(name.as_ref()) == sai_syntax::SyntaxKind::UIDENT
+        })
+        .unwrap_or(true)
 }
 
 fn const_constructor_target(
