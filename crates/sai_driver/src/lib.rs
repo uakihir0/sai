@@ -8116,6 +8116,7 @@ fn check_inherent_method_body_type<'a>(
     inputs: &'a CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
+    str_use_shadow: bool,
     primitive_type_results: &mut Option<sai_ty::typeck::body::PrimitiveBodyTypeResults>,
 ) -> Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError> {
     if !impl_owner.raw_attrs.is_empty()
@@ -8258,7 +8259,9 @@ fn check_inherent_method_body_type<'a>(
         // `self.<field>` reads project the field's family —
         // `Str`/`scalar` fields only; other field types keep the
         // whole impl gated.
-        let Some(field_types) = str_inherent_method_field_types(*self_ty, symbols, inputs) else {
+        let Some(field_types) =
+            str_inherent_method_field_types(*self_ty, symbols, inputs, str_use_shadow)
+        else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
         // `self.<method>(..)` calls resolve through the impl's sibling
@@ -8407,7 +8410,9 @@ fn check_inherent_method_body_type<'a>(
         };
         return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
     }
-    let Some(field_types) = inherent_method_primitive_field_types(*self_ty, symbols, inputs) else {
+    let Some(field_types) =
+        inherent_method_primitive_field_types(*self_ty, symbols, inputs, str_use_shadow)
+    else {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
     let mut self_field_projections = HashMap::new();
@@ -8789,10 +8794,28 @@ fn parse_inherent_method_impl(
     ))
 }
 
+// `Str` bound by a `use` item that resolved to a real definition
+// shadows the prelude string the same way a file-local `type Str`
+// does — a `Str`-spelled field type then names that def, not core
+// `Str`. Unresolved or target-filtered imports leave no `Str` def
+// in the module scope, so they keep the builtin treatment.
+fn use_shadows_str(module_scope: &Phase1ModuleScopes, symbols: &Interner) -> bool {
+    let Ok(str_symbol) = symbols.intern("Str") else {
+        return false;
+    };
+    module_scope.scope.get(&str_symbol).is_some_and(|binding| {
+        matches!(
+            binding.origin,
+            BindingOrigin::Use { .. } | BindingOrigin::PubUse { .. }
+        ) && matches!(binding.res, Res::Def(_, _))
+    })
+}
+
 fn inherent_method_primitive_field_types(
     self_ty: Ty<'_>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+    str_use_shadow: bool,
 ) -> Option<InherentMethodPrimitiveFields> {
     use sai_syntax::ast::AstNode as _;
 
@@ -8810,10 +8833,6 @@ fn inherent_method_primitive_field_types(
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
-        || source_file
-            .syntax()
-            .children()
-            .any(|child| ast::UseDecl::can_cast(child.kind()))
     {
         return None;
     }
@@ -8826,7 +8845,7 @@ fn inherent_method_primitive_field_types(
         match item {
             ast::Item::Type(decl) => type_decls.push(decl),
             ast::Item::Impl(decl) => impl_decls.push(decl),
-            ast::Item::Function(_) | ast::Item::Const(_) => {}
+            ast::Item::Function(_) | ast::Item::Const(_) | ast::Item::Use(_) => {}
             _ => return None,
         }
     }
@@ -8859,7 +8878,7 @@ fn inherent_method_primitive_field_types(
                 .strip_prefix("r#")
                 .unwrap_or(&record.type_name),
         ) == "Str"
-    });
+    }) || str_use_shadow;
     let mut nested = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if index == self_index {
@@ -9550,6 +9569,7 @@ fn str_inherent_method_field_types(
     self_ty: Ty<'_>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
+    str_use_shadow: bool,
 ) -> Option<InherentMethodStrFields> {
     use sai_syntax::ast::AstNode as _;
 
@@ -9567,10 +9587,6 @@ fn str_inherent_method_field_types(
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
-        || source_file
-            .syntax()
-            .children()
-            .any(|child| ast::UseDecl::can_cast(child.kind()))
     {
         return None;
     }
@@ -9580,7 +9596,7 @@ fn str_inherent_method_field_types(
         match item {
             ast::Item::Type(decl) => type_decls.push(decl),
             ast::Item::Impl(decl) => impl_decls.push(decl),
-            ast::Item::Function(_) | ast::Item::Const(_) => {}
+            ast::Item::Function(_) | ast::Item::Const(_) | ast::Item::Use(_) => {}
             _ => return None,
         }
     }
@@ -9613,7 +9629,7 @@ fn str_inherent_method_field_types(
                 .strip_prefix("r#")
                 .unwrap_or(&record.type_name),
         ) == "Str"
-    });
+    }) || str_use_shadow;
     let mut nested = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if index == self_index {
@@ -45934,6 +45950,8 @@ impl RootDatabase {
                                         collection.module_tree.package,
                                         &inputs,
                                     );
+                                    let str_use_shadow =
+                                        use_shadows_str(module_scope, &self.symbols);
                                     body_type_check = if descriptor.kind == TopLevelOwnerKind::Impl
                                     {
                                         check_inherent_method_body_type(
@@ -45949,6 +45967,7 @@ impl RootDatabase {
                                             &inputs,
                                             snapshot,
                                             &collection.target_cfg,
+                                            str_use_shadow,
                                             &mut primitive_body_type_results,
                                         )
                                     } else {

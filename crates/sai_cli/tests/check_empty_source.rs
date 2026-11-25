@@ -22149,3 +22149,210 @@ fn multi_file_source_with_impl_only_file_stays_gated() {
         "impl-only files stay behind the existing gate: {stdout}"
     );
 }
+
+#[test]
+fn multi_file_source_with_use_import_checks() {
+    // `use pkg/module.{item}` imports resolve for body checking —
+    // `caller` invokes the imported `add` from the sibling file
+    // (IR-1142).
+    let root_source = concat!(
+        "use acme:empty/helper.{add}\n",
+        "\n",
+        "type Inner { s: Str }\n",
+        "impl Inner {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.s\n",
+        "    }\n",
+        "}\n",
+        "pub fn caller() -> I32 {\n",
+        "    add(1)\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/helper.sai", "pub fn add(x: I32) -> I32 {\n    x\n}\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn multi_file_source_with_use_item_alias_checks() {
+    // `.{item as alias}` binds the alias — `plus(1)` resolves to the
+    // sibling file's `add` (IR-1142).
+    let root_source = concat!(
+        "use acme:empty/helper.{add as plus}\n",
+        "\n",
+        "type Inner { s: Str }\n",
+        "impl Inner {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.s\n",
+        "    }\n",
+        "}\n",
+        "pub fn caller() -> I32 {\n",
+        "    plus(1)\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/helper.sai", "pub fn add(x: I32) -> I32 {\n    x\n}\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn multi_file_source_with_use_import_in_method_checks() {
+    // Imported names resolve inside `impl` method bodies too
+    // (IR-1142).
+    let root_source = concat!(
+        "use acme:empty/helper.{add}\n",
+        "\n",
+        "type Inner { s: Str }\n",
+        "impl Inner {\n",
+        "    pub fn get_len(self: borrow Self) -> I32 {\n",
+        "        add(1)\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/helper.sai", "pub fn add(x: I32) -> I32 {\n    x\n}\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn multi_file_source_with_unresolved_import_reports() {
+    // An unresolved `.{item}` import reports UNRESOLVED_IMPORT rather
+    // than gating (IR-1142).
+    let root_source = concat!(
+        "use acme:empty/helper.{missing}\n",
+        "\n",
+        "type Inner { s: Str }\n",
+        "impl Inner {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.s\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/helper.sai", "pub fn add(x: I32) -> I32 {\n    x\n}\n")],
+        &[],
+    );
+    assert!(!output.status.success(), "unresolved import must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"UNRESOLVED_IMPORT\""),
+        "expected UNRESOLVED_IMPORT: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "import diagnostics must not gate: {stdout}"
+    );
+}
+
+#[test]
+fn multi_file_source_with_module_alias_call_stays_gated() {
+    // `use pkg/module` binds a module alias, but `module.item(..)`
+    // path calls are not yet resolved in bodies — stays gated
+    // (IR-1142 bound).
+    let root_source = concat!(
+        "use acme:empty/helper\n",
+        "\n",
+        "type Inner { s: Str }\n",
+        "impl Inner {\n",
+        "    pub fn get_text(self: borrow Self) -> Str {\n",
+        "        self.s\n",
+        "    }\n",
+        "}\n",
+        "pub fn caller() -> I32 {\n",
+        "    helper.add(1)\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/helper.sai", "pub fn add(x: I32) -> I32 {\n    x\n}\n")],
+        &[],
+    );
+    assert!(!output.status.success(), "module-alias calls must gate");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "module-alias path calls stay behind the existing gate: {stdout}"
+    );
+}
+
+#[test]
+fn multi_file_source_with_str_import_stays_gated() {
+    // `use pkg/mod.{Str}` imports a record named `Str` — a field
+    // typed `Str` then names that record, not the builtin, so
+    // `self.s.is_empty()` must gate rather than wrongly pass as a
+    // builtin Str method call (IR-1142 review fix).
+    let root_source = concat!(
+        "use acme:empty/helper.{Str}\n",
+        "\n",
+        "type T { s: Str }\n",
+        "impl T {\n",
+        "    pub fn m(self: borrow Self) -> Bool {\n",
+        "        self.s.is_empty()\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/helper.sai", "type Str { v: Bool }\n")],
+        &[],
+    );
+    assert!(
+        !output.status.success(),
+        "imported Str must not pass as builtin"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "imported `Str` record fields stay behind the existing gate: {stdout}"
+    );
+}
+
+#[test]
+fn multi_file_source_with_unresolved_str_import_does_not_also_gate() {
+    // An unresolved `use pkg/mod.{Str}` reports UNRESOLVED_IMPORT
+    // only — without a resolved `Str` def in scope the name keeps
+    // the builtin treatment, so no extra feature gate is emitted
+    // (IR-1142 review fix).
+    let root_source = concat!(
+        "use acme:empty/helper.{Str}\n",
+        "\n",
+        "type T { s: Str }\n",
+        "impl T {\n",
+        "    pub fn m(self: borrow Self) -> Bool {\n",
+        "        self.s.is_empty()\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[("src/helper.sai", "pub fn add(x: I32) -> I32 {\n    x\n}\n")],
+        &[],
+    );
+    assert!(!output.status.success(), "unresolved import must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"UNRESOLVED_IMPORT\""),
+        "expected UNRESOLVED_IMPORT: {stdout}"
+    );
+    assert!(
+        !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "an unresolved import must not add a feature gate: {stdout}"
+    );
+}
