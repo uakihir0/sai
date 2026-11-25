@@ -23090,6 +23090,206 @@ fn member_const_reference_in_match_scrutinee_checks() {
 }
 
 #[test]
+fn const_patterns_in_primitive_match_check() {
+    // Upper-case const paths are value patterns, not bindings. Direct
+    // constants and literal-or alternatives type primitive match arms in
+    // tail and statement positions; because const values are opaque in
+    // this slice, they do not count as catch-all coverage.
+    let source = concat!(
+        "pub const LIMIT: I32 = 5
+",
+        "pub fn tail(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        LIMIT | 6 => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn stmt(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        LIMIT => { let hit = 1 },
+",
+        "        _ => { let hit = 2 },
+",
+        "    }
+",
+        "    0
+",
+        "}
+",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn imported_const_patterns_in_primitive_match_check() {
+    // Direct imports, module-member paths, aliases, and `pub use`
+    // re-exports all resolve const patterns to the original const type.
+    let root_source = concat!(
+        "use acme:empty/values
+",
+        "use acme:empty/values.{CAP as MAX}
+",
+        "use acme:empty/reexport.{CAP as REEXPORTED}
+",
+        "pub fn direct(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        MAX => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn member(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        values.CAP => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn reexported(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        REEXPORTED | 9 => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+    );
+    let output = run_check(
+        root_source,
+        "",
+        &[
+            (
+                "src/values.sai",
+                "pub const CAP: I32 = 7
+",
+            ),
+            (
+                "src/reexport.sai",
+                "pub use acme:empty/values.{CAP}
+",
+            ),
+        ],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn const_pattern_type_mismatch_reports() {
+    // A const pattern must have the scrutinee's type; a `Str` const in an
+    // `I32` match is diagnosed rather than gated.
+    let source = concat!(
+        "pub const TEXT: Str = \"x\"
+",
+        "pub fn pick(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        TEXT => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(
+        !output.status.success(),
+        "mismatched const pattern must fail"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `I32`, found `Str`")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "const pattern mismatch is diagnosed, not gated: {stdout}"
+    );
+}
+
+#[test]
+fn float_const_pattern_reports_const_pattern_type() {
+    // Float consts are valid scalar consts, but float patterns are not:
+    // using one in a match reports CONST_PATTERN_TYPE rather than passing
+    // merely because the scrutinee has the same float type.
+    let source = concat!(
+        "pub const RATIO: F32 = 1.0
+",
+        "pub fn pick(x: F32) -> I32 {
+",
+        "    match x {
+",
+        "        RATIO => 1,
+",
+        "        _ => 2,
+",
+        "    }
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "float const pattern must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"CONST_PATTERN_TYPE\"")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "float const patterns are diagnosed, not gated or accepted: {stdout}"
+    );
+}
+
+#[test]
+fn const_pattern_does_not_exhaust_primitive_match() {
+    // Const values are not evaluated in this slice, so a const pattern is
+    // opaque to exhaustiveness and cannot replace a wildcard or binding.
+    let source = concat!(
+        "pub const LIMIT: I32 = 5
+",
+        "pub fn pick(x: I32) -> I32 {
+",
+        "    match x {
+",
+        "        LIMIT => 1,
+",
+        "    }
+",
+        "}
+",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert!(!output.status.success(), "non-exhaustive match must fail");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"NON_EXHAUSTIVE_MATCH\"")
+            && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+        "opaque const patterns require catch-all coverage: {stdout}"
+    );
+}
+
+#[test]
 fn reexported_const_reference_checks() {
     // `pub use` keeps the original const identity through direct
     // imports, module-member reads, aliases, and re-export chains.

@@ -14407,6 +14407,25 @@ fn primitive_if_branch_tail_shape_is_supported(
     }
 }
 
+fn primitive_const_pattern_shape_is_supported(
+    hir_id: HirId,
+    kind: PatKind<'_>,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    matches!(
+        kind,
+        PatKind::Ctor {
+            args: None,
+            has_rest: false,
+            ..
+        }
+    ) && inputs
+        .const_path_sites
+        .borrow()
+        .as_ref()
+        .is_some_and(|sites| sites.contains_key(&hir_id))
+}
+
 /// `match` tails: a preceding-binding path scrutinee, literal / wildcard /
 /// plain-binding patterns, a required catch-all arm, no guards, and no arms
 /// after the catch-all — the bounded exhaustiveness rule the checker mirrors.
@@ -14475,14 +14494,20 @@ fn primitive_match_tail_shape_is_supported(
         let mut arm_bindings = None;
         match arm.pat.kind {
             PatKind::Lit(_) => {}
+            kind if primitive_const_pattern_shape_is_supported(arm.pat.hir_id, kind, inputs) => {}
             // Or-patterns admit literal alternatives only — bindings,
             // wildcards and nested compound patterns inside `l1 | l2`
             // stay gated, matching the checker's arm-pattern admission.
             PatKind::Or(alternatives) => {
                 if alternatives.is_empty()
-                    || !alternatives
-                        .iter()
-                        .all(|alternative| matches!(alternative.kind, PatKind::Lit(_)))
+                    || !alternatives.iter().all(|alternative| {
+                        matches!(alternative.kind, PatKind::Lit(_))
+                            || primitive_const_pattern_shape_is_supported(
+                                alternative.hir_id,
+                                alternative.kind,
+                                inputs,
+                            )
+                    })
                 {
                     return false;
                 }
@@ -14920,11 +14945,21 @@ fn primitive_match_stmt_shape_is_supported(
         } else {
             match arm.pat.kind {
                 PatKind::Lit(_) => {}
+                kind if primitive_const_pattern_shape_is_supported(
+                    arm.pat.hir_id,
+                    kind,
+                    inputs,
+                ) => {}
                 PatKind::Or(alternatives) => {
                     if alternatives.is_empty()
-                        || !alternatives
-                            .iter()
-                            .all(|alternative| matches!(alternative.kind, PatKind::Lit(_)))
+                        || !alternatives.iter().all(|alternative| {
+                            matches!(alternative.kind, PatKind::Lit(_))
+                                || primitive_const_pattern_shape_is_supported(
+                                    alternative.hir_id,
+                                    alternative.kind,
+                                    inputs,
+                                )
+                        })
                     {
                         return false;
                     }
@@ -15569,6 +15604,18 @@ fn primitive_body_errors_to_diagnostics(
                     const_primitive_name(found)
                 ),
                 "type mismatch",
+            )?,
+            PrimitiveBodyErrorKind::ConstPatternType { found } => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::ConstPatternType,
+                format!(
+                    "const pattern type `{}` is not an integer, Bool, Char, Byte or Str",
+                    scalar_name(found)
+                ),
+                "invalid const pattern type",
             )?,
             PrimitiveBodyErrorKind::ScalarTypeMismatch { expected, found } => {
                 const_literal_diagnostic(
@@ -16329,6 +16376,136 @@ fn direct_primitive_call_sites(
     calls
 }
 
+fn const_pattern_path_type(
+    path: HirPath<'_>,
+    module_scope: &Phase1ModuleScopes,
+    const_types: &HashMap<DefId, FunctionDirectType>,
+    requesting_package: PackageId,
+    members: &ModuleMemberIndex<'_>,
+) -> Option<FunctionDirectType> {
+    if path.root != PathRoot::Plain
+        || path.segments.is_empty()
+        || path.segments.iter().any(|segment| segment.args.is_some())
+    {
+        return None;
+    }
+    let mut res = module_scope.scope.get(&path.segments[0].name.sym)?.res;
+    for segment in &path.segments[1..] {
+        res = match members.lookup(res, segment.name.sym, requesting_package) {
+            ModuleMemberLookup::Found(binding) => binding.res,
+            ModuleMemberLookup::WitMember(res) => res,
+            _ => return None,
+        };
+    }
+    match res {
+        Res::Def(DefKind::Const, def) => const_types.get(&def).copied(),
+        _ => None,
+    }
+}
+
+fn record_const_pattern_sites(
+    pattern: &sai_hir::patterns::Pat<'_>,
+    module_scope: &Phase1ModuleScopes,
+    const_types: &HashMap<DefId, FunctionDirectType>,
+    requesting_package: PackageId,
+    members: &ModuleMemberIndex<'_>,
+    sites: &mut HashMap<HirId, FunctionDirectType>,
+) {
+    match pattern.kind {
+        PatKind::Ctor {
+            path,
+            args,
+            has_rest,
+        } => {
+            if args.is_none()
+                && !has_rest
+                && let Some(const_type) = const_pattern_path_type(
+                    path,
+                    module_scope,
+                    const_types,
+                    requesting_package,
+                    members,
+                )
+            {
+                sites.insert(pattern.hir_id, const_type);
+            }
+            if let Some(args) = args {
+                for arg in args {
+                    record_const_pattern_sites(
+                        arg.pat,
+                        module_scope,
+                        const_types,
+                        requesting_package,
+                        members,
+                        sites,
+                    );
+                }
+            }
+        }
+        PatKind::Binding { sub: Some(sub), .. } => record_const_pattern_sites(
+            sub,
+            module_scope,
+            const_types,
+            requesting_package,
+            members,
+            sites,
+        ),
+        PatKind::Tuple(patterns) | PatKind::Or(patterns) => {
+            for pattern in patterns {
+                record_const_pattern_sites(
+                    pattern,
+                    module_scope,
+                    const_types,
+                    requesting_package,
+                    members,
+                    sites,
+                );
+            }
+        }
+        PatKind::Slice {
+            before,
+            rest,
+            after,
+        } => {
+            for pattern in before.iter().chain(after) {
+                record_const_pattern_sites(
+                    pattern,
+                    module_scope,
+                    const_types,
+                    requesting_package,
+                    members,
+                    sites,
+                );
+            }
+            if let Some(Some(pattern)) = rest {
+                record_const_pattern_sites(
+                    pattern,
+                    module_scope,
+                    const_types,
+                    requesting_package,
+                    members,
+                    sites,
+                );
+            }
+        }
+        PatKind::ImplicitMember {
+            args: Some(args), ..
+        } => {
+            for arg in args {
+                record_const_pattern_sites(
+                    arg.pat,
+                    module_scope,
+                    const_types,
+                    requesting_package,
+                    members,
+                    sites,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Const-reference sites in one body: `LIMIT`-style paths that resolve
 /// to `Res::Def(DefKind::Const)` and `helper2.LIMIT` member accesses on
 /// a module alias. Each maps the expression's `HirId` to the const's
@@ -16336,6 +16513,7 @@ fn direct_primitive_call_sites(
 fn const_literal_path_sites(
     body: &sai_hir::body::Body<'_>,
     module_paths: &ModuleResolution,
+    module_scope: &Phase1ModuleScopes,
     const_types: &HashMap<DefId, FunctionDirectType>,
     requesting_package: PackageId,
     members: &ModuleMemberIndex<'_>,
@@ -16400,6 +16578,21 @@ fn const_literal_path_sites(
             if let ExprKind::Path(path) = expression.kind {
                 sites.insert(path.hir_id, const_type);
             }
+        }
+    });
+    visit_expression_tree(&body.value, &mut |expression| {
+        let ExprKind::Match { arms, .. } = expression.kind else {
+            return;
+        };
+        for arm in arms {
+            record_const_pattern_sites(
+                arm.pat,
+                module_scope,
+                const_types,
+                requesting_package,
+                members,
+                &mut sites,
+            );
         }
     });
     sites
@@ -37134,15 +37327,19 @@ impl RootDatabase {
                                             )
                                         });
                                     let const_path_sites =
-                                        module_paths.as_ref().ok().map(|module_paths| {
-                                            const_literal_path_sites(
-                                                body,
-                                                module_paths,
-                                                &const_literal_types,
-                                                collection.module_tree.package,
-                                                &module_members,
-                                            )
-                                        });
+                                        match (&module_scope, module_paths.as_ref()) {
+                                            (Ok(module_scope), Ok(module_paths)) => {
+                                                Some(const_literal_path_sites(
+                                                    body,
+                                                    module_paths,
+                                                    module_scope,
+                                                    &const_literal_types,
+                                                    collection.module_tree.package,
+                                                    &module_members,
+                                                ))
+                                            }
+                                            _ => None,
+                                        };
                                     body_type_check = Some(check_function_body_type(
                                         &hir_owner,
                                         body,
@@ -47231,6 +47428,7 @@ impl RootDatabase {
                                     let const_path_sites = const_literal_path_sites(
                                         body,
                                         &module,
+                                        module_scope,
                                         &const_literal_types,
                                         collection.module_tree.package,
                                         &module_members,
