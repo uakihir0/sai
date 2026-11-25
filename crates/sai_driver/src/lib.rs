@@ -28660,6 +28660,9 @@ fn const_reference_cycle_members(references: &HashMap<DefId, Vec<DefId>>) -> Has
 enum ConstScalarValue {
     Bool(bool),
     Byte(u8),
+    Char(char),
+    Str(Symbol),
+    Unit,
     SignedInt(i128),
     UnsignedInt(u128),
     Float32(f32),
@@ -29106,6 +29109,86 @@ fn check_const_scalar_expression(
             left_evaluation.value = result;
             Ok(Some(left_evaluation))
         }
+        ExprKind::Binary(
+            operator @ (BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge),
+            left,
+            right,
+        ) => {
+            let Some(operand_type) = infer_const_scalar_expression_type(left) else {
+                return Ok(None);
+            };
+            let Some(mut left_evaluation) = check_const_scalar_expression(
+                owner,
+                operand_type,
+                left,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(right_evaluation) = check_const_scalar_expression(
+                owner,
+                operand_type,
+                right,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            left_evaluation
+                .diagnostics
+                .extend(right_evaluation.diagnostics);
+            if !const_comparison_operator_supported(operator, operand_type) {
+                left_evaluation.diagnostics.push(const_literal_diagnostic(
+                    owner,
+                    inputs,
+                    snapshot,
+                    value.span,
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    format!(
+                        "operator `{}` has no `PartialOrd` implementation for `{}`",
+                        const_binary_operator_text(operator),
+                        const_literal_type_display(operand_type)
+                    ),
+                    "operator not supported",
+                )?);
+                left_evaluation.value = None;
+            } else {
+                let result = if left_evaluation.diagnostics.is_empty() {
+                    match (left_evaluation.value, right_evaluation.value) {
+                        (Some(left_value), Some(right_value)) => {
+                            evaluate_const_comparison(operator, left_value, right_value, symbols)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                left_evaluation.value = result;
+            }
+            let bool_type = ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool);
+            if literal_type != bool_type {
+                left_evaluation.diagnostics.push(const_literal_diagnostic(
+                    owner,
+                    inputs,
+                    snapshot,
+                    value.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found `Bool`",
+                        const_literal_type_display(literal_type)
+                    ),
+                    "type mismatch",
+                )?);
+            }
+            Ok(Some(left_evaluation))
+        }
         ExprKind::Binary(operator @ (BinOp::And | BinOp::Or), left, right) => {
             let bool_type = ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool);
             let Some(mut left_evaluation) = check_const_scalar_expression(
@@ -29163,6 +29246,9 @@ fn const_scalar_literal_value(
     value: &HirExpr<'_>,
     symbols: &Interner,
 ) -> Option<ConstScalarValue> {
+    if matches!(value.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
+        return (literal_type == ConstLiteralType::Unit).then_some(ConstScalarValue::Unit);
+    }
     let ExprKind::Lit(literal) = value.kind else {
         return None;
     };
@@ -29173,6 +29259,10 @@ fn const_scalar_literal_value(
         (ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Byte), Lit::Byte(value)) => {
             Some(ConstScalarValue::Byte(value))
         }
+        (ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Char), Lit::Char(value)) => {
+            Some(ConstScalarValue::Char(value))
+        }
+        (ConstLiteralType::Str, Lit::Str(value)) => Some(ConstScalarValue::Str(value)),
         (ConstLiteralType::Primitive(primitive), Lit::Int { value, negated })
             if matches!(
                 primitive,
@@ -29237,6 +29327,158 @@ fn const_integer_literal_value(
         | sai_resolve::prelude::PrimTy::U32
         | sai_resolve::prelude::PrimTy::U64
         | sai_resolve::prelude::PrimTy::USize => Some(ConstScalarValue::UnsignedInt(magnitude)),
+        _ => None,
+    }
+}
+
+fn infer_const_scalar_expression_type(value: &HirExpr<'_>) -> Option<ConstLiteralType> {
+    match value.kind {
+        ExprKind::Lit(Lit::Int { .. }) => Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::I64,
+        )),
+        ExprKind::Lit(Lit::Float { .. }) => Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::F64,
+        )),
+        ExprKind::Lit(Lit::Bool(_)) => Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::Bool,
+        )),
+        ExprKind::Lit(Lit::Byte(_)) => Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::Byte,
+        )),
+        ExprKind::Lit(Lit::Char(_)) => Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::Char,
+        )),
+        ExprKind::Lit(Lit::Str(_)) => Some(ConstLiteralType::Str),
+        ExprKind::Tuple(elements) if elements.is_empty() => Some(ConstLiteralType::Unit),
+        ExprKind::Unary(UnOp::Not, _) => Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::Bool,
+        )),
+        ExprKind::Unary(UnOp::Neg | UnOp::BitNot, operand) => {
+            infer_const_scalar_expression_type(operand)
+        }
+        ExprKind::Binary(
+            BinOp::And
+            | BinOp::Or
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge,
+            _,
+            _,
+        ) => Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::Bool,
+        )),
+        ExprKind::Binary(
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::WrapAdd
+            | BinOp::WrapSub
+            | BinOp::WrapMul
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr,
+            left,
+            _,
+        ) => infer_const_scalar_expression_type(left),
+        _ => None,
+    }
+}
+
+fn const_comparison_operator_supported(operator: BinOp, operand_type: ConstLiteralType) -> bool {
+    match operator {
+        BinOp::Eq | BinOp::Ne => true,
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => operand_type != ConstLiteralType::Unit,
+        _ => false,
+    }
+}
+
+fn scalar_ordering(operator: BinOp, ordering: std::cmp::Ordering) -> ConstScalarValue {
+    let result = match operator {
+        BinOp::Eq => ordering == std::cmp::Ordering::Equal,
+        BinOp::Ne => ordering != std::cmp::Ordering::Equal,
+        BinOp::Lt => ordering == std::cmp::Ordering::Less,
+        BinOp::Le => ordering != std::cmp::Ordering::Greater,
+        BinOp::Gt => ordering == std::cmp::Ordering::Greater,
+        BinOp::Ge => ordering != std::cmp::Ordering::Less,
+        _ => false,
+    };
+    ConstScalarValue::Bool(result)
+}
+
+fn evaluate_const_comparison(
+    operator: BinOp,
+    left: ConstScalarValue,
+    right: ConstScalarValue,
+    symbols: &Interner,
+) -> Option<ConstScalarValue> {
+    match (left, right) {
+        (ConstScalarValue::Bool(left), ConstScalarValue::Bool(right)) => {
+            Some(scalar_ordering(operator, left.cmp(&right)))
+        }
+        (ConstScalarValue::Byte(left), ConstScalarValue::Byte(right)) => {
+            Some(scalar_ordering(operator, left.cmp(&right)))
+        }
+        (ConstScalarValue::Char(left), ConstScalarValue::Char(right)) => {
+            Some(scalar_ordering(operator, left.cmp(&right)))
+        }
+        (ConstScalarValue::Str(left), ConstScalarValue::Str(right)) => {
+            let left = symbols.resolve(left).ok()?;
+            let right = symbols.resolve(right).ok()?;
+            Some(scalar_ordering(operator, left.cmp(&right)))
+        }
+        (ConstScalarValue::Unit, ConstScalarValue::Unit) => Some(ConstScalarValue::Bool(matches!(
+            operator,
+            BinOp::Eq | BinOp::Le | BinOp::Ge
+        ))),
+        (ConstScalarValue::SignedInt(left), ConstScalarValue::SignedInt(right)) => {
+            Some(scalar_ordering(operator, left.cmp(&right)))
+        }
+        (ConstScalarValue::UnsignedInt(left), ConstScalarValue::UnsignedInt(right)) => {
+            Some(scalar_ordering(operator, left.cmp(&right)))
+        }
+        (ConstScalarValue::Float32(left), ConstScalarValue::Float32(right)) => {
+            let ordering = left.partial_cmp(&right);
+            Some(ConstScalarValue::Bool(match operator {
+                BinOp::Eq => ordering == Some(std::cmp::Ordering::Equal),
+                BinOp::Ne => ordering != Some(std::cmp::Ordering::Equal),
+                BinOp::Lt => ordering == Some(std::cmp::Ordering::Less),
+                BinOp::Le => matches!(
+                    ordering,
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                ),
+                BinOp::Gt => ordering == Some(std::cmp::Ordering::Greater),
+                BinOp::Ge => matches!(
+                    ordering,
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                ),
+                _ => false,
+            }))
+        }
+        (ConstScalarValue::Float64(left), ConstScalarValue::Float64(right)) => {
+            let ordering = left.partial_cmp(&right);
+            Some(ConstScalarValue::Bool(match operator {
+                BinOp::Eq => ordering == Some(std::cmp::Ordering::Equal),
+                BinOp::Ne => ordering != Some(std::cmp::Ordering::Equal),
+                BinOp::Lt => ordering == Some(std::cmp::Ordering::Less),
+                BinOp::Le => matches!(
+                    ordering,
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                ),
+                BinOp::Gt => ordering == Some(std::cmp::Ordering::Greater),
+                BinOp::Ge => matches!(
+                    ordering,
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                ),
+                _ => false,
+            }))
+        }
         _ => None,
     }
 }
@@ -29367,6 +29609,12 @@ fn const_binary_operator_text(operator: BinOp) -> &'static str {
         BinOp::BitXor => "^",
         BinOp::Shl => "<<",
         BinOp::Shr => ">>",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
         _ => "operator",
     }
 }

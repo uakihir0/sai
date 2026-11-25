@@ -23401,7 +23401,7 @@ fn runtime_enum_constructor_arithmetic_is_not_const_evaluated() {
 }
 
 #[test]
-fn primitive_const_arithmetic_and_logical_expressions_check() {
+fn primitive_const_operator_expressions_check() {
     for source in [
         "pub const VALUE: I32 = 1 + 2 * 3
 pub fn get() -> I32 {
@@ -23436,6 +23436,24 @@ pub fn ready() -> Bool {
         "pub const VALUE: I8 = (~0) + 1
 ",
         "pub const VALUE: Byte = ~(b'\\x0f' << 1) | b'\\x01'
+",
+        "pub const VALUE: Bool = 1 + 2 < 4
+",
+        "pub const VALUE: Bool = 127 + 1 < 200
+",
+        "pub const VALUE: Bool = 1.5 + 0.5 >= 2.0
+",
+        "pub const VALUE: Bool = false < true
+",
+        "pub const VALUE: Bool = 'a' != 'b'
+",
+        "pub const VALUE: Bool = b'a' <= b'z'
+",
+        "pub const VALUE: Bool = \"abc\" < \"abd\"
+",
+        "pub const VALUE: Bool = () == ()
+",
+        "pub const VALUE: Bool = (1 << 3) == 8
 ",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
@@ -23564,6 +23582,30 @@ fn primitive_const_expression_errors_are_checked() {
 ",
             "CONST_EVAL_PANIC",
             "integer overflow in subtraction",
+        ),
+        (
+            "pub const VALUE: I32 = 1 < 2
+",
+            "TYPE_MISMATCH",
+            "expected `I32`, found `Bool`",
+        ),
+        (
+            "pub const VALUE: Bool = 1 < true
+",
+            "TYPE_MISMATCH",
+            "expected `I64`, found a Bool literal",
+        ),
+        (
+            "pub const VALUE: Bool = () < ()
+",
+            "OPERATOR_NOT_SUPPORTED",
+            "operator `<` has no `PartialOrd` implementation for `()`",
+        ),
+        (
+            "pub const VALUE: Bool = 18446744073709551616 < 0
+",
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `I64`",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);
