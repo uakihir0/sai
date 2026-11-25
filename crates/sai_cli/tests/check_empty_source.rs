@@ -23615,6 +23615,24 @@ fn primitive_const_expression_errors_are_checked() {
             "TYPE_MISMATCH",
             "expected `I64`, found a Bool literal",
         ),
+        (
+            "pub const VALUE: Bool = \"a\" == (1 + 2)
+",
+            "TYPE_MISMATCH",
+            "expected `Str`, found `I64`",
+        ),
+        (
+            "pub const VALUE: Bool = () == (1 + 2)
+",
+            "TYPE_MISMATCH",
+            "expected `()`, found `I64`",
+        ),
+        (
+            "pub const VALUE: Bool = \"a\" == (1 < 2)
+",
+            "TYPE_MISMATCH",
+            "expected `Str`, found `Bool`",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8_lossy(&output.stdout);

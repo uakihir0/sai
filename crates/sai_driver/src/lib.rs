@@ -29129,9 +29129,19 @@ fn check_const_scalar_expression(
             else {
                 return Ok(None);
             };
-            let Some(right_evaluation) = check_const_scalar_expression(
+            let inferred_right_type = infer_const_scalar_expression_type(right);
+            let composite_right = !matches!(right.kind, ExprKind::Lit(_))
+                && !matches!(right.kind, ExprKind::Tuple(elements) if elements.is_empty());
+            let mismatched_composite_right = composite_right
+                && inferred_right_type.is_some_and(|right_type| right_type != operand_type);
+            let right_check_type = if mismatched_composite_right {
+                inferred_right_type.unwrap_or(operand_type)
+            } else {
+                operand_type
+            };
+            let Some(mut right_evaluation) = check_const_scalar_expression(
                 owner,
-                operand_type,
+                right_check_type,
                 right,
                 symbols,
                 inputs,
@@ -29141,6 +29151,21 @@ fn check_const_scalar_expression(
             else {
                 return Ok(None);
             };
+            if mismatched_composite_right {
+                right_evaluation.diagnostics.push(const_literal_diagnostic(
+                    owner,
+                    inputs,
+                    snapshot,
+                    right.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found `{}`",
+                        const_literal_type_display(operand_type),
+                        const_literal_type_display(right_check_type)
+                    ),
+                    "type mismatch",
+                )?);
+            }
             left_evaluation
                 .diagnostics
                 .extend(right_evaluation.diagnostics);
