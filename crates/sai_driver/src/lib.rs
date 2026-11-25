@@ -17506,6 +17506,9 @@ fn check_const_tuple_literal(
 
     let ExprKind::Tuple(values) = value.kind else {
         let ExprKind::Lit(literal) = value.kind else {
+            if !is_const_scalar_expression_shape(owner.id, value, const_references) {
+                return Ok(None);
+            }
             let Some(found_type) = infer_const_scalar_expression_type(value, const_references)
             else {
                 return Ok(None);

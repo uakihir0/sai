@@ -13300,6 +13300,7 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
 fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
         "pub const TUPLE_TARGET: (I32,) = (1,)\npub const ARITY_UNSUPPORTED_TARGET: (I32,) = (TUPLE_TARGET, TUPLE_TARGET)\n",
+        "pub const LEFT: (I32,) = (1,)\npub const RIGHT: (I32,) = (2,)\npub const COMPARISON_FOR_TUPLE: (Bool,) = LEFT == RIGHT\n",
         "pub const ARRAY: Array<I32, 1> = [1]\n",
         "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
         "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
