@@ -2529,7 +2529,6 @@ fn check_source_is_mixed_public_items_fragment(source: &[u8]) -> (bool, bool, bo
                 }
                 saw_const = true;
             }
-            sai_syntax::ast::Item::Use(_) => {}
             _ => return (false, false, false, false, false),
         }
     }
