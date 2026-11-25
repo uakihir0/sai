@@ -23455,6 +23455,10 @@ pub fn ready() -> Bool {
 ",
         "pub const VALUE: Bool = (1 << 3) == 8
 ",
+        "pub const VALUE: Bool = false and (1 / 0 == 0)
+",
+        "pub const VALUE: Bool = true or (1 / 0 == 0)
+",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -23606,6 +23610,12 @@ fn primitive_const_expression_errors_are_checked() {
 ",
             "LITERAL_OUT_OF_RANGE",
             "integer literal is out of range for `I64`",
+        ),
+        (
+            "pub const VALUE: Bool = false and (1 + true == 0)
+",
+            "TYPE_MISMATCH",
+            "expected `I64`, found a Bool literal",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);

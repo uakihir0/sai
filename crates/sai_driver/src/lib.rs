@@ -29197,16 +29197,30 @@ fn check_const_scalar_expression(
             else {
                 return Ok(None);
             };
-            let Some(right_evaluation) = check_const_scalar_expression(
+            let short_circuits = left_evaluation.diagnostics.is_empty()
+                && matches!(
+                    left_evaluation.value,
+                    Some(ConstScalarValue::Bool(left_value))
+                        if (operator == BinOp::And && !left_value)
+                            || (operator == BinOp::Or && left_value)
+                );
+            let Some(mut right_evaluation) = check_const_scalar_expression(
                 owner, bool_type, right, symbols, inputs, snapshot, target_cfg,
             )?
             else {
                 return Ok(None);
             };
+            if short_circuits {
+                right_evaluation
+                    .diagnostics
+                    .retain(|diagnostic| diagnostic.code != sai_diagnostics::Code::ConstEvalPanic);
+            }
             left_evaluation
                 .diagnostics
                 .extend(right_evaluation.diagnostics);
-            let result = if left_evaluation.diagnostics.is_empty() {
+            let result = if short_circuits {
+                left_evaluation.value
+            } else if left_evaluation.diagnostics.is_empty() {
                 match (left_evaluation.value, right_evaluation.value) {
                     (Some(ConstScalarValue::Bool(left)), Some(ConstScalarValue::Bool(right))) => {
                         Some(ConstScalarValue::Bool(if operator == BinOp::And {
