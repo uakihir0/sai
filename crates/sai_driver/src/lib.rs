@@ -39017,6 +39017,13 @@ impl RootDatabase {
                 let Some(next) = direct_const_references.get(&current).copied() else {
                     break None;
                 };
+                let types_match = match (const_types.get(&current), const_types.get(&next)) {
+                    (Some(current_type), Some(next_type)) => current_type == next_type,
+                    _ => false,
+                };
+                if !types_match {
+                    break None;
+                }
                 current = next;
             };
             for def_id in path {

@@ -23812,6 +23812,26 @@ pub const SECOND: I32 = FIRST + 1
 }
 
 #[test]
+fn type_mismatched_const_alias_does_not_cascade_const_eval_panic() {
+    let source = concat!(
+        "pub const BASE: I8 = 100\n",
+        "pub const ALIAS: I16 = BASE\n",
+        "pub const VALUE: I16 = ALIAS + 32700\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+        "the alias type mismatch remains the primary error:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"CONST_EVAL_PANIC\""),
+        "an invalid alias must not propagate a value into later const evaluation:\n{stdout}"
+    );
+}
+
+#[test]
 fn package_private_consts_check_in_primitive_bodies() {
     // Package-private consts are visible throughout their package
     // (D-MOD-02): direct references and const patterns do not require
