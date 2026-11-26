@@ -8208,6 +8208,84 @@ fn check_function_body_type(
 // needing inference gate the whole form, but integer literals fitting no
 // integer type at all surface through the gate because they are out of
 // range independent of inference (spec 6.3.1).
+// A condition of a parameterized function `if` is valid as a Bool
+// literal, a Bool-parameter path, or a comparison against the parameter
+// (spec 6.14.1); other forms gate for the inference slice.
+#[allow(clippy::too_many_arguments)]
+fn validate_parameterized_if_condition(
+    owner: &HirOwner<'_>,
+    cond: &HirExpr<'_>,
+    parameter: &sai_hir::body::FnParam<'_>,
+    body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if matches!(cond.kind, ExprKind::Lit(Lit::Bool(_))) {
+        return Ok(Some(Vec::new()));
+    }
+    if function_if_condition_uses_parameter_binding(cond, body_parameter, locals, inputs)
+        && matches!(
+            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
+            Some(FunctionDirectType::Primitive(
+                sai_resolve::prelude::PrimTy::Bool
+            ))
+        )
+    {
+        return Ok(Some(Vec::new()));
+    }
+    check_function_if_parameter_comparison_condition(
+        owner,
+        cond,
+        *parameter.ty,
+        body_parameter,
+        locals,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )
+}
+
+// `else if` is `else` followed by an `IfExpr` and nests to the right
+// (spec 6.14.1). The chain walk collects every branch tail of an `if`
+// whose conditions are all Bool literals: each link contributes its
+// then-branch tail, a final `else` block contributes its tail, and a
+// missing final `else` means the chain has type `()` on its own. Links
+// with other conditions, statements, or unsafe blocks gate the chain.
+fn collect_literal_unit_if_chain_tails<'a>(
+    if_expr: &'a HirExpr<'a>,
+    tails: &mut Vec<Option<&'a HirExpr<'a>>>,
+) -> bool {
+    let ExprKind::If { cond, then, els } = if_expr.kind else {
+        return false;
+    };
+    if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+        || then.safety != sai_hir::Safety::Safe
+        || !then.stmts.is_empty()
+    {
+        return false;
+    }
+    tails.push(then.tail);
+    match els {
+        None => true,
+        Some(else_expr) => match else_expr.kind {
+            ExprKind::Block(else_block)
+                if else_block.safety == sai_hir::Safety::Safe && else_block.stmts.is_empty() =>
+            {
+                tails.push(else_block.tail);
+                true
+            }
+            ExprKind::If { .. } => collect_literal_unit_if_chain_tails(else_expr, tails),
+            _ => false,
+        },
+    }
+}
+
 fn check_unit_discard_if_branch_tails(
     owner: &HirOwner<'_>,
     tails: &[Option<&HirExpr<'_>>],
@@ -8499,58 +8577,76 @@ fn check_function_body_shape_dispatch(
                         return Ok(FunctionBodyTypeCheck::Unsupported);
                     }
                 }
-                let condition_diagnostics = if matches!(cond.kind, ExprKind::Lit(Lit::Bool(_))) {
-                    Some(Vec::new())
-                } else if function_if_condition_uses_parameter_binding(
+                let condition_diagnostics = validate_parameterized_if_condition(
+                    owner,
                     cond,
+                    parameter,
                     body_parameter,
                     locals,
+                    type_paths,
+                    symbols,
                     inputs,
-                ) && matches!(
-                    resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
-                    Some(FunctionDirectType::Primitive(
-                        sai_resolve::prelude::PrimTy::Bool
-                    ))
-                ) {
-                    Some(Vec::new())
-                } else {
-                    check_function_if_parameter_comparison_condition(
-                        owner,
-                        cond,
-                        *parameter.ty,
-                        body_parameter,
-                        locals,
-                        type_paths,
-                        symbols,
-                        inputs,
-                        snapshot,
-                        target_cfg,
-                    )?
-                };
+                    snapshot,
+                    target_cfg,
+                )?;
                 let Some(mut condition_diagnostics) = condition_diagnostics else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 };
                 if unit_return {
                     // Branch tails checked against `()` discard their values
                     // (spec 6.11.1/6.25.2). An `if` without `else` has type
-                    // `()` (spec 6.14.1), so it is valid here.
+                    // `()` (spec 6.14.1), so it is valid here, and `else if`
+                    // chains nest to the right — each link's condition
+                    // validates like the first.
                     if !then.stmts.is_empty() || then.safety != sai_hir::Safety::Safe {
                         return Ok(FunctionBodyTypeCheck::Unsupported);
                     }
-                    let tails = match els {
-                        None => vec![then.tail],
-                        Some(else_expr) => {
-                            let ExprKind::Block(else_block) = else_expr.kind else {
-                                return Ok(FunctionBodyTypeCheck::Unsupported);
-                            };
-                            if !else_block.stmts.is_empty()
-                                || else_block.safety != sai_hir::Safety::Safe
+                    let mut tails = vec![then.tail];
+                    let mut next_else = els;
+                    loop {
+                        let Some(else_expr) = next_else else {
+                            break;
+                        };
+                        match else_expr.kind {
+                            ExprKind::Block(else_block)
+                                if else_block.safety == sai_hir::Safety::Safe
+                                    && else_block.stmts.is_empty() =>
                             {
-                                return Ok(FunctionBodyTypeCheck::Unsupported);
+                                tails.push(else_block.tail);
+                                break;
                             }
-                            vec![then.tail, else_block.tail]
+                            ExprKind::If {
+                                cond: link_cond,
+                                then: link_then,
+                                els: link_els,
+                            } => {
+                                if !link_then.stmts.is_empty()
+                                    || link_then.safety != sai_hir::Safety::Safe
+                                {
+                                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                                }
+                                let Some(link_diagnostics) = validate_parameterized_if_condition(
+                                    owner,
+                                    link_cond,
+                                    parameter,
+                                    body_parameter,
+                                    locals,
+                                    type_paths,
+                                    symbols,
+                                    inputs,
+                                    snapshot,
+                                    target_cfg,
+                                )?
+                                else {
+                                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                                };
+                                condition_diagnostics.extend(link_diagnostics);
+                                tails.push(link_then.tail);
+                                next_else = link_els;
+                            }
+                            _ => return Ok(FunctionBodyTypeCheck::Unsupported),
                         }
-                    };
+                    }
                     let Some(tail_diagnostics) = check_unit_discard_if_branch_tails(
                         owner, &tails, symbols, inputs, snapshot,
                     )?
@@ -8846,27 +8942,14 @@ fn check_function_body_shape_dispatch(
                     // A tail checked against `()` discards its value (spec
                     // 6.11.1/6.25.2); validate it like a discarded composite
                     // branch tail. `if` tails validate both branch tails.
-                    if let ExprKind::If { cond, then, els } = tail.kind
-                        && matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
-                        && then.stmts.is_empty()
-                        && then.safety == sai_hir::Safety::Safe
-                    {
+                    if matches!(tail.kind, ExprKind::If { .. }) {
                         // An `if` without `else` has type `()` (spec 6.14.1),
-                        // so it is valid where `()` is expected.
-                        let tails = match els {
-                            None => vec![then.tail],
-                            Some(else_expr) => {
-                                let ExprKind::Block(else_block) = else_expr.kind else {
-                                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                                };
-                                if !else_block.stmts.is_empty()
-                                    || else_block.safety != sai_hir::Safety::Safe
-                                {
-                                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                                }
-                                vec![then.tail, else_block.tail]
-                            }
-                        };
+                        // so it is valid where `()` is expected; `else if`
+                        // chains nest to the right.
+                        let mut tails = Vec::new();
+                        if !collect_literal_unit_if_chain_tails(tail, &mut tails) {
+                            return Ok(FunctionBodyTypeCheck::Unsupported);
+                        }
                         let Some(diagnostics) = check_unit_discard_if_branch_tails(
                             owner, &tails, symbols, inputs, snapshot,
                         )?
@@ -9372,23 +9455,16 @@ fn check_function_composite_literal_element(
         // 6.11.1/6.25.2). Literal and composite-construction tails are
         // self-consistent in the direct-type fragment, so they are valid
         // discards; other forms fall through to the element checks. An `if`
-        // without `else` has type `()` (spec 6.14.1), so it is valid here.
+        // without `else` has type `()` (spec 6.14.1), so it is valid here,
+        // and `else if` chains nest to the right.
         if matches!(
             resolve_const_literal_type(ty, type_paths, symbols, inputs),
             Some(ConstLiteralType::Unit)
         ) {
-            let tails = match els {
-                None => vec![then.tail],
-                Some(else_expr) => {
-                    let ExprKind::Block(else_block) = else_expr.kind else {
-                        return Ok(None);
-                    };
-                    if else_block.safety != sai_hir::Safety::Safe || !else_block.stmts.is_empty() {
-                        return Ok(None);
-                    }
-                    vec![then.tail, else_block.tail]
-                }
-            };
+            let mut tails = Vec::new();
+            if !collect_literal_unit_if_chain_tails(element, &mut tails) {
+                return Ok(None);
+            }
             return check_unit_discard_if_branch_tails(owner, &tails, symbols, inputs, snapshot);
         }
         let Some(else_expr) = els else {
