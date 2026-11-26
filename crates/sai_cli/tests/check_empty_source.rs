@@ -11606,6 +11606,62 @@ fn public_zero_parameter_nested_composite_literal_returns_emit_check_result() {
 }
 
 #[test]
+fn public_composite_if_branch_returns_emit_check_result() {
+    for source in [
+        "pub fn f() -> (I32, Bool) { if true { (1, true) } else { (2, false) } }\n",
+        "pub fn f() -> Array<I32, 1> { if true { [1] } else { [2] } }\n",
+        "pub fn f(x: I32) -> (I32, Bool) { if true { (1, true) } else { (2, false) } }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_composite_if_branch_element_errors_are_diagnosed() {
+    let output = run_check(
+        "pub fn f() -> (I32, Bool) { if true { (1, 2) } else { (2, false) } }\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "expected TYPE_MISMATCH without a result or feature gate:\n{stdout}"
+    );
+}
+
+#[test]
+fn public_unit_position_if_branch_tails_discard_values() {
+    // Branch tails checked against `()` discard their values (spec
+    // 6.11.1/6.25.2), so literal and composite-construction tails in unit
+    // positions are valid discards.
+    for source in [
+        "pub fn f() -> ((), I32) { (if true { 1 } else { 2 }, 3) }\n",
+        "pub fn f() -> ((), I32) { (if true { (1, true) } else { (2, false) }, 3) }\n",
+        "pub fn f() -> ((), I32) { (if true { () } else { () }, 3) }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_unit_position_direct_elements_do_not_discard() {
+    // Direct elements in unit positions are not block tails, so the discard
+    // rules do not apply: they report the structural type mismatch.
+    let output = run_check("pub fn f() -> ((), I32) { ((1, 2), 3) }\n", "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"") && !stdout.contains("\"type\":\"result\""),
+        "expected TYPE_MISMATCH without a result:\n{stdout}"
+    );
+}
+
+#[test]
 fn public_parameterized_composite_literal_returns_emit_check_result() {
     for source in [
         "pub fn f(x: I32) -> (I32, Bool) { (1, true) }\n",
