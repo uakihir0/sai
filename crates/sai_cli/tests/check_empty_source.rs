@@ -14425,6 +14425,22 @@ fn invalid_array_length_arguments_are_diagnosed_not_gated() {
             ),
             "CONST_ARG_NOT_SIMPLE",
         ),
+        // Negative and oversized integer lengths never fit `USize`.
+        (
+            "pub const A: Array<I32, -1> = [1]\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub const A: Array<I32, 4294967296> = [1]\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub const T: (Array<I32, -1>,) = ([1],)\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        // Character and boolean lengths are the wrong type.
+        ("pub const A: Array<I32, 'a'> = [1]\n", "TYPE_MISMATCH"),
+        ("pub const A: Array<I32, true> = [1]\n", "TYPE_MISMATCH"),
         // Any other type in the length position is a type/const kind
         // mismatch.
         (
