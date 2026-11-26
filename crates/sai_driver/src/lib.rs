@@ -9077,10 +9077,7 @@ fn check_function_discarded_unit_tail(
                     owner, element, false, symbols, inputs, snapshot,
                 )?
                 else {
-                    if diagnostics.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some((DiscardLiteralShape::Unknown, diagnostics)));
+                    return Ok(None);
                 };
                 diagnostics.extend(element_diagnostics);
                 shapes.push(shape);
@@ -9096,10 +9093,7 @@ fn check_function_discarded_unit_tail(
                     owner, element, true, symbols, inputs, snapshot,
                 )?
                 else {
-                    if diagnostics.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some((DiscardLiteralShape::Unknown, diagnostics)));
+                    return Ok(None);
                 };
                 diagnostics.extend(element_diagnostics);
                 if !conflict {
