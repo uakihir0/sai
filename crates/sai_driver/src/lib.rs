@@ -7414,6 +7414,7 @@ struct ConstReferenceContext<'a, 'm> {
     module_scope: &'a Phase1ModuleScopes,
     module_members: &'a ModuleMemberIndex<'m>,
     types: &'a HashMap<DefId, FunctionDirectType>,
+    type_aliases: &'a HashMap<DefId, ConstConstructorType>,
     aggregate_types: &'a HashMap<DefId, ConstConstructorType>,
     constructors: &'a ConstTypeConstructorIndex,
     values: &'a HashMap<DefId, ConstScalarValue>,
@@ -18232,8 +18233,18 @@ fn const_explicit_variant_parts(
     if prefix.consumed_segments != head_segments.len() {
         return None;
     }
-    let Res::Def(DefKind::Enum, enum_def) = prefix.base else {
-        return None;
+    let enum_def = match prefix.base {
+        Res::Def(DefKind::Enum, enum_def) => enum_def,
+        // A transparent alias of an enum names the same variants.
+        Res::Def(DefKind::Alias, alias_def) => match context.type_aliases.get(&alias_def) {
+            Some(ConstConstructorType::Nominal(nominal))
+                if context.constructors.enums.contains_key(&nominal.def_id) =>
+            {
+                nominal.def_id
+            }
+            _ => return None,
+        },
+        _ => return None,
     };
     Some((
         enum_def,
@@ -18299,7 +18310,26 @@ fn const_constructor_target(
     if let Some((enum_def, variant)) = const_variant_target(callee, context, expected_enum) {
         return Some(ConstConstructorTarget::Variant { enum_def, variant });
     }
-    match const_constructor_path_resolution(callee, context)? {
+    let resolved = const_constructor_path_resolution(callee, context)?;
+    // Transparent aliases expand to their underlying nominal type, so an
+    // alias names the same constructor as the nominal type itself.
+    let resolved = match resolved {
+        Res::Def(DefKind::Alias, alias_def) => match context.type_aliases.get(&alias_def) {
+            Some(ConstConstructorType::Nominal(nominal))
+                if context.constructors.records.contains_key(&nominal.def_id) =>
+            {
+                Res::Def(DefKind::Struct, nominal.def_id)
+            }
+            Some(ConstConstructorType::Nominal(nominal))
+                if context.constructors.distincts.contains_key(&nominal.def_id) =>
+            {
+                Res::Def(DefKind::Distinct, nominal.def_id)
+            }
+            _ => return None,
+        },
+        other => other,
+    };
+    match resolved {
         Res::Def(DefKind::Struct, def_id) if context.constructors.records.contains_key(&def_id) => {
             Some(ConstConstructorTarget::Record { def_id })
         }
@@ -41496,6 +41526,7 @@ impl RootDatabase {
                 module_scope,
                 module_members,
                 types: &const_types,
+                type_aliases: const_type_aliases.as_ref(),
                 aggregate_types: &const_aggregate_types,
                 constructors: const_type_constructors,
                 values: &const_values,
@@ -42582,6 +42613,7 @@ impl RootDatabase {
                             module_scope,
                             module_members: &module_members,
                             types: &const_literal_types,
+                            type_aliases: const_type_aliases.as_ref(),
                             aggregate_types: &const_aggregate_literal_types,
                             constructors: &const_type_constructors,
                             values: &const_literal_values,

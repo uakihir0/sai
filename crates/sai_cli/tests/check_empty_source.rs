@@ -14322,6 +14322,30 @@ fn transparent_alias_const_types_check() {
             "pub const B: I32 = A\n",
             "pub const C: Number = B\n",
         ),
+        // Nominal constructor paths accept transparent aliases of the
+        // record type, in either annotation or callee position.
+        concat!(
+            "pub type Point {\nx: I32\n}\n",
+            "pub type P = Point\n",
+            "pub const Q: P = P(x: 1)\n",
+            "pub const R: Point = P(x: 2)\n",
+            "pub const S: P = Point(x: 3)\n",
+        ),
+        // Enum variant paths accept transparent aliases of the enum,
+        // including chained aliases and payload constructors.
+        concat!(
+            "pub enum E {\nC(I32),\nB\n}\n",
+            "pub type EA = E\n",
+            "pub type EB = EA\n",
+            "pub const X: EA = EA.C(3)\n",
+            "pub const Y: EB = EB.B\n",
+        ),
+        // Distinct constructors accept transparent aliases.
+        concat!(
+            "pub distinct Meters = I32\n",
+            "pub type M = Meters\n",
+            "pub const X: M = M(5)\n",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_success_result(output, "wasm32-core", "dev");
@@ -14346,6 +14370,16 @@ fn transparent_alias_const_type_errors_are_diagnosed() {
         (
             "pub type Arr = Array<I8, 2>\npub const A: Arr = [1, 128]\n",
             "LITERAL_OUT_OF_RANGE",
+        ),
+        // Constructor field errors diagnose through aliased constructor
+        // paths.
+        (
+            concat!(
+                "pub type Point {\nx: I32\n}\n",
+                "pub type P = Point\n",
+                "pub const Q: Point = P(x: true)\n",
+            ),
+            "TYPE_MISMATCH",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);
