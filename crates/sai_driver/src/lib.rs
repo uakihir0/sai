@@ -8236,6 +8236,104 @@ fn check_function_body_shape_dispatch(
             return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
         }
     }
+    let block = match body.value.kind {
+        ExprKind::Block(block) if block.safety == sai_hir::Safety::Safe => block,
+        _ => return Ok(FunctionBodyTypeCheck::Unsupported),
+    };
+    // Invalid literal array lengths in the return type are spec-invalid
+    // (spec 5.2.2) independent of the body shape — including empty
+    // array literals whose elements are never checked.
+    let mut invalid_length = None;
+    for parameter in sig.params {
+        if let Some(found) = find_invalid_array_length_type_argument(
+            *parameter.ty,
+            type_paths,
+            target_cfg.pointer_width(),
+        ) {
+            invalid_length = Some(found);
+            break;
+        }
+    }
+    if invalid_length.is_none()
+        && let Some(return_ty) = sig.ret
+        && let Some(found) = find_invalid_array_length_type_argument(
+            *return_ty,
+            type_paths,
+            target_cfg.pointer_width(),
+        )
+    {
+        invalid_length = Some(found);
+    }
+    if let Some((span, code)) = invalid_length {
+        let (message, label) = match code {
+            sai_diagnostics::Code::ConstArgNotSimple => (
+                "const arguments must be simple literals".to_string(),
+                "not a simple const argument",
+            ),
+            sai_diagnostics::Code::LiteralOutOfRange => (
+                "integer literal is out of range for `USize`".to_string(),
+                "literal out of range",
+            ),
+            sai_diagnostics::Code::TypeMismatch => (
+                "array length must be a `USize` integer literal".to_string(),
+                "wrong type for array length",
+            ),
+            _ => (
+                "a const parameter takes a const argument, not a type".to_string(),
+                "type argument in const parameter position",
+            ),
+        };
+        let diagnostics = vec![const_literal_diagnostic(
+            owner.id, inputs, snapshot, span, code, message, label,
+        )?];
+        return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
+    }
+    // Tuple returns of direct element types check tuple-literal tails
+    // element-wise: `pub fn pair() -> (I32, Bool) { (1, true) }` (spec
+    // 6.5.1 — the tail checks against the tuple element types).
+    if let Some(return_ty) = sig.ret
+        && let TyKind::Tuple(type_elements) = return_ty.kind
+        && !type_elements.is_empty()
+    {
+        if !block.stmts.is_empty() {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
+        let Some(tail) = block.tail else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        let Some(tuple_diagnostics) = check_function_composite_literal_element(
+            owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+        )?
+        else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        return Ok(FunctionBodyTypeCheck::Supported {
+            diagnostics: tuple_diagnostics,
+        });
+    }
+    // Array returns of direct element types check array-literal tails
+    // element-wise, with the spec's length diagnostic:
+    // `pub fn pair() -> Array<I32, 2> { [1, 2] }`.
+    if let Some(return_ty) = sig.ret
+        && let Some(..) =
+            resolve_const_array_type(*return_ty, type_paths, target_cfg.pointer_width())
+    {
+        if !block.stmts.is_empty() {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
+        let Some(tail) = block.tail else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        let Some(array_diagnostics) = check_function_composite_literal_element(
+            owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+        )?
+        else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        return Ok(FunctionBodyTypeCheck::Supported {
+            diagnostics: array_diagnostics,
+        });
+    }
     let (parameter, parameter_pair) = match (sig.params, body.params) {
         ([], []) => (None, None),
         ([parameter], [body_parameter])
@@ -8269,10 +8367,6 @@ fn check_function_body_shape_dispatch(
         _ => return Ok(FunctionBodyTypeCheck::Unsupported),
     };
 
-    let block = match body.value.kind {
-        ExprKind::Block(block) if block.safety == sai_hir::Safety::Safe => block,
-        _ => return Ok(FunctionBodyTypeCheck::Unsupported),
-    };
     let diagnostics = if let Some((parameter, body_parameter)) = parameter {
         let parameter_family =
             resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
@@ -8621,85 +8715,6 @@ fn check_function_body_shape_dispatch(
             }
         }
     } else {
-        // Invalid literal array lengths in the return type are spec-invalid
-        // (spec 5.2.2) independent of the body shape — including empty
-        // array literals whose elements are never checked.
-        if let Some(return_ty) = sig.ret
-            && let Some((span, code)) = find_invalid_array_length_type_argument(
-                *return_ty,
-                type_paths,
-                target_cfg.pointer_width(),
-            )
-        {
-            let (message, label) = match code {
-                sai_diagnostics::Code::ConstArgNotSimple => (
-                    "const arguments must be simple literals".to_string(),
-                    "not a simple const argument",
-                ),
-                sai_diagnostics::Code::LiteralOutOfRange => (
-                    "integer literal is out of range for `USize`".to_string(),
-                    "literal out of range",
-                ),
-                sai_diagnostics::Code::TypeMismatch => (
-                    "array length must be a `USize` integer literal".to_string(),
-                    "wrong type for array length",
-                ),
-                _ => (
-                    "a const parameter takes a const argument, not a type".to_string(),
-                    "type argument in const parameter position",
-                ),
-            };
-            let diagnostics = vec![const_literal_diagnostic(
-                owner.id, inputs, snapshot, span, code, message, label,
-            )?];
-            return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
-        }
-        // Tuple returns of direct element types check tuple-literal tails
-        // element-wise: `pub fn pair() -> (I32, Bool) { (1, true) }` (spec
-        // 6.5.1 — the tail checks against the tuple element types).
-        if let Some(return_ty) = sig.ret
-            && let TyKind::Tuple(type_elements) = return_ty.kind
-            && !type_elements.is_empty()
-        {
-            if !block.stmts.is_empty() {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            }
-            let Some(tail) = block.tail else {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            };
-            let Some(tuple_diagnostics) = check_function_composite_literal_element(
-                owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
-            )?
-            else {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            };
-            return Ok(FunctionBodyTypeCheck::Supported {
-                diagnostics: tuple_diagnostics,
-            });
-        }
-        // Array returns of direct element types check array-literal tails
-        // element-wise, with the spec's length diagnostic:
-        // `pub fn pair() -> Array<I32, 2> { [1, 2] }`.
-        if let Some(return_ty) = sig.ret
-            && let Some(..) =
-                resolve_const_array_type(*return_ty, type_paths, target_cfg.pointer_width())
-        {
-            if !block.stmts.is_empty() {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            }
-            let Some(tail) = block.tail else {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            };
-            let Some(array_diagnostics) = check_function_composite_literal_element(
-                owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
-            )?
-            else {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            };
-            return Ok(FunctionBodyTypeCheck::Supported {
-                diagnostics: array_diagnostics,
-            });
-        }
         // A missing return type is the implicit `-> ()` (spec 6.5.1), so it
         // resolves to unit; an explicit annotation that does not resolve
         // stays unsupported.
