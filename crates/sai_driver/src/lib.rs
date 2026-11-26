@@ -17589,12 +17589,19 @@ fn check_function_if_parameter_comparison_condition(
     ) {
         return Ok(None);
     }
+    // Byte-string literals are valid comparison operands here only so
+    // that the type check below diagnoses them: they never match a
+    // primitive or `Str` parameter type.
+    let is_comparison_literal = |expression: &HirExpr<'_>| {
+        is_direct_function_scalar_literal(expression)
+            || matches!(expression.kind, ExprKind::Lit(Lit::ByteStr(_)))
+    };
     let (literal, parameter_path, literal_is_left) =
         if function_if_path_uses_parameter_binding(left, body_parameter, locals, inputs)
-            && is_direct_function_scalar_literal(right)
+            && is_comparison_literal(right)
         {
             (right, left, false)
-        } else if is_direct_function_scalar_literal(left)
+        } else if is_comparison_literal(left)
             && function_if_path_uses_parameter_binding(right, body_parameter, locals, inputs)
         {
             (left, right, true)
