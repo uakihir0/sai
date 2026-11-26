@@ -2694,22 +2694,12 @@ fn type_has_supported_const_constructor_shape(ty: &sai_syntax::ast::Type) -> boo
             }
             let type_args = arguments.type_args().collect::<Vec<_>>();
             let const_args = arguments.const_args().collect::<Vec<_>>();
-            !type_args.is_empty()
+            type_args.len() == 1
+                && const_args.len() == 1
                 && type_args[0]
                     .ty()
                     .is_some_and(|ty| type_has_supported_const_constructor_shape(&ty))
-                && if type_args.len() == 1 && const_args.len() == 1 {
-                    const_arg_is_supported_array_length(&const_args[0])
-                } else {
-                    // A type argument in the length position is how a
-                    // const-item path (`Array<I32, N>`) parses. That form is
-                    // spec-invalid (`CONST_ARG_NOT_SIMPLE`) in every context
-                    // this slice admits, so it is admitted here for the
-                    // driver to diagnose rather than gate.
-                    type_args.len() == 2
-                        && const_args.is_empty()
-                        && matches!(type_args[1].ty(), Some(sai_syntax::ast::Type::PathType(_)))
-                }
+                && const_arg_is_supported_array_length(&const_args[0])
         }),
         sai_syntax::ast::Type::TupleType(tuple) => tuple
             .elements()
