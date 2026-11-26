@@ -9022,8 +9022,11 @@ fn check_function_composite_literal_element(
         resolve_const_array_type(ty, type_paths, target_cfg.pointer_width())
     {
         let ExprKind::Array(tail_elements) = element.kind else {
-            let ExprKind::Lit(literal) = element.kind else {
-                return Ok(None);
+            let word = match element.kind {
+                ExprKind::Lit(literal) => str_lit_kind_word(literal),
+                // `()` is the unit literal, not an array.
+                ExprKind::Tuple(elements) if elements.is_empty() => "unit",
+                _ => return Ok(None),
             };
             let Some(display) =
                 direct_composite_type_display(ty, type_paths, symbols, inputs, target_cfg)
@@ -9036,11 +9039,7 @@ fn check_function_composite_literal_element(
                 snapshot,
                 element.span,
                 sai_diagnostics::Code::TypeMismatch,
-                format!(
-                    "expected `{}`, found {}",
-                    display,
-                    str_lit_kind_word(literal)
-                ),
+                format!("expected `{}`, found {}", display, word),
                 "type mismatch",
             )?]));
         };

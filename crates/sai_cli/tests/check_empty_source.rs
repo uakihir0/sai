@@ -11617,6 +11617,10 @@ fn public_zero_parameter_literal_against_composite_type_is_diagnosed() {
             "expected `Array<I32, 2>`, found a Bool literal",
         ),
         (
+            "pub fn f() -> Array<I32, 2> { () }\n",
+            "expected `Array<I32, 2>`, found unit",
+        ),
+        (
             "pub fn f() -> ((I32, Bool), I8) { ((1, 2), 3) }\n",
             "expected `Bool`, found an integer literal",
         ),
