@@ -8844,6 +8844,44 @@ fn check_function_body_shape_dispatch(
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
 }
 
+// Renders direct composite types for arity diagnostics: scalars by their
+// literal-type names, tuples as `(A, B)`, arrays as `Array<E, N>`. Types
+// outside the direct slice have no display and gate instead.
+fn direct_composite_type_display(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    target_cfg: &TargetCfg,
+) -> Option<String> {
+    if let TyKind::Tuple(elements) = ty.kind {
+        if elements.is_empty() {
+            return Some("()".to_string());
+        }
+        let mut rendered = Vec::new();
+        for element in elements.iter() {
+            rendered.push(direct_composite_type_display(
+                *element, type_paths, symbols, inputs, target_cfg,
+            )?);
+        }
+        // `(T)` is a parenthesized type in sai, so 1-tuples render with the
+        // trailing comma `(T,)`.
+        if rendered.len() == 1 {
+            return Some(format!("({},)", rendered[0]));
+        }
+        return Some(format!("({})", rendered.join(", ")));
+    }
+    if let Some((element, length)) =
+        resolve_const_array_type(ty, type_paths, target_cfg.pointer_width())
+    {
+        let inner =
+            direct_composite_type_display(*element, type_paths, symbols, inputs, target_cfg)?;
+        return Some(format!("Array<{}, {}>", inner, length));
+    }
+    let literal_type = resolve_const_literal_type(ty, type_paths, symbols, inputs)?;
+    Some(local_enum_variant_type_name(literal_type).to_string())
+}
+
 // Literal operator expressions in function bodies reuse the const scalar
 // evaluator for type and range checks, but overflow, division by zero, and
 // shift overflow are runtime panics (spec 6.8 / D-TYPE-06), not compile
@@ -8896,13 +8934,48 @@ fn check_function_composite_literal_element(
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     if let TyKind::Tuple(type_elements) = ty.kind
+        && type_elements.is_empty()
+        && let ExprKind::Tuple(tail_elements) = element.kind
+        && !tail_elements.is_empty()
+    {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            element.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `()`, found tuple of arity {}",
+                tail_elements.len()
+            ),
+            "type mismatch",
+        )?]));
+    }
+    if let TyKind::Tuple(type_elements) = ty.kind
         && !type_elements.is_empty()
     {
         let ExprKind::Tuple(tail_elements) = element.kind else {
             return Ok(None);
         };
         if tail_elements.len() != type_elements.len() {
-            return Ok(None);
+            let Some(display) =
+                direct_composite_type_display(ty, type_paths, symbols, inputs, target_cfg)
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                element.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected `{}`, found tuple of arity {}",
+                    display,
+                    tail_elements.len()
+                ),
+                "type mismatch",
+            )?]));
         }
         let mut diagnostics = Vec::new();
         for (type_element, tail_element) in type_elements.iter().zip(tail_elements) {

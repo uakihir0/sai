@@ -11606,6 +11606,35 @@ fn public_zero_parameter_nested_composite_literal_returns_emit_check_result() {
 }
 
 #[test]
+fn public_zero_parameter_tuple_arity_mismatch_is_diagnosed() {
+    for (source, message) in [
+        (
+            "pub fn f() -> (I32, Bool) { (1, true, 2) }\n",
+            "expected `(I32, Bool)`, found tuple of arity 3",
+        ),
+        (
+            "pub fn f() -> (I32, (Bool, I8)) { (1, (true, 5, 2)) }\n",
+            "expected `(Bool, I8)`, found tuple of arity 3",
+        ),
+        (
+            "pub fn f() -> ((), I32) { ((1,), 2) }\n",
+            "expected `()`, found tuple of arity 1",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && stdout.contains(message)
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected the arity TYPE_MISMATCH without a result or gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn public_zero_parameter_literal_operator_returns_emit_check_result() {
     for source in [
         "pub fn calc() -> I32 { 1 + 2 * 3 }\n",
