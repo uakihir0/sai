@@ -14381,6 +14381,15 @@ fn transparent_alias_const_type_errors_are_diagnosed() {
             ),
             "TYPE_MISMATCH",
         ),
+        // Unknown variants diagnose through aliased enum paths.
+        (
+            concat!(
+                "pub enum E {\nA,\nB\n}\n",
+                "pub type EA = E\n",
+                "pub const X: EA = EA.Missing\n",
+            ),
+            "UNKNOWN_VARIANT",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
@@ -14465,6 +14474,15 @@ fn unsupported_alias_const_forms_remain_gated() {
         // Generic and cyclic aliases never convert.
         "pub type Number<T> = I32\npub const A: I32 = 1\n",
         "pub type Number = Number\npub const A: Number = 1\n",
+        // `Self`-rooted constructor paths have no meaning at item level:
+        // they must not resolve as plain names, so they gate rather than
+        // silently accepting an invalid program.
+        "pub type Point {\nx: I32\n}\npub const Q: Point = Self.Point(x: 1)\n",
+        concat!(
+            "pub type Point {\nx: I32\n}\n",
+            "pub type P = Point\n",
+            "pub const Q: P = Self.P(x: 1)\n",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);

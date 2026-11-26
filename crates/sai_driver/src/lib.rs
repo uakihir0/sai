@@ -18179,7 +18179,13 @@ fn const_constructor_path_resolution(
     expression: &HirExpr<'_>,
     context: &ConstReferenceContext<'_, '_>,
 ) -> Option<Res> {
-    let (_path, segments) = direct_enum_variant_type_head(expression)?;
+    let (path, segments) = direct_enum_variant_type_head(expression)?;
+    // `Self`/`self`-rooted paths have no meaning in the owners this slice
+    // checks, and resolving their segments as plain names would silently
+    // accept invalid programs.
+    if path.root != PathRoot::Plain {
+        return None;
+    }
     if segments.is_empty() || segments.iter().any(|segment| segment.args.is_some()) {
         return None;
     }
@@ -18215,7 +18221,10 @@ fn const_explicit_variant_parts(
     expression: &HirExpr<'_>,
     context: &ConstReferenceContext<'_, '_>,
 ) -> Option<(DefId, Symbol, sai_hir::Span)> {
-    let (_path, segments) = direct_enum_variant_type_head(expression)?;
+    let (path, segments) = direct_enum_variant_type_head(expression)?;
+    if path.root != PathRoot::Plain {
+        return None;
+    }
     if segments.len() < 2 || segments.iter().any(|segment| segment.args.is_some()) {
         return None;
     }
@@ -19252,36 +19261,21 @@ fn check_const_nominal_constructor(
         };
     }
 
-    if let Some((_path, segments)) = direct_enum_variant_type_head(value)
-        && segments.len() >= 2
-        && segments.iter().all(|segment| segment.args.is_none())
-        && let Some(first) = segments.first()
-        && let Some(binding) = context.module_scope.scope.get(&first.name.sym)
+    if let Some((enum_def, variant_name, variant_span)) =
+        const_explicit_variant_parts(value, context)
+        && context.constructors.enums.contains_key(&enum_def)
+        && const_variant_like_name(symbols, variant_name)
+        && find_const_variant(enum_def, variant_name, context.constructors).is_none()
     {
-        let variant_segment = segments.last().expect("len checked above");
-        let head_segments = &segments[1..segments.len() - 1];
-        if let Ok(prefix) = resolve_module_prefix(
-            binding.res,
-            head_segments,
-            context.requesting_package,
-            context.module_members,
-        ) && prefix.consumed_segments == head_segments.len()
-            && let Res::Def(DefKind::Enum, enum_def) = prefix.base
-            && context.constructors.enums.contains_key(&enum_def)
-            && const_variant_like_name(symbols, variant_segment.name.sym)
-            && find_const_variant(enum_def, variant_segment.name.sym, context.constructors)
-                .is_none()
-        {
-            return Ok(Some(vec![const_literal_diagnostic(
-                owner.id,
-                inputs,
-                snapshot,
-                variant_segment.name.span,
-                sai_diagnostics::Code::UnknownVariant,
-                "unknown enum variant".to_string(),
-                "unknown variant",
-            )?]));
-        }
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            variant_span,
+            sai_diagnostics::Code::UnknownVariant,
+            "unknown enum variant".to_string(),
+            "unknown variant",
+        )?]));
     }
 
     if let Some(resolution) = const_constructor_path_resolution(value, context) {
