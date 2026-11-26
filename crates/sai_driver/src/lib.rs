@@ -7892,6 +7892,61 @@ fn check_const_literal_owner(
         return Ok(ConstLiteralCheck::SupportedTuple { diagnostics });
     }
 
+    // A whole-annotation transparent alias expanding to a tuple or array
+    // type checks exactly like its underlying constructor type. Direct
+    // annotations never reach this branch because the HIR-shape-driven
+    // dispatch above already consumes them.
+    match resolve_const_constructor_type(
+        *ty,
+        type_paths,
+        symbols,
+        inputs,
+        target_cfg.pointer_width(),
+    ) {
+        Some(ConstConstructorType::Tuple(elements)) => {
+            let Some(mut diagnostics) = check_const_tuple_constructor_value(
+                owner,
+                &elements,
+                &body.value,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                const_references.as_ref(),
+            )?
+            else {
+                return Ok(ConstLiteralCheck::Unsupported);
+            };
+            if let Some(diagnostic) = public_api_diagnostic.take() {
+                diagnostics.insert(0, diagnostic);
+            }
+            return Ok(ConstLiteralCheck::SupportedTuple { diagnostics });
+        }
+        Some(ConstConstructorType::Array(element, length)) => {
+            let Some(mut diagnostics) = check_const_array_constructor_value(
+                owner,
+                &element,
+                length,
+                &body.value,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                const_references.as_ref(),
+            )?
+            else {
+                return Ok(ConstLiteralCheck::Unsupported);
+            };
+            if let Some(diagnostic) = public_api_diagnostic.take() {
+                diagnostics.insert(0, diagnostic);
+            }
+            return Ok(ConstLiteralCheck::SupportedArray { diagnostics });
+        }
+        _ => {}
+    }
+
     let Some(literal_type) =
         resolve_const_literal_type(*ty, type_paths, symbols, inputs).or_else(|| {
             // A whole-annotation transparent alias expanding to a scalar
@@ -41304,12 +41359,40 @@ impl RootDatabase {
                 Some(module_members),
                 descriptor.owner.def_id.package(),
                 Some(source_graph_packages),
-            );
+            )
+            .with_const_aliases(Arc::clone(const_type_aliases));
             let Some(body) = hir_owner.body else {
                 continue;
             };
             let Some(literal_type) =
-                resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs)
+                resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs).or_else(
+                    || {
+                        // Alias-typed annotations expand transparently through
+                        // the constructor conversion; scalar expansions
+                        // evaluate exactly like their underlying literal type.
+                        match resolve_const_constructor_type(
+                            *ty,
+                            Some(&type_paths),
+                            &self.symbols,
+                            inputs,
+                            collection.target_cfg.pointer_width(),
+                        )? {
+                            ConstConstructorType::Scalar(scalar) => match scalar {
+                                FunctionDirectType::Primitive(primitive)
+                                    if sai_ty::typeck::literal::supports_primitive_literal(
+                                        primitive,
+                                    ) =>
+                                {
+                                    Some(ConstLiteralType::Primitive(primitive))
+                                }
+                                FunctionDirectType::Str => Some(ConstLiteralType::Str),
+                                FunctionDirectType::Unit => Some(ConstLiteralType::Unit),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    },
+                )
             else {
                 continue;
             };
