@@ -11606,6 +11606,30 @@ fn public_zero_parameter_nested_composite_literal_returns_emit_check_result() {
 }
 
 #[test]
+fn public_zero_parameter_return_array_length_type_errors_are_diagnosed() {
+    for (source, code) in [
+        (
+            "pub fn f() -> Array<Array<I32, -1>, 0> { [] }\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub fn f() -> Array<I32, -1> { [] }\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected {code} without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn public_zero_parameter_nested_composite_literal_errors_are_diagnosed() {
     for (source, code) in [
         (

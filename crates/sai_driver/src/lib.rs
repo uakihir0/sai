@@ -8621,6 +8621,39 @@ fn check_function_body_shape_dispatch(
             }
         }
     } else {
+        // Invalid literal array lengths in the return type are spec-invalid
+        // (spec 5.2.2) independent of the body shape — including empty
+        // array literals whose elements are never checked.
+        if let Some(return_ty) = sig.ret
+            && let Some((span, code)) = find_invalid_array_length_type_argument(
+                *return_ty,
+                type_paths,
+                target_cfg.pointer_width(),
+            )
+        {
+            let (message, label) = match code {
+                sai_diagnostics::Code::ConstArgNotSimple => (
+                    "const arguments must be simple literals".to_string(),
+                    "not a simple const argument",
+                ),
+                sai_diagnostics::Code::LiteralOutOfRange => (
+                    "integer literal is out of range for `USize`".to_string(),
+                    "literal out of range",
+                ),
+                sai_diagnostics::Code::TypeMismatch => (
+                    "array length must be a `USize` integer literal".to_string(),
+                    "wrong type for array length",
+                ),
+                _ => (
+                    "a const parameter takes a const argument, not a type".to_string(),
+                    "type argument in const parameter position",
+                ),
+            };
+            let diagnostics = vec![const_literal_diagnostic(
+                owner.id, inputs, snapshot, span, code, message, label,
+            )?];
+            return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
+        }
         // Tuple returns of direct element types check tuple-literal tails
         // element-wise: `pub fn pair() -> (I32, Bool) { (1, true) }` (spec
         // 6.5.1 — the tail checks against the tuple element types).
