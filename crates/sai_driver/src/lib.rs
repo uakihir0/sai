@@ -19370,12 +19370,24 @@ fn find_invalid_array_length_type_argument(
                         // type/const kind mismatch.
                         let code = match length.kind {
                             TyKind::Path(length_path)
-                                if matches!(
-                                    type_paths?.paths().get(&length_path.hir_id),
-                                    Some(PathRes {
-                                        base: Res::Def(DefKind::Const, _),
-                                        ..
-                                    })
+                                if type_paths?.paths().get(&length_path.hir_id).is_some_and(
+                                    |resolution| {
+                                        // A path that names a value — a
+                                        // const, variant, or function — or
+                                        // a member path into a nominal type
+                                        // (`Status.Ready`) expresses a
+                                        // const-argument intent, so it is a
+                                        // non-simple const argument rather
+                                        // than a type argument.
+                                        matches!(
+                                            resolution.base,
+                                            Res::Def(
+                                                DefKind::Const | DefKind::Variant | DefKind::Fn,
+                                                _
+                                            )
+                                        ) || (resolution.resolved_segments
+                                            < resolution.segment_count)
+                                    },
                                 ) =>
                             {
                                 sai_diagnostics::Code::ConstArgNotSimple

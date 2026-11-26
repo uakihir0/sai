@@ -14373,6 +14373,15 @@ fn invalid_array_length_arguments_are_diagnosed_not_gated() {
             "pub const N: USize = 1\npub const T: (Array<I32, N>,) = ([1],)\n",
             "CONST_ARG_NOT_SIMPLE",
         ),
+        // Value-paths (variants, member paths into nominal types) are
+        // const-argument intent as well.
+        (
+            concat!(
+                "pub enum Status {\nReady,\nDone\n}\n",
+                "pub const A: Array<I32, Status.Ready> = [1]\n",
+            ),
+            "CONST_ARG_NOT_SIMPLE",
+        ),
         // Any other type in the length position is a type/const kind
         // mismatch.
         (
