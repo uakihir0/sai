@@ -8634,39 +8634,12 @@ fn check_function_body_shape_dispatch(
             let Some(tail) = block.tail else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             };
-            let ExprKind::Tuple(tail_elements) = tail.kind else {
+            let Some(tuple_diagnostics) = check_function_composite_literal_element(
+                owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+            )?
+            else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             };
-            if tail_elements.len() != type_elements.len() {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            }
-            let mut tuple_diagnostics = Vec::new();
-            for (type_element, tail_element) in type_elements.iter().zip(tail_elements) {
-                if resolve_function_direct_type(*type_element, type_paths, symbols, inputs)
-                    .is_none()
-                {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                }
-                let is_unit_tuple =
-                    matches!(tail_element.kind, ExprKind::Tuple(elements) if elements.is_empty());
-                if !is_direct_function_scalar_literal(tail_element) && !is_unit_tuple {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                }
-                let Some(element_diagnostics) = check_const_literal_leaf(
-                    owner,
-                    *type_element,
-                    tail_element,
-                    type_paths,
-                    symbols,
-                    inputs,
-                    snapshot,
-                    target_cfg,
-                )?
-                else {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                };
-                tuple_diagnostics.extend(element_diagnostics);
-            }
             return Ok(FunctionBodyTypeCheck::Supported {
                 diagnostics: tuple_diagnostics,
             });
@@ -8675,60 +8648,21 @@ fn check_function_body_shape_dispatch(
         // element-wise, with the spec's length diagnostic:
         // `pub fn pair() -> Array<I32, 2> { [1, 2] }`.
         if let Some(return_ty) = sig.ret
-            && let Some((element_ty, expected_length)) =
+            && let Some(..) =
                 resolve_const_array_type(*return_ty, type_paths, target_cfg.pointer_width())
         {
-            if resolve_function_direct_type(*element_ty, type_paths, symbols, inputs).is_none() {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            }
             if !block.stmts.is_empty() {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             }
             let Some(tail) = block.tail else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             };
-            let ExprKind::Array(tail_elements) = tail.kind else {
+            let Some(array_diagnostics) = check_function_composite_literal_element(
+                owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+            )?
+            else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             };
-            if tail_elements.len() as u128 != expected_length {
-                return Ok(FunctionBodyTypeCheck::Supported {
-                    diagnostics: vec![const_literal_diagnostic(
-                        owner.id,
-                        inputs,
-                        snapshot,
-                        tail.span,
-                        sai_diagnostics::Code::ArrayLengthMismatch,
-                        format!(
-                            "expected array length {}, found {}",
-                            expected_length,
-                            tail_elements.len()
-                        ),
-                        "array length mismatch",
-                    )?],
-                });
-            }
-            let mut array_diagnostics = Vec::new();
-            for tail_element in tail_elements {
-                let is_unit_tuple =
-                    matches!(tail_element.kind, ExprKind::Tuple(elements) if elements.is_empty());
-                if !is_direct_function_scalar_literal(tail_element) && !is_unit_tuple {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                }
-                let Some(element_diagnostics) = check_const_literal_leaf(
-                    owner,
-                    *element_ty,
-                    tail_element,
-                    type_paths,
-                    symbols,
-                    inputs,
-                    snapshot,
-                    target_cfg,
-                )?
-                else {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                };
-                array_diagnostics.extend(element_diagnostics);
-            }
             return Ok(FunctionBodyTypeCheck::Supported {
                 diagnostics: array_diagnostics,
             });
@@ -8853,6 +8787,102 @@ fn check_function_body_shape_dispatch(
         }
     };
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+}
+
+// Composite literal elements in tuple/array returns recurse structurally
+// (spec 6.5.1): tuple literals check element-wise against tuple element
+// types, array literals against the array element type with the spec's
+// length diagnostic, and scalar leaves fall back to the const literal leaf
+// checks. `Ok(None)` gates positions needing inference.
+#[allow(clippy::too_many_arguments)]
+fn check_function_composite_literal_element(
+    owner: &HirOwner<'_>,
+    ty: Ty<'_>,
+    element: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if let TyKind::Tuple(type_elements) = ty.kind
+        && !type_elements.is_empty()
+    {
+        let ExprKind::Tuple(tail_elements) = element.kind else {
+            return Ok(None);
+        };
+        if tail_elements.len() != type_elements.len() {
+            return Ok(None);
+        }
+        let mut diagnostics = Vec::new();
+        for (type_element, tail_element) in type_elements.iter().zip(tail_elements) {
+            let Some(element_diagnostics) = check_function_composite_literal_element(
+                owner,
+                *type_element,
+                tail_element,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            diagnostics.extend(element_diagnostics);
+        }
+        return Ok(Some(diagnostics));
+    }
+    if let Some((element_ty, expected_length)) =
+        resolve_const_array_type(ty, type_paths, target_cfg.pointer_width())
+    {
+        let ExprKind::Array(tail_elements) = element.kind else {
+            return Ok(None);
+        };
+        if tail_elements.len() as u128 != expected_length {
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                element.span,
+                sai_diagnostics::Code::ArrayLengthMismatch,
+                format!(
+                    "expected array length {}, found {}",
+                    expected_length,
+                    tail_elements.len()
+                ),
+                "array length mismatch",
+            )?]));
+        }
+        let mut diagnostics = Vec::new();
+        for tail_element in tail_elements {
+            let Some(element_diagnostics) = check_function_composite_literal_element(
+                owner,
+                *element_ty,
+                tail_element,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            diagnostics.extend(element_diagnostics);
+        }
+        return Ok(Some(diagnostics));
+    }
+    if resolve_function_direct_type(ty, type_paths, symbols, inputs).is_none() {
+        return Ok(None);
+    }
+    let is_unit_tuple = matches!(element.kind, ExprKind::Tuple(elements) if elements.is_empty());
+    if !is_direct_function_scalar_literal(element) && !is_unit_tuple {
+        return Ok(None);
+    }
+    check_const_literal_leaf(
+        owner, ty, element, type_paths, symbols, inputs, snapshot, target_cfg,
+    )
 }
 
 fn check_inherent_method_body_type<'a>(

@@ -11595,6 +11595,45 @@ fn public_zero_parameter_array_literal_return_errors_are_diagnosed() {
 }
 
 #[test]
+fn public_zero_parameter_nested_composite_literal_returns_emit_check_result() {
+    for source in [
+        "pub fn nested() -> (I32, (Bool, I8)) { (1, (true, 5)) }\n",
+        "pub fn matrix() -> Array<Array<I32, 2>, 2> { [[1, 2], [3, 4]] }\n",
+        "pub fn mixed() -> Array<(I32, Bool), 1> { [(1, true)] }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_zero_parameter_nested_composite_literal_errors_are_diagnosed() {
+    for (source, code) in [
+        (
+            "pub fn nested() -> (I32, (Bool, I8)) { (1, (true, 128)) }\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub fn matrix() -> Array<Array<I32, 2>, 1> { [[1]] }\n",
+            "ARRAY_LENGTH_MISMATCH",
+        ),
+        (
+            "pub fn mixed() -> Array<(I32, Bool), 1> { [(1, 2)] }\n",
+            "TYPE_MISMATCH",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected {code} without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn public_zero_parameter_tuple_literal_return_element_errors_are_diagnosed() {
     for (source, code) in [
         ("pub fn pair() -> (I32, Bool) { (1, 2) }\n", "TYPE_MISMATCH"),
