@@ -3529,9 +3529,10 @@ fn package_private_const_in_mixed_source_checks() {
 }
 
 #[test]
-fn unsupported_const_initializer_in_mixed_source_stays_gated() {
-    // A const whose initializer is outside the literal slice keeps the
-    // mixed source gated rather than passing silently (IR-1134).
+fn not_const_initializer_in_mixed_source_is_diagnosed_without_gating() {
+    // A const whose initializer is a call is not a constant expression:
+    // the mixed source reports `NOT_CONST_EXPRESSION` rather than the
+    // stage gate or a silent pass (IR-1134, IR-1168).
     let source = concat!(
         "pub const LIMIT: I32 = make()\n",
         "type Counter { count: I32 }\n",
@@ -3545,7 +3546,19 @@ fn unsupported_const_initializer_in_mixed_source_stays_gated() {
         "    1\n",
         "}\n",
     );
-    assert_check_stays_gated(&run_check(source, "", &[], &[]), "call const");
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "call const should exit 1:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"NOT_CONST_EXPRESSION\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "call const expected NOT_CONST_EXPRESSION without a result or feature gate:\n{stdout}"
+    );
 }
 
 #[test]
@@ -13112,8 +13125,6 @@ fn public_str_const_type_errors_suppress_the_check_result() {
 #[test]
 fn str_const_forms_outside_the_literal_slice_remain_gated() {
     for source in [
-        "pub const FORMATTED: Str = f\"text\"\n",
-        "pub const BLOCK: Str = { \"text\" }\n",
         "pub const ALIAS: Text = \"text\"\n",
         "pub type Text = Str\npub const ALIAS: Text = \"text\"\n",
         "pub const RAW_TYPE: r#Str = \"text\"\n",
@@ -13157,7 +13168,6 @@ fn public_unit_const_type_errors_suppress_the_check_result() {
 #[test]
 fn unit_const_forms_outside_the_literal_slice_remain_gated() {
     for source in [
-        "pub const BLOCK: () = { () }\n",
         "pub const ALIAS: Unit = ()\n",
         "pub type Unit = ()\npub const ALIAS: Unit = ()\n",
     ] {
@@ -13299,7 +13309,6 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
 fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
         "pub const LEFT: (I32,) = (1,)\npub const RIGHT: (I32,) = (2,)\npub const COMPARISON_FOR_TUPLE: (Bool,) = LEFT == RIGHT\n",
-        "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
         "pub type Number = I32\npub const ALIAS_FIELD: (Number,) = (1,)\n",
         "pub type Number = I32\npub const ALIAS_ARITY: (Number,) = (1, 2)\n",
     ] {
@@ -14195,7 +14204,6 @@ fn duplicate_public_primitive_const_names_report_a_duplicate_without_a_result() 
 fn const_forms_outside_literal_slice_remain_gated() {
     for source in [
         "pub const ALIAS: MyInt = 1\n",
-        "pub const BORROWED: &Bool = &true\n",
         "use missing;\npub const VALUE: I8 = 1\n",
         "unsafe module\npub const VALUE: I8 = 1\n",
         "property \"coverage\" () {}\npub const VALUE: I8 = 1\n",
@@ -14208,6 +14216,70 @@ fn const_forms_outside_literal_slice_remain_gated() {
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
+fn spec_invalid_const_forms_are_diagnosed_without_gating() {
+    for (source, context) in [
+        (
+            "pub fn one() -> I32 { 1 }\npub const CALL: I32 = one()\n",
+            "function call",
+        ),
+        (
+            "pub fn one() -> I32 { 1 }\npub const ITEM: I32 = one\n",
+            "function item",
+        ),
+        (
+            "pub const IF: I32 = if true { 1 } else { 2 }\n",
+            "if expression",
+        ),
+        ("pub const BLOCK: I32 = { 1 }\n", "block"),
+        ("pub const MATCH: I32 = match 1 { _ => 2 }\n", "match"),
+        ("pub const BORROW: I32 = borrow 1\n", "borrow"),
+        ("pub const FORMAT: Str = f\"text\"\n", "f-string"),
+        (
+            "pub const NESTED: (I32,) = ({ 1 },)\n",
+            "nested invalid form in a tuple field",
+        ),
+        (
+            "pub type Point { x: I32 }\npub const CTOR: Point = Point(x: if true { 1 } else { 2 })\n",
+            "nested invalid form in a constructor argument",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: {context} should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"NOT_CONST_EXPRESSION\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: {context} expected NOT_CONST_EXPRESSION without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn valid_but_unimplemented_const_forms_remain_gated_not_misdiagnosed() {
+    for source in [
+        // Generic record construction is a valid constant form whose
+        // implementation is outside the current slice: it must stay
+        // gated rather than being reported as NOT_CONST_EXPRESSION.
+        "pub type Box2<T> { v: T }\npub const BOXED: Box2<I32> = Box2(v: 1)\n",
+        // Alias type annotations are valid but unsupported.
+        "pub type Number = I32\npub const ALIAS: Number = 1\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"NOT_CONST_EXPRESSION\""),
+            "{source:?}: valid-but-unimplemented forms must not be misdiagnosed:\n{stdout}"
+        );
     }
 }
 

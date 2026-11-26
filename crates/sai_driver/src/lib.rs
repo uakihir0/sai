@@ -7347,6 +7347,10 @@ pub enum ConstLiteralCheck {
     /// A nominal record, enum, or distinct type construction in the
     /// supported const-constructor slice.
     SupportedNominal { diagnostics: Vec<Diagnostic> },
+    /// The initializer contains a form that is never a constant
+    /// expression (spec §6.27), so it is `NOT_CONST_EXPRESSION` regardless
+    /// of the remaining implementation coverage.
+    SupportedNotConst { diagnostics: Vec<Diagnostic> },
 }
 
 impl ConstLiteralCheck {
@@ -7359,6 +7363,7 @@ impl ConstLiteralCheck {
                 | Self::SupportedTuple { .. }
                 | Self::SupportedArray { .. }
                 | Self::SupportedNominal { .. }
+                | Self::SupportedNotConst { .. }
         )
     }
 
@@ -7369,7 +7374,8 @@ impl ConstLiteralCheck {
             | Self::SupportedUnit { diagnostics }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics }
-            | Self::SupportedNominal { diagnostics } => diagnostics.is_empty(),
+            | Self::SupportedNominal { diagnostics }
+            | Self::SupportedNotConst { diagnostics } => diagnostics.is_empty(),
             Self::Unsupported => false,
         }
     }
@@ -7382,7 +7388,8 @@ impl ConstLiteralCheck {
             | Self::SupportedUnit { diagnostics }
             | Self::SupportedTuple { diagnostics }
             | Self::SupportedArray { diagnostics }
-            | Self::SupportedNominal { diagnostics } => diagnostics,
+            | Self::SupportedNominal { diagnostics }
+            | Self::SupportedNotConst { diagnostics } => diagnostics,
         }
     }
 }
@@ -7522,6 +7529,121 @@ fn const_constructor_kind_mismatch(
     )?]))
 }
 
+/// Determine whether a path or field-chain expression in a const
+/// initializer is a form that can never be constant. Enum variant paths
+/// surface in HIR as field chains (`Status.Ready` is `Field` syntax), so
+/// both shapes are normalized through `direct_enum_variant_type_head`.
+/// Constructor-shaped chains — penultimate segment resolving to an enum,
+/// or the chain resolving to anything other than a free function — are
+/// valid constant forms (or at worst valid-but-unimplemented forms that
+/// must stay gated rather than misdiagnosed). Chains rooted in another
+/// const are field access on a value, and chains resolving to free
+/// functions are function items or calls, neither of which is constant.
+fn const_path_chain_is_not_const(
+    expression: &HirExpr<'_>,
+    context: &ConstReferenceContext<'_, '_>,
+) -> bool {
+    let Some((_path, segments)) = direct_enum_variant_type_head(expression) else {
+        return true;
+    };
+    if segments.is_empty() || segments.iter().any(|segment| segment.args.is_some()) {
+        return false;
+    }
+    if const_explicit_variant_parts(expression, context).is_some() {
+        return false;
+    }
+    if segments.len() > 1
+        && let Some(first) = segments.first()
+        && let Some(binding) = context.module_scope.scope.get(&first.name.sym)
+        && matches!(binding.res, Res::Def(DefKind::Const, _))
+    {
+        return true;
+    }
+    matches!(
+        const_constructor_path_resolution(expression, context),
+        Some(Res::Def(DefKind::Fn, _))
+    )
+}
+
+/// Scan a const initializer for forms that can never be constant
+/// expressions (spec §6.27): `if`, `match`, blocks, closures, borrows,
+/// indexing, ranges, field access, f-strings, loops, control flow, casts,
+/// and calls whose callee is not constructor-shaped. Valid constant forms
+/// never contain these because the constant-context restriction applies
+/// recursively, so the first hit in pre-order is a `NOT_CONST_EXPRESSION`
+/// regardless of the remaining implementation coverage. Constructor calls
+/// resolve to record, enum, or distinct definitions; only callees that
+/// resolve to free functions (or method-style/non-path callees, which are
+/// never constructors) are flagged, so valid-but-unimplemented constructor
+/// forms stay gated instead of being misdiagnosed.
+fn find_not_const_expression_form(
+    value: &HirExpr<'_>,
+    const_references: Option<&ConstReferenceContext<'_, '_>>,
+) -> Option<sai_hir::Span> {
+    match &value.kind {
+        ExprKind::Lit(_) | ExprKind::ImplicitMember(_) | ExprKind::Err => None,
+        // Paths and field chains share one shape in const initializers:
+        // enum variant paths are field-chain syntax in HIR. A chain is
+        // invalid when it is value field access or a free function item;
+        // constructor-shaped and unresolvable chains stay conservative.
+        ExprKind::Path(_) | ExprKind::Field { .. } => const_references
+            .is_some_and(|context| const_path_chain_is_not_const(value, context))
+            .then_some(value.span),
+        ExprKind::If { .. }
+        | ExprKind::Match { .. }
+        | ExprKind::Loop { .. }
+        | ExprKind::Break { .. }
+        | ExprKind::Continue { .. }
+        | ExprKind::Return(_)
+        | ExprKind::Closure(_)
+        | ExprKind::Borrow(..)
+        | ExprKind::Index(..)
+        | ExprKind::FormatString(_)
+        | ExprKind::Try(_)
+        | ExprKind::Await(_)
+        | ExprKind::AsyncBlock { .. }
+        | ExprKind::Region { .. }
+        | ExprKind::AsCast { .. }
+        | ExprKind::ContractResult
+        | ExprKind::ContractOld { .. }
+        | ExprKind::Range { .. }
+        | ExprKind::Block(_)
+        | ExprKind::TupleField { .. } => Some(value.span),
+        ExprKind::Unary(operator, inner) => {
+            if matches!(operator, UnOp::Deref) {
+                return Some(value.span);
+            }
+            find_not_const_expression_form(inner, const_references)
+        }
+        ExprKind::Binary(_, left, right) => find_not_const_expression_form(left, const_references)
+            .or_else(|| find_not_const_expression_form(right, const_references)),
+        ExprKind::Tuple(elements) | ExprKind::Array(elements) => elements
+            .iter()
+            .find_map(|element| find_not_const_expression_form(element, const_references)),
+        ExprKind::Call { callee, args, base } => {
+            // Constructor callees (record, variant, or distinct
+            // construction) are valid constant forms and surface as path
+            // or field-chain syntax; only chains that resolve to free
+            // functions — or callees that are not chain-shaped at all,
+            // such as method or closure calls — are invalid.
+            let callee_invalid = match &callee.kind {
+                ExprKind::Path(_) | ExprKind::Field { .. } => const_references
+                    .is_some_and(|context| const_path_chain_is_not_const(callee, context)),
+                ExprKind::ImplicitMember(_) => false,
+                _ => true,
+            };
+            if callee_invalid {
+                return Some(callee.span);
+            }
+            args.iter()
+                .find_map(|arg| find_not_const_expression_form(arg.expr, const_references))
+                .or_else(|| {
+                    base.and_then(|base| find_not_const_expression_form(base, const_references))
+                })
+        }
+    }
+}
+
 fn check_const_literal_owner(
     owner: &HirOwner<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
@@ -7556,6 +7678,18 @@ fn check_const_literal_owner(
     let Some(body) = owner.body else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
+    if let Some(span) = find_not_const_expression_form(&body.value, const_references.as_ref()) {
+        let diagnostics = vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            span,
+            sai_diagnostics::Code::NotConstExpression,
+            "not a constant expression".to_string(),
+            "not a constant expression",
+        )?];
+        return Ok(ConstLiteralCheck::SupportedNotConst { diagnostics });
+    }
     let mut public_api_diagnostic = None;
     if matches!(item.vis, Visibility::Pub | Visibility::Export)
         && let Some(surface_type) = resolve_const_constructor_type(
@@ -102594,11 +102728,22 @@ property "shared"() {}
                 "owner index {index} diagnostic points to the literal"
             );
         }
-        for index in [16, 17, 23, 24] {
+        for index in [17] {
+            let ConstLiteralCheck::SupportedNotConst { diagnostics } = checks[index] else {
+                panic!("spec-invalid const form at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::NotConstExpression,
+                "owner index {index}"
+            );
+        }
+        for index in [16, 23, 24] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "aliases, non-literal expressions, raw identifiers and names outside the supported ASCII UPPER_SNAKE_CASE convention remain gated"
+                "aliases, raw identifiers and names outside the supported ASCII UPPER_SNAKE_CASE convention remain gated"
             );
         }
     }
@@ -102896,11 +103041,22 @@ property "shared"() {}
         assert_eq!(*primitive, sai_resolve::prelude::PrimTy::I8);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
-        for index in [8, 9, 10, 11] {
+        for index in [8, 9] {
+            let ConstLiteralCheck::SupportedNotConst { diagnostics } = checks[index] else {
+                panic!("spec-invalid const form at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::NotConstExpression,
+                "owner index {index}"
+            );
+        }
+        for index in [10, 11] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "unsupported string form or noncanonical type at owner index {index}"
+                "alias or noncanonical type at owner index {index} remains unsupported"
             );
         }
 
@@ -102988,13 +103144,22 @@ property "shared"() {}
             assert!(diagnostics[0].has_workspace_snapshot());
             assert!(diagnostics[0].primary().is_some());
         }
-        for index in [6, 7] {
+        for index in [6] {
+            let ConstLiteralCheck::SupportedNotConst { diagnostics } = checks[index] else {
+                panic!("spec-invalid const form at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
             assert_eq!(
-                checks[index],
-                &ConstLiteralCheck::Unsupported,
-                "nonliteral unit form or alias at owner index {index} remains unsupported"
+                diagnostics[0].code,
+                sai_diagnostics::Code::NotConstExpression,
+                "owner index {index}"
             );
         }
+        assert_eq!(
+            checks[7],
+            &ConstLiteralCheck::Unsupported,
+            "alias unit form at owner index 7 remains unsupported"
+        );
     }
 
     #[test]
@@ -103148,13 +103313,22 @@ property "shared"() {}
             },
             "array constructor at owner index 9 is supported"
         );
-        for index in [10, 11] {
+        for index in [10] {
+            let ConstLiteralCheck::SupportedNotConst { diagnostics } = checks[index] else {
+                panic!("spec-invalid const form at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
             assert_eq!(
-                checks[index],
-                &ConstLiteralCheck::Unsupported,
-                "block or alias form at owner index {index} stays gated"
+                diagnostics[0].code,
+                sai_diagnostics::Code::NotConstExpression,
+                "owner index {index}"
             );
         }
+        assert_eq!(
+            checks[11],
+            &ConstLiteralCheck::Unsupported,
+            "alias tuple field form at owner index 11 stays gated"
+        );
     }
 
     #[test]
