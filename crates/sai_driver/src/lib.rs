@@ -8948,6 +8948,48 @@ fn check_function_composite_literal_element(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    // `if` expressions with a Bool-literal condition check both branch
+    // tails recursively (spec 6.5.1); other conditions and branch shapes
+    // gate for the inference slice.
+    if let ExprKind::If {
+        cond,
+        then,
+        els: Some(else_expr),
+    } = element.kind
+    {
+        if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+            || then.safety != sai_hir::Safety::Safe
+            || !then.stmts.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(then_tail) = then.tail else {
+            return Ok(None);
+        };
+        let ExprKind::Block(else_block) = else_expr.kind else {
+            return Ok(None);
+        };
+        if else_block.safety != sai_hir::Safety::Safe || !else_block.stmts.is_empty() {
+            return Ok(None);
+        }
+        let Some(else_tail) = else_block.tail else {
+            return Ok(None);
+        };
+        let Some(mut diagnostics) = check_function_composite_literal_element(
+            owner, ty, then_tail, type_paths, symbols, inputs, snapshot, target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(mut else_diagnostics) = check_function_composite_literal_element(
+            owner, ty, else_tail, type_paths, symbols, inputs, snapshot, target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut else_diagnostics);
+        return Ok(Some(diagnostics));
+    }
     if let TyKind::Tuple(type_elements) = ty.kind
         && type_elements.is_empty()
         && let ExprKind::Tuple(tail_elements) = element.kind
