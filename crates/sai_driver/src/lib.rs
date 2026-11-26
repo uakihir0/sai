@@ -8621,10 +8621,14 @@ fn check_function_body_shape_dispatch(
             }
         }
     } else {
-        let Some(return_ty) = sig.ret else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
+        // A missing return type is the implicit `-> ()` (spec 6.5.1), so it
+        // resolves to unit; an explicit annotation that does not resolve
+        // stays unsupported.
+        let return_type = match sig.ret {
+            Some(ty) => resolve_function_direct_type(*ty, type_paths, symbols, inputs),
+            None => Some(FunctionDirectType::Unit),
         };
-        match resolve_function_direct_type(*return_ty, type_paths, symbols, inputs) {
+        match return_type {
             Some(FunctionDirectType::Unit) if block.stmts.is_empty() && block.tail.is_none() => {
                 Vec::new()
             }
@@ -8638,15 +8642,23 @@ fn check_function_body_shape_dispatch(
                 if !matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
-                let Some(diagnostics) = check_const_literal_leaf(
-                    owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
-                )?
-                else {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                };
-                diagnostics
+                if let Some(return_ty) = sig.ret {
+                    let Some(diagnostics) = check_const_literal_leaf(
+                        owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+                    )?
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    diagnostics
+                } else {
+                    Vec::new()
+                }
             }
             Some(FunctionDirectType::Primitive(_)) => {
+                // Primitive returns always come from an explicit annotation.
+                let Some(return_ty) = sig.ret else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
                 if !block.stmts.is_empty() {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
@@ -8689,6 +8701,10 @@ fn check_function_body_shape_dispatch(
                 }
             }
             Some(FunctionDirectType::Str) => {
+                // `Str` returns always come from an explicit annotation.
+                let Some(return_ty) = sig.ret else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
                 // `Str` locals bind only string literals and earlier `Str`
                 // locals: `let s = "a"`, `let t: Str = s`.
                 let mut str_bindings = StrLocalBindings::new();
@@ -70514,7 +70530,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [13, 14, 19] {
+        for index in [13, 14, 19, 21] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -70594,7 +70610,8 @@ property "shared"() {}
             .iter()
             .chain(owners[16..17].iter())
             .chain(owners[18..19].iter())
-            .chain(owners[20..].iter())
+            .chain(owners[20..21].iter())
+            .chain(owners[22..].iter())
         {
             assert!(matches!(
                 owner
