@@ -11545,6 +11545,39 @@ fn public_zero_parameter_implicit_unit_function_emits_check_result() {
 }
 
 #[test]
+fn public_zero_parameter_tuple_literal_return_emits_check_result() {
+    for source in [
+        "pub fn pair() -> (I32, Bool) { (1, true) }\n",
+        "pub fn pair() -> (I32, Str) { (1, \"a\") }\n",
+        "pub fn pair() -> (I32,) { (-1,) }\n",
+        "pub fn triple() -> (I32, Bool, ()) { (1, true, ()) }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_zero_parameter_tuple_literal_return_element_errors_are_diagnosed() {
+    for (source, code) in [
+        ("pub fn pair() -> (I32, Bool) { (1, 2) }\n", "TYPE_MISMATCH"),
+        (
+            "pub fn pair() -> (I8, Bool) { (128, true) }\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected {code} without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn public_zero_parameter_direct_literal_if_function_emits_check_result() {
     for source in [
         "pub fn choose() -> I32 { if true { 1 } else { 2 } }\n",
