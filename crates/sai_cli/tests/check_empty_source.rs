@@ -13387,6 +13387,183 @@ fn cross_file_nominal_const_constructors_check() {
 }
 
 #[test]
+fn cross_file_module_qualified_nominal_payload_checks() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types\n",
+            "use acme:empty/types.{Point}\n",
+            "pub enum Status { Ready(types.Point) }\n",
+            "pub const STATUS: Status = Status.Ready(Point(x: 1))\n",
+            "pub const QUALIFIED: Status = Status.Ready(types.Point(x: 2))\n",
+            "pub const REMOTE: types.Remote = types.Remote.Ready(types.Point(x: 3))\n",
+            "pub const ID: types.UserId = types.UserId(4)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[(
+            "src/types.sai",
+            concat!(
+                "pub type Point { x: I32 }\n",
+                "pub enum Remote { Ready(Point) }\n",
+                "pub distinct UserId = U64\n",
+            ),
+        )],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn missing_module_qualified_nominal_payload_stays_outside_const_constructor_slice() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types\n",
+            "pub enum Status { Ready(types.Missing) }\n",
+            "pub const ONE: I32 = 1\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[("src/types.sai", "pub type Point { x: I32 }\n")],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, "missing module member");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "missing module-qualified nominal payload stays gated:\n{stdout}"
+    );
+}
+
+#[test]
+fn missing_imported_nominal_payload_stays_outside_const_constructor_slice() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types.{Missing}\n",
+            "pub enum Status { Ready(Missing) }\n",
+            "pub const ONE: I32 = 1\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[("src/types.sai", "pub type Point { x: I32 }\n")],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, "missing imported nominal type");
+}
+
+#[test]
+fn cross_module_nominal_cycles_stay_outside_const_constructor_slice() {
+    let output = run_check(
+        concat!("pub const ONE: I32 = 1\n", "pub fn zero() -> I32 { 0 }\n",),
+        "",
+        &[
+            (
+                "src/a.sai",
+                concat!("use acme:empty/b\n", "pub enum A { Wrap(b.B) }\n",),
+            ),
+            (
+                "src/b.sai",
+                concat!("use acme:empty/a\n", "pub enum B { Wrap(a.A) }\n",),
+            ),
+        ],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, "cross-module nominal cycle");
+}
+
+#[test]
+fn module_qualified_same_name_nominal_payload_checks() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types\n",
+            "pub enum Node { Local(types.Node) }\n",
+            "pub const ROOT: Node = Node.Local(types.Node.Leaf)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[("src/types.sai", "pub enum Node { Leaf }\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn reexported_nominal_const_constructors_check() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/facade.{Point}\n",
+            "pub enum Status { Ready(Point) }\n",
+            "pub const STATUS: Status = Status.Ready(Point(x: 1))\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[
+            ("src/model.sai", "pub type Point { x: I32 }\n"),
+            ("src/middle.sai", "pub use acme:empty/model.{Point}\n"),
+            ("src/facade.sai", "pub use acme:empty/middle.{Point}\n"),
+        ],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn reexported_cross_module_nominal_cycle_stays_gated() {
+    let output = run_check(
+        concat!("pub const ONE: I32 = 1\n", "pub fn zero() -> I32 { 0 }\n",),
+        "",
+        &[
+            (
+                "src/a.sai",
+                concat!("use acme:empty/b\n", "pub enum A { Wrap(b.B) }\n"),
+            ),
+            (
+                "src/b.sai",
+                concat!("use acme:empty/facade.{A}\n", "pub enum B { Wrap(A) }\n"),
+            ),
+            ("src/facade.sai", "pub use acme:empty/a.{A}\n"),
+        ],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "re-exported cross-module nominal cycle",
+    );
+}
+
+#[test]
+fn private_imported_nominal_payload_stays_gated_in_public_enum() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types.{Secret}\n",
+            "pub enum Status { Ready(Secret) }\n",
+            "pub const ONE: I32 = 1\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[("src/types.sai", "type Secret { x: I32 }\n")],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, "private imported enum payload");
+}
+
+#[test]
+fn target_filtered_module_import_does_not_validate_qualified_payload() {
+    let output = run_check(
+        concat!(
+            "@target(\"wasm64-core\")\n",
+            "use acme:empty/types\n",
+            "pub enum Status { Ready(types.Point) }\n",
+            "pub const ONE: I32 = 1\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[("src/types.sai", "pub type Point { x: I32 }\n")],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, "target-filtered module import");
+}
+
+#[test]
 fn nominal_const_constructor_errors_are_checked() {
     for (source, code, message) in [
         (
