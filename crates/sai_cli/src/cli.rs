@@ -2860,6 +2860,18 @@ fn scanner_type_references_in_item(item: &sai_syntax::ast::Item) -> Vec<ScannerT
                     })
                     .collect()
             })
+            .or_else(|| {
+                // Aliases expand transparently, so a nominal type reaching
+                // itself through an alias chain is infinite exactly like a
+                // direct field cycle, and an alias reaching itself has no
+                // expansion at all; both belong in the dependency graph.
+                type_decl.alias_def().map(|definition| {
+                    definition
+                        .ty()
+                        .map(|ty| type_reference_names(&ty))
+                        .unwrap_or_default()
+                })
+            })
             .unwrap_or_default(),
         sai_syntax::ast::Item::Enum(enumeration) => enumeration
             .variants()
@@ -3053,6 +3065,9 @@ fn check_type_decls_acyclic(
                 else {
                     continue;
                 };
+                // Aliases expand transparently, so their right-hand type
+                // names are dependency edges exactly like record fields:
+                // a record reaching itself through an alias is infinite.
                 let targets = type_decl
                     .struct_def()
                     .and_then(|definition| definition.fields())
@@ -3061,6 +3076,11 @@ fn check_type_decls_acyclic(
                             .fields()
                             .flat_map(|field| type_texts(field.ty()))
                             .collect()
+                    })
+                    .or_else(|| {
+                        type_decl
+                            .alias_def()
+                            .map(|definition| type_texts(definition.ty()))
                     })
                     .unwrap_or_default();
                 (name, targets)
@@ -3323,13 +3343,47 @@ fn check_source_is_mixed_public_items_fragment(
                 saw_fn = true;
             }
             sai_syntax::ast::Item::Type(type_decl) => {
-                if !check_type_decl_primitive_fields(
-                    &type_decl,
-                    source,
-                    &type_names,
-                    &public_type_names,
-                    &use_item_bound_names(&source_file, source),
-                ) {
+                let admitted = if let Some(alias_def) = type_decl.alias_def() {
+                    // Transparent aliases (spec §5.6.5) are admitted when
+                    // their right-hand type stays inside the const
+                    // constructor shape the driver converts: no generics,
+                    // no refinement, no attributes, and a right-hand type
+                    // built from known names. Cyclic or otherwise
+                    // unsupported expansions are excluded by the driver's
+                    // conversion fixpoint, so they gate conservatively
+                    // rather than being misdiagnosed here.
+                    type_decl.attrs().next().is_none()
+                        && type_decl.generic_params().is_none()
+                        && !type_decl
+                            .syntax()
+                            .descendants()
+                            .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+                        && !type_decl.syntax().descendants().any(|node| {
+                            node.kind() == sai_syntax::SyntaxKind::ERROR
+                                || node.children_with_tokens().any(|element| {
+                                    element.as_token().is_some_and(|token| token.has_error())
+                                })
+                        })
+                        && alias_def.refinement().is_none()
+                        && alias_def.ty().is_some_and(|ty| {
+                            type_uses_known_names(
+                                &ty,
+                                &type_names,
+                                &item_imports,
+                                &module_bindings,
+                                module_type_inventory,
+                            ) && type_has_supported_const_constructor_shape(&ty)
+                        })
+                } else {
+                    check_type_decl_primitive_fields(
+                        &type_decl,
+                        source,
+                        &type_names,
+                        &public_type_names,
+                        &use_item_bound_names(&source_file, source),
+                    )
+                };
+                if !admitted {
                     return (false, false, false, false);
                 }
             }

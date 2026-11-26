@@ -3083,6 +3083,10 @@ pub struct TypeOwnerPathResolution {
     paths: HashMap<HirId, PathRes>,
     deferred_paths: Vec<DeferredPath>,
     module_path_errors: Vec<TypeOwnerModulePathError>,
+    /// Transparent non-generic type alias expansions available to const
+    /// constructor type conversion, keyed by the alias definition. Empty
+    /// for owners whose resolution does not participate in const checking.
+    const_aliases: Arc<HashMap<DefId, ConstConstructorType>>,
 }
 
 impl TypeOwnerPathResolution {
@@ -3092,6 +3096,18 @@ impl TypeOwnerPathResolution {
 
     pub fn paths(&self) -> &HashMap<HirId, PathRes> {
         &self.paths
+    }
+
+    pub(crate) fn const_aliases(&self) -> &Arc<HashMap<DefId, ConstConstructorType>> {
+        &self.const_aliases
+    }
+
+    pub(crate) fn with_const_aliases(
+        mut self,
+        aliases: Arc<HashMap<DefId, ConstConstructorType>>,
+    ) -> Self {
+        self.const_aliases = aliases;
+        self
     }
 
     pub fn deferred_paths(&self) -> &[DeferredPath] {
@@ -7876,7 +7892,85 @@ fn check_const_literal_owner(
         return Ok(ConstLiteralCheck::SupportedTuple { diagnostics });
     }
 
-    let Some(literal_type) = resolve_const_literal_type(*ty, type_paths, symbols, inputs) else {
+    // A whole-annotation transparent alias expanding to a tuple or array
+    // type checks exactly like its underlying constructor type. Direct
+    // annotations never reach this branch because the HIR-shape-driven
+    // dispatch above already consumes them.
+    match resolve_const_constructor_type(
+        *ty,
+        type_paths,
+        symbols,
+        inputs,
+        target_cfg.pointer_width(),
+    ) {
+        Some(ConstConstructorType::Tuple(elements)) => {
+            let Some(mut diagnostics) = check_const_tuple_constructor_value(
+                owner,
+                &elements,
+                &body.value,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                const_references.as_ref(),
+            )?
+            else {
+                return Ok(ConstLiteralCheck::Unsupported);
+            };
+            if let Some(diagnostic) = public_api_diagnostic.take() {
+                diagnostics.insert(0, diagnostic);
+            }
+            return Ok(ConstLiteralCheck::SupportedTuple { diagnostics });
+        }
+        Some(ConstConstructorType::Array(element, length)) => {
+            let Some(mut diagnostics) = check_const_array_constructor_value(
+                owner,
+                &element,
+                length,
+                &body.value,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+                const_references.as_ref(),
+            )?
+            else {
+                return Ok(ConstLiteralCheck::Unsupported);
+            };
+            if let Some(diagnostic) = public_api_diagnostic.take() {
+                diagnostics.insert(0, diagnostic);
+            }
+            return Ok(ConstLiteralCheck::SupportedArray { diagnostics });
+        }
+        _ => {}
+    }
+
+    let Some(literal_type) =
+        resolve_const_literal_type(*ty, type_paths, symbols, inputs).or_else(|| {
+            // A whole-annotation transparent alias expanding to a scalar
+            // type checks exactly like its underlying literal type.
+            match resolve_const_constructor_type(
+                *ty,
+                type_paths,
+                symbols,
+                inputs,
+                target_cfg.pointer_width(),
+            )? {
+                ConstConstructorType::Scalar(FunctionDirectType::Primitive(primitive)) => {
+                    Some(ConstLiteralType::Primitive(primitive))
+                }
+                ConstConstructorType::Scalar(FunctionDirectType::Str) => {
+                    Some(ConstLiteralType::Str)
+                }
+                ConstConstructorType::Scalar(FunctionDirectType::Unit) => {
+                    Some(ConstLiteralType::Unit)
+                }
+                _ => None,
+            }
+        })
+    else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
 
@@ -16984,11 +17078,27 @@ fn resolve_const_constructor_type(
         return None;
     }
     let segment_count = u32::try_from(path.segments.len()).ok()?;
+    let resolution = type_paths?.paths().get(&path.hir_id).copied();
+    if let Some(PathRes {
+        base: Res::Def(DefKind::Alias, alias_def),
+        resolved_segments,
+        segment_count: resolved_segment_count,
+    }) = resolution
+        && resolved_segments == segment_count
+        && resolved_segment_count == segment_count
+        && let Some(expansion) = type_paths?.const_aliases().get(&alias_def)
+    {
+        // Transparent aliases expand to their converted right-hand type;
+        // chained aliases were converted to fixpoint when the alias index
+        // was built, and cyclic or unsupported aliases are absent from the
+        // index, so this position stays conservatively gated.
+        return Some(expansion.clone());
+    }
     let Some(PathRes {
         base: Res::Def(DefKind::Struct | DefKind::Enum | DefKind::Distinct, def_id),
         resolved_segments,
         segment_count: resolved_segment_count,
-    }) = type_paths?.paths().get(&path.hir_id).copied()
+    }) = resolution
     else {
         return None;
     };
@@ -36441,6 +36551,7 @@ fn resolve_type_owner_module_paths(
         paths,
         deferred_paths,
         module_path_errors,
+        const_aliases: Arc::new(HashMap::new()),
     }
 }
 
@@ -40575,6 +40686,137 @@ impl RootDatabase {
     /// so `Str` and literal-length arrays use the same slice as const
     /// declarations. Generic, refined, attributed, and recovered nominal
     /// definitions stay outside this slice.
+    /// Index same-package, non-generic, unattributed type aliases whose
+    /// right-hand types convert into the const constructor slice. Aliases
+    /// are transparent (spec §5.6.5): the conversion of one alias right-
+    /// hand side may reference an already-converted alias, so conversion
+    /// runs to a fixpoint; cyclic or otherwise unsupported aliases are
+    /// absent from the result and their use positions stay gated.
+    fn index_const_type_aliases(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        snapshot: &WorkspaceSnapshot,
+        top_level_owner_index: &HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
+        module_members: &ModuleMemberIndex<'_>,
+        source_graph_packages: &HashSet<PackageId>,
+    ) -> Arc<HashMap<DefId, ConstConstructorType>> {
+        let Ok(primitive_prelude) = self.primitive_prelude.clone() else {
+            return Arc::new(HashMap::new());
+        };
+        let package = collection.module_tree.package;
+        let mut owner_inputs_by_file = HashMap::<FileId, Option<CurrentOwnerInputs>>::new();
+        let mut pending = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .filter(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::Alias
+                    && descriptor.owner.def_id.package() == package
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let mut converted = HashMap::new();
+        while !pending.is_empty() {
+            let mut progress = false;
+            let mut remaining = Vec::new();
+            for descriptor in pending {
+                let def_id = descriptor.owner.def_id.to_def_id();
+                if def_id.package != package {
+                    continue;
+                }
+                let converted_type = (|| {
+                    if !owner_inputs_by_file.contains_key(&descriptor.file) {
+                        owner_inputs_by_file.insert(
+                            descriptor.file,
+                            self.current_owner_inputs(
+                                snapshot,
+                                descriptor.file,
+                                &collection.target_cfg,
+                            )
+                            .ok(),
+                        );
+                    }
+                    let Some(Some(inputs)) = owner_inputs_by_file.get(&descriptor.file) else {
+                        return None;
+                    };
+                    let module_scope =
+                        module_scope_for_file(collection, &collection.module_tree, descriptor.file)
+                            .ok()?;
+                    let owner_descriptor = find_top_level_owner_descriptor(
+                        top_level_owner_index,
+                        descriptor.owner,
+                        descriptor.file,
+                        descriptor.item_id,
+                        descriptor.kind,
+                    )
+                    .ok()?;
+                    let def_paths = self.def_paths.get(&descriptor.owner.def_id.package())?;
+                    let expected_path = def_paths.resolve_def_id(def_id).ok()??;
+                    let arena = HirArena::new();
+                    let context = HirLoweringContext::new(
+                        &inputs.ast_ids,
+                        snapshot,
+                        &inputs.root,
+                        &arena,
+                        &self.symbols,
+                        def_paths,
+                    );
+                    let (hir_owner, _source_map) = lower_top_level_owner(
+                        owner_descriptor,
+                        &expected_path,
+                        &inputs.filtered_item_tree,
+                        &inputs.retained_item_kinds,
+                        &context,
+                    )
+                    .ok()?;
+                    if hir_owner.id != descriptor.owner || !hir_owner.raw_attrs.is_empty() {
+                        return None;
+                    }
+                    let OwnerNode::Item(item) = hir_owner.node else {
+                        return None;
+                    };
+                    let ItemKind::Alias { generics, ty } = item.kind else {
+                        return None;
+                    };
+                    if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                        return None;
+                    }
+                    let path_candidates = owner_test_only_path_candidates(&hir_owner);
+                    let type_paths = resolve_type_owner_module_paths(
+                        descriptor.owner,
+                        &path_candidates,
+                        &HashMap::new(),
+                        &primitive_prelude,
+                        &HashSet::new(),
+                        module_scope,
+                        Some(module_members),
+                        package,
+                        Some(source_graph_packages),
+                    )
+                    .with_const_aliases(Arc::new(converted.clone()));
+                    resolve_const_constructor_type(
+                        *ty,
+                        Some(&type_paths),
+                        &self.symbols,
+                        inputs,
+                        collection.target_cfg.pointer_width(),
+                    )
+                })();
+                if let Some(converted_type) = converted_type {
+                    converted.insert(def_id, converted_type);
+                    progress = true;
+                } else {
+                    remaining.push(descriptor);
+                }
+            }
+            if !progress {
+                break;
+            }
+            pending = remaining;
+        }
+        Arc::new(converted)
+    }
+
     fn index_const_type_constructors(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -40582,6 +40824,7 @@ impl RootDatabase {
         top_level_owner_index: &HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
         module_members: &ModuleMemberIndex<'_>,
         source_graph_packages: &HashSet<PackageId>,
+        const_type_aliases: &Arc<HashMap<DefId, ConstConstructorType>>,
     ) -> ConstTypeConstructorIndex {
         let mut constructors = ConstTypeConstructorIndex::default();
         let Ok(primitive_prelude) = self.primitive_prelude.clone() else {
@@ -40667,7 +40910,8 @@ impl RootDatabase {
                 Some(module_members),
                 package,
                 Some(source_graph_packages),
-            );
+            )
+            .with_const_aliases(Arc::clone(const_type_aliases));
             let convert_type = |ty: &Ty<'_>| {
                 resolve_const_constructor_type(
                     *ty,
@@ -40805,6 +41049,7 @@ impl RootDatabase {
         module_members: &ModuleMemberIndex<'_>,
         source_graph_packages: &HashSet<PackageId>,
         const_type_constructors: &ConstTypeConstructorIndex,
+        const_type_aliases: &Arc<HashMap<DefId, ConstConstructorType>>,
     ) -> (
         HashMap<DefId, FunctionDirectType>,
         HashMap<DefId, ConstConstructorType>,
@@ -40920,7 +41165,8 @@ impl RootDatabase {
                 Some(module_members),
                 descriptor.owner.def_id.package(),
                 Some(source_graph_packages),
-            );
+            )
+            .with_const_aliases(Arc::clone(const_type_aliases));
             if let Some(body) = hir_owner.body {
                 let targets = const_initializer_reference_targets(
                     &body.value,
@@ -40955,6 +41201,21 @@ impl RootDatabase {
                     Some(ConstLiteralType::Str) => Some(FunctionDirectType::Str),
                     Some(ConstLiteralType::Unit) => Some(FunctionDirectType::Unit),
                     _ => None,
+                })
+                .or_else(|| {
+                    // Alias-typed annotations expand transparently through the
+                    // constructor conversion; scalar expansions index exactly
+                    // like their underlying literal type.
+                    match resolve_const_constructor_type(
+                        *ty,
+                        Some(&type_paths),
+                        &self.symbols,
+                        inputs,
+                        collection.target_cfg.pointer_width(),
+                    )? {
+                        ConstConstructorType::Scalar(scalar) => Some(scalar),
+                        _ => None,
+                    }
                 })
             else {
                 continue;
@@ -41098,12 +41359,40 @@ impl RootDatabase {
                 Some(module_members),
                 descriptor.owner.def_id.package(),
                 Some(source_graph_packages),
-            );
+            )
+            .with_const_aliases(Arc::clone(const_type_aliases));
             let Some(body) = hir_owner.body else {
                 continue;
             };
             let Some(literal_type) =
-                resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs)
+                resolve_const_literal_type(*ty, Some(&type_paths), &self.symbols, inputs).or_else(
+                    || {
+                        // Alias-typed annotations expand transparently through
+                        // the constructor conversion; scalar expansions
+                        // evaluate exactly like their underlying literal type.
+                        match resolve_const_constructor_type(
+                            *ty,
+                            Some(&type_paths),
+                            &self.symbols,
+                            inputs,
+                            collection.target_cfg.pointer_width(),
+                        )? {
+                            ConstConstructorType::Scalar(scalar) => match scalar {
+                                FunctionDirectType::Primitive(primitive)
+                                    if sai_ty::typeck::literal::supports_primitive_literal(
+                                        primitive,
+                                    ) =>
+                                {
+                                    Some(ConstLiteralType::Primitive(primitive))
+                                }
+                                FunctionDirectType::Str => Some(ConstLiteralType::Str),
+                                FunctionDirectType::Unit => Some(ConstLiteralType::Unit),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    },
+                )
             else {
                 continue;
             };
@@ -41351,6 +41640,7 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
             &ConstTypeConstructorIndex::default(),
+            &Arc::new(HashMap::new()),
         );
         let const_literal_types = const_literal_types
             .into_iter()
@@ -42011,12 +42301,20 @@ impl RootDatabase {
             .map(|scopes| &scopes.source_graph_packages)
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let const_type_aliases = self.index_const_type_aliases(
+            collection,
+            snapshot,
+            &top_level_owner_index,
+            &module_members,
+            source_graph_packages,
+        );
         let const_type_constructors = self.index_const_type_constructors(
             collection,
             snapshot,
             &top_level_owner_index,
             &module_members,
             source_graph_packages,
+            &const_type_aliases,
         );
         let (
             const_literal_types,
@@ -42030,6 +42328,7 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
             &const_type_constructors,
+            &const_type_aliases,
         );
         let descriptors = collection
             .scopes
@@ -42177,6 +42476,11 @@ impl RootDatabase {
                             ),
                             (_, _, Err(error)) => Err(error),
                         };
+                    let type_path_resolution = type_path_resolution.map(|resolution| {
+                        resolution.map(|resolution| {
+                            resolution.with_const_aliases(Arc::clone(&const_type_aliases))
+                        })
+                    });
                     let const_reference_context = match &module_scope {
                         Ok(module_scope) => Some(ConstReferenceContext {
                             module_scope,
@@ -48367,6 +48671,7 @@ impl RootDatabase {
                                     paths: HashMap::from([(path.hir_id, path_resolution)]),
                                     deferred_paths: Vec::new(),
                                     module_path_errors,
+                                    const_aliases: Arc::new(HashMap::new()),
                                 };
                                 self.type_owner_module_path_diagnostics(
                                     owner,
@@ -51241,6 +51546,7 @@ impl RootDatabase {
             &module_members,
             source_graph_packages,
             &ConstTypeConstructorIndex::default(),
+            &Arc::new(HashMap::new()),
         );
         let const_literal_types = const_literal_types
             .into_iter()
@@ -102709,7 +103015,7 @@ property "shared"() {}
             })
             .collect::<Vec<_>>();
         assert_eq!(checks.len(), 25);
-        for index in [0, 1, 2, 3, 6, 8, 13, 18, 19, 20] {
+        for index in [0, 1, 2, 3, 6, 8, 13, 16, 18, 19, 20] {
             assert!(
                 checks[index].is_valid(),
                 "const at owner index {index} is a supported valid literal: {:?}",
@@ -102778,11 +103084,19 @@ property "shared"() {}
                 "owner index {index}"
             );
         }
-        for index in [16, 23, 24] {
+        assert_eq!(
+            checks[16],
+            &ConstLiteralCheck::Supported {
+                primitive: PrimTy::U8,
+                diagnostics: Vec::new(),
+            },
+            "transparent scalar alias at owner index 16 expands to its underlying type"
+        );
+        for index in [23, 24] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "aliases, raw identifiers and names outside the supported ASCII UPPER_SNAKE_CASE convention remain gated"
+                "raw identifiers and names outside the supported ASCII UPPER_SNAKE_CASE convention remain gated"
             );
         }
     }
@@ -103116,13 +103430,20 @@ property "shared"() {}
         let resolved = database
             .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
             .expect("shadowing const owners resolve");
-        assert_eq!(
-            resolved.owners()[0]
-                .literal_check()
-                .expect("literal checks use the current owner snapshot"),
-            &ConstLiteralCheck::Unsupported,
-            "a source type binding named Str must not use the canonical prelude fallback"
-        );
+        let ConstLiteralCheck::Supported {
+            primitive,
+            diagnostics,
+        } = resolved.owners()[0]
+            .literal_check()
+            .expect("literal checks use the current owner snapshot")
+        else {
+            panic!("a shadowing transparent alias expands to its underlying type");
+        };
+        assert_eq!(*primitive, sai_resolve::prelude::PrimTy::U8);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        // The transparent alias expansion shadows the prelude binding, so the
+        // canonical `Str` fallback is never consulted.
     }
 
     #[test]
@@ -103365,8 +103686,10 @@ property "shared"() {}
         }
         assert_eq!(
             checks[11],
-            &ConstLiteralCheck::Unsupported,
-            "alias tuple field form at owner index 11 stays gated"
+            &ConstLiteralCheck::SupportedTuple {
+                diagnostics: Vec::new(),
+            },
+            "transparent alias tuple field at owner index 11 expands to its underlying type"
         );
     }
 
