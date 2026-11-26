@@ -8494,12 +8494,9 @@ fn check_function_body_shape_dispatch(
             ),
             None => true,
         };
-        let parameters_resolve = sig
-            .params
-            .iter()
-            .all(|parameter| {
-                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs).is_some()
-            });
+        let parameters_resolve = sig.params.iter().all(|parameter| {
+            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs).is_some()
+        });
         if tail_unit_return
             && parameters_resolve
             && let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
@@ -9536,8 +9533,18 @@ fn check_function_discarded_unit_tail(
             let mut shapes = Vec::new();
             for element in elements {
                 let Some((shape, element_diagnostics)) = check_function_discarded_unit_tail(
-                    owner, element, in_array_element, true, sig, body, locals, symbols, inputs,
-                    snapshot, type_paths, target_cfg,
+                    owner,
+                    element,
+                    in_array_element,
+                    true,
+                    sig,
+                    body,
+                    locals,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    type_paths,
+                    target_cfg,
                 )?
                 else {
                     let mut literals = Vec::new();
