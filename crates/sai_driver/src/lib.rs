@@ -7762,6 +7762,10 @@ fn check_const_literal_owner(
                 "array length must be a `USize` integer literal".to_string(),
                 "wrong type for array length",
             ),
+            sai_diagnostics::Code::WrongNumberOfGenericArgs => (
+                "`Array` takes a type and a const argument".to_string(),
+                "wrong number of generic arguments",
+            ),
             _ => (
                 "a const parameter takes a const argument, not a type".to_string(),
                 "type argument in const parameter position",
@@ -8206,7 +8210,7 @@ fn check_function_body_type(
 // range independent of inference (spec 6.3.1).
 fn check_unit_discard_if_branch_tails(
     owner: &HirOwner<'_>,
-    tails: [Option<&HirExpr<'_>>; 2],
+    tails: &[Option<&HirExpr<'_>>],
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -8322,6 +8326,10 @@ fn check_function_body_shape_dispatch(
             sai_diagnostics::Code::TypeMismatch => (
                 "array length must be a `USize` integer literal".to_string(),
                 "wrong type for array length",
+            ),
+            sai_diagnostics::Code::WrongNumberOfGenericArgs => (
+                "`Array` takes a type and a const argument".to_string(),
+                "wrong number of generic arguments",
             ),
             _ => (
                 "a const parameter takes a const argument, not a type".to_string(),
@@ -8472,22 +8480,28 @@ fn check_function_body_shape_dispatch(
             let Some(tail) = block.tail else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             };
-            if let ExprKind::If {
-                cond,
-                then,
-                els: Some(else_expr),
-            } = tail.kind
-            {
-                let Some(return_ty) = sig.ret else {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
+            if let ExprKind::If { cond, then, els } = tail.kind {
+                let unit_return = match sig.ret {
+                    Some(return_ty) => matches!(
+                        resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+                        Some(FunctionDirectType::Unit)
+                    ),
+                    // A missing return type is the implicit `-> ()` (spec
+                    // 6.5.1).
+                    None => true,
                 };
-                if !matches!(
-                    resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
-                    Some(FunctionDirectType::Primitive(_))
-                ) {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                if !unit_return {
+                    let return_ty = sig.ret.expect("non-unit return is present");
+                    if !matches!(
+                        resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+                        Some(FunctionDirectType::Primitive(_))
+                    ) {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    }
                 }
-                let condition_diagnostics = if function_if_condition_uses_parameter_binding(
+                let condition_diagnostics = if matches!(cond.kind, ExprKind::Lit(Lit::Bool(_))) {
+                    Some(Vec::new())
+                } else if function_if_condition_uses_parameter_binding(
                     cond,
                     body_parameter,
                     locals,
@@ -8516,15 +8530,50 @@ fn check_function_body_shape_dispatch(
                 let Some(mut condition_diagnostics) = condition_diagnostics else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 };
-                let Some(mut branch_diagnostics) = check_function_if_literal_branches(
-                    owner, *return_ty, true, then, else_expr, type_paths, symbols, inputs,
-                    snapshot, target_cfg,
-                )?
-                else {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                };
-                condition_diagnostics.append(&mut branch_diagnostics);
-                condition_diagnostics
+                if unit_return {
+                    // Branch tails checked against `()` discard their values
+                    // (spec 6.11.1/6.25.2). An `if` without `else` has type
+                    // `()` (spec 6.14.1), so it is valid here.
+                    if !then.stmts.is_empty() || then.safety != sai_hir::Safety::Safe {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    }
+                    let tails = match els {
+                        None => vec![then.tail],
+                        Some(else_expr) => {
+                            let ExprKind::Block(else_block) = else_expr.kind else {
+                                return Ok(FunctionBodyTypeCheck::Unsupported);
+                            };
+                            if !else_block.stmts.is_empty()
+                                || else_block.safety != sai_hir::Safety::Safe
+                            {
+                                return Ok(FunctionBodyTypeCheck::Unsupported);
+                            }
+                            vec![then.tail, else_block.tail]
+                        }
+                    };
+                    let Some(tail_diagnostics) = check_unit_discard_if_branch_tails(
+                        owner, &tails, symbols, inputs, snapshot,
+                    )?
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    condition_diagnostics.extend(tail_diagnostics);
+                    condition_diagnostics
+                } else {
+                    let Some(else_expr) = els else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    let return_ty = sig.ret.expect("non-unit return is present");
+                    let Some(mut branch_diagnostics) = check_function_if_literal_branches(
+                        owner, *return_ty, true, then, else_expr, type_paths, symbols, inputs,
+                        snapshot, target_cfg,
+                    )?
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    condition_diagnostics.append(&mut branch_diagnostics);
+                    condition_diagnostics
+                }
             } else {
                 let ExprKind::Path(path) = tail.kind else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8797,24 +8846,29 @@ fn check_function_body_shape_dispatch(
                     // A tail checked against `()` discards its value (spec
                     // 6.11.1/6.25.2); validate it like a discarded composite
                     // branch tail. `if` tails validate both branch tails.
-                    if let ExprKind::If {
-                        cond,
-                        then,
-                        els: Some(else_expr),
-                    } = tail.kind
+                    if let ExprKind::If { cond, then, els } = tail.kind
                         && matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
                         && then.stmts.is_empty()
                         && then.safety == sai_hir::Safety::Safe
-                        && let ExprKind::Block(else_block) = else_expr.kind
-                        && else_block.stmts.is_empty()
-                        && else_block.safety == sai_hir::Safety::Safe
                     {
+                        // An `if` without `else` has type `()` (spec 6.14.1),
+                        // so it is valid where `()` is expected.
+                        let tails = match els {
+                            None => vec![then.tail],
+                            Some(else_expr) => {
+                                let ExprKind::Block(else_block) = else_expr.kind else {
+                                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                                };
+                                if !else_block.stmts.is_empty()
+                                    || else_block.safety != sai_hir::Safety::Safe
+                                {
+                                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                                }
+                                vec![then.tail, else_block.tail]
+                            }
+                        };
                         let Some(diagnostics) = check_unit_discard_if_branch_tails(
-                            owner,
-                            [then.tail, else_block.tail],
-                            symbols,
-                            inputs,
-                            snapshot,
+                            owner, &tails, symbols, inputs, snapshot,
                         )?
                         else {
                             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -9307,39 +9361,44 @@ fn check_function_composite_literal_element(
     // `if` expressions with a Bool-literal condition check both branch
     // tails recursively (spec 6.5.1); other conditions and branch shapes
     // gate for the inference slice.
-    if let ExprKind::If {
-        cond,
-        then,
-        els: Some(else_expr),
-    } = element.kind
-    {
+    if let ExprKind::If { cond, then, els } = element.kind {
         if !matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
             || then.safety != sai_hir::Safety::Safe
             || !then.stmts.is_empty()
         {
             return Ok(None);
         }
+        // Branch tails checked against `()` discard their values (spec
+        // 6.11.1/6.25.2). Literal and composite-construction tails are
+        // self-consistent in the direct-type fragment, so they are valid
+        // discards; other forms fall through to the element checks. An `if`
+        // without `else` has type `()` (spec 6.14.1), so it is valid here.
+        if matches!(
+            resolve_const_literal_type(ty, type_paths, symbols, inputs),
+            Some(ConstLiteralType::Unit)
+        ) {
+            let tails = match els {
+                None => vec![then.tail],
+                Some(else_expr) => {
+                    let ExprKind::Block(else_block) = else_expr.kind else {
+                        return Ok(None);
+                    };
+                    if else_block.safety != sai_hir::Safety::Safe || !else_block.stmts.is_empty() {
+                        return Ok(None);
+                    }
+                    vec![then.tail, else_block.tail]
+                }
+            };
+            return check_unit_discard_if_branch_tails(owner, &tails, symbols, inputs, snapshot);
+        }
+        let Some(else_expr) = els else {
+            return Ok(None);
+        };
         let ExprKind::Block(else_block) = else_expr.kind else {
             return Ok(None);
         };
         if else_block.safety != sai_hir::Safety::Safe || !else_block.stmts.is_empty() {
             return Ok(None);
-        }
-        // Branch tails checked against `()` discard their values (spec
-        // 6.11.1/6.25.2). Literal and composite-construction tails are
-        // self-consistent in the direct-type fragment, so they are valid
-        // discards; other forms fall through to the element checks.
-        if matches!(
-            resolve_const_literal_type(ty, type_paths, symbols, inputs),
-            Some(ConstLiteralType::Unit)
-        ) {
-            return check_unit_discard_if_branch_tails(
-                owner,
-                [then.tail, else_block.tail],
-                symbols,
-                inputs,
-                snapshot,
-            );
         }
         let Some(then_tail) = then.tail else {
             return Ok(None);
@@ -17530,18 +17589,89 @@ fn check_function_if_parameter_comparison_condition(
     ) {
         return Ok(None);
     }
+    // Byte-string literals are valid comparison operands here only so
+    // that the type check below diagnoses them: they never match a
+    // primitive or `Str` parameter type.
+    let is_comparison_literal = |expression: &HirExpr<'_>| {
+        is_direct_function_scalar_literal(expression)
+            || matches!(expression.kind, ExprKind::Lit(Lit::ByteStr(_)))
+    };
     let (literal, parameter_path, literal_is_left) =
         if function_if_path_uses_parameter_binding(left, body_parameter, locals, inputs)
-            && is_direct_function_scalar_literal(right)
+            && is_comparison_literal(right)
         {
             (right, left, false)
-        } else if is_direct_function_scalar_literal(left)
+        } else if is_comparison_literal(left)
             && function_if_path_uses_parameter_binding(right, body_parameter, locals, inputs)
         {
             (left, right, true)
         } else {
             return Ok(None);
         };
+    if matches!(
+        resolve_function_direct_type(parameter_ty, type_paths, symbols, inputs),
+        Some(FunctionDirectType::Str)
+    ) {
+        // `Str` comparisons mirror the primitive walker: string literals
+        // compare in any equality or ordering operator, and other literal
+        // kinds mismatch. A literal on the left fixes the expectation
+        // through its own type like the primitive comparisons do, while a
+        // literal on the right checks against the `Str` parameter.
+        if matches!(literal.kind, ExprKind::Lit(Lit::Str(_))) {
+            return Ok(Some(Vec::new()));
+        }
+        if literal_is_left {
+            let expected = match literal.kind {
+                ExprKind::Lit(Lit::Int { .. }) => "I64",
+                ExprKind::Lit(Lit::Float { .. }) => "F64",
+                ExprKind::Lit(Lit::Bool(_)) => "Bool",
+                ExprKind::Lit(Lit::Char(_)) => "Char",
+                ExprKind::Lit(Lit::Byte(_)) => "Byte",
+                ExprKind::Lit(Lit::ByteStr(_)) => {
+                    // Byte-string literals have the fixed type
+                    // `Slice<Byte>` (spec 6.21.3), so they never compare
+                    // against `Str` in either operand position.
+                    return Ok(Some(vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        literal.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        "expected `Str`, found a byte string literal".to_string(),
+                        "type mismatch",
+                    )?]));
+                }
+                _ => return Ok(None),
+            };
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                parameter_path.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `{expected}`, found `Str`"),
+                "type mismatch",
+            )?]));
+        }
+        let found = match literal.kind {
+            ExprKind::Lit(Lit::Int { .. }) => "an integer literal",
+            ExprKind::Lit(Lit::Float { .. }) => "a floating-point literal",
+            ExprKind::Lit(Lit::Bool(_)) => "a Bool literal",
+            ExprKind::Lit(Lit::Char(_)) => "a character literal",
+            ExprKind::Lit(Lit::Byte(_)) => "a byte literal",
+            ExprKind::Lit(Lit::ByteStr(_)) => "a byte string literal",
+            _ => return Ok(None),
+        };
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            literal.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `Str`, found {found}"),
+            "type mismatch",
+        )?]));
+    }
     let Some(FunctionDirectType::Primitive(parameter_primitive)) =
         resolve_function_direct_type(parameter_ty, type_paths, symbols, inputs)
     else {
@@ -20274,7 +20404,17 @@ fn find_invalid_array_length_type_argument(
                     })
                 );
             for segment in path.segments {
+                if is_prelude_array && segment.args.is_none() {
+                    // `Array` takes a type and a const argument (spec
+                    // 5.4.2); omitting them is spec-invalid.
+                    return Some((path.span, sai_diagnostics::Code::WrongNumberOfGenericArgs));
+                }
                 if let Some(args) = segment.args {
+                    if is_prelude_array && args.args.len() != 2 {
+                        // `Array` takes a type and a const argument (spec
+                        // 5.4.2); any other arity is spec-invalid.
+                        return Some((args.span, sai_diagnostics::Code::WrongNumberOfGenericArgs));
+                    }
                     if is_prelude_array
                         && args.args.len() == 2
                         && let GenericArg::Const(const_length) = args.args[1]
