@@ -11537,6 +11537,14 @@ fn public_zero_parameter_explicit_unit_function_emits_check_result() {
 }
 
 #[test]
+fn public_zero_parameter_implicit_unit_function_emits_check_result() {
+    // A missing return type is the implicit `-> ()`.
+    for source in ["pub fn empty() {}\n", "pub fn unit() { () }\n"] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
 fn public_zero_parameter_direct_literal_if_function_emits_check_result() {
     for source in [
         "pub fn choose() -> I32 { if true { 1 } else { 2 } }\n",
@@ -12412,7 +12420,6 @@ fn unsupported_zero_parameter_function_shapes_remain_gated() {
         "pub fn answer() -> I32 { let value = 42; value }\n",
         "pub fn answer() -> () { 42 }\n",
         "pub fn answer() -> () { let value = (); }\n",
-        "pub fn answer() {}\n",
         "pub type Number = I32\npub fn answer() -> Number { 42 }\n",
         "@inline\npub fn answer() -> I32 { 42 }\n",
     ] {
