@@ -11674,6 +11674,10 @@ fn public_unit_return_discards_tail_values() {
         "pub fn f() { if true { 1 } else { 2 } }\n",
         "pub fn f() { if true { 1 } else {} }\n",
         "pub fn f() { if true {} else { 2 } }\n",
+        "pub fn f() { if true { 1 } }\n",
+        "pub fn f(flag: Bool) { if flag { 1 } else { 2 } }\n",
+        "pub fn f(flag: Bool) { if flag { 1 } }\n",
+        "pub fn f(x: I32) { if x < 10 { 1 } else { 2 } }\n",
         "pub fn f() { (1, true) }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
@@ -11692,6 +11696,10 @@ fn public_unit_return_discard_errors_are_diagnosed() {
         (
             "pub fn f() { if true { x } else { 99999999999999999999 } }\n",
             "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub fn f(flag: Bool) { if flag { [1, true] } else { [1] } }\n",
+            "TYPE_MISMATCH",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);

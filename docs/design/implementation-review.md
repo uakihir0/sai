@@ -10958,3 +10958,37 @@ blocks and non-literal `if` conditions gate.
 **Remaining scope.** Operators over parameters in composite positions,
 local bindings and projections, tuple/array-typed parameters, the no-effect
 warning, and must-use discard diagnostics.
+
+## IR-1185: Parameterized unit returns and `if` without `else`
+
+**Decision.** Single-parameter functions returning `()` (implicitly or
+explicitly) check `if` tails through the same condition validation as
+scalar returns — Bool-literal conditions, Bool-parameter paths, and
+parameter comparisons — with both branch tails validated as unit discards:
+`pub fn f(flag: Bool) { if flag { 1 } else { 2 } }` is valid. An `if`
+without `else` has type `()` (spec 6.14.1), so it is valid wherever `()` is
+expected: function tails and composite unit positions. Empty `if` branches
+evaluate to `()` on their own, and when a branch needs inference, integer
+literals fitting no integer type still surface through the gate because
+they are out of range independent of inference (spec 6.3.1).
+
+**Reason.** Parameterized functions were gated before the unit-discard
+validation ran, and the no-else form is spec-valid in unit positions;
+rejecting either misdiagnosed valid programs. The shared branch-tail
+validator keeps discard semantics identical across zero-parameter,
+parameterized, and composite unit positions.
+
+**Failure boundary.** `if` without `else` in non-unit positions still gates
+rather than reporting `IF_WITHOUT_ELSE`; non-literal, non-parameter
+conditions gate; branch tails that are parameter or local paths gate for
+the local-binding slice.
+
+**Verification.** Driver and CLI suites pass; probes cover parameter
+conditions, comparison conditions, empty branches, no-else forms, range
+errors surfacing past gated sibling branches, and composite unit positions.
+
+**Remaining scope.** `IF_WITHOUT_ELSE` in non-unit positions, parameter and
+local paths in discard positions, `else if` chains, operators over
+parameters in composite positions, local bindings and projections,
+tuple/array-typed parameters, the no-effect warning, and must-use discard
+diagnostics.
