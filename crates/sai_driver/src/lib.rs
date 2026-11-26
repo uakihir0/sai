@@ -8938,6 +8938,83 @@ fn check_function_operator_expression_against_type(
 // length diagnostic, and scalar leaves fall back to the const literal leaf
 // checks. `Ok(None)` gates positions needing inference.
 #[allow(clippy::too_many_arguments)]
+// A branch tail discarded against `()` must still be well-typed on its own
+// (spec 6.25.2): integer literals default to `I64` and range-check after
+// resolution (6.3.1), array elements share one type, and composite
+// constructions validate recursively. Forms needing inference gate.
+fn check_function_discarded_unit_tail(
+    owner: &HirOwner<'_>,
+    tail: &HirExpr<'_>,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    match tail.kind {
+        ExprKind::Lit(Lit::Int { value, negated }) => {
+            let fits = match value {
+                Some(value) if negated => value <= (i64::MAX as u128) + 1,
+                Some(value) => value <= i64::MAX as u128,
+                None => false,
+            };
+            if fits {
+                return Ok(Some(Vec::new()));
+            }
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                tail.span,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "integer literal out of range for `I64`".to_string(),
+                "literal out of range",
+            )?]));
+        }
+        ExprKind::Lit(_) => return Ok(Some(Vec::new())),
+        ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
+            let mut diagnostics = Vec::new();
+            let mut literal_kinds: Vec<&'static str> = Vec::new();
+            for element in elements {
+                let Some(element_diagnostics) =
+                    check_function_discarded_unit_tail(owner, element, inputs, snapshot)?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.extend(element_diagnostics);
+                if matches!(tail.kind, ExprKind::Array(_)) {
+                    let kind = match element.kind {
+                        ExprKind::Lit(Lit::Int { .. }) => "integer",
+                        ExprKind::Lit(Lit::Float { .. }) => "float",
+                        ExprKind::Lit(Lit::Str(_)) => "string",
+                        ExprKind::Lit(Lit::ByteStr(_)) => "byte string",
+                        ExprKind::Lit(Lit::Char(_)) => "char",
+                        ExprKind::Lit(Lit::Byte(_)) => "byte",
+                        ExprKind::Lit(Lit::Bool(_)) => "bool",
+                        _ => "other",
+                    };
+                    literal_kinds.push(kind);
+                }
+            }
+            if matches!(tail.kind, ExprKind::Array(_))
+                && literal_kinds
+                    .first()
+                    .is_some_and(|first| literal_kinds.iter().any(|kind| kind != first))
+            {
+                diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    tail.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    "array elements have mismatched types".to_string(),
+                    "type mismatch",
+                )?);
+            }
+            return Ok(Some(diagnostics));
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
 fn check_function_composite_literal_element(
     owner: &HirOwner<'_>,
     ty: Ty<'_>,
@@ -8982,19 +9059,17 @@ fn check_function_composite_literal_element(
         if matches!(
             resolve_const_literal_type(ty, type_paths, symbols, inputs),
             Some(ConstLiteralType::Unit)
-        ) && [then_tail, else_tail].iter().all(|tail| match tail.kind {
-            ExprKind::Lit(_) => true,
-            ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
-                elements.iter().all(|nested| {
-                    matches!(
-                        nested.kind,
-                        ExprKind::Lit(_) | ExprKind::Tuple(_) | ExprKind::Array(_)
-                    )
-                })
+        ) {
+            let mut discard_diagnostics = Vec::new();
+            for tail in [then_tail, else_tail] {
+                let Some(tail_diagnostics) =
+                    check_function_discarded_unit_tail(owner, tail, inputs, snapshot)?
+                else {
+                    return Ok(None);
+                };
+                discard_diagnostics.extend(tail_diagnostics);
             }
-            _ => false,
-        }) {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(discard_diagnostics));
         }
         let Some(mut diagnostics) = check_function_composite_literal_element(
             owner, ty, then_tail, type_paths, symbols, inputs, snapshot, target_cfg,
