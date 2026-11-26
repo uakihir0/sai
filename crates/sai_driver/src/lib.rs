@@ -7745,6 +7745,18 @@ fn check_const_literal_owner(
         )?];
         return Ok(ConstLiteralCheck::SupportedNotConst { diagnostics });
     }
+    if let Some(span) = find_const_arg_not_simple_array_length(*ty, type_paths) {
+        let diagnostics = vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            span,
+            sai_diagnostics::Code::ConstArgNotSimple,
+            "const arguments must be simple literals".to_string(),
+            "not a simple const argument",
+        )?];
+        return Ok(ConstLiteralCheck::SupportedNotConst { diagnostics });
+    }
     let mut public_api_diagnostic = None;
     if matches!(item.vis, Visibility::Pub | Visibility::Export)
         && let Some(surface_type) = resolve_const_constructor_type(
@@ -19318,6 +19330,56 @@ fn check_const_nominal_constructor(
         ),
         "type mismatch",
     )?]))
+}
+
+/// Finds an `Array` type annotation whose length argument is a type
+/// argument — the shape a const-item path (`Array<I32, N>`) parses to.
+/// Const-item names and arithmetic are never valid const arguments (spec
+/// §5.2.2: `CONST_ARG_NOT_SIMPLE`), and const parameters cannot exist in
+/// the non-generic owners this slice checks, so every such annotation is
+/// spec-invalid. Returns the offending length argument's span.
+fn find_const_arg_not_simple_array_length(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+) -> Option<sai_hir::Span> {
+    match ty.kind {
+        TyKind::Path(path) => {
+            let is_prelude_array = path.root == PathRoot::Plain
+                && path.segments.len() == 1
+                && matches!(
+                    type_paths?.paths().get(&path.hir_id),
+                    Some(PathRes {
+                        base: Res::PrimTy(sai_resolve::prelude::PrimTy::Array),
+                        resolved_segments: 1,
+                        segment_count: 1,
+                    })
+                );
+            for segment in path.segments {
+                if let Some(args) = segment.args {
+                    if is_prelude_array
+                        && args.args.len() == 2
+                        && let GenericArg::Type(length) = args.args[1]
+                    {
+                        return Some(length.span);
+                    }
+                    for arg in args.args {
+                        if let GenericArg::Type(element) = arg
+                            && let Some(span) =
+                                find_const_arg_not_simple_array_length(**element, type_paths)
+                        {
+                            return Some(span);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        TyKind::Tuple(elements) => elements
+            .iter()
+            .find_map(|element| find_const_arg_not_simple_array_length(*element, type_paths)),
+        TyKind::Borrow(_, inner) => find_const_arg_not_simple_array_length(*inner, type_paths),
+        _ => None,
+    }
 }
 
 fn resolve_const_array_type<'hir>(

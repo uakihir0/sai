@@ -14361,6 +14361,24 @@ fn transparent_alias_const_type_errors_are_diagnosed() {
 }
 
 #[test]
+fn const_item_array_lengths_are_diagnosed_not_gated() {
+    for source in [
+        "pub const N: USize = 2\npub const A: Array<I32, N> = [1, 2]\n",
+        "pub const N: USize = 1\npub const T: (Array<I32, N>,) = ([1],)\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"CONST_ARG_NOT_SIMPLE\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected CONST_ARG_NOT_SIMPLE without a result or gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn unsupported_alias_const_forms_remain_gated() {
     for source in [
         // Cyclic aliases gate the package even when nothing uses them:
