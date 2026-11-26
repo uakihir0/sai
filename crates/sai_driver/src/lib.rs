@@ -8494,8 +8494,12 @@ fn check_function_body_shape_dispatch(
             ),
             None => true,
         };
+        // `self` parameters belong to methods, not free functions; they
+        // fall through to the method paths instead of validating here.
         let parameters_resolve = sig.params.iter().all(|parameter| {
-            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs).is_some()
+            !parameter.is_self
+                && resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+                    .is_some()
         });
         if tail_unit_return
             && parameters_resolve
