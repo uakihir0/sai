@@ -8785,7 +8785,7 @@ fn check_function_body_shape_dispatch(
                         else {
                             return Ok(FunctionBodyTypeCheck::Unsupported);
                         };
-                        let Some(diagnostics) = check_const_operator_expression_against_type(
+                        let Some(diagnostics) = check_function_operator_expression_against_type(
                             owner.id,
                             literal_type,
                             tail,
@@ -8793,7 +8793,6 @@ fn check_function_body_shape_dispatch(
                             inputs,
                             snapshot,
                             target_cfg,
-                            None,
                         )?
                         else {
                             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8843,6 +8842,41 @@ fn check_function_body_shape_dispatch(
         }
     };
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+}
+
+// Literal operator expressions in function bodies reuse the const scalar
+// evaluator for type and range checks, but overflow, division by zero, and
+// shift overflow are runtime panics (spec 6.8 / D-TYPE-06), not compile
+// errors — `CONST_EVAL_PANIC` applies to const initializers only.
+#[allow(clippy::too_many_arguments)]
+fn check_function_operator_expression_against_type(
+    owner: OwnerId,
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(diagnostics) = check_const_operator_expression_against_type(
+        owner,
+        literal_type,
+        value,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code != sai_diagnostics::Code::ConstEvalPanic)
+            .collect(),
+    ))
 }
 
 // Composite literal elements in tuple/array returns recurse structurally
@@ -8943,7 +8977,7 @@ fn check_function_composite_literal_element(
     let Some(literal_type) = resolve_const_literal_type(ty, type_paths, symbols, inputs) else {
         return Ok(None);
     };
-    check_const_operator_expression_against_type(
+    check_function_operator_expression_against_type(
         owner.id,
         literal_type,
         element,
@@ -8951,7 +8985,6 @@ fn check_function_composite_literal_element(
         inputs,
         snapshot,
         target_cfg,
-        None,
     )
 }
 

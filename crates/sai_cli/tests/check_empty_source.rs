@@ -11617,21 +11617,15 @@ fn public_zero_parameter_literal_operator_returns_emit_check_result() {
 }
 
 #[test]
-fn public_zero_parameter_literal_operator_overflow_is_diagnosed() {
-    let output = run_check(
+fn public_zero_parameter_literal_operator_runtime_panics_are_not_compile_errors() {
+    // Overflow and division panics are runtime behavior in function bodies
+    // (spec 6.8 / D-TYPE-06), not compile errors.
+    for source in [
         "pub fn pair() -> (I8, Bool) { (127 + 1, true) }\n",
-        "",
-        &[],
-        &[],
-    );
-    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
-    assert_eq!(output.status.code(), Some(1), "{stdout}");
-    assert!(
-        stdout.contains("\"code\":\"CONST_EVAL_PANIC\"")
-            && !stdout.contains("\"type\":\"result\"")
-            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
-        "expected CONST_EVAL_PANIC without a result or feature gate:\n{stdout}"
-    );
+        "pub fn calc() -> I8 { 127 + 1 }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
 }
 
 #[test]
