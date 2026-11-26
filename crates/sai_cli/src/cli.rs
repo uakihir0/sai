@@ -2860,6 +2860,18 @@ fn scanner_type_references_in_item(item: &sai_syntax::ast::Item) -> Vec<ScannerT
                     })
                     .collect()
             })
+            .or_else(|| {
+                // Aliases expand transparently, so a nominal type reaching
+                // itself through an alias chain is infinite exactly like a
+                // direct field cycle, and an alias reaching itself has no
+                // expansion at all; both belong in the dependency graph.
+                type_decl.alias_def().map(|definition| {
+                    definition
+                        .ty()
+                        .map(|ty| type_reference_names(&ty))
+                        .unwrap_or_default()
+                })
+            })
             .unwrap_or_default(),
         sai_syntax::ast::Item::Enum(enumeration) => enumeration
             .variants()
