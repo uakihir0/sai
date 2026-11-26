@@ -17665,12 +17665,19 @@ fn check_function_if_parameter_comparison_condition(
     ) {
         return Ok(None);
     }
+    // Byte-string literals are valid comparison operands here only so
+    // that the type check below diagnoses them: they never match a
+    // primitive or `Str` parameter type.
+    let is_comparison_literal = |expression: &HirExpr<'_>| {
+        is_direct_function_scalar_literal(expression)
+            || matches!(expression.kind, ExprKind::Lit(Lit::ByteStr(_)))
+    };
     let (literal, parameter_path, literal_is_left) =
         if function_if_path_uses_parameter_binding(left, body_parameter, locals, inputs)
-            && is_direct_function_scalar_literal(right)
+            && is_comparison_literal(right)
         {
             (right, left, false)
-        } else if is_direct_function_scalar_literal(left)
+        } else if is_comparison_literal(left)
             && function_if_path_uses_parameter_binding(right, body_parameter, locals, inputs)
         {
             (left, right, true)
@@ -17696,6 +17703,20 @@ fn check_function_if_parameter_comparison_condition(
                 ExprKind::Lit(Lit::Bool(_)) => "Bool",
                 ExprKind::Lit(Lit::Char(_)) => "Char",
                 ExprKind::Lit(Lit::Byte(_)) => "Byte",
+                ExprKind::Lit(Lit::ByteStr(_)) => {
+                    // Byte-string literals have the fixed type
+                    // `Slice<Byte>` (spec 6.21.3), so they never compare
+                    // against `Str` in either operand position.
+                    return Ok(Some(vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        literal.span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        "expected `Str`, found a byte string literal".to_string(),
+                        "type mismatch",
+                    )?]));
+                }
                 _ => return Ok(None),
             };
             return Ok(Some(vec![const_literal_diagnostic(
@@ -17714,6 +17735,7 @@ fn check_function_if_parameter_comparison_condition(
             ExprKind::Lit(Lit::Bool(_)) => "a Bool literal",
             ExprKind::Lit(Lit::Char(_)) => "a character literal",
             ExprKind::Lit(Lit::Byte(_)) => "a byte literal",
+            ExprKind::Lit(Lit::ByteStr(_)) => "a byte string literal",
             _ => return Ok(None),
         };
         return Ok(Some(vec![const_literal_diagnostic(
@@ -20458,6 +20480,11 @@ fn find_invalid_array_length_type_argument(
                     })
                 );
             for segment in path.segments {
+                if is_prelude_array && segment.args.is_none() {
+                    // `Array` takes a type and a const argument (spec
+                    // 5.4.2); omitting them is spec-invalid.
+                    return Some((path.span, sai_diagnostics::Code::WrongNumberOfGenericArgs));
+                }
                 if let Some(args) = segment.args {
                     if is_prelude_array && args.args.len() != 2 {
                         // `Array` takes a type and a const argument (spec
