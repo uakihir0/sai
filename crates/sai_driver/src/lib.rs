@@ -9051,7 +9051,10 @@ fn check_function_discarded_unit_tail(
                 };
                 diagnostics.extend(element_diagnostics);
                 let Some(shape) = discard_literal_shape(element) else {
-                    return Ok(None);
+                    if diagnostics.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(diagnostics));
                 };
                 shapes.push(Some(shape));
             }
