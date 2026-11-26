@@ -10897,6 +10897,13 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Failure boundary:** non-literal conditions (comparisons, parameters) and statement-bearing branches gate for the inference slice; missing `else` gates.
 - **Verification:** CLI fixtures cover tuple/array/parameterized if-branch returns and branch element errors. Driver 795 / CLI 553.
 - **Remaining scope:** tuple/array element inference (projections, parameters, locals), tuple/array types in parameters and locals, borrows/nominal types in function bodies, generalized aggregate compile-time values, literal-value-aware const-pattern semantics, imported `type` names in signatures, cross-package nominal constructors, constructor visibility/lints, and `for` loops (deferred — iterator calls outside the walk).
+### IR-1182 (2026-11-26): parameter references in composite literal elements
+- **Decision:** paths in scalar leaf positions of composite returns that resolve to a function parameter binding now check against the parameter's direct type: `pub fn f(x: I32) -> (I32, Bool) { (x, true) }` checks, array elements and nested positions work, and type mismatches produce `TYPE_MISMATCH` (`expected `I32`, found `Bool``).
+- **Reason:** spec 6.5.1 — a parameter reference is a value of its declared type; checking it against the leaf type is the first element-inference position and needs no general inference, only binding resolution and type equality.
+- **Failure boundary:** non-parameter paths (locals, constants), operators over parameters, projections, and composite-typed parameters gate; parameter types outside the direct scalar set gate.
+- **Verification:** CLI fixtures cover tuple/array/nested parameter elements and the mismatch diagnostic. Driver 795 / CLI 555.
+- **Remaining scope:** local bindings and projections in composite positions, operators over parameter references, tuple/array types in parameters and locals, borrows/nominal types in function bodies, generalized aggregate compile-time values, literal-value-aware const-pattern semantics, imported `type` names in signatures, cross-package nominal constructors, constructor visibility/lints, and `for` loops (deferred — iterator calls outside the walk).
+
 
 ## IR-1183: Unit positions discard literal if-branch tails
 
