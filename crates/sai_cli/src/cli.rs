@@ -3352,7 +3352,9 @@ fn check_source_is_mixed_public_items_fragment(
                         };
                         variant_names.insert(variant_name)
                             && variant.attrs().next().is_none()
-                            && variant.discriminant().is_none()
+                            && variant
+                                .discriminant()
+                                .is_none_or(|discriminant| discriminant.integer().is_some())
                             && variant.tuple_shape().is_none_or(|shape| {
                                 shape.types().all(|ty| {
                                     type_uses_known_names(

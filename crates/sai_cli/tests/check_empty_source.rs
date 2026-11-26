@@ -13547,6 +13547,64 @@ fn private_imported_nominal_payload_stays_gated_in_public_enum() {
 }
 
 #[test]
+fn explicit_discriminant_enum_const_constructors_check() {
+    let output = run_check(
+        concat!(
+            "pub enum Level { Low = -5, Middle, High = 10 }\n",
+            "pub const LOW: Level = Level.Low\n",
+            "pub const MIDDLE: Level = Level.Middle\n",
+            "pub const HIGH: Level = Level.High\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn invalid_explicit_discriminants_are_diagnosed_without_gating() {
+    for (source, code) in [
+        (
+            concat!(
+                "pub enum Level { Low = 1, High = 1 }\n",
+                "pub const LOW: Level = Level.Low\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "DUPLICATE_DISCRIMINANT",
+        ),
+        (
+            concat!(
+                "pub enum Level { Low = 9223372036854775808 }\n",
+                "pub const LOW: Level = Level.Low\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "DISCRIMINANT_OUT_OF_RANGE",
+        ),
+        (
+            concat!(
+                "pub enum Level { Low = 170141183460469231731687303715884105728 }\n",
+                "pub const LOW: Level = Level.Low\n",
+                "pub fn zero() -> I32 { 0 }\n",
+            ),
+            "DISCRIMINANT_OUT_OF_RANGE",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            stdout.contains(format!("\"code\":\"{code}\"").as_str()),
+            "{code} is diagnosed for a supported-but-invalid discriminated enum:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "discriminant diagnostics do not fall back to the stage gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn target_filtered_module_import_does_not_validate_qualified_payload() {
     let output = run_check(
         concat!(
@@ -13785,11 +13843,6 @@ fn nominal_const_constructor_forms_outside_the_slice_remain_gated() {
         concat!(
             "pub enum Maybe<T> { Some(T) }\n",
             "pub const VALUE: Maybe<I32> = Maybe.Some(1)\n",
-            "pub fn zero() -> I32 { 0 }\n",
-        ),
-        concat!(
-            "pub enum Status { Ready = 1 }\n",
-            "pub const READY: Status = Status.Ready\n",
             "pub fn zero() -> I32 { 0 }\n",
         ),
         concat!(
