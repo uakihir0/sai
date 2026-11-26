@@ -7543,26 +7543,65 @@ fn const_path_chain_is_not_const(
     expression: &HirExpr<'_>,
     context: &ConstReferenceContext<'_, '_>,
 ) -> bool {
-    let Some((_path, segments)) = direct_enum_variant_type_head(expression) else {
-        return true;
+    // Normalize field chains and paths into one segment sequence.
+    // Generic arguments do not affect member lookup, so chains that
+    // carry them still resolve: `types.Box2<I32>` resolves to its record
+    // and `identity<I32>` to its function.
+    let mut base = expression;
+    let mut field_segments = Vec::new();
+    let segments = loop {
+        match base.kind {
+            ExprKind::Field {
+                base: inner, name, ..
+            } => {
+                field_segments.push(PathSegment {
+                    hir_id: base.hir_id,
+                    name,
+                    args: None,
+                });
+                base = inner;
+            }
+            ExprKind::Path(path) => {
+                let mut segments = path.segments.to_vec();
+                field_segments.reverse();
+                segments.extend(field_segments);
+                break segments;
+            }
+            // Field access on a non-path base (a call result, a
+            // parenthesized value) is never a constant expression.
+            _ => return true,
+        }
     };
-    if segments.is_empty() || segments.iter().any(|segment| segment.args.is_some()) {
+    let Some(first) = segments.first() else {
         return false;
-    }
-    if const_explicit_variant_parts(expression, context).is_some() {
+    };
+    let Some(binding) = context.module_scope.scope.get(&first.name.sym) else {
         return false;
+    };
+    // The walker consumes module-like members and stops at the first
+    // non-module resolution, leaving the remaining suffix unconsumed.
+    // Type-rooted chains therefore stop at their type: enum-rooted chains
+    // are variant construction or references, never free function items.
+    let Ok(prefix) = resolve_module_prefix(
+        binding.res,
+        &segments[1..],
+        context.requesting_package,
+        context.module_members,
+    ) else {
+        return false;
+    };
+    let fully_consumed = prefix.consumed_segments + 1 == segments.len();
+    match prefix.base {
+        // A chain that resolves to a free function is a function item or
+        // call, never a constant expression — whether or not further
+        // field-access segments follow it.
+        Res::Def(DefKind::Fn, _) => true,
+        // A chain rooted in a const or variant is a valid reference only
+        // when it ends there; trailing segments are field access on a
+        // value.
+        Res::Def(DefKind::Const | DefKind::Variant, _) => !fully_consumed,
+        _ => false,
     }
-    if segments.len() > 1
-        && let Some(first) = segments.first()
-        && let Some(binding) = context.module_scope.scope.get(&first.name.sym)
-        && matches!(binding.res, Res::Def(DefKind::Const, _))
-    {
-        return true;
-    }
-    matches!(
-        const_constructor_path_resolution(expression, context),
-        Some(Res::Def(DefKind::Fn, _))
-    )
 }
 
 /// Scan a const initializer for forms that can never be constant

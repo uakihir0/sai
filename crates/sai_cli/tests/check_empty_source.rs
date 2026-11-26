@@ -14246,6 +14246,10 @@ fn spec_invalid_const_forms_are_diagnosed_without_gating() {
             "pub type Point { x: I32 }\npub const CTOR: Point = Point(x: if true { 1 } else { 2 })\n",
             "nested invalid form in a constructor argument",
         ),
+        (
+            "pub type Rec { x: I32 }\npub const ORIGIN: Rec = Rec(x: 1)\npub const FIELD: I32 = ORIGIN.x\n",
+            "field access on a const value",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
@@ -14270,10 +14274,16 @@ fn valid_but_unimplemented_const_forms_remain_gated_not_misdiagnosed() {
         // implementation is outside the current slice: it must stay
         // gated rather than being reported as NOT_CONST_EXPRESSION.
         "pub type Box2<T> { v: T }\npub const BOXED: Box2<I32> = Box2(v: 1)\n",
+        "use acme:empty/types\npub const QUALIFIED: types.Box2<I32> = types.Box2<I32>(v: 1)\n",
         // Alias type annotations are valid but unsupported.
         "pub type Number = I32\npub const ALIAS: Number = 1\n",
     ] {
-        let output = run_check(source, "", &[], &[]);
+        let extra_files: &[(&str, &str)] = if source.contains("use acme:empty/types") {
+            &[("src/types.sai", "pub type Box2<T> { v: T }\n")]
+        } else {
+            &[]
+        };
+        let output = run_check(source, "", extra_files, &[]);
         assert_check_stays_gated(&output, source);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
         assert!(
