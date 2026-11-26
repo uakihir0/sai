@@ -8975,6 +8975,27 @@ fn check_function_composite_literal_element(
         let Some(else_tail) = else_block.tail else {
             return Ok(None);
         };
+        // Branch tails checked against `()` discard their values (spec
+        // 6.11.1/6.25.2). Literal and composite-construction tails are
+        // self-consistent in the direct-type fragment, so they are valid
+        // discards; other forms fall through to the element checks.
+        if matches!(
+            resolve_const_literal_type(ty, type_paths, symbols, inputs),
+            Some(ConstLiteralType::Unit)
+        ) && [then_tail, else_tail].iter().all(|tail| match tail.kind {
+            ExprKind::Lit(_) => true,
+            ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
+                elements.iter().all(|nested| {
+                    matches!(
+                        nested.kind,
+                        ExprKind::Lit(_) | ExprKind::Tuple(_) | ExprKind::Array(_)
+                    )
+                })
+            }
+            _ => false,
+        }) {
+            return Ok(Some(Vec::new()));
+        }
         let Some(mut diagnostics) = check_function_composite_literal_element(
             owner, ty, then_tail, type_paths, symbols, inputs, snapshot, target_cfg,
         )?

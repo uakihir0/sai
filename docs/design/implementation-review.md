@@ -10897,3 +10897,32 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Failure boundary:** non-literal conditions (comparisons, parameters) and statement-bearing branches gate for the inference slice; missing `else` gates.
 - **Verification:** CLI fixtures cover tuple/array/parameterized if-branch returns and branch element errors. Driver 795 / CLI 553.
 - **Remaining scope:** tuple/array element inference (projections, parameters, locals), tuple/array types in parameters and locals, borrows/nominal types in function bodies, generalized aggregate compile-time values, literal-value-aware const-pattern semantics, imported `type` names in signatures, cross-package nominal constructors, constructor visibility/lints, and `for` loops (deferred — iterator calls outside the walk).
+
+## IR-1183: Unit positions discard literal if-branch tails
+
+**Decision.** `if` branch tails checked against `()` in composite literal
+positions discard their values per spec 6.11.1/6.25.2: literal and
+composite-construction tails are accepted without element checks because
+they are self-consistent in the direct-type fragment. Direct elements in
+unit positions are not block tails, so the discard rules do not apply to
+them and they still report the structural type mismatch.
+
+**Reason.** Devin Review on the if-branch slice observed that checking unit
+positions against literal-condition `if` branches rejected valid discarding
+code. The spec's discard rules apply only to expression-statement values and
+block tails checked against `()`, so the acceptance is scoped to branch
+tails and leaves direct elements strict.
+
+**Failure boundary.** Must-use types (`Result`, anonymous futures) in
+discarded positions still need `UNUSED_MUST_USE` once the inference slice
+reaches them; the `STATEMENT_HAS_NO_EFFECT` warning for side-effect-free
+discards is not yet emitted; operator-expression tails in unit positions
+fall through to the element checks and gate where their operators need
+inference.
+
+**Verification.** Driver 795 passed, CLI 555 passed. Direct-element probes
+still diagnose `TYPE_MISMATCH` while literal/composite branch tails in unit
+positions emit the check result.
+
+**Remaining scope.** Must-use discard diagnostics, no-effect warnings, and
+operator tails in unit positions.
