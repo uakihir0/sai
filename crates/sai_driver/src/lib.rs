@@ -9310,7 +9310,7 @@ fn discard_operator_expression_type(expr: &HirExpr<'_>) -> Option<ConstLiteralTy
             _,
             _,
         )
-        | ExprKind::Unary(UnOp::Neg, _) => {}
+        | ExprKind::Unary(UnOp::Neg | UnOp::BitNot, _) => {}
         _ => return None,
     }
     let mut has_float = false;
@@ -9318,9 +9318,8 @@ fn discard_operator_expression_type(expr: &HirExpr<'_>) -> Option<ConstLiteralTy
     while let Some(current) = stack.pop() {
         match current.kind {
             ExprKind::Lit(Lit::Float { .. }) => has_float = true,
-            ExprKind::Lit(
-                Lit::Int { .. } | Lit::Bool(_) | Lit::Char(_) | Lit::Byte(_) | Lit::Str(_),
-            ) => {}
+            ExprKind::Lit(Lit::Byte(_) | Lit::Int { .. }) => {}
+            ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Str(_)) => {}
             ExprKind::Binary(_, left, right) => {
                 stack.push(left);
                 stack.push(right);
