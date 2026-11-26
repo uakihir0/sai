@@ -7762,6 +7762,10 @@ fn check_const_literal_owner(
                 "array length must be a `USize` integer literal".to_string(),
                 "wrong type for array length",
             ),
+            sai_diagnostics::Code::WrongNumberOfGenericArgs => (
+                "`Array` takes a type and a const argument".to_string(),
+                "wrong number of generic arguments",
+            ),
             _ => (
                 "a const parameter takes a const argument, not a type".to_string(),
                 "type argument in const parameter position",
@@ -8322,6 +8326,10 @@ fn check_function_body_shape_dispatch(
             sai_diagnostics::Code::TypeMismatch => (
                 "array length must be a `USize` integer literal".to_string(),
                 "wrong type for array length",
+            ),
+            sai_diagnostics::Code::WrongNumberOfGenericArgs => (
+                "`Array` takes a type and a const argument".to_string(),
+                "wrong number of generic arguments",
             ),
             _ => (
                 "a const parameter takes a const argument, not a type".to_string(),
@@ -20352,6 +20360,11 @@ fn find_invalid_array_length_type_argument(
                 );
             for segment in path.segments {
                 if let Some(args) = segment.args {
+                    if is_prelude_array && args.args.len() != 2 {
+                        // `Array` takes a type and a const argument (spec
+                        // 5.4.2); any other arity is spec-invalid.
+                        return Some((args.span, sai_diagnostics::Code::WrongNumberOfGenericArgs));
+                    }
                     if is_prelude_array
                         && args.args.len() == 2
                         && let GenericArg::Const(const_length) = args.args[1]
