@@ -7745,15 +7745,19 @@ fn check_const_literal_owner(
         )?];
         return Ok(ConstLiteralCheck::SupportedNotConst { diagnostics });
     }
-    if let Some(span) = find_const_arg_not_simple_array_length(*ty, type_paths) {
+    if let Some((span, code)) = find_invalid_array_length_type_argument(*ty, type_paths) {
+        let (message, label) = match code {
+            sai_diagnostics::Code::ConstArgNotSimple => (
+                "const arguments must be simple literals".to_string(),
+                "not a simple const argument",
+            ),
+            _ => (
+                "a const parameter takes a const argument, not a type".to_string(),
+                "type argument in const parameter position",
+            ),
+        };
         let diagnostics = vec![const_literal_diagnostic(
-            owner.id,
-            inputs,
-            snapshot,
-            span,
-            sai_diagnostics::Code::ConstArgNotSimple,
-            "const arguments must be simple literals".to_string(),
-            "not a simple const argument",
+            owner.id, inputs, snapshot, span, code, message, label,
         )?];
         return Ok(ConstLiteralCheck::SupportedNotConst { diagnostics });
     }
@@ -19338,10 +19342,10 @@ fn check_const_nominal_constructor(
 /// §5.2.2: `CONST_ARG_NOT_SIMPLE`), and const parameters cannot exist in
 /// the non-generic owners this slice checks, so every such annotation is
 /// spec-invalid. Returns the offending length argument's span.
-fn find_const_arg_not_simple_array_length(
+fn find_invalid_array_length_type_argument(
     ty: Ty<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
-) -> Option<sai_hir::Span> {
+) -> Option<(sai_hir::Span, sai_diagnostics::Code)> {
     match ty.kind {
         TyKind::Path(path) => {
             let is_prelude_array = path.root == PathRoot::Plain
@@ -19360,14 +19364,32 @@ fn find_const_arg_not_simple_array_length(
                         && args.args.len() == 2
                         && let GenericArg::Type(length) = args.args[1]
                     {
-                        return Some(length.span);
+                        // A path that resolves to a const item is a
+                        // non-simple const argument (spec §5.2.2); any
+                        // other type in the length position is a
+                        // type/const kind mismatch.
+                        let code = match length.kind {
+                            TyKind::Path(length_path)
+                                if matches!(
+                                    type_paths?.paths().get(&length_path.hir_id),
+                                    Some(PathRes {
+                                        base: Res::Def(DefKind::Const, _),
+                                        ..
+                                    })
+                                ) =>
+                            {
+                                sai_diagnostics::Code::ConstArgNotSimple
+                            }
+                            _ => sai_diagnostics::Code::GenericArgKindMismatch,
+                        };
+                        return Some((length.span, code));
                     }
                     for arg in args.args {
                         if let GenericArg::Type(element) = arg
-                            && let Some(span) =
-                                find_const_arg_not_simple_array_length(**element, type_paths)
+                            && let Some(found) =
+                                find_invalid_array_length_type_argument(**element, type_paths)
                         {
-                            return Some(span);
+                            return Some(found);
                         }
                     }
                 }
@@ -19376,8 +19398,8 @@ fn find_const_arg_not_simple_array_length(
         }
         TyKind::Tuple(elements) => elements
             .iter()
-            .find_map(|element| find_const_arg_not_simple_array_length(*element, type_paths)),
-        TyKind::Borrow(_, inner) => find_const_arg_not_simple_array_length(*inner, type_paths),
+            .find_map(|element| find_invalid_array_length_type_argument(*element, type_paths)),
+        TyKind::Borrow(_, inner) => find_invalid_array_length_type_argument(*inner, type_paths),
         _ => None,
     }
 }
