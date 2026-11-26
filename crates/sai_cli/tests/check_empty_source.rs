@@ -14304,6 +14304,17 @@ fn transparent_alias_const_types_check() {
             "pub type Rec { n: Number }\n",
             "pub const R: Rec = Rec(n: 1)\n",
         ),
+        // Whole-annotation tuple and array aliases expand transparently.
+        "pub type Tup = (I32, Bool)\npub const T: Tup = (1, true)\n",
+        "pub type Arr = Array<I32, 2>\npub const A: Arr = [1, 2]\n",
+        // Alias-typed consts evaluate in operator expressions like their
+        // underlying type.
+        concat!(
+            "pub type Number = I32\n",
+            "pub const A: Number = 1\n",
+            "pub const B: I32 = A + 1\n",
+            "pub const C: Number = A * 2\n",
+        ),
         // Const references type-match across alias and plain annotations.
         concat!(
             "pub type Number = I32\n",
@@ -14328,6 +14339,14 @@ fn transparent_alias_const_type_errors_are_diagnosed() {
             "pub type Number = I32\npub const A: Number = true\n",
             "TYPE_MISMATCH",
         ),
+        (
+            "pub type Tup = (I32, Bool)\npub const T: Tup = (1, 2)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub type Arr = Array<I8, 2>\npub const A: Arr = [1, 128]\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
@@ -14344,10 +14363,11 @@ fn transparent_alias_const_type_errors_are_diagnosed() {
 #[test]
 fn unsupported_alias_const_forms_remain_gated() {
     for source in [
-        // Whole-annotation tuple and array aliases are outside the
-        // conversion-driven dispatch slice.
-        "pub type Tup = (I32, Bool)\npub const T: Tup = (1, true)\n",
-        "pub type Arr = Array<I32, 2>\npub const A: Arr = [1, 2]\n",
+        // Cyclic aliases gate the package even when nothing uses them:
+        // their expansion is spec-invalid (ALIAS_CYCLE upstream) and the
+        // slice cannot diagnose declaration-level alias cycles yet.
+        "pub type Number = Number\npub const A: I32 = 1\n",
+        "pub type A2 = B2\npub type B2 = A2\npub const A: I32 = 1\n",
         // Generic and cyclic aliases never convert.
         "pub type Number<T> = I32\npub const A: I32 = 1\n",
         "pub type Number = Number\npub const A: Number = 1\n",
