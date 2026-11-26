@@ -9314,11 +9314,17 @@ fn discard_operator_expression_type(expr: &HirExpr<'_>) -> Option<ConstLiteralTy
         _ => return None,
     }
     let mut has_float = false;
+    let mut has_byte = false;
+    let mut has_other_numeric = false;
     let mut stack = vec![expr];
     while let Some(current) = stack.pop() {
         match current.kind {
-            ExprKind::Lit(Lit::Float { .. }) => has_float = true,
-            ExprKind::Lit(Lit::Byte(_) | Lit::Int { .. }) => {}
+            ExprKind::Lit(Lit::Float { .. }) => {
+                has_float = true;
+                has_other_numeric = true;
+            }
+            ExprKind::Lit(Lit::Byte(_)) => has_byte = true,
+            ExprKind::Lit(Lit::Int { .. }) => has_other_numeric = true,
             ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Str(_)) => {}
             ExprKind::Binary(_, left, right) => {
                 stack.push(left);
@@ -9327,6 +9333,14 @@ fn discard_operator_expression_type(expr: &HirExpr<'_>) -> Option<ConstLiteralTy
             ExprKind::Unary(_, operand) => stack.push(operand),
             _ => return None,
         }
+    }
+    // Byte-only bitwise operands keep their `Byte` type; mixed operands
+    // fall through to the defaults and the evaluation diagnoses the
+    // mismatch.
+    if has_byte && !has_other_numeric {
+        return Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::Byte,
+        ));
     }
     if has_float {
         Some(ConstLiteralType::Primitive(
@@ -9428,6 +9442,9 @@ fn check_function_discarded_unit_tail(
                     ) =>
                 {
                     DiscardLiteralShape::Float
+                }
+                ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Byte) => {
+                    DiscardLiteralShape::Byte
                 }
                 _ => DiscardLiteralShape::Integer,
             };

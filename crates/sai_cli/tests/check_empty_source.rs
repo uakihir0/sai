@@ -11692,6 +11692,8 @@ fn public_unit_return_discards_tail_values() {
         "pub fn f() { -1 }\n",
         "pub fn f() { if true { 1 + 2 } else { 3 } }\n",
         "pub fn f() { [1 + 2, 3] }\n",
+        "pub fn f() { ~1 }\n",
+        "pub fn f() { b'a' & b'b' }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
