@@ -8476,6 +8476,43 @@ fn check_function_body_shape_dispatch(
             diagnostics: array_diagnostics,
         });
     }
+    // Unit-returning bodies discard a non-`if` tail of any shape (spec
+    // 6.11.1/6.25.2) regardless of parameter count — but only once every
+    // parameter type resolves in the direct fragment, since unresolvable
+    // or ill-formed parameter types make the signature itself invalid and
+    // must not pass silently.
+    if !sig.params.is_empty()
+        && sig.params.len() == body.params.len()
+        && block.stmts.is_empty()
+        && let Some(tail) = block.tail
+        && !matches!(tail.kind, ExprKind::If { .. })
+    {
+        let tail_unit_return = match sig.ret {
+            Some(return_ty) => matches!(
+                resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+                Some(FunctionDirectType::Unit)
+            ),
+            None => true,
+        };
+        let parameters_resolve = sig
+            .params
+            .iter()
+            .all(|parameter| {
+                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs).is_some()
+            });
+        if tail_unit_return
+            && parameters_resolve
+            && let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
+                owner, tail, false, false, sig, body, locals, symbols, inputs, snapshot,
+                type_paths, target_cfg,
+            )?
+        {
+            return Ok(FunctionBodyTypeCheck::Supported {
+                diagnostics: tail_diagnostics,
+            });
+        }
+    }
+
     let (parameter, parameter_pair) = match (sig.params, body.params) {
         ([], []) => (None, None),
         ([parameter], [body_parameter])
@@ -8681,28 +8718,6 @@ fn check_function_body_shape_dispatch(
                     condition_diagnostics
                 }
             } else {
-                let tail_unit_return = match sig.ret {
-                    Some(return_ty) => matches!(
-                        resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
-                        Some(FunctionDirectType::Unit)
-                    ),
-                    None => true,
-                };
-                if tail_unit_return {
-                    // Any tail shape in a unit-returning body discards its
-                    // value (spec 6.11.1/6.25.2); validate it like the
-                    // zero-parameter arm does.
-                    let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
-                        owner, tail, false, false, sig, body, locals, symbols, inputs, snapshot,
-                        type_paths, target_cfg,
-                    )?
-                    else {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    };
-                    return Ok(FunctionBodyTypeCheck::Supported {
-                        diagnostics: tail_diagnostics,
-                    });
-                }
                 let ExprKind::Path(path) = tail.kind else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 };
