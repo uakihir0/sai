@@ -11665,6 +11665,48 @@ fn public_composite_if_branch_element_errors_are_diagnosed() {
 }
 
 #[test]
+fn public_unit_return_discards_tail_values() {
+    // A tail checked against the implicit or explicit `()` return discards
+    // its value (spec 6.11.1/6.25.2).
+    for source in [
+        "pub fn f() { 1 }\n",
+        "pub fn f() -> () { 1 }\n",
+        "pub fn f() { if true { 1 } else { 2 } }\n",
+        "pub fn f() { if true { 1 } else {} }\n",
+        "pub fn f() { if true {} else { 2 } }\n",
+        "pub fn f() { (1, true) }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_unit_return_discard_errors_are_diagnosed() {
+    for (source, code) in [
+        (
+            "pub fn f() { 99999999999999999999 }\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        ("pub fn f() { [1, true] }\n", "TYPE_MISMATCH"),
+        ("pub fn f() { [] }\n", "TYPE_ANNOTATIONS_NEEDED"),
+        (
+            "pub fn f() { if true { x } else { 99999999999999999999 } }\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+            "expected {code} without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn public_unit_position_if_branch_tails_discard_values() {
     // Branch tails checked against `()` discard their values (spec
     // 6.11.1/6.25.2), so literal and composite-construction tails in unit
@@ -12691,7 +12733,6 @@ fn unsupported_zero_parameter_if_shapes_remain_gated() {
         "pub fn choose() -> I32 { if 1 == 1 { 1 } else { 2 } }\n",
         "pub fn choose() -> I32 { if true { 1 } }\n",
         "pub fn choose() -> I32 { if true { let value = 1; value } else { 2 } }\n",
-        "pub fn choose() -> () { if true { () } else { () } }\n",
         "pub fn choose() -> I32 { if 1 { 1 } else { 2 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -12743,9 +12784,7 @@ fn zero_parameter_direct_scalar_type_errors_suppress_check_result() {
 #[test]
 fn unsupported_zero_parameter_function_shapes_remain_gated() {
     for source in [
-        "pub fn answer() { 42 }\n",
         "pub fn answer() -> I32 { let value = 42; value }\n",
-        "pub fn answer() -> () { 42 }\n",
         "pub fn answer() -> () { let value = (); }\n",
         "pub type Number = I32\npub fn answer() -> Number { 42 }\n",
         "@inline\npub fn answer() -> I32 { 42 }\n",

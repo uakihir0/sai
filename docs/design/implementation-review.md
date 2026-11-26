@@ -10933,3 +10933,28 @@ positions emit the check result.
 
 **Remaining scope.** Must-use discard diagnostics, no-effect warnings, and
 operator tails in unit positions.
+
+## IR-1184: Unit returns discard tail values
+
+**Decision.** Tails checked against the implicit or explicit `()` return
+type discard their values per spec 6.11.1/6.25.2: `pub fn f() { 1 }` and
+`pub fn f() { if true { 1 } else { 2 } }` are valid. The discard validation
+reuses the composite branch-tail validator — integer literals range-check
+against the `I64` default, arrays check homogeneity, empty arrays report
+`TYPE_ANNOTATIONS_NEEDED`, and opaque forms gate.
+
+**Reason.** The spec discards block tails in unit positions; rejecting them
+misdiagnosed valid programs. Sharing the validator keeps the semantics
+identical across unit positions.
+
+**Failure boundary.** Must-use types in discarded positions still need
+`UNUSED_MUST_USE` once the inference slice reaches them; the
+`STATEMENT_HAS_NO_EFFECT` warning is not yet emitted; statement-bearing
+blocks and non-literal `if` conditions gate.
+
+**Verification.** Driver and CLI suites pass; probes cover discarding tails,
+`if` branch tails, range errors, and array homogeneity.
+
+**Remaining scope.** Operators over parameters in composite positions,
+local bindings and projections, tuple/array-typed parameters, the no-effect
+warning, and must-use discard diagnostics.
