@@ -11022,3 +11022,32 @@ discard positions, `IF_WITHOUT_ELSE` in non-unit positions, operators over
 parameters in composite positions, local bindings and projections,
 tuple/array-typed parameters, the no-effect warning, and must-use discard
 diagnostics.
+
+## IR-1187: Parameter paths in discard positions
+
+**Decision.** A parameter reference discarded against `()` is valid on its
+own — the binding is a self-typed value and no direct-fragment type is
+must-use — so `pub fn f(x: I32) { if x < 10 { x } else { 0 } }` type-checks.
+References inside composite constructions still gate: array element
+unification needs the binding's type, which the direct-fragment literal
+shapes cannot carry without re-implementing inference.
+
+**Reason.** Discarding a parameter is spec-valid per 6.11.1/6.25.2; gating
+it misdiagnosed valid programs. The composite gate keeps the boundary
+sound — accepting `(x, 1)` or `[x]` without the binding's type would risk
+missing unification failures.
+
+**Failure boundary.** Paths inside tuples and arrays gate even when their
+types are in principle resolvable; const paths and multi-segment paths
+gate; must-use types in discard positions still need `UNUSED_MUST_USE`
+once the inference slice reaches them.
+
+**Verification.** Driver and CLI suites pass; probes cover parameter paths
+as branch tails in literal and comparison conditions, composite-position
+gating, and unresolved-path gating.
+
+**Remaining scope.** Parameter paths inside composites, const paths in
+discard positions, scalar-position `else if` chains, `IF_WITHOUT_ELSE` in
+non-unit positions, operators over parameters in composite positions,
+local bindings and projections, tuple/array-typed parameters, the
+no-effect warning, and must-use discard diagnostics.

@@ -8289,6 +8289,7 @@ fn collect_literal_unit_if_chain_tails<'a>(
 fn check_unit_discard_if_branch_tails(
     owner: &HirOwner<'_>,
     tails: &[Option<&HirExpr<'_>>],
+    locals: &LocalResolution,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -8296,7 +8297,9 @@ fn check_unit_discard_if_branch_tails(
     let mut diagnostics = Vec::new();
     let mut unsupported = false;
     for tail in tails.iter().copied().flatten() {
-        match check_function_discarded_unit_tail(owner, tail, false, symbols, inputs, snapshot)? {
+        match check_function_discarded_unit_tail(
+            owner, tail, false, false, locals, symbols, inputs, snapshot,
+        )? {
             Some((_, tail_diagnostics)) => diagnostics.extend(tail_diagnostics),
             None => unsupported = true,
         }
@@ -8648,7 +8651,7 @@ fn check_function_body_shape_dispatch(
                         }
                     }
                     let Some(tail_diagnostics) = check_unit_discard_if_branch_tails(
-                        owner, &tails, symbols, inputs, snapshot,
+                        owner, &tails, locals, symbols, inputs, snapshot,
                     )?
                     else {
                         return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8951,7 +8954,7 @@ fn check_function_body_shape_dispatch(
                             return Ok(FunctionBodyTypeCheck::Unsupported);
                         }
                         let Some(diagnostics) = check_unit_discard_if_branch_tails(
-                            owner, &tails, symbols, inputs, snapshot,
+                            owner, &tails, locals, symbols, inputs, snapshot,
                         )?
                         else {
                             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8959,7 +8962,7 @@ fn check_function_body_shape_dispatch(
                         diagnostics
                     } else {
                         let Some((_, diagnostics)) = check_function_discarded_unit_tail(
-                            owner, tail, false, symbols, inputs, snapshot,
+                            owner, tail, false, false, locals, symbols, inputs, snapshot,
                         )?
                         else {
                             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -9257,6 +9260,8 @@ fn check_function_discarded_unit_tail(
     owner: &HirOwner<'_>,
     tail: &HirExpr<'_>,
     in_array_element: bool,
+    in_composite: bool,
+    locals: &LocalResolution,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -9315,12 +9320,32 @@ fn check_function_discarded_unit_tail(
         ExprKind::Lit(Lit::Char(_)) => return Ok(Some((DiscardLiteralShape::Char, Vec::new()))),
         ExprKind::Lit(Lit::Byte(_)) => return Ok(Some((DiscardLiteralShape::Byte, Vec::new()))),
         ExprKind::Lit(Lit::Bool(_)) => return Ok(Some((DiscardLiteralShape::Bool, Vec::new()))),
+        ExprKind::Path(path)
+            if !in_composite
+                && path.root == PathRoot::Plain
+                && path.segments.len() == 1
+                && path.segments[0].args.is_none()
+                && matches!(
+                    locals.paths.get(&path.hir_id),
+                    Some(PathRes {
+                        base: Res::Local(_),
+                        resolved_segments: 1,
+                        segment_count: 1,
+                    })
+                ) =>
+        {
+            // A local (parameter) reference is a self-typed value, so
+            // discarding it is valid on its own. Inside composites it
+            // gates for the inference slice: array unification needs the
+            // binding's type, which direct-fragment shapes cannot carry.
+            return Ok(Some((DiscardLiteralShape::Opaque, Vec::new())));
+        }
         ExprKind::Tuple(elements) => {
             let mut diagnostics = Vec::new();
             let mut shapes = Vec::new();
             for element in elements {
                 let Some((shape, element_diagnostics)) = check_function_discarded_unit_tail(
-                    owner, element, false, symbols, inputs, snapshot,
+                    owner, element, false, true, locals, symbols, inputs, snapshot,
                 )?
                 else {
                     let mut literals = Vec::new();
@@ -9355,7 +9380,7 @@ fn check_function_discarded_unit_tail(
             let mut conflict = false;
             for element in elements {
                 let Some((shape, element_diagnostics)) = check_function_discarded_unit_tail(
-                    owner, element, true, symbols, inputs, snapshot,
+                    owner, element, true, true, locals, symbols, inputs, snapshot,
                 )?
                 else {
                     let mut literals = Vec::new();
@@ -9465,7 +9490,9 @@ fn check_function_composite_literal_element(
             if !collect_literal_unit_if_chain_tails(element, &mut tails) {
                 return Ok(None);
             }
-            return check_unit_discard_if_branch_tails(owner, &tails, symbols, inputs, snapshot);
+            return check_unit_discard_if_branch_tails(
+                owner, &tails, locals, symbols, inputs, snapshot,
+            );
         }
         let Some(else_expr) = els else {
             return Ok(None);
