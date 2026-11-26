@@ -8955,7 +8955,29 @@ fn check_function_composite_literal_element(
         && !type_elements.is_empty()
     {
         let ExprKind::Tuple(tail_elements) = element.kind else {
-            return Ok(None);
+            // Scalar literals never match a tuple type (spec 5.2.1); other
+            // expression forms stay gated for inference.
+            let ExprKind::Lit(literal) = element.kind else {
+                return Ok(None);
+            };
+            let Some(display) =
+                direct_composite_type_display(ty, type_paths, symbols, inputs, target_cfg)
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                element.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected `{}`, found {}",
+                    display,
+                    str_lit_kind_word(literal)
+                ),
+                "type mismatch",
+            )?]));
         };
         if tail_elements.len() != type_elements.len() {
             let Some(display) =
@@ -9000,7 +9022,26 @@ fn check_function_composite_literal_element(
         resolve_const_array_type(ty, type_paths, target_cfg.pointer_width())
     {
         let ExprKind::Array(tail_elements) = element.kind else {
-            return Ok(None);
+            let word = match element.kind {
+                ExprKind::Lit(literal) => str_lit_kind_word(literal),
+                // `()` is the unit literal, not an array.
+                ExprKind::Tuple(elements) if elements.is_empty() => "unit",
+                _ => return Ok(None),
+            };
+            let Some(display) =
+                direct_composite_type_display(ty, type_paths, symbols, inputs, target_cfg)
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                element.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `{}`, found {}", display, word),
+                "type mismatch",
+            )?]));
         };
         if tail_elements.len() as u128 != expected_length {
             return Ok(Some(vec![const_literal_diagnostic(
@@ -9044,6 +9085,26 @@ fn check_function_composite_literal_element(
         return check_const_literal_leaf(
             owner, ty, element, type_paths, symbols, inputs, snapshot, target_cfg,
         );
+    }
+    // Composite literals never match scalar types (spec 5.2.1); the scalar
+    // renders through the literal-type names.
+    if let ExprKind::Tuple(elements) = element.kind
+        && !elements.is_empty()
+        && let Some(literal_type) = resolve_const_literal_type(ty, type_paths, symbols, inputs)
+    {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            element.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found tuple of arity {}",
+                local_enum_variant_type_name(literal_type),
+                elements.len()
+            ),
+            "type mismatch",
+        )?]));
     }
     // Literal-only operator expressions in element positions evaluate like
     // const initializers (spec 6.27); references and calls stay gated.
