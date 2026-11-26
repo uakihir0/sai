@@ -8681,6 +8681,28 @@ fn check_function_body_shape_dispatch(
                     condition_diagnostics
                 }
             } else {
+                let tail_unit_return = match sig.ret {
+                    Some(return_ty) => matches!(
+                        resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+                        Some(FunctionDirectType::Unit)
+                    ),
+                    None => true,
+                };
+                if tail_unit_return {
+                    // Any tail shape in a unit-returning body discards its
+                    // value (spec 6.11.1/6.25.2); validate it like the
+                    // zero-parameter arm does.
+                    let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
+                        owner, tail, false, false, sig, body, locals, symbols, inputs, snapshot,
+                        type_paths, target_cfg,
+                    )?
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    return Ok(FunctionBodyTypeCheck::Supported {
+                        diagnostics: tail_diagnostics,
+                    });
+                }
                 let ExprKind::Path(path) = tail.kind else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 };
@@ -9463,7 +9485,7 @@ fn check_function_discarded_unit_tail(
             return Ok(Some((shape, diagnostics)));
         }
         ExprKind::Path(path)
-            if !in_composite
+            if !in_array_element
                 && path.root == PathRoot::Plain
                 && path.segments.len() == 1
                 && path.segments[0].args.is_none()
@@ -9477,9 +9499,12 @@ fn check_function_discarded_unit_tail(
             // it is valid on its own — but only when the parameter's type
             // resolves in the direct fragment: nominal or otherwise
             // unsupported parameter types gate the whole function rather
-            // than passing on name resolution alone. Inside composites it
-            // gates for the inference slice: array unification needs the
-            // binding's type, which direct-fragment shapes cannot carry.
+            // than passing on name resolution alone. Tuples type each
+            // element independently (spec 5.3), so parameter references in
+            // tuple positions are self-typed there as well; array positions
+            // gate for the inference slice because element unification
+            // needs the binding's type, which direct-fragment shapes
+            // cannot carry.
             let Some(position) = body.params.iter().position(|p| p.binding == *binding) else {
                 return Ok(None);
             };

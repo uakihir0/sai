@@ -11063,3 +11063,15 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** Driver 795 tests green; CLI suite green including `pub fn f() { 1 + 2 }`, `1.5 * 2.0`, `1 < 2`, `true and false`, `not true`, `-1`, if-branch tails, and array elements accepted, and `1 + x` still gated.
 
 **Remaining scope.** Operator expressions over parameter references in any position; the evaluation in discards shares the const evaluator, so runtime-overflow operands are not diagnosed in fn bodies (spec 6.2.2 panics at runtime).
+
+## IR-1189: Discarded tails of any shape in parameterized unit returns
+
+**Decision.** Validate non-`if` tails of any shape in parameterized unit-returning bodies through the shared discard validator: `pub fn f(x: I32) { 1 }`, `(1, true)`, `1 + 2`, and parameter references inside tuple positions like `(x, 1)` are accepted; `[x, 1]` stays gated because array element unification is inference-dependent. `Str`-typed parameter discards — previously gated by the scalar-return arm's Str seeding boundary — are accepted as ordinary discards.
+
+**Reason.** Spec 6.11.1/6.25.2 discard the tail value of a unit-checked body regardless of whether the function has parameters. The zero-parameter arm already validated every shape; the parameterized arm only handled `if` tails and bare parameter paths, leaving inference-independent forms incorrectly gated.
+
+**Failure boundary.** Array element positions containing parameter references stay gated (unification needs the binding's type). Parameter types outside the direct fragment gate. Non-unit returns are unchanged.
+
+**Verification.** CLI suite green with the new acceptance cases; the prior gating expectations for `str_param_to_unit`/`str_param_without_return` moved to the success suite.
+
+**Remaining scope.** Const item paths in discards; array-position parameter unification; local bindings.
