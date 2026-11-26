@@ -14322,6 +14322,30 @@ fn transparent_alias_const_types_check() {
             "pub const B: I32 = A\n",
             "pub const C: Number = B\n",
         ),
+        // Nominal constructor paths accept transparent aliases of the
+        // record type, in either annotation or callee position.
+        concat!(
+            "pub type Point {\nx: I32\n}\n",
+            "pub type P = Point\n",
+            "pub const Q: P = P(x: 1)\n",
+            "pub const R: Point = P(x: 2)\n",
+            "pub const S: P = Point(x: 3)\n",
+        ),
+        // Enum variant paths accept transparent aliases of the enum,
+        // including chained aliases and payload constructors.
+        concat!(
+            "pub enum E {\nC(I32),\nB\n}\n",
+            "pub type EA = E\n",
+            "pub type EB = EA\n",
+            "pub const X: EA = EA.C(3)\n",
+            "pub const Y: EB = EB.B\n",
+        ),
+        // Distinct constructors accept transparent aliases.
+        concat!(
+            "pub distinct Meters = I32\n",
+            "pub type M = Meters\n",
+            "pub const X: M = M(5)\n",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_success_result(output, "wasm32-core", "dev");
@@ -14346,6 +14370,25 @@ fn transparent_alias_const_type_errors_are_diagnosed() {
         (
             "pub type Arr = Array<I8, 2>\npub const A: Arr = [1, 128]\n",
             "LITERAL_OUT_OF_RANGE",
+        ),
+        // Constructor field errors diagnose through aliased constructor
+        // paths.
+        (
+            concat!(
+                "pub type Point {\nx: I32\n}\n",
+                "pub type P = Point\n",
+                "pub const Q: Point = P(x: true)\n",
+            ),
+            "TYPE_MISMATCH",
+        ),
+        // Unknown variants diagnose through aliased enum paths.
+        (
+            concat!(
+                "pub enum E {\nA,\nB\n}\n",
+                "pub type EA = E\n",
+                "pub const X: EA = EA.Missing\n",
+            ),
+            "UNKNOWN_VARIANT",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);
@@ -14431,6 +14474,15 @@ fn unsupported_alias_const_forms_remain_gated() {
         // Generic and cyclic aliases never convert.
         "pub type Number<T> = I32\npub const A: I32 = 1\n",
         "pub type Number = Number\npub const A: Number = 1\n",
+        // `Self`-rooted constructor paths have no meaning at item level:
+        // they must not resolve as plain names, so they gate rather than
+        // silently accepting an invalid program.
+        "pub type Point {\nx: I32\n}\npub const Q: Point = Self.Point(x: 1)\n",
+        concat!(
+            "pub type Point {\nx: I32\n}\n",
+            "pub type P = Point\n",
+            "pub const Q: P = Self.P(x: 1)\n",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);
