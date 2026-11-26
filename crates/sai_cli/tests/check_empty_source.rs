@@ -13126,7 +13126,6 @@ fn public_str_const_type_errors_suppress_the_check_result() {
 fn str_const_forms_outside_the_literal_slice_remain_gated() {
     for source in [
         "pub const ALIAS: Text = \"text\"\n",
-        "pub type Text = Str\npub const ALIAS: Text = \"text\"\n",
         "pub const RAW_TYPE: r#Str = \"text\"\n",
         "pub const BYTE_SLICE: Slice<Byte> = b\"bytes\"\n",
     ] {
@@ -13167,10 +13166,7 @@ fn public_unit_const_type_errors_suppress_the_check_result() {
 
 #[test]
 fn unit_const_forms_outside_the_literal_slice_remain_gated() {
-    for source in [
-        "pub const ALIAS: Unit = ()\n",
-        "pub type Unit = ()\npub const ALIAS: Unit = ()\n",
-    ] {
+    for source in ["pub const ALIAS: Unit = ()\n"] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);
     }
@@ -13309,8 +13305,6 @@ fn public_flat_tuple_type_errors_suppress_the_check_result() {
 fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
     for source in [
         "pub const LEFT: (I32,) = (1,)\npub const RIGHT: (I32,) = (2,)\npub const COMPARISON_FOR_TUPLE: (Bool,) = LEFT == RIGHT\n",
-        "pub type Number = I32\npub const ALIAS_FIELD: (Number,) = (1,)\n",
-        "pub type Number = I32\npub const ALIAS_ARITY: (Number,) = (1, 2)\n",
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);
@@ -14275,8 +14269,6 @@ fn valid_but_unimplemented_const_forms_remain_gated_not_misdiagnosed() {
         // gated rather than being reported as NOT_CONST_EXPRESSION.
         "pub type Box2<T> { v: T }\npub const BOXED: Box2<I32> = Box2(v: 1)\n",
         "use acme:empty/types\npub const QUALIFIED: types.Box2<I32> = types.Box2<I32>(v: 1)\n",
-        // Alias type annotations are valid but unsupported.
-        "pub type Number = I32\npub const ALIAS: Number = 1\n",
     ] {
         let extra_files: &[(&str, &str)] = if source.contains("use acme:empty/types") {
             &[("src/types.sai", "pub type Box2<T> { v: T }\n")]
@@ -14290,6 +14282,78 @@ fn valid_but_unimplemented_const_forms_remain_gated_not_misdiagnosed() {
             !stdout.contains("\"code\":\"NOT_CONST_EXPRESSION\""),
             "{source:?}: valid-but-unimplemented forms must not be misdiagnosed:\n{stdout}"
         );
+    }
+}
+
+#[test]
+fn transparent_alias_const_types_check() {
+    for source in [
+        // Scalar, chained, and nominal aliases expand transparently.
+        "pub type Number = I32\npub const A: Number = 1\n",
+        "pub type Number = I32\npub type N2 = Number\npub const A: N2 = 1 + 2\n",
+        concat!(
+            "pub type Point { x: I32 }\n",
+            "pub type P = Point\n",
+            "pub const ORIGIN: P = Point(x: 1)\n",
+        ),
+        // Aliases in tuple, array, and record-field positions.
+        "pub type Number = I32\npub const T: (Number,) = (1,)\n",
+        "pub type Number = I32\npub const A: Array<Number, 2> = [1, 2]\n",
+        concat!(
+            "pub type Number = I32\n",
+            "pub type Rec { n: Number }\n",
+            "pub const R: Rec = Rec(n: 1)\n",
+        ),
+        // Const references type-match across alias and plain annotations.
+        concat!(
+            "pub type Number = I32\n",
+            "pub const A: Number = 1\n",
+            "pub const B: I32 = A\n",
+            "pub const C: Number = B\n",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_success_result(output, "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn transparent_alias_const_type_errors_are_diagnosed() {
+    for (source, code) in [
+        (
+            "pub type Number = I8\npub const A: Number = 128\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub type Number = I32\npub const A: Number = true\n",
+            "TYPE_MISMATCH",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{source:?}:\n{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected {code} without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_alias_const_forms_remain_gated() {
+    for source in [
+        // Whole-annotation tuple and array aliases are outside the
+        // conversion-driven dispatch slice.
+        "pub type Tup = (I32, Bool)\npub const T: Tup = (1, true)\n",
+        "pub type Arr = Array<I32, 2>\npub const A: Arr = [1, 2]\n",
+        // Generic and cyclic aliases never convert.
+        "pub type Number<T> = I32\npub const A: I32 = 1\n",
+        "pub type Number = Number\npub const A: Number = 1\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
     }
 }
 
