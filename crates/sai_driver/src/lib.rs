@@ -8735,19 +8735,62 @@ fn check_function_body_shape_dispatch(
                 let Some(tail) = block.tail else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 };
-                if !matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                }
-                if let Some(return_ty) = sig.ret {
-                    let Some(diagnostics) = check_const_literal_leaf(
-                        owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
-                    )?
-                    else {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    };
-                    diagnostics
+                if matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
+                    if let Some(return_ty) = sig.ret {
+                        let Some(diagnostics) = check_const_literal_leaf(
+                            owner, *return_ty, tail, type_paths, symbols, inputs, snapshot,
+                            target_cfg,
+                        )?
+                        else {
+                            return Ok(FunctionBodyTypeCheck::Unsupported);
+                        };
+                        diagnostics
+                    } else {
+                        Vec::new()
+                    }
                 } else {
-                    Vec::new()
+                    // A tail checked against `()` discards its value (spec
+                    // 6.11.1/6.25.2); validate it like a discarded composite
+                    // branch tail. `if` tails validate both branch tails.
+                    if let ExprKind::If {
+                        cond,
+                        then,
+                        els: Some(else_expr),
+                    } = tail.kind
+                        && matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
+                        && then.stmts.is_empty()
+                        && then.safety == sai_hir::Safety::Safe
+                        && let Some(then_tail) = then.tail
+                        && let ExprKind::Block(else_block) = else_expr.kind
+                        && else_block.stmts.is_empty()
+                        && else_block.safety == sai_hir::Safety::Safe
+                        && let Some(else_tail) = else_block.tail
+                    {
+                        let mut diagnostics = Vec::new();
+                        for branch_tail in [then_tail, else_tail] {
+                            let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
+                                owner,
+                                branch_tail,
+                                false,
+                                symbols,
+                                inputs,
+                                snapshot,
+                            )?
+                            else {
+                                return Ok(FunctionBodyTypeCheck::Unsupported);
+                            };
+                            diagnostics.extend(tail_diagnostics);
+                        }
+                        diagnostics
+                    } else {
+                        let Some((_, diagnostics)) = check_function_discarded_unit_tail(
+                            owner, tail, false, symbols, inputs, snapshot,
+                        )?
+                        else {
+                            return Ok(FunctionBodyTypeCheck::Unsupported);
+                        };
+                        diagnostics
+                    }
                 }
             }
             Some(FunctionDirectType::Primitive(_)) => {
@@ -71317,7 +71360,7 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [13, 14, 19, 21] {
+        for index in [12, 13, 14, 19, 20, 21] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -71410,12 +71453,7 @@ property "shared"() {}
         assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
         assert_eq!(diagnostics[0].message, "expected `I32`, found unit");
 
-        for owner in owners[12..13]
-            .iter()
-            .chain(owners[18..19].iter())
-            .chain(owners[20..21].iter())
-            .chain(owners[22..23].iter())
-        {
+        for owner in owners[18..19].iter().chain(owners[22..23].iter()) {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -100699,7 +100737,13 @@ property "shared"() {}
                 "each `Str` branch reports its mismatch"
             );
         }
-        for index in [5, 6, 9, 12, 13] {
+        assert!(matches!(
+            owners[13]
+                .body_type_check()
+                .expect("unit if result check succeeds"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for index in [5, 6, 9, 12] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
