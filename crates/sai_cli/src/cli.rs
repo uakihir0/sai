@@ -2125,6 +2125,9 @@ fn use_item_bound_names(
         let sai_syntax::ast::Item::Use(use_decl) = item else {
             continue;
         };
+        if use_decl.attrs().next().is_some() {
+            continue;
+        }
         let Some(use_items) = use_decl.items() else {
             continue;
         };
@@ -2147,6 +2150,24 @@ fn use_item_bound_names(
     names
 }
 
+fn use_package_module_path(
+    package: &sai_syntax::ast::PkgPath,
+    package_identity: &str,
+) -> Option<String> {
+    let text = sai_syntax::ast::AstToken::syntax(package).text();
+    let package_name = package_identity
+        .split('@')
+        .next()
+        .unwrap_or(package_identity);
+    if text == package_name {
+        Some(String::new())
+    } else {
+        text.strip_prefix(package_name)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(str::to_owned)
+    }
+}
+
 fn use_module_bindings(
     source_file: &sai_syntax::ast::SourceFile,
     source: &[u8],
@@ -2159,21 +2180,14 @@ fn use_module_bindings(
         let sai_syntax::ast::Item::Use(use_decl) = item else {
             continue;
         };
+        if use_decl.attrs().next().is_some() {
+            continue;
+        }
         let Some(package) = use_decl.package() else {
             continue;
         };
         let text = sai_syntax::ast::AstToken::syntax(&package).text();
-        let package_name = package_identity
-            .split('@')
-            .next()
-            .unwrap_or(package_identity);
-        let module_path = if text == package_name {
-            Some("")
-        } else {
-            text.strip_prefix(package_name)
-                .and_then(|rest| rest.strip_prefix('/'))
-        };
-        let Some(module_path) = module_path else {
+        let Some(module_path) = use_package_module_path(&package, package_identity) else {
             continue;
         };
         let binding = if let Some(alias) = use_decl.alias().and_then(|alias| alias.name()) {
@@ -2432,7 +2446,8 @@ fn name_ref_normalized(name: &sai_syntax::ast::NameRef) -> Option<String> {
 fn unqualified_constructor_type_name_is_known(
     name: &str,
     type_names: &HashSet<String>,
-    imported_names: &HashSet<String>,
+    item_imports: &HashMap<String, (String, String)>,
+    module_type_inventory: &HashMap<String, HashSet<String>>,
 ) -> bool {
     matches!(
         name,
@@ -2457,15 +2472,19 @@ fn unqualified_constructor_type_name_is_known(
         && (type_names
             .iter()
             .any(|candidate| normalize_type_name(candidate) == name)
-            || imported_names
-                .iter()
-                .any(|candidate| normalize_type_name(candidate) == name)))
+            || item_imports
+                .get(name)
+                .is_some_and(|(module_path, item_name)| {
+                    module_type_inventory
+                        .get(module_path)
+                        .is_some_and(|types| types.contains(item_name))
+                })))
 }
 
 fn type_uses_known_names(
     ty: &sai_syntax::ast::Type,
     type_names: &HashSet<String>,
-    imported_names: &HashSet<String>,
+    item_imports: &HashMap<String, (String, String)>,
     module_bindings: &HashMap<String, String>,
     module_type_inventory: &HashMap<String, HashSet<String>>,
 ) -> bool {
@@ -2482,7 +2501,7 @@ fn type_uses_known_names(
                             type_uses_known_names(
                                 &ty,
                                 type_names,
-                                imported_names,
+                                item_imports,
                                 module_bindings,
                                 module_type_inventory,
                             )
@@ -2492,7 +2511,7 @@ fn type_uses_known_names(
                             type_uses_known_names(
                                 &ty,
                                 type_names,
-                                imported_names,
+                                item_imports,
                                 module_bindings,
                                 module_type_inventory,
                             )
@@ -2514,7 +2533,8 @@ fn type_uses_known_names(
                 return unqualified_constructor_type_name_is_known(
                     &names[0],
                     type_names,
-                    imported_names,
+                    item_imports,
+                    module_type_inventory,
                 );
             }
             names.len() == 2
@@ -2527,7 +2547,7 @@ fn type_uses_known_names(
             type_uses_known_names(
                 &element,
                 type_names,
-                imported_names,
+                item_imports,
                 module_bindings,
                 module_type_inventory,
             )
@@ -2536,7 +2556,7 @@ fn type_uses_known_names(
             type_uses_known_names(
                 &ty,
                 type_names,
-                imported_names,
+                item_imports,
                 module_bindings,
                 module_type_inventory,
             )
@@ -2609,63 +2629,295 @@ fn type_has_supported_const_constructor_shape(ty: &sai_syntax::ast::Type) -> boo
     }
 }
 
-fn type_uses_imported_name(ty: &sai_syntax::ast::Type, imported_names: &HashSet<String>) -> bool {
-    type_identifier_names(ty).into_iter().any(|name| {
-        imported_names
-            .iter()
-            .any(|candidate| normalize_type_name(candidate) == name)
-    })
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ScannerTypeReference {
+    Unqualified(String),
+    Qualified { binding: String, name: String },
 }
 
-fn item_type_uses_imported_names(
-    item: &sai_syntax::ast::Item,
-    imported_names: &HashSet<String>,
-) -> bool {
-    let any_type = |types: Vec<sai_syntax::ast::Type>| {
-        types
-            .iter()
-            .any(|ty| type_uses_imported_name(ty, imported_names))
-    };
+fn type_reference_names(ty: &sai_syntax::ast::Type) -> Vec<ScannerTypeReference> {
+    let mut references = Vec::new();
+    match ty {
+        sai_syntax::ast::Type::PathType(path) => {
+            let segments = path.segments().collect::<Vec<_>>();
+            let names = segments
+                .iter()
+                .map(|segment| segment.name().as_ref().and_then(name_ref_normalized))
+                .collect::<Option<Vec<_>>>();
+            if let Some(names) = names {
+                if names.len() == 1 {
+                    references.push(ScannerTypeReference::Unqualified(names[0].clone()));
+                } else if names.len() == 2 {
+                    references.push(ScannerTypeReference::Qualified {
+                        binding: names[0].clone(),
+                        name: names[1].clone(),
+                    });
+                }
+            }
+            for segment in segments {
+                if let Some(arguments) = segment.generic_args() {
+                    for argument in arguments.type_args() {
+                        if let Some(ty) = argument.ty() {
+                            references.extend(type_reference_names(&ty));
+                        }
+                    }
+                    for binding in arguments.assoc_type_bindings() {
+                        if let Some(ty) = binding.ty() {
+                            references.extend(type_reference_names(&ty));
+                        }
+                    }
+                }
+            }
+        }
+        sai_syntax::ast::Type::TupleType(tuple) => {
+            for element in tuple.elements() {
+                references.extend(type_reference_names(&element));
+            }
+        }
+        sai_syntax::ast::Type::ParenType(paren) => {
+            if let Some(ty) = paren.ty() {
+                references.extend(type_reference_names(&ty));
+            }
+        }
+        _ => {}
+    }
+    references
+}
+
+fn use_item_import_bindings(
+    source_file: &sai_syntax::ast::SourceFile,
+    source: &[u8],
+    package_identity: &str,
+) -> HashMap<String, (String, String)> {
+    use sai_syntax::ast::AstNode as _;
+
+    let mut imports = HashMap::new();
+    for item in source_file.items() {
+        let sai_syntax::ast::Item::Use(use_decl) = item else {
+            continue;
+        };
+        if use_decl.attrs().next().is_some() {
+            continue;
+        }
+        let Some(package) = use_decl.package() else {
+            continue;
+        };
+        let Some(module_path) = use_package_module_path(&package, package_identity) else {
+            continue;
+        };
+        let Some(use_items) = use_decl.items() else {
+            continue;
+        };
+        for use_item in use_items.items() {
+            let Some(item_name) = use_item.name().and_then(|name| {
+                let range = name.syntax().text_range();
+                source
+                    .get(range.start().to_usize()..range.end().to_usize())
+                    .and_then(|text| std::str::from_utf8(text).ok())
+                    .map(str::to_owned)
+            }) else {
+                continue;
+            };
+            let Some(binding_range) = use_item
+                .alias()
+                .map(|alias| alias.syntax().text_range())
+                .or_else(|| use_item.name().map(|name| name.syntax().text_range()))
+            else {
+                continue;
+            };
+            let Some(binding) = source
+                .get(binding_range.start().to_usize()..binding_range.end().to_usize())
+                .and_then(|text| std::str::from_utf8(text).ok())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            imports.insert(
+                normalize_type_name(&binding),
+                (module_path.to_owned(), normalize_type_name(&item_name)),
+            );
+        }
+    }
+    imports
+}
+
+fn scanner_type_references_in_item(item: &sai_syntax::ast::Item) -> Vec<ScannerTypeReference> {
     match item {
         sai_syntax::ast::Item::Type(type_decl) => type_decl
             .struct_def()
             .and_then(|definition| definition.fields())
-            .is_some_and(|fields| {
-                any_type(fields.fields().filter_map(|field| field.ty()).collect())
-            }),
-        sai_syntax::ast::Item::Enum(enumeration) => {
-            enumeration.variants().is_some_and(|variants| {
-                any_type(
-                    variants
-                        .variants()
-                        .flat_map(|variant| {
-                            let tuple_types = variant
-                                .tuple_shape()
-                                .map(|shape| shape.types().collect::<Vec<_>>())
-                                .unwrap_or_default();
-                            let record_types = variant
-                                .record_shape()
-                                .map(|shape| {
-                                    shape
-                                        .fields()
-                                        .filter_map(|field| field.ty())
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
-                            tuple_types
-                                .into_iter()
-                                .chain(record_types)
-                                .collect::<Vec<_>>()
-                        })
-                        .collect(),
-                )
+            .map(|fields| {
+                fields
+                    .fields()
+                    .flat_map(|field| {
+                        field
+                            .ty()
+                            .map(|ty| type_reference_names(&ty))
+                            .unwrap_or_default()
+                    })
+                    .collect()
             })
-        }
+            .unwrap_or_default(),
+        sai_syntax::ast::Item::Enum(enumeration) => enumeration
+            .variants()
+            .map(|variants| {
+                variants
+                    .variants()
+                    .flat_map(|variant| {
+                        let tuple_types = variant
+                            .tuple_shape()
+                            .map(|shape| shape.types().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        let record_types = variant
+                            .record_shape()
+                            .map(|shape| {
+                                shape
+                                    .fields()
+                                    .filter_map(|field| field.ty())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        tuple_types
+                            .into_iter()
+                            .chain(record_types)
+                            .flat_map(|ty| type_reference_names(&ty))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         sai_syntax::ast::Item::Distinct(distinct) => distinct
             .base_type()
-            .is_some_and(|ty| type_uses_imported_name(&ty, imported_names)),
-        _ => false,
+            .map(|ty| type_reference_names(&ty))
+            .unwrap_or_default(),
+        _ => Vec::new(),
     }
+}
+
+fn package_nominal_types_are_acyclic(input: &CheckModuleTreePackageInput) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    struct FileTypes {
+        module_path: String,
+        local_names: HashSet<String>,
+        module_bindings: HashMap<String, String>,
+        item_imports: HashMap<String, (String, String)>,
+        owners: Vec<(String, Vec<ScannerTypeReference>)>,
+    }
+
+    let inventory = package_module_type_inventory(input);
+    let mut files = Vec::new();
+    for (path, _, source) in &input.source_inputs {
+        let Some(module_path) = checked_source_module_path(&input.source_directory, path) else {
+            return false;
+        };
+        let source = strip_utf8_bom(source);
+        let Ok(parsed) = sai_fmt::parse_source(source) else {
+            return false;
+        };
+        let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
+            return false;
+        };
+        let mut local_names = HashSet::new();
+        let mut owners = Vec::new();
+        for item in source_file.items() {
+            let name = match &item {
+                sai_syntax::ast::Item::Type(type_decl) => type_decl.name(),
+                sai_syntax::ast::Item::Enum(enumeration) => enumeration.name(),
+                sai_syntax::ast::Item::Distinct(distinct) => distinct.name(),
+                _ => continue,
+            };
+            let Some(name) = name
+                .and_then(|name| name.token())
+                .map(|token| normalize_type_name(token.text()))
+            else {
+                return false;
+            };
+            if !local_names.insert(name.clone()) {
+                return false;
+            }
+            owners.push((name, scanner_type_references_in_item(&item)));
+        }
+        files.push(FileTypes {
+            module_bindings: use_module_bindings(&source_file, source, &input.package_identity),
+            item_imports: use_item_import_bindings(&source_file, source, &input.package_identity),
+            module_path,
+            local_names,
+            owners,
+        });
+    }
+
+    let mut edges: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+    for file in &files {
+        for (owner_name, references) in &file.owners {
+            let owner = (file.module_path.clone(), owner_name.clone());
+            let targets = edges.entry(owner).or_default();
+            for reference in references {
+                let target = match reference {
+                    ScannerTypeReference::Qualified { binding, name } => {
+                        module_binding_target(&file.module_bindings, &inventory, binding, name)
+                    }
+                    ScannerTypeReference::Unqualified(name) => {
+                        if file.local_names.contains(name) {
+                            Some((file.module_path.clone(), name.clone()))
+                        } else if let Some((module_path, item_name)) = file.item_imports.get(name) {
+                            inventory
+                                .get(module_path)
+                                .is_some_and(|types| types.contains(item_name))
+                                .then(|| (module_path.clone(), item_name.clone()))
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(target) = target {
+                    targets.push(target);
+                }
+            }
+        }
+    }
+
+    fn module_binding_target(
+        module_bindings: &HashMap<String, String>,
+        inventory: &HashMap<String, HashSet<String>>,
+        binding: &str,
+        name: &str,
+    ) -> Option<(String, String)> {
+        let module_path = module_bindings.get(binding)?;
+        inventory
+            .get(module_path)
+            .is_some_and(|types| types.contains(name))
+            .then(|| (module_path.clone(), name.to_owned()))
+    }
+
+    let mut state: HashMap<(String, String), u8> = HashMap::new();
+    for start in edges.keys() {
+        if state.contains_key(start) {
+            continue;
+        }
+        let mut stack = vec![(start.clone(), false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                state.insert(node, 2);
+                continue;
+            }
+            match state.get(&node) {
+                Some(2) => continue,
+                Some(1) => return false,
+                _ => {}
+            }
+            state.insert(node.clone(), 1);
+            stack.push((node.clone(), true));
+            for target in edges.get(&node).into_iter().flatten() {
+                match state.get(target) {
+                    Some(2) => {}
+                    Some(1) => return false,
+                    _ => stack.push((target.clone(), false)),
+                }
+            }
+        }
+    }
+    true
 }
 
 // `type` decls whose record-typed fields point back through other decls
@@ -2876,21 +3128,21 @@ fn check_source_is_mixed_public_items_fragment(
     source: &[u8],
     package_identity: &str,
     module_type_inventory: &HashMap<String, HashSet<String>>,
-) -> (bool, bool, bool, bool, bool) {
+) -> (bool, bool, bool, bool) {
     use sai_syntax::ast::AstNode as _;
 
     let source = strip_utf8_bom(source);
     let Some(parsed) = sai_fmt::parse_source(source).ok() else {
-        return (false, false, false, false, false);
+        return (false, false, false, false);
     };
     let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
-        return (false, false, false, false, false);
+        return (false, false, false, false);
     };
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
     {
-        return (false, false, false, false, false);
+        return (false, false, false, false);
     }
     let mut saw_impl = false;
     let mut saw_fn = false;
@@ -2923,27 +3175,22 @@ fn check_source_is_mixed_public_items_fragment(
             _ => continue,
         };
         let Some(name) = name else {
-            return (false, false, false, false, false);
+            return (false, false, false, false);
         };
         if is_public_visibility(visibility) {
             public_type_names.insert(name.clone());
         }
         type_names.insert(name);
     }
-    if !check_type_decls_acyclic(&source_file, source, &type_names) {
-        return (false, false, false, false, false);
-    }
     // `use pkg/mod.{item}` member imports bind names an `impl` head
     // may spell — gather the bound spelling (`alias` wins, else the
     // member name) so an `impl` on an imported record stays a
     // candidate. The driver decides whether the name really resolves.
     let mut imported_names = HashSet::new();
-    let bound_names = use_item_bound_names(&source_file, source);
     let module_bindings = use_module_bindings(&source_file, source, package_identity);
-    let mut type_uses_imported = false;
+    let item_imports = use_item_import_bindings(&source_file, source, package_identity);
     let mut impls = Vec::new();
     for item in source_file.items() {
-        type_uses_imported |= item_type_uses_imported_names(&item, &bound_names);
         match item {
             sai_syntax::ast::Item::Use(use_decl) => {
                 if let Some(use_items) = use_decl.items() {
@@ -2970,7 +3217,7 @@ fn check_source_is_mixed_public_items_fragment(
                         .visibility()
                         .is_some_and(|visibility| visibility.pub_token().is_some())
                 {
-                    return (false, false, false, false, false);
+                    return (false, false, false, false);
                 }
                 saw_fn = true;
             }
@@ -2982,7 +3229,7 @@ fn check_source_is_mixed_public_items_fragment(
                     &public_type_names,
                     &use_item_bound_names(&source_file, source),
                 ) {
-                    return (false, false, false, false, false);
+                    return (false, false, false, false);
                 }
             }
             sai_syntax::ast::Item::Enum(enumeration) => {
@@ -3010,7 +3257,7 @@ fn check_source_is_mixed_public_items_fragment(
                                     type_uses_known_names(
                                         &ty,
                                         &type_names,
-                                        &bound_names,
+                                        &item_imports,
                                         &module_bindings,
                                         module_type_inventory,
                                     ) && type_has_supported_const_constructor_shape(&ty)
@@ -3023,7 +3270,7 @@ fn check_source_is_mixed_public_items_fragment(
                                             type_uses_known_names(
                                                 &ty,
                                                 &type_names,
-                                                &bound_names,
+                                                &item_imports,
                                                 &module_bindings,
                                                 module_type_inventory,
                                             ) && type_has_supported_const_constructor_shape(&ty)
@@ -3042,7 +3289,7 @@ fn check_source_is_mixed_public_items_fragment(
                     || has_error
                     || !variants_are_supported
                 {
-                    return (false, false, false, false, false);
+                    return (false, false, false, false);
                 }
             }
             sai_syntax::ast::Item::Distinct(distinct) => {
@@ -3064,13 +3311,13 @@ fn check_source_is_mixed_public_items_fragment(
                         !type_uses_known_names(
                             &ty,
                             &type_names,
-                            &bound_names,
+                            &item_imports,
                             &module_bindings,
                             module_type_inventory,
                         ) || !type_has_supported_const_constructor_shape(&ty)
                     })
                 {
-                    return (false, false, false, false, false);
+                    return (false, false, false, false);
                 }
             }
             sai_syntax::ast::Item::Impl(impl_decl) => {
@@ -3079,11 +3326,11 @@ fn check_source_is_mixed_public_items_fragment(
             }
             sai_syntax::ast::Item::Const(constant) => {
                 if !check_const_decl(&constant) {
-                    return (false, false, false, false, false);
+                    return (false, false, false, false);
                 }
                 saw_const = true;
             }
-            _ => return (false, false, false, false, false),
+            _ => return (false, false, false, false),
         }
     }
     let mut seen_methods = HashSet::new();
@@ -3096,7 +3343,7 @@ fn check_source_is_mixed_public_items_fragment(
             &mut seen_methods,
         )
     });
-    (ok, saw_impl, saw_fn, saw_const, type_uses_imported)
+    (ok, saw_impl, saw_fn, saw_const)
 }
 
 fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> bool {
@@ -7309,10 +7556,10 @@ fn module_tree_workspace_check_diagnostics(
             let mut package_saw_impl = false;
             let mut package_saw_fn = false;
             let mut package_saw_const = false;
-            let mut package_type_uses_imported = false;
             let module_type_inventory = package_module_type_inventory(&inputs[0]);
+            let package_types_are_acyclic = package_nominal_types_are_acyclic(&inputs[0]);
             let all_fragments = inputs[0].source_inputs.iter().all(|(_, _, source)| {
-                let (ok, file_saw_impl, file_saw_fn, file_saw_const, type_uses_imported) =
+                let (ok, file_saw_impl, file_saw_fn, file_saw_const) =
                     check_source_is_mixed_public_items_fragment(
                         source.as_ref(),
                         &inputs[0].package_identity,
@@ -7321,20 +7568,17 @@ fn module_tree_workspace_check_diagnostics(
                 package_saw_impl |= file_saw_impl;
                 package_saw_fn |= file_saw_fn;
                 package_saw_const |= file_saw_const;
-                package_type_uses_imported |= type_uses_imported;
                 ok
             });
             // The mixed coverage gate requires at least one impl owner
             // package-wide, a `pub fn`+`pub const` mix, or const items.
             // Nominal type declarations are admissible with consts because
-            // their constructor slice is checked directly. A type declaration
-            // that itself references an imported nominal type still needs the
-            // established fn/impl coverage: the file-local cycle scan cannot
-            // prove that cross-file type graph finite.
+            // their constructor slice is checked directly. The package-wide
+            // nominal dependency graph must be acyclic, including references
+            // through item imports and module-qualified paths.
             all_fragments
-                && (package_saw_impl
-                    || (package_saw_fn && package_saw_const)
-                    || (package_saw_const && !package_type_uses_imported))
+                && package_types_are_acyclic
+                && (package_saw_impl || (package_saw_fn && package_saw_const) || package_saw_const)
         };
     let mut public_primitive_const_set_covered = false;
     let mut single_public_function_body_covered = false;

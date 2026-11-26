@@ -13435,6 +13435,75 @@ fn missing_module_qualified_nominal_payload_stays_outside_const_constructor_slic
 }
 
 #[test]
+fn missing_imported_nominal_payload_stays_outside_const_constructor_slice() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types.{Missing}\n",
+            "pub enum Status { Ready(Missing) }\n",
+            "pub const ONE: I32 = 1\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[("src/types.sai", "pub type Point { x: I32 }\n")],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, "missing imported nominal type");
+}
+
+#[test]
+fn cross_module_nominal_cycles_stay_outside_const_constructor_slice() {
+    let output = run_check(
+        concat!("pub const ONE: I32 = 1\n", "pub fn zero() -> I32 { 0 }\n",),
+        "",
+        &[
+            (
+                "src/a.sai",
+                concat!("use acme:empty/b\n", "pub enum A { Wrap(b.B) }\n",),
+            ),
+            (
+                "src/b.sai",
+                concat!("use acme:empty/a\n", "pub enum B { Wrap(a.A) }\n",),
+            ),
+        ],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, "cross-module nominal cycle");
+}
+
+#[test]
+fn module_qualified_same_name_nominal_payload_checks() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types\n",
+            "pub enum Node { Local(types.Node) }\n",
+            "pub const ROOT: Node = Node.Local(types.Node.Leaf)\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[("src/types.sai", "pub enum Node { Leaf }\n")],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn target_filtered_module_import_does_not_validate_qualified_payload() {
+    let output = run_check(
+        concat!(
+            "@target(\"wasm64-core\")\n",
+            "use acme:empty/types\n",
+            "pub enum Status { Ready(types.Point) }\n",
+            "pub const ONE: I32 = 1\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[("src/types.sai", "pub type Point { x: I32 }\n")],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, "target-filtered module import");
+}
+
+#[test]
 fn nominal_const_constructor_errors_are_checked() {
     for (source, code, message) in [
         (
