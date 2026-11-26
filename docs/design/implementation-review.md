@@ -10992,3 +10992,33 @@ local paths in discard positions, `else if` chains, operators over
 parameters in composite positions, local bindings and projections,
 tuple/array-typed parameters, the no-effect warning, and must-use discard
 diagnostics.
+
+## IR-1186: `else if` chains in unit positions
+
+**Decision.** `else if` chains — which nest as `else` followed by an
+`IfExpr` (spec 6.14.1) — validate every link in unit positions:
+`pub fn f() { if true { 1 } else if true { 2 } else { 3 } }` and
+`pub fn f(x: I32) { if x < 1 { 1 } else if x < 2 { 2 } else { 3 } }` are
+valid. In parameterized functions each link's condition validates like the
+first (Bool literals, Bool-parameter paths, parameter comparisons), so
+`else if x < true` reports the comparison's `TYPE_MISMATCH`; in
+zero-parameter functions and composite unit positions literal conditions
+are collected by a shared right-nesting chain walk.
+
+**Reason.** Chains are the idiomatic multi-way branch; gating them
+misdiagnosed valid programs. The right-nesting walk reuses the same
+branch-tail validation as plain `if`/`else`.
+
+**Failure boundary.** Chains in scalar and non-unit composite positions
+still gate for the branch-type unification slice; links with non-literal,
+non-parameter conditions in zero-parameter functions gate.
+
+**Verification.** Driver and CLI suites pass; probes cover zero-parameter
+and parameterized chains, composite unit positions, per-link condition
+diagnostics, and range errors in later links.
+
+**Remaining scope.** Scalar-position chains, parameter and local paths in
+discard positions, `IF_WITHOUT_ELSE` in non-unit positions, operators over
+parameters in composite positions, local bindings and projections,
+tuple/array-typed parameters, the no-effect warning, and must-use discard
+diagnostics.
