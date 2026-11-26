@@ -11051,3 +11051,15 @@ discard positions, scalar-position `else if` chains, `IF_WITHOUT_ELSE` in
 non-unit positions, operators over parameters in composite positions,
 local bindings and projections, tuple/array-typed parameters, the
 no-effect warning, and must-use discard diagnostics.
+
+## IR-1188: Literal operator expressions in unit discard positions
+
+**Decision.** Evaluate literal-only operator expressions discarded in unit positions — tail values of unit-returning bodies, statement-free if branches, tuple and array elements — like const initializers, with operand types defaulting per spec 6.3.1/6.3.2: integer literals to `I64`, float literals to `F64`. Comparisons (`<`, `==`, …) and logical operations produce `Bool`. `pub fn f() { 1 + 2 }` and `[1 + 2, 3]` elements are accepted, `1 + 2.0` reports the evaluation's type mismatch, and non-literal operands (parameter references, calls) stay gated.
+
+**Reason.** Spec 6.11.1/6.25.2 discard the value but still require it to be well-typed on its own. Literal-only operator expressions are fully typed by the spec's defaults, so they are inference-independent and must be evaluated; operands needing inference stay gated per the failure boundary.
+
+**Failure boundary.** Arithmetic, bitwise, wrapping, shift, comparison, logical, and unary operators over literal operands evaluate in discards. Expressions involving non-literal operands — parameters, local bindings, calls, projections — gate, including inside composites. The evaluated shape (`Integer`/`Float`/`Bool`) participates in array-element unification like plain literals.
+
+**Verification.** Driver 795 tests green; CLI suite green including `pub fn f() { 1 + 2 }`, `1.5 * 2.0`, `1 < 2`, `true and false`, `not true`, `-1`, if-branch tails, and array elements accepted, and `1 + x` still gated.
+
+**Remaining scope.** Operator expressions over parameter references in any position; the evaluation in discards shares the const evaluator, so runtime-overflow operands are not diagnosed in fn bodies (spec 6.2.2 panics at runtime).

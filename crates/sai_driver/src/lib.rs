@@ -8297,12 +8297,14 @@ fn check_unit_discard_if_branch_tails(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let mut diagnostics = Vec::new();
     let mut unsupported = false;
     for tail in tails.iter().copied().flatten() {
         match check_function_discarded_unit_tail(
             owner, tail, false, false, sig, body, locals, symbols, inputs, snapshot, type_paths,
+            target_cfg,
         )? {
             Some((_, tail_diagnostics)) => diagnostics.extend(tail_diagnostics),
             None => unsupported = true,
@@ -8656,6 +8658,7 @@ fn check_function_body_shape_dispatch(
                     }
                     let Some(tail_diagnostics) = check_unit_discard_if_branch_tails(
                         owner, &tails, sig, body, locals, type_paths, symbols, inputs, snapshot,
+                        target_cfg,
                     )?
                     else {
                         return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8958,7 +8961,8 @@ fn check_function_body_shape_dispatch(
                             return Ok(FunctionBodyTypeCheck::Unsupported);
                         }
                         let Some(diagnostics) = check_unit_discard_if_branch_tails(
-                            owner, &tails, sig, body, locals, type_paths, symbols, inputs, snapshot,
+                            owner, &tails, sig, body, locals, type_paths, symbols, inputs,
+                            snapshot, target_cfg,
                         )?
                         else {
                             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8967,7 +8971,7 @@ fn check_function_body_shape_dispatch(
                     } else {
                         let Some((_, diagnostics)) = check_function_discarded_unit_tail(
                             owner, tail, false, false, sig, body, locals, symbols, inputs,
-                            snapshot, type_paths,
+                            snapshot, type_paths, target_cfg,
                         )?
                         else {
                             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -9261,6 +9265,81 @@ fn discard_impossible_int_literals<'a>(expr: &'a HirExpr<'_>, literals: &mut Vec
     }
 }
 
+// The natural type of a literal-only operator expression in a discard
+// position (spec 6.3.1/6.3.2): comparisons and logical operations produce
+// `Bool`, and arithmetic produces `F64` when any operand is a float
+// literal, `I64` otherwise. Mixed literal kinds are diagnosed by the
+// evaluation itself; expressions with non-literal operands gate.
+fn discard_operator_expression_type(expr: &HirExpr<'_>) -> Option<ConstLiteralType> {
+    match expr.kind {
+        ExprKind::Unary(UnOp::Not, _) => {
+            return Some(ConstLiteralType::Primitive(
+                sai_resolve::prelude::PrimTy::Bool,
+            ));
+        }
+        ExprKind::Binary(
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or,
+            _,
+            _,
+        ) => {
+            return Some(ConstLiteralType::Primitive(
+                sai_resolve::prelude::PrimTy::Bool,
+            ));
+        }
+        ExprKind::Binary(
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::WrapAdd
+            | BinOp::WrapSub
+            | BinOp::WrapMul
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr,
+            _,
+            _,
+        )
+        | ExprKind::Unary(UnOp::Neg, _) => {}
+        _ => return None,
+    }
+    let mut has_float = false;
+    let mut stack = vec![expr];
+    while let Some(current) = stack.pop() {
+        match current.kind {
+            ExprKind::Lit(Lit::Float { .. }) => has_float = true,
+            ExprKind::Lit(
+                Lit::Int { .. } | Lit::Bool(_) | Lit::Char(_) | Lit::Byte(_) | Lit::Str(_),
+            ) => {}
+            ExprKind::Binary(_, left, right) => {
+                stack.push(left);
+                stack.push(right);
+            }
+            ExprKind::Unary(_, operand) => stack.push(operand),
+            _ => return None,
+        }
+    }
+    if has_float {
+        Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::F64,
+        ))
+    } else {
+        Some(ConstLiteralType::Primitive(
+            sai_resolve::prelude::PrimTy::I64,
+        ))
+    }
+}
+
 fn check_function_discarded_unit_tail(
     owner: &HirOwner<'_>,
     tail: &HirExpr<'_>,
@@ -9273,6 +9352,7 @@ fn check_function_discarded_unit_tail(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     type_paths: Option<&TypeOwnerPathResolution>,
+    target_cfg: &TargetCfg,
 ) -> Result<Option<(DiscardLiteralShape, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     match tail.kind {
         ExprKind::Lit(Lit::Int { value, negated }) => {
@@ -9328,6 +9408,44 @@ fn check_function_discarded_unit_tail(
         ExprKind::Lit(Lit::Char(_)) => return Ok(Some((DiscardLiteralShape::Char, Vec::new()))),
         ExprKind::Lit(Lit::Byte(_)) => return Ok(Some((DiscardLiteralShape::Byte, Vec::new()))),
         ExprKind::Lit(Lit::Bool(_)) => return Ok(Some((DiscardLiteralShape::Bool, Vec::new()))),
+        ExprKind::Binary(_, _, _) | ExprKind::Unary(_, _)
+            if discard_operator_expression_type(tail).is_some() =>
+        {
+            // Literal-only operator expressions in discards evaluate like
+            // const initializers, with operand types defaulting per spec
+            // 6.3.1/6.3.2 — integer literals to `I64` and float literals to
+            // `F64`; comparisons and logical operations produce `Bool`.
+            let Some(literal_type) = discard_operator_expression_type(tail) else {
+                return Ok(None);
+            };
+            let shape = match literal_type {
+                ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool) => {
+                    DiscardLiteralShape::Bool
+                }
+                ConstLiteralType::Primitive(primitive)
+                    if matches!(
+                        primitive,
+                        sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64
+                    ) =>
+                {
+                    DiscardLiteralShape::Float
+                }
+                _ => DiscardLiteralShape::Integer,
+            };
+            let Some(diagnostics) = check_function_operator_expression_against_type(
+                owner.id,
+                literal_type,
+                tail,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some((shape, diagnostics)));
+        }
         ExprKind::Path(path)
             if !in_composite
                 && path.root == PathRoot::Plain
@@ -9363,7 +9481,7 @@ fn check_function_discarded_unit_tail(
             for element in elements {
                 let Some((shape, element_diagnostics)) = check_function_discarded_unit_tail(
                     owner, element, false, true, sig, body, locals, symbols, inputs, snapshot,
-                    type_paths,
+                    type_paths, target_cfg,
                 )?
                 else {
                     let mut literals = Vec::new();
@@ -9399,7 +9517,7 @@ fn check_function_discarded_unit_tail(
             for element in elements {
                 let Some((shape, element_diagnostics)) = check_function_discarded_unit_tail(
                     owner, element, true, true, sig, body, locals, symbols, inputs, snapshot,
-                    type_paths,
+                    type_paths, target_cfg,
                 )?
                 else {
                     let mut literals = Vec::new();
@@ -9510,7 +9628,7 @@ fn check_function_composite_literal_element(
                 return Ok(None);
             }
             return check_unit_discard_if_branch_tails(
-                owner, &tails, sig, body, locals, type_paths, symbols, inputs, snapshot,
+                owner, &tails, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
             );
         }
         let Some(else_expr) = els else {
