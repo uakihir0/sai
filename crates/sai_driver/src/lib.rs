@@ -8199,6 +8199,51 @@ fn check_function_body_type(
 // inherent methods (associated functions — every parameter explicit):
 // the primitive local-block walk first, then the `-> Str` walk and the
 // remaining statement/tail shapes.
+// Branch tails of an `if` checked against `()` are independent discards:
+// an empty branch evaluates to `()` on its own (spec 6.5.1). Branches
+// needing inference gate the whole form, but integer literals fitting no
+// integer type at all surface through the gate because they are out of
+// range independent of inference (spec 6.3.1).
+fn check_unit_discard_if_branch_tails(
+    owner: &HirOwner<'_>,
+    tails: [Option<&HirExpr<'_>>; 2],
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let mut diagnostics = Vec::new();
+    let mut unsupported = false;
+    for tail in tails.iter().copied().flatten() {
+        match check_function_discarded_unit_tail(owner, tail, false, symbols, inputs, snapshot)? {
+            Some((_, tail_diagnostics)) => diagnostics.extend(tail_diagnostics),
+            None => unsupported = true,
+        }
+    }
+    if !unsupported {
+        return Ok(Some(diagnostics));
+    }
+    let mut literals = Vec::new();
+    for tail in tails.iter().copied().flatten() {
+        discard_impossible_int_literals(tail, &mut literals);
+    }
+    if literals.is_empty() {
+        return Ok(None);
+    }
+    let mut definite = Vec::new();
+    for literal in literals {
+        definite.push(const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            literal.span,
+            sai_diagnostics::Code::LiteralOutOfRange,
+            "integer literal out of range for every integer type".to_string(),
+            "literal out of range",
+        )?);
+    }
+    Ok(Some(definite))
+}
+
 fn check_function_body_shape_dispatch(
     owner: &HirOwner<'_>,
     sig: sai_hir::body::FnSig<'_>,
@@ -8760,27 +8805,20 @@ fn check_function_body_shape_dispatch(
                         && matches!(cond.kind, ExprKind::Lit(Lit::Bool(_)))
                         && then.stmts.is_empty()
                         && then.safety == sai_hir::Safety::Safe
-                        && let Some(then_tail) = then.tail
                         && let ExprKind::Block(else_block) = else_expr.kind
                         && else_block.stmts.is_empty()
                         && else_block.safety == sai_hir::Safety::Safe
-                        && let Some(else_tail) = else_block.tail
                     {
-                        let mut diagnostics = Vec::new();
-                        for branch_tail in [then_tail, else_tail] {
-                            let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
-                                owner,
-                                branch_tail,
-                                false,
-                                symbols,
-                                inputs,
-                                snapshot,
-                            )?
-                            else {
-                                return Ok(FunctionBodyTypeCheck::Unsupported);
-                            };
-                            diagnostics.extend(tail_diagnostics);
-                        }
+                        let Some(diagnostics) = check_unit_discard_if_branch_tails(
+                            owner,
+                            [then.tail, else_block.tail],
+                            symbols,
+                            inputs,
+                            snapshot,
+                        )?
+                        else {
+                            return Ok(FunctionBodyTypeCheck::Unsupported);
+                        };
                         diagnostics
                     } else {
                         let Some((_, diagnostics)) = check_function_discarded_unit_tail(
@@ -9281,18 +9319,12 @@ fn check_function_composite_literal_element(
         {
             return Ok(None);
         }
-        let Some(then_tail) = then.tail else {
-            return Ok(None);
-        };
         let ExprKind::Block(else_block) = else_expr.kind else {
             return Ok(None);
         };
         if else_block.safety != sai_hir::Safety::Safe || !else_block.stmts.is_empty() {
             return Ok(None);
         }
-        let Some(else_tail) = else_block.tail else {
-            return Ok(None);
-        };
         // Branch tails checked against `()` discard their values (spec
         // 6.11.1/6.25.2). Literal and composite-construction tails are
         // self-consistent in the direct-type fragment, so they are valid
@@ -9301,18 +9333,20 @@ fn check_function_composite_literal_element(
             resolve_const_literal_type(ty, type_paths, symbols, inputs),
             Some(ConstLiteralType::Unit)
         ) {
-            let mut discard_diagnostics = Vec::new();
-            for tail in [then_tail, else_tail] {
-                let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
-                    owner, tail, false, symbols, inputs, snapshot,
-                )?
-                else {
-                    return Ok(None);
-                };
-                discard_diagnostics.extend(tail_diagnostics);
-            }
-            return Ok(Some(discard_diagnostics));
+            return check_unit_discard_if_branch_tails(
+                owner,
+                [then.tail, else_block.tail],
+                symbols,
+                inputs,
+                snapshot,
+            );
         }
+        let Some(then_tail) = then.tail else {
+            return Ok(None);
+        };
+        let Some(else_tail) = else_block.tail else {
+            return Ok(None);
+        };
         let Some(mut diagnostics) = check_function_composite_literal_element(
             owner, ty, then_tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
             target_cfg,

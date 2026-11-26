@@ -11672,6 +11672,8 @@ fn public_unit_return_discards_tail_values() {
         "pub fn f() { 1 }\n",
         "pub fn f() -> () { 1 }\n",
         "pub fn f() { if true { 1 } else { 2 } }\n",
+        "pub fn f() { if true { 1 } else {} }\n",
+        "pub fn f() { if true {} else { 2 } }\n",
         "pub fn f() { (1, true) }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
@@ -11687,6 +11689,10 @@ fn public_unit_return_discard_errors_are_diagnosed() {
         ),
         ("pub fn f() { [1, true] }\n", "TYPE_MISMATCH"),
         ("pub fn f() { [] }\n", "TYPE_ANNOTATIONS_NEEDED"),
+        (
+            "pub fn f() { if true { x } else { 99999999999999999999 } }\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
