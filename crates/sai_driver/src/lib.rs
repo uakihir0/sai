@@ -8941,12 +8941,39 @@ fn check_function_operator_expression_against_type(
 // checks. `Ok(None)` gates positions needing inference.
 #[allow(clippy::too_many_arguments)]
 // A branch tail discarded against `()` must still be well-typed on its own
-// (spec 6.25.2): integer literals default to `I64` and range-check after
-// resolution (6.3.1), array elements share one type, and composite
-// constructions validate recursively. Forms needing inference gate.
+// (spec 6.25.2): integer literals default to `I64` and float literals to
+// `F64` with range checks after resolution (6.3.1/6.3.2), array elements
+// share one type compared by literal shape, empty arrays need a type the
+// fragment cannot infer, and composite constructions validate recursively.
+// Forms needing inference gate.
+fn discard_literal_shape(expr: &HirExpr<'_>) -> Option<String> {
+    match expr.kind {
+        ExprKind::Lit(Lit::Int { .. }) => Some("integer".to_string()),
+        ExprKind::Lit(Lit::Float { .. }) => Some("float".to_string()),
+        ExprKind::Lit(Lit::Str(_)) => Some("string".to_string()),
+        ExprKind::Lit(Lit::ByteStr(_)) => Some("byte string".to_string()),
+        ExprKind::Lit(Lit::Char(_)) => Some("char".to_string()),
+        ExprKind::Lit(Lit::Byte(_)) => Some("byte".to_string()),
+        ExprKind::Lit(Lit::Bool(_)) => Some("bool".to_string()),
+        ExprKind::Tuple(elements) => {
+            let mut shapes = Vec::new();
+            for element in elements {
+                shapes.push(discard_literal_shape(element)?);
+            }
+            Some(format!("({})", shapes.join(", ")))
+        }
+        ExprKind::Array(elements) => {
+            let first = elements.first()?;
+            Some(format!("[{}]", discard_literal_shape(first)?))
+        }
+        _ => None,
+    }
+}
+
 fn check_function_discarded_unit_tail(
     owner: &HirOwner<'_>,
     tail: &HirExpr<'_>,
+    symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
@@ -8970,35 +8997,69 @@ fn check_function_discarded_unit_tail(
                 "literal out of range",
             )?]));
         }
+        ExprKind::Lit(Lit::Float { text, .. }) => {
+            let Ok(text) = symbols.resolve(text) else {
+                return Ok(None);
+            };
+            let cleaned = text.replace('_', "");
+            if cleaned
+                .parse::<f64>()
+                .is_ok_and(|value| value.is_infinite())
+            {
+                return Ok(Some(vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    tail.span,
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    "floating-point literal out of range for `F64`".to_string(),
+                    "literal out of range",
+                )?]));
+            }
+            return Ok(Some(Vec::new()));
+        }
         ExprKind::Lit(_) => return Ok(Some(Vec::new())),
-        ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
+        ExprKind::Tuple(elements) => {
             let mut diagnostics = Vec::new();
-            let mut literal_kinds: Vec<&'static str> = Vec::new();
             for element in elements {
                 let Some(element_diagnostics) =
-                    check_function_discarded_unit_tail(owner, element, inputs, snapshot)?
+                    check_function_discarded_unit_tail(owner, element, symbols, inputs, snapshot)?
                 else {
                     return Ok(None);
                 };
                 diagnostics.extend(element_diagnostics);
-                if matches!(tail.kind, ExprKind::Array(_)) {
-                    let kind = match element.kind {
-                        ExprKind::Lit(Lit::Int { .. }) => "integer",
-                        ExprKind::Lit(Lit::Float { .. }) => "float",
-                        ExprKind::Lit(Lit::Str(_)) => "string",
-                        ExprKind::Lit(Lit::ByteStr(_)) => "byte string",
-                        ExprKind::Lit(Lit::Char(_)) => "char",
-                        ExprKind::Lit(Lit::Byte(_)) => "byte",
-                        ExprKind::Lit(Lit::Bool(_)) => "bool",
-                        _ => "other",
-                    };
-                    literal_kinds.push(kind);
-                }
             }
-            if matches!(tail.kind, ExprKind::Array(_))
-                && literal_kinds
-                    .first()
-                    .is_some_and(|first| literal_kinds.iter().any(|kind| kind != first))
+            return Ok(Some(diagnostics));
+        }
+        ExprKind::Array(elements) => {
+            if elements.is_empty() {
+                return Ok(Some(vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    tail.span,
+                    sai_diagnostics::Code::TypeAnnotationsNeeded,
+                    "type annotations needed for the empty array literal".to_string(),
+                    "type annotations needed",
+                )?]));
+            }
+            let mut diagnostics = Vec::new();
+            let mut shapes: Vec<Option<String>> = Vec::new();
+            for element in elements {
+                let Some(element_diagnostics) =
+                    check_function_discarded_unit_tail(owner, element, symbols, inputs, snapshot)?
+                else {
+                    return Ok(None);
+                };
+                diagnostics.extend(element_diagnostics);
+                let Some(shape) = discard_literal_shape(element) else {
+                    return Ok(None);
+                };
+                shapes.push(Some(shape));
+            }
+            if shapes
+                .first()
+                .is_some_and(|first| shapes.iter().any(|shape| shape != first))
             {
                 diagnostics.push(const_literal_diagnostic(
                     owner.id,
@@ -9068,7 +9129,7 @@ fn check_function_composite_literal_element(
             let mut discard_diagnostics = Vec::new();
             for tail in [then_tail, else_tail] {
                 let Some(tail_diagnostics) =
-                    check_function_discarded_unit_tail(owner, tail, inputs, snapshot)?
+                    check_function_discarded_unit_tail(owner, tail, symbols, inputs, snapshot)?
                 else {
                     return Ok(None);
                 };
