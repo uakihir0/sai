@@ -8302,7 +8302,8 @@ fn check_function_body_shape_dispatch(
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
         let Some(tuple_diagnostics) = check_function_composite_literal_element(
-            owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+            owner, *return_ty, tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            target_cfg,
         )?
         else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -8325,7 +8326,8 @@ fn check_function_body_shape_dispatch(
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
         let Some(array_diagnostics) = check_function_composite_literal_element(
-            owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+            owner, *return_ty, tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            target_cfg,
         )?
         else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -9212,6 +9214,9 @@ fn check_function_composite_literal_element(
     owner: &HirOwner<'_>,
     ty: Ty<'_>,
     element: &HirExpr<'_>,
+    sig: sai_hir::body::FnSig<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
@@ -9266,13 +9271,15 @@ fn check_function_composite_literal_element(
             return Ok(Some(discard_diagnostics));
         }
         let Some(mut diagnostics) = check_function_composite_literal_element(
-            owner, ty, then_tail, type_paths, symbols, inputs, snapshot, target_cfg,
+            owner, ty, then_tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            target_cfg,
         )?
         else {
             return Ok(None);
         };
         let Some(mut else_diagnostics) = check_function_composite_literal_element(
-            owner, ty, else_tail, type_paths, symbols, inputs, snapshot, target_cfg,
+            owner, ty, else_tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            target_cfg,
         )?
         else {
             return Ok(None);
@@ -9352,6 +9359,9 @@ fn check_function_composite_literal_element(
                 owner,
                 *type_element,
                 tail_element,
+                sig,
+                body,
+                locals,
                 type_paths,
                 symbols,
                 inputs,
@@ -9411,6 +9421,9 @@ fn check_function_composite_literal_element(
                 owner,
                 *element_ty,
                 tail_element,
+                sig,
+                body,
+                locals,
                 type_paths,
                 symbols,
                 inputs,
@@ -9432,6 +9445,54 @@ fn check_function_composite_literal_element(
         return check_const_literal_leaf(
             owner, ty, element, type_paths, symbols, inputs, snapshot, target_cfg,
         );
+    }
+    // Parameter references in leaf positions check against the parameter's
+    // direct type (spec 6.5.1); other paths gate for the inference slice.
+    if let ExprKind::Path(path) = element.kind
+        && path.root == PathRoot::Plain
+        && path.segments.len() == 1
+        && path.segments[0].args.is_none()
+        && let Some(PathRes {
+            base: Res::Local(binding),
+            resolved_segments: 1,
+            segment_count: 1,
+        }) = locals.paths.get(&path.hir_id)
+    {
+        let Some(position) = body
+            .params
+            .iter()
+            .position(|parameter| parameter.binding == *binding)
+        else {
+            return Ok(None);
+        };
+        let Some(sig_parameter) = sig.params.get(position) else {
+            return Ok(None);
+        };
+        let Some(parameter_type) =
+            resolve_const_literal_type(*sig_parameter.ty, type_paths, symbols, inputs)
+        else {
+            return Ok(None);
+        };
+        let Some(expected_type) = resolve_const_literal_type(ty, type_paths, symbols, inputs)
+        else {
+            return Ok(None);
+        };
+        if parameter_type == expected_type {
+            return Ok(Some(Vec::new()));
+        }
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            element.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found `{}`",
+                local_enum_variant_type_name(expected_type),
+                local_enum_variant_type_name(parameter_type)
+            ),
+            "type mismatch",
+        )?]));
     }
     // Composite literals never match scalar types (spec 5.2.1); the scalar
     // renders through the literal-type names.

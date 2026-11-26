@@ -11606,6 +11606,36 @@ fn public_zero_parameter_nested_composite_literal_returns_emit_check_result() {
 }
 
 #[test]
+fn public_parameter_reference_elements_emit_check_result() {
+    for source in [
+        "pub fn f(x: I32) -> (I32, Bool) { (x, true) }\n",
+        "pub fn f(x: I32) -> Array<I32, 2> { [x, 2] }\n",
+        "pub fn f(x: I32) -> (I32, (Bool, I8)) { (x, (true, 5)) }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_parameter_reference_element_type_errors_are_diagnosed() {
+    let output = run_check(
+        "pub fn f(x: Bool) -> (I32, Bool) { (x, true) }\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `I32`, found `Bool`")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "expected TYPE_MISMATCH without a result or feature gate:\n{stdout}"
+    );
+}
+
+#[test]
 fn public_composite_if_branch_returns_emit_check_result() {
     for source in [
         "pub fn f() -> (I32, Bool) { if true { (1, true) } else { (2, false) } }\n",
