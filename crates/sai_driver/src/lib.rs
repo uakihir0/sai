@@ -17607,9 +17607,32 @@ fn check_function_if_parameter_comparison_condition(
     ) {
         // `Str` comparisons mirror the primitive walker: string literals
         // compare in any equality or ordering operator, and other literal
-        // kinds mismatch the parameter type.
+        // kinds mismatch. A literal on the left fixes the expectation
+        // through its own type like the primitive comparisons do, while a
+        // literal on the right checks against the `Str` parameter.
+        if matches!(literal.kind, ExprKind::Lit(Lit::Str(_))) {
+            return Ok(Some(Vec::new()));
+        }
+        if literal_is_left {
+            let expected = match literal.kind {
+                ExprKind::Lit(Lit::Int { .. }) => "I64",
+                ExprKind::Lit(Lit::Float { .. }) => "F64",
+                ExprKind::Lit(Lit::Bool(_)) => "Bool",
+                ExprKind::Lit(Lit::Char(_)) => "Char",
+                ExprKind::Lit(Lit::Byte(_)) => "Byte",
+                _ => return Ok(None),
+            };
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                parameter_path.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `{expected}`, found `Str`"),
+                "type mismatch",
+            )?]));
+        }
         let found = match literal.kind {
-            ExprKind::Lit(Lit::Str(_)) => return Ok(Some(Vec::new())),
             ExprKind::Lit(Lit::Int { .. }) => "an integer literal",
             ExprKind::Lit(Lit::Float { .. }) => "a floating-point literal",
             ExprKind::Lit(Lit::Bool(_)) => "a Bool literal",
