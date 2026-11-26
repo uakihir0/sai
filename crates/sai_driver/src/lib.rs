@@ -8671,6 +8671,68 @@ fn check_function_body_shape_dispatch(
                 diagnostics: tuple_diagnostics,
             });
         }
+        // Array returns of direct element types check array-literal tails
+        // element-wise, with the spec's length diagnostic:
+        // `pub fn pair() -> Array<I32, 2> { [1, 2] }`.
+        if let Some(return_ty) = sig.ret
+            && let Some((element_ty, expected_length)) =
+                resolve_const_array_type(*return_ty, type_paths, target_cfg.pointer_width())
+        {
+            if resolve_function_direct_type(*element_ty, type_paths, symbols, inputs).is_none() {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            if !block.stmts.is_empty() {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            let Some(tail) = block.tail else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            let ExprKind::Array(tail_elements) = tail.kind else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            if tail_elements.len() as u128 != expected_length {
+                return Ok(FunctionBodyTypeCheck::Supported {
+                    diagnostics: vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        tail.span,
+                        sai_diagnostics::Code::ArrayLengthMismatch,
+                        format!(
+                            "expected array length {}, found {}",
+                            expected_length,
+                            tail_elements.len()
+                        ),
+                        "array length mismatch",
+                    )?],
+                });
+            }
+            let mut array_diagnostics = Vec::new();
+            for tail_element in tail_elements {
+                let is_unit_tuple =
+                    matches!(tail_element.kind, ExprKind::Tuple(elements) if elements.is_empty());
+                if !is_direct_function_scalar_literal(tail_element) && !is_unit_tuple {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+                let Some(element_diagnostics) = check_const_literal_leaf(
+                    owner,
+                    *element_ty,
+                    tail_element,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                array_diagnostics.extend(element_diagnostics);
+            }
+            return Ok(FunctionBodyTypeCheck::Supported {
+                diagnostics: array_diagnostics,
+            });
+        }
         // A missing return type is the implicit `-> ()` (spec 6.5.1), so it
         // resolves to unit; an explicit annotation that does not resolve
         // stays unsupported.
