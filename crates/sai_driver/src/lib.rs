@@ -7746,11 +7746,21 @@ fn check_const_literal_owner(
         )?];
         return Ok(ConstLiteralCheck::SupportedNotConst { diagnostics });
     }
-    if let Some((span, code)) = find_invalid_array_length_type_argument(*ty, type_paths) {
+    if let Some((span, code)) =
+        find_invalid_array_length_type_argument(*ty, type_paths, target_cfg.pointer_width())
+    {
         let (message, label) = match code {
             sai_diagnostics::Code::ConstArgNotSimple => (
                 "const arguments must be simple literals".to_string(),
                 "not a simple const argument",
+            ),
+            sai_diagnostics::Code::LiteralOutOfRange => (
+                "integer literal is out of range for `USize`".to_string(),
+                "literal out of range",
+            ),
+            sai_diagnostics::Code::TypeMismatch => (
+                "array length must be a `USize` integer literal".to_string(),
+                "wrong type for array length",
             ),
             _ => (
                 "a const parameter takes a const argument, not a type".to_string(),
@@ -19369,6 +19379,7 @@ fn check_const_nominal_constructor(
 fn find_invalid_array_length_type_argument(
     ty: Ty<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
+    pointer_width: u8,
 ) -> Option<(sai_hir::Span, sai_diagnostics::Code)> {
     match ty.kind {
         TyKind::Path(path) => {
@@ -19384,6 +19395,33 @@ fn find_invalid_array_length_type_argument(
                 );
             for segment in path.segments {
                 if let Some(args) = segment.args {
+                    if is_prelude_array
+                        && args.args.len() == 2
+                        && let GenericArg::Const(const_length) = args.args[1]
+                    {
+                        // Literal lengths of the wrong type or outside the
+                        // `USize` range are spec-invalid (spec 5.2.2
+                        // TYPE_MISMATCH / LITERAL_OUT_OF_RANGE), not
+                        // unimplemented forms.
+                        let code = match const_length {
+                            sai_hir::types::ConstArg::Int {
+                                value: Some(value),
+                                negated,
+                            } if (negated && value != 0)
+                                || value.bit_width() > pointer_width.into() =>
+                            {
+                                Some(sai_diagnostics::Code::LiteralOutOfRange)
+                            }
+                            sai_hir::types::ConstArg::Char(_)
+                            | sai_hir::types::ConstArg::Bool(_) => {
+                                Some(sai_diagnostics::Code::TypeMismatch)
+                            }
+                            _ => None,
+                        };
+                        if let Some(code) = code {
+                            return Some((args.span, code));
+                        }
+                    }
                     if is_prelude_array
                         && args.args.len() == 2
                         && let GenericArg::Type(length) = args.args[1]
@@ -19422,8 +19460,11 @@ fn find_invalid_array_length_type_argument(
                     }
                     for arg in args.args {
                         if let GenericArg::Type(element) = arg
-                            && let Some(found) =
-                                find_invalid_array_length_type_argument(**element, type_paths)
+                            && let Some(found) = find_invalid_array_length_type_argument(
+                                **element,
+                                type_paths,
+                                pointer_width,
+                            )
                         {
                             return Some(found);
                         }
@@ -19432,10 +19473,12 @@ fn find_invalid_array_length_type_argument(
             }
             None
         }
-        TyKind::Tuple(elements) => elements
-            .iter()
-            .find_map(|element| find_invalid_array_length_type_argument(*element, type_paths)),
-        TyKind::Borrow(_, inner) => find_invalid_array_length_type_argument(*inner, type_paths),
+        TyKind::Tuple(elements) => elements.iter().find_map(|element| {
+            find_invalid_array_length_type_argument(*element, type_paths, pointer_width)
+        }),
+        TyKind::Borrow(_, inner) => {
+            find_invalid_array_length_type_argument(*inner, type_paths, pointer_width)
+        }
         _ => None,
     }
 }
