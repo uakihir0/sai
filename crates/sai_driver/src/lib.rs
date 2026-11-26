@@ -9007,6 +9007,26 @@ fn unify_discard_shapes(
     }
 }
 
+// An integer literal that fits no integer type at all (positive above
+// `U64`, negative below `I64`) is out of range independent of inference
+// (spec 6.3.1), so it is diagnosed even when sibling elements gate.
+fn discard_impossible_int_literal<'a>(expr: &'a HirExpr<'_>) -> Option<&'a HirExpr<'a>> {
+    match expr.kind {
+        ExprKind::Lit(Lit::Int { value, negated }) => {
+            let impossible = match value {
+                Some(value) if negated => value > (i64::MAX as u128) + 1,
+                Some(value) => value > u64::MAX as u128,
+                None => true,
+            };
+            impossible.then_some(expr)
+        }
+        ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
+            elements.iter().find_map(discard_impossible_int_literal)
+        }
+        _ => None,
+    }
+}
+
 fn check_function_discarded_unit_tail(
     owner: &HirOwner<'_>,
     tail: &HirExpr<'_>,
@@ -9077,7 +9097,24 @@ fn check_function_discarded_unit_tail(
                     owner, element, false, symbols, inputs, snapshot,
                 )?
                 else {
-                    return Ok(None);
+                    let mut definite = Vec::new();
+                    for checked in elements.iter() {
+                        if let Some(literal) = discard_impossible_int_literal(checked) {
+                            definite.push(const_literal_diagnostic(
+                                owner.id,
+                                inputs,
+                                snapshot,
+                                literal.span,
+                                sai_diagnostics::Code::LiteralOutOfRange,
+                                "integer literal out of range for every integer type".to_string(),
+                                "literal out of range",
+                            )?);
+                        }
+                    }
+                    if definite.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some((DiscardLiteralShape::Unknown, definite)));
                 };
                 diagnostics.extend(element_diagnostics);
                 shapes.push(shape);
@@ -9093,7 +9130,24 @@ fn check_function_discarded_unit_tail(
                     owner, element, true, symbols, inputs, snapshot,
                 )?
                 else {
-                    return Ok(None);
+                    let mut definite = Vec::new();
+                    for checked in elements.iter() {
+                        if let Some(literal) = discard_impossible_int_literal(checked) {
+                            definite.push(const_literal_diagnostic(
+                                owner.id,
+                                inputs,
+                                snapshot,
+                                literal.span,
+                                sai_diagnostics::Code::LiteralOutOfRange,
+                                "integer literal out of range for every integer type".to_string(),
+                                "literal out of range",
+                            )?);
+                        }
+                    }
+                    if definite.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some((DiscardLiteralShape::Unknown, definite)));
                 };
                 diagnostics.extend(element_diagnostics);
                 if !conflict {
